@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supertable"
+version = "0.1.0"
+description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Super Table Public Use License (STPUL) v1.0" }
+authors = [
+    { name = "Levente Kupas", email = "lkupas@kladnasoft.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent"
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[project.urls]
+Homepage = "https://github.com/kladnasoft/supertable"

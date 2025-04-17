@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+tmp/
+*.egg-info/
+.eggs/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit tests / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+
+# PyCharm / VS Code / IDE stuff
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+ENV/
+
+# Other
+.DS_Store
+*.log
+*.bak
+
