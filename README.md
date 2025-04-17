@@ -7,15 +7,25 @@
 A high‑performance, lightweight transaction catalog that integrates multiple
 basic tables into a single, cohesive framework designed for ultimate
 efficiency.
-
-Whether you are processing massive datasets or continuously evolving data
-structures, SuperTable lets you query your information effortlessly. It
-automatically creates and manages tables so you can start running SQL queries
+It automatically creates and manages tables so you can start running SQL queries
 immediately—no complicated schemas or manual joins required.
 
-By holding all your data in one place, SuperTable removes complexity, boosts
-efficiency, and provides a unified view of your information. From startups to
-enterprises, SuperTable helps you make better decisions, faster.
+
+---
+
+## Installation
+
+```bash
+pip install supertable
+```
+
+## Setup
+To set the SUPERTABLE_HOME variable in Linux (default: ~/supertable):
+```bash
+export SUPERTABLE_HOME="$HOME/supertable"
+```
+
+SuperTable is published on PyPI. The only requirement is Python ≥ 3.10.
 
 ---
 
@@ -26,16 +36,15 @@ enterprises, SuperTable helps you make better decisions, faster.
   columns—no predefined schema or extra setup.
 
 - **Self‑referencing architecture**  
-  Combine and analyze data across tables without writing manual joins; tables
-  can dynamically reference each other for richer insights.
+  Combine and analyze data across tables without writing manual joins.
 
 - **Staging module with history**  
   Upload files to a staging area and reload any version at any time, keeping a
   complete audit trail for tracking and compliance.
 
 - **Columnar storage for speed**  
-  Fully denormalized, column‑partitioned tables deliver lightning‑fast queries,
-  even with thousands of columns.
+  With fully denormalized columnar storage, queries remain lightning-fast, 
+  even when dealing with thousands of columns
 
 - **Built‑in RBAC security**  
   Define users and roles to control row‑ and column‑level access—no external
@@ -44,6 +53,24 @@ enterprises, SuperTable helps you make better decisions, faster.
 - **Platform independent**  
   Deploy on any major cloud provider or on‑premise. SuperTable is a pure Python
   library with no hidden costs.
+
+---
+
+## Examples
+
+The project ships with an **`examples/`** folder that walks you through common
+workflows:
+
+| Script prefix | What it shows |
+|---------------|---------------|
+| **1.\*** | Create a SuperTable, roles, and users |
+| **2.\*** | Write dummy or single‑file data into a simple table |
+| **3.\*** | Read data, query statistics, and inspect metadata |
+| **4.1**   | Clean obsolete files |
+| **5.\*** | Delete tables and supertables |
+
+Additional utility scripts demonstrate locking, parallel writes, and
+performance measurement. Browse the folder to get started quickly.
 
 ---
 
