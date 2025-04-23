@@ -1,6 +1,5 @@
 import json
 import time
-import fcntl
 import threading
 import queue
 import atexit
@@ -8,11 +7,11 @@ import uuid
 import os
 from typing import Dict, List, Any, Optional
 import pyarrow as pa
-import pyarrow.parquet as pq
 import polars as pl
 from datetime import datetime, timezone
 from supertable.storage.storage_interface import StorageInterface
 from supertable.storage.storage_factory import get_storage
+
 
 class MonitoringLogger:
     def __init__(
@@ -34,7 +33,7 @@ class MonitoringLogger:
         self.flush_interval = flush_interval
         self.compression = compression
         self.compression_level = compression_level
-        self.storage = get_storage()  # Always use storage interface
+        self.storage = get_storage()
 
         # Initialize paths
         self.base_dir = os.path.join(self.organization, self.super_name, self.identity, self.monitor_type)
@@ -48,6 +47,19 @@ class MonitoringLogger:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.has_data_event = threading.Event()
+
+        # Queue monitoring stats
+        self.queue_stats = {
+            'total_received': 0,
+            'total_processed': 0,
+            'current_size': 0,
+            'max_size': 0,
+            'last_flush_time': 0,
+            'flush_durations': [],
+            'last_flush_size': 0,
+            'start_time': time.time()
+        }
+        self.queue_stats_lock = threading.Lock()
 
         # Ensure directories exist
         self.storage.makedirs(self.base_dir)
@@ -81,6 +93,7 @@ class MonitoringLogger:
         }
 
     def _save_catalog(self):
+        """Save the catalog with file locking."""
         self.storage.write_json(self.catalog_path, self.catalog)
 
     def _generate_filename(self, prefix: str) -> str:
@@ -89,11 +102,10 @@ class MonitoringLogger:
         unique_hash = uuid.uuid4().hex[:16]
         return f"{timestamp}_{unique_hash}_{prefix}"
 
-    def _create_snapshot(self, resources: List[Dict[str, Any]], sample_record: Optional[Dict[str, Any]] = None) -> tuple[str, Dict[str, Any]]:
+    def _create_snapshot(self, resources: List[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
         """Create a new snapshot metadata file."""
         snapshot_id = self._generate_filename(f"{self.monitor_type}.json")
         snapshot_path = os.path.join(self.snapshots_dir, snapshot_id)
-
 
         snapshot = {
             "snapshot_version": self.catalog["version"] + 1,
@@ -104,20 +116,19 @@ class MonitoringLogger:
         self.storage.write_json(snapshot_path, snapshot)
         return snapshot_path, snapshot
 
-
-    def _write_parquet_file(self, data: List[Dict[str, Any]], existing_file: Optional[str] = None) -> Dict[str, Any]:
+    def _write_parquet_file(self, data: List[Dict[str, Any]], existing_path: Optional[str] = None) -> Dict[str, Any]:
         """Write data to a new or existing Parquet file."""
         data = [self._ensure_execution_time(record) for record in data]
         df = pl.from_dicts(data)
 
-        if existing_file:
-            if self.storage.exists(existing_file):
+        if existing_path:
+            if self.storage.exists(existing_path):
                 try:
-                    existing_df = pl.read_parquet(existing_file)
+                    existing_df = pl.read_parquet(existing_path)
                     df = pl.concat([existing_df, df])
-                    self.storage.delete(existing_file)
+                    self.storage.delete(existing_path)
                 except Exception as e:
-                    print(f"Warning: Failed to merge with existing file {existing_file}: {str(e)}")
+                    print(f"Warning: Failed to merge with existing file {existing_path}: {str(e)}")
 
         new_filename = self._generate_filename("data.parquet")
         new_path = os.path.join(self.data_dir, new_filename)
@@ -169,6 +180,7 @@ class MonitoringLogger:
 
             # Process existing files that haven't reached max size
             processed_data = self.current_batch.copy()
+            n = len(processed_data)
             self.current_batch = []
             new_resources = []
 
@@ -193,10 +205,15 @@ class MonitoringLogger:
                 processed_data = processed_data[chunk_size:]
                 new_resources.append(self._write_parquet_file(chunk))
 
-            # Get schema from new data
-            sample_record = self.current_batch[0] if self.current_batch else None
-            new_snapshot_path, new_snapshot = self._create_snapshot(new_resources, sample_record)
-            self._update_catalog(new_snapshot_path, current_snapshot_path, new_snapshot)
+            # Create new snapshot
+            snapshot_path, new_snapshot = self._create_snapshot(new_resources)
+            self._update_catalog(snapshot_path, current_snapshot_path, new_snapshot)
+
+            # Update queue stats after successful flush
+            with self.queue_stats_lock:
+                self.queue_stats["total_processed"] += n
+                self.queue_stats["last_flush_size"] = n
+                self.queue_stats['last_flush_time'] = time.time()
 
     def _update_catalog(self, snapshot_path: str, current_snapshot_path: str, new_snapshot: Dict[str, Any]):
         """Update the catalog with new snapshot information."""
@@ -218,27 +235,95 @@ class MonitoringLogger:
         return record
 
     def log_metric(self, metric_data: Dict[str, Any]):
-        """Add metric data to the queue and trigger flush if queue is large."""
+        """Add metric data to the queue and update stats."""
         self.queue.put(metric_data)
+        with self.queue_stats_lock:
+            self.queue_stats['total_received'] += 1
+            current_size = self.queue.qsize()
+            self.queue_stats['current_size'] = current_size
+            self.queue_stats['max_size'] = max(
+                self.queue_stats['max_size'],
+                current_size
+            )
         self.has_data_event.set()
 
     def _write_loop(self):
         """Main writer loop that processes the queue."""
         while not self.stop_event.is_set():
+            start_wait = time.time()
             self.has_data_event.wait(timeout=self.flush_interval)
+            wait_time = time.time() - start_wait
 
-            while not self.queue.empty():
-                try:
-                    self.current_batch.append(self.queue.get_nowait())
-                except queue.Empty:
-                    break
+            # Process queue
+            start_flush = time.time()
+            processed_count = 0
+
+            with self.lock:
+                while not self.queue.empty():
+                    try:
+                        self.current_batch.append(self.queue.get_nowait())
+                        processed_count += 1
+                    except queue.Empty:
+                        break
 
             if self.current_batch:
                 self._flush_batch()
+                self.has_data_event.clear()
+
+                # Update stats after flush
+                with self.queue_stats_lock:
+                    flush_duration = time.time() - start_flush
+                    self.queue_stats['flush_durations'].append(flush_duration)
+                    # Keep only last 100 durations
+                    if len(self.queue_stats['flush_durations']) > 100:
+                        self.queue_stats['flush_durations'].pop(0)
 
             self.has_data_event.clear()
 
         self._flush_batch(force=True)
+
+    def get_queue_stats(self) -> Dict[str, Any]:
+        """Return current queue statistics."""
+        with self.queue_stats_lock:
+            stats = self.queue_stats.copy()
+            stats['current_size'] = self.queue.qsize()
+
+            # Calculate averages
+            if stats['flush_durations']:
+                stats['avg_flush_duration'] = sum(stats['flush_durations']) / len(stats['flush_durations'])
+            else:
+                stats['avg_flush_duration'] = 0
+
+            uptime = time.time() - stats['start_time']
+            stats['processing_rate'] = (
+                stats['total_processed'] / uptime if uptime > 0 else 0
+            )
+
+            return stats
+
+    def get_queue_health(self) -> Dict[str, Any]:
+        """Return a health assessment of the queue."""
+        stats = self.get_queue_stats()
+        return {
+            'status': 'healthy' if stats['current_size'] < self.max_rows_per_file else 'backlogged',
+            'backlog': stats['current_size'],
+            'processing_rate': stats['processing_rate'],
+            'estimated_time_to_clear': (
+                stats['current_size'] / stats['processing_rate']
+                if stats['processing_rate'] > 0
+                else float('inf')
+            ),
+            'last_flush': {
+                'time': stats['last_flush_time'],
+                'duration': stats['flush_durations'][-1] if stats['flush_durations'] else 0,
+                'items_processed': stats['last_flush_size']
+            },
+            'totals': {
+                'received': stats['total_received'],
+                'processed': stats['total_processed'],
+                'uptime_seconds': time.time() - stats['start_time']
+            }
+        }
 
     def _emergency_flush(self):
         """Flush remaining data when program exits."""
