@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 import datetime
 
@@ -38,9 +39,13 @@ def extend_execution_plan(
     then writes it back using the provided storage interface (or default storage if none is passed).
     """
     simple_name = "__query_stats__"
+    return
 
     if query_plan_manager.original_table == simple_name:
         return
+
+    original_level = logger.getEffectiveLevel()
+    logging.getLogger('supertable').setLevel(logging.INFO)
 
     # If no storage is passed, create one via the storage factory
     if storage is None:
@@ -83,9 +88,9 @@ def extend_execution_plan(
 
     arrow_table = df.to_arrow()
     logger.debug(f"Data to Write: {arrow_table}")
-    data_writer = DataWriter(super_name=super_table.super_name, organization=super_table.organization)
-
     logger.debug(f"Writing data to {simple_name}")
+
+    data_writer = DataWriter(super_name=super_table.super_name, organization=super_table.organization)
 
     columns, rows, inserted, deleted = data_writer.write(
         user_hash=superuser_hash,
@@ -93,5 +98,7 @@ def extend_execution_plan(
         data=arrow_table,
         overwrite_columns=["query_id"],
     )
-    logger.debug(f"Wrote data to {simple_name}")
+
+    logging.getLogger('supertable').setLevel(original_level)
+    logger.debug(f"Query Plan Saved")
     storage.delete(query_plan_manager.query_plan_path)

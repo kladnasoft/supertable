@@ -33,7 +33,7 @@ class LocalStorage(StorageInterface):
             os.makedirs(directory, exist_ok=True)
 
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
     def exists(self, path: str) -> bool:
         return os.path.exists(path)

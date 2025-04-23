@@ -7,7 +7,7 @@ rm -rf build dist *.egg-info
 python3 setup.py sdist bdist_wheel
 
 # Install your package locally
-pip install ~/dev/supertable/dist/supertable-0.1.0-py3-none-any.whl --force-reinstall
+pip install ~/dev/supertable/dist/supertable-0.1.1-py3-none-any.whl --force-reinstall
 
 # copy to my project
-cp -f ~/dev/supertable/dist/supertable-0.1.0-py3-none-any.whl ~/dev/reflection/dist/
+cp -f ~/dev/supertable/dist/supertable-0.1.1-py3-none-any.whl ~/dev/reflection/dist/

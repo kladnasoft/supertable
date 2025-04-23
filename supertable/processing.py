@@ -1,3 +1,4 @@
+import logging
 import os
 import polars
 from datetime import datetime, date
@@ -117,6 +118,7 @@ def find_and_lock_overlapping_files(
             timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
             lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC,
         ):
+            logging.DEBUG(f"Resources cannot be locked: {resources_to_lock}")
             raise RuntimeError("Failed to acquire locks for overlapping resources")
 
     return overlapping_files

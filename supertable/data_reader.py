@@ -70,11 +70,10 @@ class DataReader:
 
             snapshots = self.filter_snapshots(super_table_data=super_table_data,
                                               super_table_meta=super_table_meta)
-            logger.debug(f"Filtered snapshots: {snapshots}")
+            logger.debug(f"Filtered snapshots: {len(snapshots)}")
 
             parquet_files, schema = self.process_snapshots(snapshots=snapshots,
                                                            with_scan=with_scan)
-            logger.debug(f"Parquet Files: {parquet_files}")
 
             missing_columns = (
                 set([column.lower() for column in self.parser.columns_list])
@@ -162,9 +161,9 @@ class DataReader:
                     reflection_file_size += file_size
                     reflection_rows += file_rows
 
-            logger.debug(f"snapshots: {len ( snapshots )}")
-            logger.debug(f"parquet_files: {len ( parquet_files )}")
-            logger.debug(f"schema: {schema}")
+            logger.debug(f"Processed Snapshots: {len ( snapshots )}")
+            logger.debug(f"Processed Parquet Files: {len ( parquet_files )}")
+            logger.debug(f"Processed Schema: {len(schema)}")
 
         self.plan_stats.add_stat({"REFLECTIONS": len(parquet_files)})
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
@@ -181,22 +180,48 @@ class DataReader:
         con.execute("PRAGMA enable_profiling='json';")
         #con.execute("SET profiling_mode = 'standard';")
         con.execute(f"PRAGMA profile_output = '{query_manager.query_plan_path}';")
+        con.execute("PRAGMA default_collation='nocase';")
 
         # Read and register parquet files directly with DuckDB
         parquet_files_str = ", ".join(f"'{file}'" for file in parquet_files)
-        logger.debug(f"parquet files: {len(parquet_files)}")
+        logger.debug(f"Parsed Columns: {self.parser.columns_csv}")
 
         self.timer.capture_and_reset_timing("CONNECTING")
+
+
+        safe_columns = []
+
+        if self.parser.columns_csv == "*":
+            safe_columns.append("*")
+        else:
+            # Handle columns with spaces/special characters
+            columns = self.parser.columns_csv.split(',')
+
+            for col in columns:
+                col = col.strip()
+                if any(not c.isalnum() and c != '_' for c in col):
+                    # Quote column names with special characters
+                    safe_columns.append(f'"{col}"')
+                else:
+                    safe_columns.append(col)
+
+        safe_columns_csv = ', '.join(safe_columns)
+        logger.debug(f"Safe Columns: {safe_columns_csv}")
 
         create_table = f"""
 CREATE TABLE {self.parser.reflection_table} 
 AS 
-SELECT {self.parser.columns_csv}
+SELECT {safe_columns_csv}
 FROM parquet_scan([{parquet_files_str}], union_by_name=True, HIVE_PARTITIONING=TRUE);
           """
 
-        logger.debug(f"create_table: {create_table}")
-        con.execute(create_table)
+        try:
+            con.execute(create_table)
+        except Exception as e:
+            # Log the error with the SQL statement
+            logger.error(f"Error creating table: {create_table}\nError: {str(e)}")
+            # Re-raise the original exception to maintain the call stack
+            raise
 
         create_view = f"""
 CREATE VIEW {self.parser.rbac_view}
