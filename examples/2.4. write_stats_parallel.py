@@ -8,7 +8,7 @@ import os
 print("Current working directory:", os.getcwd())
 
 # Example with 'stats' metric
-with MonitoringLogger(base_dir="/home/kladnasoft/supertable/kladna-soft/example", metric="stats") as logger:
+with MonitoringLogger(super_name="example", organization="kladna-soft", monitor_type="plans") as monitor:
     def simulate_query_stats(query_id: int):
         stats = {
             "query_id": f"query_{query_id}",
@@ -17,7 +17,7 @@ with MonitoringLogger(base_dir="/home/kladnasoft/supertable/kladna-soft/example"
             # Note: execution_time will be added automatically if missing
             "query_hash": random.randint(100000, 999999)
         }
-        logger.log_metric(stats)
+        monitor.log_metric(stats)
 
 
     # Simulate high-volume writes

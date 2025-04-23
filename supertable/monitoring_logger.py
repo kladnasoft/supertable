@@ -94,44 +94,16 @@ class MonitoringLogger:
         snapshot_id = self._generate_filename(f"{self.monitor_type}.json")
         snapshot_path = os.path.join(self.snapshots_dir, snapshot_id)
 
-        # Get schema from sample record or first resource
-        schema = None
-        if sample_record:
-            schema = self._get_schema_from_data(sample_record)
-        elif resources:
-            first_file = os.path.join(self.data_dir, resources[0]["file"])
-            if self.storage.exists(first_file):
-                try:
-                    table = self.storage.read_parquet(first_file)
-                    schema = table.schema
-                except Exception as e:
-                    print(f"Warning: Failed to read schema from {first_file}: {str(e)}")
 
         snapshot = {
             "snapshot_version": self.catalog["version"] + 1,
             "last_updated_ms": int(time.time() * 1000),
-            "schema": {field.name: str(field.type) for field in schema} if schema else {},
             "resources": resources
         }
 
         self.storage.write_json(snapshot_path, snapshot)
         return snapshot_path, snapshot
 
-    def _get_schema_from_data(self, sample_record: Dict[str, Any]) -> pa.Schema:
-        """Generate schema from a sample record."""
-        fields = []
-        for key, value in sample_record.items():
-            if isinstance(value, int):
-                fields.append(pa.field(key, pa.int64()))
-            elif isinstance(value, float):
-                fields.append(pa.field(key, pa.float64()))
-            elif isinstance(value, str):
-                fields.append(pa.field(key, pa.string()))
-            elif isinstance(value, bool):
-                fields.append(pa.field(key, pa.bool_()))
-            else:
-                fields.append(pa.field(key, pa.string()))
-        return pa.schema(fields)
 
     def _write_parquet_file(self, data: List[Dict[str, Any]], existing_file: Optional[str] = None) -> Dict[str, Any]:
         """Write data to a new or existing Parquet file."""
@@ -139,14 +111,13 @@ class MonitoringLogger:
         df = pl.from_dicts(data)
 
         if existing_file:
-            existing_path = os.path.join(self.data_dir, existing_file)
-            if self.storage.exists(existing_path):
+            if self.storage.exists(existing_file):
                 try:
-                    existing_df = pl.read_parquet(existing_path)
+                    existing_df = pl.read_parquet(existing_file)
                     df = pl.concat([existing_df, df])
-                    self.storage.delete(existing_path)
+                    self.storage.delete(existing_file)
                 except Exception as e:
-                    print(f"Warning: Failed to merge with existing file {existing_path}: {str(e)}")
+                    print(f"Warning: Failed to merge with existing file {existing_file}: {str(e)}")
 
         new_filename = self._generate_filename("data.parquet")
         new_path = os.path.join(self.data_dir, new_filename)
