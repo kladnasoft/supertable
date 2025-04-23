@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Optional
 import pyarrow as pa
 import polars as pl
 from datetime import datetime, timezone
-from supertable.storage.storage_interface import StorageInterface
+from supertable.super_table import SuperTable
 from supertable.storage.storage_factory import get_storage
 
 

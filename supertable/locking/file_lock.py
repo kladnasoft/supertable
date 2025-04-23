@@ -43,6 +43,14 @@ class FileLocking:
     def remove_own_locks(self, lock_data):
         return [L for L in lock_data if L["pid"] != self.lock_id]
 
+    def self_lock(self,
+                  timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
+                  lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC):
+        """Convenience: lock just this identity as a single-resource lock."""
+        return self.lock_resources([self.identity],
+                                   timeout_seconds,
+                                   lock_duration_seconds)
+
     def lock_resources(self, resources,
                        timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
                        lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC):
@@ -73,9 +81,11 @@ class FileLocking:
 
                         now    = int(time.time())
                         exp_ts = now + lock_duration_seconds
-                        data.append({"pid": self.lock_id,
-                                     "exp": exp_ts,
-                                     "res": resources})
+                        data.append({
+                            "pid": self.lock_id,
+                            "exp": exp_ts,
+                            "res": resources
+                        })
                         self.write_lock_file(data, f)
                         logger.debug(f"{self.identity}: lock acquired, expires at {exp_ts}")
 
@@ -113,7 +123,7 @@ class FileLocking:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
     def __enter__(self):
-        if not self.lock_resources([self.identity]):
+        if not self.self_lock():
             raise Exception(f"Unable to acquire file lock for {self.identity}")
         return self
 

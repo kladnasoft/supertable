@@ -1,11 +1,11 @@
 import threading
 import time
-from supertable.monitoring_logger import MonitoringLogger
-from concurrent.futures import ThreadPoolExecutor, wait
 import random
 import os
-from queue import Empty
 
+from concurrent.futures import ThreadPoolExecutor, wait
+from supertable.monitoring_logger import MonitoringLogger
+from examples.defaults import super_name, organization, MonitorType
 
 def print_monitor_stats(monitor):
     stats = monitor.get_queue_stats()
@@ -39,9 +39,9 @@ def verify_output(monitor, expected_count):
 print("Current working directory:", os.getcwd())
 
 with MonitoringLogger(
-        super_name="example",
-        organization="kladna-soft",
-        monitor_type="plans",
+        super_name=super_name,
+        organization=organization,
+        monitor_type=MonitorType.METRICS.value,
         max_rows_per_file=500,
         flush_interval=0.1
 ) as monitor:

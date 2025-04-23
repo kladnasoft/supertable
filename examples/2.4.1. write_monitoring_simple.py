@@ -1,14 +1,16 @@
 import time
 import random
-import os
 
 from supertable.monitoring_logger import MonitoringLogger
+from examples.defaults import super_name, organization, MonitorType
 
 # Use the MonitoringLogger in a context manager to ensure proper setup and teardown
 with MonitoringLogger(
-    super_name="example",
-    organization="kladna-soft",
-    monitor_type="plans"
+        super_name=super_name,
+        organization=organization,
+        monitor_type=MonitorType.METRICS.value,
+        max_rows_per_file=500,
+        flush_interval=0.1
 ) as monitor:
 
     # Generate a unique ID for this query run

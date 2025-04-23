@@ -28,20 +28,24 @@ def run_as_module(file_path):
 
 def main():
     scripts = [
-        '1.1. create_super_table.py',
-        '1.2. create_roles.py',
-        '1.3. create_users.py',
-        '2.1. write_dummy_data.py',
-        '2.2. write_single_data.py',
-        '2.3. write_staging.py',
-        '3.1. read_data_error.py',
-        '3.2.2. read_table_data_ok.py',
-        '3.3. read_meta.py',
-        '3.4. read_staging.py',
-        '3.5. read_query_plans.py',
-        '4.1. clean_obsolete_files.py',
-        '5.1. delete_table.py',
-        '5.2. delete_super_table.py'
+        "1.1. create_super_table.py",
+        "1.2. create_roles.py",
+        "1.3. create_users.py",
+        "2.1. write_dummy_data.py",
+        "2.2. write_single_data.py",
+        "2.3. write_staging.py",
+        "2.4.2. write_monitoring_parallel.py",
+        "2.4.1. write_monitoring_simple.py",
+        "3.1. read_data_error.py",
+        "3.2.1. read_super_data_ok.py",
+        "3.2.2. read_table_data_ok.py",
+        "3.3. read_meta.py",
+        "3.4. read_staging.py",
+        "3.5. read_query_plans.py",
+        "3.6. read_user.py",
+        "4.1. clean_obsolete_files.py",
+        #"5.1. delete_table.py",
+        #"5.2. delete_super_table.py",
     ]
 
     print("🚀 Starting script execution...\n")
