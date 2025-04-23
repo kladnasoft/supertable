@@ -13,6 +13,7 @@ from supertable.monitoring_logger import MonitoringLogger
 def extend_execution_plan(
     super_table: SuperTable,
     query_plan_manager: QueryPlanManager,
+    user_hash: str,
     timing: dict,
     plan_stats: PlanStats,
     status: str,
@@ -46,6 +47,7 @@ def extend_execution_plan(
     stats = {
         "query_id":       query_plan_manager.query_id,
         "query_hash":     query_plan_manager.query_hash,
+        "user_hash":      user_hash,
         "recorded_at":    datetime.utcnow().isoformat(),
         "table_name":     query_plan_manager.original_table,
         "status":         status,

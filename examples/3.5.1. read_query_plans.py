@@ -2,13 +2,14 @@ import os
 from datetime import datetime, timezone, timedelta
 
 from supertable.monitoring_reader import MonitoringReader
+from examples.defaults import super_name, organization, MonitorType
 
 def main():
     # 1) Instantiate for the “plans” monitor
     reader = MonitoringReader(
-        super_name="example",
-        organization="kladna-soft",
-        monitor_type="plans"
+        super_name=super_name,
+        organization=organization,
+        monitor_type=MonitorType.PLANS.value
     )
 
     # 2) Read the last 24h of data (default)

@@ -1,9 +1,14 @@
+import time
+import uuid
+from datetime import datetime
+
 import polars
 import re
 
 from polars import DataFrame
 
 from supertable.config.defaults import logger
+from supertable.monitoring_logger import MonitoringLogger
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
@@ -21,6 +26,8 @@ class DataWriter:
 
     @timer
     def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1):
+
+        start_inner = time.time()
 
         logger.debug("Checking for Write Access")
         check_write_access(super_name=self.super_table.super_name,
@@ -70,6 +77,29 @@ class DataWriter:
 
         simple_table.locking.release_lock()
         # self.super_table.locking.release_lock()
+
+        stats = {
+            "query_id": str(uuid.uuid4()),
+            "recorded_at": datetime.utcnow().isoformat(),
+            "super_name": self.super_table.super_name,
+            "table_name": simple_name,
+            "overwrite_columns": overwrite_columns,
+            "inserted": inserted,
+            "deleted": deleted,
+            "total_rows": total_rows,
+            "total_columns": total_columns,
+            "new_resources": len(new_resources),
+            "sunset_files": len(sunset_files),
+            "duration": round(time.time() - start_inner, 6)
+        }
+
+        # Instantiate and use MonitoringLogger within the function
+        with MonitoringLogger(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                monitor_type="stats",
+        ) as monitor:
+            monitor.log_metric(stats)
 
         return total_columns, total_rows, inserted, deleted
 

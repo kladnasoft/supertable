@@ -115,9 +115,10 @@ class DataReader:
         try:
             extend_execution_plan(super_table=self.super_table,
                                   query_plan_manager=self.query_plan_manager,
+                                  user_hash=user_hash,
                                   timing=self.timer.timings,
                                   plan_stats=self.plan_stats,
-                                  status=status.value,
+                                  status=str(status.value),
                                   message=message,
                                   result_shape=result.shape
                                   )
