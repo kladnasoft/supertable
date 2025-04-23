@@ -146,13 +146,17 @@ class MonitoringLogger:
         }
 
     def _calculate_stats(self, df: pl.DataFrame) -> Dict[str, Any]:
-        """Calculate statistics for the DataFrame."""
-        stats = {}
+        """Calculate min/max of execution_time as integer ms timestamps."""
+        stats: Dict[str, Any] = {}
         if "execution_time" in df.columns:
             try:
+                # Make sure the column is Int64
+                ts_col = df["execution_time"].cast(pl.Int64)
+                min_ms = int(ts_col.min())
+                max_ms = int(ts_col.max())
                 stats["execution_time"] = {
-                    "min": str(df["execution_time"].min()),
-                    "max": str(df["execution_time"].max())
+                    "min": min_ms,
+                    "max": max_ms
                 }
             except Exception:
                 stats["execution_time"] = {"min": "unknown", "max": "unknown"}
@@ -229,9 +233,9 @@ class MonitoringLogger:
         self._save_catalog()
 
     def _ensure_execution_time(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Add UTC timestamp if execution_time is missing."""
+        """Add UTC timestamp in milliseconds if execution_time is missing."""
         if "execution_time" not in record:
-            record["execution_time"] = datetime.now(timezone.utc).isoformat()
+            record["execution_time"] = int(datetime.now(timezone.utc).timestamp() * 1_000)
         return record
 
     def log_metric(self, metric_data: Dict[str, Any]):

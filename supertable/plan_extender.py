@@ -1,104 +1,76 @@
 import json
 import logging
-import uuid
-import datetime
-
-import polars as pl
+from datetime import datetime
 from typing import Optional
 
-from supertable.config.defaults import logger
 from supertable.query_plan_manager import QueryPlanManager
-from supertable.storage.storage_interface import StorageInterface
+from supertable.plan_stats import PlanStats
 from supertable.storage.storage_factory import get_storage
-from supertable.data_writer import DataWriter
 from supertable.super_table import SuperTable
-from supertable.rbac.user_manager import UserManager
-
-
-class PlanStats:
-    def __init__(self):
-        self.stats = []
-
-    def add_stat(self, stat):
-        self.stats.append(stat)
+from supertable.monitoring_logger import MonitoringLogger
 
 
 def extend_execution_plan(
     super_table: SuperTable,
-    user_hash: str,
     query_plan_manager: QueryPlanManager,
-    timing,
+    timing: dict,
     plan_stats: PlanStats,
     status: str,
     message: str,
-    result_shape: tuple,
-    storage: Optional[StorageInterface] = None,
-):
+    result_shape: tuple[int, int]
+) -> None:
     """
-    Reads a JSON execution plan, extends it with the given timing and PlanStats,
-    then writes it back using the provided storage interface (or default storage if none is passed).
+    Read an existing execution plan JSON, extend it with timing and profiling info,
+    then log a single metric record via MonitoringLogger and delete the original plan.
     """
-    simple_name = "__query_stats__"
-    return
 
-    if query_plan_manager.original_table == simple_name:
-        return
+    # Lazily acquire a storage interface if not provided
+    storage = get_storage()
 
-    original_level = logger.getEffectiveLevel()
-    logging.getLogger('supertable').setLevel(logging.INFO)
-
-    # If no storage is passed, create one via the storage factory
-    if storage is None:
-        storage = get_storage()
-
-    # Read the existing plan JSON from the storage
+    # Attempt to load the existing JSON plan; fall back to empty dict on error
     try:
-        current_plan = storage.read_json(query_plan_manager.query_plan_path)
-        logger.debug(f"Plan: {current_plan}")
+        base_plan = storage.read_json(query_plan_manager.query_plan_path)
+        logging.debug("Loaded existing execution plan.")
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.warn(f"Warning: Could not read query plan - {str(e)}")
-        current_plan = {}  # or whatever default value makes sense
+        logging.warning(f"Could not read plan at {query_plan_manager.query_plan_path}: {e}")
+        base_plan = {}
 
-    user_manager = UserManager(super_table.super_name, super_table.organization)
-    user_data = user_manager.get_user_hash_by_name("superuser")
-    superuser_hash = user_data.get('hash', user_hash)
-    logger.debug(f"User Data:- {str(user_data)}")
-
-    # Build the new extended plan
-    new_plan = {
+    # Build the extended plan payload
+    extended_plan = {
         "execution_timings": timing,
         "profile_overview": plan_stats.stats,
-        "query_profile": current_plan,
+        "query_profile": base_plan,
     }
 
-    df = pl.DataFrame({
-            "query_id": query_plan_manager.query_id,
-            "query_hash": query_plan_manager.query_hash,
-            "recorded_at": [datetime.datetime.utcnow()],
-            "user_hash": user_hash,
-            "table_name": query_plan_manager.original_table,
-            "status": status,
-            "message": message,
-            "result_rows": result_shape[0],
-            "result_columns": result_shape[1],
-            "execution_timings": [json.dumps(new_plan["execution_timings"])],
-            "profile_overview": [json.dumps(new_plan["profile_overview"])],
-            "query_profile": [json.dumps(new_plan["query_profile"])]
-    })
+    # Prepare the flat stats dictionary to send to MonitoringLogger
+    stats = {
+        "query_id":       query_plan_manager.query_id,
+        "query_hash":     query_plan_manager.query_hash,
+        "recorded_at":    datetime.utcnow().isoformat(),
+        "table_name":     query_plan_manager.original_table,
+        "status":         status,
+        "message":        message,
+        "result_rows":    result_shape[0],
+        "result_columns": result_shape[1],
+        # JSON‐serialize the nested objects
+        "execution_timings": json.dumps(extended_plan["execution_timings"]),
+        "profile_overview":  json.dumps(extended_plan["profile_overview"]),
+        "query_profile":     json.dumps(extended_plan["query_profile"]),
+    }
 
-    arrow_table = df.to_arrow()
-    logger.debug(f"Data to Write: {arrow_table}")
-    logger.debug(f"Writing data to {simple_name}")
+    # Instantiate and use MonitoringLogger within the function
+    with MonitoringLogger(
+        super_name=super_table.super_name,
+        organization=super_table.organization,
+        monitor_type="plans",
+    ) as monitor:
+        # Log the metric (this will handle buffering, flushing, etc.)
+        monitor.log_metric(stats)
+        logging.debug("Logged extended execution plan metrics.")
 
-    data_writer = DataWriter(super_name=super_table.super_name, organization=super_table.organization)
-
-    columns, rows, inserted, deleted = data_writer.write(
-        user_hash=superuser_hash,
-        simple_name=simple_name,
-        data=arrow_table,
-        overwrite_columns=["query_id"],
-    )
-
-    logging.getLogger('supertable').setLevel(original_level)
-    logger.debug(f"Query Plan Saved")
-    storage.delete(query_plan_manager.query_plan_path)
+    # Clean up the original plan file once logged
+    try:
+        storage.delete(query_plan_manager.query_plan_path)
+        logging.debug(f"Deleted original plan JSON: {query_plan_manager.query_plan_path}")
+    except Exception as e:
+        logging.warning(f"Failed to delete plan file: {e}")

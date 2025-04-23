@@ -9,7 +9,8 @@ from supertable.super_table import SuperTable
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.utils.helper import dict_keys_to_lowercase
-from supertable.plan_extender import PlanStats, extend_execution_plan
+from supertable.plan_extender import extend_execution_plan
+from supertable.plan_stats import PlanStats
 from supertable.rbac.access_control import restrict_read_access
 
 class Status(Enum):
@@ -113,13 +114,13 @@ class DataReader:
 
         try:
             extend_execution_plan(super_table=self.super_table,
-                                  user_hash=user_hash,
                                   query_plan_manager=self.query_plan_manager,
                                   timing=self.timer.timings,
+                                  plan_stats=self.plan_stats,
                                   status=status.value,
                                   message=message,
-                                  result_shape=result.shape,
-                                  plan_stats=self.plan_stats)
+                                  result_shape=result.shape
+                                  )
         except Exception as e:
             logger.error(f"Exception: {e}")
 
