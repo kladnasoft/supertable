@@ -1,19 +1,24 @@
-from supertable.config.defaults import logger
-from supertable.data_writer import DataWriter
+import polars as pl
+import glob, os
+
 from examples.dummy_data import get_dummy_data
-from examples.defaults import super_name, user_hash, organization
+from examples.defaults import super_name, user_hash, simple_name, organization
+from supertable.data_writer import DataWriter
+from supertable.simple_table import SimpleTable
 
 overwrite_columns = ["day", "client"]
+dw = DataWriter(super_name=super_name, organization=organization)
+st = SimpleTable(dw.super_table, simple_name)
+data_dir = st.data_dir
 
-super_table = DataWriter(super_name=super_name, organization=organization)
-
-for i in range(1, 5):
-    simple_name, new_data = get_dummy_data(i)
-
-    columns, rows, inserted, deleted = super_table.write(
+for ds in [1, 2, 6, 7, 3, 4, 5]:
+    table_name, arrow = get_dummy_data(ds)
+    print(f"\n=== Running write(ds={ds}) === Table: {simple_name} ===")
+    _, _, ins, del_ = dw.write(
         user_hash=user_hash,
         simple_name=simple_name,
-        data=new_data,
-        overwrite_columns=overwrite_columns
+        data=arrow,
+        overwrite_columns=overwrite_columns,
     )
-    logger.info(f"Result: columns: {columns}, rows: {rows}, inserted: {inserted}, deleted: {deleted}")
+    print(f"inserted={ins}, deleted={del_}")
+
