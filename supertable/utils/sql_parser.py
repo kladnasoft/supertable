@@ -76,7 +76,7 @@ class SQLParser:
         })
 
 
-    @timer
+    #@timer
     def parse_sql(self):
         try:
             # Attempt to parse the SQL query
