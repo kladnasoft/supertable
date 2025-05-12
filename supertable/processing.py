@@ -17,12 +17,13 @@ def is_file_is_in_overlapping_files(file, overlapping_files):
 def prune_not_overlapping_files_by_threshold(overlapping_files):
     # Step 1: Get all items and calculate their total size
     total_size = sum(item[2] for item in overlapping_files)
+    total_files = len([item for item in overlapping_files if item[1] is False])
 
     # Step 2: Add all True items, maybe nothing else is needed
     result = set([item for item in overlapping_files if item[1] is True])
 
     # we have to unite
-    if total_size > default.MAX_MEMORY_CHUNK_SIZE:
+    if total_size > default.MAX_MEMORY_CHUNK_SIZE or total_files >= default.MAX_OVERLAPPING_FILES:
         running_total = sum(item[2] for item in overlapping_files if item[1] is True)
 
         # Step 3: Decide whether we can add False items or not
@@ -246,28 +247,28 @@ def process_files_without_overlap(
         for file, has_overlap, file_size in overlapping_files
         if not has_overlap
     )
-    if total_chunks_file_size >= default.MAX_MEMORY_CHUNK_SIZE:
-        for file, file_size in (
-            (file, file_size)
-            for file, has_overlap, file_size in overlapping_files
-            if not has_overlap
-        ):
-            # Read the parquet file and concatenate it to the chunk DataFrame
-            chunk_df = polars.concat([chunk_df, polars.read_parquet(file)])
-            sunset_files.add(file)  # Track the file being processed
-            chunk_size += file_size
+    #if total_chunks_file_size >= default.MAX_MEMORY_CHUNK_SIZE:
+    for file, file_size in (
+        (file, file_size)
+        for file, has_overlap, file_size in overlapping_files
+        if not has_overlap
+    ):
+        # Read the parquet file and concatenate it to the chunk DataFrame
+        chunk_df = polars.concat([chunk_df, polars.read_parquet(file)])
+        sunset_files.add(file)  # Track the file being processed
+        chunk_size += file_size
 
-            # If the chunk size exceeds the max memory chunk size, write it out
-            if chunk_size >= default.MAX_MEMORY_CHUNK_SIZE:
-                write_parquet_and_collect_resources(
-                    chunk_df,
-                    overwrite_columns,
-                    data_dir,
-                    new_resources,
-                    compression_level,
-                )
-                chunk_size = 0  # Reset the chunk size
-                chunk_df = empty_df.clone()  # Reset the chunk DataFrame
+        # If the chunk size exceeds the max memory chunk size, write it out
+        if chunk_size >= default.MAX_MEMORY_CHUNK_SIZE:
+            write_parquet_and_collect_resources(
+                chunk_df,
+                overwrite_columns,
+                data_dir,
+                new_resources,
+                compression_level,
+            )
+            chunk_size = 0  # Reset the chunk size
+            chunk_df = empty_df.clone()  # Reset the chunk DataFrame
     return chunk_df
 
 

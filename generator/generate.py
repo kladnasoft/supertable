@@ -5,56 +5,72 @@ from faker import Faker
 from sample_generator import generate_dummy_data
 from sample_schemas import schema, get_random_schema
 from multiprocessing import Pool, cpu_count
-
+from enum import Enum, auto
 from supertable.data_writer import DataWriter
-print(os.getcwd())
 
-FILE_FORMAT = "csv"  # Can be 'csv', 'parquet', or 'json'
-START_DATE = "2024-01-01"
+class TimePrecision(Enum):
+    DAY = auto()
+    HOUR = auto()
+    MINUTE = auto()
+
+# Configuration
+FILE_FORMAT = "parquet"  # Can be 'csv', 'parquet', or 'json'
+START_DATE = "2025-01-01"
 ITERATION = 1
-MIN_FILES = 5
-MAX_FILES = 500
-MIN_ROWS = 100
-MAX_ROWS = 10000
-MIN_COLUMNS = 10
-MAX_COLUMNS = 20
-
+MIN_FILES = 10000
+MAX_FILES = 100000
+MIN_ROWS = 10
+MAX_ROWS = 5000
+MIN_COLUMNS = 6
+MAX_COLUMNS = 15
+TIME_PRECISION = TimePrecision.MINUTE  # Change to DAY, HOUR, or MINUTE
 
 # Initialize Faker
 faker = Faker()
 
+def get_timestamp_format(current_date, precision):
+    if precision == TimePrecision.DAY:
+        return current_date.strftime("%Y-%m-%d"), timedelta(days=1)
+    elif precision == TimePrecision.HOUR:
+        return current_date.strftime("%Y-%m-%d_%H"), timedelta(hours=1)
+    elif precision == TimePrecision.MINUTE:
+        return current_date.strftime("%Y-%m-%d_%H-%M"), timedelta(minutes=1)
+    else:
+        raise ValueError(f"Unknown time precision: {precision}")
 
-# Function to generate files
 def generate_files(partition_info):
     part, files_to_generate, partition_value, start_date, random_schema = partition_info
 
-    # Create the base sample directory
     base_dir = "generated_data"
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
 
-    # Create directory for the partition value under the sample folder
     partition_dir = os.path.join(base_dir, partition_value)
     if not os.path.exists(partition_dir):
         os.makedirs(partition_dir)
 
-    # Generate files
+    current_date = start_date
     for i in range(files_to_generate):
         num_rows = random.randint(MIN_ROWS, MAX_ROWS)
-        # Calculate the date for the current iteration
-        current_date = start_date + timedelta(days=i)
-        day_str = current_date.strftime("%Y-%m-%d")
-        print(
-            f"partition: {part}, iteration: {i} out of {files_to_generate}, day_str: {day_str}, num_rows: {num_rows}, columns: {len(random_schema)}"
-        )
-        # Generate dummy data
-        df = generate_dummy_data(random_schema, num_rows, partition_value, day_str)
+        timestamp_str, time_increment = get_timestamp_format(current_date, TIME_PRECISION)
+        current_date += time_increment
 
-        # Construct file name
-        file_name = f"{day_str}_dummy_data.{FILE_FORMAT}"
+        print(
+            f"partition: {part}, iteration: {i}/{files_to_generate}, "
+            f"timestamp: {timestamp_str}, rows: {num_rows}, columns: {len(random_schema)}"
+        )
+
+        # Generate dummy data with updated function signature
+        df = generate_dummy_data(
+            schema=random_schema,
+            num_rows=num_rows,
+            _sys_table_name=partition_value,
+            partition=timestamp_str
+        )
+
+        file_name = f"{timestamp_str}_dummy_data.{FILE_FORMAT}"
         file_path = os.path.join(partition_dir, file_name)
 
-        # Save to the specified format
         if FILE_FORMAT == "csv":
             df.to_csv(file_path, index=False)
         elif FILE_FORMAT == "parquet":
@@ -64,39 +80,30 @@ def generate_files(partition_info):
         else:
             raise ValueError(f"Unsupported file format: {FILE_FORMAT}")
 
-        print(f"Dummy {FILE_FORMAT.upper()} file generated successfully: {file_path}")
-
-    print("All files processed.")
-
+        print(f"Generated: {file_path}")
 
 def main():
     tasks = []
     for part in range(ITERATION):
-        # Parameters
-        files_to_generate = random.randint(
-            MIN_FILES, MAX_FILES
-        )  # Number of files to generate
+        files_to_generate = random.randint(MIN_FILES, MAX_FILES)
         partition_value = faker.sentence().replace(" ", "_").lower().replace(".", "")
         start_date = datetime.strptime(START_DATE, "%Y-%m-%d")
         random_schema = get_random_schema(schema, MIN_COLUMNS, MAX_COLUMNS)
 
-        print(f"files_to_generate: {files_to_generate}")
-        print(f"columns: {len(random_schema)}")
+        print(f"Files to generate: {files_to_generate}")
+        print(f"Columns: {len(random_schema)}")
+        print(f"Time precision: {TIME_PRECISION.name}")
 
-        # Prepare task information
-        task_info = (
+        tasks.append((
             part,
             files_to_generate,
             partition_value,
             start_date,
             random_schema,
-        )
-        tasks.append(task_info)
+        ))
 
-    # Use multiprocessing to generate files in parallel
     with Pool(cpu_count()) as pool:
         pool.map(generate_files, tasks)
-
 
 if __name__ == "__main__":
     main()

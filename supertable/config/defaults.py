@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Default:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024
+    MAX_OVERLAPPING_FILES: int = 100
     DEFAULT_TIMEOUT_SEC: int = 10
     DEFAULT_LOCK_DURATION_SEC: int = 60
     LOG_LEVEL: str = "INFO"  # Replaced IS_DEBUG with LOG_LEVEL
@@ -70,6 +71,8 @@ def load_defaults_from_env(env_file: str = ".env") -> Default:
 
     return Default(
         MAX_MEMORY_CHUNK_SIZE=int(os.getenv("MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024)),
+        MAX_OVERLAPPING_FILES=int(os.getenv("MAX_OVERLAPPING_FILES", 100)),
+
         DEFAULT_TIMEOUT_SEC=int(os.getenv("DEFAULT_TIMEOUT_SEC", 10)),
         DEFAULT_LOCK_DURATION_SEC=int(os.getenv("DEFAULT_LOCK_DURATION_SEC", 60)),
         LOG_LEVEL=log_level,

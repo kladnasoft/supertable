@@ -5,11 +5,11 @@ from faker import Faker
 faker = Faker()
 
 
-def generate_dummy_data(schema, num_rows, partition_value, day):
+def generate_dummy_data(schema, num_rows, _sys_table_name, partition):
     data = {}
     for column, col_type in schema.items():
-        data["PartitionKey"] = [partition_value for _ in range(num_rows)]
-        data["Day"] = [day for _ in range(num_rows)]
+        data["_sys_table_name"] = [_sys_table_name for _ in range(num_rows)]
+        data["partition"] = [partition for _ in range(num_rows)]
         if col_type == "name":
             data[column] = [faker.name() for _ in range(num_rows)]
         elif col_type == "address":
