@@ -40,19 +40,15 @@ class SimpleTable:
         if not self.storage.exists(self.snapshot_dir):
             self.storage.makedirs(self.snapshot_dir)
 
-        # Check if there's already a snapshot. If not, create an initial snapshot.
-        # For local storage, self.storage.exists(...) checks the local filesystem,
-        # but for S3 or MinIO, it may rely on a different mechanism.
-        initial_snapshot_file = generate_filename(alias=self.identity)
-        new_simple_path = os.path.join(self.snapshot_dir, initial_snapshot_file)
+        # --- FIX: read super-table metadata WITHOUT taking a shared lock to avoid self-deadlock ---
+        super_snapshot = self.super_table.get_super_table()  # no lock
+        snapshots = super_snapshot.get("snapshots", [])
 
-        # If we don't have any snapshot files, let's create the initial one
-        # (for local storage, you might also check the directory contents or rely on some metadata).
-        # If you want a more robust check, you can see if 'current' is set in the super table for this.
-        # But for now, let's only create if the directory is empty or no snapshot is found.
-        # Since we don't store a local pointer in the simple_dir, we can just attempt to read:
-        # We'll skip extra checks here and always place an initial snapshot if it doesn't exist.
-        if not self._any_existing_snapshots():
+        has_entry = any(s.get("table_name") == self.simple_name for s in snapshots)
+        if not has_entry:
+            initial_snapshot_file = generate_filename(alias=self.identity)
+            new_simple_path = os.path.join(self.snapshot_dir, initial_snapshot_file)
+
             snapshot_data = {
                 "simple_name": self.simple_name,
                 "location": self.simple_dir,
@@ -64,6 +60,7 @@ class SimpleTable:
             }
 
             self.write_snapshot_file(new_simple_path, snapshot_data)
+            # This acquires the exclusive lock on the super table as needed.
             self.super_table.update_with_lock(self.simple_name, new_simple_path, [])
 
     def delete(self, user_hash: str):
@@ -85,18 +82,7 @@ class SimpleTable:
         If the storage is remote, this logic may vary. For local storage,
         we'll assume it checks the directory content.
         """
-        # For local storage, we can just do:
-        # "os.listdir(self.snapshot_dir)" via direct local approach
-        # or attempt a custom approach in the storage layer if needed.
-        # Right now, the default LocalStorage doesn't have a "list" method,
-        # so let's do a naive check for presence of any file within snapshot_dir
-        # for local. For remote, this is not implemented in the stubs, so we'll
-        # return False if we're not local.
-        #
-        # This is a partial example, you may add a 'list' method to your
-        # storage classes for a real solution. For now, let's just check local:
         if hasattr(self.storage, "exists") and default.STORAGE_TYPE.upper() == "LOCAL":
-            # We can do a normal Python check:
             if os.path.exists(self.snapshot_dir) and os.path.isdir(self.snapshot_dir):
                 return len(os.listdir(self.snapshot_dir)) > 0
         return False

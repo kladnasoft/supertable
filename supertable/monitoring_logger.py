@@ -43,7 +43,7 @@ class MonitoringLogger:
 
         # Initialize state
         self.queue = queue.Queue()
-        self.current_batch = []
+        self.current_batch: List[Dict[str, Any]] = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.has_data_event = threading.Event()
@@ -69,14 +69,23 @@ class MonitoringLogger:
         # Load or initialize catalog
         self.catalog = self._load_or_init_catalog()
 
-        # Start background writer
+        # Start background writer (daemon → won't block process exit)
         self.writer_thread = threading.Thread(
             target=self._write_loop,
             name=f"MonitoringWriter-{monitor_type}",
-            daemon=False
+            daemon=True
         )
         self.writer_thread.start()
-        atexit.register(self._emergency_flush)
+
+        # Ensure graceful shutdown without relying on open() during teardown
+        atexit.register(self._safe_close)
+
+    def _safe_close(self):
+        try:
+            self.close()
+        except Exception:
+            # Avoid noisy errors during interpreter shutdown
+            pass
 
     def _load_or_init_catalog(self) -> Dict[str, Any]:
         """Load existing catalog or initialize a new one."""
@@ -118,24 +127,40 @@ class MonitoringLogger:
 
     def _write_parquet_file(self, data: List[Dict[str, Any]], existing_path: Optional[str] = None) -> Dict[str, Any]:
         """Write data to a new or existing Parquet file."""
+        if not data:
+            # Return a no-op resource to keep caller logic simple
+            return {
+                "file": existing_path or "",
+                "file_size": 0,
+                "rows": 0,
+                "columns": 0,
+                "stats": {}
+            }
+
         data = [self._ensure_execution_time(record) for record in data]
         df = pl.from_dicts(data)
 
-        if existing_path:
-            if self.storage.exists(existing_path):
-                try:
-                    existing_df = pl.read_parquet(existing_path)
-                    df = pl.concat([existing_df, df])
-                    self.storage.delete(existing_path)
-                except Exception as e:
-                    print(f"Warning: Failed to merge with existing file {existing_path}: {str(e)}")
+        if existing_path and self.storage.exists(existing_path):
+            try:
+                existing_df = pl.read_parquet(existing_path)
+                df = pl.concat([existing_df, df], how="vertical_relaxed")
+                self.storage.delete(existing_path)
+            except Exception as e:
+                print(f"Warning: Failed to merge with existing file {existing_path}: {str(e)}")
 
         new_filename = self._generate_filename("data.parquet")
         new_path = os.path.join(self.data_dir, new_filename)
 
         # Convert to pyarrow table and write using storage interface
         table = df.to_arrow()
-        self.storage.write_parquet(table, new_path)
+        # (Storage interface handles details; compression may be ignored if unsupported)
+        try:
+            self.storage.write_parquet(table, new_path)
+        except TypeError:
+            # Fallback if storage doesn't accept pyarrow Table
+            # Write via pyarrow directly to a local path, then upload if needed
+            import pyarrow.parquet as pq
+            pq.write_table(table, new_path, compression="zstd")
 
         return {
             "file": new_path,
@@ -150,14 +175,10 @@ class MonitoringLogger:
         stats: Dict[str, Any] = {}
         if "execution_time" in df.columns:
             try:
-                # Make sure the column is Int64
                 ts_col = df["execution_time"].cast(pl.Int64)
                 min_ms = int(ts_col.min())
                 max_ms = int(ts_col.max())
-                stats["execution_time"] = {
-                    "min": min_ms,
-                    "max": max_ms
-                }
+                stats["execution_time"] = {"min": min_ms, "max": max_ms}
             except Exception:
                 stats["execution_time"] = {"min": "unknown", "max": "unknown"}
         return stats
@@ -167,40 +188,37 @@ class MonitoringLogger:
             return
 
         with self.lock:
-            if not self.current_batch:
+            if not self.current_batch and not force:
                 return
 
             # Initialize resources from current snapshot
-            current_resources = []
+            current_resources: List[Dict[str, Any]] = []
             current_snapshot = None
             current_snapshot_path = self.catalog["current"]
-            if current_snapshot_path:
-                if self.storage.exists(current_snapshot_path):
-                    try:
-                        current_snapshot = self.storage.read_json(current_snapshot_path)
-                        current_resources = current_snapshot["resources"]
-                    except Exception as e:
-                        print(f"Warning: Failed to load current snapshot: {str(e)}")
+            if current_snapshot_path and self.storage.exists(current_snapshot_path):
+                try:
+                    current_snapshot = self.storage.read_json(current_snapshot_path)
+                    current_resources = current_snapshot.get("resources", [])
+                except Exception as e:
+                    print(f"Warning: Failed to load current snapshot: {str(e)}")
 
-            # Process existing files that haven't reached max size
-            processed_data = self.current_batch.copy()
+            processed_data = self.current_batch
             n = len(processed_data)
             self.current_batch = []
-            new_resources = []
+            new_resources: List[Dict[str, Any]] = []
 
-            # Find files that can accept more data
+            # Fill partially-full files first
             for resource in current_resources:
-                if resource["rows"] < self.max_rows_per_file and processed_data:
-                    remaining = self.max_rows_per_file - resource["rows"]
-                    chunk = processed_data[:remaining]
-                    processed_data = processed_data[remaining:]
-
-                    # Write merged data to existing file
-                    merged_resource = self._write_parquet_file(chunk, resource["file"])
-                    new_resources.append(merged_resource)
-                else:
-                    # Keep files that are full or not being modified
-                    new_resources.append(resource)
+                if processed_data and resource.get("rows", 0) < self.max_rows_per_file:
+                    remaining = self.max_rows_per_file - int(resource.get("rows", 0))
+                    if remaining > 0:
+                        chunk = processed_data[:remaining]
+                        processed_data = processed_data[remaining:]
+                        merged_resource = self._write_parquet_file(chunk, resource.get("file"))
+                        new_resources.append(merged_resource)
+                        continue
+                # keep as-is (full or not touched)
+                new_resources.append(resource)
 
             # Create new files for remaining data
             while processed_data:
@@ -221,14 +239,15 @@ class MonitoringLogger:
 
     def _update_catalog(self, snapshot_path: str, current_snapshot_path: str, new_snapshot: Dict[str, Any]):
         """Update the catalog with new snapshot information."""
+        resources = new_snapshot.get("resources", [])
         self.catalog.update({
             "current": snapshot_path,
             "previous": current_snapshot_path,
-            "last_updated_ms": new_snapshot["last_updated_ms"],
-            "file_count": len(new_snapshot["resources"]),
-            "total_rows": sum(r["rows"] for r in new_snapshot["resources"]),
-            "total_file_size": sum(r["file_size"] for r in new_snapshot["resources"]),
-            "version": new_snapshot["snapshot_version"]
+            "last_updated_ms": new_snapshot.get("last_updated_ms", 0),
+            "file_count": len(resources),
+            "total_rows": sum(int(r.get("rows", 0)) for r in resources),
+            "total_file_size": sum(int(r.get("file_size", 0)) for r in resources),
+            "version": int(new_snapshot.get("snapshot_version", 0))
         })
         self._save_catalog()
 
@@ -245,46 +264,45 @@ class MonitoringLogger:
             self.queue_stats['total_received'] += 1
             current_size = self.queue.qsize()
             self.queue_stats['current_size'] = current_size
-            self.queue_stats['max_size'] = max(
-                self.queue_stats['max_size'],
-                current_size
-            )
+            self.queue_stats['max_size'] = max(self.queue_stats['max_size'], current_size)
         self.has_data_event.set()
 
     def _write_loop(self):
         """Main writer loop that processes the queue."""
         while not self.stop_event.is_set():
-            start_wait = time.time()
+            # Wait up to flush_interval or until data arrives
             self.has_data_event.wait(timeout=self.flush_interval)
-            wait_time = time.time() - start_wait
 
-            # Process queue
             start_flush = time.time()
-            processed_count = 0
+            drained = 0
 
-            with self.lock:
-                while not self.queue.empty():
-                    try:
-                        self.current_batch.append(self.queue.get_nowait())
-                        processed_count += 1
-                    except queue.Empty:
-                        break
+            # Drain queue quickly without holding the write lock
+            while True:
+                try:
+                    item = self.queue.get_nowait()
+                    self.current_batch.append(item)
+                    drained += 1
+                except queue.Empty:
+                    break
 
             if self.current_batch:
                 self._flush_batch()
                 self.has_data_event.clear()
-
-                # Update stats after flush
                 with self.queue_stats_lock:
                     flush_duration = time.time() - start_flush
                     self.queue_stats['flush_durations'].append(flush_duration)
-                    # Keep only last 100 durations
                     if len(self.queue_stats['flush_durations']) > 100:
                         self.queue_stats['flush_durations'].pop(0)
+            else:
+                # Nothing to do, reset event
+                self.has_data_event.clear()
 
-            self.has_data_event.clear()
-
-        self._flush_batch(force=True)
+        # Final forced flush on shutdown request
+        try:
+            self._flush_batch(force=True)
+        except Exception:
+            # Don't crash on shutdown
+            pass
 
     def get_queue_stats(self) -> Dict[str, Any]:
         """Return current queue statistics."""
@@ -330,18 +348,26 @@ class MonitoringLogger:
         }
 
     def _emergency_flush(self):
-        """Flush remaining data when program exits."""
-        if not self.stop_event.is_set():
-            self._flush_batch(force=True)
+        """(Kept for backward compat; prefer _safe_close/close)"""
+        try:
+            if not self.stop_event.is_set():
+                self._flush_batch(force=True)
+        except Exception:
+            pass
 
     def close(self):
         """Stop the writer and flush remaining data."""
         if not self.stop_event.is_set():
             self.stop_event.set()
             self.has_data_event.set()
-            self.writer_thread.join(timeout=5.0)
+            # Join briefly; thread is daemon so process can still exit if it lingers
+            self.writer_thread.join(timeout=2.0)
             if self.writer_thread.is_alive():
-                print("Warning: Writer thread did not shutdown cleanly")
+                # Best-effort final flush
+                try:
+                    self._flush_batch(force=True)
+                except Exception:
+                    pass
 
     def __enter__(self):
         return self

@@ -10,7 +10,7 @@ class HistoryCleaner:
         self.storage = self.super_table.storage
 
     def clean(self, user_hash):
-        # Acquire the shared lock and read super table meta
+        # Read super table meta (shared-lock internally; lock is released by the getter)
         super_table_data, super_table_path, super_table_meta = (
             self.super_table.get_super_table_and_path_with_shared_lock()
         )
@@ -35,15 +35,14 @@ class HistoryCleaner:
         )
 
         # Iterate over each snapshot in the super table
-        for snapshot in super_table_data["snapshots"]:
-            # Note: If your snapshot dict uses "table_name" instead of "simple_name", adjust here:
-            simple_table_name = snapshot["table_name"]    # or snapshot["simple_name"] if appropriate
-            simple_table_path = snapshot["path"]
+        for snapshot in super_table_data.get("snapshots", []):
+            simple_table_name = snapshot.get("table_name")
+            simple_table_path = snapshot.get("path")
 
             # Read the simple table's own snapshot JSON
             simple_table_data = self.storage.read_json(simple_table_path)
 
-            location = simple_table_data["location"]
+            location = simple_table_data.get("location")
             active_files = [entry["file"] for entry in simple_table_data.get("resources", [])]
 
             designated_files = set(self.collect_files(location)) - set(active_files)
@@ -64,7 +63,6 @@ class HistoryCleaner:
         Collect parquet & JSON files under 'location'.
         This uses the storage interface's list_files instead of glob.
         """
-        # Example usage for a typical directory layout:
         parquet_files = self.storage.list_files(os.path.join(location, "data"), "*.parquet")
         json_files = self.storage.list_files(os.path.join(location, "snapshots"), "*.json")
         super_json_files = self.storage.list_files(location, "*.json")
@@ -72,22 +70,20 @@ class HistoryCleaner:
 
     def get_files_to_delete(self, designated_files, last_updated_ms):
         """
-        Compare the numeric timestamp in the file name (e.g. 1678900000_*.json)
-        against `last_updated_ms`.
+        Compare the numeric timestamp in the file name (e.g. 1678900000000_*.json)
+        against `last_updated_ms`. Keeps only strictly older-or-equal files.
         """
         files_to_delete = []
         for file in designated_files:
-            # Example: "1678900000_fileinfo.json" => "1678900000"
             filename = os.path.basename(file)
-            timestamp_str = filename.split("_")[0]
+            ts_part = filename.split("_")[0]
             try:
-                timestamp_val = int(timestamp_str)
-                if timestamp_val <= last_updated_ms:
+                ts_val = int(ts_part)
+                if ts_val <= last_updated_ms:
                     files_to_delete.append(file)
             except ValueError:
-                # If the file doesn't match the pattern, skip or handle differently
-                pass
-
+                # Skip files not following the timestamped naming convention
+                continue
         return files_to_delete
 
     def delete_files(self, files_to_delete):
@@ -95,5 +91,8 @@ class HistoryCleaner:
         Deletes files using the storage interface's `delete` method.
         """
         for file in files_to_delete:
-            self.storage.delete(file)
-            logger.debug(f"Deleted file: {file}")
+            try:
+                self.storage.delete(file)
+                logger.debug(f"Deleted file: {file}")
+            except Exception as e:
+                logger.debug(f"Skip delete (error) {file}: {e}")

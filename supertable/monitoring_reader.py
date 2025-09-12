@@ -60,19 +60,26 @@ class MonitoringReader:
     def _collect_parquet_files(
         self,
         snapshot: dict,
+        from_ts_ms: int,
         to_ts_ms: int
     ) -> List[str]:
         """
-        Collect files whose data may include timestamps <= to_ts_ms.
+        Collect only files whose [min,max] execution_time overlaps the requested window.
+        If stats are missing, include the file to be safe.
         """
         files: List[str] = []
         for res in snapshot.get("resources", []):
             stats = res.get("stats", {}).get("execution_time", {})
-            min_ts = stats.get("min", float('-inf'))
-            if min_ts <= to_ts_ms:
+            min_ts = stats.get("min", None)
+            max_ts = stats.get("max", None)
+            if min_ts is None or max_ts is None:
+                files.append(res["file"])
+                continue
+            # keep if ranges overlap: (min <= to) and (max >= from)
+            if (min_ts <= to_ts_ms) and (max_ts >= from_ts_ms):
                 files.append(res["file"])
         if not files:
-            logger.warning("No parquet files found before %d", to_ts_ms)
+            logger.warning("No parquet files found overlapping [%d, %d]", from_ts_ms, to_ts_ms)
         return files
 
     def _generate_table_name(self) -> str:
@@ -80,19 +87,19 @@ class MonitoringReader:
 
     def _build_query(
         self,
-        table_name: str,
+        parquet_files_sql_array: str,
         from_ts_ms: int,
         to_ts_ms: int,
         limit: int
     ) -> str:
         """
-        Build a SQL query filtering execution_time between from_ts_ms and to_ts_ms.
+        Build a SQL query that scans Parquet files with pushdown filters.
         """
         return (
-            f"SELECT *\n"
-            f"FROM {table_name}\n"
+            "SELECT *\n"
+            f"FROM parquet_scan({parquet_files_sql_array}, union_by_name=TRUE, HIVE_PARTITIONING=TRUE)\n"
             f"WHERE execution_time BETWEEN {from_ts_ms} AND {to_ts_ms}\n"
-            f"ORDER BY execution_time DESC\n"
+            "ORDER BY execution_time DESC\n"
             f"LIMIT {limit}"
         )
 
@@ -114,41 +121,30 @@ class MonitoringReader:
         if from_ts_ms is None:
             from_ts_ms = to_ts_ms - int(timedelta(days=1).total_seconds() * 1_000)
         if from_ts_ms > to_ts_ms:
-            raise ValueError(
-                f"from_ts_ms ({from_ts_ms}) must be <= to_ts_ms ({to_ts_ms})"
-            )
+            raise ValueError(f"from_ts_ms ({from_ts_ms}) must be <= to_ts_ms ({to_ts_ms})")
 
-        # load snapshot & collect files
+        # load snapshot & collect files (overlap-aware)
         snapshot = self._load_current_snapshot()
-        parquet_files = self._collect_parquet_files(snapshot, to_ts_ms)
+        parquet_files = self._collect_parquet_files(snapshot, from_ts_ms, to_ts_ms)
         if not parquet_files:
             return pd.DataFrame()
 
-        # setup DuckDB
+        # setup DuckDB (enable temp dir and threads)
         con = duckdb.connect()
         con.execute("PRAGMA memory_limit='2GB';")
         con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
         con.execute("PRAGMA default_collation='nocase';")
 
-        # ingest parquet files
-        table_name = self._generate_table_name()
-        files_list = ", ".join(f"'{f}'" for f in parquet_files)
-        create_sql = (
-            f"CREATE TABLE {table_name} AS\n"
-            f"  SELECT *\n"
-            f"  FROM parquet_scan([{files_list}],\n"
-            f"                       union_by_name=TRUE,\n"
-            f"                       HIVE_PARTITIONING=TRUE);"
-        )
+        # Build query directly over parquet_scan with pushdown filters
+        files_sql_array = "[" + ", ".join(f"'{f}'" for f in parquet_files) + "]"
+        query = self._build_query(files_sql_array, from_ts_ms, to_ts_ms, limit)
+        logger.debug("Executing Query:\n%s", query)
+
         try:
-            con.execute(create_sql)
+            df = con.execute(query).fetchdf()
         except Exception as e:
-            logger.error("Error creating table:\n%s\n%s", create_sql, e)
+            logger.error("Error executing monitoring query:\n%s\n%s", query, e)
             raise
 
-        # build and execute range query
-        query = self._build_query(table_name, from_ts_ms, to_ts_ms, limit)
-        logger.debug("Executing Query:\n%s", query)
-        df = con.execute(query).fetchdf()
         logger.debug("Result shape: %s", df.shape)
         return df

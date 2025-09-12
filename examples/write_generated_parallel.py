@@ -5,7 +5,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import concurrent.futures
-import logging
 import traceback
 import time
 from typing import List, Dict, Tuple
@@ -15,11 +14,11 @@ from supertable.data_writer import DataWriter
 from supertable.utils.helper import format_size
 from examples.defaults import organization, super_name, user_hash, overwrite_columns, generated_data_dir
 
-data_writer = DataWriter(super_name, organization)
+from supertable.config.defaults import logger, logging
+logger.setLevel(logging.INFO)
 
-logging.getLogger("file_lock").setLevel(logging.DEBUG)
-logging.getLogger("locking").setLevel(logging.DEBUG)
-logging.getLogger("redis_lock").setLevel(logging.DEBUG)
+
+data_writer = DataWriter(super_name, organization)
 
 
 def read_file_as_table(file_path):
@@ -150,6 +149,7 @@ def main():
                 future = executor.submit(process_file, file_info)
                 futures.append(future)
                 future_to_file_info[future] = file_info  # Store mapping
+                time.sleep(1)  # wait 1 second before creating the next thread
 
             # Wait for all tasks to complete and collect results
             successful = 0

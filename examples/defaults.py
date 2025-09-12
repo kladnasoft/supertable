@@ -2,7 +2,7 @@ import logging
 from enum import Enum
 
 from supertable.config import defaults
-logging.getLogger('supertable').setLevel(logging.INFO)
+logging.getLogger('supertable').setLevel(logging.DEBUG)
 
 defaults.default.IS_SHOW_TIMING = True
 
