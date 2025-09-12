@@ -34,19 +34,13 @@ class Locking:
         self.identity = identity
         self.check_interval = check_interval
 
-        # If user explicitly sets a backend, we respect that.
-        # Otherwise, pick based on STORAGE_TYPE.
         if backend is None:
             storage_type = getattr(default, "STORAGE_TYPE", "LOCAL").upper()
-            if storage_type == "LOCAL":
-                backend = LockingBackend.FILE
-            else:
-                backend = LockingBackend.REDIS
+            backend = LockingBackend.FILE if storage_type == "LOCAL" else LockingBackend.REDIS
 
         self.backend = backend
 
         if self.backend == LockingBackend.REDIS:
-            # Use Redis settings from default, plus any kwargs overrides
             redis_options = {
                 "host": getattr(default, "REDIS_HOST", "localhost"),
                 "port": getattr(default, "REDIS_PORT", 6379),
@@ -54,24 +48,16 @@ class Locking:
                 "password": getattr(default, "REDIS_PASSWORD", None),
             }
             redis_options.update(kwargs)
-
-            self.lock_instance = RedisLocking(
-                identity,
-                check_interval=self.check_interval,
-                **redis_options
-            )
+            self.lock_instance = RedisLocking(identity, check_interval=self.check_interval, **redis_options)
 
         elif self.backend == LockingBackend.FILE:
-
-
             self.lock_instance = FileLocking(
                 identity,
                 working_dir,
                 lock_file_name=lock_file_name,
-                check_interval=self.check_interval
+                check_interval=self.check_interval,
             )
         else:
-            # Shouldn’t happen unless you add new backends, but just in case:
             raise ValueError(f"Unsupported locking backend: {self.backend}")
 
     def lock_resources(
@@ -99,6 +85,13 @@ class Locking:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.release_lock()
+
+    def __del__(self):
+        # Ensure backend-specific cleanup runs on GC
+        try:
+            self.release_lock()
+        except Exception:
+            pass
 
 
     def lock_shared_and_read(self, lock_file_path: str):
