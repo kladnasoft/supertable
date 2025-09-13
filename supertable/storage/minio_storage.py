@@ -216,3 +216,61 @@ class MinioStorage(StorageInterface):
             )
         except S3Error as e:
             raise RuntimeError(f"Failed to write Parquet to {path}: {e}") from e
+
+
+    def write_bytes(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        try:
+            self.client.put_object(
+                bucket_name=self.bucket_name,
+                object_name=path,
+                data=io.BytesIO(data),
+                length=len(data),
+                content_type=content_type,
+            )
+        except S3Error as e:
+            raise RuntimeError(f"Failed to write bytes to {path}: {e}") from e
+
+    def read_bytes(self, path: str) -> bytes:
+        try:
+            resp = self.client.get_object(self.bucket_name, path)
+            data = resp.read()
+            resp.close()
+            resp.release_conn()
+            return data
+        except S3Error as e:
+            if e.code == "NoSuchKey":
+                raise FileNotFoundError(f"File not found: {path}") from e
+            raise
+
+    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        self.write_bytes(path, text.encode(encoding), content_type="text/plain; charset=utf-8")
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        return self.read_bytes(path).decode(encoding)
+
+    def copy(self, src_path: str, dst_path: str) -> None:
+        # Server-side copy within the same bucket
+        try:
+            self.client.copy_object(
+                bucket_name=self.bucket_name,
+                object_name=dst_path,
+                source=f"/{self.bucket_name}/{src_path}",
+            )
+        except S3Error as e:
+            raise RuntimeError(f"Failed to copy {src_path} -> {dst_path}: {e}") from e
+
+    # --- NEW: read_parquet ---------------------------------------------------
+    def read_parquet(self, path: str) -> pa.Table:
+        try:
+            resp = self.client.get_object(self.bucket_name, path)
+            data = resp.read()
+            resp.close()
+            resp.release_conn()
+        except S3Error as e:
+            if e.code == "NoSuchKey":
+                raise FileNotFoundError(f"Parquet file not found: {path}") from e
+            raise
+        try:
+            return pq.read_table(io.BytesIO(data))
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")

@@ -28,7 +28,7 @@ def run_as_module(file_path):
 
 def main():
     scripts = [
-        "1.1. create_super_table.py",
+        "1.1.1. create_super_table.py",
         "1.2. create_roles.py",
         "1.3. create_users.py",
         "2.1. write_dummy_data.py",

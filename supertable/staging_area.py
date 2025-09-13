@@ -107,7 +107,7 @@ class StagingArea:
         # Blue total, dark green rest, reset at end
         total_str = f"\033[94m{elapsed:.3f}\033[32m"
         logger.info(
-            f"\033[32m[staging][{op_id}] Summary: total={total_str} | "
+            f"\033[32m[staging][{op_id}] Summary: total={total_str}s | "
             f"table={table_name} | file={os.path.basename(file_path)} | method={method} | "
             f"rows={rows} | cols={cols}"
         )
@@ -139,7 +139,7 @@ class StagingArea:
             elapsed = time.perf_counter() - t0
             total_str = f"\033[94m{elapsed:.3f}\033[32m"
             logger.info(
-                f"\033[32m[staging][{op_id}] Summary: total={total_str} | "
+                f"\033[32m[staging][{op_id}] Summary: total={total_str}s| "
                 f"mode=relpath | file={file_name_or_relpath} | rows={getattr(table, 'num_rows', None)} | "
                 f"cols={getattr(table, 'num_columns', None)}"
             )
@@ -153,7 +153,7 @@ class StagingArea:
             elapsed = time.perf_counter() - t0
             total_str = f"\033[94m{elapsed:.3f}\033[32m"
             logger.info(
-                f"\033[32m[staging][{op_id}] Summary: total={total_str} | "
+                f"\033[32m[staging][{op_id}] Summary: total={total_str}s | "
                 f"mode=direct | file={file_name_or_relpath} | rows={getattr(table, 'num_rows', None)} | "
                 f"cols={getattr(table, 'num_columns', None)}"
             )
@@ -176,7 +176,7 @@ class StagingArea:
         elapsed = time.perf_counter() - t0
         total_str = f"\033[94m{elapsed or 0.0:.3f}\033[32m"
         logger.info(
-            f"\033[32m[staging][{op_id}] Summary: total={total_str} | "
+            f"\033[32m[staging][{op_id}] Summary: total={total_str}s | "
             f"mode=search | file={file_name_or_relpath} | resolved={os.path.relpath(found_path, self.staging_dir)} | "
             f"rows={getattr(table, 'num_rows', None)} | cols={getattr(table, 'num_columns', None)}"
         )

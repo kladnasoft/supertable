@@ -126,3 +126,35 @@ class LocalStorage(StorageInterface):
             return table
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def read_bytes(self, path: str) -> bytes:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        with open(path, "rb") as f:
+            return f.read()
+
+    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding=encoding) as f:
+            f.write(text)
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        with open(path, "r", encoding=encoding) as f:
+            return f.read()
+
+    def copy(self, src_path: str, dst_path: str) -> None:
+        directory = os.path.dirname(dst_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        shutil.copyfile(src_path, dst_path)

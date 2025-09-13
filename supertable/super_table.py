@@ -1,12 +1,11 @@
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from supertable.locking import Locking
 from supertable.config.defaults import default, logger
 from supertable.rbac.access_control import check_write_access
 from supertable.utils.helper import generate_filename
-from supertable.config.homedir import app_home
 
 # Storage backend
 from supertable.storage.storage_factory import get_storage
@@ -14,6 +13,8 @@ from supertable.storage.storage_interface import StorageInterface
 
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
+
+from supertable.mirroring.mirror_formats import MirrorFormats
 
 
 def read_super_table(super_table_meta: Dict[str, Any], storage: StorageInterface) -> Dict[str, Any]:
@@ -59,11 +60,13 @@ class SuperTable:
             new_super_path = os.path.join(self.super_dir, generate_filename(alias=self.identity))
             self.storage.write_json(new_super_path, initial_super)
 
+            # NOTE: add and persist mirrors in meta (empty by default)
             meta_data = {
                 "current": new_super_path,
                 "previous": None,
                 "version": 0,
                 "tables": 0,
+                "format_mirrors": [],  # <-- NEW
             }
             self.storage.write_json(self.super_meta_path, meta_data)
 
@@ -182,6 +185,9 @@ class SuperTable:
         last_super_path = last_super_meta.get("current", "")
         last_super_table = read_super_table(last_super_meta, self.storage)
 
+        # Preserve mirrors across meta rewrites
+        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))  # <-- NEW
+
         last_updated_ms = int(datetime.now().timestamp() * 1000)
         last_super_version = last_super_table.get("version", 0)
 
@@ -216,7 +222,7 @@ class SuperTable:
         # Write the new snapshot
         self.storage.write_json(new_super_snapshot_path, new_super_snapshot)
 
-        # Update the main meta pointer
+        # Update the main meta pointer (preserve mirrors)
         meta_data = {
             "current": new_super_snapshot_path,
             "previous": last_super_path,
@@ -226,8 +232,23 @@ class SuperTable:
             "total_file_size": total_file_size,
             "tables": len(snapshots),
             "version": last_super_version + 1,
+            "format_mirrors": mirrors,
         }
         self.storage.write_json(self.super_meta_path, meta_data)
+
+        # ---- MIRROR (if enabled) ----------------------------------------- NEW
+        try:
+            # Read the full simple-table snapshot for schema + resources
+            simple_snapshot = self.read_simple_table_snapshot(simple_table_path)
+            MirrorFormats.mirror_if_enabled(
+                super_table=self,
+                table_name=table_name,
+                simple_snapshot=simple_snapshot,
+                mirrors=mirrors,  # avoid re-reading meta here
+            )
+        except Exception as e:
+            # Non-fatal: we keep the super catalog consistent even if mirror fails
+            logger.error(f"[mirror] Failed to write mirrors for table '{table_name}': {e}")
 
     def update_with_lock(self, table_name, simple_table_path, simple_table_content):
         if not self.locking.self_lock(
@@ -250,6 +271,9 @@ class SuperTable:
         last_super_meta = self.get_super_meta()
         last_super_path = last_super_meta.get("current", "")
         last_super_table = read_super_table(last_super_meta, self.storage)
+
+        # Preserve mirrors across meta rewrites
+        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))  # <-- NEW
 
         last_updated_ms = int(datetime.now().timestamp() * 1000)
         last_super_version = last_super_table.get("version", 0)
@@ -286,6 +310,7 @@ class SuperTable:
             "total_file_size": total_file_size,
             "tables": len(new_snapshots),
             "version": last_super_version + 1,
+            "format_mirrors": mirrors,  # <-- NEW
         }
         self.storage.write_json(self.super_meta_path, meta_data)
 

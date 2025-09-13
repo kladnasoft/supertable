@@ -80,7 +80,6 @@ class DataReader:
 
     timer = Timer()
 
-    # @timer
     def execute(self, user_hash: str, with_scan: bool = False):
         status = Status.ERROR
         message = None

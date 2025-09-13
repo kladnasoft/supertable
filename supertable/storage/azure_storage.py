@@ -197,3 +197,37 @@ class AzureStorage(StorageInterface):
 
         blob_client = self.container_client.get_blob_client(blob=path)
         blob_client.upload_blob(buffer, overwrite=True, content_type="application/octet-stream")
+
+    def write_bytes(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        blob_client = self.container_client.get_blob_client(blob=path)
+        blob_client.upload_blob(data, overwrite=True, content_type=content_type)
+
+    def read_bytes(self, path: str) -> bytes:
+        blob_client = self.container_client.get_blob_client(blob=path)
+        try:
+            stream = blob_client.download_blob()
+            return stream.readall()
+        except ResourceNotFoundError:
+            raise FileNotFoundError(f"File not found: {path}")
+
+    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        self.write_bytes(path, text.encode(encoding), content_type="text/plain; charset=utf-8")
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        return self.read_bytes(path).decode(encoding)
+
+    def copy(self, src_path: str, dst_path: str) -> None:
+        """
+        Server-side copy would need a signed URL; to keep dependencies minimal,
+        we implement a generic copy = download+upload.
+        """
+        data = self.read_bytes(src_path)
+        self.write_bytes(dst_path, data)
+
+    # --- NEW: read_parquet ---------------------------------------------------
+    def read_parquet(self, path: str) -> pa.Table:
+        data = self.read_bytes(path)
+        try:
+            return pq.read_table(io.BytesIO(data))
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
