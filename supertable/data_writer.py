@@ -1,10 +1,9 @@
 import time
 import uuid
 from datetime import datetime
-
-import polars
 import re
 
+import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
@@ -36,71 +35,116 @@ class DataWriter:
 
     timer = Timer()
 
-    @timer
+    #@timer
     def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1):
         """
-        Gracefully handles KeyboardInterrupt:
-        - Cleans up any held locks before the interpreter starts tearing down.
-        - Avoids bubbling KeyboardInterrupt (which can lead to noisy teardown logs).
-        - Returns zeros so the caller can exit cleanly.
+        Writes an Arrow table into the target SimpleTable with overlap handling.
+
+        Enhancements (logging & robustness):
+        - Adds a per-call qid to correlate logs across threads/processes.
+        - Rich DEBUG logs for each stage (access, convert, validate, snapshot, overlap, process, update, monitor).
+        - Single INFO line at the end with timing breakdown and blue-highlighted total.
+        - Graceful KeyboardInterrupt handling with safe lock release.
         """
-        start_inner = time.time()
+        # ---- correlation id for this write ----
+        qid = str(uuid.uuid4())
+        lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
+
+        # ---- stage timing helpers ----
+        t0 = time.time()
+        t_last = t0
+        timings = {}
+
+        def mark(stage: str):
+            nonlocal t_last
+            now = time.time()
+            timings[stage] = now - t_last
+            t_last = now
+
         simple_table = None  # ensure visible in finally
         acquired_any_lock = False
 
         try:
-            logger.debug("Checking for Write Access")
-            check_write_access(super_name=self.super_table.super_name,
-                               organization=self.super_table.organization,
-                               user_hash=user_hash,
-                               table_name=simple_name)
-            logger.debug("Passed Write Access Check")
+            logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
 
-            # Convert the input dataset from Arrow format to a Polars DataFrame
-            logger.debug("Converting data to DataFrame")
+            # --- Access control ------------------------------------------------
+            logger.debug(lp("Checking Write Access…"))
+            check_write_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                user_hash=user_hash,
+                table_name=simple_name,
+            )
+            logger.debug(lp("Write Access passed"))
+            mark("access")
+
+            # --- Convert input -------------------------------------------------
+            logger.debug(lp("Converting Arrow input -> Polars DataFrame…"))
             dataframe: DataFrame = polars.from_arrow(data)
-            logger.debug("Converted data to DataFrame")
+            logger.debug(lp(f"DataFrame shape: rows={dataframe.height}, cols={dataframe.width}"))
+            mark("convert")
 
-            logger.debug("Validating the dataframe")
+            # --- Validate ------------------------------------------------------
+            logger.debug(lp("Validating input…"))
             self.validation(dataframe, simple_name, overwrite_columns)
-            logger.debug("dataframe is valid")
+            logger.debug(lp("Validation OK"))
+            mark("validate")
 
-            logger.debug(f"Reading Simple Table Metadata {simple_name}")
+            # --- Read last snapshot -------------------------------------------
+            logger.debug(lp("Loading simple-table snapshot…"))
             simple_table = SimpleTable(self.super_table, simple_name)
             last_simple_table, _ = simple_table.get_simple_table_with_shared_lock()
-            logger.debug(f"last_simple_table: {last_simple_table}")
+            logger.debug(lp(f"Snapshot loaded. Keys={list(last_simple_table.keys())}"))
+            mark("snapshot")
 
-            # Find files that have overlapping data and lock them to prevent concurrent modifications
+            # --- Detect & lock overlaps ---------------------------------------
+            logger.debug(lp("Finding & locking overlapping files…"))
             overlapping_files = find_and_lock_overlapping_files(
                 last_simple_table, dataframe, overwrite_columns, simple_table.locking
             )
             acquired_any_lock = True
-            logger.debug(f"overlapping_files: {overlapping_files}")
+            logger.debug(lp(f"Locked {len(overlapping_files)} overlapping files"))
+            mark("overlap")
 
-            # Process the overlapping files by filtering, merging, and updating resources
-            inserted, deleted, total_rows, total_columns, new_resources, sunset_files = (
-                process_overlapping_files(
-                    dataframe,
-                    overlapping_files,
-                    overwrite_columns,
-                    simple_table.data_dir,
-                    compression_level,
+            # --- Process overlaps / write data --------------------------------
+            logger.debug(lp("Processing overlapping files (merge, filter, write)…"))
+            inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
+                dataframe,
+                overlapping_files,
+                overwrite_columns,
+                simple_table.data_dir,
+                compression_level,
+            )
+            logger.debug(
+                lp(
+                    f"Processed: inserted={inserted}, deleted={deleted}, "
+                    f"rows={total_rows}, cols={total_columns}, "
+                    f"new_files={len(new_resources)}, sunset_files={len(sunset_files)}"
                 )
             )
+            mark("process")
 
+            # --- Update simple & super snapshots ------------------------------
+            logger.debug(lp("Updating simple-table snapshot…"))
             new_simple_table_snapshot, new_simple_table_path = simple_table.lock_and_update(
                 new_resources, sunset_files, dataframe
             )
+            logger.debug(lp(f"Simple-table snapshot updated at {new_simple_table_path}"))
+            mark("update_simple")
 
+            logger.debug(lp("Updating super-table meta…"))
             self.super_table.update_with_lock(
                 simple_name, new_simple_table_path, new_simple_table_snapshot
             )
+            logger.debug(lp("Super-table meta updated"))
+            mark("update_super")
 
             # Release simple-table partition/file locks explicitly after successful update
             _safe_release(getattr(simple_table, "locking", None), name=simple_name)
 
+            # --- Monitoring stats ---------------------------------------------
             stats = {
-                "query_id": str(uuid.uuid4()),
+                "query_id": qid,  # correlate write metrics, too
                 "recorded_at": datetime.utcnow().isoformat(),
                 "super_name": self.super_table.super_name,
                 "table_name": simple_name,
@@ -111,34 +155,80 @@ class DataWriter:
                 "total_columns": total_columns,
                 "new_resources": len(new_resources),
                 "sunset_files": len(sunset_files),
-                "duration": round(time.time() - start_inner, 6)
+                "duration": round(time.time() - t0, 6),
             }
-
-            # Instantiate and use MonitoringLogger within the function
             with MonitoringLogger(
-                    super_name=self.super_table.super_name,
-                    organization=self.super_table.organization,
-                    monitor_type="stats",
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                monitor_type="stats",
             ) as monitor:
                 monitor.log_metric(stats)
+            mark("monitor")
+
+            # --- final summary -------------------------------------------------
+            total_duration = time.time() - t0
+            logger.debug(
+                lp(
+                    f"✅ write() complete: rows={total_rows}, cols={total_columns}, "
+                    f"inserted={inserted}, deleted={deleted}, duration={total_duration:.3f}s"
+                )
+            )
+
+            # Blue for the total number, then switch to dark green for the rest
+            total_str = f"\033[94m{total_duration:.3f}\033[32m"
+            logger.info(
+                lp(
+                    "Timing(s): "
+                    f"total={total_str} | "
+                    f"access={timings.get('access', 0):.3f} | "
+                    f"convert={timings.get('convert', 0):.3f} | "
+                    f"validate={timings.get('validate', 0):.3f} | "
+                    f"snapshot={timings.get('snapshot', 0):.3f} | "
+                    f"overlap={timings.get('overlap', 0):.3f} | "
+                    f"process={timings.get('process', 0):.3f} | "
+                    f"update_simple={timings.get('update_simple', 0):.3f} | "
+                    f"update_super={timings.get('update_super', 0):.3f} | "
+                    f"monitor={timings.get('monitor', 0):.3f}\033[0m"  # reset at the very end
+                )
+            )
 
             return total_columns, total_rows, inserted, deleted
 
         except KeyboardInterrupt:
             # Graceful stop: best-effort cleanup and return zeros, do not re-raise
-            logger.warning("⏹️ KeyboardInterrupt received — cleaning up locks gracefully…")
+            logger.warning(lp("⏹️ KeyboardInterrupt received — cleaning up locks gracefully…"))
             if simple_table and acquired_any_lock:
                 _safe_release(simple_table.locking, name=simple_name)
             _safe_release(getattr(self.super_table, "locking", None), name=self.super_table.super_name)
-            # Return a neutral response so the caller can exit without stack traces
+
+            # INFO timing even on interrupt
+            total_duration = time.time() - t0
+            total_str = f"\033[94m{total_duration:.3f}\033[0m"
+            logger.info(
+                lp(
+                    "Timing(s): "
+                    f"total={total_str} | "
+                    f"access={timings.get('access', 0):.3f} | "
+                    f"convert={timings.get('convert', 0):.3f} | "
+                    f"validate={timings.get('validate', 0):.3f} | "
+                    f"snapshot={timings.get('snapshot', 0):.3f} | "
+                    f"overlap={timings.get('overlap', 0):.3f} | "
+                    f"process={timings.get('process', 0):.3f} | "
+                    f"update_simple={timings.get('update_simple', 0):.3f} | "
+                    f"update_super={timings.get('update_super', 0):.3f} | "
+                    f"monitor={timings.get('monitor', 0):.3f} "
+                )
+            )
             return 0, 0, 0, 0
+
         except Exception as e:
             # On any failure, try to release locks before bubbling up
-            logger.error(f"write() failed: {e!s}")
+            logger.error(lp(f"write() failed: {e!s}"))
             if simple_table and acquired_any_lock:
                 _safe_release(simple_table.locking, name=simple_name)
             _safe_release(getattr(self.super_table, "locking", None), name=self.super_table.super_name)
             raise
+
         finally:
             # Final safety net in case any lock survived; avoid noisy errors on teardown
             if simple_table:

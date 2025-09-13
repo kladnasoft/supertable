@@ -172,7 +172,7 @@ class DataReader:
             result = self.execute_with_duckdb(
                 parquet_files=parquet_files, query_manager=self.query_plan_manager
             )
-            logger.info(self._lp(f"Finished query: rows={result.shape[0]}, cols={result.shape[1]}"))
+            logger.debug(self._lp(f"Finished query: rows={result.shape[0]}, cols={result.shape[1]}"))
 
             status = Status.OK
         except Exception as e:
@@ -209,13 +209,14 @@ class DataReader:
             extend = next((t["EXTENDING_PLAN"] for t in self.timer.timings if "EXTENDING_PLAN" in t), 0.0)
 
             # blue highlight for total
-            total_str = f"\033[94m{total or 0.0:.3f}\033[0m"
+            total_str = f"\033[94m{total or 0.0:.3f}\033[32m"
 
             logger.info(
-                f"[qid={self.query_plan_manager.query_id}] "
-                "Timing breakdown (s): "
+                f"[read][qid={self.query_plan_manager.query_id}] "
+                "Timing(s): "
+                f"total={total_str} | "
                 f"meta={meta:.3f} | filter={filt:.3f} | connect={conn:.3f} | "
-                f"create={create:.3f} | execute={execq:.3f} | extend={extend:.3f} | total={total_str}"
+                f"create={create:.3f} | execute={execq:.3f} | extend={extend:.3f}"
             )
         except Exception:
             pass
@@ -261,7 +262,7 @@ class DataReader:
         self.plan_stats.add_stat({"REFLECTION_ROWS": reflection_rows})
 
         if logger.isEnabledFor(20):  # INFO
-            logger.info(
+            logger.debug(
                 self._lp(
                     f"Selected parquet files: {len(parquet_files)} | "
                     f"total_rows={reflection_rows} | approx_size={reflection_file_size} bytes"
