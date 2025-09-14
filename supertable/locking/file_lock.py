@@ -12,6 +12,10 @@ from typing import Iterable, List, Dict, Optional, Set
 from supertable.config.defaults import default, logger
 
 
+# Synthetic, per-table exclusive lock resource name
+TABLE_LOCK_NAME = "__table__"
+
+
 class FileLocking:
     """
     File-based, multi-thread & multi-process safe lock manager.
@@ -25,6 +29,9 @@ class FileLocking:
         * per-resource conflict lines:
           "[<identity>] lock blocked by <res> (held by <who>, TTL=<s>s), retrying…"
         * heartbeat lifecycle
+    - Table-level escalation:
+        * Holding "__table__" blocks all per-file locks by others
+        * Requesting "__table__" conflicts with any resources held by others
     """
 
     def __init__(
@@ -161,6 +168,10 @@ class FileLocking:
     ) -> bool:
         """
         Acquire a lock on the given resources atomically (all-or-nothing).
+
+        Table-level exclusivity rules (minimal change):
+          - If another process holds "__table__", we block any per-file lock request.
+          - If we request "__table__", we block if any other process holds any resource.
         """
         resources = list(resources)
         start = time.time()
@@ -169,9 +180,22 @@ class FileLocking:
                      f"(timeout={timeout_seconds}s, duration={lock_duration_seconds}s, path={self.lock_file_path})")
 
         while time.time() - start < timeout_seconds:
-            # In-process overlap guard
+            # In-process overlap guard (respect table-level exclusivity)
             with self._state_lock:
-                inproc_conflict = set(resources) & self._owned_resources
+                owned = set(self._owned_resources)
+                req = set(resources)
+
+                inproc_conflict = owned & req
+
+                # Table exclusivity (same-process): table lock conflicts with any other resource set
+                if not inproc_conflict:
+                    # Holding table lock and requesting any non-table resource(s)
+                    if (TABLE_LOCK_NAME in owned) and (req != {TABLE_LOCK_NAME}):
+                        inproc_conflict = {TABLE_LOCK_NAME}
+                    # Requesting table lock while we already hold any resource(s)
+                    elif (TABLE_LOCK_NAME in req) and owned:
+                        inproc_conflict = owned or {TABLE_LOCK_NAME}
+
                 if inproc_conflict:
                     # per-resource conflict log (in-process)
                     for res in sorted(inproc_conflict):
@@ -210,23 +234,44 @@ class FileLocking:
                     if logger.isEnabledFor(10):
                         logger.debug(f"{self.identity}: current lock content={self._snapshot_str(data)}")
 
-                    # Check conflicts with others
+                    # Check conflicts with others (respect table-level exclusivity)
                     owned_by_others = [L for L in data if L.get("pid") != self.lock_id]
                     conflict_entry: Optional[Dict] = None
+
+                    req_set = set(resources)
+                    requesting_table = (req_set == {TABLE_LOCK_NAME})
+
                     for lock in owned_by_others:
                         lock_res = set(lock.get("res", []))
-                        if any(r in lock_res for r in resources):
+                        holds_table = TABLE_LOCK_NAME in lock_res
+
+                        conflict = False
+                        if requesting_table:
+                            # We want the table lock: conflict with ANY resources held by others
+                            if lock_res:
+                                conflict = True
+                        else:
+                            # We want per-file locks:
+                            #   - conflict if another holds the table lock
+                            #   - or if there is a direct overlap on requested resources
+                            if holds_table or any(r in lock_res for r in req_set):
+                                conflict = True
+
+                        if conflict:
                             conflict_entry = lock
                             break
 
                     if conflict_entry:
                         ttl = self._ttl_of(int(conflict_entry.get("exp", 0)))
                         holder = conflict_entry.get("who") or conflict_entry.get("pid")
-                        # emit one line per overlapping resource (for easy grepping)
+                        # emit one line per overlapping/guarding resource (for easy grepping)
                         overlap = sorted(set(resources) & set(conflict_entry.get("res", [])))
-                        for res in overlap:
+                        # ensure we also log the table guard if it's the blocker
+                        if TABLE_LOCK_NAME in conflict_entry.get("res", []) and TABLE_LOCK_NAME not in overlap:
+                            overlap.append(TABLE_LOCK_NAME)
+                        for res in overlap or [TABLE_LOCK_NAME]:
                             logger.debug(f"[{self.identity}] lock blocked by {res} (held by {holder}, TTL={ttl}s), retrying…")
-                        # keep the compact summary as well
+                        # compact summary
                         logger.debug(
                             f"{self.identity}: conflict blocking acquisition → "
                             f"pid={conflict_entry.get('pid')} res={conflict_entry.get('res')} "

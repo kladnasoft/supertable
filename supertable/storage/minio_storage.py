@@ -1,10 +1,10 @@
 import io
 import json
 import fnmatch
+from typing import Any, Dict, List, Iterable
+
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from typing import Any, Dict, List
 from minio import Minio
 from minio.error import S3Error
 
@@ -13,37 +13,70 @@ from supertable.storage.storage_interface import StorageInterface
 
 class MinioStorage(StorageInterface):
     """
-    A MinIO-based implementation of StorageInterface.
-    Leverages the official MinIO Python client.
-
-    Usage Example:
-        from minio import Minio
-        minio_client = Minio(
-            endpoint="localhost:9000",
-            access_key="minioadmin",
-            secret_key="minioadmin",
-            secure=False
-        )
-        storage = MinioStorage(bucket_name="my-bucket", client=minio_client)
+    MinIO backend with LocalStorage parity:
+    - list_files(): one-level listing under a prefix, pattern applied to child basename
+    - delete(): deletes a single object if it exists, otherwise deletes all objects under prefix
     """
 
     def __init__(self, bucket_name: str, client: Minio):
         self.bucket_name = bucket_name
         self.client = client
 
-    def read_json(self, path: str) -> Dict[str, Any]:
-        """
-        Reads and returns JSON data from MinIO at the given object path.
-        Raises FileNotFoundError or ValueError on error.
-        """
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _object_exists(self, key: str) -> bool:
         try:
-            response = self.client.get_object(self.bucket_name, path)
-            data = response.read()
-            response.close()
-            response.release_conn()
+            self.client.stat_object(self.bucket_name, key)
+            return True
         except S3Error as e:
-            # MinIO raises S3Error if the object is missing
-            if e.code == "NoSuchKey":
+            if e.code in ("NoSuchKey", "NotFound"):
+                return False
+            raise
+
+    def _list_objects(self, prefix: str, recursive: bool) -> Iterable:
+        return self.client.list_objects(self.bucket_name, prefix=prefix, recursive=recursive)
+
+    def _child_names_one_level(self, prefix: str) -> List[str]:
+        """
+        Return immediate child names under prefix, like LocalStorage listing one directory level.
+        MinIO returns full keys; we need to collapse to children at exactly one level.
+        """
+        if prefix and not prefix.endswith("/"):
+            prefix = prefix + "/"
+
+        # Use non-recursive listing and extract either object keys at this level or "common prefixes"
+        # MinIO's list_objects doesn't directly yield common prefixes, but non-recursive means
+        # children one level down (objects and "dir marker" objects) appear distinctly.
+        children = []
+        seen = set()
+
+        for obj in self._list_objects(prefix, recursive=False):
+            key = obj.object_name
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):]
+
+            # Consider only the first path component under the prefix (one level)
+            # e.g., if suffix = "a/b/c", the child at this level is "a"
+            part = suffix.split("/", 1)[0]
+            if part not in seen:
+                seen.add(part)
+                children.append(part)
+
+        return children
+
+    # -------------------------
+    # JSON
+    # -------------------------
+    def read_json(self, path: str) -> Dict[str, Any]:
+        try:
+            resp = self.client.get_object(self.bucket_name, path)
+            data = resp.read()
+            resp.close()
+            resp.release_conn()
+        except S3Error as e:
+            if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
 
@@ -56,179 +89,148 @@ class MinioStorage(StorageInterface):
             raise ValueError(f"Invalid JSON in {path}") from je
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
-        """
-        Writes JSON data to the given object path in MinIO.
-        Overwrites if it already exists.
-        """
-        json_bytes = json.dumps(data).encode("utf-8")
-        try:
-            # Content length is required by put_object
-            self.client.put_object(
-                bucket_name=self.bucket_name,
-                object_name=path,
-                data=io.BytesIO(json_bytes),
-                length=len(json_bytes),
-                content_type="application/json",
-            )
-        except S3Error as e:
-            raise RuntimeError(f"Failed to write JSON to {path}: {e}") from e
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        # MinIO put_object requires length
+        self.client.put_object(
+            self.bucket_name,
+            path,
+            data=io.BytesIO(payload),
+            length=len(payload),
+            content_type="application/json",
+        )
 
+    # -------------------------
+    # Existence / size / makedirs
+    # -------------------------
     def exists(self, path: str) -> bool:
-        """
-        Returns True if the object at 'path' exists in MinIO; False otherwise.
-        """
-        try:
-            self.client.stat_object(self.bucket_name, path)
-            return True
-        except S3Error as e:
-            if e.code == "NoSuchKey":
-                return False
-            raise
+        return self._object_exists(path)
 
     def size(self, path: str) -> int:
-        """
-        Returns the size in bytes of the object at 'path'.
-        Raises FileNotFoundError if the object doesn't exist.
-        """
         try:
             stat = self.client.stat_object(self.bucket_name, path)
             return stat.size
         except S3Error as e:
-            if e.code == "NoSuchKey":
+            if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
 
     def makedirs(self, path: str) -> None:
-        """
-        MinIO (S3-like) does not have real directories. This is effectively a no-op.
-        However, if you want to simulate a 'folder', you could create a placeholder object
-        with a trailing slash. We'll leave it as no-op.
-        """
-        # No-op in MinIO
-        return
+        # No-op for object storage. If you want folder markers, you could:
+        # if not path.endswith("/"): path += "/"
+        # self.write_bytes(path, b"")
+        pass
 
+    # -------------------------
+    # Listing
+    # -------------------------
     def list_files(self, path: str, pattern: str = "*") -> List[str]:
         """
-        Lists objects in MinIO (non-recursive) that start with 'path'.
-        Because S3/MinIO doesn't natively support single-level listings, we approximate:
-          - We set prefix=path
-          - We do NOT set recursive=True, so it only yields immediate children at that 'directory'.
-          - We'll apply 'pattern' filtering with fnmatch.
-        Note: For deeper control, you might need to parse the returned keys or use custom logic.
+        Local parity:
+        - treat `path` as a directory prefix (append '/' if needed)
+        - return immediate children (one level)
+        - apply fnmatch to the child name only
+        - return full keys like LocalStorage returns full paths
         """
-        results = []
-        # If you want to simulate "non-recursive," try delimiter='/' and prefix=path if path ends with '/'.
-        # For a simpler approach, just do a full list and filter keys that don't have extra '/' beyond prefix.
-        # We'll do a partial approach here:
-        # Ensuring path has a trailing slash if you truly want just that 'directory'
-        if not path.endswith("/"):
-            path += "/"
+        if path and not path.endswith("/"):
+            path = path + "/"
 
-        # S3-like listing
-        # If you prefer a non-recursive approach with delimiter, pass delimiter='/'.
-        objects = self.client.list_objects(self.bucket_name, prefix=path, recursive=False)
-        for obj in objects:
-            key = obj.object_name
-            # If there's an additional slash beyond the prefix, it means a deeper "directory"
-            if "/" in key[len(path):].strip("/"):
-                # skip deeper levels
-                continue
-            if fnmatch.fnmatch(key, pattern):
-                results.append(key)
+        children = self._child_names_one_level(path)
+        # Filter by pattern against the child basename
+        filtered_children = [c for c in children if fnmatch.fnmatch(c, pattern)]
+        return [path + c for c in filtered_children]
 
-        return results
-
+    # -------------------------
+    # Delete
+    # -------------------------
     def delete(self, path: str) -> None:
         """
-        Deletes the object at 'path' from MinIO.
-        Raises FileNotFoundError if the object does not exist.
+        - If `path` is an exact object: delete it.
+        - Else, treat `path` as a prefix (normalize with '/'), delete all children recursively.
+        - Raise FileNotFoundError if neither object nor any child exists.
         """
-        if not self.exists(path):
-            raise FileNotFoundError(f"File not found: {path}")
-        try:
+        # exact object?
+        if self._object_exists(path):
             self.client.remove_object(self.bucket_name, path)
-        except S3Error as e:
-            raise RuntimeError(f"Failed to delete {path}: {e}") from e
+            return
 
+        # try as prefix
+        prefix = path if path.endswith("/") else f"{path}/"
+        to_delete = [obj.object_name for obj in self._list_objects(prefix, recursive=True)]
+
+        if not to_delete:
+            # Nothing matched as object nor prefix
+            raise FileNotFoundError(f"File or folder not found: {path}")
+
+        # Batch delete (best-effort)
+        for key in to_delete:
+            self.client.remove_object(self.bucket_name, key)
+
+    # -------------------------
+    # Directory structure
+    # -------------------------
     def get_directory_structure(self, path: str) -> dict:
         """
-        Recursively builds and returns a nested dictionary that represents
-        the folder structure under 'path'. For example:
-        {
-          "subfolder1": {
-            "fileA.txt": None,
-            "fileB.json": None
-          },
-          "subfolder2": {
-            "nested": {
-              "fileC.parquet": None
-            }
-          }
-        }
-
-        We'll do a full recursive list of all objects whose key starts with `path`, 
-        then parse them to build a nested dictionary.
+        Build nested dict of the subtree at `path`.
         """
-        directory_structure = {}
+        root = {}
         if path and not path.endswith("/"):
-            path += "/"
+            path = path + "/"
 
-        # List all objects under this prefix
-        for obj in self.client.list_objects(self.bucket_name, prefix=path, recursive=True):
-            full_key = obj.object_name
-            # Remove the leading path from the key
-            rel_key = full_key[len(path):] if path else full_key
-            # If there's an accidental leading slash, remove it
-            if rel_key.startswith("/"):
-                rel_key = rel_key[1:]
-            if not rel_key:
-                continue  # skip if it's exactly the path folder
+        for obj in self._list_objects(path, recursive=True):
+            key = obj.object_name
+            suffix = key[len(path):] if path else key
+            parts = [p for p in suffix.split("/") if p]
+            if not parts:
+                continue
+            cursor = root
+            for i, part in enumerate(parts):
+                if i == len(parts) - 1:
+                    cursor[part] = None
+                else:
+                    cursor = cursor.setdefault(part, {})
+        return root
 
-            # Split into folders/files
-            parts = rel_key.split("/")
-            parent = directory_structure
-            for subfolder in parts[:-1]:
-                parent = parent.setdefault(subfolder, {})
-            # Mark the file as None for consistency
-            parent[parts[-1]] = None
-
-        return directory_structure
-
+    # -------------------------
+    # Parquet
+    # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
-        """
-        Writes a PyArrow table to MinIO as a Parquet object.
-        We'll serialize in-memory, then upload via put_object.
-        """
-        # Convert the Arrow table to Parquet bytes
-        buffer = io.BytesIO()
-        pq.write_table(table, buffer)
-        buffer.seek(0)
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        data = buf.getvalue()
+        self.client.put_object(
+            self.bucket_name,
+            path,
+            data=io.BytesIO(data),
+            length=len(data),
+            content_type="application/octet-stream",
+        )
 
-        # Upload to MinIO
-        data_size = len(buffer.getvalue())
+    def read_parquet(self, path: str) -> pa.Table:
         try:
-            self.client.put_object(
-                bucket_name=self.bucket_name,
-                object_name=path,
-                data=buffer,
-                length=data_size,
-                content_type="application/octet-stream"
-            )
+            resp = self.client.get_object(self.bucket_name, path)
+            data = resp.read()
+            resp.close()
+            resp.release_conn()
         except S3Error as e:
-            raise RuntimeError(f"Failed to write Parquet to {path}: {e}") from e
-
-
-    def write_bytes(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            if e.code in ("NoSuchKey", "NotFound"):
+                raise FileNotFoundError(f"Parquet file not found: {path}") from e
+            raise
         try:
-            self.client.put_object(
-                bucket_name=self.bucket_name,
-                object_name=path,
-                data=io.BytesIO(data),
-                length=len(data),
-                content_type=content_type,
-            )
-        except S3Error as e:
-            raise RuntimeError(f"Failed to write bytes to {path}: {e}") from e
+            return pq.read_table(io.BytesIO(data))
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+
+    # -------------------------
+    # Bytes / Text / Copy
+    # -------------------------
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.client.put_object(
+            self.bucket_name,
+            path,
+            data=io.BytesIO(data),
+            length=len(data),
+            content_type="application/octet-stream",
+        )
 
     def read_bytes(self, path: str) -> bytes:
         try:
@@ -238,39 +240,20 @@ class MinioStorage(StorageInterface):
             resp.release_conn()
             return data
         except S3Error as e:
-            if e.code == "NoSuchKey":
+            if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
-        self.write_bytes(path, text.encode(encoding), content_type="text/plain; charset=utf-8")
+        self.write_bytes(path, text.encode(encoding))
 
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
         # Server-side copy within the same bucket
-        try:
-            self.client.copy_object(
-                bucket_name=self.bucket_name,
-                object_name=dst_path,
-                source=f"/{self.bucket_name}/{src_path}",
-            )
-        except S3Error as e:
-            raise RuntimeError(f"Failed to copy {src_path} -> {dst_path}: {e}") from e
-
-    # --- NEW: read_parquet ---------------------------------------------------
-    def read_parquet(self, path: str) -> pa.Table:
-        try:
-            resp = self.client.get_object(self.bucket_name, path)
-            data = resp.read()
-            resp.close()
-            resp.release_conn()
-        except S3Error as e:
-            if e.code == "NoSuchKey":
-                raise FileNotFoundError(f"Parquet file not found: {path}") from e
-            raise
-        try:
-            return pq.read_table(io.BytesIO(data))
-        except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+        self.client.copy_object(
+            bucket_name=self.bucket_name,
+            object_name=dst_path,
+            source=f"/{self.bucket_name}/{src_path}",
+        )

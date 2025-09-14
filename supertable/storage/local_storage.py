@@ -4,6 +4,8 @@ import glob
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
+import tempfile
+import time
 
 from typing import Any, Dict, List
 
@@ -16,24 +18,93 @@ class LocalStorage(StorageInterface):
     """
 
     def read_json(self, path: str) -> Dict[str, Any]:
+        """
+        Robust JSON reader:
+          - fast path: read once
+          - if file is empty or decoding fails, retry briefly (handles concurrent atomic replace)
+        """
+        # quick existence check
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
-        if os.path.getsize(path) == 0:
-            raise ValueError(f"File is empty: {path}")
 
-        with open(path, "r", encoding="utf-8") as f:
+        # micro-retry window for transient writer activity
+        attempts = 5
+        backoff = 0.02  # 20 ms
+
+        for attempt in range(1, attempts + 1):
             try:
-                return json.load(f)
+                # if a writer is mid-replace and we catch a brand new file entry that is still size 0,
+                # back off and retry once more
+                try:
+                    if os.path.getsize(path) == 0:
+                        if attempt == attempts:
+                            raise ValueError(f"File is empty: {path}")
+                        time.sleep(backoff)
+                        continue
+                except FileNotFoundError:
+                    # vanished between exists() and getsize(); retry
+                    if attempt == attempts:
+                        raise FileNotFoundError(f"File not found: {path}")
+                    time.sleep(backoff)
+                    continue
+
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
             except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON in {path}") from e
+                # reader may have raced with a writer that just replaced the file;
+                # give it a tiny moment to settle, then retry
+                if attempt == attempts:
+                    raise ValueError(f"Invalid JSON in {path}") from e
+                time.sleep(backoff)
+            except FileNotFoundError:
+                # replaced again during open—retry
+                if attempt == attempts:
+                    raise
+                time.sleep(backoff)
+
+        # Should never get here
+        raise RuntimeError(f"Unexpected failure reading JSON at {path}")
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        """
+        Atomic JSON write:
+          - write to a temp file in the same directory
+          - fsync file
+          - os.replace() to atomically swap into place
+          - fsync directory entry
+        """
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # write to a temp file in the same directory to ensure atomic rename on the same filesystem
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-json-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmpf:
+                json.dump(data, tmpf, indent=2, ensure_ascii=False)
+                tmpf.flush()
+                os.fsync(tmpf.fileno())
+
+            # atomic replace
+            os.replace(tmp_path, path)
+
+            # fsync the directory to persist the rename on POSIX
+            try:
+                dir_fd = os.open(directory, os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                # best-effort; not all platforms allow this
+                pass
+        finally:
+            # if something failed before replace(), make sure temp is gone
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def exists(self, path: str) -> bool:
         return os.path.exists(path)
@@ -53,8 +124,6 @@ class LocalStorage(StorageInterface):
         if not os.path.isdir(path):
             return []
         return glob.glob(os.path.join(path, pattern))
-
-
 
     def delete(self, path: str) -> None:
         """
