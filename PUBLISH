@@ -1,0 +1,31 @@
+# 0. Ensure build & pip are present (run once)
+python3 -m pip install --upgrade pip build twine
+
+# 1. Build source tar.gz + wheel into dist/
+python3 -m build
+
+# 2. Inspect what got created
+ls -l dist/
+# → supertable-0.1.0.tar.gz
+#   supertable-0.1.0-py3-none-any.whl
+
+# 3. Smoke‑test the wheel in an empty target directory
+python3 -m pip install dist/supertable-0.1.0-py3-none-any.whl --target /tmp/testenv
+
+# 4. Verify contents
+tree -L 2 /tmp/testenv | head
+
+
+
+# fresh temp dir
+rm -rf /tmp/testenv
+python3 -m pip install dist/supertable-1.1.0-py3-none-any.whl --target /tmp/testenv
+python3 - <<'PY'
+import importlib.util, pathlib, sys
+sys.path.insert(0, "/tmp/testenv")
+spec = importlib.util.find_spec("supertable")
+print("Supertable found at:", pathlib.Path(spec.origin).parent)
+PY
+
+
+twine upload dist/*

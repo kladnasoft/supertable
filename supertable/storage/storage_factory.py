@@ -56,12 +56,11 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     if storage_type == "AZURE":
         _require("azure.storage.blob", "azure")
         mod = importlib.import_module("supertable.storage.azure_storage")
-        return getattr(mod, "AzureStorage")(**kwargs)
+        return getattr(mod, "AzureBlobStorage")(**kwargs)
 
-    # Add GCS once a backend exists
-    # if storage_type == "GCS":
-    #     _require("google.cloud.storage", "gcs")
-    #     mod = importlib.import_module("supertable.storage.gcs_storage")
-    #     return getattr(mod, "GCSStorage")(**kwargs)
+    if storage_type == "GCS":  # add this branch
+        _require("google.cloud.storage", "gcs")
+        mod = importlib.import_module("supertable.storage.gcp_storage")
+        return getattr(mod, "GCSStorage")(**kwargs)
 
     raise ValueError(f"Unknown storage type: {storage_type}")
