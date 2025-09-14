@@ -32,13 +32,20 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.10",
-    install_requires=read_requirements(),
+    install_requires=read_requirements(),  # local/default only (no redis here)
     extras_require={
-        # Optional cloud backends (install on demand)
-        "s3": ["boto3>=1.34"],
-        "minio": ["minio>=7.2"],
-        "azure": ["azure-storage-blob>=12.24"],
-        # "gcs": ["google-cloud-storage>=3.1.0"],  # enable once backend exists
-        "all": ["boto3>=1.34", "minio>=7.2", "azure-storage-blob>=12.24"],
+        # Optional cloud backends (each includes redis)
+        "s3": ["boto3>=1.34", "redis>=5.2.1"],
+        "minio": ["minio>=7.2", "redis>=5.2.1"],
+        "azure": ["azure-storage-blob>=12.24", "redis>=5.2.1"],
+        "gcp": ["google-cloud-storage>=3.1.0", "redis>=5.2.1"],  # enable GCS backend
+        # Convenience meta-extra
+        "all-cloud": [
+            "boto3>=1.34",
+            "minio>=7.2",
+            "azure-storage-blob>=12.24",
+            "google-cloud-storage>=3.1.0",
+            "redis>=5.2.1",
+        ],
     },
 )

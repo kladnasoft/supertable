@@ -10,15 +10,15 @@ sqlglot~=25.4.1
 Faker~=26.0.0
 numpy~=2.0.0
 colorlog~=6.9.0
-redis==5.2.1
 python-dotenv~=1.0.1
 Booktype~=1.5
 pytest~=8.3.4
 
 # NOTE:
-# Cloud SDKs were removed from base to avoid unnecessary installs in local mode.
-# Install them via extras:
-#   pip install 'supertable[minio]'   -> minio backend
-#   pip install 'supertable[s3]'      -> AWS S3 backend
-#   pip install 'supertable[azure]'   -> Azure Blob backend
-#   pip install 'supertable[all]'     -> everything
+# Redis and cloud SDKs are NOT installed by default.
+# Install them via extras, e.g.:
+#   pip install 'supertable[minio]'   -> minio backend + redis
+#   pip install 'supertable[s3]'      -> AWS S3 backend + redis
+#   pip install 'supertable[azure]'   -> Azure Blob backend + redis
+#   pip install 'supertable[gcp]'     -> GCS backend + redis
+#   pip install 'supertable[all-cloud]' -> all cloud backends (each brings redis)
