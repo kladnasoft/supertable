@@ -13,38 +13,71 @@ from supertable.storage.storage_interface import StorageInterface
 
 class GCSStorage(StorageInterface):
     """
-    Google Cloud Storage backend with LocalStorage parity:
-    - list_files(): one-level listing under a prefix, pattern applied to child basename
-    - delete(): deletes a single object if it exists, otherwise deletes all objects under prefix
+    Google Cloud Storage backend.
+
+    Notes
+    -----
+    - GCS has "flat" namespace; "directories" are simulated by common prefixes.
+    - For one-level listing parity with local, we use delimiter="/" and then collect:
+        * blobs (files) directly under the prefix
+        * common prefixes (subdirs) reported by the API
     """
 
-    def __init__(self, bucket_name: str, client: Optional[storage.Client] = None):
-        self.bucket_name = bucket_name
-        self.client = client or storage.Client()
-        self.bucket = self.client.bucket(bucket_name)
+    def __init__(
+        self,
+        bucket: str,
+        credentials_path: Optional[str] = None,
+        client: Optional[storage.Client] = None,
+        **_: Any,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        bucket : str
+            Name of the GCS bucket
+        credentials_path : Optional[str]
+            If provided, use this service account JSON
+        client : Optional[storage.Client]
+            Pre-initialized client (for testing/DI)
+        """
+        if client is not None:
+            self.client = client
+        else:
+            if credentials_path:
+                self.client = storage.Client.from_service_account_json(credentials_path)
+            else:
+                self.client = storage.Client()
+
+        self.bucket_name = bucket
+        self.bucket = self.client.bucket(bucket)
 
     # -------------------------
     # Helpers
     # -------------------------
-    def _blob_exists(self, name: str) -> bool:
-        blob = self.bucket.get_blob(name)  # issues a GET; returns None if missing
-        return blob is not None
+    @staticmethod
+    def _normalize_dir_prefix(path: str) -> str:
+        """Ensure directory-like prefix ends with '/' (except empty)."""
+        if not path:
+            return ""
+        return path if path.endswith("/") else (path + "/")
 
-    def _get_blob_raise(self, name: str):
-        blob = self.bucket.get_blob(name)
+    def _blob_exists(self, path: str) -> bool:
+        return self.bucket.blob(path).exists(self.client)
+
+    def _get_blob_raise(self, path: str):
+        blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"File not found: {name}")
+            raise FileNotFoundError(f"File not found: {path}")
         return blob
-
-    def _normalize_dir_prefix(self, prefix: str) -> str:
-        if prefix and not prefix.endswith("/"):
-            return prefix + "/"
-        return prefix
 
     # -------------------------
     # JSON
     # -------------------------
     def read_json(self, path: str) -> Dict[str, Any]:
+        """
+        Reads and returns a JSON object.
+        Raises FileNotFoundError if missing, ValueError if empty/invalid JSON.
+        """
         try:
             blob = self._get_blob_raise(path)
             data = blob.download_as_bytes()
@@ -75,10 +108,12 @@ class GCSStorage(StorageInterface):
         if blob is None:
             raise FileNotFoundError(f"File not found: {path}")
         # size is populated on the Blob returned by get_blob
-        return int(blob.size)
+        return int(blob.size or 0)
 
-    def makedirs(self, path: str) -> None:
-        # No-op for object storage. Optionally create a marker:
+    def makedirs(self, path: str, exist_ok: bool = True) -> None:
+        """
+        No-op for GCS, but if you want directory markers, uncomment below.
+        """
         # marker = self.bucket.blob(self._normalize_dir_prefix(path))
         # marker.upload_from_string(b"")
         pass
@@ -99,31 +134,32 @@ class GCSStorage(StorageInterface):
         # Use delimiter='/' to get immediate children (prefixes + items at this level)
         it = self.client.list_blobs(self.bucket_name, prefix=prefix, delimiter="/")
 
-        children = []
+        children: List[str] = []
         seen = set()
 
-        # Contents at this level (files)
-        for blob in it:
-            key = blob.name
-            if key == prefix:
-                continue  # folder marker
-            part = key[len(prefix):]
-            # If deeper (shouldn't happen with delimiter), guard anyway
-            if "/" in part:
-                part = part.split("/", 1)[0]
-            if part and part not in seen:
-                seen.add(part)
-                children.append(part)
-
-        # Sub-prefixes (directories) one level down
-        # Access prefixes via pages to ensure populated
+        # Iterate pages once; gather both blobs and common prefixes.
         for page in it.pages:
+            # Files directly under this prefix
+            for blob in page:
+                key = blob.name
+                if key == prefix:
+                    continue  # directory marker
+                part = key[len(prefix):]
+                if "/" in part:
+                    part = part.split("/", 1)[0]
+                if part and part not in seen:
+                    seen.add(part)
+                    children.append(part)
+
+            # "Directories" (common prefixes) one level down
             for pfx in getattr(page, "prefixes", []):
-                # pfx looks like '<prefix>child/'
                 part = pfx[len(prefix):].rstrip("/")
                 if part and part not in seen:
                     seen.add(part)
                     children.append(part)
+
+        # Deterministic order across providers
+        children.sort()
 
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
         return [prefix + c for c in filtered]
@@ -132,26 +168,38 @@ class GCSStorage(StorageInterface):
     # Delete (single or recursive on prefix)
     # -------------------------
     def delete(self, path: str) -> None:
-        # exact object?
-        if self._blob_exists(path):
-            self.bucket.delete_blob(path)
+        """
+        Delete single object or recursively delete a "directory" (prefix).
+        """
+        if path.endswith("/"):
+            # recursive delete
+            prefix = self._normalize_dir_prefix(path)
+            blobs = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
+            for b in blobs:
+                b.delete()
             return
 
-        # try as prefix (recursive)
-        prefix = self._normalize_dir_prefix(path)
-        to_delete = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
+        # single object
+        blob = self.bucket.get_blob(path)
+        if blob is None:
+            # mimic local semantics: deleting nonexistent path is not fatal
+            return
+        blob.delete()
 
-        if not to_delete:
-            raise FileNotFoundError(f"File or folder not found: {path}")
-
-        # Best-effort loop (GCS doesn't have a multi-delete API)
-        for blob in to_delete:
-            self.bucket.delete_blob(blob.name)
+    def delete_prefix(self, path: str) -> None:
+        """Explicit recursive delete for a prefix."""
+        prefix = self._normalize_dir_prefix(path) if path else path
+        for blob in self.client.list_blobs(self.bucket_name, prefix=prefix):
+            blob.delete()
 
     # -------------------------
     # Directory structure (recursive)
     # -------------------------
-    def get_directory_structure(self, path: str) -> dict:
+    def get_directory_structure(self, path: str) -> Dict[str, Any]:
+        """
+        Build a nested dict mirroring keys. Leaf files -> None, folders -> dict.
+        Potentially expensive for large buckets.
+        """
         root: Dict[str, Any] = {}
         prefix = self._normalize_dir_prefix(path) if path else path
 
@@ -184,21 +232,26 @@ class GCSStorage(StorageInterface):
         blob.upload_from_string(data, content_type="application/octet-stream")
 
     def read_parquet(self, path: str) -> pa.Table:
+        """
+        Reads and returns a PyArrow Table.
+        """
         blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"Parquet file not found: {path}")
+            raise FileNotFoundError(f"File not found: {path}")
         data = blob.download_as_bytes()
-        try:
-            return pq.read_table(io.BytesIO(data))
-        except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+        if not data:
+            raise ValueError(f"File is empty: {path}")
+        return pq.read_table(io.BytesIO(data))
 
     # -------------------------
-    # Bytes / Text / Copy
+    # Raw bytes / text
     # -------------------------
-    def write_bytes(self, path: str, data: bytes) -> None:
+    def write_bytes(self, path: str, data: bytes, content_type: Optional[str] = None) -> None:
         blob = self.bucket.blob(path)
-        blob.upload_from_string(data, content_type="application/octet-stream")
+        if content_type:
+            blob.upload_from_string(data, content_type=content_type)
+        else:
+            blob.upload_from_string(data)
 
     def read_bytes(self, path: str) -> bytes:
         blob = self.bucket.get_blob(path)
