@@ -108,7 +108,8 @@ class SimpleTable:
         return {}
 
     def get_simple_table_with_lock(self):
-        simple_meta = self.get_simple_meta_with_lock()
+        self.super_table.locking.lock_resources(self.simple_name)
+        simple_meta = self.get_simple_meta_with_shared_lock()
         simple_table_path = simple_meta.get("path")
 
         if not simple_table_path:
@@ -129,18 +130,12 @@ class SimpleTable:
         simple_table = self.storage.read_json(simple_table_path)
         return simple_table, simple_table_path
 
-    def lock_and_update(
+    def update(
         self,
         new_resources,
         sunset_files,
         model_df,
     ):
-        # Lock partition and therefore the respective snapshot
-        self.locking.lock_resources(
-            resources=[self.simple_name],
-            timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-            lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC,
-        )
 
         # Read current snapshot path and data
         last_simple_table, last_simple_table_path = (

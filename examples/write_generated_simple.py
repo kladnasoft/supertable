@@ -11,6 +11,36 @@ from supertable.data_writer import DataWriter
 from supertable.utils.helper import format_size
 from examples.defaults import organization, super_name, user_hash, overwrite_columns, generated_data_dir
 
+# --- Logging suppression (quiet the library, keep our prints) ---
+import logging
+
+def quiet_logs():
+    """
+    Silence noisy third-party loggers without affecting our own print output.
+    Tweak LEVEL to WARNING/ERROR/CRITICAL as you prefer.
+    """
+    LEVEL = logging.ERROR
+
+    targets = [
+        "supertable",
+        "supertable.data_writer",
+        "supertable.locking",
+        "supertable.utils",
+        # Optional extras you might want quieter in this script:
+        "py4j", "py4j.java_gateway", "pyspark",
+        "urllib3", "botocore",
+    ]
+
+    for name in targets:
+        lg = logging.getLogger(name)
+        lg.setLevel(LEVEL)
+        lg.propagate = False
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
+
+# Apply log silencing early
+quiet_logs()
+
 # Initialize DataWriter (placeholder, this will be handled in the main loop)
 data_writer = None
 
@@ -21,6 +51,7 @@ stats = {
     'total_inserted': 0,
     'total_deleted': 0,
     'total_duration': 0.0,
+    'total_bytes': 0,
     'batch_stats': defaultdict(lambda: {
         'count': 0,
         'inserted': 0,
@@ -29,28 +60,11 @@ stats = {
     })
 }
 
-
 def format_duration(seconds):
     """Convert seconds to human-readable HH:MM:SS.ss format"""
+    seconds = max(0.0, float(seconds))
     return str(timedelta(seconds=seconds))
 
-
-def print_stats(batch_number):
-    batch = stats['batch_stats'][batch_number]
-    print("\n" + "=" * 100)
-    print(f"BATCH STATISTICS (Every 1000 files) - BATCH {batch_number}")
-    print(f"Files processed: {batch['count']}")
-    print(f"Total duration: {format_duration(batch['duration'])}")
-    print(f"Rows inserted: {batch['inserted']}")
-    print(f"Rows deleted: {batch['deleted']}")
-
-    if batch['count'] > 0:
-        avg_duration = batch['duration'] / batch['count']
-        print(f"Avg duration per file: {format_duration(avg_duration)}")
-        print(f"Avg inserted per file: {batch['inserted'] / batch['count']:.2f}")
-        print(f"Avg deleted per file: {batch['deleted'] / batch['count']:.2f}")
-        print(f"Files per second: {batch['count'] / batch['duration']:.2f}")
-    print("=" * 100 + "\n")
 
 
 def read_file_as_table(file_path):
@@ -77,36 +91,46 @@ def read_file_as_table(file_path):
     else:
         raise ValueError(f"Unsupported file type: {file_path}")
 
-
-def get_data(generated_data_dir=generated_data_dir):
-    directories = os.listdir(generated_data_dir)
-
-    for directory in sorted(directories):
+def list_all_files(generated_data_dir=generated_data_dir):
+    """Pre-scan all files so we can show totals & ETA."""
+    for directory in sorted(os.listdir(generated_data_dir)):
         dir_path = os.path.join(generated_data_dir, directory)
         if os.path.isdir(dir_path):
-            #print(f"Directory: {directory}")
-            #print("-" * 100)
-            files = os.listdir(dir_path)
-            for file in sorted(files):
-                relative_path = os.path.join(dir_path, file)
-                hyper_name = relative_path.split("/")[1]
-                #print(f"File: {relative_path}")
-                table = read_file_as_table(relative_path)
-                file_size = os.path.getsize(relative_path)
+            for file in sorted(os.listdir(dir_path)):
+                abs_path = os.path.join(dir_path, file)
+                if not os.path.isfile(abs_path):
+                    continue
+                parts = abs_path.split(os.sep)
+                hyper_name = parts[1] if len(parts) > 1 else directory
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    size = 0
+                yield hyper_name, abs_path, size
 
-                #print( f"Rows: {table.num_rows}, Columns: {table.num_columns}, Size: {format_size(file_size)}" )
-
-                yield hyper_name, table
-
+def get_data(file_list):
+    """Read data tables for the previously listed files."""
+    for hyper_name, abs_path, size in file_list:
+        table = read_file_as_table(abs_path)
+        yield hyper_name, table, size
 
 # Main Execution
 if __name__ == "__main__":
+    # Pre-scan files for accurate progress & ETA
+    all_files = list(list_all_files(generated_data_dir))
+    total_files = len(all_files)
+
+    print("=" * 100)
+    print(f"Discovered {total_files} files in: {generated_data_dir}")
+    print("=" * 100)
+
     # Initialize DataWriter with the super name
     data_writer = DataWriter(super_name, organization)
     start_time = time.time()
     batch_start_time = start_time
 
-    for i, (hyper_name, data) in enumerate(get_data(generated_data_dir), 1):
+    # Stream the data
+    for i, (hyper_name, data, file_size) in enumerate(get_data(all_files), 1):
         file_start_time = time.time()
         batch_number = (i - 1) // 1000 + 1
 
@@ -125,6 +149,7 @@ if __name__ == "__main__":
         stats['total_inserted'] += inserted
         stats['total_deleted'] += deleted
         stats['total_duration'] += file_duration
+        stats['total_bytes'] += int(file_size or 0)
 
         current_batch = stats['batch_stats'][batch_number]
         current_batch['count'] += 1
@@ -132,32 +157,42 @@ if __name__ == "__main__":
         current_batch['deleted'] += deleted
         current_batch['duration'] += file_duration
 
-        print(
+        # Merge progress + response into one line
+        elapsed = time.time() - start_time
+        percent = (i / total_files) * 100 if total_files else 100.0
+        avg_time_per_file = elapsed / i if i > 0 else 0
+        eta = avg_time_per_file * (total_files - i)
+        files_per_sec = i / elapsed if elapsed > 0 else 0
+
+        line = (
+            f"[{i}/{total_files}] {percent:6.2f}% | "
+            f"elapsed {format_duration(elapsed)} | "
+            f"ETA {format_duration(eta)} | {files_per_sec:.2f} files/s | "
+            f"rows {stats['total_rows']:,} | bytes {format_size(stats['total_bytes'])} | "
             f"Response: [columns: {columns}, rows: {rows}, "
             f"inserted: {inserted}, deleted: {deleted}, "
             f"duration: {format_duration(file_duration)}]"
         )
-        print("-" * 100)
+        print(line)
 
-        # Print batch statistics every 1000 files
-        if i % 1000 == 0:
-            print_stats(batch_number)
-            batch_start_time = time.time()
 
-    # Print final statistics
+    # Final stats
     total_duration = time.time() - start_time
     print("\n" + "=" * 100)
     print("FINAL STATISTICS")
     print(f"Total files processed: {stats['total_files']}")
     print(f"Total rows processed: {stats['total_rows']}")
+    print(f"Total data size: {format_size(stats['total_bytes'])}")
     print(f"Total duration: {format_duration(total_duration)}")
     print(f"Total inserted: {stats['total_inserted']}")
     print(f"Total deleted: {stats['total_deleted']}")
-
-    if stats['total_files'] > 0:
+    if stats['total_files'] > 0 and total_duration > 0:
         print(f"\nAverages:")
         print(f"Duration per file: {format_duration(total_duration / stats['total_files'])}")
         print(f"Inserted per file: {stats['total_inserted'] / stats['total_files']:.2f}")
         print(f"Deleted per file: {stats['total_deleted'] / stats['total_files']:.2f}")
         print(f"Files per second: {stats['total_files'] / total_duration:.2f}")
+        print(f"Rows per second: {stats['total_rows'] / total_duration:.2f}")
+        if stats['total_bytes'] > 0:
+            print(f"Throughput: {format_size(stats['total_bytes'] / total_duration)}/s")
     print("=" * 100)

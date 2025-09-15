@@ -93,7 +93,7 @@ class DataWriter:
             # --- Read last snapshot -------------------------------------------
             logger.debug(lp("Loading simple-table snapshot…"))
             simple_table = SimpleTable(self.super_table, simple_name)
-            last_simple_table, _ = simple_table.get_simple_table_with_shared_lock()
+            last_simple_table, _ = simple_table.get_simple_table_with_lock()
             logger.debug(lp(f"Snapshot loaded. Keys={list(last_simple_table.keys())}"))
             mark("snapshot")
 
@@ -126,7 +126,7 @@ class DataWriter:
 
             # --- Update simple & super snapshots ------------------------------
             logger.debug(lp("Updating simple-table snapshot…"))
-            new_simple_table_snapshot, new_simple_table_path = simple_table.lock_and_update(
+            new_simple_table_snapshot, new_simple_table_path = simple_table.update(
                 new_resources, sunset_files, dataframe
             )
             logger.debug(lp(f"Simple-table snapshot updated at {new_simple_table_path}"))

@@ -159,7 +159,7 @@ def find_and_lock_overlapping_files(
             overlapping_files.add((file, True, file_size))
 
     # Acquire per-file locks on the overlapping files (by basename → lock id stays short)
-    if overlapping_files:
+    if False: #overlapping_files:
         lock_list = [os.path.basename(f) for (f, _, _) in overlapping_files]
         got = locking.lock_resources(
             resources=lock_list,

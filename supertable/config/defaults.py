@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 class Default:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024
     MAX_OVERLAPPING_FILES: int = 100
-    DEFAULT_TIMEOUT_SEC: int = 600
-    DEFAULT_LOCK_DURATION_SEC: int = 60
+    DEFAULT_TIMEOUT_SEC: int = 60
+    DEFAULT_LOCK_DURATION_SEC: int = 30
     LOG_LEVEL: str = "INFO"
     IS_SHOW_TIMING: bool = True
     STORAGE_TYPE: str = "LOCAL"

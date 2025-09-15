@@ -104,7 +104,7 @@ class Locking:
           The data (as a dict or list) read from the file if successful,
           or None if unable to lock/read within DEFAULT_TIMEOUT_SEC.
         """
-        result = None
+        result = {}
         start_time = time.time()
 
         while time.time() - start_time < default.DEFAULT_TIMEOUT_SEC:
