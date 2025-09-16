@@ -44,7 +44,7 @@ def main():
         "3.5.1. read_query_plans.py",
         "3.5.2. read_write_stats.py",
         "3.6. read_user.py",
-        "4.1. clean_obsolete_files.py",
+        "4.1.1. clean_obsolete_files.py",
         #"5.1. delete_table.py",
         #"5.2. delete_super_table.py",
     ]

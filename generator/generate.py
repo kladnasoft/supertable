@@ -17,10 +17,10 @@ class TimePrecision(Enum):
 FILE_FORMAT = "parquet"  # Can be 'csv', 'parquet', or 'json'
 START_DATE = "2025-01-01"
 ITERATION = 1
-MIN_FILES = 10000
-MAX_FILES = 100000
+MIN_FILES = 1000
+MAX_FILES = 10000
 MIN_ROWS = 10
-MAX_ROWS = 5000
+MAX_ROWS = 1000
 MIN_COLUMNS = 6
 MAX_COLUMNS = 15
 TIME_PRECISION = TimePrecision.MINUTE  # Change to DAY, HOUR, or MINUTE

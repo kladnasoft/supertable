@@ -45,7 +45,7 @@ quiet_logs()
 # -------------------------
 # Config
 # -------------------------
-DEFAULT_THREADS = 2
+DEFAULT_THREADS = 4
 # If DataWriter.write is NOT thread-safe, set this to True to serialize writes:
 SERIALIZE_WRITES = False
 
@@ -69,7 +69,7 @@ stats = {
 stats_lock = threading.Lock()
 print_lock = threading.Lock()       # avoid interleaved lines in console
 write_lock = threading.Lock()       # optional: serialize DataWriter.write if needed
-counter = 0                         # processed files counter
+counter = 0                         # processed files counter (global)
 counter_lock = threading.Lock()
 
 # Compact thread id mapping (ident -> T1, T2, ...)
@@ -120,27 +120,66 @@ def read_file_as_table(file_path):
         raise ValueError(f"Unsupported file type: {file_path}")
 
 
-def list_all_files(base_dir=generated_data_dir):
-    """Pre-scan all files so we can show totals & ETA."""
-    for directory in sorted(os.listdir(base_dir)):
-        dir_path = os.path.join(base_dir, directory)
-        if os.path.isdir(dir_path):
-            for file in sorted(os.listdir(dir_path)):
-                abs_path = os.path.join(dir_path, file)
-                if not os.path.isfile(abs_path):
-                    continue
-                parts = abs_path.split(os.sep)
-                hyper_name = parts[1] if len(parts) > 1 else directory
-                try:
-                    size = os.path.getsize(abs_path)
-                except OSError:
-                    size = 0
-                yield hyper_name, abs_path, size
+# -------------------------
+# Folder-aware scanning & partitioning
+# -------------------------
+def list_top_level_folders(base_dir):
+    """Return sorted list of subfolder names (top-level only) under base_dir."""
+    return sorted(
+        [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
+    )
 
-
-def process_one(data_writer, file_tuple, start_time, total_files):
+def list_files_in_folders(base_dir, folders_subset):
     """
-    Worker: read a file → write via DataWriter → update stats → print merged progress line.
+    Yield (hyper_name, abs_path, size) for files inside the specified top-level folders.
+    hyper_name == folder name.
+    """
+    for folder in folders_subset:
+        dir_path = os.path.join(base_dir, folder)
+        if not os.path.isdir(dir_path):
+            continue
+        for file in sorted(os.listdir(dir_path)):
+            abs_path = os.path.join(dir_path, file)
+            if not os.path.isfile(abs_path):
+                continue
+            try:
+                size = os.path.getsize(abs_path)
+            except OSError:
+                size = 0
+            yield folder, abs_path, size
+
+def build_folder_file_index(base_dir, folders):
+    """Return dict: folder -> list[(hyper_name, abs_path, size)] and overall total file count."""
+    index = {}
+    total = 0
+    for folder in folders:
+        files = list(list_files_in_folders(base_dir, [folder]))
+        index[folder] = files
+        total += len(files)
+    return index, total
+
+def partition_folders(folders, num_parts):
+    """
+    Split folder list into num_parts slices with nearly equal size.
+    Example: 10 folders, 2 parts -> 5 each; 10 folders, 3 parts -> 4,3,3
+    """
+    n = len(folders)
+    if num_parts <= 0:
+        return [folders]
+    size = max(1, (n + num_parts - 1) // num_parts)  # ceil division
+    parts = [folders[i:i + size] for i in range(0, n, size)]
+    # Ensure exactly num_parts partitions (some may be empty)
+    while len(parts) < num_parts:
+        parts.append([])
+    return parts[:num_parts]
+
+
+# -------------------------
+# Worker functions
+# -------------------------
+def process_file_core(data_writer, file_tuple, start_time, total_files):
+    """
+    Read one file → write via DataWriter → update stats → print progress.
     """
     global counter
     hyper_name, abs_path, file_size = file_tuple
@@ -201,43 +240,64 @@ def process_one(data_writer, file_tuple, start_time, total_files):
             f"Response: [columns: {columns}, rows: {rows}, "
             f"inserted: {inserted}, deleted: {deleted}, "
             f"duration: {format_duration(file_duration)}] "
-            f"({tid})"
+            f"({tid}, folder={hyper_name})"
         )
         print(line)
 
-    return True
+def worker_thread(data_writer, files_subset, start_time, total_files):
+    """
+    Process a pre-assigned list of files (all from specific folders) sequentially within this thread.
+    """
+    for ft in files_subset:
+        process_file_core(data_writer, ft, start_time, total_files)
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Multithreaded SuperTable loader")
+    ap = argparse.ArgumentParser(description="Multithreaded SuperTable loader (folder-partitioned)")
     ap.add_argument("--threads", "-t", type=int, default=DEFAULT_THREADS, help="Number of worker threads")
     return ap.parse_args()
 
 
-# Main Execution
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     args = parse_args()
     num_threads = max(1, args.threads or DEFAULT_THREADS)
 
-    # Pre-scan files for accurate progress & ETA
-    all_files = list(list_all_files(generated_data_dir))
-    total_files = len(all_files)
+    # Top-level folders and indexing
+    folders = list_top_level_folders(generated_data_dir)
+    folder_index, total_files = build_folder_file_index(generated_data_dir, folders)
+    folder_parts = partition_folders(folders, num_threads)
 
     print("=" * 100)
-    print(f"Discovered {total_files} files in: {generated_data_dir}")
+    print(f"Discovered {total_files} files in {len(folders)} folders under: {generated_data_dir}")
     print(f"Using {num_threads} threads")
+    # Show assignment summary
+    for idx, part in enumerate(folder_parts, 1):
+        print(f"  Thread {idx} → {len(part)} folder(s): {', '.join(part) if part else '-'}")
     print("=" * 100)
 
-    # Initialize DataWriter with the super name (shared across threads)
+    # Prepare per-thread file lists (concatenate files of assigned folders)
+    per_thread_files = []
+    for part in folder_parts:
+        files = []
+        for folder in part:
+            files.extend(folder_index.get(folder, []))
+        per_thread_files.append(files)
+
+    # Initialize DataWriter (shared across threads)
     data_writer = DataWriter(super_name, organization)
     start_time = time.time()
 
-    # Thread pool: submit tasks
+    # Launch one worker per thread with its folder subset
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = [executor.submit(process_one, data_writer, ft, start_time, total_files)
-                   for ft in all_files]
+        futures = []
+        for files_subset in per_thread_files:
+            futures.append(executor.submit(worker_thread, data_writer, files_subset, start_time, total_files))
         for f in as_completed(futures):
-            _ = f.result()
+            # Surface exceptions
+            f.result()
 
     # Final stats
     total_duration = time.time() - start_time
