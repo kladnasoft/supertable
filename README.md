@@ -303,6 +303,36 @@ performance measurement. Browse the folder to get started quickly.
   Consolidate licenses, simplify support, and reinvest the savings in deeper
   analytics.
 
+
+
+## 🚀 SuperTable Benchmark (Serialized Run)
+
+Our latest benchmark shows how **SuperTable** performs in a serialized run on real data:
+
+<table>
+<tr>
+<td valign="top">
+
+<h3>💡 Performance Highlights</h3>
+
+<ul>
+  <li>👉 <b>29,788 files processed</b></li>
+  <li>⚡ ~<b>18,865 rows/sec</b> throughput</li>
+  <li>📂 ~<b>4.9 files/sec</b> processed</li>
+  <li>📈 <b>1.1 MB/sec</b> sustained throughput</li>
+  <li>✅ <b>74 million new rows inserted</b> with zero deletions</li>
+</ul>
+
+</td>
+<td valign="top">
+
+<img width="226" height="340" alt="SuperTable Benchmark" src="https://github.com/user-attachments/assets/b53ace69-098c-4953-b18a-460571e15da5" />
+
+</td>
+</tr>
+</table>
+
+
 ---
 ## 🚀 SuperTable Benchmark (Serialized Run)
 
