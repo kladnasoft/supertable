@@ -1,0 +1,47 @@
+version: "3.9"
+services:
+  supertable:
+    build:
+      context: .
+      args:
+        # Pin the version or leave empty for latest
+        SUPERTABLE_VERSION: "1.2.1"
+        # Choose extras: empty for LOCAL, or any of: s3|minio|azure|gcp
+        SUPERTABLE_EXTRAS: "s3"
+    image: supertable:1.2.1-s3
+    environment:
+      # Select backend at runtime
+      STORAGE_TYPE: "S3"   # LOCAL | S3 | MINIO | AZURE | GCP
+
+      # Common Redis env
+      REDIS_URL: "redis://redis:6379/0"
+      AUTO_VALIDATE: "false"
+
+      # S3 example env
+      AWS_ACCESS_KEY_ID: "REPLACE_ME"
+      AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+      AWS_DEFAULT_REGION: "eu-central-1"
+
+      # MINIO extras (if STORAGE_TYPE=MINIO)
+      # AWS_S3_ENDPOINT_URL: "http://minio:9000"
+      # AWS_S3_FORCE_PATH_STYLE: "true"
+
+      # AZURE example (if STORAGE_TYPE=AZURE)
+      # AZURE_STORAGE_ACCOUNT: "myacct"
+      # AZURE_STORAGE_KEY: "REPLACE_ME"
+      # AZURE_BLOB_ENDPOINT: "https://myacct.blob.core.windows.net"
+
+      # GCP example (if STORAGE_TYPE=GCP)
+      # GCP_PROJECT: "my-gcp-project"
+      # GOOGLE_APPLICATION_CREDENTIALS: "/secrets/gcp.json"
+    volumes:
+      - ./config:/config
+      # - ./secrets:/secrets:ro   # if using GCP key file
+    command: ["bash","-lc","echo 'Container ready. .env generated at /config/.env'; sleep infinity"]
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

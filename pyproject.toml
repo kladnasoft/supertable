@@ -4,33 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.2.0"
+version = "1.2.1"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Super Table Public Use License (STPUL) v1.0" }
-authors = [
-    { name = "Levente Kupas", email = "lkupas@kladnasoft.com" }
-]
+authors = [{ name = "Levente Kupas", email = "lkupas@kladnasoft.com" }]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: Other/Proprietary License",
-    "Operating System :: OS Independent"
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent"
 ]
 
-# Core deps remain specified via setup.py (install_requires).
-# Cloud SDKs and Redis are OPTIONAL and tied to their backends.
+# Install optional cloud backends (each brings redis for locking)
 [project.optional-dependencies]
 s3    = ["boto3>=1.34", "redis>=5.2.1"]
 minio = ["minio>=7.2", "redis>=5.2.1"]
 azure = ["azure-storage-blob>=12.24", "redis>=5.2.1"]
 gcp   = ["google-cloud-storage>=3.1.0", "redis>=5.2.1"]
-
-# Convenience meta-extra to install all cloud backends at once (still optional)
+# Convenience meta-extra to install all cloud backends at once
 all-cloud = ["supertable[s3,minio,azure,gcp]"]
 
 [project.urls]
 Homepage = "https://github.com/kladnasoft/supertable"
+
+# ⚠️ This exposes the CLI: `supertable config ...`
+[project.scripts]
+supertable = "supertable.config.cli:main"
 
 [tool.setuptools]
 include-package-data = true
