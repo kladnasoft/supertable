@@ -1,11 +1,11 @@
-# pyproject.toml  (no functional changes required; made packages-find explicit)
+# pyproject.toml — compat-broadened deps for wider env support (NumPy 1.26 → 2.x, Pandas 1.5 → 2.3)
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.2.8"
+version = "1.2.13"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,11 +24,12 @@ dependencies = [
     "polars>=1.6.0",
     "sqlglot>=26.17.1",
     "duckdb>=1.4.0",
-    "pyarrow>=17.0.0",
-    "pandas>=2.2.2",
-    "numpy>=2.1.0",
-    "pyarrow==19.0.1",
-    "python-dateutil>=2.9.0.post0"
+    # Arrow: allow modern releases but avoid hard pin & keep room for distro constraints
+    "pyarrow>=17,<22",
+    # Broaden for older stacks (e.g., AzureML 1.55) and NumPy 2.x-ready stacks
+    "pandas>=1.5,<2.4",
+    "numpy>=1.26,<3",
+    "python-dateutil>=2.8.2"
 ]
 
 [project.optional-dependencies]
@@ -49,4 +50,4 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 # Be explicit; include all subpackages (requires __init__.py in each package dir)
-include = ["supertable*"]
+include = ["supertable", "supertable.*"]

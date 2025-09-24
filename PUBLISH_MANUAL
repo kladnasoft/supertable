@@ -22,17 +22,17 @@ twine check dist/*
 
 ```bash
 python -m venv .venv-test && source .venv-test/bin/activate
-pip install dist/supertable-1.2.0-py3-none-any.whl
+pip install dist/supertable-1.2.12-py3-none-any.whl
 python -c "import supertable; print('ok base')"
 ```
 
 6. **Test extras install (choose at least one)**
 
 ```bash
-pip install 'dist/supertable-1.2.0-py3-none-any.whl[minio]'
+pip install 'dist/supertable-1.2.12-py3-none-any.whl[minio]'
 python -c "import importlib; importlib.import_module('minio'); print('ok minio extra')"
 
-pip install 'dist/supertable-1.2.0-py3-none-any.whl[s3]'
+pip install 'dist/supertable-1.2.12-py3-none-any.whl[s3]'
 python -c "import importlib; importlib.import_module('s3'); print('ok s3 extra')"
 
 pip install 'dist/supertable-1.2.0-py3-none-any.whl[azure]'
@@ -47,7 +47,7 @@ python -c "import importlib; importlib.import_module('azure'); print('ok azure e
 ```bash
 twine upload --repository testpypi dist/*
 python -m venv .venv-testpypi && source .venv-testpypi/bin/activate
-pip install -i https://test.pypi.org/simple/ 'supertable[minio]==1.2.0'
+pip install -i https://test.pypi.org/simple/ 'supertable[minio]==1.2.12'
 ```
 
 8. **Publish to PyPI**

@@ -5,6 +5,7 @@ import supertable.config.homedir
 
 from supertable.config.defaults import default
 from supertable.locking.file_lock import FileLocking
+from supertable.locking.redis_lock import RedisLocking
 from supertable.locking.locking_backend import LockingBackend
 
 class Locking:
