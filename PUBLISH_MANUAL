@@ -1,0 +1,73 @@
+1. **Bump version** (same in `pyproject.toml` and `setup.py`; we set `1.2.0` in both).
+2. **Clean build artifacts**
+
+```bash
+rm -rf build dist *.egg-info
+```
+
+3. **Build sdist + wheel**
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+```
+
+4. **Sanity-check the metadata**
+
+```bash
+twine check dist/*
+```
+
+5. **Test install from the built dists (LOCAL only)**
+
+```bash
+python -m venv .venv-test && source .venv-test/bin/activate
+pip install dist/supertable-1.2.0-py3-none-any.whl
+python -c "import supertable; print('ok base')"
+```
+
+6. **Test extras install (choose at least one)**
+
+```bash
+pip install 'dist/supertable-1.2.0-py3-none-any.whl[minio]'
+python -c "import importlib; importlib.import_module('minio'); print('ok minio extra')"
+
+pip install 'dist/supertable-1.2.0-py3-none-any.whl[s3]'
+python -c "import importlib; importlib.import_module('s3'); print('ok s3 extra')"
+
+pip install 'dist/supertable-1.2.0-py3-none-any.whl[azure]'
+python -c "import importlib; importlib.import_module('azure'); print('ok azure extra')"
+```
+```
+
+(Repeat for `[s3]` and `[azure]` if you want.)
+
+7. **Optional: Test from TestPyPI**
+
+```bash
+twine upload --repository testpypi dist/*
+python -m venv .venv-testpypi && source .venv-testpypi/bin/activate
+pip install -i https://test.pypi.org/simple/ 'supertable[minio]==1.2.0'
+```
+
+8. **Publish to PyPI**
+
+```bash
+twine upload dist/*
+```
+
+9. **Tag & push**
+
+```bash
+git tag v1.2.0
+git push --tags
+```
+
+### Notes specific to our changes
+
+* We moved cloud SDKs to **extras**; no change is needed in your publish script beyond making sure you test-install the extras once (steps 6/7).
+* `requirements.txt` now lists only **base deps**. That’s fine; PyPI will use `setup.py`/`pyproject.toml` for install metadata, including extras.
+* `storage_factory.py` uses **lazy imports** and gives a friendly error if a user selects a backend without installing its extra — this doesn’t affect publishing.
+* If your `PUBLISH` previously ran a `pip install -r requirements.txt` as a smoke test, keep it; it will test the **local** install path (no cloud SDKs), which is exactly what we want.
+
+If you want, paste your current `PUBLISH` steps here and I’ll mark any tweaks inline, but the checklist above should cover everything for the new optional-deps setup.

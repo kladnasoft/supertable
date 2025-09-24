@@ -5,7 +5,6 @@ import supertable.config.homedir
 
 from supertable.config.defaults import default
 from supertable.locking.file_lock import FileLocking
-from supertable.locking.redis_lock import RedisLocking
 from supertable.locking.locking_backend import LockingBackend
 
 class Locking:
@@ -48,7 +47,15 @@ class Locking:
                 "password": getattr(default, "REDIS_PASSWORD", None),
             }
             redis_options.update(kwargs)
-            self.lock_instance = RedisLocking(identity, check_interval=self.check_interval, **redis_options)
+            # Lazy import to avoid pulling Redis when not needed
+            try:
+                from supertable.locking.redis_lock import RedisLocking
+                self.lock_instance = RedisLocking(identity, check_interval=self.check_interval, **redis_options)
+            except Exception as e:
+                raise RuntimeError(
+                    "Redis backend selected, but redis backend could not be imported. "
+                    "Install `redis` and ensure configuration is correct."
+                ) from e
 
         elif self.backend == LockingBackend.FILE:
             self.lock_instance = FileLocking(

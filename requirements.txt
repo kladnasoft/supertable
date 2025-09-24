@@ -1,18 +1,17 @@
 # Base (provider-agnostic) dependencies only
 polars~=0.20.28
 python-dateutil~=2.9.0.post0
-fastapi~=0.111.0
 pyarrow~=16.1.0
 setuptools~=68.2.0
 duckdb~=1.2.2
 pandas~=2.2.2
 sqlglot~=25.4.1
-Faker~=26.0.0
 numpy~=2.0.0
 colorlog~=6.9.0
 python-dotenv~=1.0.1
 Booktype~=1.5
 pytest~=8.3.4
+pyarrow~=19.0.1
 
 # NOTE:
 # Redis and cloud SDKs are NOT installed by default.

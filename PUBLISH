@@ -1,31 +1,9 @@
-# 0. Ensure build & pip are present (run once)
-python3 -m pip install --upgrade pip build twine
+NO_GIT=1 ./publish.sh 1.2.4
+# or, to skip tests explicitly:
+NO_GIT=1 ./publish.sh 1.2.4 --no-tests
 
-# 1. Build source tar.gz + wheel into dist/
-python3 -m build
-
-# 2. Inspect what got created
-ls -l dist/
-# → supertable-0.1.0.tar.gz
-#   supertable-0.1.0-py3-none-any.whl
-
-# 3. Smoke‑test the wheel in an empty target directory
-python3 -m pip install dist/supertable-0.1.0-py3-none-any.whl --target /tmp/testenv
-
-# 4. Verify contents
-tree -L 2 /tmp/testenv | head
-
-
-
-# fresh temp dir
-rm -rf /tmp/testenv
-python3 -m pip install dist/supertable-1.1.0-py3-none-any.whl --target /tmp/testenv
-python3 - <<'PY'
-import importlib.util, pathlib, sys
-sys.path.insert(0, "/tmp/testenv")
-spec = importlib.util.find_spec("supertable")
-print("Supertable found at:", pathlib.Path(spec.origin).parent)
-PY
-
-
-twine upload dist/*
+./publish.sh                # bumps to 1.2.0, builds, tests, uploads to PyPI
+./publish.sh 1.2.3          # same, but with version 1.2.3
+./publish.sh --testpypi     # uploads to TestPyPI (good for a dry run)
+NO_GIT=1 ./publish.sh       # skip git tag/push if you prefer
+SKIP_TESTS=1 ./publish.sh   # skip local install smoke test
