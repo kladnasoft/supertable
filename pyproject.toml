@@ -1,11 +1,10 @@
-# pyproject.toml — compat-broadened deps for wider env support (NumPy 1.26 → 2.x, Pandas 1.5 → 2.3)
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.2.13"
+version = "1.2.18"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,19 +17,11 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 
-dependencies = [
-    "python-dotenv>=1.1.0",
-    "colorlog>=6.9.0",
-    "polars>=1.6.0",
-    "sqlglot>=26.17.1",
-    "duckdb>=1.4.0",
-    # Arrow: allow modern releases but avoid hard pin & keep room for distro constraints
-    "pyarrow>=17,<22",
-    # Broaden for older stacks (e.g., AzureML 1.55) and NumPy 2.x-ready stacks
-    "pandas>=1.5,<2.4",
-    "numpy>=1.26,<3",
-    "python-dateutil>=2.8.2"
-]
+# Instead of hardcoding, tell setuptools to read requirements.txt
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
 
 [project.optional-dependencies]
 s3    = ["boto3>=1.40.30", "redis>=6.4.0"]
@@ -49,5 +40,4 @@ supertable = "supertable.config.cli:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-# Be explicit; include all subpackages (requires __init__.py in each package dir)
 include = ["supertable", "supertable.*"]
