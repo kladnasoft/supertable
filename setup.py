@@ -19,7 +19,7 @@ long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
     name="supertable",
-    version="1.2.18",
+    version="1.2.31",
     description="SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework.",
     long_description=long_description,
     long_description_content_type="text/markdown",

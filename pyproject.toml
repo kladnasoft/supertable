@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.2.18"
+version = "1.2.31"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 
-# Instead of hardcoding, tell setuptools to read requirements.txt
+# Read runtime deps from requirements.txt to keep a single source of truth
 dynamic = ["dependencies"]
 
 [tool.setuptools.dynamic]

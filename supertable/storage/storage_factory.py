@@ -11,6 +11,7 @@ Dynamic storage factory with lazy imports and optional cloud dependencies.
 
 from typing import Any, Optional
 import importlib
+import os
 
 from supertable.config.defaults import default
 from supertable.storage.storage_interface import StorageInterface
@@ -35,7 +36,7 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
       2) default.STORAGE_TYPE (e.g., 'LOCAL', 'S3', 'MINIO', 'AZURE')
       3) fallback to 'LOCAL'
 
-    Extra kwargs are passed to the specific storage constructors.
+    For AZURE: if no args are provided, constructs from environment (supports abfss:// SUPERTABLE_HOME and AAD).
     """
     storage_type = (kind or getattr(default, "STORAGE_TYPE", None) or "LOCAL").upper()
 
@@ -56,10 +57,15 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     if storage_type == "AZURE":
         _require("azure.storage.blob", "azure")
         mod = importlib.import_module("supertable.storage.azure_storage")
-        return getattr(mod, "AzureBlobStorage")(**kwargs)
+        AzureBlobStorage = getattr(mod, "AzureBlobStorage")
+        if kwargs:
+            # Backward compatibility: explicit parameters provided by caller
+            return AzureBlobStorage(**kwargs)
+        # From environment (supports managed identity & abfss SUPERTABLE_HOME)
+        return AzureBlobStorage.from_env()
 
-    if storage_type == "GCS":  # add this branch
-        _require("google.cloud.storage", "gcs")
+    if storage_type in ("GCS", "GCP"):
+        _require("google.cloud.storage", "gcp")
         mod = importlib.import_module("supertable.storage.gcp_storage")
         return getattr(mod, "GCSStorage")(**kwargs)
 
