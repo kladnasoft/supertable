@@ -1,4 +1,4 @@
-# supertable/storage/synapse_storage.py
+## supertable/storage/synapse_storage.py
 # -----------------------------------------------------------------------------
 # One-call activation for Synapse / ABFSS:
 #   - LocalStorage I/O (json/bytes/exists/ls/size/delete/parquet) via fsspec+adlfs
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import traceback
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Iterator
 
 __all__ = ["activate_synapse", "silence_azure_http_logs"]
 
@@ -75,6 +75,7 @@ def activate_synapse(
     *,
     cache_dir: Optional[str] = None,
     duckdb_memory_limit: str = "2GB",
+    silence: bool = True,
 ) -> None:
     """
     Patch Supertable to run reliably on Azure Synapse (ABFSS).
@@ -82,12 +83,17 @@ def activate_synapse(
     - home: ABFSS root for Supertable (e.g., 'abfss://.../supertable').
     - cache_dir: local directory for DuckDB parquet cache (default: /tmp/supertable_duck_cache).
     - duckdb_memory_limit: PRAGMA memory_limit value (e.g., '2GB').
+    - silence: if True, suppress noisy Azure HTTP logs (default: True).
 
     Idempotent: safe to call more than once.
     """
     global _PATCHED
     if _PATCHED:
         return
+
+    if silence:
+        import logging
+        silence_azure_http_logs(logging.INFO)
 
     if not home or not isinstance(home, str):
         raise ValueError("activate_synapse(home=...) is required (ABFSS path).")
@@ -216,6 +222,14 @@ def activate_synapse(
     _ORIG_write_parquet = getattr(_ls.LocalStorage, "write_parquet", None)
     _ORIG_read_parquet = getattr(_ls.LocalStorage, "read_parquet", None)
 
+    # NEW: provide generic FS-like methods used by delta mirror
+    _ORIG_remove = getattr(_ls.LocalStorage, "remove", None)
+    _ORIG_copy = getattr(_ls.LocalStorage, "copy", None)
+    _ORIG_stat = getattr(_ls.LocalStorage, "stat", None)
+    _ORIG_listdir = getattr(_ls.LocalStorage, "listdir", None)
+    _ORIG_list = getattr(_ls.LocalStorage, "list", None)
+    _ORIG_iterdir = getattr(_ls.LocalStorage, "iterdir", None)
+
     def _ls_read_json(self, path: str, retries: int = 3, backoff: float = 0.05) -> Any:
         target = _to_full_uri(path) if SUPERTABLE_HOME else path
         fs, norm = _fs_and_path(target)
@@ -289,7 +303,10 @@ def activate_synapse(
     def _ls_size(self, path: str) -> int:
         fs, norm = _fs_and_path(_to_full_uri(path))
         if hasattr(fs, "size"):
-            return int(fs.size(norm))
+            try:
+                return int(fs.size(norm))
+            except Exception:
+                pass
         info = fs.info(norm)
         size_val = info.get("size")
         if size_val is None:
@@ -345,6 +362,96 @@ def activate_synapse(
         with fs.open(norm, "rb") as f:
             return pq.read_table(f)
 
+    # -------- NEW: mirror_delta compat methods (read/write/listing primitives) --------
+
+    def _ls_remove(self, path: str) -> None:
+        """Remove a file or directory (recursive safe)."""
+        fs, norm = _fs_and_path(_to_full_uri(path))
+        try:
+            fs.rm(norm, recursive=True)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            try:
+                fs.delete(norm, recursive=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def _ls_copy(self, src: str, dst: str) -> None:
+        """
+        Copy a single file from src to dst within/backed by the same fsspec filesystem
+        (or across if the FS supports it). Falls back to streaming copy.
+        """
+        fs_src, s = _fs_and_path(_to_full_uri(src))
+        fs_dst, d = _fs_and_path(_to_full_uri(dst))
+
+        try:
+            parent = d.rsplit("/", 1)[0]
+            fs_dst.mkdirs(parent, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            if fs_src is fs_dst and hasattr(fs_dst, "copy"):
+                fs_dst.copy(s, d)  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+        try:
+            if hasattr(fs_dst, "cp"):
+                fs_dst.cp(s, d)  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+
+        with fs_src.open(s, "rb") as r, fs_dst.open(d, "wb") as w:
+            while True:
+                chunk = r.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                w.write(chunk)
+
+    def _ls_stat(self, path: str) -> Dict[str, Any]:
+        """
+        Return a dict with at least {'size': int} so callers can read .get('size').
+        """
+        fs, norm = _fs_and_path(_to_full_uri(path))
+        try:
+            info = fs.info(norm)
+        except FileNotFoundError:
+            return {"size": 0, "exists": False}
+        size = info.get("size", 0)
+        return {"size": int(size) if isinstance(size, (int, float)) else 0, "exists": True, **info}
+
+    def _ls_listdir(self, path: str) -> List[str]:
+        """
+        Return full child paths under `path`. Empty list if path missing or backend can't list.
+        """
+        fs, norm = _fs_and_path(_to_full_uri(path))
+        try:
+            entries = fs.ls(norm, detail=True)
+        except Exception:
+            try:
+                entries = [{"name": p} for p in (fs.glob(f"{norm.rstrip('/')}/*") or [])]
+            except Exception:
+                return []
+        out: List[str] = []
+        for e in entries:
+            name = e.get("name") or e.get("Key")
+            if not name:
+                continue
+            out.append(name)
+        return out
+
+    def _ls_list(self, path: str) -> List[str]:
+        """Alias for listdir (some backends use .list)."""
+        return _ls_listdir(self, path)
+
+    def _ls_iterdir(self, path: str) -> Iterator[str]:
+        """Iterator variant of listdir."""
+        for p in _ls_listdir(self, path):
+            yield p
+
     # Apply LocalStorage patches
     setattr(_ls.LocalStorage, "read_json", _ls_read_json)
     setattr(_ls.LocalStorage, "write_json", _ls_write_json)
@@ -359,8 +466,15 @@ def activate_synapse(
     setattr(_ls.LocalStorage, "get_directory_structure", _ls_get_directory_structure)
     setattr(_ls.LocalStorage, "write_parquet", _ls_write_parquet)
     setattr(_ls.LocalStorage, "read_parquet", _ls_read_parquet)
+    setattr(_ls.LocalStorage, "remove", _ls_remove)
+    setattr(_ls.LocalStorage, "copy", _ls_copy)
+    setattr(_ls.LocalStorage, "stat", _ls_stat)
+    setattr(_ls.LocalStorage, "listdir", _ls_listdir)
+    setattr(_ls.LocalStorage, "list", _ls_list)
+    setattr(_ls.LocalStorage, "iterdir", _ls_iterdir)
 
-    # ===================== Patch 2: Locking (directory-based, no 'xb') =====================
+    # ===================== Patch 2: Locking, Patch 3: Polars, Patch 4..6 omitted for brevity in this snippet
+
 
     import supertable.locking.locking as _locking_mod  # type: ignore
     _Locking = getattr(_locking_mod, "Locking")

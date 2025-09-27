@@ -31,6 +31,69 @@ from typing import Dict, Any, List, Tuple, Set
 
 from supertable.config.defaults import logger
 
+# ---- Spark/Delta schema normalization helpers ----
+_SPARK_TYPE_MAP = {
+    "string": "string",
+    "boolean": "boolean", "bool": "boolean",
+    "byte": "byte", "short": "short",
+    "integer": "integer", "int": "integer", "int32": "integer",
+    "long": "long", "int64": "long", "bigint": "long",
+    "float": "float", "double": "double",
+    "decimal": "decimal",  # keep decimal(p,s) as-is
+    "date": "date", "timestamp": "timestamp",
+    "binary": "binary",
+}
+
+def _normalize_type(t: str) -> str:
+    if not isinstance(t, str):
+        return "string"
+    ts = t.strip().lower()
+    if ts.startswith("decimal(") and ts.endswith(")"):
+        return ts
+    # if timestamp like {"type":"timestamp","timezone":"UTC"} was used earlier, normalize
+    if ts.startswith("{") and "timestamp" in ts:
+        return "timestamp"
+    return _SPARK_TYPE_MAP.get(ts, ts)
+
+def _schema_to_structtype_json(schema_string: Any = None, schema_list: Any = None) -> str:
+    """Return a valid Spark StructType JSON string for Delta metaData.schemaString."""
+    import json as _json
+    # Try schema_string first
+    if schema_string:
+        try:
+            parsed = _json.loads(schema_string) if isinstance(schema_string, str) else schema_string
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("fields"), list):
+                    for f in parsed["fields"]:
+                        if isinstance(f, dict):
+                            t = f.get("type")
+                            if isinstance(t, str):
+                                f["type"] = _normalize_type(t)
+                            f.setdefault("nullable", True)
+                            f.setdefault("metadata", {})
+                    return _json.dumps(parsed, separators=(",", ":"))
+                if isinstance(parsed.get("fields"), dict):
+                    fields_map = parsed["fields"]
+                    fields = []
+                    for name, typ in fields_map.items():
+                        fields.append({"name": name, "type": _normalize_type(str(typ)), "nullable": True, "metadata": {}})
+                    out = {"type": "struct", "fields": fields}
+                    return _json.dumps(out, separators=(",", ":"))
+        except Exception:
+            pass
+    # schema_list
+    if schema_list:
+        fields = []
+        for f in schema_list:
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name")
+            typ = _normalize_type(str(f.get("type", "string")))
+            fields.append({"name": name, "type": typ, "nullable": f.get("nullable", True), "metadata": f.get("metadata", {})})
+        out = {"type": "struct", "fields": fields}
+        return _json.dumps(out, separators=(",", ":"))
+    return _json.dumps({"type": "struct", "fields": []}, separators=(",", ":"))
+
 # --------- Tunables (keep minimal & local) -----------------------------------
 
 # Try to copy data files under delta/<table>/files/ for stricter compatibility.
@@ -214,20 +277,34 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
 
     # Build current file paths, optionally co-locate under table dir
     current_paths: List[str] = []
-    path_records: List[Tuple[str, int]] = []  # (path_used_in_add, size)
+    path_records: List[Tuple[str, int, Dict[str, Any]]] = []  # (path_used_in_add, size, resource)
     for r in resources:
         src_file = r["file"]
         size = int(r.get("file_size", 0))
         used_path, is_relative = _co_locate_or_reuse_path(super_table.storage, files_dir, src_file)
         current_paths.append(used_path)
-        path_records.append((used_path, size))
+        path_records.append((used_path, size, r))
 
     current_set = set(current_paths)
 
     # Actions to remove: those present before but not now
     to_remove = sorted(list(prev_paths - current_set))
     # Actions to add: those present now (we do full overwrite, but include removes for correctness)
-    to_add = path_records  # (path, size)
+    to_add = path_records  # (path, size, resource)
+
+    # Compute operation metrics
+    num_files = len(to_add)
+    num_output_bytes = sum(int(sz) for _, sz, *_ in to_add) if to_add else 0
+    try:
+        # sum rows from resources if available
+        num_output_rows = 0
+        for rec in resources:
+            val = rec.get("rows") or rec.get("numRecords") or 0
+            if isinstance(val, str) and val.isdigit():
+                val = int(val)
+            num_output_rows += int(val)
+    except Exception:
+        num_output_rows = 0
 
     # Compose Delta JSON log (newline-delimited actions)
     commit_path = os.path.join(log_dir, _pad_version(version) + ".json")
@@ -237,16 +314,24 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             "commitInfo": {
                 "timestamp": _now_ms(),
                 "operation": "WRITE",
-                "operationParameters": {"mode": "CompleteOverwrite"},
+                "operationParameters": {"mode": "Overwrite", "partitionBy": "[]"},
+                "isolationLevel": "Serializable",
                 "readVersion": prev_version if prev_version >= 0 else None,
                 "isBlindAppend": False,
-                "engineInfo": "supertable-mirror-delta/1.0",
+                "operationMetrics": {
+                    "numFiles": str(num_files),
+                    "numOutputRows": str(num_output_rows),
+                    "numOutputBytes": str(num_output_bytes)
+                },
+                "engineInfo": "supertable-delta/1.0",
+                "txnId": __import__("uuid").uuid4().hex
             }
         }
         s.write(json.dumps(commit_info, separators=(",", ":")) + "\n")
 
+
         # 2) protocol
-        protocol = {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
+        protocol = {"protocol": {"minReaderVersion": 1, "minWriterVersion": 4}}
         s.write(json.dumps(protocol, separators=(",", ":")) + "\n")
 
         # 3) metaData (repeat each commit to be robust)
@@ -255,7 +340,7 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
                 "id": f"{super_table.organization}:{super_table.super_name}:{table_name}",
                 "name": table_name,
                 # Delta expects Spark-like JSON schema string; we provide a minimal projection
-                "schemaString": _to_spark_schema_json(schema_any),
+                "schemaString": _schema_to_structtype_json(None, schema_any),
                 "partitionColumns": [],
                 "configuration": {"created.by": "supertable", "mirror": "delta"},
                 "createdTime": _now_ms(),
@@ -271,13 +356,35 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
 
         # 5) add (for all current files)
         add_ts = _now_ms()
-        for p, size in to_add:
-            s.write(json.dumps({"add": {
-                "path": p,
-                "size": int(size),
-                "modificationTime": add_ts,
-                "dataChange": True
-            }}, separators=(",", ":")) + "\n")
+        for p, size, res in to_add:
+            # Build stats if provided
+            stats_val = None
+            try:
+                if isinstance(res.get("stats_json"), str):
+                    stats_val = res.get("stats_json")
+                elif isinstance(res.get("stats"), dict):
+                    stats_val = json.dumps(res["stats"], separators=(",", ":"))
+                else:
+                    rows_val = res.get("rows") or res.get("numRecords")
+                    if isinstance(rows_val, (int, float)) or (isinstance(rows_val, str) and rows_val.isdigit()):
+                        stats_val = json.dumps({"numRecords": int(rows_val)}, separators=(",", ":"))
+            except Exception:
+                stats_val = None
+
+            add_obj = {
+                "add": {
+                    "path": p,
+                    "partitionValues": {},
+                    "size": int(size),
+                    "modificationTime": add_ts,
+                    "dataChange": True,
+                    "tags": {}
+                }
+            }
+            if stats_val is not None:
+                add_obj["add"]["stats"] = stats_val
+
+            s.write(json.dumps(add_obj, separators=(",", ":")) + "\n")
 
         # Atomically write the commit file
         content = s.getvalue().encode("utf-8")
@@ -294,7 +401,7 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         "version": version,
         "updated_at_ms": _now_ms(),
         "schema": schema_any,  # original schema projection
-        "files": [{"path": p, "size": int(sz)} for p, sz in to_add],
+        "files": [{"path": p, "size": int(sz)} for p, sz, _ in to_add],
     }
     super_table.storage.write_json(os.path.join(base, "latest.json"), latest_state)
 
