@@ -8,11 +8,13 @@ from supertable.storage.storage_interface import StorageInterface
 # Writers are split per-format
 from supertable.mirroring.mirror_delta import write_delta_table
 from supertable.mirroring.mirror_iceberg import write_iceberg_table
+from supertable.mirroring.mirror_parquet import write_parquet_table  # NEW
 
 
 class FormatMirror(str, Enum):
     DELTA = "DELTA"
     ICEBERG = "ICEBERG"
+    PARQUET = "PARQUET"  # NEW
 
     @staticmethod
     def normalize(values: Iterable[str]) -> List[str]:
@@ -101,9 +103,13 @@ class MirrorFormats:
         if "ICEBERG" in enabled:
             super_table.storage.makedirs(os.path.join(base, "iceberg", table_name, "metadata"))
             super_table.storage.makedirs(os.path.join(base, "iceberg", table_name, "manifests"))
+        if "PARQUET" in enabled:  # NEW
+            super_table.storage.makedirs(os.path.join(base, "parquet", table_name, "files"))
 
         # Delegate to per-format writers (latest-only mirror)
         if "DELTA" in enabled:
             write_delta_table(super_table, table_name, simple_snapshot)
         if "ICEBERG" in enabled:
             write_iceberg_table(super_table, table_name, simple_snapshot)
+        if "PARQUET" in enabled:  # NEW
+            write_parquet_table(super_table, table_name, simple_snapshot)
