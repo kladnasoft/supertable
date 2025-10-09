@@ -1,7 +1,10 @@
 import io
+import os
+import re
 import json
 import fnmatch
-from typing import Any, Dict, List, Iterable
+from typing import Any, Dict, List, Iterable, Optional
+from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,9 +25,130 @@ class MinioStorage(StorageInterface):
         self.bucket_name = bucket_name
         self.client = client
 
-    # -------------------------
-    # Helpers
-    # -------------------------
+    # ---------- client helpers ----------
+
+    @staticmethod
+    def _build_client(endpoint: str, access_key: str, secret_key: str, region: Optional[str]) -> Minio:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported scheme in AWS_S3_ENDPOINT_URL: {endpoint}")
+        secure = parsed.scheme == "https"
+        host = parsed.netloc or parsed.path  # tolerate "localhost:9000"
+        return Minio(
+            endpoint=host,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure,
+            region=region or None,
+        )
+
+    @staticmethod
+    def _extract_expected_region_from_error(e: S3Error) -> Optional[str]:
+        """
+        Parse messages like:
+        'The authorization header is malformed; the region is wrong; expecting "eu-central-1".'
+        """
+        msg = getattr(e, "message", "") or str(e)
+        m = re.search(r"expecting ['\"]([a-z0-9-]+)['\"]", msg, re.IGNORECASE)
+        return m.group(1) if m else None
+
+    def _ensure_bucket_exists(self, bucket: str, region: Optional[str]) -> None:
+        try:
+            # Some deployments require correct region for even bucket_exists; handle mismatch below
+            exists = self.client.bucket_exists(bucket)
+        except S3Error as e:
+            if getattr(e, "code", "") == "AuthorizationHeaderMalformed":
+                # Recreate client with the expected region and retry
+                expected = self._extract_expected_region_from_error(e)
+                if expected:
+                    # rebuild client with corrected region and retry
+                    self.client = self._rebuild_with_region(expected)
+                    exists = self.client.bucket_exists(bucket)
+                else:
+                    raise
+            else:
+                raise
+
+        if not exists:
+            try:
+                # When region differs from us-east-1, pass location
+                if region and region.lower() != "us-east-1":
+                    self.client.make_bucket(bucket, location=region)
+                else:
+                    self.client.make_bucket(bucket)
+            except S3Error as e:
+                # If another process created it concurrently, ignore those codes
+                if getattr(e, "code", "") not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                    # If it's a region issue, try once with parsed expected region
+                    if getattr(e, "code", "") == "AuthorizationHeaderMalformed":
+                        expected = self._extract_expected_region_from_error(e)
+                        if expected:
+                            self.client = self._rebuild_with_region(expected)
+                            if expected.lower() != "us-east-1":
+                                self.client.make_bucket(bucket, location=expected)
+                            else:
+                                self.client.make_bucket(bucket)
+                            return
+                    raise
+
+    def _rebuild_with_region(self, region: str) -> Minio:
+        # Recreate a client using same endpoint/creds but new region.
+        # Pull current settings out of the existing client.
+        # The Minio client doesn't expose endpoint directly, but we can reconstruct from _endpoint_url.
+        # Fallback: use env vars again.
+        endpoint_url = os.getenv("AWS_S3_ENDPOINT_URL")
+        access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        if not (endpoint_url and access_key and secret_key):
+            # If envs are not present (unlikely in our flow), fail loudly with instructions
+            raise RuntimeError(
+                "Cannot rebuild MinIO client with region: missing AWS_S3_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+            )
+        return self._build_client(endpoint_url, access_key, secret_key, region)
+
+    # ---------- construction from env ----------
+
+    @classmethod
+    def from_env(cls) -> "MinioStorage":
+        """
+        Build a MinioStorage from environment variables.
+
+        Required env:
+          - AWS_S3_ENDPOINT_URL  (e.g., http://localhost:9000)
+          - AWS_ACCESS_KEY_ID
+          - AWS_SECRET_ACCESS_KEY
+
+        Optional env:
+          - SUPERTABLE_BUCKET (default: 'supertable')
+          - MINIO_REGION or AWS_S3_REGION or AWS_DEFAULT_REGION
+        """
+        bucket = os.getenv("SUPERTABLE_BUCKET") or os.getenv("MINIO_BUCKET") or "supertable"
+        endpoint = os.getenv("AWS_S3_ENDPOINT_URL")
+        access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        # region precedence: explicit MinIO envs first, then AWS-style, else None
+        region = (
+            os.getenv("MINIO_REGION")
+            or os.getenv("AWS_S3_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or None
+        )
+
+        if not endpoint or not access_key or not secret_key:
+            raise RuntimeError(
+                "MinIO environment incomplete. "
+                "Expected AWS_S3_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY."
+            )
+
+        client = cls._build_client(endpoint, access_key, secret_key, region)
+
+        # Ensure bucket exists, handling region mismatches gracefully
+        storage = cls(bucket_name=bucket, client=client)
+        storage._ensure_bucket_exists(bucket, region)
+        return storage
+
+    # ---------- low-level helpers ----------
+
     def _object_exists(self, key: str) -> bool:
         try:
             self.client.stat_object(self.bucket_name, key)
@@ -45,9 +169,6 @@ class MinioStorage(StorageInterface):
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
 
-        # Use non-recursive listing and extract either object keys at this level or "common prefixes"
-        # MinIO's list_objects doesn't directly yield common prefixes, but non-recursive means
-        # children one level down (objects and "dir marker" objects) appear distinctly.
         children = []
         seen = set()
 
@@ -58,7 +179,6 @@ class MinioStorage(StorageInterface):
             suffix = key[len(prefix):]
 
             # Consider only the first path component under the prefix (one level)
-            # e.g., if suffix = "a/b/c", the child at this level is "a"
             part = suffix.split("/", 1)[0]
             if part not in seen:
                 seen.add(part)
@@ -66,9 +186,8 @@ class MinioStorage(StorageInterface):
 
         return children
 
-    # -------------------------
-    # JSON
-    # -------------------------
+    # ---------- JSON ----------
+
     def read_json(self, path: str) -> Dict[str, Any]:
         try:
             resp = self.client.get_object(self.bucket_name, path)
@@ -99,9 +218,8 @@ class MinioStorage(StorageInterface):
             content_type="application/json",
         )
 
-    # -------------------------
-    # Existence / size / makedirs
-    # -------------------------
+    # ---------- existence / size / dirs ----------
+
     def exists(self, path: str) -> bool:
         return self._object_exists(path)
 
@@ -115,14 +233,11 @@ class MinioStorage(StorageInterface):
             raise
 
     def makedirs(self, path: str) -> None:
-        # No-op for object storage. If you want folder markers, you could:
-        # if not path.endswith("/"): path += "/"
-        # self.write_bytes(path, b"")
+        # Object storage is flat; no-op
         pass
 
-    # -------------------------
-    # Listing
-    # -------------------------
+    # ---------- listing ----------
+
     def list_files(self, path: str, pattern: str = "*") -> List[str]:
         """
         Local parity:
@@ -135,13 +250,11 @@ class MinioStorage(StorageInterface):
             path = path + "/"
 
         children = self._child_names_one_level(path)
-        # Filter by pattern against the child basename
         filtered_children = [c for c in children if fnmatch.fnmatch(c, pattern)]
         return [path + c for c in filtered_children]
 
-    # -------------------------
-    # Delete
-    # -------------------------
+    # ---------- delete ----------
+
     def delete(self, path: str) -> None:
         """
         - If `path` is an exact object: delete it.
@@ -165,9 +278,8 @@ class MinioStorage(StorageInterface):
         for key in to_delete:
             self.client.remove_object(self.bucket_name, key)
 
-    # -------------------------
-    # Directory structure
-    # -------------------------
+    # ---------- directory structure ----------
+
     def get_directory_structure(self, path: str) -> dict:
         """
         Build nested dict of the subtree at `path`.
@@ -190,9 +302,8 @@ class MinioStorage(StorageInterface):
                     cursor = cursor.setdefault(part, {})
         return root
 
-    # -------------------------
-    # Parquet
-    # -------------------------
+    # ---------- parquet ----------
+
     def write_parquet(self, table: pa.Table, path: str) -> None:
         buf = io.BytesIO()
         pq.write_table(table, buf)
@@ -220,9 +331,8 @@ class MinioStorage(StorageInterface):
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
 
-    # -------------------------
-    # Bytes / Text / Copy
-    # -------------------------
+    # ---------- bytes / text / copy ----------
+
     def write_bytes(self, path: str, data: bytes) -> None:
         self.client.put_object(
             self.bucket_name,

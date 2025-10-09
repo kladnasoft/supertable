@@ -1,9 +1,12 @@
 import logging
 import os
+import io
 from datetime import datetime, date
 from typing import Dict, List, Set, Tuple, Optional
 
 import polars
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from supertable.locking import Locking
 from supertable.utils.helper import generate_filename, collect_schema
@@ -23,6 +26,7 @@ _NUMERIC_INTS = {
 }
 _NUMERIC_FLOATS = {polars.Float32, polars.Float64}
 
+
 def _resolve_unified_dtype(dtypes: Set[polars.DataType]) -> polars.DataType:
     if not dtypes:
         return polars.Utf8
@@ -30,7 +34,7 @@ def _resolve_unified_dtype(dtypes: Set[polars.DataType]) -> polars.DataType:
         return next(iter(dtypes))
     if polars.Utf8 in dtypes:
         return polars.Utf8
-    ints   = any(dt in _NUMERIC_INTS   for dt in dtypes)
+    ints = any(dt in _NUMERIC_INTS for dt in dtypes)
     floats = any(dt in _NUMERIC_FLOATS for dt in dtypes)
     if polars.Datetime in dtypes:
         return polars.Datetime("us", None)
@@ -42,15 +46,19 @@ def _resolve_unified_dtype(dtypes: Set[polars.DataType]) -> polars.DataType:
         return polars.Int64
     return polars.Utf8
 
+
 def _union_schema(a: polars.DataFrame, b: polars.DataFrame) -> Dict[str, polars.DataType]:
     cols: List[str] = list(dict.fromkeys(a.columns + b.columns))
     target: Dict[str, polars.DataType] = {}
     for c in cols:
         types: Set[polars.DataType] = set()
-        if c in a.columns: types.add(a[c].dtype)
-        if c in b.columns: types.add(b[c].dtype)
+        if c in a.columns:
+            types.add(a[c].dtype)
+        if c in b.columns:
+            types.add(b[c].dtype)
         target[c] = _resolve_unified_dtype(types)
     return target
+
 
 def _align_to_schema(df: polars.DataFrame, target_schema: Dict[str, polars.DataType]) -> polars.DataFrame:
     exprs = []
@@ -62,9 +70,12 @@ def _align_to_schema(df: polars.DataFrame, target_schema: Dict[str, polars.DataT
             exprs.append(polars.lit(None, dtype=dtype).alias(col))
     return df.with_columns(exprs) if exprs else df
 
+
 def concat_with_union(a: polars.DataFrame, b: polars.DataFrame) -> polars.DataFrame:
-    if a.height == 0: return b
-    if b.height == 0: return a
+    if a.height == 0:
+        return b
+    if b.height == 0:
+        return a
     target = _union_schema(a, b)
     return polars.concat([_align_to_schema(a, target), _align_to_schema(b, target)], how="vertical_relaxed")
 
@@ -78,6 +89,7 @@ def _safe_exists(path: str) -> bool:
         return _storage.exists(path)
     except Exception:
         return False
+
 
 def _read_parquet_safe(path: str) -> Optional[polars.DataFrame]:
     if not _safe_exists(path):
@@ -104,9 +116,10 @@ def is_file_in_overlapping_files(file: str, overlapping_files: Set[Tuple[str, bo
             return True
     return False
 
+
 def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, bool, int]]) -> Set[Tuple[str, bool, int]]:
     """
-    Bring forward your original policy:
+    Policy:
       - Always include entries with has_overlap=True
       - For has_overlap=False small files, include them only if either:
           total_size_of_all_candidates > MAX_MEMORY_CHUNK_SIZE
@@ -191,11 +204,15 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
 
                     # Normalize to types if needed
                     if col in new_schema and new_schema[col] == "Date":
-                        if isinstance(min_val, str): min_val = datetime.fromisoformat(min_val).date()
-                        if isinstance(max_val, str): max_val = datetime.fromisoformat(max_val).date()
+                        if isinstance(min_val, str):
+                            min_val = datetime.fromisoformat(min_val).date()
+                        if isinstance(max_val, str):
+                            max_val = datetime.fromisoformat(max_val).date()
                     elif col in new_schema and new_schema[col] == "DateTime":
-                        if isinstance(min_val, str): min_val = datetime.fromisoformat(min_val)
-                        if isinstance(max_val, str): max_val = datetime.fromisoformat(max_val)
+                        if isinstance(min_val, str):
+                            min_val = datetime.fromisoformat(min_val)
+                        if isinstance(max_val, str):
+                            max_val = datetime.fromisoformat(max_val)
 
                     if any(val is None for val in new_vals):
                         overlapped = True
@@ -223,7 +240,7 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
             if file_size < int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024)):
                 overlapping_files.add((file, False, file_size))
 
-    # Apply your original pruning logic to trigger compaction when many/large small files accumulate
+    # Apply pruning logic to trigger compaction when many/large small files accumulate
     overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files)
 
     # Per-file locks removed intentionally; higher-level simple/table lock handles concurrency
@@ -350,7 +367,7 @@ def process_files_with_overlap(
         merged_df = concat_with_union(merged_df, filtered_df)
         sunset_files.add(file)
 
-        # Spill chunk if too large (2x memory chunk heuristic like your original)
+        # Spill chunk if too large (2x memory chunk heuristic)
         if merged_df.estimated_size() > int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024)) * 2:
             total_rows += merged_df.shape[0]
             write_parquet_and_collect_resources(
@@ -414,22 +431,72 @@ def write_parquet_and_collect_resources(
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    # Collect statistics and schema
+    # Collect statistics
     stats = collect_column_statistics(write_df, overwrite_columns)
+
+    # Ensure target "directory" exists in the active storage (creates a marker or no-op)
+    try:
+        if not _storage.exists(data_dir):
+            _storage.makedirs(data_dir)
+    except Exception:
+        # Best-effort: some backends may not require explicit directory creation
+        pass
 
     new_parquet_file = generate_filename("data", "parquet")
     new_parquet_path = os.path.join(data_dir, new_parquet_file)
-    write_df.write_parquet(
-        file=new_parquet_path,
-        compression="zstd",
-        compression_level=int(compression_level),
-        statistics=True,
-    )
+
+    # Write to the active storage backend (MinIO/local/etc.) WITHOUT changing behavior:
+    # we keep zstd + compression_level + statistics exactly like before by generating
+    # the Parquet bytes ourselves and uploading them.
+    try:
+        # Create parquet bytes with the same settings the original code used
+        arrow_tbl: pa.Table = write_df.to_arrow()
+        buf = io.BytesIO()
+        pq.write_table(
+            arrow_tbl,
+            buf,
+            compression="zstd",
+            compression_level=int(compression_level),
+            use_dictionary=True,
+            write_statistics=True,
+        )
+        data = buf.getvalue()
+
+        if hasattr(_storage, "write_bytes"):
+            _storage.write_bytes(new_parquet_path, data)
+        elif hasattr(_storage, "write_parquet"):
+            # Fallback: some storage backends may only expose write_parquet(table, path)
+            # (may ignore compression level); we prefer bytes path above to preserve behavior.
+            _storage.write_parquet(arrow_tbl, new_parquet_path)
+        else:
+            # Last-resort local write identical to original behavior
+            write_df.write_parquet(
+                file=new_parquet_path,
+                compression="zstd",
+                compression_level=int(compression_level),
+                statistics=True,
+            )
+    except Exception:
+        # As a safety net, do a local write if the storage upload path fails
+        write_df.write_parquet(
+            file=new_parquet_path,
+            compression="zstd",
+            compression_level=int(compression_level),
+            statistics=True,
+        )
+
     # size via storage if available
     try:
         file_size = _storage.size(new_parquet_path)
     except Exception:
-        file_size = os.path.getsize(new_parquet_path)
+        try:
+            file_size = os.path.getsize(new_parquet_path)
+        except Exception:
+            # if we uploaded via bytes and path is virtual, fall back to len(data) if defined
+            try:
+                file_size = len(data)  # type: ignore[name-defined]
+            except Exception:
+                file_size = 0
 
     new_resources.append(
         {

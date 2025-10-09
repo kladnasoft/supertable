@@ -5,24 +5,26 @@ import queue
 import atexit
 import uuid
 import os
+import io
 from typing import Dict, List, Any, Optional
 import pyarrow as pa
+import pyarrow.parquet as pq
 import polars as pl
 from datetime import datetime, timezone
-from supertable.super_table import SuperTable
+from supertable.super_table import SuperTable  # kept (even if unused elsewhere)
 from supertable.storage.storage_factory import get_storage
 
 
 class MonitoringLogger:
     def __init__(
-            self,
-            super_name: str,
-            organization: str,
-            monitor_type: str,
-            max_rows_per_file: int = 5000,
-            flush_interval: float = 1.0,
-            compression: str = "zstd",
-            compression_level: int = 1
+        self,
+        super_name: str,
+        organization: str,
+        monitor_type: str,
+        max_rows_per_file: int = 5000,
+        flush_interval: float = 1.0,
+        compression: str = "zstd",
+        compression_level: int = 1,
     ):
         self.identity = "monitoring"
         self.super_name = super_name
@@ -50,18 +52,18 @@ class MonitoringLogger:
 
         # Queue monitoring stats
         self.queue_stats = {
-            'total_received': 0,
-            'total_processed': 0,
-            'current_size': 0,
-            'max_size': 0,
-            'last_flush_time': 0,
-            'flush_durations': [],
-            'last_flush_size': 0,
-            'start_time': time.time()
+            "total_received": 0,
+            "total_processed": 0,
+            "current_size": 0,
+            "max_size": 0,
+            "last_flush_time": 0,
+            "flush_durations": [],
+            "last_flush_size": 0,
+            "start_time": time.time(),
         }
         self.queue_stats_lock = threading.Lock()
 
-        # Ensure directories exist
+        # Ensure directories exist in the configured storage (MinIO, local, etc.)
         self.storage.makedirs(self.base_dir)
         self.storage.makedirs(self.data_dir)
         self.storage.makedirs(self.snapshots_dir)
@@ -73,7 +75,7 @@ class MonitoringLogger:
         self.writer_thread = threading.Thread(
             target=self._write_loop,
             name=f"MonitoringWriter-{monitor_type}",
-            daemon=True
+            daemon=True,
         )
         self.writer_thread.start()
 
@@ -98,7 +100,7 @@ class MonitoringLogger:
             "file_count": 0,
             "total_rows": 0,
             "total_file_size": 0,
-            "version": 1
+            "version": 1,
         }
 
     def _save_catalog(self):
@@ -119,14 +121,69 @@ class MonitoringLogger:
         snapshot = {
             "snapshot_version": self.catalog["version"] + 1,
             "last_updated_ms": int(time.time() * 1000),
-            "resources": resources
+            "resources": resources,
         }
 
         self.storage.write_json(snapshot_path, snapshot)
         return snapshot_path, snapshot
 
+    def _read_existing_parquet_to_df(self, path: str) -> Optional[pl.DataFrame]:
+        """
+        Read an existing parquet file from the ACTIVE STORAGE (MinIO/local),
+        returning a Polars DataFrame. Never touch the local filesystem path directly.
+        """
+        try:
+            if not self.storage.exists(path):
+                return None
+
+            # Preferred: storage returns an Arrow table
+            if hasattr(self.storage, "read_parquet"):
+                table = self.storage.read_parquet(path)  # pyarrow.Table expected
+                if isinstance(table, pa.Table):
+                    return pl.from_arrow(table)
+
+            # Fallback: read bytes then parse as parquet with pyarrow
+            if hasattr(self.storage, "read_bytes"):
+                data = self.storage.read_bytes(path)
+                table = pq.read_table(io.BytesIO(data))
+                return pl.from_arrow(table)
+
+            # Last resort (should not be used for MinIO): try Polars direct path
+            # Only do this if the storage is truly local.
+            return pl.read_parquet(path)
+        except FileNotFoundError:
+            # Race: disappeared between exists() and read
+            return None
+        except Exception as e:
+            print(f"Warning: Failed to read existing parquet {path}: {e}")
+            return None
+
+    def _write_parquet_bytes_via_storage(self, table: pa.Table, path: str):
+        """
+        Write a pyarrow.Table as parquet bytes and upload via storage.
+        Keeps compression + statistics consistent across backends.
+        """
+        buf = io.BytesIO()
+        pq.write_table(
+            table,
+            buf,
+            compression=self.compression,
+            compression_level=int(self.compression_level),
+            use_dictionary=True,
+            write_statistics=True,
+        )
+        data = buf.getvalue()
+        if hasattr(self.storage, "write_bytes"):
+            self.storage.write_bytes(path, data)
+        elif hasattr(self.storage, "write_parquet"):
+            # Some storage backends accept a Table (may ignore compression args)
+            self.storage.write_parquet(table, path)
+        else:
+            # Local-only fallback
+            pq.write_table(table, path, compression=self.compression, compression_level=int(self.compression_level))
+
     def _write_parquet_file(self, data: List[Dict[str, Any]], existing_path: Optional[str] = None) -> Dict[str, Any]:
-        """Write data to a new or existing Parquet file."""
+        """Write data to a new or existing Parquet file using the storage backend."""
         if not data:
             # Return a no-op resource to keep caller logic simple
             return {
@@ -134,16 +191,19 @@ class MonitoringLogger:
                 "file_size": 0,
                 "rows": 0,
                 "columns": 0,
-                "stats": {}
+                "stats": {},
             }
 
         data = [self._ensure_execution_time(record) for record in data]
         df = pl.from_dicts(data)
 
+        # Merge with existing parquet strictly via storage (fixes 'No such file or directory' on MinIO)
         if existing_path and self.storage.exists(existing_path):
             try:
-                existing_df = pl.read_parquet(existing_path)
-                df = pl.concat([existing_df, df], how="vertical_relaxed")
+                existing_df = self._read_existing_parquet_to_df(existing_path)
+                if existing_df is not None and existing_df.height > 0:
+                    df = pl.concat([existing_df, df], how="vertical_relaxed")
+                # Remove the old object; we'll write a fresh one
                 self.storage.delete(existing_path)
             except Exception as e:
                 print(f"Warning: Failed to merge with existing file {existing_path}: {str(e)}")
@@ -153,21 +213,27 @@ class MonitoringLogger:
 
         # Convert to pyarrow table and write using storage interface
         table = df.to_arrow()
-        # (Storage interface handles details; compression may be ignored if unsupported)
         try:
-            self.storage.write_parquet(table, new_path)
-        except TypeError:
-            # Fallback if storage doesn't accept pyarrow Table
-            # Write via pyarrow directly to a local path, then upload if needed
-            import pyarrow.parquet as pq
-            pq.write_table(table, new_path, compression="zstd")
+            self._write_parquet_bytes_via_storage(table, new_path)
+        except Exception:
+            # Final fallback: best-effort local write (kept for compatibility)
+            pq.write_table(table, new_path, compression=self.compression, compression_level=int(self.compression_level))
+
+        # Gather metadata
+        try:
+            size = self.storage.size(new_path)
+        except Exception:
+            try:
+                size = os.path.getsize(new_path)
+            except Exception:
+                size = 0
 
         return {
             "file": new_path,
-            "file_size": self.storage.size(new_path),
+            "file_size": int(size),
             "rows": len(df),
             "columns": len(df.columns),
-            "stats": self._calculate_stats(df)
+            "stats": self._calculate_stats(df),
         }
 
     def _calculate_stats(self, df: pl.DataFrame) -> Dict[str, Any]:
@@ -235,20 +301,22 @@ class MonitoringLogger:
             with self.queue_stats_lock:
                 self.queue_stats["total_processed"] += n
                 self.queue_stats["last_flush_size"] = n
-                self.queue_stats['last_flush_time'] = time.time()
+                self.queue_stats["last_flush_time"] = time.time()
 
     def _update_catalog(self, snapshot_path: str, current_snapshot_path: str, new_snapshot: Dict[str, Any]):
         """Update the catalog with new snapshot information."""
         resources = new_snapshot.get("resources", [])
-        self.catalog.update({
-            "current": snapshot_path,
-            "previous": current_snapshot_path,
-            "last_updated_ms": new_snapshot.get("last_updated_ms", 0),
-            "file_count": len(resources),
-            "total_rows": sum(int(r.get("rows", 0)) for r in resources),
-            "total_file_size": sum(int(r.get("file_size", 0)) for r in resources),
-            "version": int(new_snapshot.get("snapshot_version", 0))
-        })
+        self.catalog.update(
+            {
+                "current": snapshot_path,
+                "previous": current_snapshot_path,
+                "last_updated_ms": new_snapshot.get("last_updated_ms", 0),
+                "file_count": len(resources),
+                "total_rows": sum(int(r.get("rows", 0)) for r in resources),
+                "total_file_size": sum(int(r.get("file_size", 0)) for r in resources),
+                "version": int(new_snapshot.get("snapshot_version", 0)),
+            }
+        )
         self._save_catalog()
 
     def _ensure_execution_time(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,10 +329,10 @@ class MonitoringLogger:
         """Add metric data to the queue and update stats."""
         self.queue.put(metric_data)
         with self.queue_stats_lock:
-            self.queue_stats['total_received'] += 1
+            self.queue_stats["total_received"] += 1
             current_size = self.queue.qsize()
-            self.queue_stats['current_size'] = current_size
-            self.queue_stats['max_size'] = max(self.queue_stats['max_size'], current_size)
+            self.queue_stats["current_size"] = current_size
+            self.queue_stats["max_size"] = max(self.queue_stats["max_size"], current_size)
         self.has_data_event.set()
 
     def _write_loop(self):
@@ -290,9 +358,9 @@ class MonitoringLogger:
                 self.has_data_event.clear()
                 with self.queue_stats_lock:
                     flush_duration = time.time() - start_flush
-                    self.queue_stats['flush_durations'].append(flush_duration)
-                    if len(self.queue_stats['flush_durations']) > 100:
-                        self.queue_stats['flush_durations'].pop(0)
+                    self.queue_stats["flush_durations"].append(flush_duration)
+                    if len(self.queue_stats["flush_durations"]) > 100:
+                        self.queue_stats["flush_durations"].pop(0)
             else:
                 # Nothing to do, reset event
                 self.has_data_event.clear()
@@ -308,18 +376,16 @@ class MonitoringLogger:
         """Return current queue statistics."""
         with self.queue_stats_lock:
             stats = self.queue_stats.copy()
-            stats['current_size'] = self.queue.qsize()
+            stats["current_size"] = self.queue.qsize()
 
             # Calculate averages
-            if stats['flush_durations']:
-                stats['avg_flush_duration'] = sum(stats['flush_durations']) / len(stats['flush_durations'])
+            if stats["flush_durations"]:
+                stats["avg_flush_duration"] = sum(stats["flush_durations"]) / len(stats["flush_durations"])
             else:
-                stats['avg_flush_duration'] = 0
+                stats["avg_flush_duration"] = 0
 
-            uptime = time.time() - stats['start_time']
-            stats['processing_rate'] = (
-                stats['total_processed'] / uptime if uptime > 0 else 0
-            )
+            uptime = time.time() - stats["start_time"]
+            stats["processing_rate"] = stats["total_processed"] / uptime if uptime > 0 else 0
 
             return stats
 
@@ -327,24 +393,22 @@ class MonitoringLogger:
         """Return a health assessment of the queue."""
         stats = self.get_queue_stats()
         return {
-            'status': 'healthy' if stats['current_size'] < self.max_rows_per_file else 'backlogged',
-            'backlog': stats['current_size'],
-            'processing_rate': stats['processing_rate'],
-            'estimated_time_to_clear': (
-                stats['current_size'] / stats['processing_rate']
-                if stats['processing_rate'] > 0
-                else float('inf')
+            "status": "healthy" if stats["current_size"] < self.max_rows_per_file else "backlogged",
+            "backlog": stats["current_size"],
+            "processing_rate": stats["processing_rate"],
+            "estimated_time_to_clear": (
+                stats["current_size"] / stats["processing_rate"] if stats["processing_rate"] > 0 else float("inf")
             ),
-            'last_flush': {
-                'time': stats['last_flush_time'],
-                'duration': stats['flush_durations'][-1] if stats['flush_durations'] else 0,
-                'items_processed': stats['last_flush_size']
+            "last_flush": {
+                "time": stats["last_flush_time"],
+                "duration": stats["flush_durations"][-1] if stats["flush_durations"] else 0,
+                "items_processed": stats["last_flush_size"],
             },
-            'totals': {
-                'received': stats['total_received'],
-                'processed': stats['total_processed'],
-                'uptime_seconds': time.time() - stats['start_time']
-            }
+            "totals": {
+                "received": stats["total_received"],
+                "processed": stats["total_processed"],
+                "uptime_seconds": time.time() - stats["start_time"],
+            },
         }
 
     def _emergency_flush(self):

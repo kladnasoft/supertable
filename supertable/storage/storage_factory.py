@@ -33,12 +33,17 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
 
     Selection order:
       1) explicit `kind` argument if provided
-      2) default.STORAGE_TYPE (e.g., 'LOCAL', 'S3', 'MINIO', 'AZURE')
-      3) fallback to 'LOCAL'
+      2) process environment STORAGE_TYPE (live os.environ)
+      3) default.STORAGE_TYPE (e.g., 'LOCAL', 'S3', 'MINIO', 'AZURE')
+      4) fallback to 'LOCAL'
 
-    For AZURE: if no args are provided, constructs from environment (supports abfss:// SUPERTABLE_HOME and AAD).
+    For AZURE and MINIO: if no args are provided, construct from environment.
     """
-    storage_type = (kind or getattr(default, "STORAGE_TYPE", None) or "LOCAL").upper()
+    storage_type = (
+        (kind or "").upper()
+        or (os.getenv("STORAGE_TYPE") or "").upper()
+        or (getattr(default, "STORAGE_TYPE", None) or "LOCAL").upper()
+    )
 
     if storage_type == "LOCAL":
         mod = importlib.import_module("supertable.storage.local_storage")
@@ -52,7 +57,12 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     if storage_type == "MINIO":
         _require("minio", "minio")
         mod = importlib.import_module("supertable.storage.minio_storage")
-        return getattr(mod, "MinioStorage")(**kwargs)
+        MinioStorage = getattr(mod, "MinioStorage")
+        if kwargs:
+            # Backward compatibility: explicit parameters provided by caller
+            return MinioStorage(**kwargs)
+        # From environment (endpoint, creds, bucket)
+        return MinioStorage.from_env()
 
     if storage_type == "AZURE":
         _require("azure.storage.blob", "azure")

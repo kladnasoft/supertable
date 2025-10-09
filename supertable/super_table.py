@@ -66,7 +66,7 @@ class SuperTable:
                 "previous": None,
                 "version": 0,
                 "tables": 0,
-                "format_mirrors": [],  # <-- NEW
+                "format_mirrors": [],  # <-- mirrors persisted in meta
             }
             self.storage.write_json(self.super_meta_path, meta_data)
 
@@ -110,10 +110,35 @@ class SuperTable:
 
     def get_super_meta_with_shared_lock(self) -> Dict[str, Any]:
         """
-        Use shared/read locking to read the meta file (local-file based implementation).
+        Acquire a read/shared lock using the configured backend and read meta via the
+        active storage interface (works for LOCAL and object storage like MinIO).
         """
-        last_super_table = self.locking.lock_shared_and_read(self.super_meta_path)
-        return last_super_table
+        timeout = default.DEFAULT_TIMEOUT_SEC
+        duration = default.DEFAULT_LOCK_DURATION_SEC
+
+        # Try to lock just the meta path as a logical resource, then read via storage.
+        acquired = self.locking.lock_resources(
+            [self.super_meta_path],
+            timeout_seconds=timeout,
+            lock_duration_seconds=duration,
+        )
+        try:
+            if not acquired:
+                # Tolerate by returning empty to callers that handle it defensively.
+                return {}
+
+            if not self.storage.exists(self.super_meta_path):
+                return {}
+            if self.storage.size(self.super_meta_path) == 0:
+                return {}
+
+            return self.storage.read_json(self.super_meta_path)
+        finally:
+            # Release only this resource (subset release)
+            try:
+                self.locking.release_lock([self.super_meta_path])
+            except Exception:
+                pass
 
     def get_super_meta(self) -> Dict[str, Any]:
         """
@@ -186,7 +211,7 @@ class SuperTable:
         last_super_table = read_super_table(last_super_meta, self.storage)
 
         # Preserve mirrors across meta rewrites
-        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))  # <-- NEW
+        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))  # <-- preserve mirrors
 
         last_updated_ms = int(datetime.now().timestamp() * 1000)
         last_super_version = last_super_table.get("version", 0)
@@ -236,7 +261,7 @@ class SuperTable:
         }
         self.storage.write_json(self.super_meta_path, meta_data)
 
-        # ---- MIRROR (if enabled) ----------------------------------------- NEW
+        # ---- MIRROR (if enabled)
         try:
             # Read the full simple-table snapshot for schema + resources
             simple_snapshot = self.read_simple_table_snapshot(simple_table_path)
@@ -273,7 +298,7 @@ class SuperTable:
         last_super_table = read_super_table(last_super_meta, self.storage)
 
         # Preserve mirrors across meta rewrites
-        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))  # <-- NEW
+        mirrors: List[str] = list(last_super_meta.get("format_mirrors", []))
 
         last_updated_ms = int(datetime.now().timestamp() * 1000)
         last_super_version = last_super_table.get("version", 0)
@@ -310,7 +335,7 @@ class SuperTable:
             "total_file_size": total_file_size,
             "tables": len(new_snapshots),
             "version": last_super_version + 1,
-            "format_mirrors": mirrors,  # <-- NEW
+            "format_mirrors": mirrors,
         }
         self.storage.write_json(self.super_meta_path, meta_data)
 

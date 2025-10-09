@@ -1,34 +1,44 @@
+# locking.py
+
 import json
 import time
 import fcntl
-import supertable.config.homedir
+from typing import Optional
+
+import supertable.config.homedir  # noqa: F401
 
 from supertable.config.defaults import default
 from supertable.locking.file_lock import FileLocking
 from supertable.locking.locking_backend import LockingBackend
 
+
 class Locking:
+    """
+    Unified locking façade that delegates to a concrete backend (file or Redis)
+    and provides a small set of convenience helpers used across the codebase.
+    """
+
     def __init__(
         self,
-        identity,
-        backend: LockingBackend = None,
-        working_dir=None,
-        lock_file_name=".lock.json",
-        check_interval=0.1,
-        **kwargs
+        identity: str,
+        backend: Optional[LockingBackend] = None,
+        working_dir: Optional[str] = None,
+        lock_file_name: str = ".lock.json",
+        check_interval: float = 0.1,
+        **kwargs,
     ):
         """
         Parameters:
-            identity: Unique identifier for the lock.
+            identity: Unique identifier for the lock owner (used for logging/diagnostics).
             backend:
                 - LockingBackend.FILE or LockingBackend.REDIS
                 - If None, auto-detect based on default.STORAGE_TYPE.
-                - If default.STORAGE_TYPE == 'LOCAL', use file-based locking.
-                - Otherwise, use Redis-based locking.
+                  If default.STORAGE_TYPE == 'LOCAL', use file-based locking.
+                  Otherwise, use Redis-based locking.
             working_dir: Required for file-based locking; ignored for Redis.
             lock_file_name: Name of the lock file (for file-based locking).
             check_interval: Time between retry attempts.
-            kwargs: Additional parameters passed to the backend.
+            kwargs: Additional parameters passed to the backend (e.g., Redis connection).
         """
         self.identity = identity
         self.check_interval = check_interval
@@ -50,10 +60,13 @@ class Locking:
             # Lazy import to avoid pulling Redis when not needed
             try:
                 from supertable.locking.redis_lock import RedisLocking
-                self.lock_instance = RedisLocking(identity, check_interval=self.check_interval, **redis_options)
+
+                self.lock_instance = RedisLocking(
+                    identity, check_interval=self.check_interval, **redis_options
+                )
             except Exception as e:
                 raise RuntimeError(
-                    "Redis backend selected, but redis backend could not be imported. "
+                    "Redis backend selected, but the Redis backend could not be imported. "
                     "Install `redis` and ensure configuration is correct."
                 ) from e
 
@@ -67,18 +80,20 @@ class Locking:
         else:
             raise ValueError(f"Unsupported locking backend: {self.backend}")
 
+    # ---------------- Public proxy API ----------------
+
     def lock_resources(
         self,
         resources,
-        timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-        lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC
+        timeout_seconds: int = default.DEFAULT_TIMEOUT_SEC,
+        lock_duration_seconds: int = default.DEFAULT_LOCK_DURATION_SEC,
     ):
         return self.lock_instance.lock_resources(resources, timeout_seconds, lock_duration_seconds)
 
     def self_lock(
         self,
-        timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-        lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC
+        timeout_seconds: int = default.DEFAULT_TIMEOUT_SEC,
+        lock_duration_seconds: int = default.DEFAULT_LOCK_DURATION_SEC,
     ):
         return self.lock_instance.self_lock(timeout_seconds, lock_duration_seconds)
 
@@ -100,63 +115,92 @@ class Locking:
         except Exception:
             pass
 
+    # ---------------- Convenience helpers ----------------
 
     def lock_shared_and_read(self, lock_file_path: str):
         """
-        Acquires a shared lock and reads the file contents.
-        - If STORAGE_TYPE=LOCAL, it uses local file I/O plus an fcntl-based shared lock.
-        - Otherwise, it falls back to Redis-based locking, then reads from self.storage.
+        Acquire a shared/read lock for the given *path-like* resource and return
+        the JSON content of that file (dict/list). Behavior depends on backend:
 
-        Returns:
-          The data (as a dict or list) read from the file if successful,
-          or None if unable to lock/read within DEFAULT_TIMEOUT_SEC.
+        - FILE backend:
+            Use an fcntl-based shared lock directly on the local file, then read.
+        - REDIS backend:
+            Use the Redis locking backend to acquire a logical lock on the
+            path string, then read the file via local I/O.
+
+        Notes:
+            * This helper intentionally avoids any dependency on a storage/S3
+              abstraction. If remote storage is needed, call sites should be
+              refactored to pass in a reader callable, or a corresponding
+              storage-aware helper should be introduced. For now, this function
+              reads via local filesystem paths which matches current usage.
         """
-        result = {}
         start_time = time.time()
+        result = {}
 
-        while time.time() - start_time < default.DEFAULT_TIMEOUT_SEC:
-            if default.STORAGE_TYPE.upper() == "LOCAL":
-                # 1. Local mode: use fcntl-based locking on a local file
+        # -------- File backend: fcntl shared lock + local read
+        if self.backend == LockingBackend.FILE:
+            while time.time() - start_time < default.DEFAULT_TIMEOUT_SEC:
                 try:
                     with open(lock_file_path, "r") as local_file:
                         fcntl.flock(local_file, fcntl.LOCK_SH)
                         try:
                             result = json.load(local_file)
-                            break
+                            return result
                         finally:
                             fcntl.flock(local_file, fcntl.LOCK_UN)
                 except BlockingIOError:
-                    # Could not acquire the lock; retry after a brief delay
                     time.sleep(self.check_interval)
                 except FileNotFoundError:
-                    # The file doesn't exist locally
-                    break
+                    # Missing file is a valid "empty" state for callers.
+                    return {}
                 except json.JSONDecodeError:
-                    # File is present but not valid JSON
-                    # Depending on your preference, either break or raise an error
-                    break
+                    # Corrupt/empty JSON -> treat as empty to avoid hard failure.
+                    return {}
+                except OSError:
+                    # Transient I/O -> retry until timeout
+                    time.sleep(self.check_interval)
+            # Timeout -> return empty
+            return {}
 
-            else:
-                # 2. Remote mode (S3, MinIO, etc.): use Redis-based locking and read from storage
+        # -------- Redis backend: logical lock on the path + local read
+        # Use the existing backend to lock the path string atomically.
+        timeout = default.DEFAULT_TIMEOUT_SEC
+        duration = default.DEFAULT_LOCK_DURATION_SEC
+        acquired = False
+
+        try:
+            while time.time() - start_time < timeout:
+                acquired = self.lock_instance.lock_resources(
+                    [lock_file_path],
+                    timeout_seconds=min(1, max(0, timeout - int(time.time() - start_time))),
+                    lock_duration_seconds=duration,
+                )
+                if acquired:
+                    break
+                time.sleep(self.check_interval)
+
+            if not acquired:
+                # Could not acquire within timeout; return empty to keep callers tolerant.
+                return {}
+
+            # Once locked, perform a best-effort local read (see Notes above).
+            try:
+                with open(lock_file_path, "r") as fh:
+                    try:
+                        return json.load(fh)
+                    except json.JSONDecodeError:
+                        return {}
+                    except OSError:
+                        return {}
+            except FileNotFoundError:
+                return {}
+
+        finally:
+            if acquired:
+                # Always release only the resource we took.
                 try:
-                    acquired = self.redis_lock.acquire_shared_lock(
-                        lock_name=lock_file_path,
-                        timeout=default.DEFAULT_TIMEOUT_SEC
-                    )
-                    if acquired:
-                        try:
-                            # Use the storage interface for remote read
-                            result = self.storage.read_json(lock_file_path)
-                        finally:
-                            self.redis_lock.release_shared_lock(lock_file_path)
-                        break
-                    else:
-                        time.sleep(self.check_interval)
-                except FileNotFoundError:
-                    # Path not found in remote storage
-                    break
-                except json.JSONDecodeError:
-                    # Remote file has invalid JSON
-                    break
-
-        return result
+                    self.lock_instance.release_lock([lock_file_path])
+                except Exception:
+                    # Never raise on cleanup
+                    pass
