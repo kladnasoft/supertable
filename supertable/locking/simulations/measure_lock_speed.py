@@ -3,63 +3,53 @@ import os
 import sys
 import gc
 import time
-import shutil
 import random
 import argparse
-import tempfile
 import threading
+
+import supertable.config.homedir  # ensure env/init
 from supertable.config.defaults import logger, logging
-logger.setLevel(logging.DEBUG)
+from supertable.locking import Locking
+from supertable.storage.storage_factory import get_storage
 
-
-# ---- Import your locking implementation ----
-try:
-    from supertable.locking.file_lock import FileLocking as OriginalLocking
-except Exception as e:
-    print("[FATAL] Could not import supertable.locking.file_lock.FileLocking")
-    raise
+logger.setLevel(logging.INFO)
 
 # ---------- Defaults ----------
 NUM_THREADS_DEFAULT = 10
-HOLD_TIME_DEFAULT   = 1.0   # seconds each thread holds the lock once acquired
-RES_POOL_SIZE       = 50    # resources are named res1..res50
-PICKS_PER_THREAD    = 5     # each thread picks 5 distinct resources
+HOLD_TIME_DEFAULT = 1.0  # seconds each thread holds the lock once acquired
+RES_POOL_SIZE = 50       # resources are named res1..res50
+PICKS_PER_THREAD = 5     # each thread picks 5 distinct resources
 
 
 def run_multithreaded_test(
-    lock_cls,
-    label,
-    num_threads=NUM_THREADS_DEFAULT,
-    hold_time=HOLD_TIME_DEFAULT,
-    working_dir=None,
-    use_tmpdir=False,
-    keep_dir=False,
+    label: str,
+    num_threads: int = NUM_THREADS_DEFAULT,
+    hold_time: float = HOLD_TIME_DEFAULT,
+    working_dir: str | None = None,
 ):
     """
-    Run a multi-threaded contention test against lock_cls (FileLocking).
-    - If use_tmpdir=True: uses a unique temp dir (deleted unless keep_dir=True).
-    - Else: uses a persistent project-local '.locks' dir (created if needed).
+    Run a multi-threaded contention test using the unified Locking façade.
+    Works with any configured storage backend (File/MinIO/S3 + Redis locking).
     """
+    storage = get_storage()
 
-    if use_tmpdir:
-        tmpdir = tempfile.mkdtemp(prefix="locktest-")
-        workdir = tmpdir
-    else:
-        workdir = os.path.abspath("./.locks")
-        os.makedirs(workdir, exist_ok=True)
-        tmpdir = None  # not used
+    # Default to a persistent, backend-agnostic ".locks" directory in storage
+    workdir = working_dir or ".locks"
+    if not storage.exists(workdir):
+        storage.makedirs(workdir)
 
     barrier = threading.Barrier(num_threads)
-    acquisitions = []       # dicts with thread info (for analysis)
+    acquisitions: list[dict] = []
     acquisitions_lock = threading.Lock()
 
-    def worker(idx):
+    def worker(idx: int) -> None:
         # each thread picks 5 distinct resources from 1–50
         picks = random.sample(range(1, RES_POOL_SIZE + 1), PICKS_PER_THREAD)
-        resources = [f"res{n}" for n in picks]
+        # Use storage-path resources so both File and remote backends behave consistently
+        resources = [os.path.join(workdir, f"res{n}") for n in picks]
 
         name = f"{label}-T{idx}"
-        lock = lock_cls(identity=name, working_dir=workdir)
+        lock = Locking(identity=name, working_dir=workdir)
 
         print(f"[{name}] attempting lock on {resources}")
         barrier.wait()  # sync start
@@ -75,17 +65,18 @@ def run_multithreaded_test(
         wait_time = t1 - t0
         print(f"[{name}] acquired lock after waiting {wait_time:.4f}s")
 
-        # record acquisition info
         with acquisitions_lock:
-            acquisitions.append({
-                "name": name,
-                "resources": set(resources),
-                "start": t0,
-                "acquired": t1,
-                "wait": wait_time
-            })
+            acquisitions.append(
+                {
+                    "name": name,
+                    "resources": set(resources),
+                    "start": t0,
+                    "acquired": t1,
+                    "wait": wait_time,
+                }
+            )
 
-        # hold the lock
+        # hold the lock, then release all
         time.sleep(hold_time)
         lock.release_lock()
 
@@ -95,13 +86,9 @@ def run_multithreaded_test(
     for t in threads:
         t.join()
 
-    # Give destructors/atexit a chance to run *before* removing temp dir
+    # Let any finalizers run
     gc.collect()
     time.sleep(0.2)
-
-    # cleanup
-    if use_tmpdir and tmpdir and not keep_dir:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
     # post-process to determine which thread waited for which
     print(f"\n{label} DETAILED WAIT ANALYSIS:")
@@ -113,10 +100,10 @@ def run_multithreaded_test(
             and other["resources"].intersection(rec["resources"])
         ]
         dep_list = ", ".join(deps) if deps else "none"
-        print(f"- {rec['name']} waited {rec['wait']:.4f}s; "
-              f"blocked by: {dep_list}")
+        print(
+            f"- {rec['name']} waited {rec['wait']:.4f}s; blocked by: {dep_list}"
+        )
 
-    # summary
     waits = [r["wait"] for r in acquisitions]
     avg = sum(waits) / len(waits) if waits else 0.0
     mn = min(waits) if waits else 0.0
@@ -128,42 +115,51 @@ def run_multithreaded_test(
     print(f"  Avg wait          : {avg:.4f}s")
     print(f"  Min wait          : {mn:.4f}s")
     print(f"  Max wait          : {mx:.4f}s")
-    if use_tmpdir:
-        print(f"  Working dir       : {tmpdir} (temp)")
-        print(f"  Kept dir?         : {'yes' if keep_dir else 'no'}")
-    else:
-        print(f"  Working dir       : {workdir} (persistent)")
+    print(f"  Working dir       : {workdir} (storage)" )
     print("-" * 40)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Measure FileLocking multi-threaded lock timing.")
-    ap.add_argument("--threads", type=int, default=NUM_THREADS_DEFAULT, help="Number of threads (default: 10)")
-    ap.add_argument("--hold", type=float, default=HOLD_TIME_DEFAULT, help="Seconds each thread holds the lock (default: 1.0)")
-    ap.add_argument("--use-tmpdir", action="store_true", help="Use a temporary working directory for the lock file")
-    ap.add_argument("--keep-dir", action="store_true", help="When using --use-tmpdir, keep the directory after the run")
-    ap.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (default: None)")
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Measure multi-threaded lock timing using storage-backed locking."
+    )
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=NUM_THREADS_DEFAULT,
+        help="Number of threads (default: 10)",
+    )
+    ap.add_argument(
+        "--hold",
+        type=float,
+        default=HOLD_TIME_DEFAULT,
+        help="Seconds each thread holds the lock (default: 1.0)",
+    )
+    ap.add_argument(
+        "--workdir",
+        type=str,
+        default=".locks",
+        help="Logical working directory inside the configured storage (default: .locks)",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: None)",
+    )
     args = ap.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
 
-    print("==== LOCKING Implementation ====")
+    print("==== STORAGE-BASED LOCKING ====")
     run_multithreaded_test(
-        OriginalLocking,
         "Locking",
         num_threads=args.threads,
         hold_time=args.hold,
-        working_dir=os.path.abspath("./.locks"),  # <- force shared dir
-        use_tmpdir=False,  # <- keep persistent dir
-        keep_dir=False,
+        working_dir=args.workdir,
     )
 
 
 if __name__ == "__main__":
-    # No args needed — defaults give you a clean run with persistent ./.locks
-    # Example overrides:
-    #   --threads 16 --hold 0.5
-    #   --use-tmpdir            (uses /tmp, removed safely)
-    #   --use-tmpdir --keep-dir (inspect lock file after run)
     main()

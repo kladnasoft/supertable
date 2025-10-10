@@ -17,8 +17,8 @@ class TimePrecision(Enum):
 FILE_FORMAT = "parquet"  # Can be 'csv', 'parquet', or 'json'
 START_DATE = "2025-01-01"
 ITERATION = 1
-MIN_FILES = 1000
-MAX_FILES = 10000
+MIN_FILES = 50
+MAX_FILES = 200
 MIN_ROWS = 10
 MAX_ROWS = 1000
 MIN_COLUMNS = 6

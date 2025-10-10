@@ -43,6 +43,7 @@ class SuperTable:
         logger.debug(f"super_dir: {self.super_dir}")
         logger.debug(f"super_meta: {self.super_meta_path}")
 
+        # One locking coordinator for all super/meta operations.
         self.locking = Locking(identity=self.super_name, working_dir=self.super_dir)
         self.init_super_table()
 
@@ -88,15 +89,21 @@ class SuperTable:
     # ------------------------------ meta getters (with/without locking)
     def get_super_meta_with_lock(self) -> Dict[str, Any]:
         """
-        Acquire an exclusive lock, read meta JSON, and release the lock.
+        Acquire a short, exclusive lock on the *meta path resource*, read meta JSON,
+        and release the lock. Using the same resource as writers ensures readers
+        contend correctly with updates.
         """
+        timeout = default.DEFAULT_TIMEOUT_SEC
+        duration = default.DEFAULT_LOCK_DURATION_SEC
+
+        acquired = self.locking.lock_resources(
+            [self.super_meta_path],
+            timeout_seconds=timeout,
+            lock_duration_seconds=duration,
+        )
         try:
-            locked = self.locking.self_lock(
-                timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-                lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC,
-            )
-            if not locked:
-                raise RuntimeError(f"Failed to acquire locks for super table: {self.super_meta_path}")
+            if not acquired:
+                raise RuntimeError(f"Failed to acquire lock for super table meta: {self.super_meta_path}")
 
             if not self.storage.exists(self.super_meta_path):
                 raise FileNotFoundError(f"Super table meta file not found: {self.super_meta_path}")
@@ -105,18 +112,19 @@ class SuperTable:
 
             return self.storage.read_json(self.super_meta_path)
         finally:
-            # Always release even if exceptions were thrown
-            self.locking.release_lock()
+            try:
+                self.locking.release_lock([self.super_meta_path])
+            except Exception:
+                pass
 
     def get_super_meta_with_shared_lock(self) -> Dict[str, Any]:
         """
-        Acquire a read/shared lock using the configured backend and read meta via the
-        active storage interface (works for LOCAL and object storage like MinIO).
+        Acquire a very short, exclusive lock on the meta path and read meta via storage.
+        (Name kept for compatibility; backend does not implement true shared locks.)
         """
         timeout = default.DEFAULT_TIMEOUT_SEC
         duration = default.DEFAULT_LOCK_DURATION_SEC
 
-        # Try to lock just the meta path as a logical resource, then read via storage.
         acquired = self.locking.lock_resources(
             [self.super_meta_path],
             timeout_seconds=timeout,
@@ -134,7 +142,6 @@ class SuperTable:
 
             return self.storage.read_json(self.super_meta_path)
         finally:
-            # Release only this resource (subset release)
             try:
                 self.locking.release_lock([self.super_meta_path])
             except Exception:
@@ -197,7 +204,7 @@ class SuperTable:
         Update the super-table snapshot and meta to point to `simple_table_path`.
 
         DEADLOCK PREVENTION:
-        This method is called while the caller already holds the EXCLUSIVE lock
+        This method is called while the caller already holds the meta-path lock
         via `update_with_lock()`. Therefore, DO NOT acquire the same lock again
         from inside this method. Read meta WITHOUT locking here.
         """
@@ -205,7 +212,7 @@ class SuperTable:
         rows = sum(item["rows"] for item in simple_table_content)
         file_size = sum(item["file_size"] for item in simple_table_content)
 
-        # Read without lock (we already hold it at the caller)
+        # Read without lock (outer caller holds it)
         last_super_meta = self.get_super_meta()
         last_super_path = last_super_meta.get("current", "")
         last_super_table = read_super_table(last_super_meta, self.storage)
@@ -276,21 +283,34 @@ class SuperTable:
             logger.error(f"[mirror] Failed to write mirrors for table '{table_name}': {e}")
 
     def update_with_lock(self, table_name, simple_table_path, simple_table_content):
-        if not self.locking.self_lock(
-            timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-            lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC,
-        ):
-            raise RuntimeError("Failed to acquire locks for meta resources")
+        """
+        Public API to update super snapshot/meta.
+        Locks the meta path resource so readers and writers contend on the same key.
+        """
+        timeout = default.DEFAULT_TIMEOUT_SEC
+        duration = default.DEFAULT_LOCK_DURATION_SEC
 
-        # We now hold the exclusive lock → safe to call the unlocked updater.
-        self.update_super_table(table_name, simple_table_path, simple_table_content)
-        self.locking.release_lock()
+        if not self.locking.lock_resources(
+            [self.super_meta_path],
+            timeout_seconds=timeout,
+            lock_duration_seconds=duration,
+        ):
+            raise RuntimeError("Failed to acquire lock for meta resources")
+
+        try:
+            # We now hold the exclusive meta-path lock → safe to call the unlocked updater.
+            self.update_super_table(table_name, simple_table_path, simple_table_content)
+        finally:
+            try:
+                self.locking.release_lock([self.super_meta_path])
+            except Exception:
+                pass
 
     # -------------------------- remove helpers (deadlock-safe like update)
     def _remove_table_unlocked(self, table_name: str):
         """
         Internal helper that performs the meta/snapshot update to remove a table.
-        Caller MUST hold the exclusive lock already. This function must NOT lock.
+        Caller MUST hold the meta-path exclusive lock already. This function must NOT lock.
         """
         # Read without taking a lock (outer caller holds it)
         last_super_meta = self.get_super_meta()
@@ -349,16 +369,23 @@ class SuperTable:
     def remove_table_with_lock(self, table_name: str):
         """
         Public API to remove a table from the super table.
-        Acquires the exclusive lock once and avoids self-deadlock by calling
+        Acquires the meta-path exclusive lock once and avoids self-deadlock by calling
         the *_unlocked() variant internally.
         """
-        if not self.locking.self_lock(
-            timeout_seconds=default.DEFAULT_TIMEOUT_SEC,
-            lock_duration_seconds=default.DEFAULT_LOCK_DURATION_SEC,
+        timeout = default.DEFAULT_TIMEOUT_SEC
+        duration = default.DEFAULT_LOCK_DURATION_SEC
+
+        if not self.locking.lock_resources(
+            [self.super_meta_path],
+            timeout_seconds=timeout,
+            lock_duration_seconds=duration,
         ):
-            raise RuntimeError("Failed to acquire locks for meta resources")
+            raise RuntimeError("Failed to acquire lock for meta resources")
 
         try:
             self._remove_table_unlocked(table_name)
         finally:
-            self.locking.release_lock()
+            try:
+                self.locking.release_lock([self.super_meta_path])
+            except Exception:
+                pass
