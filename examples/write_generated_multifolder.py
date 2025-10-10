@@ -45,7 +45,7 @@ quiet_logs()
 # -------------------------
 # Config
 # -------------------------
-DEFAULT_THREADS = 4
+DEFAULT_THREADS = 12
 # If DataWriter.write is NOT thread-safe, set this to True to serialize writes:
 SERIALIZE_WRITES = False
 

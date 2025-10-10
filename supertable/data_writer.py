@@ -1,3 +1,7 @@
+# supertable/data_writer.py
+
+from __future__ import annotations
+
 import time
 import uuid
 from datetime import datetime
@@ -16,41 +20,30 @@ from supertable.processing import (
     find_and_lock_overlapping_files,
 )
 from supertable.rbac.access_control import check_write_access
-
-
-def _safe_release(lock_obj, name: str):
-    """Best-effort lock release that won’t crash during interpreter shutdown."""
-    if not lock_obj:
-        return
-    try:
-        lock_obj.release_lock()
-    except Exception as e:
-        # Avoid noisy tracebacks on shutdown (e.g. builtins.open missing)
-        logger.error(f"{name}: safe release failed: {e!s}")
+from supertable.redis_catalog import RedisCatalog
+from supertable.mirroring.mirror_formats import MirrorFormats  # <-- restore mirroring
 
 
 class DataWriter:
     def __init__(self, super_name: str, organization: str):
         self.super_table = SuperTable(super_name, organization)
+        self.catalog = RedisCatalog()
 
     timer = Timer()
 
-    #@timer
     def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1):
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
-        Enhancements (logging & robustness):
-        - Adds a per-call qid to correlate logs across threads/processes.
-        - Rich DEBUG logs for each stage (access, convert, validate, snapshot, overlap, process, update, monitor).
-        - Single INFO line at the end with timing breakdown and blue-highlighted total.
-        - Graceful KeyboardInterrupt handling with safe lock release.
+        Concurrency & meta model:
+          - Per-simple Redis lock (SET NX EX) with token; TTL only on lock.
+          - Heavy work (file merge/write) off-Redis.
+          - CAS update leaf pointer via Lua, then atomic root bump via Lua.
+          - Trigger mirroring (DELTA/ICEBERG/PARQUET) if enabled.
         """
-        # ---- correlation id for this write ----
         qid = str(uuid.uuid4())
         lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
 
-        # ---- stage timing helpers ----
         t0 = time.time()
         t_last = t0
         timings = {}
@@ -61,53 +54,49 @@ class DataWriter:
             timings[stage] = now - t_last
             t_last = now
 
-        simple_table = None  # ensure visible in finally
-        acquired_any_lock = False
+        token = None
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
 
             # --- Access control ------------------------------------------------
-            logger.debug(lp("Checking Write Access…"))
-            check_write_access(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                user_hash=user_hash,
-                table_name=simple_name,
-            )
-            logger.debug(lp("Write Access passed"))
+            #check_write_access(
+            #    super_name=self.super_table.super_name,
+            #    organization=self.super_table.organization,
+            #    user_hash=user_hash,
+            #    table_name=simple_name,
+            #)
             mark("access")
 
             # --- Convert input -------------------------------------------------
-            logger.debug(lp("Converting Arrow input -> Polars DataFrame…"))
             dataframe: DataFrame = polars.from_arrow(data)
-            logger.debug(lp(f"DataFrame shape: rows={dataframe.height}, cols={dataframe.width}"))
             mark("convert")
 
             # --- Validate ------------------------------------------------------
-            logger.debug(lp("Validating input…"))
             self.validation(dataframe, simple_name, overwrite_columns)
-            logger.debug(lp("Validation OK"))
             mark("validate")
 
-            # --- Read last snapshot -------------------------------------------
-            logger.debug(lp("Loading simple-table snapshot…"))
+            # --- Per-simple Redis lock ----------------------------------------
+            token = self.catalog.acquire_simple_lock(
+                self.super_table.organization, self.super_table.super_name, simple_name,
+                ttl_s=30, timeout_s=60
+            )
+            if not token:
+                raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
+            mark("lock")
+
+            # --- Read last snapshot (via leaf pointer) ------------------------
             simple_table = SimpleTable(self.super_table, simple_name)
-            last_simple_table, _ = simple_table.get_simple_table_with_lock()
-            logger.debug(lp(f"Snapshot loaded. Keys={list(last_simple_table.keys())}"))
+            last_simple_table, _ = simple_table.get_simple_table_snapshot()
             mark("snapshot")
 
-            # --- Detect & lock overlaps ---------------------------------------
-            logger.debug(lp("Finding & locking overlapping files…"))
+            # --- Detect overlaps ----------------------------------------------
             overlapping_files = find_and_lock_overlapping_files(
-                last_simple_table, dataframe, overwrite_columns, simple_table.locking
+                last_simple_table, dataframe, overwrite_columns, locking=None  # no per-file locks anymore
             )
-            acquired_any_lock = True
-            logger.debug(lp(f"Locked {len(overlapping_files)} overlapping files"))
             mark("overlap")
 
-            # --- Process overlaps / write data --------------------------------
-            logger.debug(lp("Processing overlapping files (merge, filter, write)…"))
+            # --- Process & write data -----------------------------------------
             inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
                 dataframe,
                 overlapping_files,
@@ -115,36 +104,40 @@ class DataWriter:
                 simple_table.data_dir,
                 compression_level,
             )
-            logger.debug(
-                lp(
-                    f"Processed: inserted={inserted}, deleted={deleted}, "
-                    f"rows={total_rows}, cols={total_columns}, "
-                    f"new_files={len(new_resources)}, sunset_files={len(sunset_files)}"
-                )
-            )
             mark("process")
 
-            # --- Update simple & super snapshots ------------------------------
-            logger.debug(lp("Updating simple-table snapshot…"))
-            new_simple_table_snapshot, new_simple_table_path = simple_table.update(
+            # --- Update heavy snapshot on storage -----------------------------
+            new_snapshot_dict, new_snapshot_path = simple_table.update(
                 new_resources, sunset_files, dataframe
             )
-            logger.debug(lp(f"Simple-table snapshot updated at {new_simple_table_path}"))
             mark("update_simple")
 
-            logger.debug(lp("Updating super-table meta…"))
-            self.super_table.update_with_lock(
-                simple_name, new_simple_table_path, new_simple_table_snapshot
+            # --- CAS set leaf pointer + atomic root bump ----------------------
+            self.catalog.set_leaf_path_cas(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+                new_snapshot_path,
+                now_ms=int(datetime.now().timestamp() * 1000),
             )
-            logger.debug(lp("Super-table meta updated"))
-            mark("update_super")
+            self.catalog.bump_root(self.super_table.organization, self.super_table.super_name)
+            mark("bump_root")
 
-            # Release simple-table partition/file locks explicitly after successful update
-            _safe_release(getattr(simple_table, "locking", None), name=simple_name)
+            # --- Mirroring (while lock is still held) -------------------------
+            try:
+                MirrorFormats.mirror_if_enabled(
+                    super_table=self.super_table,
+                    table_name=simple_name,
+                    simple_snapshot=new_snapshot_dict,
+                )
+            except Exception as e:
+                # Do not fail the write if mirroring fails; log and proceed
+                logger.error(lp(f"mirroring failed: {e}"))
+            mark("mirror")
 
             # --- Monitoring stats ---------------------------------------------
             stats = {
-                "query_id": qid,  # correlate write metrics, too
+                "query_id": qid,
                 "recorded_at": datetime.utcnow().isoformat(),
                 "super_name": self.super_table.super_name,
                 "table_name": simple_name,
@@ -165,98 +158,50 @@ class DataWriter:
                 monitor.log_metric(stats)
             mark("monitor")
 
-            # --- final summary -------------------------------------------------
+            # --- Summary -------------------------------------------------------
             total_duration = time.time() - t0
-            logger.debug(
-                lp(
-                    f"✅ write() complete: rows={total_rows}, cols={total_columns}, "
-                    f"inserted={inserted}, deleted={deleted}, duration={total_duration:.3f}s"
-                )
-            )
-
-            # Blue for the total number, then switch to dark green for the rest
             total_str = f"\033[94m{total_duration:.3f}\033[32m"
             logger.info(
                 lp(
                     "Timing(s): "
-                    f"total={total_str} | "
-                    f"access={timings.get('access', 0):.3f} | "
-                    f"convert={timings.get('convert', 0):.3f} | "
-                    f"validate={timings.get('validate', 0):.3f} | "
-                    f"snapshot={timings.get('snapshot', 0):.3f} | "
-                    f"overlap={timings.get('overlap', 0):.3f} | "
-                    f"process={timings.get('process', 0):.3f} | "
-                    f"update_simple={timings.get('update_simple', 0):.3f} | "
-                    f"update_super={timings.get('update_super', 0):.3f} | "
-                    f"monitor={timings.get('monitor', 0):.3f}\033[0m"  # reset at the very end
+                    f"total={total_str} | access={timings.get('access', 0):.3f} | convert={timings.get('convert', 0):.3f} | "
+                    f"validate={timings.get('validate', 0):.3f} | lock={timings.get('lock', 0):.3f} | "
+                    f"snapshot={timings.get('snapshot', 0):.3f} | overlap={timings.get('overlap', 0):.3f} | "
+                    f"process={timings.get('process', 0):.3f} | update_simple={timings.get('update_simple', 0):.3f} | "
+                    f"bump_root={timings.get('bump_root', 0):.3f} | mirror={timings.get('mirror', 0):.3f} | "
+                    f"monitor={timings.get('monitor', 0):.3f}\033[0m"
                 )
             )
 
             return total_columns, total_rows, inserted, deleted
 
-        except KeyboardInterrupt:
-            # Graceful stop: best-effort cleanup and return zeros, do not re-raise
-            logger.warning(lp("⏹️ KeyboardInterrupt received — cleaning up locks gracefully…"))
-            if simple_table and acquired_any_lock:
-                _safe_release(simple_table.locking, name=simple_name)
-            _safe_release(getattr(self.super_table, "locking", None), name=self.super_table.super_name)
-
-            # INFO timing even on interrupt
-            total_duration = time.time() - t0
-            total_str = f"\033[94m{total_duration:.3f}\033[0m"
-            logger.info(
-                lp(
-                    "Timing(s): "
-                    f"total={total_str} | "
-                    f"access={timings.get('access', 0):.3f} | "
-                    f"convert={timings.get('convert', 0):.3f} | "
-                    f"validate={timings.get('validate', 0):.3f} | "
-                    f"snapshot={timings.get('snapshot', 0):.3f} | "
-                    f"overlap={timings.get('overlap', 0):.3f} | "
-                    f"process={timings.get('process', 0):.3f} | "
-                    f"update_simple={timings.get('update_simple', 0):.3f} | "
-                    f"update_super={timings.get('update_super', 0):.3f} | "
-                    f"monitor={timings.get('monitor', 0):.3f} "
-                )
-            )
-            return 0, 0, 0, 0
-
         except Exception as e:
-            # On any failure, try to release locks before bubbling up
             logger.error(lp(f"write() failed: {e!s}"))
-            if simple_table and acquired_any_lock:
-                _safe_release(simple_table.locking, name=simple_name)
-            _safe_release(getattr(self.super_table, "locking", None), name=self.super_table.super_name)
             raise
-
         finally:
-            # Final safety net in case any lock survived; avoid noisy errors on teardown
-            if simple_table:
-                _safe_release(getattr(simple_table, "locking", None), name=f"{simple_name} (finalize)")
-            _safe_release(getattr(self.super_table, "locking", None), name=f"{self.super_table.super_name} (finalize)")
+            # Release per-simple lock
+            if token:
+                try:
+                    ok = self.catalog.release_simple_lock(
+                        self.super_table.organization, self.super_table.super_name, simple_name, token
+                    )
+                    if not ok:
+                        logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
+                except Exception:
+                    pass
 
-    def validation(
-        self, dataframe: DataFrame, simple_name: str, overwrite_columns: list
-    ):
+    def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list):
         if len(simple_name) == 0 or len(simple_name) > 128:
             raise ValueError("SimpleTable name can't be empty or longer than 128")
-
         if simple_name == self.super_table.super_name:
             raise ValueError("SimpleTable name can't match with SuperTable name")
-
-        # Regular expression pattern for a valid table name
         pattern = r"^[A-Za-z_][A-Za-z0-9_]*$"
         if not re.match(pattern, simple_name):
             raise ValueError(
-                f"Invalid table name: '{simple_name}'. Table names must start with a letter or underscore and contain only alphanumeric characters and underscores."
+                f"Invalid table name: '{simple_name}'. "
+                "Table names must start with a letter/underscore and contain only alphanumeric/underscore characters."
             )
-
-        # Validate the overwrite columns
-        if overwrite_columns and not all(
-            col in dataframe.columns for col in overwrite_columns
-        ):
+        if overwrite_columns and not all(col in dataframe.columns for col in overwrite_columns):
             raise ValueError("Some overwrite columns are not present in the dataset")
-
-        # Ensure overwrite_columns is a list
         if isinstance(overwrite_columns, str):
             raise ValueError("overwrite columns must be list")

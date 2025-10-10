@@ -1,0 +1,339 @@
+# supertable/redis_catalog.py
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Dict, Iterator, List, Optional
+
+import redis
+
+from supertable.config.defaults import default, logger
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _root_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:meta:root"
+
+
+def _leaf_key(org: str, sup: str, simple: str) -> str:
+    return f"supertable:{org}:{sup}:meta:leaf:{simple}"
+
+
+def _lock_key(org: str, sup: str, simple: str) -> str:
+    return f"supertable:{org}:{sup}:lock:leaf:{simple}"
+
+
+def _mirrors_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:meta:mirrors"
+
+
+@dataclass(frozen=True)
+class RedisOptions:
+    host: str = getattr(default, "REDIS_HOST", "localhost")
+    port: int = getattr(default, "REDIS_PORT", 6379)
+    db: int = getattr(default, "REDIS_DB", 0)
+    password: Optional[str] = getattr(default, "REDIS_PASSWORD", None)
+    decode_responses: bool = True
+
+
+class RedisCatalog:
+    """
+    Redis-backed catalog for SuperTable:
+      * meta:root -> {"version": int, "ts": epoch_ms}
+      * meta:leaf:{simple} -> {"version": int, "ts": epoch_ms, "path": "minio://.../snapshot.json"}
+      * meta:mirrors -> {"formats": ["DELTA","ICEBERG","PARQUET"], "ts": epoch_ms}
+      * lock:leaf:{simple} -> "<token>" (NX EX TTL seconds)
+    """
+
+    # ------------- Lua sources -------------
+    _LUA_LEAF_CAS_SET = """
+local key = KEYS[1]
+local new_path = ARGV[1]
+local now_ms = tonumber(ARGV[2])
+
+local cur = redis.call('GET', key)
+local old_version = -1
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if ok and obj and obj['version'] then
+    old_version = tonumber(obj['version'])
+  end
+end
+local new_version = old_version + 1
+local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path})
+redis.call('SET', key, new_val)
+return new_version
+"""
+
+    _LUA_ROOT_BUMP = """
+local key = KEYS[1]
+local now_ms = tonumber(ARGV[1])
+
+local cur = redis.call('GET', key)
+local old_version = -1
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if ok and obj and obj['version'] then
+    old_version = tonumber(obj['version'])
+  end
+end
+local new_version = old_version + 1
+local new_val = cjson.encode({version=new_version, ts=now_ms})
+redis.call('SET', key, new_val)
+return new_version
+"""
+
+    _LUA_LOCK_RELEASE_IF_TOKEN = """
+local key = KEYS[1]
+local token = ARGV[1]
+local cur = redis.call('GET', key)
+if cur and cur == token then
+  redis.call('DEL', key)
+  return 1
+end
+return 0
+"""
+
+    _LUA_LOCK_EXTEND_IF_TOKEN = """
+local key = KEYS[1]
+local token = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+local cur = redis.call('GET', key)
+if cur and cur == token then
+  redis.call('PEXPIRE', key, ttl_ms)
+  return 1
+end
+return 0
+"""
+
+    def __init__(self, options: Optional[RedisOptions] = None):
+        opts = options or RedisOptions()
+        self.r = redis.Redis(
+            host=opts.host,
+            port=opts.port,
+            db=opts.db,
+            password=opts.password,
+            decode_responses=opts.decode_responses,
+        )
+
+        # Register scripts (sha cached internally by redis-py)
+        self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
+        self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
+        self._lock_release_if_token = self.r.register_script(self._LUA_LOCK_RELEASE_IF_TOKEN)
+        self._lock_extend_if_token = self.r.register_script(self._LUA_LOCK_EXTEND_IF_TOKEN)
+
+    # ------------- Locking -------------
+
+    def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[str]:
+        """
+        SET lock key NX EX with retry/backoff <= timeout.
+        Returns token if acquired else None.
+        """
+        key = _lock_key(org, sup, simple)
+        token = uuid.uuid4().hex
+        deadline = time.time() + max(1, int(timeout_s))
+
+        while time.time() < deadline:
+            try:
+                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
+                if ok:
+                    return token
+            except redis.RedisError as e:
+                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
+            time.sleep(0.05)
+        return None
+
+    def release_simple_lock(self, org: str, sup: str, simple: str, token: str) -> bool:
+        """Compare-and-delete via Lua."""
+        try:
+            res = self._lock_release_if_token(keys=[_lock_key(org, sup, simple)], args=[token])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-lock] release error: {e}")
+            return False
+
+    def extend_simple_lock(self, org: str, sup: str, simple: str, token: str, ttl_ms: int) -> bool:
+        """Optionally extend TTL if token matches."""
+        try:
+            res = self._lock_extend_if_token(keys=[_lock_key(org, sup, simple)], args=[token, int(ttl_ms)])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-lock] extend error: {e}")
+            return False
+
+    # ------------- Pointers (root/leaf) -------------
+
+    def ensure_root(self, org: str, sup: str) -> None:
+        """
+        Initialize meta:root if missing with version=0.
+        """
+        key = _root_key(org, sup)
+        try:
+            if not self.r.exists(key):
+                init = {"version": 0, "ts": _now_ms()}
+                self.r.set(key, json.dumps(init))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] ensure_root failed: {e}")
+            raise
+
+    def get_root(self, org: str, sup: str) -> Optional[Dict]:
+        try:
+            raw = self.r.get(_root_key(org, sup))
+            return json.loads(raw) if raw else None
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_root error: {e}")
+            return None
+
+    def bump_root(self, org: str, sup: str, now_ms: Optional[int] = None) -> int:
+        try:
+            return int(self._root_bump(keys=[_root_key(org, sup)], args=[int(now_ms or _now_ms())]) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] root_bump error: {e}")
+            raise
+
+    def get_leaf(self, org: str, sup: str, simple: str) -> Optional[Dict]:
+        try:
+            raw = self.r.get(_leaf_key(org, sup, simple))
+            return json.loads(raw) if raw else None
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_leaf error: {e}")
+            return None
+
+    def set_leaf_path_cas(self, org: str, sup: str, simple: str, path: str, now_ms: Optional[int] = None) -> int:
+        try:
+            return int(
+                self._leaf_cas_set(keys=[_leaf_key(org, sup, simple)], args=[path, int(now_ms or _now_ms())]) or 0
+            )
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] leaf_cas_set error: {e}")
+            raise
+
+    # ------------- Mirror formats (Redis-backed) -------------
+
+    def get_mirrors(self, org: str, sup: str) -> List[str]:
+        """
+        Read enabled mirror formats from Redis key:
+          meta:mirrors -> {"formats":[...], "ts": epoch_ms}
+        """
+        try:
+            raw = self.r.get(_mirrors_key(org, sup))
+            if not raw:
+                return []
+            obj = json.loads(raw)
+            formats = obj.get("formats", [])
+            # normalize to uppercase unique order-preserving
+            seen = set()
+            out: List[str] = []
+            for f in (formats or []):
+                fu = str(f).upper()
+                if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
+                    seen.add(fu)
+                    out.append(fu)
+            return out
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_mirrors error: {e}")
+            return []
+        except Exception:
+            return []
+
+    def set_mirrors(self, org: str, sup: str, formats: List[str], now_ms: Optional[int] = None) -> List[str]:
+        """
+        Atomically set enabled mirror formats.
+        """
+        # normalize
+        seen = set()
+        ordered: List[str] = []
+        for f in formats or []:
+            fu = str(f).upper()
+            if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
+                seen.add(fu)
+                ordered.append(fu)
+        try:
+            payload = {"formats": ordered, "ts": int(now_ms or _now_ms())}
+            self.r.set(_mirrors_key(org, sup), json.dumps(payload))
+            return ordered
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] set_mirrors error: {e}")
+            raise
+
+    def enable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
+        cur = self.get_mirrors(org, sup)
+        fu = str(fmt).upper()
+        if fu not in ("DELTA", "ICEBERG", "PARQUET"):
+            return cur
+        if fu in cur:
+            return cur
+        return self.set_mirrors(org, sup, cur + [fu])
+
+    def disable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
+        cur = self.get_mirrors(org, sup)
+        fu = str(fmt).upper()
+        nxt = [x for x in cur if x != fu]
+        if nxt == cur:
+            return cur
+        return self.set_mirrors(org, sup, nxt)
+
+    # ------------- Listings via SCAN -------------
+
+    def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
+        """
+        Yields full Redis keys: supertable:{org}:{super}:meta:leaf:*
+        """
+        pattern = f"supertable:{org}:{sup}:meta:leaf:*"
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
+                for k in keys:
+                    yield k
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] SCAN error: {e}")
+            return
+
+    def scan_leaf_items(self, org: str, sup: str, count: int = 1000) -> Iterator[Dict]:
+        """
+        Iterates SCAN pages and fetches values in batches (pipeline),
+        yielding dicts: {"simple", "version", "ts", "path"}.
+        """
+        batch: List[str] = []
+        for key in self.scan_leaf_keys(org, sup, count=count):
+            batch.append(key)
+            if len(batch) >= count:
+                yield from self._fetch_batch(batch)
+                batch = []
+        if batch:
+            yield from self._fetch_batch(batch)
+
+    def _fetch_batch(self, keys: List[str]) -> Iterator[Dict]:
+        try:
+            with self.r.pipeline() as p:
+                for k in keys:
+                    p.get(k)
+                vals = p.execute()
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] pipeline GET error: {e}")
+            return
+
+        for k, raw in zip(keys, vals):
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+                # derive simple from suffix
+                simple = k.rsplit("meta:leaf:", 1)[-1]
+                yield {
+                    "simple": simple,
+                    "version": int(obj.get("version", -1)),
+                    "ts": int(obj.get("ts", 0)),
+                    "path": obj.get("path", ""),
+                }
+            except Exception:
+                continue

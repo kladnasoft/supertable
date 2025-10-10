@@ -1,5 +1,9 @@
+# supertable/data_reader.py
+
+from __future__ import annotations
+
 from enum import Enum
-from typing import Iterable, Set, Tuple, List
+from typing import Iterable, Set, Tuple, List, Dict
 
 import duckdb
 import pandas as pd
@@ -13,6 +17,7 @@ from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.plan_extender import extend_execution_plan
 from supertable.plan_stats import PlanStats
 from supertable.rbac.access_control import restrict_read_access
+from supertable.redis_catalog import RedisCatalog
 
 
 class Status(Enum):
@@ -25,11 +30,6 @@ def _lower_set(items: Iterable[str]) -> Set[str]:
 
 
 def _quote_if_needed(col: str) -> str:
-    """
-    Quote a column identifier only if it contains characters that
-    would require quoting in DuckDB (anything except letters, digits, or _).
-    Keeps '*' unchanged.
-    """
     col = col.strip()
     if col == "*":
         return "*"
@@ -46,37 +46,40 @@ class DataReader:
         self.timer = None
         self.plan_stats = None
         self.query_plan_manager = None
-
-        # log-context prefix (filled once a QueryPlanManager is created)
         self._log_ctx = ""
+        self.catalog = RedisCatalog()
 
     def _lp(self, msg: str) -> str:
-        """Prefix log lines with query correlation info."""
         return f"{self._log_ctx}{msg}"
 
-    def filter_snapshots(self, super_table_data, super_table_meta):
-        snapshots = super_table_data.get("snapshots")
-        file_count = super_table_meta.get("file_count", 0)
-        total_rows = super_table_meta.get("total_rows", 0)
-        total_file_size = super_table_meta.get("total_file_size", 0)
-        self.plan_stats.add_stat({"TABLE_FILES": file_count})
-        self.plan_stats.add_stat({"TABLE_SIZE": total_file_size})
-        self.plan_stats.add_stat({"TABLE_ROWS": total_rows})
+    def _collect_snapshots_from_redis(self) -> List[Dict]:
+        """
+        Build a list shaped like old 'snapshots' entries from Redis leaves.
+        Each item: {"table_name": <simple>, "path": <snapshot_path>, "files": 0, "rows": 0, "file_size": 0, "last_updated_ms": ts}
+        File/row/size will be recomputed when reading heavy snapshot inside process_snapshots().
+        """
+        items = list(self.catalog.scan_leaf_items(self.super_table.organization, self.super_table.super_name, count=512))
+        snapshots = []
+        for it in items:
+            if not it.get("path"):
+                continue
+            snapshots.append(
+                {
+                    "table_name": it["simple"],
+                    "last_updated_ms": int(it.get("ts", 0)),
+                    "path": it["path"],
+                    "files": 0,
+                    "rows": 0,
+                    "file_size": 0,
+                }
+            )
+        return snapshots
 
+    def filter_snapshots(self, snapshots: List[Dict]) -> List[Dict]:
         if self.super_table.super_name.lower() == self.parser.original_table.lower():
-            filtered_snapshots = [
-                s
-                for s in snapshots
-                if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))
-            ]
-            return filtered_snapshots
+            return [s for s in snapshots if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))]
         else:
-            filtered_snapshots = [
-                entry
-                for entry in snapshots
-                if entry["table_name"].lower() == self.parser.original_table.lower()
-            ]
-            return filtered_snapshots
+            return [s for s in snapshots if s["table_name"].lower() == self.parser.original_table.lower()]
 
     timer = Timer()
 
@@ -87,44 +90,29 @@ class DataReader:
         self.plan_stats = PlanStats()
 
         try:
-            super_table_data, super_table_path, super_table_meta = (
-                self.super_table.get_super_table_and_path_with_shared_lock()
-            )
-            self.timer.capture_and_reset_timing(event="META")
-
             # --- Planning / IDs -------------------------------------------------
             self.query_plan_manager = QueryPlanManager(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
-                current_meta_path=super_table_path,
+                current_meta_path="redis://meta/root",  # informational only
                 parser=self.parser,
             )
-            # set correlation prefix now that we have ids
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
 
-            logger.debug(self._lp(f"Using temp dir {self.query_plan_manager.temp_dir}"))
-            logger.debug(
-                self._lp(
-                    f"DuckDB version: {getattr(duckdb, '__version__', 'unknown')} "
-                    f"| SQL table={self.parser.reflection_table} | RBAC view={self.parser.rbac_view}"
-                )
-            )
+            logger.debug(self._lp(f"DuckDB version: {getattr(duckdb, '__version__', 'unknown')} "
+                                  f"| SQL table={self.parser.reflection_table} | RBAC view={self.parser.rbac_view}"))
 
-            # --- Snapshot selection -------------------------------------------
-            snapshots = self.filter_snapshots(
-                super_table_data=super_table_data, super_table_meta=super_table_meta
-            )
+            # --- Snapshot selection via Redis ---------------------------------
+            snapshots_all = self._collect_snapshots_from_redis()
+            snapshots = self.filter_snapshots(snapshots_all)
             logger.debug(self._lp(f"Filtered snapshots: {len(snapshots)}"))
             if logger.isEnabledFor(20) and snapshots:
                 snap_names = ", ".join(s["table_name"] for s in snapshots[:8])
                 extra = "" if len(snapshots) <= 8 else f" …(+{len(snapshots)-8})"
                 logger.debug(self._lp(f"Reading from simple tables: {snap_names}{extra}"))
 
-            parquet_files, schema = self.process_snapshots(
-                snapshots=snapshots, with_scan=with_scan
-            )
+            parquet_files, schema = self.process_snapshots(snapshots=snapshots, with_scan=with_scan)
 
-            # Correct missing-columns detection (keep original behavior when '*' is used)
             missing_columns: Set[str] = set()
             if self.parser.columns_csv != "*":
                 requested = _lower_set(self.parser.columns_list)
@@ -135,16 +123,9 @@ class DataReader:
             logger.debug(self._lp(f"Processed Schema: {len(schema)}"))
             logger.debug(self._lp(f"Missing Columns: {missing_columns}"))
 
-            if logger.isEnabledFor(20):
-                preview_cols = ", ".join(sorted(list(schema))[:10])
-                more = "" if len(schema) <= 10 else f" …(+{len(schema)-10})"
-                logger.debug(self._lp(f"Schema columns ({len(schema)}): {preview_cols}{more}"))
-
             if len(snapshots) == 0 or missing_columns or not parquet_files:
                 message = (
-                    f"Missing column(s): {', '.join(missing_columns)}"
-                    if missing_columns
-                    else "No parquet files found"
+                    f"Missing column(s): {', '.join(missing_columns)}" if missing_columns else "No parquet files found"
                 )
                 logger.warning(self._lp(f"Filter Result: {message}"))
                 return pd.DataFrame(), status, message
@@ -168,9 +149,7 @@ class DataReader:
                     f"| with_scan={with_scan} | limit={getattr(self.parser, 'limit', None)}"
                 )
             )
-            result = self.execute_with_duckdb(
-                parquet_files=parquet_files, query_manager=self.query_plan_manager
-            )
+            result = self.execute_with_duckdb(parquet_files=parquet_files, query_manager=self.query_plan_manager)
             logger.debug(self._lp(f"Finished query: rows={result.shape[0]}, cols={result.shape[1]}"))
 
             status = Status.OK
@@ -178,9 +157,10 @@ class DataReader:
             message = str(e)
             logger.error(self._lp(f"Exception: {e}"))
             result = pd.DataFrame()
+
         self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
 
-        # --- Monitoring extension (best-effort) -------------------------------
+        # Monitoring extension (best-effort)
         try:
             extend_execution_plan(
                 super_table=self.super_table,
@@ -207,14 +187,10 @@ class DataReader:
             execq = next((t["EXECUTING_QUERY"] for t in self.timer.timings if "EXECUTING_QUERY" in t), 0.0)
             extend = next((t["EXTENDING_PLAN"] for t in self.timer.timings if "EXTENDING_PLAN" in t), 0.0)
 
-            # blue highlight for total
-            total_str = f"\033[94m{total or 0.0:.3f}\033[32m"
-
+            total_str = f"\033[94m{(total or 0.0):.3f}\033[32m"
             logger.info(
-                f"[read][qid={self.query_plan_manager.query_id}] "
-                "Timing(s): "
-                f"total={total_str} | "
-                f"meta={meta:.3f} | filter={filt:.3f} | connect={conn:.3f} | "
+                f"[read][qid={self.query_plan_manager.query_id}] Timing(s): "
+                f"total={total_str} | meta={meta:.3f} | filter={filt:.3f} | connect={conn:.3f} | "
                 f"create={create:.3f} | execute={execq:.3f} | extend={extend:.3f}"
             )
         except Exception:
@@ -222,7 +198,7 @@ class DataReader:
 
         return result, status, message
 
-    def process_snapshots(self, snapshots, with_scan) -> Tuple[List[str], Set[str]]:
+    def process_snapshots(self, snapshots: List[Dict], with_scan: bool) -> Tuple[List[str], Set[str]]:
         parquet_files: List[str] = []
         reflection_file_size = 0
         reflection_rows = 0
@@ -230,37 +206,25 @@ class DataReader:
         schema: Set[str] = set()
         for snapshot in snapshots:
             current_snapshot_path = snapshot["path"]
-            current_snapshot_data = self.super_table.read_simple_table_snapshot(
-                current_snapshot_path
-            )
+            current_snapshot_data = self.super_table.read_simple_table_snapshot(current_snapshot_path)
 
             current_schema = current_snapshot_data.get("schema", {})
-            # Ensure dict-like; merge column names (lowercased) into schema set
             schema.update(dict_keys_to_lowercase(current_schema).keys())
 
-            # Ensure resources is a list (not {}), keep integers
             resources = current_snapshot_data.get("resources", []) or []
             for resource in resources:
                 file_size = int(resource.get("file_size", 0))
                 file_rows = int(resource.get("rows", 0))
 
-                if (
-                    with_scan
-                    or self.parser.columns_csv == "*"
-                    or any(
-                        col in dict_keys_to_lowercase(current_schema).keys()
-                        for col in [column.lower() for column in self.parser.columns_list]
-                    )
-                ):
-                    parquet_files.append(resource["file"])
-                    reflection_file_size += file_size
-                    reflection_rows += file_rows
+                parquet_files.append(resource["file"])
+                reflection_file_size += file_size
+                reflection_rows += file_rows
 
         self.plan_stats.add_stat({"REFLECTIONS": len(parquet_files)})
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
         self.plan_stats.add_stat({"REFLECTION_ROWS": reflection_rows})
 
-        if logger.isEnabledFor(20):  # INFO
+        if logger.isEnabledFor(20):
             logger.debug(
                 self._lp(
                     f"Selected parquet files: {len(parquet_files)} | "
@@ -271,16 +235,9 @@ class DataReader:
         return parquet_files, schema
 
     def execute_with_duckdb(self, parquet_files, query_manager: QueryPlanManager):
-        """
-        Use DuckDB to read and query the parquet files directly.
-        Keep semantics aligned with the original behaviour.
-        """
         con = duckdb.connect()
         try:
-            # Measure connection time similar to the original logs
             self.timer.capture_and_reset_timing("CONNECTING")
-
-            # Use broadly-compatible PRAGMAs
             con.execute("PRAGMA memory_limit='2GB';")
             con.execute(f"PRAGMA temp_directory='{query_manager.temp_dir}';")
             con.execute("PRAGMA enable_profiling='json';")
@@ -288,41 +245,29 @@ class DataReader:
             con.execute("PRAGMA default_collation='nocase';")
 
             parquet_files_str = ", ".join(f"'{file}'" for file in parquet_files)
-            logger.debug(self._lp(f"Parsed Columns: {self.parser.columns_csv}"))
-
-            # Project columns safely (preserve '*' exactly)
             if self.parser.columns_csv == "*":
                 safe_columns_csv = "*"
             else:
                 cols = [c for c in self.parser.columns_csv.split(",") if c.strip()]
                 safe_columns_csv = ", ".join(_quote_if_needed(c) for c in cols)
-            logger.debug(self._lp(f"Safe Columns: {safe_columns_csv}"))
 
-            # Preserve original pattern: CREATE TABLE + CREATE VIEW
             create_table = f"""
 CREATE TABLE {self.parser.reflection_table}
 AS
 SELECT {safe_columns_csv}
 FROM parquet_scan([{parquet_files_str}], union_by_name=TRUE, HIVE_PARTITIONING=TRUE);
 """
-            try:
-                con.execute(create_table)
-            except Exception as e:
-                logger.error(self._lp(f"Error creating table: {create_table}\nError: {str(e)}"))
-                raise
+            con.execute(create_table)
 
             create_view = f"""
 CREATE VIEW {self.parser.rbac_view}
 AS
 {self.parser.view_definition}
 """
-            logger.debug(self._lp(f"create_view: \n{create_view}"))
             con.execute(create_view)
 
             self.timer.capture_and_reset_timing("CREATING_REFLECTION")
-            logger.debug(self._lp(f"Executing Query: {self.parser.executing_query}"))
             result = con.execute(query=self.parser.executing_query).fetchdf()
-            logger.debug(self._lp(f"result.shape: (rows={result.shape[0]}, cols={result.shape[1]})"))
             return result
         finally:
             try:
