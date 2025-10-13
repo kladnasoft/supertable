@@ -755,7 +755,7 @@ AS
 
     # ===================== Patch 5: MonitoringLogger (merge via storage) =====================
 
-    import supertable.monitoring_logger as _ml  # type: ignore
+    import supertable.monitoring_writer as _ml  # type: ignore
     _ORIG_ML_write_parquet_file = getattr(_ml.MonitoringLogger, "_write_parquet_file", None)
 
     def _patched_ml_write_parquet_file(self, data: List[Dict[str, Any]], existing_path: Optional[str] = None) -> Dict[str, Any]:

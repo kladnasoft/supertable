@@ -4,7 +4,7 @@ import random
 import os
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from supertable.monitoring_logger import MonitoringLogger
+from supertable.monitoring_writer import MonitoringLogger
 from examples.defaults import super_name, organization, MonitorType
 
 def print_monitor_stats(monitor):

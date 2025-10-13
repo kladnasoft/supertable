@@ -19,7 +19,7 @@ class SimpleTable:
 
     def __init__(self, super_table: SuperTable, simple_name: str):
         self.super_table = super_table
-        self.identity = "simple"
+        self.identity = "tables"
         self.simple_name = simple_name
 
         # Storage is the same as SuperTable's

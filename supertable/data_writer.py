@@ -11,7 +11,7 @@ import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
-from supertable.monitoring_logger import MonitoringLogger
+from supertable.monitoring_writer import MonitoringLogger
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer

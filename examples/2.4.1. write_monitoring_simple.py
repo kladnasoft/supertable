@@ -1,7 +1,7 @@
 import time
 import random
 
-from supertable.monitoring_logger import MonitoringLogger
+from supertable.monitoring_writer import MonitoringLogger
 from examples.defaults import super_name, organization, MonitorType
 
 # Use the MonitoringLogger in a context manager to ensure proper setup and teardown
