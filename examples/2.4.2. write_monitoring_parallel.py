@@ -4,7 +4,7 @@ import random
 import os
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from supertable.monitoring_writer import MonitoringLogger
+from supertable.monitoring_writer import MonitoringWriter
 from examples.defaults import super_name, organization, MonitorType
 
 def print_monitor_stats(monitor):
@@ -38,7 +38,7 @@ def verify_output(monitor, expected_count):
 
 print("Current working directory:", os.getcwd())
 
-with MonitoringLogger(
+with MonitoringWriter(
         super_name=super_name,
         organization=organization,
         monitor_type=MonitorType.METRICS.value,

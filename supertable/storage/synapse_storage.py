@@ -756,7 +756,7 @@ AS
     # ===================== Patch 5: MonitoringLogger (merge via storage) =====================
 
     import supertable.monitoring_writer as _ml  # type: ignore
-    _ORIG_ML_write_parquet_file = getattr(_ml.MonitoringLogger, "_write_parquet_file", None)
+    _ORIG_ML_write_parquet_file = getattr(_ml.MonitoringWriter, "_write_parquet_file", None)
 
     def _patched_ml_write_parquet_file(self, data: List[Dict[str, Any]], existing_path: Optional[str] = None) -> Dict[str, Any]:
         import polars as pl  # local import
@@ -795,7 +795,7 @@ AS
         return resource
 
     if _ORIG_ML_write_parquet_file is not None:
-        setattr(_ml.MonitoringLogger, "_write_parquet_file", _patched_ml_write_parquet_file)
+        setattr(_ml.MonitoringWriter, "_write_parquet_file", _patched_ml_write_parquet_file)
 
     # ===================== Patch 6: MonitoringReader (cache parquet + pristine DuckDB) =====================
 

@@ -1,5 +1,4 @@
 # supertable/data_writer.py
-
 from __future__ import annotations
 
 import time
@@ -11,7 +10,7 @@ import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
-from supertable.monitoring_writer import MonitoringLogger
+from supertable.monitoring_writer import get_monitoring_logger  # <-- use singleton monitor
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
@@ -55,17 +54,19 @@ class DataWriter:
             t_last = now
 
         token = None
+        result_tuple = None  # to return at the very end
+        stats_payload = None  # monitoring metrics (logged after lock release)
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
 
             # --- Access control ------------------------------------------------
-            #check_write_access(
-            #    super_name=self.super_table.super_name,
-            #    organization=self.super_table.organization,
-            #    user_hash=user_hash,
-            #    table_name=simple_name,
-            #)
+            # check_write_access(
+            #     super_name=self.super_table.super_name,
+            #     organization=self.super_table.organization,
+            #     user_hash=user_hash,
+            #     table_name=simple_name,
+            # )
             mark("access")
 
             # --- Convert input -------------------------------------------------
@@ -131,12 +132,11 @@ class DataWriter:
                     simple_snapshot=new_snapshot_dict,
                 )
             except Exception as e:
-                # Do not fail the write if mirroring fails; log and proceed
                 logger.error(lp(f"mirroring failed: {e}"))
             mark("mirror")
 
-            # --- Monitoring stats ---------------------------------------------
-            stats = {
+            # Prepare monitoring payload (but DO NOT log yet — do it after lock release)
+            stats_payload = {
                 "query_id": qid,
                 "recorded_at": datetime.utcnow().isoformat(),
                 "super_name": self.super_table.super_name,
@@ -150,15 +150,8 @@ class DataWriter:
                 "sunset_files": len(sunset_files),
                 "duration": round(time.time() - t0, 6),
             }
-            with MonitoringLogger(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                monitor_type="stats",
-            ) as monitor:
-                monitor.log_metric(stats)
-            mark("monitor")
+            mark("prepare_monitor")
 
-            # --- Summary -------------------------------------------------------
             total_duration = time.time() - t0
             total_str = f"\033[94m{total_duration:.3f}\033[32m"
             logger.info(
@@ -169,17 +162,17 @@ class DataWriter:
                     f"snapshot={timings.get('snapshot', 0):.3f} | overlap={timings.get('overlap', 0):.3f} | "
                     f"process={timings.get('process', 0):.3f} | update_simple={timings.get('update_simple', 0):.3f} | "
                     f"bump_root={timings.get('bump_root', 0):.3f} | mirror={timings.get('mirror', 0):.3f} | "
-                    f"monitor={timings.get('monitor', 0):.3f}\033[0m"
+                    f"prepare_monitor={timings.get('prepare_monitor', 0):.3f}\033[0m"
                 )
             )
 
-            return total_columns, total_rows, inserted, deleted
+            result_tuple = (total_columns, total_rows, inserted, deleted)
 
         except Exception as e:
             logger.error(lp(f"write() failed: {e!s}"))
             raise
         finally:
-            # Release per-simple lock
+            # Release per-simple lock first
             if token:
                 try:
                     ok = self.catalog.release_simple_lock(
@@ -189,6 +182,22 @@ class DataWriter:
                         logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
                 except Exception:
                     pass
+
+        # ---------- LOCK IS RELEASED HERE ----------
+        # Perform monitoring enqueue totally outside the critical section
+        try:
+            if stats_payload is not None:
+                monitor = get_monitoring_logger(
+                    super_name=self.super_table.super_name,
+                    organization=self.super_table.organization,
+                    monitor_type="stats",
+                )
+                monitor.log_metric(stats_payload)
+        except Exception as me:
+            logger.error(lp(f"monitoring enqueue failed: {me}"))
+
+        # Return result to caller
+        return result_tuple
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list):
         if len(simple_name) == 0 or len(simple_name) > 128:

@@ -7,7 +7,7 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.plan_stats import PlanStats
 from supertable.storage.storage_factory import get_storage
 from supertable.super_table import SuperTable
-from supertable.monitoring_writer import MonitoringLogger
+from supertable.monitoring_writer import MonitoringWriter
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def extend_execution_plan(
 
     # Log the metric (buffered; background writer flushes)
     try:
-        with MonitoringLogger(
+        with MonitoringWriter(
             super_name=super_table.super_name,
             organization=super_table.organization,
             monitor_type="plans",
