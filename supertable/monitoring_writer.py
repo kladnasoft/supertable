@@ -21,8 +21,8 @@ from supertable.redis_catalog import RedisCatalog
 # ---------------- Singleton registry ----------------
 
 _MONITOR_INSTANCES: Dict[Tuple[str, str, str], "MonitoringWriter"] = {}
-# Use WeakValueDictionary to allow garbage collection when no references remain
 _MONITOR_INSTANCES_WEAK = weakref.WeakValueDictionary()
+_MONITOR_INSTANCES_LOCK = threading.Lock()
 
 
 def get_monitoring_logger(super_name: str, organization: str, monitor_type: str) -> "MonitoringWriter":
@@ -32,24 +32,34 @@ def get_monitoring_logger(super_name: str, organization: str, monitor_type: str)
     Uses weak references to allow garbage collection.
     """
     key = (organization, super_name, monitor_type)
-    inst = _MONITOR_INSTANCES_WEAK.get(key)
-    if inst is None or not inst.is_alive():
-        inst = MonitoringWriter(super_name=super_name, organization=organization, monitor_type=monitor_type)
-        _MONITOR_INSTANCES_WEAK[key] = inst
-        _MONITOR_INSTANCES[key] = inst  # Strong reference to prevent premature GC
-    return inst
+
+    with _MONITOR_INSTANCES_LOCK:
+        inst = _MONITOR_INSTANCES_WEAK.get(key)
+        if inst is None or not inst.is_alive():
+            inst = MonitoringWriter(super_name=super_name, organization=organization, monitor_type=monitor_type)
+            _MONITOR_INSTANCES_WEAK[key] = inst
+            _MONITOR_INSTANCES[key] = inst  # Strong reference to prevent premature GC
+        return inst
 
 
 def _shutdown_all_monitors():
     """Shutdown all active monitor instances."""
-    for key, inst in list(_MONITOR_INSTANCES.items()):
-        try:
-            inst.close(force_flush=True)
-            # Remove strong reference to allow GC
-            del _MONITOR_INSTANCES[key]
-        except Exception as e:
-            logger.error(f"[monitor] Error during shutdown of {key}: {e}")
-    _MONITOR_INSTANCES.clear()
+    with _MONITOR_INSTANCES_LOCK:
+        keys_to_remove = []
+        for key, inst in _MONITOR_INSTANCES.items():
+            try:
+                if inst.is_alive():
+                    inst.close(force_flush=True)
+                keys_to_remove.append(key)
+            except Exception as e:
+                logger.error(f"[monitor] Error during shutdown of {key}: {e}")
+
+        # Remove all keys after iteration to avoid modification during iteration
+        for key in keys_to_remove:
+            try:
+                del _MONITOR_INSTANCES[key]
+            except KeyError:
+                pass  # Key might have been removed already
 
 
 atexit.register(_shutdown_all_monitors)
@@ -58,13 +68,6 @@ atexit.register(_shutdown_all_monitors)
 class MonitoringWriter:
     """
     Robust queue-based monitoring with minute-cadence batching and guaranteed final flush.
-
-    Key improvements:
-    1. Thread only stops when explicitly closed AND queue is empty
-    2. Proper synchronization for batch operations
-    3. Guaranteed final flush on shutdown
-    4. Better error handling and retry mechanisms
-    5. Weak references to prevent memory leaks
     """
 
     def __init__(
@@ -77,7 +80,7 @@ class MonitoringWriter:
             flush_interval: float = 60.0,
             compression: str = "zstd",
             compression_level: int = 1,
-            idle_stop_after: float = 300.0,  # Increased to 5 minutes for safety
+            idle_stop_after: float = 10.0,  # Auto-stop after 10 seconds of inactivity
     ):
         self.identity = "monitoring"
         self.super_name = super_name
@@ -108,6 +111,8 @@ class MonitoringWriter:
         self.stop_event = threading.Event()
         self.flush_requested = threading.Event()
         self.last_activity = time.time()
+        self.activity_lock = threading.Lock()
+        self._shutting_down = False
 
         # Stats about the queue/thread
         self.queue_stats = {
@@ -138,13 +143,24 @@ class MonitoringWriter:
         """Check if writer thread is alive."""
         return self._writer_thread is not None and self._writer_thread.is_alive()
 
+    def _update_activity(self):
+        """Update last activity timestamp."""
+        with self.activity_lock:
+            self.last_activity = time.time()
+
+    def _get_idle_time(self) -> float:
+        """Get time since last activity."""
+        with self.activity_lock:
+            return time.time() - self.last_activity
+
     # ---------------- Utilities ----------------
 
     def _ensure_thread(self):
         """Start writer thread if not running."""
-        if not self.is_alive():
+        if not self.is_alive() and not self._shutting_down:
             self.stop_event.clear()
             self.flush_requested.clear()
+            self._update_activity()  # Reset activity timer
             self._writer_thread = threading.Thread(
                 target=self._write_loop,
                 name=f"MonitoringWriter-{self.organization}-{self.super_name}-{self.monitor_type}",
@@ -413,12 +429,14 @@ class MonitoringWriter:
         Enqueue metric data. Never blocks on writer.
         Ensures background thread is running.
         """
+        if self._shutting_down:
+            logger.warning("[monitor] Writer is shutting down, ignoring new metric")
+            return
+
         self._ensure_thread()
 
-        # Update activity timestamp
-        self.last_activity = time.time()
-
-        # Enqueue without blocking
+        # Update activity timestamp and enqueue
+        self._update_activity()
         self.queue.put(metric_data)
 
         # Update stats
@@ -436,89 +454,111 @@ class MonitoringWriter:
 
     def _write_loop(self):
         """
-        Main writer loop with minute cadence and guaranteed final flush.
-        Only exits when explicitly stopped AND queue is completely processed.
+        Main writer loop with minute cadence and auto-stop after 10 seconds of inactivity.
+        Always performs final flush before stopping.
         """
         logger.info(
             f"[monitor] dequeue thread RUNNING for {self.organization}/{self.super_name}/{self.monitor_type}"
         )
 
         last_flush = time.time()
-        consecutive_empty_cycles = 0
 
         try:
             while not self.stop_event.is_set():
                 now = time.time()
+                idle_time = self._get_idle_time()
 
-                # Check if we should flush (time-based or request-based)
+                # Check if we should flush (time-based, request-based, or shutdown)
                 time_due = (now - last_flush) >= self.flush_interval
-                should_flush = self.flush_requested.is_set() or time_due
+                should_flush = self.flush_requested.is_set() or time_due or idle_time >= self.idle_stop_after
 
                 # Always drain queue first
                 drained = self._drain_queue_to_batch()
                 if drained > 0:
-                    self.last_activity = now
-                    consecutive_empty_cycles = 0
+                    self._update_activity()  # Reset idle timer
 
                 # Process batch if we have data and should flush
                 if self.current_batch and should_flush:
                     self._flush_batch()
                     last_flush = now
                     self.flush_requested.clear()
-                    consecutive_empty_cycles = 0
 
-                # Check for idle shutdown (only when explicitly stopped)
-                if self.stop_event.is_set():
-                    # When stopping, ensure we process everything
+                # Check if we should stop due to inactivity
+                if idle_time >= self.idle_stop_after:
+                    # One final drain and flush to catch any last items
+                    final_drained = self._drain_queue_to_batch()
+                    if final_drained > 0:
+                        self._update_activity()
+                        # If we got new items, flush them immediately
+                        if self.current_batch:
+                            self._flush_batch()
+
+                    # Only stop if queue is completely empty after final drain
                     if self.queue.empty() and not self.current_batch and not self.pending_stat_entries:
+                        logger.info(
+                            f"[monitor] Auto-stopping after {idle_time:.1f}s inactivity for "
+                            f"{self.organization}/{self.super_name}/{self.monitor_type}"
+                        )
                         break
-                else:
-                    # Normal operation: check for prolonged inactivity
-                    idle_time = now - self.last_activity
-                    if idle_time >= self.idle_stop_after:
-                        consecutive_empty_cycles += 1
-                        if consecutive_empty_cycles >= 3:  # Multiple empty cycles before stopping
-                            logger.info(
-                                f"[monitor] idle timeout, stopping dequeue thread for "
-                                f"{self.organization}/{self.super_name}/{self.monitor_type}"
-                            )
-                            break
 
-                # Sleep to reduce CPU usage
-                time.sleep(0.1)
+                # Sleep to reduce CPU usage (shorter sleep when nearing idle timeout)
+                sleep_time = 0.1 if idle_time < self.idle_stop_after - 1 else 0.01
+                time.sleep(sleep_time)
 
         except Exception as e:
             logger.error(f"[monitor] Unexpected error in write loop: {e}")
         finally:
-            # FINAL FLUSH: Ensure all data is processed before exit
-            try:
+            # GUARANTEED FINAL FLUSH: Ensure all data is processed before exit
+            self._perform_final_flush()
+
+    def _perform_final_flush(self):
+        """Perform final flush ensuring all data is written before thread exit."""
+        try:
+            logger.info(
+                f"[monitor] Performing final flush for {self.organization}/{self.super_name}/{self.monitor_type}"
+            )
+
+            # Drain any remaining items from queue
+            remaining_in_queue = self._drain_queue_to_batch()
+
+            # Final flush if we have any data
+            if self.current_batch or self.pending_stat_entries:
                 logger.info(
-                    f"[monitor] Final flush for {self.organization}/{self.super_name}/{self.monitor_type}: "
-                    f"queue_size={self.queue.qsize()}, batch_size={len(self.current_batch)}, "
-                    f"pending_stats={len(self.pending_stat_entries)}"
+                    f"[monitor] Final flush processing: "
+                    f"batch_size={len(self.current_batch)}, pending_stats={len(self.pending_stat_entries)}"
                 )
+                self._flush_batch()
 
-                # Drain any remaining items
-                self._drain_queue_to_batch()
+            logger.info(
+                f"[monitor] Final flush completed for {self.organization}/{self.super_name}/{self.monitor_type}: "
+                f"processed_final_items={remaining_in_queue}"
+            )
 
-                # Final flush
-                if self.current_batch or self.pending_stat_entries:
-                    self._flush_batch()
+        except Exception as e:
+            logger.error(f"[monitor] Error during final flush: {e}")
+        finally:
+            logger.info(
+                f"[monitor] dequeue thread EXITED for {self.organization}/{self.super_name}/{self.monitor_type}"
+            )
+            # Clean up singleton reference when thread exits naturally
+            self._cleanup_singleton()
 
-            except Exception as e:
-                logger.error(f"[monitor] Error during final flush: {e}")
-
-        logger.info(
-            f"[monitor] dequeue thread EXITED for {self.organization}/{self.super_name}/{self.monitor_type}"
-        )
+    def _cleanup_singleton(self):
+        """Clean up singleton reference safely."""
+        with _MONITOR_INSTANCES_LOCK:
+            key = (self.organization, self.super_name, self.monitor_type)
+            try:
+                if key in _MONITOR_INSTANCES:
+                    del _MONITOR_INSTANCES[key]
+            except KeyError:
+                pass  # Key might have been removed already
 
     def close(self, force_flush: bool = False):
         """
         Graceful shutdown with optional forced flush.
-
-        Args:
-            force_flush: If True, wait for final flush to complete
         """
+        self._shutting_down = True
+
         if force_flush:
             self.request_flush()
             # Give it a moment to process
@@ -527,9 +567,7 @@ class MonitoringWriter:
         self.stop_event.set()
 
         if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=10.0)  # Wait up to 10 seconds
+            self._writer_thread.join(timeout=5.0)  # Wait up to 5 seconds for clean shutdown
 
         # Clean up singleton reference
-        key = (self.organization, self.super_name, self.monitor_type)
-        if key in _MONITOR_INSTANCES:
-            del _MONITOR_INSTANCES[key]
+        self._cleanup_singleton()

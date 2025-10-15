@@ -6,6 +6,8 @@ import os
 from typing import Dict, Any
 
 from supertable.config.defaults import logger
+from supertable.rbac.role_manager import RoleManager
+from supertable.rbac.user_manager import UserManager
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.redis_catalog import RedisCatalog
@@ -35,6 +37,10 @@ class SuperTable:
         logger.debug(f"super_dir: {self.super_dir}")
 
         self.init_super_table()
+
+        # Initialize RBAC scaffolding
+        RoleManager(super_name=self.super_name, organization=self.organization)
+        UserManager(super_name=self.super_name, organization=self.organization)
 
     # ------------------------------------------------------------------ init
     def init_super_table(self) -> None:
