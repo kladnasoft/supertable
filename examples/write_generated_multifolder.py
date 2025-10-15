@@ -23,7 +23,7 @@ def quiet_logs():
     Silence noisy third-party loggers without affecting our own print output.
     Tweak LEVEL to WARNING/ERROR/CRITICAL as you prefer.
     """
-    LEVEL = logging.ERROR
+    LEVEL = logging.INFO
     targets = [
         "supertable",
         "supertable.data_writer",
@@ -45,7 +45,7 @@ quiet_logs()
 # -------------------------
 # Config
 # -------------------------
-DEFAULT_THREADS = 12
+DEFAULT_THREADS = 6
 # If DataWriter.write is NOT thread-safe, set this to True to serialize writes:
 SERIALIZE_WRITES = False
 

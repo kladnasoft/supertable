@@ -29,6 +29,11 @@ def _lock_key(org: str, sup: str, simple: str) -> str:
     return f"supertable:{org}:{sup}:lock:leaf:{simple}"
 
 
+def _stat_lock_key(org: str, sup: str) -> str:
+    # Dedicated lock for stats updates
+    return f"supertable:{org}:{sup}:lock:stats"
+
+
 def _mirrors_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:mirrors"
 
@@ -46,9 +51,10 @@ class RedisCatalog:
     """
     Redis-backed catalog for SuperTable:
       * meta:root -> {"version": int, "ts": epoch_ms}
-      * meta:leaf:{simple} -> {"version": int, "ts": epoch_ms, "path": "minio://.../snapshot.json"}
-      * meta:mirrors -> {"formats": ["DELTA","ICEBERG","PARQUET"], "ts": epoch_ms}
-      * lock:leaf:{simple} -> "<token>" (NX EX TTL seconds)
+      * meta:leaf:{simple} -> {"version": int, "ts": epoch_ms, "path": ".../snapshot.json"}
+      * meta:mirrors -> {"formats": [...], "ts": epoch_ms}
+      * lock:leaf:{simple} -> token (SET NX EX)
+      * lock:stats -> token (SET NX EX)  # for monitoring stats updates
     """
 
     # ------------- Lua sources -------------
@@ -122,7 +128,7 @@ return 0
             decode_responses=opts.decode_responses,
         )
 
-        # Register scripts (sha cached internally by redis-py)
+        # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
         self._lock_release_if_token = self.r.register_script(self._LUA_LOCK_RELEASE_IF_TOKEN)
@@ -131,21 +137,17 @@ return 0
     # ------------- Locking -------------
 
     def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[str]:
-        """
-        SET lock key NX EX with retry/backoff <= timeout.
-        Returns token if acquired else None.
-        """
+        """SET lock key NX EX with retry/backoff <= timeout. Returns token if acquired else None."""
         key = _lock_key(org, sup, simple)
         token = uuid.uuid4().hex
         deadline = time.time() + max(1, int(timeout_s))
-
         while time.time() < deadline:
             try:
                 ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
                 if ok:
                     return token
             except redis.RedisError as e:
-                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
+                logger.info(f"[redis-lock] acquire error on {key}: {e}")
             time.sleep(0.05)
         return None
 
@@ -155,7 +157,7 @@ return 0
             res = self._lock_release_if_token(keys=[_lock_key(org, sup, simple)], args=[token])
             return int(res or 0) == 1
         except redis.RedisError as e:
-            logger.debug(f"[redis-lock] release error: {e}")
+            logger.info(f"[redis-lock] release error: {e}")
             return False
 
     def extend_simple_lock(self, org: str, sup: str, simple: str, token: str, ttl_ms: int) -> bool:
@@ -164,15 +166,39 @@ return 0
             res = self._lock_extend_if_token(keys=[_lock_key(org, sup, simple)], args=[token, int(ttl_ms)])
             return int(res or 0) == 1
         except redis.RedisError as e:
-            logger.debug(f"[redis-lock] extend error: {e}")
+            logger.info(f"[redis-lock] extend error: {e}")
+            return False
+
+    # ---- Stats lock (for monitoring _stats.json updates) ----
+
+    def acquire_stat_lock(self, org: str, sup: str, ttl_s: int = 10, timeout_s: int = 10) -> Optional[str]:
+        """Acquire stat lock: supertable:{org}:{sup}:lock:stats"""
+        key = _stat_lock_key(org, sup)
+        token = uuid.uuid4().hex
+        deadline = time.time() + max(1, int(timeout_s))
+        while time.time() < deadline:
+            try:
+                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
+                if ok:
+                    return token
+            except redis.RedisError as e:
+                logger.debug(f"[redis-stat-lock] acquire error on {key}: {e}")
+            time.sleep(0.05)
+        return None
+
+    def release_stat_lock(self, org: str, sup: str, token: str) -> bool:
+        """Release stat lock if token matches."""
+        try:
+            res = self._lock_release_if_token(keys=[_stat_lock_key(org, sup)], args=[token])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.info(f"[redis-stat-lock] release error: {e}")
             return False
 
     # ------------- Pointers (root/leaf) -------------
 
     def ensure_root(self, org: str, sup: str) -> None:
-        """
-        Initialize meta:root if missing with version=0.
-        """
+        """Initialize meta:root if missing with version=0."""
         key = _root_key(org, sup)
         try:
             if not self.r.exists(key):
@@ -217,17 +243,13 @@ return 0
     # ------------- Mirror formats (Redis-backed) -------------
 
     def get_mirrors(self, org: str, sup: str) -> List[str]:
-        """
-        Read enabled mirror formats from Redis key:
-          meta:mirrors -> {"formats":[...], "ts": epoch_ms}
-        """
+        """Read enabled mirror formats from Redis key."""
         try:
             raw = self.r.get(_mirrors_key(org, sup))
             if not raw:
                 return []
             obj = json.loads(raw)
             formats = obj.get("formats", [])
-            # normalize to uppercase unique order-preserving
             seen = set()
             out: List[str] = []
             for f in (formats or []):
@@ -243,10 +265,7 @@ return 0
             return []
 
     def set_mirrors(self, org: str, sup: str, formats: List[str], now_ms: Optional[int] = None) -> List[str]:
-        """
-        Atomically set enabled mirror formats.
-        """
-        # normalize
+        """Atomically set enabled mirror formats."""
         seen = set()
         ordered: List[str] = []
         for f in formats or []:
@@ -282,9 +301,7 @@ return 0
     # ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        """
-        Yields full Redis keys: supertable:{org}:{super}:meta:leaf:*
-        """
+        """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:*"""
         pattern = f"supertable:{org}:{sup}:meta:leaf:*"
         cursor = 0
         try:
@@ -299,10 +316,7 @@ return 0
             return
 
     def scan_leaf_items(self, org: str, sup: str, count: int = 1000) -> Iterator[Dict]:
-        """
-        Iterates SCAN pages and fetches values in batches (pipeline),
-        yielding dicts: {"simple", "version", "ts", "path"}.
-        """
+        """Iterates SCAN pages and fetches values in batches (pipeline)."""
         batch: List[str] = []
         for key in self.scan_leaf_keys(org, sup, count=count):
             batch.append(key)
@@ -327,7 +341,6 @@ return 0
                 continue
             try:
                 obj = json.loads(raw)
-                # derive simple from suffix
                 simple = k.rsplit("meta:leaf:", 1)[-1]
                 yield {
                     "simple": simple,

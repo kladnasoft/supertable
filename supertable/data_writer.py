@@ -10,7 +10,7 @@ import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
-from supertable.monitoring_writer import get_monitoring_logger  # <-- use singleton monitor
+from supertable.monitoring_writer import get_monitoring_logger  # singleton monitor (async)
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
@@ -20,7 +20,7 @@ from supertable.processing import (
 )
 from supertable.rbac.access_control import check_write_access
 from supertable.redis_catalog import RedisCatalog
-from supertable.mirroring.mirror_formats import MirrorFormats  # <-- restore mirroring
+from supertable.mirroring.mirror_formats import MirrorFormats
 
 
 class DataWriter:
@@ -34,11 +34,7 @@ class DataWriter:
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
-        Concurrency & meta model:
-          - Per-simple Redis lock (SET NX EX) with token; TTL only on lock.
-          - Heavy work (file merge/write) off-Redis.
-          - CAS update leaf pointer via Lua, then atomic root bump via Lua.
-          - Trigger mirroring (DELTA/ICEBERG/PARQUET) if enabled.
+        Monitoring is fully decoupled from locking: we only enqueue a metric after the lock is released.
         """
         qid = str(uuid.uuid4())
         lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
@@ -54,8 +50,8 @@ class DataWriter:
             t_last = now
 
         token = None
-        result_tuple = None  # to return at the very end
-        stats_payload = None  # monitoring metrics (logged after lock release)
+        result_tuple = None
+        stats_payload = None
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
@@ -93,7 +89,7 @@ class DataWriter:
 
             # --- Detect overlaps ----------------------------------------------
             overlapping_files = find_and_lock_overlapping_files(
-                last_simple_table, dataframe, overwrite_columns, locking=None  # no per-file locks anymore
+                last_simple_table, dataframe, overwrite_columns, locking=None  # keep minimal per-file locking
             )
             mark("overlap")
 
@@ -124,7 +120,7 @@ class DataWriter:
             self.catalog.bump_root(self.super_table.organization, self.super_table.super_name)
             mark("bump_root")
 
-            # --- Mirroring (while lock is still held) -------------------------
+            # --- Mirroring -----------------------------------------------------
             try:
                 MirrorFormats.mirror_if_enabled(
                     super_table=self.super_table,
@@ -135,7 +131,7 @@ class DataWriter:
                 logger.error(lp(f"mirroring failed: {e}"))
             mark("mirror")
 
-            # Prepare monitoring payload (but DO NOT log yet — do it after lock release)
+            # Prepare monitoring payload (NOT writing, only enqueue later)
             stats_payload = {
                 "query_id": qid,
                 "recorded_at": datetime.utcnow().isoformat(),
@@ -184,7 +180,7 @@ class DataWriter:
                     pass
 
         # ---------- LOCK IS RELEASED HERE ----------
-        # Perform monitoring enqueue totally outside the critical section
+        # Monitoring enqueue is fully outside any data locks
         try:
             if stats_payload is not None:
                 monitor = get_monitoring_logger(
@@ -192,7 +188,7 @@ class DataWriter:
                     organization=self.super_table.organization,
                     monitor_type="stats",
                 )
-                monitor.log_metric(stats_payload)
+                monitor.log_metric(stats_payload)  # enqueue only
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
