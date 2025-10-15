@@ -56,6 +56,15 @@ class DataWriter:
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
 
+            # --- Access control ------------------------------------------------
+            check_write_access(
+                 super_name=self.super_table.super_name,
+                 organization=self.super_table.organization,
+                 user_hash=user_hash,
+                 table_name=simple_name,
+            )
+            mark("access")
+
             # --- Convert input -------------------------------------------------
             dataframe: DataFrame = polars.from_arrow(data)
             mark("convert")
