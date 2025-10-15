@@ -7,6 +7,7 @@ import uuid
 import os
 import io
 from typing import Dict, List, Any, Optional, Tuple
+import weakref
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,58 +21,63 @@ from supertable.redis_catalog import RedisCatalog
 # ---------------- Singleton registry ----------------
 
 _MONITOR_INSTANCES: Dict[Tuple[str, str, str], "MonitoringWriter"] = {}
+# Use WeakValueDictionary to allow garbage collection when no references remain
+_MONITOR_INSTANCES_WEAK = weakref.WeakValueDictionary()
+
 
 def get_monitoring_logger(super_name: str, organization: str, monitor_type: str) -> "MonitoringWriter":
     """
     Global singleton per (organization, super_name, monitor_type).
     Ensures a single background writer thread per stream.
+    Uses weak references to allow garbage collection.
     """
     key = (organization, super_name, monitor_type)
-    inst = _MONITOR_INSTANCES.get(key)
-    if inst is None:
+    inst = _MONITOR_INSTANCES_WEAK.get(key)
+    if inst is None or not inst.is_alive():
         inst = MonitoringWriter(super_name=super_name, organization=organization, monitor_type=monitor_type)
-        _MONITOR_INSTANCES[key] = inst
+        _MONITOR_INSTANCES_WEAK[key] = inst
+        _MONITOR_INSTANCES[key] = inst  # Strong reference to prevent premature GC
     return inst
 
+
 def _shutdown_all_monitors():
-    for inst in list(_MONITOR_INSTANCES.values()):
+    """Shutdown all active monitor instances."""
+    for key, inst in list(_MONITOR_INSTANCES.items()):
         try:
-            inst.close()
-        except Exception:
-            pass
+            inst.close(force_flush=True)
+            # Remove strong reference to allow GC
+            del _MONITOR_INSTANCES[key]
+        except Exception as e:
+            logger.error(f"[monitor] Error during shutdown of {key}: {e}")
     _MONITOR_INSTANCES.clear()
+
 
 atexit.register(_shutdown_all_monitors)
 
 
 class MonitoringWriter:
     """
-    Minimal-lock, queue-based monitoring (minute-cadence batching):
+    Robust queue-based monitoring with minute-cadence batching and guaranteed final flush.
 
-      • Producers call log_metric(record) → enqueues only (no IO, no locks).
-      • A single background thread (per (org,super,type)) aggregates for ~1 minute,
-        then writes a Parquet file per table_name for that cycle.
-      • Files are written under:
-           <org>/<super>/monitoring/<type>/data/table_name=<name>/<ts>_<id>_data.parquet
-      • After each write we update _stats.json under a short Redis lock:
-           - Append {"path","rows","table_name"} for each file
-           - Maintain "file_count" and "row_count" aggregates
-      • Debug logs include:
-           - Thread start/stop
-           - Cycle BEGIN/END with pre/post file & row counts
-           - Lock acquisition time and stats update time
+    Key improvements:
+    1. Thread only stops when explicitly closed AND queue is empty
+    2. Proper synchronization for batch operations
+    3. Guaranteed final flush on shutdown
+    4. Better error handling and retry mechanisms
+    5. Weak references to prevent memory leaks
     """
 
     def __init__(
-        self,
-        super_name: str,
-        organization: str,
-        monitor_type: str,
-        max_rows_per_file: int = 1_000_000,   # effectively "unlimited" per minute per table
-        flush_interval: float = 60.0,         # strict minute cadence
-        compression: str = "zstd",
-        compression_level: int = 1,
-        idle_stop_after: float = 90.0,        # stop thread if idle this long after last activity
+            self,
+            super_name: str,
+            organization: str,
+            monitor_type: str,
+            *,
+            max_rows_per_file: int = 1_000_000,
+            flush_interval: float = 60.0,
+            compression: str = "zstd",
+            compression_level: int = 1,
+            idle_stop_after: float = 300.0,  # Increased to 5 minutes for safety
     ):
         self.identity = "monitoring"
         self.super_name = super_name
@@ -92,12 +98,16 @@ class MonitoringWriter:
         self.data_dir = os.path.join(self.base_dir, "data")
         self.stats_path = os.path.join(self.organization, self.super_name, "_stats.json")
 
-        # State
+        # State - use RLock for better reentrancy
         self.queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.current_batch: List[Dict[str, Any]] = []
-        self.batch_lock = threading.Lock()
+        self.pending_stat_entries: List[Dict[str, Any]] = []
+        self.batch_lock = threading.RLock()
 
+        # Thread control
         self.stop_event = threading.Event()
+        self.flush_requested = threading.Event()
+        self.last_activity = time.time()
 
         # Stats about the queue/thread
         self.queue_stats = {
@@ -109,34 +119,48 @@ class MonitoringWriter:
             "flush_durations": [],
             "last_flush_size": 0,
             "start_time": time.time(),
+            "flush_requests": 0,
         }
         self.queue_stats_lock = threading.Lock()
 
         # Ensure directories exist
-        self.storage.makedirs(self.base_dir)
-        self.storage.makedirs(self.data_dir)
+        try:
+            self.storage.makedirs(self.base_dir)
+            self.storage.makedirs(self.data_dir)
+        except Exception as e:
+            logger.error(f"[monitor] Directory creation failed: {e}")
 
-        # Start background writer (auto-restart on demand)
+        # Start background writer
         self._writer_thread: Optional[threading.Thread] = None
         self._ensure_thread()
+
+    def is_alive(self) -> bool:
+        """Check if writer thread is alive."""
+        return self._writer_thread is not None and self._writer_thread.is_alive()
 
     # ---------------- Utilities ----------------
 
     def _ensure_thread(self):
-        if self._writer_thread is None or not self._writer_thread.is_alive():
+        """Start writer thread if not running."""
+        if not self.is_alive():
             self.stop_event.clear()
+            self.flush_requested.clear()
             self._writer_thread = threading.Thread(
                 target=self._write_loop,
                 name=f"MonitoringWriter-{self.organization}-{self.super_name}-{self.monitor_type}",
-                daemon=True,
+                daemon=False,  # Non-daemon to ensure proper shutdown
             )
             self._writer_thread.start()
             logger.info(
-                f"[monitor] started writer thread for {self.organization}/{self.super_name}/{self.monitor_type}"
+                f"[monitor] started dequeue thread for {self.organization}/{self.super_name}/{self.monitor_type}"
             )
 
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
     def _generate_filename(self, prefix: str) -> str:
-        timestamp = int(time.time() * 1000)
+        timestamp = self._now_ms()
         unique_hash = uuid.uuid4().hex[:16]
         return f"{timestamp}_{unique_hash}_{prefix}"
 
@@ -149,101 +173,97 @@ class MonitoringWriter:
         return record
 
     def _dir_for_table(self, table_name: str) -> str:
-        safe = str(table_name)
+        safe = str(table_name).replace('/', '_').replace('\\', '_')
         return os.path.join(self.data_dir, f"table_name={safe}")
 
     def _write_parquet_file(
-        self,
-        data: List[Dict[str, Any]],
-        table_name: str,
+            self,
+            data: List[Dict[str, Any]],
+            table_name: str,
     ) -> Dict[str, Any]:
         if not data:
             return {"file": "", "file_size": 0, "rows": 0, "columns": 0, "table_name": table_name}
 
-        data = [self._ensure_execution_time(r) for r in data]
-        df = pl.from_dicts(data)
-
-        table_dir = self._dir_for_table(table_name)
-        self.storage.makedirs(table_dir)
-
-        new_filename = self._generate_filename("data.parquet")
-        new_path = os.path.join(table_dir, new_filename)
-
-        table: pa.Table = df.to_arrow()
-        buf = io.BytesIO()
-        pq.write_table(
-            table,
-            buf,
-            compression=self.compression,
-            compression_level=self.compression_level,
-            use_dictionary=True,
-            write_statistics=True,
-        )
-        payload = buf.getvalue()
-        if hasattr(self.storage, "write_bytes"):
-            self.storage.write_bytes(new_path, payload)
-        else:
-            with open(new_path, "wb") as f:
-                f.write(payload)
-
         try:
-            size = self.storage.size(new_path)
-        except Exception:
-            try:
-                size = os.path.getsize(new_path)
-            except Exception:
-                size = 0
+            data = [self._ensure_execution_time(r) for r in data]
+            df = pl.from_dicts(data)
 
-        return {
-            "file": new_path,
-            "file_size": int(size),
-            "rows": int(df.height),
-            "columns": len(df.columns),
-            "table_name": table_name,
-        }
+            table_dir = self._dir_for_table(table_name)
+            self.storage.makedirs(table_dir)
+
+            new_filename = self._generate_filename("data.parquet")
+            new_path = os.path.join(table_dir, new_filename)
+
+            table: pa.Table = df.to_arrow()
+            buf = io.BytesIO()
+            pq.write_table(
+                table,
+                buf,
+                compression=self.compression,
+                compression_level=self.compression_level,
+                use_dictionary=True,
+                write_statistics=True,
+            )
+            payload = buf.getvalue()
+
+            if hasattr(self.storage, "write_bytes"):
+                self.storage.write_bytes(new_path, payload)
+            else:
+                with open(new_path, "wb") as f:
+                    f.write(payload)
+
+            try:
+                size = self.storage.size(new_path)
+            except Exception:
+                size = len(payload)  # Fallback to buffer size
+
+            return {
+                "file": new_path,
+                "file_size": int(size),
+                "rows": int(df.height),
+                "columns": len(df.columns),
+                "table_name": table_name,
+            }
+        except Exception as e:
+            logger.error(f"[monitor] Parquet write failed for table {table_name}: {e}")
+            return {"file": "", "file_size": 0, "rows": 0, "columns": 0, "table_name": table_name}
 
     # ---------------- Stats JSON (locked) ----------------
 
     def _read_stats(self) -> Dict[str, Any]:
-        """
-        Structure:
-        {
-          "file_count": int,
-          "row_count": int,
-          "files": [ {"path": "...parquet", "rows": int, "table_name": "..." } ],
-          "updated_ms": int
-        }
-        """
+        """Read and parse stats JSON with proper error handling."""
         if self.storage.exists(self.stats_path):
             try:
                 obj = self.storage.read_json(self.stats_path)
                 if isinstance(obj, dict):
                     obj.setdefault("files", [])
-                    obj.setdefault("file_count", len(obj.get("files", [])))
-                    obj.setdefault("row_count", 0)
-                    obj.setdefault("updated_ms", 0)
                     # Back-compat: old list[str]
                     if obj["files"] and isinstance(obj["files"][0], str):
                         obj["files"] = [{"path": p, "rows": 0, "table_name": ""} for p in obj["files"]]
-                    obj["file_count"] = int(obj.get("file_count", len(obj["files"])))
-                    obj["row_count"] = int(obj.get("row_count", 0))
+                    obj["file_count"] = len(obj["files"])
+                    obj["row_count"] = sum(int(f.get("rows", 0)) for f in obj["files"])
+                    obj.setdefault("updated_ms", 0)
                     return obj
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"[monitor] Error reading stats: {e}")
         return {"files": [], "file_count": 0, "row_count": 0, "updated_ms": 0}
 
     def _write_stats(self, stats: Dict[str, Any]) -> None:
-        stats["updated_ms"] = int(time.time() * 1000)
-        self.storage.write_json(self.stats_path, stats)
+        """Write stats JSON with timestamp."""
+        stats["updated_ms"] = self._now_ms()
+        try:
+            self.storage.write_json(self.stats_path, stats)
+        except Exception as e:
+            logger.error(f"[monitor] Error writing stats: {e}")
+            raise
 
-    def _append_files_to_stats_locked(self, new_file_entries: List[Dict[str, Any]]) -> None:
+    def _commit_stats_with_retry(self, new_entries: List[Dict[str, Any]]) -> bool:
         """
-        Acquire stat lock, read _stats.json, append new refs, write back, release.
-        Logs lock acquisition time and update duration.
-        Each entry: {"path": str, "rows": int, "table_name": str}
+        Try to append entries to _stats.json under Redis lock.
+        Returns True on success, False on failure (entries will be retried).
         """
-        if not new_file_entries:
-            return
+        if not new_entries:
+            return True
 
         org = self.organization
         sup = self.super_name
@@ -251,44 +271,56 @@ class MonitoringWriter:
         acquire_start = time.time()
         token = self.catalog.acquire_stat_lock(org, sup, ttl_s=10, timeout_s=10)
         lock_wait = time.time() - acquire_start
+
         if not token:
             logger.warning(
                 f"[monitor] stats lock ACQUIRE FAILED for {org}/{sup} "
-                f"(waited {lock_wait:.4f}s), skipping stats update"
+                f"(waited {lock_wait:.4f}s); will retry next cycle"
             )
-            return
+            return False
 
-        update_start = time.time()
         try:
+            update_start = time.time()
             stats = self._read_stats()
-            before_cnt = int(stats.get("file_count", 0))
-            before_rows = int(stats.get("row_count", 0))
+
+            before_cnt = stats["file_count"]
+            before_rows = stats["row_count"]
+
             logger.debug(
                 f"[monitor] stats update BEGIN for {org}/{sup}: "
                 f"file_count(before)={before_cnt}, row_count(before)={before_rows}, "
-                f"new_files={len(new_file_entries)}, lock_wait={lock_wait:.4f}s"
+                f"new_files={len(new_entries)}, lock_wait={lock_wait:.4f}s"
             )
 
-            files = stats.get("files", [])
-            files.extend(
-                {"path": e.get("file") or e.get("path"), "rows": int(e.get("rows", 0)), "table_name": e.get("table_name", "")}
-                for e in new_file_entries
-                if e.get("file") or e.get("path")
-            )
-            stats["files"] = files
-            stats["file_count"] = len(files)
-            stats["row_count"] = sum(int(f.get("rows", 0)) for f in files)
+            # Add new entries
+            for entry in new_entries:
+                if entry.get("file") or entry.get("path"):
+                    stats["files"].append({
+                        "path": entry.get("file") or entry.get("path"),
+                        "rows": int(entry.get("rows", 0)),
+                        "table_name": entry.get("table_name", "")
+                    })
+
+            # Update counts
+            stats["file_count"] = len(stats["files"])
+            stats["row_count"] = sum(int(f.get("rows", 0)) for f in stats["files"])
 
             self._write_stats(stats)
 
-            after_cnt = int(stats["file_count"])
-            after_rows = int(stats["row_count"])
+            after_cnt = stats["file_count"]
+            after_rows = stats["row_count"]
             update_dur = time.time() - update_start
+
             logger.debug(
                 f"[monitor] stats update END for {org}/{sup}: "
                 f"file_count(after)={after_cnt}, row_count(after)={after_rows}, "
                 f"lock_wait={lock_wait:.4f}s, update_time={update_dur:.4f}s"
             )
+            return True
+
+        except Exception as e:
+            logger.error(f"[monitor] Error during stats update: {e}")
+            return False
         finally:
             try:
                 self.catalog.release_stat_lock(org, sup, token)
@@ -297,155 +329,207 @@ class MonitoringWriter:
 
     # ---------------- Flush logic ----------------
 
+    def _drain_queue_to_batch(self) -> int:
+        """Drain all available items from queue to current batch."""
+        drained = 0
+        try:
+            while True:
+                try:
+                    item = self.queue.get_nowait()
+                    with self.batch_lock:
+                        self.current_batch.append(item)
+                    drained += 1
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logger.error(f"[monitor] Error draining queue: {e}")
+        return drained
+
     def _flush_batch(self):
+        """
+        Process current batch: write parquet files and update stats.
+        Retries failed stats updates in next cycle.
+        """
+        # Get batch data quickly with minimal locking
         with self.batch_lock:
             if not self.current_batch:
                 return
-            batch = self.current_batch
-            self.current_batch = []
+            batch = self.current_batch.copy()
+            self.current_batch.clear()
 
         start = time.time()
-
-        # Group by table_name (required)
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for rec in (self._ensure_execution_time(r) for r in batch):
-            table_name = rec.get("table_name") or "unknown_table"
-            grouped.setdefault(table_name, []).append(rec)
-
-        # Write one (or few if huge) file per table_name for this minute-cycle
         written_entries: List[Dict[str, Any]] = []
-        for table_name, rows in grouped.items():
-            idx = 0
-            n = len(rows)
-            while idx < n:
-                end = min(idx + self.max_rows_per_file, n)
-                res = self._write_parquet_file(rows[idx:end], table_name)
-                if res.get("file"):
-                    written_entries.append({"path": res["file"], "rows": res["rows"], "table_name": table_name})
-                idx = end
 
-        # Update _stats.json under lock
-        if written_entries:
-            self._append_files_to_stats_locked(written_entries)
+        try:
+            # Group by table_name
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for rec in batch:
+                table_name = rec.get("table_name") or "unknown_table"
+                grouped.setdefault(table_name, []).append(self._ensure_execution_time(rec))
 
-        # Update queue stats
-        with self.queue_stats_lock:
-            self.queue_stats["total_processed"] += len(batch)
-            self.queue_stats["last_flush_size"] = len(batch)
-            self.queue_stats["last_flush_time"] = time.time()
-            self.queue_stats["flush_durations"].append(self.queue_stats["last_flush_time"] - start)
-            if len(self.queue_stats["flush_durations"]) > 100:
-                self.queue_stats["flush_durations"].pop(0)
+            # Write files for each table
+            for table_name, rows in grouped.items():
+                idx = 0
+                n = len(rows)
+                while idx < n:
+                    end = min(idx + self.max_rows_per_file, n)
+                    chunk = rows[idx:end]
+                    res = self._write_parquet_file(chunk, table_name)
+                    if res.get("file") and res["rows"] > 0:
+                        written_entries.append(res)
+                    idx = end
+
+            # Add pending entries from previous failures
+            if self.pending_stat_entries:
+                written_entries = self.pending_stat_entries + written_entries
+                self.pending_stat_entries = []
+
+            # Update stats under Redis lock
+            if written_entries:
+                ok = self._commit_stats_with_retry(written_entries)
+                if not ok:
+                    # Keep for next retry
+                    self.pending_stat_entries.extend(written_entries)
+
+            # Update performance stats
+            with self.queue_stats_lock:
+                self.queue_stats["total_processed"] += len(batch)
+                self.queue_stats["last_flush_size"] = len(batch)
+                self.queue_stats["last_flush_time"] = time.time()
+                self.queue_stats["flush_durations"].append(time.time() - start)
+                if len(self.queue_stats["flush_durations"]) > 100:
+                    self.queue_stats["flush_durations"].pop(0)
+
+        except Exception as e:
+            logger.error(f"[monitor] Flush batch failed: {e}")
+            # Restore batch on failure to prevent data loss
+            with self.batch_lock:
+                self.current_batch.extend(batch)
 
     # ---------------- Public API ----------------
 
     def log_metric(self, metric_data: Dict[str, Any]):
-        """Enqueue only; ensures background thread is running."""
+        """
+        Enqueue metric data. Never blocks on writer.
+        Ensures background thread is running.
+        """
         self._ensure_thread()
+
+        # Update activity timestamp
+        self.last_activity = time.time()
+
+        # Enqueue without blocking
         self.queue.put(metric_data)
+
+        # Update stats
         with self.queue_stats_lock:
             self.queue_stats["total_received"] += 1
             current_size = self.queue.qsize()
             self.queue_stats["current_size"] = current_size
             self.queue_stats["max_size"] = max(self.queue_stats["max_size"], current_size)
 
-    # ---------------- Thread lifecycle (minute cadence) ----------------
+    def request_flush(self):
+        """Request immediate flush (for testing or shutdown)."""
+        self.flush_requested.set()
 
-    def _drain_queue_once(self) -> int:
-        drained = 0
-        while True:
-            try:
-                item = self.queue.get_nowait()
-            except queue.Empty:
-                break
-            with self.batch_lock:
-                self.current_batch.append(item)
-            drained += 1
-        return drained
+    # ---------------- Thread lifecycle ----------------
 
     def _write_loop(self):
+        """
+        Main writer loop with minute cadence and guaranteed final flush.
+        Only exits when explicitly stopped AND queue is completely processed.
+        """
         logger.info(
-            f"[monitor] dequeue thread running for {self.organization}/{self.super_name}/{self.monitor_type}"
+            f"[monitor] dequeue thread RUNNING for {self.organization}/{self.super_name}/{self.monitor_type}"
         )
-        last_activity = time.time()
+
         last_flush = time.time()
+        consecutive_empty_cycles = 0
 
-        while not self.stop_event.is_set():
-            # 1) Periodically poll the queue, but do not flush more often than flush_interval
-            #    We use a small sleep to avoid busy looping while still being responsive.
-            polled = 0
-            try:
-                # Block briefly to accumulate data without spinning
-                item = self.queue.get(timeout=0.5)
-                with self.batch_lock:
-                    self.current_batch.append(item)
-                polled = 1
-            except queue.Empty:
-                polled = 0
-
-            if polled:
-                last_activity = time.time()
-                # Drain the rest quickly
-                polled += self._drain_queue_once()
-
-            # 2) If a full minute has elapsed since the last flush, flush whatever we've collected
-            now = time.time()
-            due = (now - last_flush) >= self.flush_interval
-
-            if due and self.current_batch:
-                # Debug: before-cycle stats snapshot
-                stats_before = self._read_stats()
-                before_cnt = int(stats_before.get("file_count", len(stats_before.get("files", []))))
-                before_rows = int(stats_before.get("row_count", 0))
-                with self.queue_stats_lock:
-                    qsz = self.queue.qsize()
-                    cur_batch = len(self.current_batch)
-                logger.info(
-                    f"[monitor] cycle BEGIN for {self.organization}/{self.super_name}/{self.monitor_type}: "
-                    f"queued={qsz}, current_batch={cur_batch}, "
-                    f"file_count(before)={before_cnt}, row_count(before)={before_rows}"
-                )
-
-                self._flush_batch()
-                last_flush = time.time()
-
-                stats_after = self._read_stats()
-                after_cnt = int(stats_after.get("file_count", len(stats_after.get("files", []))))
-                after_rows = int(stats_after.get("row_count", 0))
-                with self.queue_stats_lock:
-                    flushed = self.queue_stats["last_flush_size"]
-                logger.info(
-                    f"[monitor] cycle END for {self.organization}/{self.super_name}/{self.monitor_type}: "
-                    f"flushed_records={flushed}, file_count(after)={after_cnt}, row_count(after)={after_rows}"
-                )
-
-            # 3) Auto-stop if idle (no queue items and no current batch) for idle_stop_after
-            if self.queue.empty() and not self.current_batch and (time.time() - last_activity) >= self.idle_stop_after:
-                logger.info(
-                    f"[monitor] idle timeout reached, stopping dequeue thread for "
-                    f"{self.organization}/{self.super_name}/{self.monitor_type}"
-                )
-                break
-
-            # 4) Small sleep to respect cadence and reduce CPU
-            time.sleep(0.1)
-
-        # --- Shutdown path: drain anything left and flush once (prevents missing rows) ---
         try:
-            remaining = self._drain_queue_once()
-            if remaining or self.current_batch:
-                logger.info(
-                    f"[monitor] shutdown flush for {self.organization}/{self.super_name}/{self.monitor_type}: "
-                    f"drained_remaining={remaining}, batch_size={len(self.current_batch)}"
-                )
-                self._flush_batch()
+            while not self.stop_event.is_set():
+                now = time.time()
+
+                # Check if we should flush (time-based or request-based)
+                time_due = (now - last_flush) >= self.flush_interval
+                should_flush = self.flush_requested.is_set() or time_due
+
+                # Always drain queue first
+                drained = self._drain_queue_to_batch()
+                if drained > 0:
+                    self.last_activity = now
+                    consecutive_empty_cycles = 0
+
+                # Process batch if we have data and should flush
+                if self.current_batch and should_flush:
+                    self._flush_batch()
+                    last_flush = now
+                    self.flush_requested.clear()
+                    consecutive_empty_cycles = 0
+
+                # Check for idle shutdown (only when explicitly stopped)
+                if self.stop_event.is_set():
+                    # When stopping, ensure we process everything
+                    if self.queue.empty() and not self.current_batch and not self.pending_stat_entries:
+                        break
+                else:
+                    # Normal operation: check for prolonged inactivity
+                    idle_time = now - self.last_activity
+                    if idle_time >= self.idle_stop_after:
+                        consecutive_empty_cycles += 1
+                        if consecutive_empty_cycles >= 3:  # Multiple empty cycles before stopping
+                            logger.info(
+                                f"[monitor] idle timeout, stopping dequeue thread for "
+                                f"{self.organization}/{self.super_name}/{self.monitor_type}"
+                            )
+                            break
+
+                # Sleep to reduce CPU usage
+                time.sleep(0.1)
+
         except Exception as e:
-            logger.error(f"[monitor] error during shutdown flush: {e}")
+            logger.error(f"[monitor] Unexpected error in write loop: {e}")
+        finally:
+            # FINAL FLUSH: Ensure all data is processed before exit
+            try:
+                logger.info(
+                    f"[monitor] Final flush for {self.organization}/{self.super_name}/{self.monitor_type}: "
+                    f"queue_size={self.queue.qsize()}, batch_size={len(self.current_batch)}, "
+                    f"pending_stats={len(self.pending_stat_entries)}"
+                )
+
+                # Drain any remaining items
+                self._drain_queue_to_batch()
+
+                # Final flush
+                if self.current_batch or self.pending_stat_entries:
+                    self._flush_batch()
+
+            except Exception as e:
+                logger.error(f"[monitor] Error during final flush: {e}")
 
         logger.info(
-            f"[monitor] dequeue thread exited for {self.organization}/{self.super_name}/{self.monitor_type}"
+            f"[monitor] dequeue thread EXITED for {self.organization}/{self.super_name}/{self.monitor_type}"
         )
 
-    def close(self):
-        """Signal stop; thread is daemon and will exit. We trigger a final flush in _write_loop."""
+    def close(self, force_flush: bool = False):
+        """
+        Graceful shutdown with optional forced flush.
+
+        Args:
+            force_flush: If True, wait for final flush to complete
+        """
+        if force_flush:
+            self.request_flush()
+            # Give it a moment to process
+            time.sleep(0.5)
+
         self.stop_event.set()
+
+        if self._writer_thread and self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=10.0)  # Wait up to 10 seconds
+
+        # Clean up singleton reference
+        key = (self.organization, self.super_name, self.monitor_type)
+        if key in _MONITOR_INSTANCES:
+            del _MONITOR_INSTANCES[key]

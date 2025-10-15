@@ -1,5 +1,4 @@
 # supertable/redis_catalog.py
-
 from __future__ import annotations
 
 import json
@@ -31,7 +30,7 @@ def _lock_key(org: str, sup: str, simple: str) -> str:
 
 def _stat_lock_key(org: str, sup: str) -> str:
     # Dedicated lock for stats updates
-    return f"supertable:{org}:{sup}:lock:stats"
+    return f"supertable:{org}:{sup}:lock:stat"
 
 
 def _mirrors_key(org: str, sup: str) -> str:
@@ -54,7 +53,7 @@ class RedisCatalog:
       * meta:leaf:{simple} -> {"version": int, "ts": epoch_ms, "path": ".../snapshot.json"}
       * meta:mirrors -> {"formats": [...], "ts": epoch_ms}
       * lock:leaf:{simple} -> token (SET NX EX)
-      * lock:stats -> token (SET NX EX)  # for monitoring stats updates
+      * lock:stat -> token (SET NX EX)  # for monitoring stats updates
     """
 
     # ------------- Lua sources -------------
@@ -147,7 +146,7 @@ return 0
                 if ok:
                     return token
             except redis.RedisError as e:
-                logger.info(f"[redis-lock] acquire error on {key}: {e}")
+                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
             time.sleep(0.05)
         return None
 
@@ -157,7 +156,7 @@ return 0
             res = self._lock_release_if_token(keys=[_lock_key(org, sup, simple)], args=[token])
             return int(res or 0) == 1
         except redis.RedisError as e:
-            logger.info(f"[redis-lock] release error: {e}")
+            logger.debug(f"[redis-lock] release error: {e}")
             return False
 
     def extend_simple_lock(self, org: str, sup: str, simple: str, token: str, ttl_ms: int) -> bool:
@@ -166,13 +165,13 @@ return 0
             res = self._lock_extend_if_token(keys=[_lock_key(org, sup, simple)], args=[token, int(ttl_ms)])
             return int(res or 0) == 1
         except redis.RedisError as e:
-            logger.info(f"[redis-lock] extend error: {e}")
+            logger.debug(f"[redis-lock] extend error: {e}")
             return False
 
     # ---- Stats lock (for monitoring _stats.json updates) ----
 
     def acquire_stat_lock(self, org: str, sup: str, ttl_s: int = 10, timeout_s: int = 10) -> Optional[str]:
-        """Acquire stat lock: supertable:{org}:{sup}:lock:stats"""
+        """Acquire stat lock: supertable:{org}:{sup}:lock:stat"""
         key = _stat_lock_key(org, sup)
         token = uuid.uuid4().hex
         deadline = time.time() + max(1, int(timeout_s))
@@ -192,7 +191,7 @@ return 0
             res = self._lock_release_if_token(keys=[_stat_lock_key(org, sup)], args=[token])
             return int(res or 0) == 1
         except redis.RedisError as e:
-            logger.info(f"[redis-stat-lock] release error: {e}")
+            logger.debug(f"[redis-stat-lock] release error: {e}")
             return False
 
     # ------------- Pointers (root/leaf) -------------

@@ -40,7 +40,7 @@ def quiet_logs():
         if not lg.handlers:
             lg.addHandler(logging.NullHandler())
 
-quiet_logs()
+#quiet_logs()
 
 # -------------------------
 # Config

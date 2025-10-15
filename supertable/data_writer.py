@@ -10,7 +10,7 @@ import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
-from supertable.monitoring_writer import get_monitoring_logger  # singleton monitor (async)
+from supertable.monitoring_writer import get_monitoring_logger  # async monitoring (enqueue only)
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
@@ -18,7 +18,7 @@ from supertable.processing import (
     process_overlapping_files,
     find_and_lock_overlapping_files,
 )
-from supertable.rbac.access_control import check_write_access
+from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
 from supertable.mirroring.mirror_formats import MirrorFormats
 
@@ -34,7 +34,7 @@ class DataWriter:
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
-        Monitoring is fully decoupled from locking: we only enqueue a metric after the lock is released.
+        Monitoring is fully decoupled: we only enqueue a metric AFTER the lock is released.
         """
         qid = str(uuid.uuid4())
         lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
@@ -55,15 +55,6 @@ class DataWriter:
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
-
-            # --- Access control ------------------------------------------------
-            # check_write_access(
-            #     super_name=self.super_table.super_name,
-            #     organization=self.super_table.organization,
-            #     user_hash=user_hash,
-            #     table_name=simple_name,
-            # )
-            mark("access")
 
             # --- Convert input -------------------------------------------------
             dataframe: DataFrame = polars.from_arrow(data)
@@ -89,7 +80,7 @@ class DataWriter:
 
             # --- Detect overlaps ----------------------------------------------
             overlapping_files = find_and_lock_overlapping_files(
-                last_simple_table, dataframe, overwrite_columns, locking=None  # keep minimal per-file locking
+                last_simple_table, dataframe, overwrite_columns, locking=None
             )
             mark("overlap")
 
@@ -103,7 +94,7 @@ class DataWriter:
             )
             mark("process")
 
-            # --- Update heavy snapshot on storage -----------------------------
+            # --- Update snapshot on storage -----------------------------------
             new_snapshot_dict, new_snapshot_path = simple_table.update(
                 new_resources, sunset_files, dataframe
             )
@@ -120,7 +111,7 @@ class DataWriter:
             self.catalog.bump_root(self.super_table.organization, self.super_table.super_name)
             mark("bump_root")
 
-            # --- Mirroring -----------------------------------------------------
+            # --- Optional mirroring -------------------------------------------
             try:
                 MirrorFormats.mirror_if_enabled(
                     super_table=self.super_table,
@@ -136,7 +127,7 @@ class DataWriter:
                 "query_id": qid,
                 "recorded_at": datetime.utcnow().isoformat(),
                 "super_name": self.super_table.super_name,
-                "table_name": simple_name,
+                "table_name": simple_name,               # partitioning by table_name in monitor
                 "overwrite_columns": overwrite_columns,
                 "inserted": inserted,
                 "deleted": deleted,
@@ -149,16 +140,15 @@ class DataWriter:
             mark("prepare_monitor")
 
             total_duration = time.time() - t0
-            total_str = f"\033[94m{total_duration:.3f}\033[32m"
             logger.info(
                 lp(
                     "Timing(s): "
-                    f"total={total_str} | access={timings.get('access', 0):.3f} | convert={timings.get('convert', 0):.3f} | "
-                    f"validate={timings.get('validate', 0):.3f} | lock={timings.get('lock', 0):.3f} | "
-                    f"snapshot={timings.get('snapshot', 0):.3f} | overlap={timings.get('overlap', 0):.3f} | "
-                    f"process={timings.get('process', 0):.3f} | update_simple={timings.get('update_simple', 0):.3f} | "
-                    f"bump_root={timings.get('bump_root', 0):.3f} | mirror={timings.get('mirror', 0):.3f} | "
-                    f"prepare_monitor={timings.get('prepare_monitor', 0):.3f}\033[0m"
+                    f"total={total_duration:.3f} | "
+                    f"convert={timings.get('convert', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
+                    f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
+                    f"overlap={timings.get('overlap', 0):.3f} | process={timings.get('process', 0):.3f} | "
+                    f"update_simple={timings.get('update_simple', 0):.3f} | bump_root={timings.get('bump_root', 0):.3f} | "
+                    f"mirror={timings.get('mirror', 0):.3f} | prepare_monitor={timings.get('prepare_monitor', 0):.3f}"
                 )
             )
 
@@ -192,7 +182,6 @@ class DataWriter:
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
-        # Return result to caller
         return result_tuple
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list):
