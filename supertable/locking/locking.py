@@ -76,7 +76,7 @@ class Locking:
         else:
             raise ValueError(f"Unsupported locking backend: {self.backend!r}")
 
-        logger.info(f"[locking] backend={self.backend.value}")
+        logger.debug(f"[locking] backend={self.backend.value}")
 
     # ---------------- proxy API ----------------
 

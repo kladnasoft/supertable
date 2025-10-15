@@ -36,6 +36,14 @@ class SuperTable:
         self.super_dir = os.path.join(self.organization, self.super_name, self.identity)
         logger.debug(f"super_dir: {self.super_dir}")
 
+        # Fast path: if meta:root exists, don't touch storage
+        if self.catalog.root_exists(self.organization, self.super_name):
+            logger.debug(
+                f"[SuperTable] Root exists in Redis for {self.organization}/{self.super_name}; "
+                f"skipping storage mkdirs."
+            )
+            return
+
         self.init_super_table()
 
         # Initialize RBAC scaffolding
@@ -45,9 +53,12 @@ class SuperTable:
     # ------------------------------------------------------------------ init
     def init_super_table(self) -> None:
         """
-        Ensure underlying data folders (best-effort, some object stores ignore) and
-        initialize Redis meta:root if absent.
+        Initialize super table:
+          * If Redis meta:root already exists -> skip any folder checks/creations.
+          * Otherwise, create the base folder (best-effort) and bootstrap Redis meta:root.
         """
+
+        # Slow path: first-time initialization
         try:
             self.storage.makedirs(self.super_dir)
         except Exception:

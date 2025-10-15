@@ -207,6 +207,22 @@ return 0
             logger.error(f"[redis-catalog] ensure_root failed: {e}")
             raise
 
+    def root_exists(self, org: str, sup: str) -> bool:
+        """Check existence of meta:root key."""
+        try:
+            return bool(self.r.exists(_root_key(org, sup)))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] root_exists error: {e}")
+            return False
+
+    def leaf_exists(self, org: str, sup: str, simple: str) -> bool:
+        """Check existence of meta:leaf key for a simple table."""
+        try:
+            return bool(self.r.exists(_leaf_key(org, sup, simple)))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] leaf_exists error: {e}")
+            return False
+
     def get_root(self, org: str, sup: str) -> Optional[Dict]:
         try:
             raw = self.r.get(_root_key(org, sup))

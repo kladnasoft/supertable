@@ -26,6 +26,7 @@ class SimpleTable:
         self.storage = self.super_table.storage
         self.catalog = RedisCatalog()
 
+
         # Data layout
         self.simple_dir = os.path.join(
             super_table.organization, super_table.super_name, self.identity, self.simple_name
@@ -37,43 +38,59 @@ class SimpleTable:
         logger.debug(f"data_dir: {self.data_dir}")
         logger.debug(f"snapshot_dir: {self.snapshot_dir}")
 
+        # Fast path: if meta:leaf exists, don't touch storage
+        if self.catalog.leaf_exists(
+                self.super_table.organization, self.super_table.super_name, self.simple_name
+        ):
+            logger.debug(
+                f"[SimpleTable] Leaf exists in Redis for "
+                f"{self.super_table.organization}/{self.super_table.super_name}/{self.simple_name}; "
+                f"skipping storage mkdirs and bootstrap."
+            )
+            return
+
         self.init_simple_table()
 
-    def init_simple_table(self):
-        # Ensure directories in storage (best-effort)
+    def init_simple_table(self) -> None:
+        """
+        Initialize simple table:
+          * If Redis meta:leaf already exists -> skip any folder checks/creations and bootstrapping.
+          * Otherwise, create folders and bootstrap an initial empty snapshot and leaf pointer.
+        """
+
+        # First-time initialization: ensure directories in storage (best-effort)
         for p in (self.simple_dir, self.data_dir, self.snapshot_dir):
             try:
                 if not self.storage.exists(p):
                     self.storage.makedirs(p)
             except Exception:
+                # Object storage may no-op; that's fine
                 pass
 
-        # Bootstrap leaf pointer in Redis if missing (version=0, empty path)
-        leaf = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
-        if leaf is None:
-            # create an initial empty snapshot file so readers have a path if needed
-            initial_snapshot_file = generate_filename(alias=self.identity)
-            new_simple_path = os.path.join(self.snapshot_dir, initial_snapshot_file)
-            snapshot_data = {
-                "simple_name": self.simple_name,
-                "location": self.simple_dir,
-                "snapshot_version": 0,
-                "last_updated_ms": int(datetime.now().timestamp() * 1000),
-                "previous_snapshot": None,
-                "schema": [],
-                "resources": [],
-            }
-            self.storage.write_json(new_simple_path, snapshot_data)
-            # CAS set leaf to that path (version becomes 0)
-            self.catalog.set_leaf_path_cas(
-                self.super_table.organization,
-                self.super_table.super_name,
-                self.simple_name,
-                new_simple_path,
-                now_ms=int(datetime.now().timestamp() * 1000),
-            )
+        # Bootstrap leaf pointer in Redis (version=0, empty initial snapshot)
+        initial_snapshot_file = generate_filename(alias=self.identity)
+        new_simple_path = os.path.join(self.snapshot_dir, initial_snapshot_file)
+        snapshot_data = {
+            "simple_name": self.simple_name,
+            "location": self.simple_dir,
+            "snapshot_version": 0,
+            "last_updated_ms": int(datetime.now().timestamp() * 1000),
+            "previous_snapshot": None,
+            "schema": [],
+            "resources": [],
+        }
+        self.storage.write_json(new_simple_path, snapshot_data)
 
-    def delete(self, user_hash: str):
+        # CAS set leaf to that path (version becomes 0)
+        self.catalog.set_leaf_path_cas(
+            self.super_table.organization,
+            self.super_table.super_name,
+            self.simple_name,
+            new_simple_path,
+            now_ms=int(datetime.now().timestamp() * 1000),
+        )
+
+    def delete(self, user_hash: str) -> None:
         check_write_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
