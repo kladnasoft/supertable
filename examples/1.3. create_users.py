@@ -1,3 +1,4 @@
+
 import os
 from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
@@ -9,7 +10,7 @@ from examples.defaults import super_name, organization
 # Initialize the RoleManager with a base directory.
 role_manager = RoleManager(super_name=super_name, organization=organization)
 
-# List valid roles from _roles.json.
+# List valid roles from Redis.
 valid_roles = role_manager.list_roles()
 for role in valid_roles:
     logger.info(f"Role Type: {role['role']}, Hash: {role['hash']}")
@@ -20,6 +21,7 @@ admin_role_hash = None
 editor_role_hash = None
 viewer_role_hash = None
 usage_role_hash = None
+superadmin_role_hash = None
 
 for role in valid_roles:
     role_type = role["role"].lower()
@@ -31,6 +33,8 @@ for role in valid_roles:
         viewer_role_hash = role["hash"]
     elif role_type == "meta" and usage_role_hash is None:
         usage_role_hash = role["hash"]
+    elif role_type == "superadmin" and superadmin_role_hash is None:
+        superadmin_role_hash = role["hash"]
 
 # If no viewer role exists, create one.
 if viewer_role_hash is None:
@@ -51,7 +55,7 @@ user_manager = UserManager(super_name=super_name, organization=organization)
 # User Alice will have the admin and editor roles.
 alice_data = {
     "username": "alice",
-    "roles": [admin_role_hash, editor_role_hash]  # valid role hashes
+    "roles": [admin_role_hash, editor_role_hash] if admin_role_hash and editor_role_hash else []
 }
 alice_hash = user_manager.create_user(alice_data)
 logger.info(f"User Alice created with hash: {alice_hash}")
@@ -59,7 +63,7 @@ logger.info(f"User Alice created with hash: {alice_hash}")
 # User Bob will have the viewer role.
 bob_data = {
     "username": "bob",
-    "roles": [viewer_role_hash]
+    "roles": [viewer_role_hash] if viewer_role_hash else []
 }
 bob_hash = user_manager.create_user(bob_data)
 logger.info(f"User Bob created with hash: {bob_hash}")
@@ -74,33 +78,50 @@ logger.info(f"User Charlie created with hash: {charlie_hash}")
 
 # --- Modify user ---
 # Update Charlie: change his username and assign him the usage role.
-user_manager.modify_user(charlie_hash, {"username": "charlie_updated", "roles": [usage_role_hash]})
-charlie_data_updated = user_manager.get_user(charlie_hash)
-logger.info(f"User Charlie after modification: {charlie_data_updated}")
+if usage_role_hash:
+    user_manager.modify_user(charlie_hash, {"username": "charlie_updated", "roles": [usage_role_hash]})
+    charlie_data_updated = user_manager.get_user(charlie_hash)
+    logger.info(f"User Charlie after modification: {charlie_data_updated}")
 
 # --- Delete a user ---
 # Delete Bob.
-user_manager.delete_user(bob_hash)
-logger.info(f"User Bob deleted: {bob_hash}")
-
+try:
+    user_manager.delete_user(bob_hash)
+    logger.info(f"User Bob deleted: {bob_hash}")
+except Exception as e:
+    logger.error(f"Error deleting user Bob: {e}")
 
 # --- Delete a role ---
 # For example, delete the viewer role.
 if viewer_role_hash:
-    deleted = role_manager.delete_role(viewer_role_hash)
-    if deleted:
-        logger.info(f"Viewer role deleted: {viewer_role_hash}")
-        # Remove the deleted role from all users.
-        user_manager.remove_role_from_users(viewer_role_hash)
-        logger.info(f"Viewer role removed from all users: {viewer_role_hash}")
-    else:
-        logger.error(f"Viewer role deletion failed: {viewer_role_hash}")
+    try:
+        deleted = role_manager.delete_role(viewer_role_hash)
+        if deleted:
+            logger.info(f"Viewer role deleted: {viewer_role_hash}")
+            # Remove the deleted role from all users.
+            user_manager.remove_role_from_users(viewer_role_hash)
+            logger.info(f"Viewer role removed from all users: {viewer_role_hash}")
+        else:
+            logger.error(f"Viewer role deletion failed: {viewer_role_hash}")
+    except Exception as e:
+        logger.error(f"Error deleting viewer role: {e}")
 
-# --- List all users ---
-logger.info(f"Listing all users:")
-user_meta = user_manager.storage.read_json(user_manager.user_meta_path)
-for user_hash, username in user_meta["users"].items():
-    user_file_path = os.path.join(user_manager.user_dir, user_hash + ".json")
-    user_data = user_manager.storage.read_json(user_file_path)
-    print()
-    logger.info(user_data)
+# --- List all users using Redis storage ---
+logger.info("Listing all users from Redis:")
+try:
+    users = user_manager.list_users()
+    for user in users:
+        logger.info(f"User: {user['username']}, Hash: {user['hash']}, Roles: {user.get('roles', [])}")
+except Exception as e:
+    logger.error(f"Error listing users: {e}")
+
+# --- Test getting default superuser ---
+try:
+    default_user_hash = user_manager.get_or_create_default_user()
+    if default_user_hash:
+        default_user_data = user_manager.get_user(default_user_hash)
+        logger.info(f"Default superuser: {default_user_data}")
+    else:
+        logger.warning("No default superuser found")
+except Exception as e:
+    logger.error(f"Error getting default superuser: {e}")

@@ -1,4 +1,4 @@
-# [file name]: access_control.py
+# access_control.py
 
 from typing import Any
 
@@ -39,7 +39,7 @@ def check_write_access(super_name: str, organization: str, user_hash: str, table
             default_user_hash = user_manager.get_or_create_default_user()
             if default_user_hash:
                 user_hash = default_user_hash
-                logger.info(f"Using default superuser hash: {user_hash} for write access")
+                logger.debug(f"Using default superuser hash: {user_hash} for write access")
         except Exception as e:
             logger.warning(f"Failed to get default user, proceeding with original hash: {e}")
 
@@ -112,7 +112,7 @@ def restrict_read_access(
             default_user_hash = user_manager.get_or_create_default_user()
             if default_user_hash:
                 user_hash = default_user_hash
-                logger.info(f"Using default superuser hash: {user_hash} for read access")
+                logger.debug(f"Using default superuser hash: {user_hash} for read access")
         except Exception as e:
             logger.warning(f"Failed to get default user, proceeding with original hash: {e}")
 
@@ -227,7 +227,7 @@ def check_meta_access(super_name: str, organization: str, user_hash: str, table_
             default_user_hash = user_manager.get_or_create_default_user()
             if default_user_hash:
                 user_hash = default_user_hash
-                logger.info(f"Using default superuser hash: {user_hash} for meta access")
+                logger.debug(f"Using default superuser hash: {user_hash} for meta access")
         except Exception as e:
             logger.warning(f"Failed to get default user, proceeding with original hash: {e}")
 

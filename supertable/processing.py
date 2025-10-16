@@ -1,3 +1,5 @@
+# processing.py
+
 import logging
 import os
 import io
@@ -117,7 +119,8 @@ def is_file_in_overlapping_files(file: str, overlapping_files: Set[Tuple[str, bo
     return False
 
 
-def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, bool, int]]) -> Set[Tuple[str, bool, int]]:
+def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, bool, int]]) -> Set[
+    Tuple[str, bool, int]]:
     """
     Policy:
       - Always include entries with has_overlap=True
@@ -154,10 +157,10 @@ def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, b
 # =========================
 
 def find_and_lock_overlapping_files(  # keep name/signature for compatibility
-    last_simple_table: dict,
-    df: polars.DataFrame,
-    overwrite_columns: List[str],
-    locking: Locking,  # not used anymore for per-file locks; higher-level lock covers us
+        last_simple_table: dict,
+        df: polars.DataFrame,
+        overwrite_columns: List[str],
+        locking: Locking,  # not used anymore for per-file locks; higher-level lock covers us
 ) -> Set[Tuple[str, bool, int]]:
     """
     Builds the candidate set:
@@ -173,10 +176,12 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
     overlapping_files: Set[Tuple[str, bool, int]] = set()
 
     if overwrite_columns:
+        # ORIGINAL APPROACH - much faster
         new_schema = collect_schema(df)
         new_data_columns: Dict[str, List] = {}
         for col in overwrite_columns:
             if col in df.columns:
+                # Use original unique values approach - it's actually faster for most cases
                 unique_values = df[col].unique().to_list()
                 new_data_columns[col] = unique_values
 
@@ -226,7 +231,9 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
                     overlapping_files.add((file, True, file_size))
                 else:
                     # non-overlapping small files can be considered for compaction
-                    if (file_size < int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))) and not is_file_in_overlapping_files(file, overlapping_files):
+                    if (file_size < int(getattr(default, "MAX_MEMORY_CHUNK_SIZE",
+                                                512 * 1024 * 1024))) and not is_file_in_overlapping_files(file,
+                                                                                                          overlapping_files):
                         overlapping_files.add((file, False, file_size))
             else:
                 # Missing stats → treat as overlapping (be conservative)
@@ -252,11 +259,11 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
 # =========================
 
 def process_overlapping_files(
-    df: polars.DataFrame,
-    overlapping_files: Set[Tuple[str, bool, int]],
-    overwrite_columns: List[str],
-    data_dir: str,
-    compression_level: int,
+        df: polars.DataFrame,
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        data_dir: str,
+        compression_level: int,
 ):
     """
     Merge implementation:
@@ -321,18 +328,25 @@ def process_overlapping_files(
 
 
 def process_files_with_overlap(
-    data_dir,
-    deleted,
-    df,
-    empty_df,
-    merged_df,
-    new_resources,
-    overlapping_files,
-    overwrite_columns,
-    sunset_files,
-    total_rows,
-    compression_level,
+        data_dir,
+        deleted,
+        df,
+        empty_df,
+        merged_df,
+        new_resources,
+        overlapping_files,
+        overwrite_columns,
+        sunset_files,
+        total_rows,
+        compression_level,
 ):
+    # Pre-compute unique values for overwrite columns (ORIGINAL FAST APPROACH)
+    unique_values_map = {}
+    if overwrite_columns:
+        for col in overwrite_columns:
+            if col in df.columns:
+                unique_values_map[col] = df[col].unique(maintain_order=False)
+
     # Iterate only files where has_overlap is True
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if has_overlap):
         existing_df = _read_parquet_safe(file)
@@ -342,13 +356,15 @@ def process_files_with_overlap(
         filtered_df = empty_df.clone()
 
         if overwrite_columns:
-            # Filter out the rows where the overwrite_columns are in the new data
-            cond = polars.lit(True)
+            # ORIGINAL EFFICIENT APPROACH - multiple is_in() calls
+            cond = polars.lit(False)  # Start with False, OR with each column
             any_pred = False
             for col in overwrite_columns:
-                if col in existing_df.columns and col in df.columns:
+                if col in existing_df.columns and col in unique_values_map:
                     any_pred = True
-                    cond &= polars.col(col).is_in(df[col].unique())
+                    unique_vals = unique_values_map[col]
+                    cond = cond | polars.col(col).is_in(unique_vals)
+
             if any_pred:
                 kept = existing_df.filter(~cond)
                 difference = existing_df.shape[0] - kept.shape[0]
@@ -367,7 +383,7 @@ def process_files_with_overlap(
         merged_df = concat_with_union(merged_df, filtered_df)
         sunset_files.add(file)
 
-        # Spill chunk if too large (2x memory chunk heuristic)
+        # Spill chunk if too large (ORIGINAL APPROACH - 2x memory chunk)
         if merged_df.estimated_size() > int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024)) * 2:
             total_rows += merged_df.shape[0]
             write_parquet_and_collect_resources(
@@ -383,15 +399,15 @@ def process_files_with_overlap(
 
 
 def process_files_without_overlap(
-    empty_df,
-    data_dir,
-    new_resources,
-    overlapping_files,
-    overwrite_columns,
-    sunset_files,
-    compression_level,
+        empty_df,
+        data_dir,
+        new_resources,
+        overlapping_files,
+        overwrite_columns,
+        sunset_files,
+        compression_level,
 ):
-    # Initialize a compaction chunk
+    # ORIGINAL COMPACTION APPROACH - simple and fast
     chunk_size = 0
     chunk_df = empty_df.clone()
     max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
@@ -426,12 +442,12 @@ def process_files_without_overlap(
 # =========================
 
 def write_parquet_and_collect_resources(
-    write_df, overwrite_columns, data_dir, new_resources, compression_level=10
+        write_df, overwrite_columns, data_dir, new_resources, compression_level=10
 ):
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    # Collect statistics
+    # UPDATED: collect stats for EVERY column (still min/max only; perf-friendly vectorization)
     stats = collect_column_statistics(write_df, overwrite_columns)
 
     # Ensure target "directory" exists in the active storage (creates a marker or no-op)
@@ -510,21 +526,37 @@ def write_parquet_and_collect_resources(
 
 
 def collect_column_statistics(write_df, overwrite_columns: List[str]):
+    """
+    Collect min/max for EVERY column in a single vectorized pass (fast).
+    Function signature stays the same to preserve call sites and internal logic.
+    """
     stats: Dict[str, dict] = {}
-    rows = len(write_df)
 
-    for col in overwrite_columns:
-        if col in write_df.columns:
-            s = write_df[col]
-            if s.null_count() == rows:
-                stats[col] = {"min": None, "max": None}
-            else:
-                min_val = s.min()
-                max_val = s.max()
-                if isinstance(min_val, (date, datetime)):
-                    min_val = min_val.isoformat()
-                if isinstance(max_val, (date, datetime)):
-                    max_val = max_val.isoformat()
-                stats[col] = {"min": min_val, "max": max_val}
+    if write_df.is_empty():
+        return stats
+
+    cols = write_df.columns
+
+    # Build vectorized aggregations: for each column compute min/max.
+    agg_exprs: List[polars.Expr] = []
+    for c in cols:
+        agg_exprs.append(polars.col(c).min().alias(f"__min__{c}"))
+        agg_exprs.append(polars.col(c).max().alias(f"__max__{c}"))
+
+    agg = write_df.select(agg_exprs)
+    # Single-row result; convert once to Python dict for cheap lookups
+    row = agg.to_dicts()[0]
+
+    for c in cols:
+        min_val = row.get(f"__min__{c}")
+        max_val = row.get(f"__max__{c}")
+
+        # Normalize temporal types to ISO strings (matches original behavior)
+        if isinstance(min_val, (date, datetime)):
+            min_val = min_val.isoformat()
+        if isinstance(max_val, (date, datetime)):
+            max_val = max_val.isoformat()
+
+        stats[c] = {"min": min_val, "max": max_val}
 
     return stats

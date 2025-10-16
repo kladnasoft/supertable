@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
 from supertable.rbac.access_control import check_meta_access
@@ -19,16 +20,42 @@ def _prune_dict(d: Dict[str, Any], keys_to_remove: Set[str]) -> Dict[str, Any]:
 class MetaReader:
     """
     Read-only metadata helper for SuperTable & SimpleTable.
-    Optimizations / fixes:
-      - Use shared-lock readers to avoid self-deadlocks during read paths.
-      - Avoid in-place mutation of JSON dicts (copy before pruning keys).
-      - Consistent logging instead of print().
-      - Safer handling when snapshot paths are missing.
+    Optimized for Redis-based metadata with minimal locking.
     """
 
     def __init__(self, super_name: str, organization: str):
         # Create a SuperTable object (which internally sets up the storage backend).
         self.super_table = SuperTable(super_name=super_name, organization=organization)
+
+    def _get_all_tables(self) -> List[str]:
+        """
+        Get all tables for this super table by scanning Redis keys.
+        """
+        try:
+            # Pattern to match all leaf pointers for this organization/super
+            pattern = f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:*"
+
+            tables = []
+            cursor = 0
+            while True:
+                cursor, keys = self.catalog.r.scan(cursor=cursor, match=pattern, count=1000)
+                for key in keys:
+                    # Handle both bytes and string keys
+                    if isinstance(key, bytes):
+                        key_str = key.decode('utf-8')
+                    else:
+                        key_str = str(key)
+
+                    # Extract table name from key: supertable:org:super:meta:leaf:table_name
+                    table_name = key_str.split(':')[-1]
+                    if table_name not in tables:
+                        tables.append(table_name)
+                if cursor == 0:
+                    break
+            return tables
+        except Exception as e:
+            logger.error(f"Error getting tables from Redis: {e}")
+            return []
 
     def get_table_schema(self, table_name: str, user_hash: str) -> Optional[List[Dict[str, Any]]]:
         try:
@@ -45,42 +72,32 @@ class MetaReader:
             )
             return None
 
-        # Read super-table snapshot with a shared lock (read-only)
-        super_table_data, _, _ = self.super_table.get_super_table_and_path_with_shared_lock()
-        snapshots = super_table_data.get("snapshots", [])
-
         schema_items: Set[Tuple[str, Any]] = set()
 
         if table_name == self.super_table.super_name:
             # Aggregate schema across all simple tables
-            for snapshot in snapshots:
-                simple_path = snapshot.get("path")
-                if not simple_path:
-                    continue
+            tables = self._get_all_tables()
+            for table in tables:
                 try:
-                    simple_table_data = self.super_table.read_simple_table_snapshot(simple_path)
-                except FileNotFoundError:
-                    logger.debug("Simple table snapshot missing at %s", simple_path)
+                    simple_table = SimpleTable(self.super_table, table)
+                    simple_table_data, _ = simple_table.get_simple_table_snapshot()
+                    schema = simple_table_data.get("schema", {}) or {}
+                    for key, value in schema.items():
+                        schema_items.add((key, value))
+                except (FileNotFoundError, KeyError) as e:
+                    logger.debug("Failed to read schema for table %s: %s", table, e)
                     continue
-                schema = simple_table_data.get("schema", {}) or {}
-                for key, value in schema.items():
-                    schema_items.add((key, value))
         else:
             # Single table
-            simple_path = next(
-                (snapshot.get("path") for snapshot in snapshots
-                 if snapshot.get("table_name") == table_name),
-                None,
-            )
-            if simple_path:
-                try:
-                    simple_table_data = self.super_table.read_simple_table_snapshot(simple_path)
-                except FileNotFoundError:
-                    logger.debug("Simple table snapshot missing at %s", simple_path)
-                    return [{}]
+            try:
+                simple_table = SimpleTable(self.super_table, table_name)
+                simple_table_data, _ = simple_table.get_simple_table_snapshot()
                 schema = simple_table_data.get("schema", {}) or {}
                 for key, value in schema.items():
                     schema_items.add((key, value))
+            except (FileNotFoundError, KeyError) as e:
+                logger.debug("Failed to read schema for table %s: %s", table_name, e)
+                return [{}]
 
         distinct_schema = dict(sorted(schema_items))
         return [distinct_schema]
@@ -100,10 +117,9 @@ class MetaReader:
             )
             return
 
-        # Use shared-lock (read-only) to avoid contention
-        simple_table = SimpleTable(self.super_table, table_name)
         try:
-            simple_table_data, _ = simple_table.get_simple_table_with_shared_lock()
+            simple_table = SimpleTable(self.super_table, table_name)
+            simple_table_data, _ = simple_table.get_simple_table_snapshot()
         except FileNotFoundError:
             logger.debug("Simple table snapshot missing for %s", table_name)
             return
@@ -131,27 +147,25 @@ class MetaReader:
         stats: List[Dict[str, Any]] = []
 
         if table_name == self.super_table.super_name:
-            # Read super-table (shared-lock) and iterate simple tables
-            super_table_data, _, _ = self.super_table.get_super_table_and_path_with_shared_lock()
-            for snapshot in super_table_data.get("snapshots", []):
-                simple_name = snapshot.get("table_name")
-                if not simple_name:
-                    continue
-                st = SimpleTable(self.super_table, simple_name)
+            # Get all tables and their stats
+            tables = self._get_all_tables()
+            for table in tables:
                 try:
-                    st_data, _ = st.get_simple_table_with_shared_lock()
-                except FileNotFoundError:
-                    logger.debug("Simple table snapshot missing for %s", simple_name)
+                    st = SimpleTable(self.super_table, table)
+                    st_data, _ = st.get_simple_table_snapshot()
+                    stats.append(_prune_dict(st_data, keys_to_remove))
+                except (FileNotFoundError, KeyError):
+                    logger.debug("Simple table snapshot missing for %s", table)
                     continue
-                stats.append(_prune_dict(st_data, keys_to_remove))
         else:
-            st = SimpleTable(self.super_table, table_name)
+            # Single table
             try:
-                st_data, _ = st.get_simple_table_with_shared_lock()
-            except FileNotFoundError:
+                st = SimpleTable(self.super_table, table_name)
+                st_data, _ = st.get_simple_table_snapshot()
+                stats.append(_prune_dict(st_data, keys_to_remove))
+            except (FileNotFoundError, KeyError):
                 logger.debug("Simple table snapshot missing for %s", table_name)
                 return []
-            stats.append(_prune_dict(st_data, keys_to_remove))
 
         return stats
 
@@ -171,34 +185,58 @@ class MetaReader:
             )
             return None
 
-        # Shared-lock for read-only
-        super_table_data, current_path, super_table_meta = (
-            self.super_table.get_super_table_and_path_with_shared_lock()
-        )
+        # Get all tables from Redis
+        tables = self._get_all_tables()
 
-        simple_table_info = [
-            {
-                "name": snapshot.get("table_name"),
-                "files": snapshot.get("files", 0),
-                "rows": snapshot.get("rows", 0),
-                "size": snapshot.get("file_size", 0),
-                "updated_utc": snapshot.get("last_updated_ms", 0),
-            }
-            for snapshot in super_table_data.get("snapshots", [])
-        ]
+        simple_table_info = []
+        total_files = 0
+        total_rows = 0
+        total_size = 0
+
+        for table in tables:
+            try:
+                st = SimpleTable(self.super_table, table)
+                st_data, _ = st.get_simple_table_snapshot()
+
+                # Calculate table stats
+                resources = st_data.get("resources", [])
+                table_files = len(resources)
+                table_rows = sum(res.get("rows", 0) for res in resources)
+                table_size = sum(res.get("file_size", 0) for res in resources)
+
+                simple_table_info.append({
+                    "name": table,
+                    "files": table_files,
+                    "rows": table_rows,
+                    "size": table_size,
+                    "updated_utc": st_data.get("last_updated_ms", 0),
+                })
+
+                total_files += table_files
+                total_rows += table_rows
+                total_size += table_size
+
+            except (FileNotFoundError, KeyError) as e:
+                logger.debug("Failed to get stats for table %s: %s", table, e)
+                continue
 
         result = {
             "super": {
                 "name": self.super_table.super_name,
-                "files": super_table_meta.get("file_count", 0),
-                "rows": super_table_meta.get("total_rows", 0),
-                "size": super_table_meta.get("total_file_size", 0),
-                "updated_utc": super_table_data.get("last_updated_ms", 0),
+                "files": total_files,
+                "rows": total_rows,
+                "size": total_size,
+                "updated_utc": int(datetime.now().timestamp() * 1000),
                 "tables": simple_table_info,
-                "meta_path": current_path,
+                "meta_path": f"redis://{self.super_table.organization}/{self.super_table.super_name}",
             }
         }
         return result
+
+    @property
+    def catalog(self):
+        """Get the Redis catalog from super_table."""
+        return self.super_table.catalog
 
 
 def find_tables(organization: str) -> List[str]:

@@ -4,80 +4,95 @@ import random
 import os
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from supertable.monitoring_writer import MonitoringWriter
-from examples.defaults import super_name, organization, MonitorType
+from supertable.monitoring_writer import get_monitoring_logger
+from examples.defaults import super_name, organization
+
 
 def print_monitor_stats(monitor):
-    stats = monitor.get_queue_stats()
-    print(f"\nProcessed: {stats['total_processed']}/{stats['total_received']} | "
-          f"Queue: {stats['current_size']} | "
-          f"Rate: {stats['processing_rate']:.1f} msg/s")
+    """Print current monitor statistics."""
+    stats = monitor.queue_stats
+    with monitor.queue_stats_lock:
+        current_stats = stats.copy()
+
+    processed = current_stats.get("total_processed", 0)
+    received = current_stats.get("total_received", 0)
+    queue_size = current_stats.get("current_size", 0)
+
+    print(f"\nProcessed: {processed}/{received} | Queue: {queue_size}")
 
 
-def verify_output(monitor, expected_count):
-    # Wait for processing to complete
-    for _ in range(20):  # 20 second timeout
-        stats = monitor.get_queue_stats()
-        if stats['total_processed'] >= expected_count:
-            break
-        time.sleep(1)
-
-    # Verify final output
-    if stats['total_processed'] < expected_count:
-        print(f"\nWARNING: Only processed {stats['total_processed']}/{expected_count} messages")
-    else:
-        print(f"\nSUCCESS: Processed all {expected_count} messages")
-
-    # Print final file stats
-    catalog = monitor.storage.read_json(monitor.catalog_path)
-    print(f"\nFinal Catalog Stats:")
-    print(f"Files: {catalog['file_count']}")
-    print(f"Rows: {catalog['total_rows']}")
-    print(f"Version: {catalog['version']}")
+def worker(monitor, query_id):
+    """Worker function that logs metrics."""
+    stats = {
+        "query_id": f"query_{query_id}",
+        "rows_read": random.randint(100, 10000),
+        "rows_processed": random.randint(100, 10000),
+        "query_hash": random.randint(100000, 999999),
+        "table_name": f"table_{query_id % 5}"  # Distribute across 5 tables
+    }
+    monitor.log_metric(stats)
+    return query_id
 
 
-print("Current working directory:", os.getcwd())
+def main():
+    print("Current working directory:", os.getcwd())
 
-with MonitoringWriter(
+    # Get the monitoring logger (singleton)
+    monitor = get_monitoring_logger(
         super_name=super_name,
         organization=organization,
-        monitor_type=MonitorType.METRICS.value,
-        max_rows_per_file=500,
-        flush_interval=0.1
-) as monitor:
-    def worker(query_id):
-        stats = {
-            "query_id": f"query_{query_id}",
-            "rows_read": random.randint(100, 10000),
-            "rows_processed": random.randint(100, 10000),
-            "query_hash": random.randint(100000, 999999)
-        }
-        monitor.log_metric(stats)
-        return query_id
-
+        monitor_type="metrics"
+    )
 
     # Start monitoring thread
+    stop_monitoring = threading.Event()
+
     def monitor_loop():
-        while not monitor.stop_event.is_set():
+        while not stop_monitoring.is_set():
             print_monitor_stats(monitor)
             time.sleep(0.5)
-
 
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 
-    # Submit work
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(worker, i) for i in range(1001)]
-        wait(futures)  # Wait for all tasks to be submitted
+    try:
+        # Submit work
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker, monitor, i) for i in range(1000)]
+            wait(futures)  # Wait for all tasks to complete
 
-    # Ensure queue is drained
-    print("\nWaiting for queue to drain...")
-    while monitor.queue.qsize() > 0 or len(monitor.current_batch) > 0:
-        time.sleep(0.1)
+        print("\nAll tasks submitted. Waiting for queue to drain...")
 
-    # Verify all messages were processed
-    verify_output(monitor, 1000)
+        # Wait for processing to complete
+        for _ in range(30):  # 30 second timeout
+            with monitor.queue_stats_lock:
+                processed = monitor.queue_stats.get("total_processed", 0)
+                queue_size = monitor.queue.qsize()
+                batch_size = len(monitor.current_batch)
 
-    # Extra safety wait
-    time.sleep(1)
+            if processed >= 1000 and queue_size == 0 and batch_size == 0:
+                break
+            time.sleep(0.5)
+            print_monitor_stats(monitor)
+
+        # Final verification
+        with monitor.queue_stats_lock:
+            final_processed = monitor.queue_stats.get("total_processed", 0)
+
+        if final_processed >= 1000:
+            print(f"\nSUCCESS: Processed all {final_processed} messages")
+        else:
+            print(f"\nWARNING: Only processed {final_processed}/1000 messages")
+
+    finally:
+        # Stop monitoring thread
+        stop_monitoring.set()
+        monitor_thread.join(timeout=1.0)
+
+        # Request final flush
+        monitor.request_flush()
+        time.sleep(1.0)  # Allow time for final processing
+
+
+if __name__ == "__main__":
+    main()
