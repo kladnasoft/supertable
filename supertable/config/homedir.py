@@ -27,7 +27,7 @@ else:
     logger.error("SUPERTABLE_HOME environment variable is not set")
 
 
-logger.info(f"Current working directory: {os.getcwd()}")
+logger.debug(f"Current working directory: {os.getcwd()}")
 
 
 def get_app_home():

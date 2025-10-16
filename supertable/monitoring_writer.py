@@ -457,7 +457,7 @@ class MonitoringWriter:
         Main writer loop with minute cadence and auto-stop after 10 seconds of inactivity.
         Always performs final flush before stopping.
         """
-        logger.info(
+        logger.debug(
             f"[monitor] dequeue thread RUNNING for {self.organization}/{self.super_name}/{self.monitor_type}"
         )
 
@@ -537,7 +537,7 @@ class MonitoringWriter:
         except Exception as e:
             logger.error(f"[monitor] Error during final flush: {e}")
         finally:
-            logger.info(
+            logger.debug(
                 f"[monitor] dequeue thread EXITED for {self.organization}/{self.super_name}/{self.monitor_type}"
             )
             # Clean up singleton reference when thread exits naturally

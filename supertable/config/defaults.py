@@ -35,7 +35,7 @@ class Default:
 
     def _update_log_level(self):
         logging.getLogger().setLevel(self.LOG_LEVEL)
-        logger.info(f"Log level changed to {self.LOG_LEVEL}")
+        logger.debug(f"Log level changed to {self.LOG_LEVEL}")
 
 def _parse_bool(val: str, default: bool = True) -> bool:
     if val is None:
@@ -52,7 +52,7 @@ def _load_env(env_file: str | None, prefer_system: bool) -> str | None:
     path = env_file if env_file else find_dotenv(usecwd=True)
     if path and os.path.isfile(path):
         load_dotenv(path, override=not prefer_system)
-        logger.info(f".env loaded from: {path} (override={'off' if prefer_system else 'on'})")
+        logger.debug(f".env loaded from: {path} (override={'off' if prefer_system else 'on'})")
         return path
     else:
         logger.info(".env not found (skipped). Working dir: %s", os.getcwd())
