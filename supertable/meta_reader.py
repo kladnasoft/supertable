@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
 from supertable.rbac.access_control import check_meta_access
-from supertable.storage.storage_factory import get_storage
+from supertable.redis_catalog import RedisCatalog
 
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
@@ -16,6 +16,32 @@ def _prune_dict(d: Dict[str, Any], keys_to_remove: Set[str]) -> Dict[str, Any]:
     """Return a shallow copy of d with selected keys removed (non-mutating)."""
     return {k: v for k, v in d.items() if k not in keys_to_remove}
 
+def _get_redis_items(pattern) -> List[str]:
+    """
+    Get all tables for this super table by scanning Redis keys.
+    """
+    catalog = RedisCatalog()
+    try:
+        items = []
+        cursor = 0
+        while True:
+            cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
+            for key in keys:
+                # Handle both bytes and string keys
+                if isinstance(key, bytes):
+                    key_str = key.decode('utf-8')
+                else:
+                    key_str = str(key)
+
+                items.append(key_str)
+            if cursor == 0:
+                break
+        return items
+    except Exception as e:
+        logger.error(f"Error getting tables from Redis: {e}")
+        return []
+
+
 
 class MetaReader:
     """
@@ -26,6 +52,8 @@ class MetaReader:
     def __init__(self, super_name: str, organization: str):
         # Create a SuperTable object (which internally sets up the storage backend).
         self.super_table = SuperTable(super_name=super_name, organization=organization)
+        self.catalog = RedisCatalog()
+
 
     def _get_all_tables(self) -> List[str]:
         """
@@ -57,50 +85,63 @@ class MetaReader:
             logger.error(f"Error getting tables from Redis: {e}")
             return []
 
+    def get_tables(self, user_hash: str) -> List[str]:
+        tables = self._get_all_tables()
+        result = []
+        for table in tables:
+            try:
+                check_meta_access(super_name=self.super_table.super_name, organization=self.super_table.organization,
+                              user_hash=user_hash, table_name=table)
+                result.append(table)
+            except Exception as e:
+                logger.warning(f"No permission for the user: {user_hash} to table: {table}")
+
+        return result
+
     def get_table_schema(self, table_name: str, user_hash: str) -> Optional[List[Dict[str, Any]]]:
-        try:
-            check_meta_access(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                user_hash=user_hash,
-                table_name=table_name,
-            )
-        except PermissionError as e:
-            logger.warning(
-                "[get_table_schema] Access denied for user '%s' on table '%s': %s",
-                user_hash, table_name, str(e)
-            )
-            return None
+            try:
+                check_meta_access(
+                    super_name=self.super_table.super_name,
+                    organization=self.super_table.organization,
+                    user_hash=user_hash,
+                    table_name=table_name,
+                )
+            except PermissionError as e:
+                logger.warning(
+                    "[get_table_schema] Access denied for user '%s' on table '%s': %s",
+                    user_hash, table_name, str(e)
+                )
+                return None
 
-        schema_items: Set[Tuple[str, Any]] = set()
+            schema_items: Set[Tuple[str, Any]] = set()
 
-        if table_name == self.super_table.super_name:
-            # Aggregate schema across all simple tables
-            tables = self._get_all_tables()
-            for table in tables:
+            if table_name == self.super_table.super_name:
+                # Aggregate schema across all simple tables
+                tables = self._get_all_tables()
+                for table in tables:
+                    try:
+                        simple_table = SimpleTable(self.super_table, table)
+                        simple_table_data, _ = simple_table.get_simple_table_snapshot()
+                        schema = simple_table_data.get("schema", {}) or {}
+                        for key, value in schema.items():
+                            schema_items.add((key, value))
+                    except (FileNotFoundError, KeyError) as e:
+                        logger.debug("Failed to read schema for table %s: %s", table, e)
+                        continue
+            else:
+                # Single table
                 try:
-                    simple_table = SimpleTable(self.super_table, table)
+                    simple_table = SimpleTable(self.super_table, table_name)
                     simple_table_data, _ = simple_table.get_simple_table_snapshot()
                     schema = simple_table_data.get("schema", {}) or {}
                     for key, value in schema.items():
                         schema_items.add((key, value))
                 except (FileNotFoundError, KeyError) as e:
-                    logger.debug("Failed to read schema for table %s: %s", table, e)
-                    continue
-        else:
-            # Single table
-            try:
-                simple_table = SimpleTable(self.super_table, table_name)
-                simple_table_data, _ = simple_table.get_simple_table_snapshot()
-                schema = simple_table_data.get("schema", {}) or {}
-                for key, value in schema.items():
-                    schema_items.add((key, value))
-            except (FileNotFoundError, KeyError) as e:
-                logger.debug("Failed to read schema for table %s: %s", table_name, e)
-                return [{}]
+                    logger.debug("Failed to read schema for table %s: %s", table_name, e)
+                    return [{}]
 
-        distinct_schema = dict(sorted(schema_items))
-        return [distinct_schema]
+            distinct_schema = dict(sorted(schema_items))
+            return [distinct_schema]
 
     def collect_simple_table_schema(self, schemas: set, table_name: str, user_hash: str) -> None:
         try:
@@ -233,69 +274,37 @@ class MetaReader:
         }
         return result
 
-    @property
-    def catalog(self):
-        """Get the Redis catalog from super_table."""
-        return self.super_table.catalog
 
 
-def find_tables(organization: str) -> List[str]:
+def list_supers(organization: str) -> List[str]:
     """
     Searches the organization's directory for subdirectories that contain a
     "super" folder and a "_super.json" file. Uses the storage interface's
     get_directory_structure() for portability.
     """
-    storage = get_storage()
+    result = []
+    pattern = f"supertable:{organization}:*:meta:root"
 
-    # Normalize base path for the org (e.g., "kladna-soft/")
-    base_path = organization.rstrip("/")
-    if base_path:
-        base_path += "/"
-    else:
-        base_path = ""
+    items = _get_redis_items(pattern)
+    for item in items:
+        super_name = item.split(':')[2]
+        result.append(super_name)
 
-    try:
-        dir_structure = storage.get_directory_structure(base_path)  # nested dict
-    except Exception as e:
-        logger.error("get_directory_structure failed for '%s': %s", base_path, e)
-        return []
+    return sorted(result)
 
-    found_tables: Set[str] = set()
 
-    def walk_structure(parent_rel: str, substructure: Dict[str, Any]) -> None:
-        """
-        parent_rel is the path relative to base_path (no leading slash).
-        substructure is a dict: { name -> None (file) or dict (subdir) }
-        """
-        if not isinstance(substructure, dict):
-            return
+def list_tables(organization: str, super_name: str) -> List[str]:
+    """
+    Searches the organization's directory for subdirectories that contain a
+    "super" folder and a "_super.json" file. Uses the storage interface's
+    get_directory_structure() for portability.
+    """
+    result = []
+    pattern = f"supertable:{organization}:{super_name}:meta:leaf:*"
 
-        files = [name for name, val in substructure.items() if val is None]
-        dirs = [name for name, val in substructure.items() if isinstance(val, dict)]
+    items = _get_redis_items(pattern)
+    for item in items:
+        table_name = item.split(':')[-1]
+        result.append(table_name)
 
-        # Detect table root: has 'super' dir and '_super.json' file at this level
-        if "super" in dirs and "_super.json" in files:
-            # The folder name is the last component of parent_rel (strip trailing '/')
-            folder_rel = parent_rel.rstrip("/")
-
-            # If we are scanning at org root and the table folder is directly under it,
-            # parent_rel will be something like 'example' or 'org/example'.
-            if not folder_rel:
-                # This means base_path itself is the table root (rare). Use basename of CWD as fallback.
-                folder_name = os.path.basename(os.getcwd())
-            else:
-                folder_name = os.path.basename(folder_rel)
-
-            found_tables.add(folder_name)
-            # No need to recurse deeper within a detected table root
-            return
-
-        # Recurse into subdirectories
-        for d in dirs:
-            next_parent = f"{parent_rel}{d}/" if parent_rel else f"{d}/"
-            walk_structure(next_parent, substructure[d])
-
-    # Kick off the walk from the org base
-    walk_structure("", dir_structure)
-
-    return sorted(found_tables)
+    return sorted(result)

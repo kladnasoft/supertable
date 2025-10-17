@@ -1,6 +1,6 @@
 import os
 from supertable.config.defaults import logger
-from supertable.meta_reader import MetaReader, find_tables
+from supertable.meta_reader import MetaReader, list_supers, list_tables
 from examples.defaults import super_name, user_hash, simple_name, organization
 
 
@@ -9,21 +9,19 @@ current_working_directory = os.getcwd()
 logger.info(f"Current working directory: {current_working_directory}")
 
 
-result = find_tables(organization=organization)
-logger.info(f"result: {result}")
+result = list_supers(organization=organization)
+logger.info(f"supers: {result}")
+
+result = list_tables(organization=organization, super_name=super_name)
+logger.info(f"tables: {result}")
 
 
 
-logger.info(f"SuperTable: {super_name}")
-meta_reader = MetaReader(super_name=super_name,organization=organization)
-
+meta_reader = MetaReader(organization=organization, super_name=super_name)
 
 result = meta_reader.get_super_meta(user_hash)
 logger.info(f"meta_reader.result: {result}")
 
-
-tables = result.get("super").get("tables")
-logger.info(f"Tables: {tables}")
 
 result = meta_reader.get_table_schema(super_name, user_hash)
 logger.info(f"super_name.schema.result: {result}")

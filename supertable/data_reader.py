@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, List, Dict
 
 import pandas as pd
 
@@ -136,3 +136,43 @@ class DataReader:
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
         self.timer.capture_duration(event="TOTAL_EXECUTE")
         return result_df, status, message
+
+def query_sql(
+        organization: str,
+        super_name: str,
+        sql: str,
+        limit: int,
+        engine: Any,
+        user_hash: str,
+) -> Tuple[List[str], List[List[Any]], List[Dict[str, Any]]]:
+    """
+    Execute SQL query and return results in the format expected by MCP server.
+    Returns: (columns, rows, columns_meta)
+    """
+    reader = DataReader(organization=organization, super_name=super_name, query=sql)
+
+    # Execute the query
+    result_df, status, message = reader.execute(
+        user_hash=user_hash,
+        engine=engine,
+        with_scan=False,
+    )
+
+    if status == Status.ERROR:
+        raise RuntimeError(f"Query execution failed: {message}")
+
+    # Convert DataFrame to the expected format
+    columns = list(result_df.columns)
+    rows = result_df.values.tolist()
+
+    # Create basic column metadata
+    columns_meta = [
+        {
+            "name": col,
+            "type": str(result_df[col].dtype),
+            "nullable": True
+        }
+        for col in columns
+    ]
+
+    return columns, rows, columns_meta
