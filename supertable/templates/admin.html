@@ -1,0 +1,309 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SuperTable Redis Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    :root { --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e2e8f0; --acc:#38bdf8; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; font-family:Inter, ui-sans-serif, system-ui; background:var(--bg); color:var(--text) }
+    a { color: var(--acc); text-decoration: none; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .card { background: var(--panel); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+    .section { padding: 16px 20px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid-3 { display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .muted { color: var(--muted); }
+    .btn { padding: 8px 12px; border-radius: 10px; background:#0b2940; border:1px solid #1d3b57; color:#e2e8f0; font-weight:500; cursor:pointer; }
+    .btn:hover { filter: brightness(1.1); }
+    .btn-ghost { padding: 8px 10px; border-radius: 8px; border:1px solid #22314a; background:transparent; color:#cbd5e1; cursor:pointer; }
+    input, select { background:#0b2940; border:1px solid #1d3b57; color:#e2e8f0; border-radius: 10px; padding:8px 10px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; }
+    .border-b { border-bottom: 1px solid #22314a; }
+    .px-3 { padding-left: 12px; padding-right: 12px; }
+    .py-2 { padding-top: 8px; padding-bottom: 8px; }
+    .mt-2 { margin-top: 8px; }
+    .mt-3 { margin-top: 12px; }
+    .mt-4 { margin-top: 16px; }
+    .rounded { border-radius: 10px; }
+    .text-sm { font-size: 12px; }
+    .text-xs { font-size: 11px; }
+    .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .chip { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius: 999px; background:#0b2940; border:1px solid #1d3b57; }
+    .chip input { margin-right: 6px; }
+    .flex { display:flex; align-items:center; gap:10px; }
+    .right { text-align: right; }
+    .break-all { word-break: break-all; }
+    .tabs { display:flex; gap:8px; margin-top:12px; }
+    .tab { padding:8px 12px; border:1px solid #22314a; border-radius:10px; cursor:pointer; }
+    .tab.active { background:#0b2940; }
+    .hidden { display:none; }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px; }
+    .modal .panel { background:#0f172a; max-width:900px; width:100%; border-radius:16px; padding:16px; }
+    pre { white-space: pre-wrap; word-wrap: break-word; }
+  </style>
+  <script>
+    function api(path, opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (window.__admintoken) opts.headers['X-Admin-Token'] = window.__admintoken;
+      return fetch(path, opts).then(async res => {
+        if (!res.ok) { const t = await res.text(); throw new Error(''+res.status+': '+t); }
+        return res.json();
+      });
+    }
+    function onPairChange() {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const params = new URLSearchParams(window.location.search);
+      params.set('org', org); params.set('sup', sup); params.set('page','1');
+      window.location.search = params.toString();
+    }
+    async function toggleMirror(fmt, el) {
+      const enable = el.checked;
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const ep = enable ? '/api/mirrors/enable' : '/api/mirrors/disable';
+      await api(`${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`, {method:'POST'});
+      location.reload();
+    }
+    async function viewLeaf(simple) {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const data = await api(`/api/leaf/${encodeURIComponent(simple)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      showModal('Leaf: '+simple, JSON.stringify(data, null, 2));
+    }
+    async function viewUser(hash) {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const data = await api(`/api/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      showModal('User '+hash, JSON.stringify(data, null, 2));
+    }
+    async function viewRole(hash) {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const data = await api(`/api/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      showModal('Role '+hash, JSON.stringify(data, null, 2));
+    }
+    function gotoPage(p) {
+      const params = new URLSearchParams(window.location.search);
+      params.set('page', p);
+      window.location.search = params.toString();
+    }
+    function switchTab(id) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tabpane').forEach(p => p.classList.add('hidden'));
+      document.getElementById('tab-'+id).classList.add('active');
+      document.getElementById('pane-'+id).classList.remove('hidden');
+    }
+    function showModal(title, body) {
+      document.getElementById('m-title').textContent = title;
+      document.getElementById('m-body').textContent = body;
+      document.getElementById('modal').style.display = 'flex';
+    }
+    function closeModal() {
+      document.getElementById('modal').style.display = 'none';
+    }
+    window.addEventListener('DOMContentLoaded', () => {
+      window.__admintoken = "{{ token|e }}";
+    });
+  </script>
+</head>
+<body>
+  {% if not authorized %}
+    <div class="wrap"><p>Unauthorized</p></div>
+  {% else %}
+  <div class="wrap">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;">
+      <h1 style="font-size:22px; margin:0;">SuperTable Redis Admin</h1>
+      <div class="text-xs"><a href="/admin/config">Config</a> · <a href="/admin/logout">Sign out</a></div>
+    </div>
+
+    <div class="card">
+      <div class="section">
+        <div class="grid">
+          <div>
+            <label class="muted text-sm">Tenant</label><br/>
+            <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
+              {% for t in tenants %}
+                <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>{{t.org}} / {{t.sup}}</option>
+              {% endfor %}
+            </select>
+            {% if has_tenant %}
+              <div class="muted text-xs mt-2">Showing: {{ sel_org }} / {{ sel_sup }}</div>
+            {% else %}
+              <div class="muted text-xs mt-2">No tenant discovered in Redis.</div>
+            {% endif %}
+          </div>
+          <div class="right"></div>
+        </div>
+      </div>
+    </div>
+
+    {% if has_tenant %}
+    <div class="grid-3 mt-4">
+      <div class="card">
+        <div class="section">
+          <div class="muted text-sm">Root</div>
+          <div class="mt-2"><span class="chip">version <strong> {{ root_version }} </strong></span></div>
+          <div class="mt-2 text-xs">Updated: {{ root_ts }}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section">
+          <div class="muted text-sm">Mirrors</div>
+          <div class="mt-2 flex">
+            {% for fmt in ["DELTA","ICEBERG","PARQUET"] %}
+              <label class="chip" style="gap:6px;">
+                <input type="checkbox" {% if fmt in mirrors %}checked{% endif %} onchange="toggleMirror('{{fmt}}', this)"/> {{fmt}}
+              </label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section">
+          <div class="muted text-sm">Search</div>
+          <form method="get" class="mt-2">
+            <input type="hidden" name="org" value="{{ sel_org }}" />
+            <input type="hidden" name="sup" value="{{ sel_sup }}" />
+            <input type="text" name="q" value="{{ q }}" placeholder="simple contains..." style="width:100%"/>
+            <div class="mt-2 right"><button class="btn-ghost" type="submit">Apply</button></div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <div id="tab-leaves" class="tab active" onclick="switchTab('leaves')">Leaves</div>
+      <div id="tab-users" class="tab" onclick="switchTab('users')">Users</div>
+      <div id="tab-roles" class="tab" onclick="switchTab('roles')">Roles</div>
+    </div>
+
+    <div id="pane-leaves" class="tabpane">
+      <div class="card mt-4">
+        <div class="section">
+          <div class="muted text-sm">Leaves</div>
+          <div class="muted text-xs">Total: {{ total }} · Page {{ page }} / {{ pages }}</div>
+          <div class="mt-2">
+            <table>
+              <thead>
+                <tr class="border-b">
+                  <th class="px-3 py-2 text-xs muted">simple</th>
+                  <th class="px-3 py-2 text-xs muted">version</th>
+                  <th class="px-3 py-2 text-xs muted">updated</th>
+                  <th class="px-3 py-2 text-xs muted">path</th>
+                  <th class="px-3 py-2 text-xs muted">actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for it in items %}
+                <tr class="border-b">
+                  <td class="px-3 py-2 font-mono text-sm">{{ it.simple }}</td>
+                  <td class="px-3 py-2 text-sm">v{{ it.version }}</td>
+                  <td class="px-3 py-2 text-sm">{{ it.ts_fmt }}</td>
+                  <td class="px-3 py-2 text-sm"><span class="break-all">{{ it.path }}</span></td>
+                  <td class="px-3 py-2 text-sm">
+                    <button class="btn-ghost" onclick="viewLeaf('{{ it.simple }}')">Display</button>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="mt-3 right">
+            {% for i in range(1, (pages or 1)+1) %}
+              <button class="btn-ghost" onclick="gotoPage({{i}})" {% if i == page %}style="opacity:.6"{% endif %}> {{i}} </button>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="pane-users" class="tabpane hidden">
+      <div class="card mt-4">
+        <div class="section">
+          <div class="muted text-sm">Users</div>
+          <div class="mt-2">
+            <table>
+              <thead>
+                <tr class="border-b">
+                  <th class="px-3 py-2 text-xs muted">hash</th>
+                  <th class="px-3 py-2 text-xs muted">name</th>
+                  <th class="px-3 py-2 text-xs muted">roles</th>
+                  <th class="px-3 py-2 text-xs muted">actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for u in users %}
+                <tr class="border-b">
+                  <td class="px-3 py-2 font-mono text-sm">{{ u.hash }}</td>
+                  <td class="px-3 py-2 text-sm">{{ u.get('name','') }}</td>
+                  <td class="px-3 py-2 text-sm">{{ (u.get('roles') or []) | join(', ') }}</td>
+                  <td class="px-3 py-2 text-sm">
+                    <button class="btn-ghost" onclick="viewUser('{{ u.hash }}')">Display</button>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="pane-roles" class="tabpane hidden">
+      <div class="card mt-4">
+        <div class="section">
+          <div class="muted text-sm">Roles</div>
+          <div class="mt-2">
+            <table>
+              <thead>
+                <tr class="border-b">
+                  <th class="px-3 py-2 text-xs muted">hash</th>
+                  <th class="px-3 py-2 text-xs muted">type</th>
+                  <th class="px-3 py-2 text-xs muted">description</th>
+                  <th class="px-3 py-2 text-xs muted">actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for r in roles %}
+                <tr class="border-b">
+                  <td class="px-3 py-2 font-mono text-sm">{{ r.hash }}</td>
+                  <td class="px-3 py-2 text-sm">{{ r.get('type','') }}</td>
+                  <td class="px-3 py-2 text-sm">{{ r.get('description','') }}</td>
+                  <td class="px-3 py-2 text-sm">
+                    <button class="btn-ghost" onclick="viewRole('{{ r.hash }}')">Display</button>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal -->
+    <div id="modal" class="modal" onclick="if(event.target.id==='modal'){closeModal()}">
+      <div class="panel">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+          <h3 id="m-title" style="margin:0; font-size:16px;"></h3>
+          <button class="btn-ghost" onclick="closeModal()">Close</button>
+        </div>
+        <pre id="m-body" class="mt-2" style="max-height:60vh; overflow:auto;"></pre>
+      </div>
+    </div>
+
+    {% endif %}
+  </div>
+  {% endif %}
+</body>
+</html>

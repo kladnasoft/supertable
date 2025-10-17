@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Any
 
 import redis
 
@@ -35,6 +35,24 @@ def _stat_lock_key(org: str, sup: str) -> str:
 
 def _mirrors_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:mirrors"
+
+def _users_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:meta:users:meta"
+
+def _roles_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:meta:roles:meta"
+
+def _user_hash_key(org: str, sup: str, user_hash: str) -> str:
+    return f"supertable:{org}:{sup}:meta:users:{user_hash}"
+
+def _role_hash_key(org: str, sup: str, role_hash: str) -> str:
+    return f"supertable:{org}:{sup}:meta:roles:{role_hash}"
+
+def _user_name_to_hash_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:meta:users:name_to_hash"
+
+def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
+    return f"supertable:{org}:{sup}:meta:roles:type_to_hash:{role_type}"
 
 
 @dataclass(frozen=True)
@@ -312,6 +330,88 @@ return 0
         if nxt == cur:
             return cur
         return self.set_mirrors(org, sup, nxt)
+
+    # ------------- User and Role Management -------------
+
+    def get_users(self, org: str, sup: str) -> List[Dict[str, Any]]:
+        """Get all users for organization."""
+        users = []
+        pattern = f"supertable:{org}:{sup}:meta:users:*"
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=100)
+                for key in keys:
+                    # Skip name_to_hash and meta keys
+                    if "name_to_hash" in key or ("meta" in key and "users:meta" not in key):
+                        continue
+                    raw = self.r.get(key)
+                    if raw:
+                        try:
+                            user_data = json.loads(raw)
+                            if isinstance(user_data, dict):
+                                user_hash = key.split(':')[-1]
+                                users.append({
+                                    "hash": user_hash,
+                                    **user_data
+                                })
+                        except Exception:
+                            continue
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_users error: {e}")
+        return users
+
+    def get_roles(self, org: str, sup: str) -> List[Dict[str, Any]]:
+        """Get all roles for organization."""
+        roles = []
+        pattern = f"supertable:{org}:{sup}:meta:roles:*"
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=100)
+                for key in keys:
+                    # Skip type_to_hash and meta keys
+                    if "type_to_hash" in key or ("meta" in key and "roles:meta" not in key):
+                        continue
+                    raw = self.r.get(key)
+                    if raw:
+                        try:
+                            role_data = json.loads(raw)
+                            if isinstance(role_data, dict):
+                                role_hash = key.split(':')[-1]
+                                roles.append({
+                                    "hash": role_hash,
+                                    **role_data
+                                })
+                        except Exception:
+                            continue
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_roles error: {e}")
+        return roles
+
+    def get_role_details(self, org: str, sup: str, role_hash: str) -> Optional[Dict[str, Any]]:
+        """Get detailed role information."""
+        try:
+            raw = self.r.get(_role_hash_key(org, sup, role_hash))
+            if raw:
+                return json.loads(raw)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_role_details error: {e}")
+        return None
+
+    def get_user_details(self, org: str, sup: str, user_hash: str) -> Optional[Dict[str, Any]]:
+        """Get detailed user information."""
+        try:
+            raw = self.r.get(_user_hash_key(org, sup, user_hash))
+            if raw:
+                return json.loads(raw)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_user_details error: {e}")
+        return None
 
     # ------------- Listings via SCAN -------------
 
