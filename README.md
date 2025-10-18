@@ -1,186 +1,239 @@
 # SuperTable
 
-![Python](https://img.shields.io/badge/python-3.10+-blue)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: STPUL](https://img.shields.io/badge/license-STPUL-blue)
 
 **SuperTable — The simplest data warehouse & cataloging system.**  
-A high-performance, lightweight transaction catalog that integrates multiple
-basic tables into a single, cohesive framework designed for ultimate
-efficiency.
-It automatically creates and manages tables so you can start running SQL queries
-immediately—no complicated schemas or manual joins required.
+A high-performance, lightweight transaction catalog that **now defaults to Redis (catalog/locks) + MinIO (object storage)**.  
+It automatically creates and manages tables so you can start running SQL immediately—no complicated schemas or manual joins.
 
 ---
 
 ## Contents
 
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration via CLI](#configuration-via-cli)
-  - [Local filesystem (LOCAL)](#local-filesystem-local)
+- [What’s new](#whats-new)
+- [Architecture](#architecture)
+- [Quick start (Docker Compose)](#quick-start-docker-compose)
+- [Admin UI](#admin-ui)
+- [MCP server & client](#mcp-server--client)
+- [Configuration](#configuration)
+  - [Redis](#redis)
+  - [MinIO (default)](#minio-default)
   - [Amazon S3](#amazon-s3)
-  - [MinIO (S3-compatible)](#minio-s3-compatible)
-  - [Azure Blob Storage](#azure-blob-storage)
-    - [Authentication methods](#authentication-methods)
-    - [Using abfss:// locations](#using-abfss-locations)
-    - [Run from Azure Synapse (Managed Identity)](#run-from-azure-synapse-managed-identity)
-  - [Google Cloud Storage (GCP)](#google-cloud-storage-gcp)
-  - [Validation behavior](#validation-behavior)
-  - [Cheat sheet](#cheat-sheet-required-env-by-backend)
-- [Setup](#setup)
-- [Key Features](#key-features)
-- [Examples](#examples)
-- [Benefits](#benefits)
+  - [Azure Blob](#azure-blob)
+  - [GCP Storage](#gcp-storage)
+  - [DuckDB tuning](#duckdb-tuning)
+  - [Security](#security)
+- [Environment reference](#environment-reference)
+- [Local development](#local-development)
+- [Production deployment](#production-deployment)
+- [FAQ](#faq)
 
 ---
 
-## Installation
+## What’s new
 
-```bash
-# Core (LOCAL only)
-pip install supertable
-
-# AWS S3 (installs boto3 + redis)
-pip install "supertable[s3]"
-
-# MinIO (uses AWS-style SDK + redis)
-pip install "supertable[minio]"
-
-# Azure Blob Storage (installs azure-storage-blob + redis)
-pip install "supertable[azure]"
-
-# Google Cloud Storage (installs google-cloud-storage + redis)
-pip install "supertable[gcp]"
-
-# Everything (all cloud backends + redis)
-pip install "supertable[all-cloud]"
-```
+- **Default backends:** `LOCKING_BACKEND=redis` and `STORAGE_TYPE=MINIO`.
+- **Out-of-the-box Admin UI** (FastAPI + Jinja2) for inspecting tenants, tables, users, roles and mirror settings.
+- **MCP stdio server** (`mcp_server.py`) and a robust local **MCP client** (`mcp_client.py`) for testing your tools.
+- Production-ready Docker image and docker-compose stack (Redis + MinIO + Admin + MCP utility container).
 
 ---
 
-## Quick Start
+## Architecture
 
-```bash
-# Show help
-supertable -h
-
-# Example: S3 + Redis → write .env
-supertable --storage S3 --write .env   --aws-access-key-id AKIA...   --aws-secret-access-key "...secret..."   --aws-region eu-central-1   --redis-url redis://:password@redis:6379/0
-
-# Example: LOCAL (project folder) → write .env
-supertable --storage LOCAL --write .env   --local-home "$HOME/supertable" --create-local-home
-```
+- **Catalog & Locks:** Redis stores SuperTable metadata & locks (`supertable:{org}:{super}:meta:*`).
+- **Data files:** Object storage (MinIO/S3/Azure/GCS). MinIO is the default and ships with Compose.
+- **Query:** DuckDB (embedded) with S3-style httpfs; optional presigned reads.
+- **Mirrors:** Delta/Iceberg “latest-only” writers when enabled (see Admin mirrors box).
 
 ---
 
-## Configuration via CLI
+## Quick start (Docker Compose)
 
-`supertable` initializes and (optionally) validates environment variables for **LOCAL**, **S3**, **MINIO**, **AZURE**, and **GCP**, plus **Redis** (used for locking in non-LOCAL modes; optional for LOCAL).
-
-- `--write .env` writes variables to a file  
-- `--write -` prints `export` lines to stdout (pipe into your shell)  
-- Validation runs by default; use `--no-validate` if services aren’t reachable during setup
-
-### Local filesystem (LOCAL)
+Requirements: Docker & docker-compose.
 
 ```bash
-supertable --storage LOCAL   --local-home "$HOME/supertable"   --create-local-home   --write .env
+# 1) Clone and build
+git clone https://github.com/kladnasoft/supertable.git
+cd supertable
+
+# 2) (Optional) Create a .env next to docker-compose.yml (sample below)
+cat > .env <<'ENV'
+LOCKING_BACKEND=redis
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
+
+AWS_S3_ENDPOINT_URL=http://minio:9000
+AWS_S3_FORCE_PATH_STYLE=true
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin123!
+SUPERTABLE_BUCKET=supertable
+
+STORAGE_TYPE=MINIO
+SUPERTABLE_HOME=/data/supertable
+LOG_LEVEL=INFO
+
+SUPERTABLE_DUCKDB_PRESIGNED=1
+SUPERTABLE_DUCKDB_THREADS=4
+SUPERTABLE_DUCKDB_EXTERNAL_THREADS=2
+SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60
+SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE=1
+SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1
+SUPERTABLE_ALLOWED_USER_HASHES=0b85b786b16d195439c0da18fd4478df
+
+MCP_SERVER_PATH=/app/mcp_server.py
+SUPERTABLE_TEST_ORG=kladna-soft
+SUPERTABLE_TEST_SUPER=example
+SUPERTABLE_TEST_USER_HASH=0b85b786b16d195439c0da18fd4478df
+SUPERTABLE_TEST_QUERY=
+SUPERTABLE_ADMIN_TOKEN=change-me-now
+ENV
+
+# 3) Start services
+docker compose up -d
+
+# 4) Open the Admin UI
+# http://localhost:8000  (login with SUPERTABLE_ADMIN_TOKEN)
 ```
+
+MinIO console is available at **http://localhost:9001** (user/pass from `AWS_ACCESS_KEY_ID/SECRET`).
+
+---
+
+## Admin UI
+
+- `/` redirects to `/admin/login`.
+- `/admin` lists tenants discovered in Redis, root/meta, tables, users, roles.
+- `/admin/config` shows effective env & .env values (sensitive values redacted).
+- `/healthz` returns `ok` when Redis is reachable.
+
+> **Auth:** the UI uses a cookie with `SUPERTABLE_ADMIN_TOKEN`. Set it via env or `.env`.
+
+---
+
+## MCP server & client
+
+The MCP server runs over **stdio**. Use the **mcp** utility container:
+
+```bash
+# List tools and run a safe sample query (falls back if SQL has no table)
+docker compose run --rm mcp mcp-client --org kladna-soft --super example
+
+# Or run the raw MCP server (blocks, waiting on stdio):
+docker compose run --rm -i mcp mcp-server
+```
+
+Typical integration (VS Code / Claude Desktop / OpenAI MCP):
+- Configure a “command provider” that invokes:
+  ```
+  docker run --rm -i     --env-file <your .env>     --network host     kladnasoft/supertable:latest mcp-server
+  ```
+
+---
+
+## Configuration
+
+### Redis
+- Set `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB`, and `REDIS_PASSWORD` if needed.
+- The Admin & MCP pieces discover tenants under keys like `supertable:<org>:<super>:meta:*`.
+
+### MinIO (default)
+- `STORAGE_TYPE=MINIO`
+- `AWS_S3_ENDPOINT_URL=http://minio:9000`, `AWS_S3_FORCE_PATH_STYLE=true`
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- `SUPERTABLE_BUCKET` (default: `supertable`)
+
+> The MinIO backend will **ensure the bucket exists** automatically.
 
 ### Amazon S3
+- `STORAGE_TYPE=S3`
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+
+### Azure Blob
+- `STORAGE_TYPE=AZURE`
+- Either `AZURE_STORAGE_CONNECTION_STRING` or managed identity (when running in Azure/Synapse).
+- `SUPERTABLE_HOME` can point to `abfss://container@account.dfs.core.windows.net/prefix`.
+
+### GCP Storage
+- `STORAGE_TYPE=GCP`
+- `GCP_PROJECT` + `GOOGLE_APPLICATION_CREDENTIALS` (path) **or** inline `GCP_SA_JSON`.
+
+### DuckDB tuning
+- `SUPERTABLE_DUCKDB_*` variables enable presigned reads & thread counts.
+
+### Security
+
+- Set a strong `SUPERTABLE_ADMIN_TOKEN`.
+- If `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1`, the MCP server will require a `user_hash`.
+- You can whitelist hashes via `SUPERTABLE_ALLOWED_USER_HASHES` (comma-separated).
+
+---
+
+## Environment reference
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `LOCKING_BACKEND` | `redis` | Lock manager (redis/file) |
+| `STORAGE_TYPE` | `MINIO` | `LOCAL` \| `MINIO` \| `S3` \| `AZURE` \| `GCP` |
+| `SUPERTABLE_HOME` | `/data/supertable` | Local root for `LOCAL` (still used for temp/derived) |
+| `REDIS_*` | — | Host/Port/DB/Password |
+| `AWS_*` | — | MinIO/S3 credentials & endpoint |
+| `SUPERTABLE_BUCKET` | `supertable` | Target bucket |
+| `SUPERTABLE_ADMIN_TOKEN` | — | Required for Admin UI login |
+| `SUPERTABLE_DUCKDB_*` | — | Query performance/env knobs |
+| `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH` | `1` | Enforce user hash |
+| `SUPERTABLE_ALLOWED_USER_HASHES` | — | Comma-separated allow-list for quick demos |
+
+---
+
+## Local development
 
 ```bash
-supertable --storage S3   --aws-access-key-id AKIA...   --aws-secret-access-key "...secret..."   --aws-region eu-central-1   --redis-url redis://:password@redis:6379/0   --write .env
-```
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-### MinIO (S3-compatible)
+# Run Admin
+uvicorn admin:app --host 0.0.0.0 --port 8000
 
-```bash
-supertable --storage MINIO   --aws-access-key-id minioadmin   --aws-secret-access-key minioadmin   --aws-region us-east-1   --aws-endpoint-url http://localhost:9000   --aws-force-path-style true   --redis-url redis://:password@localhost:6379/0   --no-validate   --write .env
-```
+# Run MCP server
+python -u mcp_server.py
 
-### Azure Blob Storage
-
-#### Authentication methods
-
-**Priority order (first match wins):**
-1. Connection String  
-2. Account Key  
-3. SAS Token  
-4. Managed Identity / AAD  
-
-##### Managed Identity (default if no secrets provided)
-```bash
-supertable --storage AZURE   --home "abfss://<container>@<account>.dfs.core.windows.net/<prefix>"   --write .env
-```
-
-##### Account Key (overrides MI)
-```bash
-supertable --storage AZURE   --home "abfss://<container>@<account>.dfs.core.windows.net/<prefix>"   --azure-key "<ACCOUNT_KEY>"   --write .env
-```
-
-##### SAS token (overrides MI)
-```bash
-supertable --storage AZURE   --home "abfss://<container>@<account>.dfs.core.windows.net/<prefix>"   --azure-sas "?sv=..."   --write .env
-```
-
-##### Connection String (highest priority)
-```bash
-supertable --storage AZURE   --azure-connection-string "DefaultEndpointsProtocol=...;AccountName=<account>;AccountKey=...;EndpointSuffix=core.windows.net"   --write .env
-```
-
-##### Forcing MI explicitly
-Do not set any of: `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_KEY`, `AZURE_SAS_TOKEN`.  
-
-#### Using abfss:// locations
-
-Format:
-```
-abfss://{container}@{account}.dfs.core.windows.net/{prefix}
-```
-
-#### Run from Azure Synapse (Managed Identity)
-
-```python
-!pip install "supertable[azure]"
-
-!supertable --storage AZURE   --home "abfss://storage@kladnasoft.dfs.core.windows.net/supertable"   --write .env
-
-from dotenv import load_dotenv
-load_dotenv(".env")
-
-from supertable.super_table import SuperTable
-st = SuperTable(super_name="demo-new")
-```
-
-### Google Cloud Storage (GCP)
-
-```bash
-supertable --storage GCP   --gcp-project my-gcp-project   --gcp-credentials /path/to/sa.json   --redis-url redis://:password@redis:6379/0   --write .env
+# Test client
+python -u mcp_client.py --org kladna-soft --super example
 ```
 
 ---
 
-## Key Features
+## Production deployment
 
-- Automatic table creation
-- Self-referencing architecture
-- Staging module with history
-- Columnar storage
-- Built-in RBAC
-- Platform independent
+### Docker Hub
+
+Pull the image and run just the Admin API:
+
+```bash
+docker pull kladnasoft/supertable:latest
+
+docker run -d --name supertable-admin   -e STORAGE_TYPE=MINIO   -e LOCKING_BACKEND=redis   -e REDIS_HOST=your-redis   -e REDIS_PORT=6379   -e AWS_S3_ENDPOINT_URL=http://your-minio:9000   -e AWS_S3_FORCE_PATH_STYLE=true   -e AWS_ACCESS_KEY_ID=...   -e AWS_SECRET_ACCESS_KEY=...   -e SUPERTABLE_BUCKET=supertable   -e SUPERTABLE_ADMIN_TOKEN=replace-me   -p 8000:8000   kladnasoft/supertable:latest
+```
+
+Run the MCP server (stdio):
+
+```bash
+# Note: -i is important to provide stdio
+docker run --rm -i   --env STORAGE_TYPE=MINIO   --env LOCKING_BACKEND=redis   --env REDIS_HOST=your-redis   --env AWS_S3_ENDPOINT_URL=http://your-minio:9000   --env AWS_S3_FORCE_PATH_STYLE=true   --env AWS_ACCESS_KEY_ID=...   --env AWS_SECRET_ACCESS_KEY=...   kladnasoft/supertable:latest mcp-server
+```
 
 ---
 
-## Examples
+## FAQ
 
-See `examples/` folder for usage demos.
+**Q: Do I need buckets or schemas pre-created?**  
+A: No—MinIO/S3 bucket creation is handled on first use. Redis keys are written lazily.
 
----
+**Q: Is the MCP server networked?**  
+A: No. It speaks **stdio**. Use `docker run -i … mcp-server` with tools that spawn a process.
 
-## Benefits
-
-- Quick start
-- Higher efficiency
-- Holistic insights
-- Cost savings
+**Q: Where are Delta/Iceberg mirrors written?**  
+A: Under `<org>/<super>/delta/<table>` and `<org>/<super>/iceberg/<table>` within your object storage when enabled.

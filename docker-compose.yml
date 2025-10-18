@@ -1,47 +1,119 @@
 version: "3.9"
+
+x-common-env: &common-env
+  # --- Core behavior ---
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOCKING_BACKEND: ${LOCKING_BACKEND:-redis}
+  STORAGE_TYPE: ${STORAGE_TYPE:-MINIO}
+  SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/data/supertable}
+
+  # --- Redis (catalog + locks) ---
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_DB: ${REDIS_DB:-0}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+  # --- MinIO/S3 (object storage) ---
+  AWS_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT_URL:-http://minio:9000}
+  AWS_S3_FORCE_PATH_STYLE: ${AWS_S3_FORCE_PATH_STYLE:-true}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin123!}
+  SUPERTABLE_BUCKET: ${SUPERTABLE_BUCKET:-supertable}
+
+  # --- Admin UI ---
+  SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:-change-me-now}
+
+  # --- DuckDB tuning (optional) ---
+  SUPERTABLE_DUCKDB_PRESIGNED: ${SUPERTABLE_DUCKDB_PRESIGNED:-1}
+  SUPERTABLE_DUCKDB_THREADS: ${SUPERTABLE_DUCKDB_THREADS:-4}
+  SUPERTABLE_DUCKDB_EXTERNAL_THREADS: ${SUPERTABLE_DUCKDB_EXTERNAL_THREADS:-2}
+  SUPERTABLE_DUCKDB_HTTP_TIMEOUT: ${SUPERTABLE_DUCKDB_HTTP_TIMEOUT:-60}
+  SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE: ${SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE:-1}
+  SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
+  SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
+
 services:
-  supertable:
+  admin:
     build:
       context: .
-      args:
-        # Pin the version or leave empty for latest
-        SUPERTABLE_VERSION: "1.2.1"
-        # Choose extras: empty for LOCAL, or any of: s3|minio|azure|gcp
-        SUPERTABLE_EXTRAS: "s3"
-    image: supertable:1.2.1-s3
+    image: kladnasoft/supertable:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
     environment:
-      # Select backend at runtime
-      STORAGE_TYPE: "S3"   # LOCAL | S3 | MINIO | AZURE | GCP
-
-      # Common Redis env
-      REDIS_URL: "redis://redis:6379/0"
-      AUTO_VALIDATE: "false"
-
-      # S3 example env
-      AWS_ACCESS_KEY_ID: "REPLACE_ME"
-      AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
-      AWS_DEFAULT_REGION: "eu-central-1"
-
-      # MINIO extras (if STORAGE_TYPE=MINIO)
-      # AWS_S3_ENDPOINT_URL: "http://minio:9000"
-      # AWS_S3_FORCE_PATH_STYLE: "true"
-
-      # AZURE example (if STORAGE_TYPE=AZURE)
-      # AZURE_STORAGE_ACCOUNT: "myacct"
-      # AZURE_STORAGE_KEY: "REPLACE_ME"
-      # AZURE_BLOB_ENDPOINT: "https://myacct.blob.core.windows.net"
-
-      # GCP example (if STORAGE_TYPE=GCP)
-      # GCP_PROJECT: "my-gcp-project"
-      # GOOGLE_APPLICATION_CREDENTIALS: "/secrets/gcp.json"
+      <<: *common-env
     volumes:
-      - ./config:/config
-      # - ./secrets:/secrets:ro   # if using GCP key file
-    command: ["bash","-lc","echo 'Container ready. .env generated at /config/.env'; sleep infinity"]
+      - supertable-data:/data
+      - supertable-config:/config
     depends_on:
       - redis
+      - minio
+    command: >
+      uvicorn admin:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+
+  # MCP runs over stdio. We keep a utility container where you can:
+  #   docker compose run --rm mcp mcp-client --org <org> --super <super>
+  # or run the raw server: docker compose run --rm -i mcp mcp-server
+  mcp:
+    image: kladnasoft/supertable:latest
+    build:
+      context: .
+    stdin_open: true
+    tty: false
+    environment:
+      <<: *common-env
+      MCP_SERVER_PATH: ${MCP_SERVER_PATH:-/app/mcp_server.py}
+      SUPERTABLE_TEST_ORG: ${SUPERTABLE_TEST_ORG:-kladna-soft}
+      SUPERTABLE_TEST_SUPER: ${SUPERTABLE_TEST_SUPER:-example}
+      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH:-}
+      SUPERTABLE_TEST_QUERY: ${SUPERTABLE_TEST_QUERY:-}
+    volumes:
+      - supertable-data:/data
+      - supertable-config:/config
+    depends_on:
+      - redis
+      - minio
+    command: ["sleep","infinity"]  # use `mcp-client` or `mcp-server` via docker compose run/exec
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    command: ["redis-server","--save","","--appendonly","no"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin123!}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD","curl","-f","http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  supertable-data:
+  supertable-config:
+  redis-data:
+  minio-data:

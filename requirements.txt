@@ -1,31 +1,35 @@
-# --- Core pins compatible with Synapse/AzureML preinstalls ---
-# AzureML 1.55 requires numpy <1.24 and pandas <=2.0.0.
-numpy>=1.22,<1.24
-pandas>=1.5.3,<=2.0.0
+# -------- Core scientific stack (Python 3.12 compatible) --------
+# Keep modern, well-supported pins that work in Docker and most clouds.
+numpy>=1.26,<2.0
+pandas>=2.1,<2.3
+pyarrow>=16,<19
 
-# Arrow with ListViewType and compatible with the above
-pyarrow>=21,<23
+# Timezone helpers
+pytz>=2023.3
+tzdata>=2023.3
 
-# Timezone cap for mlflow-skinny in Synapse images
-pytz<2024
-tzdata>=2022.7
+# -------- Engines / query / utils --------
+duckdb>=1.1,<2.0
+polars>=1.6,<2.0
+sqlglot>=26,<27
+colorlog>=6.9,<7.0
+python-dotenv>=1.0,<2.0
+setuptools>=68
 
-# Project dependencies
-polars~=1.27.1
-duckdb~=1.2.2
-sqlglot~=26.14.0
-python-dateutil~=2.9.0.post0
-python-dotenv~=1.0.1
-colorlog~=6.9.0
-setuptools~=78.1.0
+# -------- Storage backends (now default: Redis + MinIO) --------
+redis>=5.0,<5.2
+minio>=7.2,<8.0
+boto3>=1.34,<2.0  # optional S3 compatibility
 
-mcp
+# -------- Admin API (FastAPI + Uvicorn + Jinja2) --------
+fastapi>=0.111,<0.116
+uvicorn>=0.30,<0.34
+jinja2>=3.1,<3.2
+
+# -------- MCP (Model Context Protocol) --------
+# We keep the short package name because the server/client code import `mcp.*`.
+mcp>=1.1.0
 
 # NOTE:
-# Redis and cloud SDKs are NOT installed by default.
-# Install them via extras, e.g.:
-#   pip install 'supertable[minio]'   -> minio backend + redis
-#   pip install 'supertable[s3]'      -> AWS S3 backend + redis
-#   pip install 'supertable[azure]'   -> Azure Blob backend + redis
-#   pip install 'supertable[gcp]'     -> GCS backend + redis
-#   pip install 'supertable[all-cloud]' -> all cloud backends (each brings redis)
+#  • Azure / GCP optional extras are handled in pyproject 'extras' (not required here).
+#  • If you deploy to a very constrained image, you can remove boto3.
