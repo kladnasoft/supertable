@@ -10,6 +10,7 @@
     input { width:100%; padding:10px 12px; border-radius:10px; border:1px solid #1d3b57; background:#0b2940; color:#e2e8f0;}
     button { margin-top:10px; width:100%; padding:10px 12px; border-radius:10px; border:1px solid #1d3b57; background:#0b2940; color:#e2e8f0; cursor:pointer;}
     .muted { color:#94a3b8; font-size:12px; margin-top:8px; }
+    .error { color:#ef4444; font-size:14px; margin-top:8px; padding:8px 12px; background:#450a0a; border:1px solid #7f1d1d; border-radius:8px; }
   </style>
 </head>
 <body>
@@ -20,6 +21,9 @@
       <input id="token" name="token" type="password" placeholder="••••••••" autofocus />
       <button type="submit">Sign in</button>
     </form>
+    {% if message %}
+      <div class="error">{{ message }}</div>
+    {% endif %}
     <div class="muted">You must provide the correct ADMIN_TOKEN to view this page.</div>
   </div>
 </body>
