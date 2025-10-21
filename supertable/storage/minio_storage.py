@@ -35,7 +35,7 @@ class MinioStorage(StorageInterface):
     def _build_client(endpoint: str, access_key: str, secret_key: str, region: Optional[str]) -> Minio:
         parsed = urlparse(endpoint)
         if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"Unsupported scheme in AWS_S3_ENDPOINT_URL: {endpoint}")
+            raise ValueError(f"Unsupported scheme in STORAGE_ENDPOINT_URL: {endpoint}")
         secure = parsed.scheme == "https"
         host = parsed.netloc or parsed.path  # tolerate "localhost:9000"
         return Minio(
@@ -86,31 +86,29 @@ class MinioStorage(StorageInterface):
                     raise
 
     def _rebuild_with_region(self, region: str) -> Minio:
-        endpoint_url = os.getenv("AWS_S3_ENDPOINT_URL")
-        access_key = os.getenv("AWS_ACCESS_KEY_ID")
-        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        endpoint_url = os.getenv("STORAGE_ENDPOINT_URL")
+        access_key = os.getenv("STORAGE_ACCESS_KEY")
+        secret_key = os.getenv("STORAGE_SECRET_KEY")
         if not (endpoint_url and access_key and secret_key):
             raise RuntimeError(
-                "Cannot rebuild MinIO client with region: missing AWS_S3_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+                "Cannot rebuild MinIO client with region: missing STORAGE_ENDPOINT_URL / STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY"
             )
         return self._build_client(endpoint_url, access_key, secret_key, region)
 
     @classmethod
     def from_env(cls) -> "MinioStorage":
-        bucket = os.getenv("SUPERTABLE_BUCKET") or os.getenv("MINIO_BUCKET") or "supertable"
-        endpoint = os.getenv("AWS_S3_ENDPOINT_URL")
-        access_key = os.getenv("AWS_ACCESS_KEY_ID")
-        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        bucket = os.getenv("STORAGE_BUCKET") or "supertable"
+        endpoint = os.getenv("STORAGE_ENDPOINT_URL")
+        access_key = os.getenv("STORAGE_ACCESS_KEY")
+        secret_key = os.getenv("STORAGE_SECRET_KEY")
         region = (
-            os.getenv("MINIO_REGION")
-            or os.getenv("AWS_S3_REGION")
-            or os.getenv("AWS_DEFAULT_REGION")
+            os.getenv("STORAGE_REGION")
             or None
         )
         if not endpoint or not access_key or not secret_key:
             raise RuntimeError(
                 "MinIO environment incomplete. "
-                "Expected AWS_S3_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY."
+                "Expected STORAGE_ENDPOINT_URL, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY."
             )
 
         client = cls._build_client(endpoint, access_key, secret_key, region)
@@ -120,7 +118,7 @@ class MinioStorage(StorageInterface):
         storage.endpoint_url = endpoint
         storage.region = region
         storage.secure = parsed.scheme == "https"
-        force_path_style = (os.getenv("AWS_S3_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
+        force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
         storage.url_style = "path" if force_path_style else "path"
 
         storage._ensure_bucket_exists(bucket, region)

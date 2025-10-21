@@ -65,13 +65,14 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_DB=0
 
-AWS_S3_ENDPOINT_URL=http://minio:9000
-AWS_S3_FORCE_PATH_STYLE=true
-AWS_ACCESS_KEY_ID=minioadmin
-AWS_SECRET_ACCESS_KEY=minioadmin123!
-SUPERTABLE_BUCKET=supertable
-
 STORAGE_TYPE=MINIO
+STORAGE_REGION=eu-central-1
+STORAGE_ENDPOINT_URL=http://localhost:9000
+STORAGE_ACCESS_KEY=minioadmin
+STORAGE_SECRET_KEY=minioadmin123!
+STORAGE_BUCKET=supertable
+STORAGE_FORCE_PATH_STYLE=true
+
 SUPERTABLE_HOME=/data/supertable
 LOG_LEVEL=INFO
 
@@ -132,7 +133,13 @@ Typical integration (VS Code / Claude Desktop / OpenAI MCP):
   ```
 
 ---
+STORAGE_TYPE=MINIO
 
+STORAGE_ENDPOINT_URL=http://localhost:9000
+STORAGE_ACCESS_KEY=minioadmin
+STORAGE_SECRET_KEY=minioadmin123!
+STORAGE_BUCKET=supertable
+STORAGE_FORCE_PATH_STYLE=true
 ## Configuration
 
 ### Redis
@@ -140,10 +147,13 @@ Typical integration (VS Code / Claude Desktop / OpenAI MCP):
 - The Admin & MCP pieces discover tenants under keys like `supertable:<org>:<super>:meta:*`.
 
 ### MinIO (default)
+- `STORAGE_REGION=eu-central-1`
 - `STORAGE_TYPE=MINIO`
-- `AWS_S3_ENDPOINT_URL=http://minio:9000`, `AWS_S3_FORCE_PATH_STYLE=true`
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-- `SUPERTABLE_BUCKET` (default: `supertable`)
+- `STORAGE_ENDPOINT_URL=http://minio:9000`, 
+- `STORAGE_FORCE_PATH_STYLE=true`
+- `STORAGE_ACCESS_KEY`, 
+- `STORAGE_SECRET_KEY`
+- `STORAGE_BUCKET` (default: `supertable`)
 
 > The MinIO backend will **ensure the bucket exists** automatically.
 
