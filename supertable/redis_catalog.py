@@ -78,7 +78,7 @@ class RedisOptions:
     decode_responses: bool = field(default=True)
 
     def __post_init__(self):
-        url = os.getenv("REDIS_URL")
+        url = os.getenv("SUPERTABLE_REDIS_URL")
         if url:
             u = urlparse(url)
             host = u.hostname or "localhost"
@@ -88,13 +88,13 @@ class RedisOptions:
             password = u.password
             use_ssl = (u.scheme.lower() == "rediss")
         else:
-            host = os.getenv("REDIS_HOST", "localhost")
-            port = int(os.getenv("REDIS_PORT", "6379"))
-            db = int(os.getenv("REDIS_DB", "0"))
-            password = os.getenv("REDIS_PASSWORD")
+            host = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
+            port = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
+            db = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
+            password = os.getenv("SUPERTABLE_REDIS_PASSWORD")
             use_ssl = False
 
-        decode = os.getenv("REDIS_DECODE_RESPONSES", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+        decode = os.getenv("SUPERTABLE_REDIS_DECODE_RESPONSES", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
