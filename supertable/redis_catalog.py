@@ -6,11 +6,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Any
+from dotenv import load_dotenv
 
 import redis
-
 from supertable.config.defaults import default, logger
 
+load_dotenv()
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
