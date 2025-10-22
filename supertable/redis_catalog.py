@@ -1,15 +1,17 @@
 # supertable/redis_catalog.py
 from __future__ import annotations
 
+import os
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Any
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 import redis
-from supertable.config.defaults import default, logger
+from supertable.config.defaults import logger
 
 load_dotenv()
 
@@ -58,11 +60,48 @@ def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
 
 @dataclass(frozen=True)
 class RedisOptions:
-    host: str = getattr(default, "REDIS_HOST", "localhost")
-    port: int = getattr(default, "REDIS_PORT", 6379)
-    db: int = getattr(default, "REDIS_DB", 0)
-    password: Optional[str] = getattr(default, "REDIS_PASSWORD", None)
-    decode_responses: bool = True
+    """
+    Reads Redis connection options from environment variables.
+
+    Supported:
+      - REDIS_URL (e.g. redis://:pass@host:6379/0 or rediss://:pass@host:6380/1)
+      - or split vars: REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
+
+    Optional:
+      - REDIS_DECODE_RESPONSES (default: "true")
+    """
+    host: str = field(init=False)
+    port: int = field(init=False)
+    db: int = field(init=False)
+    password: Optional[str] = field(init=False)
+    use_ssl: bool = field(init=False)
+    decode_responses: bool = field(default=True)
+
+    def __post_init__(self):
+        url = os.getenv("REDIS_URL")
+        if url:
+            u = urlparse(url)
+            host = u.hostname or "localhost"
+            port = u.port or 6379
+            # path like "/0"
+            db = int((u.path or "/0").lstrip("/") or 0)
+            password = u.password
+            use_ssl = (u.scheme.lower() == "rediss")
+        else:
+            host = os.getenv("REDIS_HOST", "localhost")
+            port = int(os.getenv("REDIS_PORT", "6379"))
+            db = int(os.getenv("REDIS_DB", "0"))
+            password = os.getenv("REDIS_PASSWORD")
+            use_ssl = False
+
+        decode = os.getenv("REDIS_DECODE_RESPONSES", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "port", port)
+        object.__setattr__(self, "db", db)
+        object.__setattr__(self, "password", password)
+        object.__setattr__(self, "use_ssl", use_ssl)
+        object.__setattr__(self, "decode_responses", decode)
 
 
 class RedisCatalog:
@@ -144,6 +183,7 @@ return 0
             db=opts.db,
             password=opts.password,
             decode_responses=opts.decode_responses,
+            ssl=opts.use_ssl,
         )
 
         # Register scripts
