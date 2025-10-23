@@ -1,5 +1,4 @@
-# -------- Core scientific stack (Python 3.12 compatible) --------
-# Keep modern, well-supported pins that work in Docker and most clouds.
+# -------- Core scientific stack (Python 3.11+ compatible) --------
 numpy>=1.26,<2.0
 pandas>=2.1,<2.3
 pyarrow>=16,<19
@@ -16,20 +15,22 @@ colorlog>=6.9,<7.0
 python-dotenv>=1.0,<2.0
 setuptools>=68
 
-# -------- Storage backends (now default: Redis + MinIO) --------
+# -------- Storage backends (Redis + MinIO as default) --------
 redis>=5.0,<5.2
 minio>=7.2,<8.0
 boto3>=1.34,<2.0  # optional S3 compatibility
 
 # -------- Admin API (FastAPI + Uvicorn + Jinja2) --------
-fastapi>=0.111,<0.116
-uvicorn>=0.30,<0.34
+fastapi>=0.111,<0.117
+uvicorn[standard]>=0.30,<0.34
 jinja2>=3.1,<3.2
+aiofiles>=23.2,<24.0     # static files / templates convenience
+orjson>=3.9,<4.0         # faster JSON (optional but nice)
 
 # -------- MCP (Model Context Protocol) --------
-# We keep the short package name because the server/client code import `mcp.*`.
 mcp>=1.1.0
 
 # NOTE:
-#  • Azure / GCP optional extras are handled in pyproject 'extras' (not required here).
-#  • If you deploy to a very constrained image, you can remove boto3.
+# • Using uvicorn[standard] adds uvloop, httptools, watchfiles for better perf/dev.
+# • Ranges chosen to stay friendly with python:3.11-slim in Docker.
+# • You can drop boto3 if you only use MinIO with the MinIO client.

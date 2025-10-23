@@ -1,119 +1,98 @@
-version: "3.9"
-
-x-common-env: &common-env
-  # --- Core behavior ---
-  LOG_LEVEL: ${LOG_LEVEL:-INFO}
-  LOCKING_BACKEND: ${LOCKING_BACKEND:-redis}
-  STORAGE_TYPE: ${STORAGE_TYPE:-MINIO}
-  SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/data/supertable}
-
-  # --- Redis (catalog + locks) ---
-  REDIS_HOST: ${REDIS_HOST:-redis}
-  REDIS_PORT: ${REDIS_PORT:-6379}
-  REDIS_DB: ${REDIS_DB:-0}
-  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-
-  # --- MinIO/S3 (object storage) ---
-  AWS_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT_URL:-http://minio:9000}
-  AWS_S3_FORCE_PATH_STYLE: ${AWS_S3_FORCE_PATH_STYLE:-true}
-  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
-  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin123!}
-  SUPERTABLE_BUCKET: ${SUPERTABLE_BUCKET:-supertable}
-
-  # --- Admin UI ---
-  SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:-change-me-now}
-
-  # --- DuckDB tuning (optional) ---
-  SUPERTABLE_DUCKDB_PRESIGNED: ${SUPERTABLE_DUCKDB_PRESIGNED:-1}
-  SUPERTABLE_DUCKDB_THREADS: ${SUPERTABLE_DUCKDB_THREADS:-4}
-  SUPERTABLE_DUCKDB_EXTERNAL_THREADS: ${SUPERTABLE_DUCKDB_EXTERNAL_THREADS:-2}
-  SUPERTABLE_DUCKDB_HTTP_TIMEOUT: ${SUPERTABLE_DUCKDB_HTTP_TIMEOUT:-60}
-  SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE: ${SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE:-1}
-  SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
-  SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
-
 services:
-  admin:
-    build:
-      context: .
-    image: kladnasoft/supertable:latest
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    environment:
-      <<: *common-env
-    volumes:
-      - supertable-data:/data
-      - supertable-config:/config
-    depends_on:
-      - redis
-      - minio
-    command: >
-      uvicorn admin:app --host 0.0.0.0 --port 8000
-    healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:8000/healthz || exit 1"]
-      interval: 10s
-      timeout: 2s
-      retries: 12
-
-  # MCP runs over stdio. We keep a utility container where you can:
-  #   docker compose run --rm mcp mcp-client --org <org> --super <super>
-  # or run the raw server: docker compose run --rm -i mcp mcp-server
-  mcp:
-    image: kladnasoft/supertable:latest
-    build:
-      context: .
-    stdin_open: true
-    tty: false
-    environment:
-      <<: *common-env
-      MCP_SERVER_PATH: ${MCP_SERVER_PATH:-/app/mcp_server.py}
-      SUPERTABLE_TEST_ORG: ${SUPERTABLE_TEST_ORG:-kladna-soft}
-      SUPERTABLE_TEST_SUPER: ${SUPERTABLE_TEST_SUPER:-example}
-      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH:-}
-      SUPERTABLE_TEST_QUERY: ${SUPERTABLE_TEST_QUERY:-}
-    volumes:
-      - supertable-data:/data
-      - supertable-config:/config
-    depends_on:
-      - redis
-      - minio
-    command: ["sleep","infinity"]  # use `mcp-client` or `mcp-server` via docker compose run/exec
-
+  # ===================== Optional Infra (only when you include --profile infra) =====================
   redis:
     image: redis:7-alpine
-    restart: unless-stopped
+    profiles: ["infra"]
+    command: ["redis-server","--appendonly","yes"]
+    # Map ports only if you want host access to this internal Redis
     ports:
       - "6379:6379"
-    command: ["redis-server","--save","","--appendonly","no"]
     volumes:
       - redis-data:/data
-    healthcheck:
-      test: ["CMD","redis-cli","ping"]
-      interval: 5s
-      timeout: 2s
-      retries: 20
 
   minio:
     image: minio/minio:latest
-    restart: unless-stopped
-    environment:
-      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin123!}
+    profiles: ["infra"]
     command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:-minioadmin123!}
+    # Use non-default host ports to avoid clashes with your existing MinIO (9000/9001)
     ports:
-      - "9000:9000"  # S3 API
-      - "9001:9001"  # Console
+      - "9002:9000"   # S3 API will be available at http://localhost:9002
+      - "9003:9001"   # Console at http://localhost:9003
     volumes:
       - minio-data:/data
-    healthcheck:
-      test: ["CMD","curl","-f","http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+
+  # ===================== Apps (choose admin and/or mcp; infra is optional) =====================
+  supertable-admin:
+    build: .
+    profiles: ["admin"]
+    init: true
+    env_file:
+      - .env
+    environment:
+      SERVICE: admin
+      HOST: 0.0.0.0
+      PORT: 8000
+      # must be set (in .env or env); prevents default "change-me-now" in prod
+      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?set_a_token}
+
+      # ---- Defaults point to HOST services (your already-running Redis & MinIO) ----
+      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB:   ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+
+      # Misc you already use
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # lets Linux containers reach host services using host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+
+  supertable-mcp:
+    build: .
+    profiles: ["mcp"]
+    init: true
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    environment:
+      SERVICE: mcp
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # ---- Defaults point to HOST services ----
+      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB:   ${REDIS_DB:-1}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/1}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
+      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES}
+      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
-  supertable-data:
-  supertable-config:
   redis-data:
   minio-data:
