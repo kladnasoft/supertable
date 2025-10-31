@@ -3,14 +3,18 @@ from __future__ import annotations
 import os
 import json
 import html
-from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Optional, Tuple, Set
+from datetime import datetime, timezone, date
+from decimal import Decimal
+from typing import Dict, Iterator, List, Optional, Tuple, Set, Any
 from pathlib import Path
 from urllib.parse import urlparse
+import re
+import uuid
+import enum
 
 import redis
-from fastapi import APIRouter, Query, HTTPException, Request, Depends, Form
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi import APIRouter, Query, HTTPException, Request, Depends, Form, Body
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 # Load environment variables from .env file (optional)
@@ -449,6 +453,18 @@ def read_role(org: str, sup: str, role_hash: str) -> Optional[Dict]:
     return None
 
 
+# Prefer installed package; fallback to local modules for dev
+try:
+    from supertable.meta_reader import MetaReader  # type: ignore
+except Exception:
+    from meta_reader import MetaReader  # type: ignore
+
+try:
+    from supertable.data_reader import DataReader, engine  # type: ignore
+except Exception:
+    from data_reader import DataReader, engine  # type: ignore
+
+
 # ------------------------------ Router + templates ------------------------------
 
 router = APIRouter()
@@ -866,3 +882,279 @@ def root_redirect():
     resp = RedirectResponse("/admin/login", status_code=302)
     _no_store(resp)
     return resp
+
+
+# ------------------------------ Execute tab (helpers + endpoints) ------------------------------
+
+def _clean_sql_query(query: str) -> str:
+    # remove -- ... and /* ... */ and trailing semicolons
+    q = re.sub(r'--.*$', '', query, flags=re.MULTILINE)
+    q = re.sub(r'/\*.*?\*/', '', q, flags=re.DOTALL)
+    q = re.sub(r';+$', '', q)
+    return q.strip()
+
+
+def _apply_limit_safely(query: str, max_rows: int) -> str:
+    """
+    Ensure a LIMIT is present and not above max_rows+1.
+    """
+    limit_pattern = r'(?<!\w)(limit)\s+(\d+)(?!\w)(?=[^;]*$|;)'
+    m = re.search(limit_pattern, query, re.IGNORECASE)
+    if m:
+        cur = int(m.group(2))
+        if cur > max_rows + 1:
+            return re.sub(limit_pattern, f'LIMIT {max_rows + 1}', query, flags=re.IGNORECASE, count=1)
+        return query
+    return f"{query.rstrip(';').strip()} LIMIT {max_rows + 1}"
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """
+    Convert arbitrary objects (e.g., Enums, Decimals, datetime, UUID, sets,
+    custom 'Status' objects, numpy scalars) into JSON-safe structures.
+    Fallback: str(obj).
+    """
+    # Fast path for already-safe primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Common special cases
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (datetime, date)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8", errors="ignore")
+        except Exception:
+            return str(obj)
+    if isinstance(obj, enum.Enum):
+        # Prefer the enum name if available
+        return getattr(obj, "name", str(obj))
+
+    # Numpy numbers / scalars without importing numpy explicitly
+    if obj.__class__.__name__ in ("int8","int16","int32","int64","uint8","uint16","uint32","uint64","float16","float32","float64"):
+        try:
+            return obj.item()
+        except Exception:
+            return float(obj) if "float" in obj.__class__.__name__ else int(obj)
+
+    # Containers
+    if isinstance(obj, dict):
+        return { _sanitize_for_json(k): _sanitize_for_json(v) for k, v in obj.items() }
+    if isinstance(obj, (list, tuple)):
+        return [ _sanitize_for_json(x) for x in obj ]
+    if isinstance(obj, set):
+        return [ _sanitize_for_json(x) for x in obj ]
+
+    # Objects that might have a useful dict-like view
+    for attr in ("_asdict", "dict", "__dict__"):
+        if hasattr(obj, attr):
+            try:
+                d = getattr(obj, attr)()
+                return _sanitize_for_json(d)
+            except Exception:
+                pass
+
+    # Fallback to string representation
+    return str(obj)
+
+
+@router.get("/admin/execute", response_class=HTMLResponse)
+def admin_execute_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    if not _is_authorized(request):
+        resp = RedirectResponse("/admin/login", status_code=302)
+        _no_store(resp)
+        return resp
+
+    provided = _get_provided_token(request) or ""
+
+    # same tenant selection UX as admin page
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
+
+    users = list_users(sel_org, sel_sup) if sel_org and sel_sup else []
+    ctx = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": bool(sel_org and sel_sup),
+        "users": users,  # used for user selection (hash) at execution time
+    }
+    resp = templates.TemplateResponse("execute.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+class ExecutePayload(Dict[str, Any]):
+    query: str
+    organization: str
+    super_name: str
+    user_hash: str
+    page: int
+    page_size: int
+
+
+@router.post("/admin/execute")
+def admin_execute_api(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _=Depends(admin_guard_api)
+):
+    """
+    Run a read-only SQL (SELECT/WITH) and return a paginated JSON result.
+    """
+    try:
+        query = str(payload.get("query") or "").strip()
+        organization = str(payload.get("organization") or "")
+        super_name = str(payload.get("super_name") or "")
+        user_hash = str(payload.get("user_hash") or "")
+        page = int(payload.get("page") or 1)
+        page_size = int(payload.get("page_size") or 100)
+        max_rows = 10000
+
+        if not organization or not super_name:
+            return JSONResponse({"status": "error", "message": "organization and super_name are required", "result": []}, status_code=400)
+        if not query:
+            return JSONResponse({"status": "error", "message": "No query provided", "result": []}, status_code=400)
+        if not user_hash:
+            return JSONResponse({"status": "error", "message": "user_hash is required", "result": []}, status_code=400)
+
+        # Only allow SELECT/WITH
+        q = _clean_sql_query(query)
+        if not q.lower().lstrip().startswith(("select", "with")):
+            return JSONResponse({"status": "error", "message": "Only SELECT or WITH (CTE) queries are allowed", "result": []}, status_code=400)
+
+        q = _apply_limit_safely(q, max_rows)
+
+        dr = DataReader(super_name=super_name, organization=organization, query=q)
+        res = dr.execute(user_hash=user_hash)
+
+        # Defensive unpacking similar to api_app.py
+        df = meta1 = meta2 = None
+        if isinstance(res, tuple):
+            if len(res) >= 1:
+                df = res[0]
+            if len(res) >= 2:
+                meta1 = res[1]
+            if len(res) >= 3:
+                meta2 = res[2]
+        else:
+            df = res
+
+        # Build preview rows for JSON (use full df then paginate)
+        total_count = 0
+        rows: List[Dict[str, Any]] = []
+
+        if df is not None:
+            try:
+                # pandas-like
+                total_count = int(getattr(df, "shape", [0])[0] or 0)
+                if total_count > max_rows:
+                    df = df.iloc[:max_rows]  # type: ignore[index]
+                    total_count = max_rows
+                start = max(0, (page - 1) * page_size)
+                end = start + page_size
+                page_df = df.iloc[start:end]  # type: ignore[index]
+                # produce JSON-safe list[dict]
+                rows = json.loads(page_df.to_json(orient="records", date_format="iso"))  # type: ignore[attr-defined]
+            except Exception:
+                # duckdb relation or list of dicts/list rows fallback
+                try:
+                    if hasattr(df, "fetchall"):
+                        all_rows = df.fetchall()
+                        total_count = len(all_rows)
+                        if total_count > max_rows:
+                            all_rows = all_rows[:max_rows]
+                            total_count = max_rows
+                        start = max(0, (page - 1) * page_size)
+                        end = start + page_size
+                        page_rows = all_rows[start:end]
+                        rows = [{"c{}".format(i): _sanitize_for_json(v) for i, v in enumerate(r)} for r in page_rows]
+                    elif isinstance(df, list):
+                        total_count = len(df)
+                        if total_count > max_rows:
+                            df = df[:max_rows]
+                            total_count = max_rows
+                        start = max(0, (page - 1) * page_size)
+                        end = start + page_size
+                        rows = [_sanitize_for_json(x) for x in df[start:end]]
+                    else:
+                        rows = []
+                except Exception:
+                    rows = []
+
+        meta_payload = {
+            "result_1": meta1,
+            "result_2": meta2,
+            "timings": getattr(getattr(dr, "timer", None), "timings", None),
+            "plan_stats": getattr(getattr(dr, "plan_stats", None), "stats", None),
+        }
+        meta_safe = _sanitize_for_json(meta_payload)
+
+        return JSONResponse({
+            "status": "ok",
+            "message": None,
+            "result": rows,          # already JSON-safe
+            "total_count": total_count,
+            "meta": meta_safe,       # JSON-sanitized
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
+
+
+@router.post("/admin/schema")
+def admin_schema_api(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _=Depends(admin_guard_api)
+):
+    """
+    Return a light schema for autocomplete: { "schema": [ {table: [col,...]}, ... ] }
+    Requires: organization, super_name, user_hash
+    """
+    try:
+        organization = str(payload.get("organization") or "")
+        super_name = str(payload.get("super_name") or "")
+        user_hash = str(payload.get("user_hash") or "")
+
+        if not organization or not super_name or not user_hash:
+            return JSONResponse({"status": "error", "message": "organization, super_name and user_hash are required"}, status_code=400)
+
+        mr = MetaReader(organization=organization, super_name=super_name)
+        meta = mr.get_super_meta(user_hash)
+
+        tables = [
+            t["name"]
+            for t in (meta.get("super", {}).get("tables", []) or [])
+            if not (t["name"].startswith("__") and t["name"].endswith("__"))
+        ]
+
+        schema = []
+        for t in tables:
+            table_schema = mr.get_table_schema(t, user_hash)
+            if isinstance(table_schema, list) and table_schema and isinstance(table_schema[0], dict):
+                cols = list(table_schema[0].keys())
+            else:
+                cols = []
+            schema.append({t: cols})
+
+        return JSONResponse({"status": "ok", "schema": schema})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"Get schema failed: {e}"}, status_code=500)

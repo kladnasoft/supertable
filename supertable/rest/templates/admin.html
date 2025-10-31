@@ -109,6 +109,14 @@
     function closeModal() {
       document.getElementById('modal').style.display = 'none';
     }
+    function goExecute() {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const url = new URL('/admin/execute', window.location.origin);
+      url.searchParams.set('org', org);
+      url.searchParams.set('sup', sup);
+      window.location.href = url.toString();
+    }
     window.addEventListener('DOMContentLoaded', () => {
       window.__admintoken = "{{ token|e }}";
     });
@@ -185,6 +193,7 @@
       <div id="tab-leaves" class="tab active" onclick="switchTab('leaves')">Leaves</div>
       <div id="tab-users" class="tab" onclick="switchTab('users')">Users</div>
       <div id="tab-roles" class="tab" onclick="switchTab('roles')">Roles</div>
+      <div id="tab-exec" class="tab" onclick="goExecute()">Execute</div>
     </div>
 
     <div id="pane-leaves" class="tabpane">

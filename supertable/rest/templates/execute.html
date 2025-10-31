@@ -1,0 +1,342 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Execute SQL</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.css">
+
+  <style>
+    :root { --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e2e8f0; --acc:#38bdf8; --border:#1d3b57; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; font-family:Inter, ui-sans-serif, system-ui; background:var(--bg); color:var(--text) }
+    a { color: var(--acc); text-decoration: none; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .card { background: var(--panel); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+    .section { padding: 16px 20px; }
+    .muted { color: var(--muted); }
+    .btn { padding: 10px 14px; border-radius: 10px; background:#0b2940; border:1px solid var(--border); color:#e2e8f0; font-weight:600; cursor:pointer; }
+    .btn:hover { filter: brightness(1.1); }
+    input, select, textarea { background:#0b2940; border:1px solid var(--border); color:#e2e8f0; border-radius: 10px; padding:10px 12px; width: 100%; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid-3 { display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .text-xs { font-size:11px; }
+    .text-sm { font-size:12px; }
+    .header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+    .tabs { display:flex; gap:8px; margin-top:12px; }
+    .tab { padding:8px 12px; border:1px solid #22314a; border-radius:10px; cursor:pointer; }
+    .tab.active { background:#0b2940; }
+
+    .CodeMirror { border:1px solid var(--border); height: 240px; font-size:14px; border-radius:12px; }
+    .CodeMirror-focused { border-color: var(--acc); box-shadow: 0 0 0 3px rgba(56,189,248,.25); }
+
+    .btn-exec {
+      color: #0b1220; background: linear-gradient(135deg, #38bdf8 0%, #1ac8ff 100%);
+      border: none; padding: 12px 20px; border-radius: 10px; font-weight:800; cursor: pointer;
+      box-shadow: 0 4px 15px rgba(28,150,202,.35); transition: transform .1s ease;
+    }
+    .btn-exec:active { transform: translateY(1px); }
+
+    #status i { color: #10b981; }
+    #status.executing i { color: #f59e0b; animation: spin 1s linear infinite; }
+    #status.error i { color: #ef4444; }
+    @keyframes spin { 0% {transform:rotate(0deg)} 100% {transform:rotate(360deg)} }
+
+    #result table { width:100%; border-collapse: separate; border-spacing: 0; font-size: 14px; }
+    #result th, #result td { padding: 10px 12px; border:1px solid #22314a; }
+    #result th { position: sticky; top: 0; background:#0b2940; z-index: 10; }
+    .download-row { display:flex; justify-content:flex-end; margin-top:10px; }
+    .btn-download { border:1px solid var(--acc); color: var(--acc); background: transparent; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    .btn-download:hover { background:#0b2940; }
+  </style>
+
+  <script>
+    function api(path, opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (window.__admintoken) opts.headers['X-Admin-Token'] = window.__admintoken;
+      return fetch(path, opts).then(async res => {
+        const ct = res.headers.get('content-type') || '';
+        const payload = ct.includes('application/json') ? await res.json() : await res.text();
+        if (!res.ok) { const msg = typeof payload === 'string' ? payload : JSON.stringify(payload); throw new Error(msg); }
+        return payload;
+      });
+    }
+    function onPairChange() {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const url = new URL(window.location.href);
+      url.searchParams.set('org', org);
+      url.searchParams.set('sup', sup);
+      window.location.href = url.toString();
+    }
+    function goBackAdmin(){
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const url = new URL('/admin', window.location.origin);
+      url.searchParams.set('org', org);
+      url.searchParams.set('sup', sup);
+      window.location.href = url.toString();
+    }
+  </script>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1 style="font-size:22px; margin:0;">SuperTable – Execute SQL</h1>
+    <div class="text-xs"><a href="/admin/config">Config</a> · <a href="/admin/logout">Sign out</a></div>
+  </div>
+
+  <div class="card">
+    <div class="section">
+      <div class="grid">
+        <div>
+          <label class="text-sm muted">Tenant</label><br/>
+          <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
+            {% for t in tenants %}
+              <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>{{t.org}} / {{t.sup}}</option>
+            {% endfor %}
+          </select>
+          {% if has_tenant %}
+            <div class="text-xs muted" style="margin-top:6px;">Selected: {{ sel_org }} / {{ sel_sup }}</div>
+          {% else %}
+            <div class="text-xs muted" style="margin-top:6px;">No tenant discovered in Redis.</div>
+          {% endif %}
+        </div>
+        <div style="text-align:right;">
+          <button class="btn" onclick="goBackAdmin()">← Back to Admin</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if has_tenant %}
+  <div class="card" style="margin-top:16px;">
+    <div class="section">
+      <div class="grid">
+        <div>
+          <label class="text-sm muted">Super name</label>
+          <input id="superName" placeholder="e.g. contracts" value="{{ sel_sup }}"/>
+        </div>
+        <div>
+          <label class="text-sm muted">Organization</label>
+          <input id="organization" placeholder="e.g. org1" value="{{ sel_org }}"/>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px;">
+        <div>
+          <label class="text-sm muted">User (hash)</label>
+          <select id="userHash">
+            {% for u in users %}
+              <option value="{{u.hash}}">{{u.hash}}{% if u.get('name') %} — {{u.get('name')}}{% endif %}</option>
+            {% endfor %}
+          </select>
+          <div class="text-xs muted" style="margin-top:6px;">RBAC is enforced via selected user hash.</div>
+        </div>
+        <div>
+          <label class="text-sm muted">Page size</label>
+          <input id="pageSize" type="number" min="1" max="5000" value="100"/>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <label class="text-sm muted">SQL Query</label>
+        <textarea id="sql" rows="8">SELECT * FROM {{ sel_sup }} LIMIT 100</textarea>
+      </div>
+
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
+        <div id="status" class="text-sm muted"><i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready</div>
+        <div style="display:flex; gap:8px;">
+          <button id="btnExec" class="btn-exec">Execute ⏵</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <div class="section">
+      <div id="result"></div>
+      <div class="download-row"><button class="btn-download" onclick="downloadCSV()">Download CSV</button></div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/edit/matchbrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/sql-hint.min.js"></script>
+<script src="https://kit.fontawesome.com/a2d9d5a64f.js" crossorigin="anonymous"></script>
+
+<script>
+  window.__admintoken = "{{ token|e }}";
+
+  const editor = CodeMirror.fromTextArea(document.getElementById('sql'), {
+    mode: "text/x-sql",
+    theme: 'default',
+    lineNumbers: true,
+    matchBrackets: true,
+    lineWrapping: true,
+    extraKeys: {
+      "Ctrl-Enter": function(cm){ executeSQL(1); return false; },
+      "Cmd-Enter": function(cm){ executeSQL(1); return false; },
+      "Ctrl-Space": function(cm){ cm.showHint({completeSingle:false, hint: CodeMirror.hint.sql, tables: window.__hintTables || {}}); }
+    },
+    hintOptions: { completeSingle:false, tables: {} }
+  });
+
+  function setStatus(text, cls) {
+    const el = document.getElementById('status');
+    el.className = 'text-sm muted ' + (cls || '');
+    el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
+  }
+
+  async function loadSchema() {
+    const organization = document.getElementById('organization').value.trim();
+    const superName = document.getElementById('superName').value.trim();
+    const userHash = document.getElementById('userHash').value;
+
+    if (!organization || !superName || !userHash) return;
+
+    try {
+      const data = await api('/admin/schema', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ organization, super_name: superName, user_hash: userHash })
+      });
+      if (data.status === 'ok') {
+        const hint = {};
+        (data.schema || []).forEach(obj => {
+          const t = Object.keys(obj)[0];
+          const cols = obj[t] || [];
+          hint[t] = { columns: cols };
+        });
+        window.__hintTables = hint;
+        editor.setOption('hintOptions', { completeSingle:false, tables: hint });
+      }
+    } catch (e) {
+      console.error('Schema load failed:', e);
+    }
+  }
+
+  async function executeSQL(page) {
+    const organization = document.getElementById('organization').value.trim();
+    const superName = document.getElementById('superName').value.trim();
+    const userHash = document.getElementById('userHash').value;
+    const pageSize = parseInt(document.getElementById('pageSize').value || '100', 10);
+    const query = editor.getValue().trim();
+
+    if (!organization || !superName || !userHash) {
+      setStatus('Please select tenant, provide super name, and choose a user hash.', 'error');
+      return;
+    }
+    if (!/^\s*(select|with)\b/i.test(query)) {
+      setStatus('Only SELECT/WITH queries are allowed.', 'error');
+      return;
+    }
+
+    setStatus('Executing...', 'executing');
+    try {
+      const data = await api('/admin/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ organization, super_name: superName, user_hash: userHash, query, page: page || 1, page_size: pageSize })
+      });
+      if (data.status === 'ok') {
+        renderTable(data.result || [], data.total_count || 0, page || 1, pageSize, (p)=>executeSQL(p));
+        setStatus(`Success — ${data.result?.length||0} rows (total ${data.total_count||0})`);
+      } else {
+        setStatus('Error executing query', 'error');
+        renderError(data.message || 'Unknown error');
+      }
+    } catch (e) {
+      setStatus('Error executing query', 'error');
+      renderError(e.message || String(e));
+    }
+  }
+
+  function renderError(msg) {
+    document.getElementById('result').innerHTML = `
+      <div style="border:1px solid #7f1d1d; background:#450a0a; color:#fecaca; border-radius:10px; padding:12px;">
+        <strong>Error:</strong> <pre style="white-space:pre-wrap">${(msg||'').toString()}</pre>
+      </div>`;
+  }
+
+  function renderTable(rows, total, page, pageSize, onPage) {
+    if (!rows || !rows.length) {
+      document.getElementById('result').innerHTML = '<div class="muted">No results</div>';
+      window.__curRows = []; window.__curHeaders = [];
+      return;
+    }
+    const headers = Object.keys(rows[0]);
+    let html = '<div style="overflow:auto; max-height:60vh;"><table><thead><tr><th>#</th>';
+    headers.forEach(h => { html += `<th>${h}</th>`; });
+    html += '</tr></thead><tbody>';
+
+    rows.forEach((r, i) => {
+      const absIdx = (page-1)*pageSize + i + 1;
+      html += `<tr><td class="text-xs muted">${absIdx}</td>`;
+      headers.forEach(h => {
+        let v = r[h];
+        if (v === null || v === undefined) v = '<span class="muted">NULL</span>';
+        else if (typeof v === 'object') v = JSON.stringify(v);
+        html += `<td>${v}</td>`;
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+
+    // pagination
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    if (pages > 1) {
+      html += `<div style="display:flex; align-items:center; justify-content:space-between; margin-top:10px;">
+        <div class="text-xs muted">Page ${page} / ${pages} — showing ${rows.length} rows</div>
+        <div style="display:flex; gap:6px;">`;
+      const start = Math.max(1, page-2);
+      const end = Math.min(pages, page+2);
+      if (page > 1) html += `<button class="btn" onclick="(${onPage})(1)">«</button><button class="btn" onclick="(${onPage})(${page-1})">‹</button>`;
+      for (let p = start; p <= end; p++) {
+        html += `<button class="btn" style="${p===page?'opacity:.7;':''}" onclick="(${onPage})(${p})">${p}</button>`;
+      }
+      if (page < pages) html += `<button class="btn" onclick="(${onPage})(${page+1})">›</button><button class="btn" onclick="(${onPage})(${pages})">»</button>`;
+      html += `</div></div>`;
+    }
+
+    document.getElementById('result').innerHTML = html;
+    window.__curRows = rows;
+    window.__curHeaders = headers;
+  }
+
+  function downloadCSV() {
+    const rows = window.__curRows || [];
+    const headers = window.__curHeaders || [];
+    if (!rows.length) { alert('No data to download'); return; }
+    const csv = [headers.join(',')].concat(
+      rows.map(r => headers.map(h => {
+        let v = r[h];
+        if (v === null || v === undefined) return 'NULL';
+        if (typeof v === 'object') v = JSON.stringify(v);
+        v = String(v).replace(/"/g, '""');
+        if (v.includes(',') || v.includes('"')) v = `"${v}"`;
+        return v;
+      }).join(','))
+    ).join('\n');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = `query_results_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  document.getElementById('btnExec').addEventListener('click', () => executeSQL(1));
+  // Load schema hints after initial render
+  loadSchema();
+</script>
+</body>
+</html>
