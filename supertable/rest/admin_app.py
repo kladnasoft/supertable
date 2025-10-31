@@ -6,19 +6,18 @@ import html
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Tuple, Set
 from pathlib import Path
+from urllib.parse import urlparse
 
 import redis
-from fastapi import FastAPI, Query, HTTPException, Request, Depends, Form
+from fastapi import APIRouter, Query, HTTPException, Request, Depends, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-# Load environment variables from .env file
+# Load environment variables from .env file (optional)
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except ImportError:
-    # dotenv not available, continue without it
     pass
 
 
@@ -26,16 +25,26 @@ except ImportError:
 
 class Settings:
     def __init__(self) -> None:
-        self.REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
-        self.REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
-        self.REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
-        self.REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
+        # SUPERTABLE_* — as requested
+        self.SUPERTABLE_REDIS_URL: Optional[str] = os.getenv("SUPERTABLE_REDIS_URL")
+
+        self.SUPERTABLE_REDIS_HOST: str = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
+        self.SUPERTABLE_REDIS_PORT: int = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
+        self.SUPERTABLE_REDIS_DB: int = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
+        self.SUPERTABLE_REDIS_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_PASSWORD")
+        self.SUPERTABLE_REDIS_USERNAME: Optional[str] = os.getenv("SUPERTABLE_REDIS_USERNAME")
+
         self.SUPERTABLE_ADMIN_TOKEN: Optional[str] = os.getenv("SUPERTABLE_ADMIN_TOKEN")
+
         self.DOTENV_PATH: str = os.getenv("DOTENV_PATH", ".env")
+
+        # IMPORTANT: keep templates in the original folder (parent of /rest)
+        # This preserves behavior from before the move of this file.
         self.TEMPLATES_DIR: str = os.getenv(
             "TEMPLATES_DIR",
-            str(Path(__file__).resolve().parent / "templates")
+            str(Path(__file__).resolve().parent.parent / "rest/templates")
         )
+
         # set to 1 in HTTPS environments
         self.SECURE_COOKIES: bool = os.getenv("SECURE_COOKIES", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -162,14 +171,69 @@ class _FallbackCatalog:
                 continue
 
 
-def _build_catalog() -> Tuple[object, redis.Redis]:
-    r = redis.Redis(
-        host=settings.REDIS_HOST,
-        port=settings.REDIS_PORT,
-        db=settings.REDIS_DB,
-        password=settings.REDIS_PASSWORD,
+def _coerce_password(pw: Optional[str]) -> Optional[str]:
+    if pw is None:
+        return None
+    v = pw.strip()
+    # Treat these as "no password"
+    if v in ("", "None", "none", "null", "NULL"):
+        return None
+    return v
+
+
+def _build_redis_client() -> redis.Redis:
+    """
+    Build a Redis client from SUPERTABLE_* envs.
+    Precedence:
+      1) SUPERTABLE_REDIS_URL (parsed)
+      2) SUPERTABLE_REDIS_HOST/PORT/DB/PASSWORD (overrides URL parts if provided)
+    """
+    url = (settings.SUPERTABLE_REDIS_URL or "").strip() or None
+
+    host = settings.SUPERTABLE_REDIS_HOST
+    port = settings.SUPERTABLE_REDIS_PORT
+    db = settings.SUPERTABLE_REDIS_DB
+    username = (settings.SUPERTABLE_REDIS_USERNAME or "").strip() or None
+    password = _coerce_password(settings.SUPERTABLE_REDIS_PASSWORD)
+
+    if url:
+        u = urlparse(url)
+        if u.scheme not in ("redis", "rediss"):
+            raise ValueError(f"Unsupported Redis URL scheme: {u.scheme}")
+        # Extract from URL
+        if u.hostname:
+            host = u.hostname
+        if u.port:
+            port = u.port
+        # db from path: "/0", "/1", ...
+        if u.path and len(u.path) > 1:
+            try:
+                db_from_url = int(u.path.lstrip("/"))
+                db = db_from_url
+            except Exception:
+                pass
+        if u.username:
+            username = u.username
+        if u.password:
+            password = _coerce_password(u.password)
+
+    # If username is set but password is None, drop username (ACL requires both)
+    if username and not password:
+        username = None
+
+    return redis.Redis(
+        host=host,
+        port=port,
+        db=db,
+        password=password,
+        username=username,
         decode_responses=True,
+        ssl=url.startswith("rediss://") if url else False,
     )
+
+
+def _build_catalog() -> Tuple[object, redis.Redis]:
+    r = _build_redis_client()
     try:
         from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore
         return _RC(), r
@@ -385,18 +449,18 @@ def read_role(org: str, sup: str, role_hash: str) -> Optional[Dict]:
     return None
 
 
-# ------------------------------ App + templates ------------------------------
+# ------------------------------ Router + templates ------------------------------
 
-app = FastAPI(title="SuperTable Redis Admin", version="1.9.0")
+router = APIRouter()
 templates = Jinja2Templates(directory=settings.TEMPLATES_DIR)
 
 
-@app.get("/favicon.ico")
+@router.get("/favicon.ico")
 def favicon():
     return Response(status_code=204)
 
 
-@app.get("/healthz", response_class=PlainTextResponse)
+@router.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     try:
         pong = redis_client.ping()
@@ -407,13 +471,13 @@ def healthz():
 
 # -------- JSON API (read-only) --------
 
-@app.get("/api/tenants")
+@router.get("/api/tenants")
 def api_tenants():
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
-@app.get("/api/root")
+@router.get("/api/root")
 def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -430,7 +494,7 @@ def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(No
     return {"org": org, "sup": sup, "root": root}
 
 
-@app.get("/api/mirrors")
+@router.get("/api/mirrors")
 def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -442,7 +506,7 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
     return {"org": org, "sup": sup, "formats": fmts}
 
 
-@app.get("/api/leaves")
+@router.get("/api/leaves")
 def api_list_leaves(
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
@@ -506,7 +570,7 @@ def api_list_leaves(
     return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
 
 
-@app.get("/api/leaf/{simple}")
+@router.get("/api/leaf/{simple}")
 def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -520,7 +584,7 @@ def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[st
     return {"org": org, "sup": sup, "simple": simple, "data": obj}
 
 
-@app.get("/api/users")
+@router.get("/api/users")
 def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -528,7 +592,7 @@ def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"users": list_users(org, sup)}
 
 
-@app.get("/api/roles")
+@router.get("/api/roles")
 def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -536,7 +600,7 @@ def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"roles": list_roles(org, sup)}
 
 
-@app.get("/api/user/{user_hash}")
+@router.get("/api/user/{user_hash}")
 def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -548,7 +612,7 @@ def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Opti
     return {"hash": user_hash, "data": obj}
 
 
-@app.get("/api/role/{role_hash}")
+@router.get("/api/role/{role_hash}")
 def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -562,13 +626,13 @@ def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Opti
 
 # ------------------------------ Admin page & auth routes ------------------------------
 
-@app.get("/admin/login", response_class=HTMLResponse)
+@router.get("/admin/login", response_class=HTMLResponse)
 def admin_login_form(request: Request):
     msg = None if _required_token() else "Admin token not configured. Set SUPERTABLE_ADMIN_TOKEN in your .env and restart."
     return _render_login(request, message=msg, clear_cookie=True)
 
 
-@app.post("/admin/login")
+@router.post("/admin/login")
 def admin_login(request: Request, token: str = Form("")):
     req = _required_token()
     if not req:
@@ -598,15 +662,13 @@ def admin_login(request: Request, token: str = Form("")):
     return resp
 
 
-@app.get("/admin/logout")
+@router.get("/admin/logout")
 def admin_logout():
     resp = RedirectResponse("/admin/login", status_code=302)
     resp.delete_cookie("st_admin_token", path="/")
     _no_store(resp)
     return resp
 
-
-# Add this route after the existing routes, before the entrypoint
 
 def _parse_dotenv(path: str) -> Dict[str, str]:
     env: Dict[str, str] = {}
@@ -636,40 +698,56 @@ def _parse_dotenv(path: str) -> Dict[str, str]:
 
 
 def _effective_settings() -> Dict[str, str]:
-    keys = ["REDIS_HOST", "REDIS_PORT", "REDIS_DB", "REDIS_PASSWORD", "SUPERTABLE_ADMIN_TOKEN", "DOTENV_PATH",
-            "TEMPLATES_DIR", "SECURE_COOKIES", "HOST", "PORT", "UVICORN_RELOAD"]
-    out = {}
-    for k in keys:
-        out[k] = os.getenv(k)
-    return out
+    keys = [
+        "SUPERTABLE_REDIS_URL",
+        "SUPERTABLE_REDIS_HOST",
+        "SUPERTABLE_REDIS_PORT",
+        "SUPERTABLE_REDIS_DB",
+        "SUPERTABLE_REDIS_PASSWORD",
+        "SUPERTABLE_REDIS_USERNAME",
+        "SUPERTABLE_ADMIN_TOKEN",
+        "DOTENV_PATH",
+        "TEMPLATES_DIR",
+        "SECURE_COOKIES",
+        "HOST",
+        "PORT",
+        "UVICORN_RELOAD",
+    ]
+    return {k: os.getenv(k) for k in keys}
 
 
-@app.get("/admin/config", response_class=HTMLResponse)
+@router.get("/admin/config", response_class=HTMLResponse)
 def admin_config(request: Request):
     if not _is_authorized(request):
         resp = RedirectResponse("/admin/login", status_code=302)
         _no_store(resp)
         return resp
 
-    # Check for .env files - use more comprehensive paths
+    # ---- restore original project-root search order ----
+    here = Path(__file__).resolve()
+    rest_dir = here.parent
+    pkg_dir = rest_dir.parent                  # .../supertable
+    repo_root = pkg_dir.parent                 # .../dev/supertable   (project root)
+
     dotenv_paths = [
-        settings.DOTENV_PATH,
-        ".env",
-        str(Path(__file__).resolve().parent / ".env"),
-        str(Path(__file__).resolve().parent.parent / ".env"),  # Add parent directory
-        str(Path.cwd() / ".env"),
-        str(Path.cwd().parent / ".env")  # Add parent of current directory
+        settings.DOTENV_PATH,                  # explicit override (env)
+        ".env",                                # relative to CWD
+        str(repo_root / ".env"),               # project root
+        str(pkg_dir / ".env"),                 # package dir
+        str(rest_dir / ".env"),                # rest dir
+        str(Path.cwd() / ".env"),              # CWD absolute
+        str(Path.home() / ".env"),             # $HOME
     ]
 
     # Remove duplicates while preserving order
     seen = set()
-    unique_paths = []
-    for path_str in dotenv_paths:
-        if path_str and path_str not in seen:
-            seen.add(path_str)
-            unique_paths.append(path_str)
+    unique_paths: List[str] = []
+    for p in dotenv_paths:
+        if p and p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
 
-    tried = []
+    tried: List[Tuple[str, bool]] = []
     dotenv_found = False
     dotenv_loaded_path = ""
 
@@ -681,7 +759,6 @@ def admin_config(request: Request):
             dotenv_found = True
             dotenv_loaded_path = str(path)
 
-    # Parse .env file and get effective settings
     dotenv_vars = _parse_dotenv(dotenv_loaded_path) if dotenv_found else {}
     effective = _effective_settings()
 
@@ -693,6 +770,7 @@ def admin_config(request: Request):
         "is_sensitive": any(x in k.lower() for x in ("pass", "token", "secret", "key")),
     } for k in all_keys]
 
+    # Render (same templates as before)
     ctx = {
         "request": request,
         "dotenv_found": dotenv_found,
@@ -705,7 +783,8 @@ def admin_config(request: Request):
     _no_store(resp)
     return resp
 
-@app.get("/admin", response_class=HTMLResponse)
+
+@router.get("/admin", response_class=HTMLResponse)
 def admin_page(
         request: Request,
         org: Optional[str] = Query(None),
@@ -782,19 +861,8 @@ def admin_page(
     return resp
 
 
-@app.get("/", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 def root_redirect():
     resp = RedirectResponse("/admin/login", status_code=302)
     _no_store(resp)
     return resp
-
-
-# ------------------------------ Entrypoint ------------------------------
-
-if __name__ == "__main__":
-    import uvicorn
-
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    reload_flag = os.getenv("UVICORN_RELOAD", "0").lower() in ("1", "true", "yes", "on")
-    uvicorn.run(app, host=host, port=port, reload=reload_flag)
