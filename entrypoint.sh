@@ -7,14 +7,14 @@ PORT="${PORT:-8000}"
 
 case "$SERVICE" in
   admin)
-    exec uvicorn supertable.admin:app --host "$HOST" --port "$PORT"
+    # App is inside the package: supertable/rest/application.py -> supertable.rest.application:app
+    exec uvicorn supertable.rest.application:app --host "$HOST" --port "$PORT"
     ;;
   mcp)
     exec python -u supertable/mcp_server.py
     ;;
   both)
-    # start admin in background, then run MCP in foreground
-    uvicorn supertable.admin:app --host "$HOST" --port "$PORT" &
+    uvicorn supertable.rest.application:app --host "$HOST" --port "$PORT" &
     exec python -u supertable/mcp_server.py
     ;;
   *)

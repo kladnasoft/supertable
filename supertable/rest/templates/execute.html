@@ -24,7 +24,6 @@
     .btn:hover { filter: brightness(1.1); }
     input, select, textarea { background:#0b2940; border:1px solid var(--border); color:#e2e8f0; border-radius: 10px; padding:10px 12px; width: 100%; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .grid-3 { display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
     .text-xs { font-size:11px; }
     .text-sm { font-size:12px; }
     .header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
@@ -120,17 +119,6 @@
     <div class="section">
       <div class="grid">
         <div>
-          <label class="text-sm muted">Super name</label>
-          <input id="superName" placeholder="e.g. contracts" value="{{ sel_sup }}"/>
-        </div>
-        <div>
-          <label class="text-sm muted">Organization</label>
-          <input id="organization" placeholder="e.g. org1" value="{{ sel_org }}"/>
-        </div>
-      </div>
-
-      <div class="grid" style="margin-top:12px;">
-        <div>
           <label class="text-sm muted">User (hash)</label>
           <select id="userHash">
             {% for u in users %}
@@ -198,11 +186,15 @@
     el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
   }
 
-  async function loadSchema() {
-    const organization = document.getElementById('organization').value.trim();
-    const superName = document.getElementById('superName').value.trim();
-    const userHash = document.getElementById('userHash').value;
+  function getTenant() {
+    const sel = document.getElementById('pairSel');
+    const [organization, superName] = (sel?.value || '|').split('|');
+    return { organization, superName };
+  }
 
+  async function loadSchema() {
+    const userHash = document.getElementById('userHash').value;
+    const { organization, superName } = getTenant();
     if (!organization || !superName || !userHash) return;
 
     try {
@@ -227,14 +219,13 @@
   }
 
   async function executeSQL(page) {
-    const organization = document.getElementById('organization').value.trim();
-    const superName = document.getElementById('superName').value.trim();
     const userHash = document.getElementById('userHash').value;
     const pageSize = parseInt(document.getElementById('pageSize').value || '100', 10);
     const query = editor.getValue().trim();
+    const { organization, superName } = getTenant();
 
     if (!organization || !superName || !userHash) {
-      setStatus('Please select tenant, provide super name, and choose a user hash.', 'error');
+      setStatus('Please select a tenant and a user hash.', 'error');
       return;
     }
     if (!/^\s*(select|with)\b/i.test(query)) {
@@ -293,7 +284,6 @@
     });
     html += '</tbody></table></div>';
 
-    // pagination
     const pages = Math.max(1, Math.ceil(total / pageSize));
     if (pages > 1) {
       html += `<div style="display:flex; align-items:center; justify-content:space-between; margin-top:10px;">
