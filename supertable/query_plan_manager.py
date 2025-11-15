@@ -23,10 +23,10 @@ class QueryPlanManager:
       - Optionally cleans up old plan files to keep temp tidy.
     """
 
-    def __init__(self, super_name: str, organization: str, current_meta_path: str, parser: SQLParser):
+    def __init__(self, super_name: str, organization: str, current_meta_path: str, query: str):
         self.identity = "queries"
         self.organization = organization
-        self.original_table = parser.original_table
+        self.super_name = super_name
 
         # Temp directory under the super/table scope -> avoids collisions across supers
         self.temp_dir = os.path.join(self.organization, super_name, "tmp")
@@ -35,10 +35,10 @@ class QueryPlanManager:
         logger.debug(f"Using temp dir {self.temp_dir}")
 
         # Compose a deterministic (short) hash from meta path + parsed SQL
-        parsed_sql = getattr(parser, "parsed_query", None) or getattr(parser, "original_query", "") or ""
+
         meta_id = current_meta_path or ""
         # Truncate hash to 16 chars to keep filenames short/cross-platform friendly
-        self.query_hash = generate_hash_uid("|".join([meta_id, parsed_sql]))[:16]
+        self.query_hash = generate_hash_uid("|".join([meta_id, query]))[:16]
 
         self.query_id = str(uuid.uuid4())
         self.query_plan_id = self.generate_query_plan_filename(alias="plan", extension="json")

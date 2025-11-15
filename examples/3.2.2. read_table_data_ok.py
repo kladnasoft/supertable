@@ -1,7 +1,11 @@
 from supertable.data_reader import DataReader, engine
 from examples.defaults import super_name, user_hash, simple_name, organization
 
-query = f"select * as cnt from {simple_name} where 1=1 limit 10"
+query = f"""select f.partition, c.*
+from myself_miss_represent_wait_process_attorney_free f
+join office_third_put_great_capital c on c.partition = f.partition
+where 1=1 limit 10
+"""
 
 dr = DataReader(super_name=super_name, organization=organization, query=query)
 result = dr.execute(user_hash=user_hash, with_scan=False, engine=engine.DUCKDB)
@@ -12,3 +16,4 @@ print(dr.timer.timings)
 print("-" * len(str(dr.timer.timings)))
 print(dr.plan_stats.stats)
 print("-" * len(str(dr.plan_stats.stats)))
+print(result)

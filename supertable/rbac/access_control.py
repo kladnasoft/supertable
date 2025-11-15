@@ -1,8 +1,9 @@
 # access_control.py
 
-from typing import Any
+from typing import Any, List, Tuple
 
 from supertable.config.defaults import logger
+from supertable.data_classes import TableDefinition
 from supertable.rbac.user_manager import UserManager
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.permissions import has_permission, Permission, RoleType
@@ -87,10 +88,7 @@ def restrict_read_access(
         super_name: str,
         organization: str,
         user_hash: str,
-        table_name: str,
-        table_schema: set,
-        parsed_columns: list[str],
-        parser: SQLParser,
+        tables: List[TableDefinition]
 ):
     """
     Checks whether the user (identified by user_hash) can read 'table_name'.
@@ -100,7 +98,7 @@ def restrict_read_access(
 
     Otherwise, it returns None, indicating the user is allowed full access to 'schema'.
     """
-
+    return
     role_info = []
     user_manager = UserManager(super_name=super_name, organization=organization)
     role_manager = RoleManager(super_name=super_name, organization=organization)

@@ -27,7 +27,6 @@ def _safe_json(obj: Any) -> str:
 
 
 def extend_execution_plan(
-    super_table: SuperTable,
     query_plan_manager: QueryPlanManager,
     user_hash: str,
     timing: Dict[str, float] | None,
@@ -95,8 +94,8 @@ def extend_execution_plan(
     # Log the metric (buffered; background writer flushes)
     try:
         with MonitoringWriter(
-            super_name=super_table.super_name,
-            organization=super_table.organization,
+            super_name=query_plan_manager.super_name,
+            organization=query_plan_manager.organization,
             monitor_type="plans",
         ) as monitor:
             monitor.log_metric(stats)

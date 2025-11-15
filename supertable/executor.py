@@ -14,7 +14,7 @@ from supertable.utils.sql_parser import SQLParser
 
 from supertable.execute_duckdb import DuckDBExecutor
 from supertable.execute_spark import SparkExecutor
-
+from supertable.data_classes import Reflection
 
 class Engine(Enum):
     AUTO = "auto"
@@ -31,7 +31,7 @@ class Executor:
         self.duckdb_exec = DuckDBExecutor(storage=storage)
         self.spark_exec: Optional[SparkExecutor] = None
 
-    def _auto_pick(self, files: List[str], bytes_total: int) -> Engine:
+    def _auto_pick(self, bytes_total: int) -> Engine:
         try:
             from pyspark.sql import SparkSession # noqa: F401
             spark_available = True
@@ -45,22 +45,21 @@ class Executor:
     def execute(
         self,
         engine: Engine,
-        file_list: List[str],
-        bytes_total: int,
+        reflection: Reflection,
         parser: SQLParser,
         query_manager: QueryPlanManager,
         timer: Timer,
         plan_stats: PlanStats,
         log_prefix: str,
     ) -> Tuple[pd.DataFrame, str]:
-        chosen = engine if engine != Engine.AUTO else self._auto_pick(file_list, bytes_total)
+        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection.reflection_bytes)
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
 
         if chosen == Engine.DUCKDB:
             df = self.duckdb_exec.execute(
-                parquet_files=file_list,
+                reflection=reflection,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,
@@ -71,7 +70,7 @@ class Executor:
             if self.spark_exec is None:
                 self.spark_exec = SparkExecutor()
             df = self.spark_exec.execute(
-                parquet_files=file_list,
+                selected=selected,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,

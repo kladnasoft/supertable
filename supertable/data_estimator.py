@@ -3,21 +3,103 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable, Set, List, Dict, Optional
+from collections import defaultdict
+from typing import Iterable, Set, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from supertable.config.defaults import logger
+from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.super_table import SuperTable
-from supertable.utils.sql_parser import SQLParser
 from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.plan_stats import PlanStats
 from supertable.utils.timer import Timer
 from supertable.rbac.access_control import restrict_read_access
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
+from supertable.utils.sql_parser import TableDefinition
 
 def _lower_set(items: Iterable[str]) -> Set[str]:
     return {str(x).lower() for x in items}
+
+
+from typing import Dict, List, Optional, Set, Tuple
+
+
+def get_missing_columns(
+    tables: List[TableDefinition],
+    selected: List[SuperSnapshot],
+) -> List[Tuple[str, str, Set[str]]]:
+    """
+    Returns list of (super_name, simple_name, missing_columns),
+    but only for tables where at least one requested column is missing.
+
+    Semantics (updated):
+
+      - `tables` (TableDefinition):
+          * Represents what the query requests (from SQLParser).
+          * Match key: (super_name, simple_name), case-insensitive.
+          * columns == []  => SELECT * / t.*  => all columns requested,
+                                but we DO NOT validate -> skip missing-check.
+          * columns != [] => explicit requested columns that MUST exist.
+
+      - `selected` (SuperSnapshot):
+          * Represents what is actually available for that table/version.
+          * columns: Set[str] of available columns.
+          * Multiple snapshots for same table:
+                union their columns.
+
+      - Missing logic:
+          * If TableDefinition.columns == []:
+                - No validation (treated as "don't check SELECT *").
+          * Else:
+                - If there is no matching SuperSnapshot:
+                      all requested columns are missing.
+                - If there is a match:
+                      missing = requested - available (case-insensitive).
+          * Only tables with non-empty missing set are returned.
+    """
+
+    # Build availability index from selected snapshots:
+    #   (super_name.lower(), simple_name.lower()) -> set(lowercase columns)
+    available_index: Dict[Tuple[str, str], Set[str]] = {}
+
+    for s in selected:
+        key = (s.super_name.lower(), s.simple_name.lower())
+        if key not in available_index:
+            available_index[key] = set()
+        # s.columns is a Set[str]; guard if it's empty/None
+        for c in (s.columns or []):
+            available_index[key].add(c.lower())
+
+    results: List[Tuple[str, str, Set[str]]] = []
+
+    # Check each requested table definition
+    for t in tables:
+        key = (t.super_name.lower(), t.simple_name.lower())
+
+        # [] means SELECT * (or t.*) -> all columns requested,
+        # but as per requirement: do NOT validate in this function.
+        if not t.columns:
+            continue
+
+        requested_lower = {c.lower() for c in t.columns}
+        available_lower = available_index.get(key)
+
+        if available_lower is None:
+            # No snapshot for this table -> everything requested is missing
+            missing_lower = requested_lower
+        else:
+            # Only columns that are requested but not present
+            missing_lower = requested_lower - available_lower
+
+        if missing_lower:
+            # Preserve original casing for reporting
+            missing_original = {c for c in t.columns if c.lower() in missing_lower}
+            if missing_original:
+                results.append((t.super_name, t.simple_name, missing_original))
+
+    return results
+
 
 
 class DataEstimator:
@@ -31,12 +113,10 @@ class DataEstimator:
       }
     """
 
-    def __init__(self, super_name: str, organization: str, query: str):
-        self.super_table = SuperTable(super_name=super_name, organization=organization)
-        self.storage = self.super_table.storage
-        self.parser = SQLParser(query)
-        self.parser.parse_sql()
-
+    def __init__(self, organization: str, storage, tables: List[TableDefinition]):
+        self.organization = organization
+        self.storage = storage
+        self.tables = tables
         self.timer: Optional[Timer] = None
         self.plan_stats: Optional[PlanStats] = None
         self.catalog = RedisCatalog()
@@ -110,8 +190,8 @@ class DataEstimator:
 
     def _detect_ssl(self) -> bool:
         val = (
-            (str(getattr(self.storage, "secure", "")).lower() if hasattr(self.storage, "secure") else "")
-            or (self._get_env("MINIO_SECURE", "S3_USE_SSL") or "")
+                (str(getattr(self.storage, "secure", "")).lower() if hasattr(self.storage, "secure") else "")
+                or (self._get_env("MINIO_SECURE", "S3_USE_SSL") or "")
         ).lower()
         return val in ("1", "true", "yes", "on")
 
@@ -170,8 +250,8 @@ class DataEstimator:
 
     # ----------------------- snapshot discovery & filtering -----------------------
 
-    def _collect_snapshots_from_redis(self) -> List[Dict]:
-        items = list(self.catalog.scan_leaf_items(self.super_table.organization, self.super_table.super_name, count=512))
+    def _collect_snapshots_from_redis(self, organization, super_name) -> List[Dict]:
+        items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
         snapshots = []
         for it in items:
             if not it.get("path"):
@@ -181,21 +261,30 @@ class DataEstimator:
                     "table_name": it["simple"],
                     "last_updated_ms": int(it.get("ts", 0)),
                     "path": it["path"],
-                    "files": 0,
-                    "rows": 0,
-                    "file_size": 0,
+                    "version": it['version']
                 }
             )
         return snapshots
 
-    def _filter_snapshots(self, snapshots: List[Dict]) -> List[Dict]:
-        if self.super_table.super_name.lower() == self.parser.original_table.lower():
+    def _filter_snapshots(self, super_name, simple_name, snapshots: List[Dict]) -> List[Dict]:
+        if super_name.lower() == simple_name.lower():
             return [s for s in snapshots if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))]
-        return [s for s in snapshots if s["table_name"].lower() == self.parser.original_table.lower()]
+        return [s for s in snapshots if s["table_name"].lower() == simple_name.lower()]
+
+    def _get_supertable_map(self) -> List[Tuple[str, List[str]]]:
+        grouped = defaultdict(list)
+
+        for t in self.tables:  # t: TableDefinition
+            grouped[t.super_name].append(t.simple_name)
+
+        # optional: sort simple_names per supertable
+        return [
+            (super_name, sorted(simple_names))
+            for super_name, simple_names in grouped.items()
+        ]
 
     # ----------------------- main API -----------------------
-
-    def estimate(self, user_hash: str, with_scan: bool = False) -> Dict[str, object]:
+    def estimate(self) -> Reflection:
         """
         Returns a dict with keys: STORAGE_TYPE, BYTES_AFFECTED, FILE_LIST.
         Performs RBAC check and column validation.
@@ -203,64 +292,74 @@ class DataEstimator:
         self.timer = Timer()
         self.plan_stats = PlanStats()
 
-        # Discover snapshots
-        snapshots_all = self._collect_snapshots_from_redis()
-        snapshots = self._filter_snapshots(snapshots_all)
-        logger.debug(f"[estimate] snapshots post-filter={len(snapshots)}")
-        self.timer.capture_and_reset_timing(event="META")
-
-        parquet_files: List[str] = []
+        supers: List[SuperSnapshot] = []
         reflection_file_size = 0
-        schema: Set[str] = set()
 
-        for snapshot in snapshots:
-            current_snapshot_path = snapshot["path"]
-            current_snapshot_data = self.super_table.read_simple_table_snapshot(current_snapshot_path)
+        super_map = self._get_supertable_map()
 
-            current_schema = current_snapshot_data.get("schema", {})
-            schema.update(dict_keys_to_lowercase(current_schema).keys())
+        # Discover snapshots
+        for super_name, tables in super_map:
+            for simple_name in tables:
+                snapshots = self._collect_snapshots_from_redis(organization=self.organization, super_name=super_name)
+                snapshots = self._filter_snapshots(super_name, simple_name, snapshots)
+                super_table = SuperTable(super_name, self.organization)
 
-            resources = current_snapshot_data.get("resources", []) or []
-            for resource in resources:
-                file_key = resource.get("file")
-                if not file_key:
-                    continue
-                resolved = self._to_duckdb_path(file_key)
-                parquet_files.append(resolved)
-                reflection_file_size += int(resource.get("file_size", 0))
+                parquet_files: List[str] = []
+                schema: Set[str] = set()
+
+                for snapshot in snapshots:
+                    current_snapshot_path = snapshot["path"]
+                    current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
+
+                    current_version = current_snapshot_data.get("snapshot_version", 0)
+                    current_schema = current_snapshot_data.get("schema", {})
+                    schema.update(dict_keys_to_lowercase(current_schema).keys())
+
+                    resources = current_snapshot_data.get("resources", []) or []
+                    for resource in resources:
+                        file_key = resource.get("file")
+                        if not file_key:
+                            continue
+                        resolved = self._to_duckdb_path(file_key)
+                        parquet_files.append(resolved)
+                        reflection_file_size += int(resource.get("file_size", 0))
+
+                    super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name, simple_version=current_version, files=parquet_files, columns=schema)
+                    supers.append(super_snapshot)
 
         # Validate requested columns
-        missing_columns: Set[str] = set()
-        if self.parser.columns_csv != "*":
-            requested = _lower_set(self.parser.columns_list)
-            missing_columns = requested - schema
+        missing_info = get_missing_columns(self.tables, supers)
 
-        if len(snapshots) == 0 or missing_columns or not parquet_files:
-            msg = (
-                f"Missing column(s): {', '.join(sorted(missing_columns))}"
-                if missing_columns
-                else ("No parquet files found" if not parquet_files else "No snapshots found")
-            )
+        # Total parquet files across all selected snapshots
+        total_reflections = sum(len(s.files) for s in supers)
+
+        # Ensure every selected snapshot has at least one file
+        all_have_files = all(bool(s.files) for s in supers)
+
+        if not supers or missing_info or not all_have_files:
+            if not supers:
+                msg = "No snapshots selected."
+            elif missing_info:
+                # missing_info: List[(super_name, table_name, Set[missing_cols])]
+                details = []
+                for super_name, table_name, cols in missing_info:
+                    cols_str = ", ".join(sorted(cols))
+                    details.append(f"{super_name}.{table_name}: {cols_str}")
+                msg = "Missing required column(s): " + " | ".join(details)
+            else:  # not all_have_files
+                msg = "No parquet files found for one or more selected tables."
+
             logger.warning(msg)
             raise RuntimeError(msg)
 
-        # RBAC check before returning
-        restrict_read_access(
-            super_name=self.super_table.super_name,
-            organization=self.super_table.organization,
-            user_hash=user_hash,
-            table_name=self.parser.reflection_table,
-            table_schema=schema,
-            parsed_columns=self.parser.columns_list,
-            parser=self.parser,
-        )
-        self.timer.capture_and_reset_timing(event="FILTERING")
+        self.timer.capture_and_reset_timing(event="ESTIMATE")
 
-        self.plan_stats.add_stat({"REFLECTIONS": len(parquet_files)})
+        self.plan_stats.add_stat({"REFLECTIONS": total_reflections})
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
 
-        return {
-            "STORAGE_TYPE": type(self.storage).__name__,
-            "BYTES_AFFECTED": int(reflection_file_size),
-            "FILE_LIST": parquet_files,
-        }
+        return Reflection(
+            storage_type=type(self.storage).__name__,
+            reflection_bytes=int(reflection_file_size),
+            total_reflections=total_reflections,
+            supers=supers,
+        )

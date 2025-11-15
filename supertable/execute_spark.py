@@ -35,7 +35,7 @@ class SparkExecutor:
 
     def execute(
         self,
-        parquet_files: List[str],
+        selected: List[str],
         parser: SQLParser,
         query_manager: QueryPlanManager,
         timer_capture,
