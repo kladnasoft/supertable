@@ -548,7 +548,7 @@
         pageLength: 25,
         lengthMenu: [10, 25, 50, 100],
         order: [[0, 'asc']],
-        dom: 'tip',  // just table + pagination + search
+        dom: 'frtip',  // filter + table + info + pagination
         language: {
           search: "",
           searchPlaceholder: "Filter tables..."
@@ -700,13 +700,13 @@
                   </td>
                   <td>
                     <span class="tag-version">v{{ it.version }}</span>
-                    {% if it.version == root_version %}
+                    {% if root_version is not none and it.version == root_version %}
                       <span class="tag-new">latest</span>
                     {% endif %}
                   </td>
                   <td>
                     <span class="text-xs muted">
-                      {{ it.ts_iso|default:it.ts }}
+                      {{ it.ts_iso or it.ts }}
                     </span>
                   </td>
                   <td>

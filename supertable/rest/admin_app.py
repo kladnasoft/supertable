@@ -805,10 +805,11 @@ def admin_page(
         request: Request,
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
-        q: Optional[str] = Query(None),
-        page: int = Query(1, ge=1),
-        page_size: int = Query(25, ge=5, le=200),
 ):
+    """
+    Main Redis admin page (no tables/leaves listing anymore).
+    Tables/Leaves are handled by /admin/tables.
+    """
     if not _is_authorized(request):
         # Always redirect to the login page if not authed
         resp = RedirectResponse("/admin/login", status_code=302)
@@ -844,12 +845,6 @@ def admin_page(
     except Exception:
         mirrors = []
 
-    listing = api_list_leaves(org=sel_org, sup=sel_sup, q=q, page=page, page_size=page_size)
-    raw_items = listing["items"]
-    items = [{**it, "ts_fmt": _fmt_ts(int(it.get("ts", 0)))} for it in raw_items]
-    total = int(listing["total"])
-    pages = (total + page_size - 1) // page_size if total else 1
-
     users = list_users(sel_org, sel_sup)
     roles = list_roles(sel_org, sel_sup)
 
@@ -864,15 +859,89 @@ def admin_page(
         "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
         "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
         "mirrors": mirrors,
-        "q": q or "",
-        "page": page,
-        "pages": pages if pages else 1,
-        "total": total,
-        "items": items,
         "users": users,
         "roles": roles,
     }
     resp = templates.TemplateResponse("admin.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+@router.get("/admin/tables", response_class=HTMLResponse)
+def admin_tables_page(
+        request: Request,
+        org: Optional[str] = Query(None),
+        sup: Optional[str] = Query(None),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(25, ge=5, le=200),
+):
+    """
+    Tables (Leaves) listing page, rendered with tables.html.
+    All table-related UI has been moved here from admin.html.
+    """
+    if not _is_authorized(request):
+        resp = RedirectResponse("/admin/login", status_code=302)
+        _no_store(resp)
+        return resp
+
+    provided = _get_provided_token(request) or ""
+
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
+
+    # If no tenant, just render with the selection UI
+    if not sel_org or not sel_sup:
+        ctx = {
+            "request": request,
+            "authorized": True,
+            "token": provided,
+            "tenants": tenants,
+            "sel_org": sel_org,
+            "sel_sup": sel_sup,
+            "has_tenant": False,
+        }
+        resp = templates.TemplateResponse("tables.html", ctx)
+        _no_store(resp)
+        return resp
+
+    try:
+        root = catalog.get_root(sel_org, sel_sup) or {}
+    except Exception:
+        root = {}
+
+    # Reuse the existing leaves API logic for listing
+    listing = api_list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
+    raw_items = listing.get("items", [])
+
+    items: List[Dict[str, Any]] = []
+    for it in raw_items:
+        obj = dict(it)
+        try:
+            obj["ts_iso"] = _fmt_ts(int(obj.get("ts", 0)))
+        except Exception:
+            obj["ts_iso"] = str(obj.get("ts", ""))
+        items.append(obj)
+
+    total = int(listing.get("total", 0))
+    pages = (total + page_size - 1) // page_size if total else 1
+
+    ctx = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": True,
+        "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
+        "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
+        "page": page,
+        "pages": pages if pages else 1,
+        "total": total,
+        "items": items,
+    }
+    resp = templates.TemplateResponse("tables.html", ctx)
     _no_store(resp)
     return resp
 
@@ -1158,3 +1227,91 @@ def admin_schema_api(
         return JSONResponse({"status": "ok", "schema": schema})
     except Exception as e:
         return JSONResponse({"status": "error", "message": f"Get schema failed: {e}"}, status_code=500)
+
+
+@router.get("/admin/tables", response_class=HTMLResponse)
+def tables_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=5, le=500),
+):
+    """
+    Tables view: shows Redis leaves as logical tables.
+    """
+    if not _is_authorized(request):
+      resp = RedirectResponse("/admin/login", status_code=302)
+      _no_store(resp)
+      return resp
+
+    provided = _get_provided_token(request) or ""
+
+    # same tenant selection UX as /admin
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [
+        {"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)}
+        for o, s in pairs
+    ]
+
+    has_tenant = bool(sel_org and sel_sup)
+    total = 0
+    items: List[Dict[str, Any]] = []
+    root_version = None
+    root_ts = None
+    pages = 1
+
+    if has_tenant:
+        listing = api_list_leaves(
+            org=sel_org,
+            sup=sel_sup,
+            q=None,
+            page=page,
+            page_size=page_size,
+        )
+
+        total = listing.get("total", 0)
+        page = listing.get("page", page)
+        page_size = listing.get("page_size", page_size)
+        raw_items = listing.get("items") or []
+
+        for it in raw_items:
+            ts_val = it.get("ts")
+            if isinstance(ts_val, (int, float)):
+                ts_iso = _fmt_ts(int(ts_val))
+            else:
+                ts_iso = str(ts_val) if ts_val is not None else ""
+            new_it = dict(it)
+            new_it["ts_iso"] = ts_iso
+            items.append(new_it)
+
+        pages = max(1, (total + page_size - 1) // page_size)
+
+        try:
+            root = catalog.get_root(sel_org, sel_sup)
+            if root:
+                root_version = root.get("version")
+                root_ts = _fmt_ts(root.get("ts", 0))
+        except Exception:
+            root_version = None
+            root_ts = None
+
+    ctx = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": has_tenant,
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "items": items,
+        "root_version": root_version,
+        "root_ts": root_ts,
+    }
+    resp = templates.TemplateResponse("tables.html", ctx)
+    _no_store(resp)
+    return resp

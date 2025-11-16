@@ -14,7 +14,7 @@
         integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
         crossorigin="anonymous" referrerpolicy="no-referrer" />
 
-  <!-- jQuery + Bootstrap (for dropdown, etc., similar to sidebar.html) -->
+  <!-- jQuery + Bootstrap -->
   <link rel="stylesheet"
         href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -59,7 +59,7 @@
       text-decoration: underline;
     }
 
-    /* --------- SIDEBAR (from sidebar.html / reflection_logo.html) --------- */
+    /* --------- SIDEBAR --------- */
 
     .sidebar {
       width: 280px;
@@ -91,7 +91,6 @@
       height: 80px;
     }
 
-    /* Logo / cube */
     .data-reflection-icon {
       display: inline-flex;
       align-items: center;
@@ -204,8 +203,6 @@
       border-radius: 4px;
     }
 
-    /* Sidebar links */
-
     .sidebar-link {
       color: var(--text-color);
       padding: 10px 12px;
@@ -247,8 +244,6 @@
       font-weight: 600;
       color: var(--primary-color);
     }
-
-    /* Profile section (simple version for admin) */
 
     .profile-section {
       padding: 12px 15px;
@@ -439,7 +434,6 @@
   </style>
 
   <script>
-    // --- API helper from original admin.html, unchanged except now lives in head ---
     function api(path, opts) {
       opts = opts || {};
       opts.headers = opts.headers || {};
@@ -449,13 +443,17 @@
         return res.json();
       });
     }
+
     function onPairChange() {
       const sel = document.getElementById('pairSel');
       const [org, sup] = sel.value.split('|');
       const params = new URLSearchParams(window.location.search);
-      params.set('org', org); params.set('sup', sup); params.set('page','1');
+      params.set('org', org);
+      params.set('sup', sup);
+      params.set('page','1');
       window.location.search = params.toString();
     }
+
     async function toggleMirror(fmt, el) {
       const enable = el.checked;
       const sel = document.getElementById('pairSel');
@@ -464,50 +462,36 @@
       await api(`${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`, {method:'POST'});
       location.reload();
     }
-    async function viewLeaf(simple) {
-      const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
-      const data = await api(`/api/leaf/${encodeURIComponent(simple)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-      showModal('Leaf: '+simple, JSON.stringify(data, null, 2));
-    }
+
     async function viewUser(hash) {
       const sel = document.getElementById('pairSel');
       const [org, sup] = sel.value.split('|');
       const data = await api(`/api/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('User '+hash, JSON.stringify(data, null, 2));
     }
+
     async function viewRole(hash) {
       const sel = document.getElementById('pairSel');
       const [org, sup] = sel.value.split('|');
       const data = await api(`/api/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Role '+hash, JSON.stringify(data, null, 2));
     }
-    function gotoPage(p) {
-      const params = new URLSearchParams(window.location.search);
-      params.set('page', p);
-      window.location.search = params.toString();
-    }
+
     function switchTab(id) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tabpane').forEach(p => p.classList.add('hidden'));
       document.getElementById('tab-'+id).classList.add('active');
       document.getElementById('pane-'+id).classList.remove('hidden');
     }
+
     function showModal(title, body) {
       document.getElementById('m-title').textContent = title;
       document.getElementById('m-body').textContent = body;
       document.getElementById('modal').style.display = 'flex';
     }
+
     function closeModal() {
       document.getElementById('modal').style.display = 'none';
-    }
-    function goExecute() {
-      const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
-      const url = new URL('/admin/execute', window.location.origin);
-      url.searchParams.set('org', org);
-      url.searchParams.set('sup', sup);
-      window.location.href = url.toString();
     }
 
     // Sidebar toggle + active link handling
@@ -523,12 +507,13 @@
         $("#sidebar").addClass("sidebar-collapsed");
       }
 
-      // Simple active link detection by pathname
       var path = window.location.pathname;
       if (path.startsWith("/admin/config")) {
         $("#link-config").addClass("active");
       } else if (path.startsWith("/admin/execute")) {
         $("#link-execute").addClass("active");
+      } else if (path.startsWith("/admin/tables")) {
+        $("#link-tables").addClass("active");
       } else {
         $("#link-admin").addClass("active");
       }
@@ -538,7 +523,6 @@
 <body>
   <!-- SIDEBAR -->
   <div class="sidebar" id="sidebar">
-    <!-- Logo -->
     <div class="sidebar-logo" id="toggleSidebar">
       <span class="data-reflection-icon">
         <span class="data-cube">
@@ -549,27 +533,25 @@
       <span class="logo-text">Data Reflection</span>
     </div>
 
-    <!-- Main Navigation -->
-<nav class="nav flex-column sidebar-nav">
-  <a href="/admin" class="sidebar-link" id="link-admin">
-    <i class="fas fa-database"></i>
-    <span>Redis Admin</span>
-  </a>
-  <a href="/admin/tables" class="sidebar-link" id="link-tables">
-    <i class="fas fa-table"></i>
-    <span>Tables</span>
-  </a>
-  <a href="/admin/execute" class="sidebar-link" id="link-execute">
-    <i class="fas fa-terminal"></i>
-    <span>Execute SQL</span>
-  </a>
-  <a href="/admin/config" class="sidebar-link" id="link-config">
-    <i class="fas fa-sliders-h"></i>
-    <span>Config</span>
-  </a>
-</nav>
+    <nav class="nav flex-column sidebar-nav">
+      <a href="/admin" class="sidebar-link" id="link-admin">
+        <i class="fas fa-database"></i>
+        <span>Redis Admin</span>
+      </a>
+      <a href="/admin/tables" class="sidebar-link" id="link-tables">
+        <i class="fas fa-table"></i>
+        <span>Tables</span>
+      </a>
+      <a href="/admin/execute" class="sidebar-link" id="link-execute">
+        <i class="fas fa-terminal"></i>
+        <span>Execute SQL</span>
+      </a>
+      <a href="/admin/config" class="sidebar-link" id="link-config">
+        <i class="fas fa-sliders-h"></i>
+        <span>Config</span>
+      </a>
+    </nav>
 
-    <!-- Profile / session section -->
     <div class="profile-section">
       <div class="profile-section-inner">
         <div>
@@ -589,7 +571,6 @@
       <div class="wrap"><p>Unauthorized</p></div>
     {% else %}
     <div class="wrap">
-      <!-- Header row inside content -->
       <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;">
         <div>
           <h1 style="font-size:22px; margin:0;">SuperTable Redis Admin</h1>
@@ -626,7 +607,7 @@
       </div>
 
       {% if has_tenant %}
-      <!-- Root / Mirrors / Search -->
+      <!-- Root / Mirrors / Tables link -->
       <div class="grid-3 mt-4">
         <div class="card">
           <div class="section">
@@ -659,85 +640,34 @@
 
         <div class="card">
           <div class="section">
-            <div class="muted text-sm">Search</div>
-            <form method="get" class="mt-2">
-              <input type="hidden" name="org" value="{{ sel_org }}" />
-              <input type="hidden" name="sup" value="{{ sel_sup }}" />
-              <input type="text" name="q" value="{{ q }}" placeholder="simple contains..." style="width:100%"/>
-              <div class="mt-2 right">
-                <button class="btn-ghost" type="submit">Apply</button>
+            <div class="muted text-sm">Tables</div>
+            <div class="mt-2">
+              <div class="muted text-xs">
+                Browse all leaves as logical tables with filtering and actions.
               </div>
-            </form>
+              <div class="mt-2 right">
+                <a class="btn-ghost"
+                   href="/admin/tables{% if has_tenant %}?org={{ sel_org }}&sup={{ sel_sup }}{% endif %}">
+                  <i class="fas fa-table"></i>&nbsp;Open Tables
+                </a>
+              </div>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- Tabs -->
+      <!-- Users / Roles tabs (non-table stuff) -->
       <div class="tabs">
-        <div id="tab-leaves" class="tab active" onclick="switchTab('leaves')">
-          <i class="fas fa-leaf"></i>&nbsp;Leaves
-        </div>
-        <div id="tab-users" class="tab" onclick="switchTab('users')">
+        <div id="tab-users" class="tab active" onclick="switchTab('users')">
           <i class="fas fa-users"></i>&nbsp;Users
         </div>
         <div id="tab-roles" class="tab" onclick="switchTab('roles')">
           <i class="fas fa-user-shield"></i>&nbsp;Roles
         </div>
-        <div id="tab-exec" class="tab" onclick="goExecute()">
-          <i class="fas fa-terminal"></i>&nbsp;Execute
-        </div>
-      </div>
-
-      <!-- Leaves pane -->
-      <div id="pane-leaves" class="tabpane">
-        <div class="card mt-4">
-          <div class="section">
-            <div class="muted text-sm">Leaves</div>
-            <div class="muted text-xs">Total: {{ total }} · Page {{ page }} / {{ pages }}</div>
-            <div class="mt-2">
-              <table>
-                <thead>
-                  <tr class="border-b">
-                    <th class="px-3 py-2 text-xs muted">simple</th>
-                    <th class="px-3 py-2 text-xs muted">version</th>
-                    <th class="px-3 py-2 text-xs muted">updated</th>
-                    <th class="px-3 py-2 text-xs muted">path</th>
-                    <th class="px-3 py-2 text-xs muted">actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for it in items %}
-                  <tr class="border-b">
-                    <td class="px-3 py-2 font-mono text-sm">{{ it.simple }}</td>
-                    <td class="px-3 py-2 text-sm">v{{ it.version }}</td>
-                    <td class="px-3 py-2 text-sm">{{ it.ts_fmt }}</td>
-                    <td class="px-3 py-2 text-sm">
-                      <span class="break-all">{{ it.path }}</span>
-                    </td>
-                    <td class="px-3 py-2 text-sm">
-                      <button class="btn-ghost" onclick="viewLeaf('{{ it.simple }}')">
-                        Display
-                      </button>
-                    </td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-            <div class="mt-3 right">
-              {% for i in range(1, (pages or 1)+1) %}
-                <button class="btn-ghost" onclick="gotoPage({{i}})"
-                        {% if i == page %}style="opacity:.6"{% endif %}>
-                  {{i}}
-                </button>
-              {% endfor %}
-            </div>
-          </div>
-        </div>
       </div>
 
       <!-- Users pane -->
-      <div id="pane-users" class="tabpane hidden">
+      <div id="pane-users" class="tabpane">
         <div class="card mt-4">
           <div class="section">
             <div class="muted text-sm">Users</div>
