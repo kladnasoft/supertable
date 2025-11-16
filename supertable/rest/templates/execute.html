@@ -4,329 +4,930 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SuperTable – Execute SQL</title>
+
+  <!-- Fonts & Icons -->
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
 
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.css">
+  <!-- Bootstrap for basic layout (matches admin sidebar) -->
+  <link rel="stylesheet"
+        href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+
+  <!-- CodeMirror styles -->
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.css">
 
   <style>
-    :root { --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e2e8f0; --acc:#38bdf8; --border:#1d3b57; }
-    * { box-sizing: border-box; }
-    html, body { margin:0; padding:0; font-family:Inter, ui-sans-serif, system-ui; background:var(--bg); color:var(--text) }
-    a { color: var(--acc); text-decoration: none; }
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
-    .card { background: var(--panel); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
-    .section { padding: 16px 20px; }
-    .muted { color: var(--muted); }
-    .btn { padding: 10px 14px; border-radius: 10px; background:#0b2940; border:1px solid var(--border); color:#e2e8f0; font-weight:600; cursor:pointer; }
-    .btn:hover { filter: brightness(1.1); }
-    input, select, textarea { background:#0b2940; border:1px solid var(--border); color:#e2e8f0; border-radius: 10px; padding:10px 12px; width: 100%; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .text-xs { font-size:11px; }
-    .text-sm { font-size:12px; }
-    .header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
-    .tabs { display:flex; gap:8px; margin-top:12px; }
-    .tab { padding:8px 12px; border:1px solid #22314a; border-radius:10px; cursor:pointer; }
-    .tab.active { background:#0b2940; }
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --secondary-color: #147ba3;
+      --dark-color: #1a1a2e;
+      --light-color: #f8f9fa;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+      --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 
-    .CodeMirror { border:1px solid var(--border); height: 240px; font-size:14px; border-radius:12px; }
-    .CodeMirror-focused { border-color: var(--acc); box-shadow: 0 0 0 3px rgba(56,189,248,.25); }
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+      background: #f3f6fb;
+      color: var(--text-color);
+    }
+
+    a {
+      color: var(--primary-color);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+
+    /* ------------ SIDEBAR (same as admin) ------------ */
+
+    .sidebar {
+      width: 280px;
+      height: 100vh;
+      position: fixed;
+      left: 0;
+      top: 0;
+      background: linear-gradient(180deg, #ffffff 0%, #f5faff 100%);
+      box-shadow: 4px 0 15px rgba(0, 0, 0, 0.05);
+      display: flex;
+      flex-direction: column;
+      z-index: 1100;
+      transition: var(--transition);
+      overflow: hidden;
+    }
+
+    .sidebar-collapsed { width: 80px; }
+
+    .sidebar-logo {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 20px 15px;
+      cursor: pointer;
+      background: white;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+      height: 80px;
+    }
+
+    .data-reflection-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .data-cube {
+      width: 30px;
+      height: 30px;
+      background: var(--primary-color);
+      position: relative;
+      transform: rotate(0deg);
+      overflow: hidden;
+      transition: var(--transition);
+      box-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
+    }
+
+    #toggleSidebar:hover .data-cube {
+      transform: rotate(90deg);
+      box-shadow: 0 4px 12px rgba(28, 150, 202, 0.5);
+    }
+
+    .data-cube:before {
+      content: '';
+      position: absolute;
+      width: 150%;
+      height: 40%;
+      background: linear-gradient(90deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,0.7) 50%,
+        rgba(255,255,255,0) 100%);
+      transform: translateX(-100%) rotate(45deg);
+      top: -10%;
+      left: -10%;
+      transition: transform 0.8s ease;
+    }
+
+    #toggleSidebar:hover .data-cube:before {
+      transform: translateX(100%) rotate(45deg);
+    }
+
+    .reflection {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: rgba(255,255,255,0.8);
+      border-radius: 2px;
+      bottom: 5px;
+      right: 5px;
+      transition: var(--transition);
+      opacity: 0.7;
+    }
+
+    #toggleSidebar:hover .reflection {
+      opacity: 1;
+      transform: scale(1.3) translate(-2px, -2px);
+    }
+
+    .data-grid {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      background:
+        linear-gradient(0deg, rgba(0,0,0,0.1) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px);
+      background-size: 7px 7px;
+      opacity: 0.6;
+    }
+
+    .logo-text {
+      font-size: 18px;
+      font-weight: 700;
+      color: transparent;
+      background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+      -webkit-background-clip: text;
+      background-clip: text;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      transition: var(--transition);
+      white-space: nowrap;
+      margin-left: 12px;
+    }
+
+    .sidebar-collapsed .logo-text { display: none; }
+
+    #toggleSidebar:hover .logo-text {
+      text-shadow: 0 2px 6px rgba(28, 150, 202, 0.4);
+    }
+
+    .sidebar-nav {
+      flex: 1;
+      overflow-y: auto;
+      padding: 15px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--primary-light) transparent;
+    }
+
+    .sidebar-nav::-webkit-scrollbar { width: 4px; }
+    .sidebar-nav::-webkit-scrollbar-thumb {
+      background-color: var(--primary-light);
+      border-radius: 4px;
+    }
+
+    .sidebar-link {
+      color: var(--text-color);
+      padding: 10px 12px;
+      border-radius: 8px;
+      transition: var(--transition);
+      font-weight: 500;
+      margin-bottom: 4px;
+      background: linear-gradient(to right, transparent 50%, var(--primary-light) 50%);
+      background-size: 200% 100%;
+      background-position: right bottom;
+      border-left: 3px solid transparent;
+      display: flex;
+      align-items: center;
+    }
+
+    .sidebar-link i {
+      margin-right: 10px;
+      width: 18px;
+      text-align: center;
+    }
+
+    .sidebar-collapsed .sidebar-link span { display: none; }
+    .sidebar-collapsed .sidebar-link i { margin-right: 0; }
+
+    .sidebar-link:hover {
+      background-position: left bottom;
+      border-left-color: var(--primary-color);
+      text-decoration: none;
+    }
+
+    .sidebar-link.active {
+      background: #e6f0ff;
+      border-left-color: var(--primary-color);
+      font-weight: 600;
+      color: var(--primary-color);
+    }
+
+    .profile-section {
+      padding: 12px 15px;
+      border-top: 1px solid rgba(0, 0, 0, 0.05);
+      background: white;
+      flex-shrink: 0;
+    }
+
+    .profile-section-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: var(--text-light);
+    }
+
+    .profile-section-inner strong { color: var(--text-color); }
+
+    /* ------------ MAIN CONTENT ------------ */
+
+    .content-container {
+      margin-left: 280px;
+      min-height: 100vh;
+      background-color: #f3f6fb;
+      transition: var(--transition);
+      padding-bottom: 40px;
+    }
+
+    .sidebar-collapsed ~ .content-container {
+      margin-left: 80px;
+    }
+
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .card {
+      background: var(--panel-bg);
+      border-radius: 16px;
+      box-shadow: var(--panel-shadow);
+      border: 1px solid var(--panel-border);
+    }
+
+    .section { padding: 16px 20px; }
+    .muted { color: var(--text-light); }
+    .text-xs { font-size: 11px; }
+    .text-sm { font-size: 12px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .header-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:12px;
+    }
+
+    .btn {
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: #0b2940;
+      border: 1px solid #1d3b57;
+      color: #e2e8f0;
+      font-weight: 500;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    .btn:hover { filter: brightness(1.05); }
+
+    .btn-ghost {
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid #d0d7e7;
+      background: transparent;
+      color: #475569;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .btn-ghost:hover { background: #e2e8f0; }
+
+    input, select, textarea {
+      background: #ffffff;
+      border: 1px solid #d0d7e7;
+      color: var(--text-color);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+      width: 100%;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(28,150,202,0.15);
+      border-color: var(--primary-color);
+    }
+
+    textarea { resize: vertical; min-height: 120px; }
+
+    /* CodeMirror styling – white editor */
+    .CodeMirror {
+      border-radius: 12px;
+      border: 1px solid #d0d7e7;
+      background: #ffffff;
+      color: #0b1220;
+      font-size: 13px;
+      min-height: 200px;
+    }
+
+    .CodeMirror-focused {
+      border-color: var(--primary-color);
+      box-shadow: 0 0 0 3px rgba(28,150,202,0.25);
+    }
 
     .btn-exec {
-      color: #0b1220; background: linear-gradient(135deg, #38bdf8 0%, #1ac8ff 100%);
-      border: none; padding: 12px 20px; border-radius: 10px; font-weight:800; cursor: pointer;
-      box-shadow: 0 4px 15px rgba(28,150,202,.35); transition: transform .1s ease;
+      color: #0b1220;
+      background: linear-gradient(135deg, #38bdf8 0%, #1ac8ff 100%);
+      border: none;
+      padding: 10px 18px;
+      border-radius: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 13px;
+      box-shadow: 0 4px 15px rgba(28,150,202,.35);
+      transition: transform .1s ease;
+      white-space: nowrap;
     }
     .btn-exec:active { transform: translateY(1px); }
 
     #status i { color: #10b981; }
     #status.executing i { color: #f59e0b; animation: spin 1s linear infinite; }
     #status.error i { color: #ef4444; }
-    @keyframes spin { 0% {transform:rotate(0deg)} 100% {transform:rotate(360deg)} }
 
-    #result table { width:100%; border-collapse: separate; border-spacing: 0; font-size: 14px; }
-    #result th, #result td { padding: 10px 12px; border:1px solid #22314a; }
-    #result th { position: sticky; top: 0; background:#0b2940; z-index: 10; }
-    .download-row { display:flex; justify-content:flex-end; margin-top:10px; }
-    .btn-download { border:1px solid var(--acc); color: var(--acc); background: transparent; padding:8px 12px; border-radius:8px; cursor:pointer; }
-    .btn-download:hover { background:#0b2940; }
+    @keyframes spin {
+      0% { transform:rotate(0deg); }
+      100% { transform:rotate(360deg); }
+    }
+
+    #result table {
+      width:100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 13px;
+    }
+
+    #result th, #result td {
+      padding: 8px 10px;
+      border:1px solid #e2e8f0;
+      background:#ffffff;
+    }
+
+    #result thead th {
+      position: sticky;
+      top: 0;
+      background: #f1f5f9;
+      z-index: 1;
+    }
+
+    #result tr:nth-child(even) td {
+      background: #f9fafb;
+    }
+
+    #result tr:hover td {
+      background: #e0f2fe;
+    }
+
+    #result .row-index {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      color: #64748b;
+    }
+
+    .download-row {
+      margin-top: 12px;
+      text-align: right;
+    }
+
+    .btn-download {
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid #0f172a;
+      background: #0f172a;
+      color: #e2e8f0;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn-download:hover { filter: brightness(1.08); }
+
+    .pagination {
+      margin-top: 12px;
+      text-align: right;
+    }
+
+    .page-btn {
+      padding: 4px 8px;
+      margin-left: 4px;
+      border-radius: 6px;
+      border: 1px solid #d0d7e7;
+      background: #ffffff;
+      cursor: pointer;
+      font-size: 11px;
+    }
+
+    .page-btn.active {
+      border-color: var(--primary-color);
+      color: var(--primary-color);
+      font-weight: 600;
+      background: #e6f4fa;
+    }
   </style>
 
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js">
+  </script>
+
   <script>
+    // --- Shared admin API helper ---
     function api(path, opts) {
       opts = opts || {};
       opts.headers = opts.headers || {};
       if (window.__admintoken) opts.headers['X-Admin-Token'] = window.__admintoken;
       return fetch(path, opts).then(async res => {
         const ct = res.headers.get('content-type') || '';
-        const payload = ct.includes('application/json') ? await res.json() : await res.text();
-        if (!res.ok) { const msg = typeof payload === 'string' ? payload : JSON.stringify(payload); throw new Error(msg); }
+        const payload = ct.includes('application/json')
+          ? await res.json()
+          : await res.text();
+        if (!res.ok) {
+          const msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
+          throw new Error(msg);
+        }
         return payload;
       });
     }
+
     function onPairChange() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const [org, sup] = (sel.value || '|').split('|');
       const url = new URL(window.location.href);
       url.searchParams.set('org', org);
       url.searchParams.set('sup', sup);
       window.location.href = url.toString();
     }
-    function goBackAdmin(){
+
+    function goBackAdmin() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const [org, sup] = (sel.value || '|').split('|');
       const url = new URL('/admin', window.location.origin);
-      url.searchParams.set('org', org);
-      url.searchParams.set('sup', sup);
+      if (org) url.searchParams.set('org', org);
+      if (sup) url.searchParams.set('sup', sup);
       window.location.href = url.toString();
     }
+
+    function getTenant() {
+      const sel = document.getElementById('pairSel');
+      const [organization, superName] = (sel?.value || '|').split('|');
+      return { organization, superName };
+    }
+
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      el.className = 'text-sm muted ' + (cls || '');
+      el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
+    }
+
+    function renderError(msg) {
+      document.getElementById('result').innerHTML = `
+        <div style="
+            border:1px solid #fecaca;
+            background:#fef2f2;
+            color:#7f1d1d;
+            border-radius:10px;
+            padding:12px;">
+          <strong>Error:</strong>
+          <pre style="white-space:pre-wrap; margin:4px 0 0 0;">${(msg||'').toString()}</pre>
+        </div>`;
+    }
+
+    function renderTable(rows, total, page, pageSize, onPage) {
+      if (!rows || !rows.length) {
+        document.getElementById('result').innerHTML =
+          '<div class="muted text-sm">No results</div>';
+        window.__curRows = []; window.__curHeaders = [];
+        return;
+      }
+      const headers = Object.keys(rows[0]);
+      let html =
+        '<div style="overflow:auto; max-height:60vh;">' +
+        '<table><thead><tr><th>#</th>';
+      headers.forEach(h => { html += `<th>${h}</th>`; });
+      html += '</tr></thead><tbody>';
+
+      rows.forEach((r, i) => {
+        const absIdx = (page-1)*pageSize + i + 1;
+        html += '<tr>';
+        html += `<td class="row-index">${absIdx}</td>`;
+        headers.forEach(h => {
+          let v = r[h];
+          if (v === null || v === undefined) v = '';
+          if (typeof v === 'object') v = JSON.stringify(v);
+          html += `<td>${v}</td>`;
+        });
+        html += '</tr>';
+      });
+
+      html += '</tbody></table></div>';
+
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      if (totalPages > 1) {
+        html += '<div class="pagination">';
+        for (let p = 1; p <= totalPages; p++) {
+          const cls = p === page ? 'page-btn active' : 'page-btn';
+          html += `<button class="${cls}" onclick="(${onPage.toString()})(${p})">${p}</button>`;
+        }
+        html += '</div>';
+      }
+
+      document.getElementById('result').innerHTML = html;
+      window.__curRows = rows;
+      window.__curHeaders = headers;
+    }
+
+    function downloadCSV() {
+      const rows = window.__curRows || [];
+      const headers = window.__curHeaders || [];
+      if (!rows.length || !headers.length) return;
+      const csv = [
+        headers.join(','),
+        ...rows.map(r =>
+          headers.map(h => {
+            let v = r[h];
+            if (v === null || v === undefined) v = '';
+            if (typeof v === 'object') v = JSON.stringify(v);
+            const s = String(v).replace(/"/g, '""');
+            return `"${s}"`;
+          }).join(',')
+        )
+      ].join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `query_results_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function loadSchema() {
+      const userHash = document.getElementById('userHash')?.value;
+      const { organization, superName } = getTenant();
+      if (!organization || !superName || !userHash) return;
+
+      try {
+        const data = await api('/admin/schema', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            organization,
+            super_name: superName,
+            user_hash: userHash
+          })
+        });
+        if (data.status === 'ok') {
+          const hint = {};
+          (data.schema || []).forEach(obj => {
+            const t = Object.keys(obj)[0];
+            const cols = obj[t] || [];
+            hint[t] = { columns: cols };
+          });
+          window.__hintTables = hint;
+          if (window.editor) {
+            window.editor.setOption('hintOptions', {
+              completeSingle:false,
+              tables: hint
+            });
+          }
+        }
+      } catch (e) {
+        console.error('Schema load failed:', e);
+      }
+    }
+
+    // --- execution timing state ---
+    let execStartTime = null;
+    let execTimerId = null;
+
+    async function executeSQL(page) {
+      const userHash = document.getElementById('userHash').value;
+      const pageSize = parseInt(document.getElementById('pageSize').value || '100', 10);
+      const query = window.editor.getValue().trim();
+      const { organization, superName } = getTenant();
+
+      if (!organization || !superName || !userHash) {
+        setStatus('Please select a tenant and a user hash.', 'error');
+        return;
+      }
+      if (!/^\s*(select|with)\b/i.test(query)) {
+        setStatus('Only SELECT/WITH queries are allowed.', 'error');
+        return;
+      }
+
+      const startedAt = Date.now();
+      execStartTime = startedAt;
+
+      if (execTimerId) {
+        clearInterval(execTimerId);
+        execTimerId = null;
+      }
+
+      // live timer while executing
+      execTimerId = setInterval(() => {
+        if (execStartTime === null) return;
+        const elapsedSec = (Date.now() - execStartTime) / 1000;
+        const text = `Executing… ${elapsedSec.toFixed(1)}s`;
+        setStatus(text, 'executing');
+      }, 150);
+
+      setStatus('Executing…', 'executing');
+
+      try {
+        const data = await api('/admin/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            organization,
+            super_name: superName,
+            user_hash: userHash,
+            query,
+            page: page || 1,
+            page_size: pageSize
+          })
+        });
+
+        const finishedAt = Date.now();
+        const elapsedMsClient = finishedAt - startedAt;
+
+        // stop timer
+        execStartTime = null;
+        if (execTimerId) {
+          clearInterval(execTimerId);
+          execTimerId = null;
+        }
+
+        if (data.status === 'ok') {
+          renderTable(
+            data.result || [],
+            data.total_count || 0,
+            page || 1,
+            pageSize,
+            (p) => executeSQL(p)
+          );
+
+          // prefer backend duration if available, else client timing
+          let durationMs = null;
+          if (typeof data.duration_ms === 'number') {
+            durationMs = data.duration_ms;
+          } else if (typeof data.duration === 'number') {
+            durationMs = data.duration;
+          } else {
+            durationMs = elapsedMsClient;
+          }
+
+          const durationStr = (durationMs / 1000).toFixed(3) + 's';
+          const rowsLen = (data.result || []).length;
+          const total = data.total_count || 0;
+
+          const statusText =
+            `Success — ${rowsLen} rows (total ${total}) in ${durationStr}`;
+
+          setStatus(statusText);
+        } else {
+          const finishedAtError = Date.now();
+          const elapsedErrorSec = ((finishedAtError - startedAt) / 1000).toFixed(3);
+
+          setStatus(`Error executing query after ${elapsedErrorSec}s`, 'error');
+          renderError(data.message || 'Unknown error');
+        }
+      } catch (e) {
+        const finishedAt = Date.now();
+        const elapsedSec = ((finishedAt - startedAt) / 1000).toFixed(3);
+
+        execStartTime = null;
+        if (execTimerId) {
+          clearInterval(execTimerId);
+          execTimerId = null;
+        }
+
+        setStatus(`Error executing query after ${elapsedSec}s`, 'error');
+        renderError(e.message || String(e));
+      }
+    }
+
+    // Sidebar toggle + nav highlight
+    $(document).ready(function(){
+      window.__admintoken = "{{ token|e }}";
+
+      $("#toggleSidebar").on("click", function() {
+        $("#sidebar").toggleClass("sidebar-collapsed");
+        localStorage.setItem('st_sidebar_collapsed',
+          $("#sidebar").hasClass("sidebar-collapsed"));
+      });
+
+      if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+        $("#sidebar").addClass("sidebar-collapsed");
+      }
+
+      $("#link-execute").addClass("active");
+    });
   </script>
 </head>
 <body>
-<div class="wrap">
-  <div class="header">
-    <h1 style="font-size:22px; margin:0;">SuperTable – Execute SQL</h1>
-    <div class="text-xs"><a href="/admin/config">Config</a> · <a href="/admin/logout">Sign out</a></div>
-  </div>
+  <!-- SIDEBAR -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-logo" id="toggleSidebar">
+      <span class="data-reflection-icon">
+        <span class="data-cube">
+          <span class="reflection"></span>
+          <span class="data-grid"></span>
+        </span>
+      </span>
+      <span class="logo-text">Data Reflection</span>
+    </div>
 
-  <div class="card">
-    <div class="section">
-      <div class="grid">
+    <nav class="nav flex-column sidebar-nav">
+      <a href="/admin" class="sidebar-link" id="link-admin">
+        <i class="fas fa-database"></i>
+        <span>Redis Admin</span>
+      </a>
+      <a href="/admin/execute" class="sidebar-link" id="link-execute">
+        <i class="fas fa-terminal"></i>
+        <span>Execute SQL</span>
+      </a>
+      <a href="/admin/config" class="sidebar-link" id="link-config">
+        <i class="fas fa-sliders-h"></i>
+        <span>Config</span>
+      </a>
+    </nav>
+
+    <div class="profile-section">
+      <div class="profile-section-inner">
         <div>
-          <label class="text-sm muted">Tenant</label><br/>
-          <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
-            {% for t in tenants %}
-              <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>{{t.org}} / {{t.sup}}</option>
-            {% endfor %}
-          </select>
-          {% if has_tenant %}
-            <div class="text-xs muted" style="margin-top:6px;">Selected: {{ sel_org }} / {{ sel_sup }}</div>
-          {% else %}
-            <div class="text-xs muted" style="margin-top:6px;">No tenant discovered in Redis.</div>
-          {% endif %}
+          <strong>SuperTable Admin</strong><br/>
+          <span class="text-xs">Token session</span>
         </div>
-        <div style="text-align:right;">
-          <button class="btn" onclick="goBackAdmin()">← Back to Admin</button>
-        </div>
+        <a href="/admin/logout" class="text-xs">
+          <i class="fas fa-sign-out-alt"></i> Logout
+        </a>
       </div>
     </div>
   </div>
 
-  {% if has_tenant %}
-  <div class="card" style="margin-top:16px;">
-    <div class="section">
-      <div class="grid">
+  <!-- MAIN CONTENT -->
+  <div class="content-container">
+    <div class="wrap">
+      <div class="header-row">
         <div>
-          <label class="text-sm muted">User (hash)</label>
-          <select id="userHash">
-            {% for u in users %}
-              <option value="{{u.hash}}">{{u.hash}}{% if u.get('name') %} — {{u.get('name')}}{% endif %}</option>
-            {% endfor %}
-          </select>
-          <div class="text-xs muted" style="margin-top:6px;">RBAC is enforced via selected user hash.</div>
+          <h1 style="font-size:22px; margin:0;">SuperTable – Execute SQL</h1>
+          <div class="text-xs muted">
+            Interactive SQL runner with RBAC enforced by selected user hash.
+          </div>
         </div>
-        <div>
-          <label class="text-sm muted">Page size</label>
-          <input id="pageSize" type="number" min="1" max="5000" value="100"/>
+        <div class="text-xs">
+          <a href="/admin/config">Config</a> ·
+          <a href="/admin/logout">Sign out</a>
         </div>
       </div>
 
-      <div style="margin-top:12px;">
-        <label class="text-sm muted">SQL Query</label>
-        <textarea id="sql" rows="8">SELECT * FROM {{ sel_sup }} LIMIT 100</textarea>
-      </div>
-
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
-        <div id="status" class="text-sm muted"><i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready</div>
-        <div style="display:flex; gap:8px;">
-          <button id="btnExec" class="btn-exec">Execute ⏵</button>
+      <!-- Tenant selection -->
+      <div class="card">
+        <div class="section">
+          <div class="grid">
+            <div>
+              <label class="text-sm muted">Tenant</label><br/>
+              <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
+                {% for t in tenants %}
+                  <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
+                    {{t.org}} / {{t.sup}}
+                  </option>
+                {% endfor %}
+              </select>
+              {% if has_tenant %}
+                <div class="text-xs muted" style="margin-top:6px;">
+                  Selected: {{ sel_org }} / {{ sel_sup }}
+                </div>
+              {% else %}
+                <div class="text-xs muted" style="margin-top:6px;">
+                  No tenant discovered in Redis.
+                </div>
+              {% endif %}
+            </div>
+            <div style="text-align:right;">
+              <button class="btn-ghost" onclick="goBackAdmin()">
+                <i class="fas fa-arrow-left"></i>&nbsp;Back to Redis Admin
+              </button>
+            </div>
+          </div>
         </div>
       </div>
+
+      {% if has_tenant %}
+      <!-- User + SQL editor -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section">
+          <div class="grid">
+            <div>
+              <label class="text-sm muted">User (hash)</label>
+              <select id="userHash" onchange="loadSchema()">
+                {% for u in users %}
+                  <option value="{{u.hash}}">
+                    {{u.hash}}{% if u.get('name') %} — {{u.get('name')}}{% endif %}
+                  </option>
+                {% endfor %}
+              </select>
+              <div class="text-xs muted" style="margin-top:6px;">
+                RBAC is enforced via the selected user hash.
+              </div>
+            </div>
+            <div>
+              <label class="text-sm muted">Page size</label>
+              <input id="pageSize" type="number" min="1" max="5000" value="100"/>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <label class="text-sm muted">SQL Query</label>
+            <textarea id="sql" rows="8">SELECT * FROM {{ sel_sup }} LIMIT 100</textarea>
+          </div>
+
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
+            <div id="status" class="text-sm muted">
+              <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button id="btnExec" class="btn-exec">
+                <i class="fas fa-play"></i>&nbsp;Execute
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Results -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section">
+          <div id="result"></div>
+          <div class="download-row">
+            <button class="btn-download" onclick="downloadCSV()">
+              <i class="fas fa-file-csv"></i>&nbsp;Download CSV
+            </button>
+          </div>
+        </div>
+      </div>
+      {% endif %}
     </div>
   </div>
 
-  <div class="card" style="margin-top:16px;">
-    <div class="section">
-      <div id="result"></div>
-      <div class="download-row"><button class="btn-download" onclick="downloadCSV()">Download CSV</button></div>
-    </div>
-  </div>
-  {% endif %}
-</div>
+  <!-- CodeMirror scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/edit/matchbrackets.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/sql-hint.min.js"></script>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/edit/matchbrackets.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/sql-hint.min.js"></script>
-<script src="https://kit.fontawesome.com/a2d9d5a64f.js" crossorigin="anonymous"></script>
+  <script>
+    // Initialize CodeMirror + hooks
+    window.__admintoken = "{{ token|e }}";
 
-<script>
-  window.__admintoken = "{{ token|e }}";
-
-  const editor = CodeMirror.fromTextArea(document.getElementById('sql'), {
-    mode: "text/x-sql",
-    theme: 'default',
-    lineNumbers: true,
-    matchBrackets: true,
-    lineWrapping: true,
-    extraKeys: {
-      "Ctrl-Enter": function(cm){ executeSQL(1); return false; },
-      "Cmd-Enter": function(cm){ executeSQL(1); return false; },
-      "Ctrl-Space": function(cm){ cm.showHint({completeSingle:false, hint: CodeMirror.hint.sql, tables: window.__hintTables || {}}); }
-    },
-    hintOptions: { completeSingle:false, tables: {} }
-  });
-
-  function setStatus(text, cls) {
-    const el = document.getElementById('status');
-    el.className = 'text-sm muted ' + (cls || '');
-    el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
-  }
-
-  function getTenant() {
-    const sel = document.getElementById('pairSel');
-    const [organization, superName] = (sel?.value || '|').split('|');
-    return { organization, superName };
-  }
-
-  async function loadSchema() {
-    const userHash = document.getElementById('userHash').value;
-    const { organization, superName } = getTenant();
-    if (!organization || !superName || !userHash) return;
-
-    try {
-      const data = await api('/admin/schema', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ organization, super_name: superName, user_hash: userHash })
-      });
-      if (data.status === 'ok') {
-        const hint = {};
-        (data.schema || []).forEach(obj => {
-          const t = Object.keys(obj)[0];
-          const cols = obj[t] || [];
-          hint[t] = { columns: cols };
-        });
-        window.__hintTables = hint;
-        editor.setOption('hintOptions', { completeSingle:false, tables: hint });
-      }
-    } catch (e) {
-      console.error('Schema load failed:', e);
-    }
-  }
-
-  async function executeSQL(page) {
-    const userHash = document.getElementById('userHash').value;
-    const pageSize = parseInt(document.getElementById('pageSize').value || '100', 10);
-    const query = editor.getValue().trim();
-    const { organization, superName } = getTenant();
-
-    if (!organization || !superName || !userHash) {
-      setStatus('Please select a tenant and a user hash.', 'error');
-      return;
-    }
-    if (!/^\s*(select|with)\b/i.test(query)) {
-      setStatus('Only SELECT/WITH queries are allowed.', 'error');
-      return;
-    }
-
-    setStatus('Executing...', 'executing');
-    try {
-      const data = await api('/admin/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ organization, super_name: superName, user_hash: userHash, query, page: page || 1, page_size: pageSize })
-      });
-      if (data.status === 'ok') {
-        renderTable(data.result || [], data.total_count || 0, page || 1, pageSize, (p)=>executeSQL(p));
-        setStatus(`Success — ${data.result?.length||0} rows (total ${data.total_count||0})`);
-      } else {
-        setStatus('Error executing query', 'error');
-        renderError(data.message || 'Unknown error');
-      }
-    } catch (e) {
-      setStatus('Error executing query', 'error');
-      renderError(e.message || String(e));
-    }
-  }
-
-  function renderError(msg) {
-    document.getElementById('result').innerHTML = `
-      <div style="border:1px solid #7f1d1d; background:#450a0a; color:#fecaca; border-radius:10px; padding:12px;">
-        <strong>Error:</strong> <pre style="white-space:pre-wrap">${(msg||'').toString()}</pre>
-      </div>`;
-  }
-
-  function renderTable(rows, total, page, pageSize, onPage) {
-    if (!rows || !rows.length) {
-      document.getElementById('result').innerHTML = '<div class="muted">No results</div>';
-      window.__curRows = []; window.__curHeaders = [];
-      return;
-    }
-    const headers = Object.keys(rows[0]);
-    let html = '<div style="overflow:auto; max-height:60vh;"><table><thead><tr><th>#</th>';
-    headers.forEach(h => { html += `<th>${h}</th>`; });
-    html += '</tr></thead><tbody>';
-
-    rows.forEach((r, i) => {
-      const absIdx = (page-1)*pageSize + i + 1;
-      html += `<tr><td class="text-xs muted">${absIdx}</td>`;
-      headers.forEach(h => {
-        let v = r[h];
-        if (v === null || v === undefined) v = '<span class="muted">NULL</span>';
-        else if (typeof v === 'object') v = JSON.stringify(v);
-        html += `<td>${v}</td>`;
-      });
-      html += '</tr>';
+    window.editor = CodeMirror.fromTextArea(document.getElementById('sql'), {
+      mode: "text/x-sql",
+      theme: 'default',
+      lineNumbers: true,
+      matchBrackets: true,
+      lineWrapping: true,
+      extraKeys: {
+        "Ctrl-Enter": function(cm){ executeSQL(1); return false; },
+        "Cmd-Enter": function(cm){ executeSQL(1); return false; },
+        "Ctrl-Space": function(cm){
+          cm.showHint({
+            completeSingle:false,
+            hint: CodeMirror.hint.sql,
+            tables: window.__hintTables || {}
+          });
+        }
+      },
+      hintOptions: { completeSingle:false, tables: {} }
     });
-    html += '</tbody></table></div>';
 
-    const pages = Math.max(1, Math.ceil(total / pageSize));
-    if (pages > 1) {
-      html += `<div style="display:flex; align-items:center; justify-content:space-between; margin-top:10px;">
-        <div class="text-xs muted">Page ${page} / ${pages} — showing ${rows.length} rows</div>
-        <div style="display:flex; gap:6px;">`;
-      const start = Math.max(1, page-2);
-      const end = Math.min(pages, page+2);
-      if (page > 1) html += `<button class="btn" onclick="(${onPage})(1)">«</button><button class="btn" onclick="(${onPage})(${page-1})">‹</button>`;
-      for (let p = start; p <= end; p++) {
-        html += `<button class="btn" style="${p===page?'opacity:.7;':''}" onclick="(${onPage})(${p})">${p}</button>`;
-      }
-      if (page < pages) html += `<button class="btn" onclick="(${onPage})(${page+1})">›</button><button class="btn" onclick="(${onPage})(${pages})">»</button>`;
-      html += `</div></div>`;
-    }
+    document.getElementById('btnExec')
+            .addEventListener('click', () => executeSQL(1));
 
-    document.getElementById('result').innerHTML = html;
-    window.__curRows = rows;
-    window.__curHeaders = headers;
-  }
-
-  function downloadCSV() {
-    const rows = window.__curRows || [];
-    const headers = window.__curHeaders || [];
-    if (!rows.length) { alert('No data to download'); return; }
-    const csv = [headers.join(',')].concat(
-      rows.map(r => headers.map(h => {
-        let v = r[h];
-        if (v === null || v === undefined) return 'NULL';
-        if (typeof v === 'object') v = JSON.stringify(v);
-        v = String(v).replace(/"/g, '""');
-        if (v.includes(',') || v.includes('"')) v = `"${v}"`;
-        return v;
-      }).join(','))
-    ).join('\n');
-    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob); const a = document.createElement('a');
-    a.href = url; a.download = `query_results_${new Date().toISOString().slice(0,10)}.csv`; a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  document.getElementById('btnExec').addEventListener('click', () => executeSQL(1));
-  // Load schema hints after initial render
-  loadSchema();
-</script>
+    // Load schema hints once UI is ready
+    loadSchema();
+  </script>
 </body>
 </html>

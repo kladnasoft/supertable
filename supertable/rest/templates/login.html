@@ -4,27 +4,349 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SuperTable Admin – Sign in</title>
+
+  <!-- Fonts & Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Inter; background:#0b1220; color:#e2e8f0; margin:0; }
-    .wrap { max-width: 460px; margin: 10vh auto; padding: 24px; background:#0f172a; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.3);}
-    input { width:100%; padding:10px 12px; border-radius:10px; border:1px solid #1d3b57; background:#0b2940; color:#e2e8f0;}
-    button { margin-top:10px; width:100%; padding:10px 12px; border-radius:10px; border:1px solid #1d3b57; background:#0b2940; color:#e2e8f0; cursor:pointer;}
-    .muted { color:#94a3b8; font-size:12px; margin-top:8px; }
-    .error { color:#ef4444; font-size:14px; margin-top:8px; padding:8px 12px; background:#450a0a; border:1px solid #7f1d1d; border-radius:8px; }
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --secondary-color: #147ba3;
+      --dark-color: #1a1a2e;
+      --light-color: #f8f9fa;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --panel-shadow: 0 18px 45px rgba(15, 23, 42, 0.18);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+      background:
+        radial-gradient(circle at 0% 0%, #e0f2fe 0, transparent 55%),
+        radial-gradient(circle at 100% 0%, #e9d5ff 0, transparent 55%),
+        radial-gradient(circle at 50% 100%, #fee2e2 0, transparent 55%),
+        #f3f6fb;
+      color: var(--text-color);
+      min-height: 100vh;
+    }
+
+    .page-wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .login-card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--panel-bg);
+      border-radius: 24px;
+      border: 1px solid var(--panel-border);
+      box-shadow: var(--panel-shadow);
+      padding: 24px 24px 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .login-card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at 0 0, rgba(59,130,246,.06), transparent 60%);
+      pointer-events: none;
+    }
+
+    .login-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .data-reflection-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 46px;
+      height: 46px;
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .data-cube {
+      width: 34px;
+      height: 34px;
+      background: var(--primary-color);
+      position: relative;
+      transform: rotate(0deg);
+      overflow: hidden;
+      transition: all 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
+      box-shadow: 0 4px 16px rgba(28, 150, 202, 0.45);
+      border-radius: 6px;
+    }
+
+    .data-cube:before {
+      content: '';
+      position: absolute;
+      width: 150%;
+      height: 40%;
+      background: linear-gradient(90deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,0.7) 50%,
+        rgba(255,255,255,0) 100%);
+      transform: translateX(-100%) rotate(45deg);
+      top: -10%;
+      left: -10%;
+      transition: transform 0.8s ease;
+    }
+
+    .reflection {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background: rgba(255,255,255,0.85);
+      border-radius: 3px;
+      bottom: 6px;
+      right: 6px;
+      transition: all 0.35s ease;
+      opacity: 0.8;
+    }
+
+    .data-grid {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      background:
+        linear-gradient(0deg, rgba(0,0,0,0.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,0,0,0.08) 1px, transparent 1px);
+      background-size: 7px 7px;
+      opacity: 0.65;
+    }
+
+    .login-card:hover .data-cube {
+      transform: rotate(90deg);
+      box-shadow: 0 6px 20px rgba(28, 150, 202, 0.55);
+    }
+
+    .login-card:hover .data-cube:before {
+      transform: translateX(100%) rotate(45deg);
+    }
+
+    .login-card:hover .reflection {
+      transform: scale(1.25) translate(-2px, -2px);
+      opacity: 1;
+    }
+
+    .logo-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .logo-main {
+      font-size: 18px;
+      font-weight: 700;
+      color: transparent;
+      background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+      -webkit-background-clip: text;
+      background-clip: text;
+      text-transform: uppercase;
+      letter-spacing: 1.4px;
+    }
+
+    .logo-sub {
+      font-size: 13px;
+      color: var(--text-light);
+    }
+
+    h2 {
+      margin: 0;
+      margin-top: 4px;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-color);
+    }
+
+    .subtitle {
+      margin: 4px 0 12px;
+      font-size: 13px;
+      color: var(--text-light);
+    }
+
+    form {
+      margin-top: 8px;
+      position: relative;
+      z-index: 1;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--text-light);
+      margin-bottom: 4px;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: var(--text-color);
+      font-size: 14px;
+      transition: box-shadow 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: var(--primary-color);
+      background: #ffffff;
+      box-shadow: 0 0 0 3px rgba(28,150,202,0.18);
+    }
+
+    button {
+      margin-top: 12px;
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: none;
+      background: linear-gradient(135deg, #38bdf8 0%, #1d9df2 40%, #0ea5e9 100%);
+      color: #0b1220;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 8px 22px rgba(37, 99, 235, 0.35);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: transform 0.1s ease, box-shadow 0.1s ease, filter 0.1s ease;
+    }
+
+    button:hover {
+      filter: brightness(1.05);
+    }
+
+    button:active {
+      transform: translateY(1px);
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+    }
+
+    .muted {
+      color: var(--text-light);
+      font-size: 12px;
+      margin-top: 10px;
+    }
+
+    .error {
+      color: #b91c1c;
+      font-size: 13px;
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 10px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .error-icon {
+      font-size: 16px;
+      line-height: 1;
+      margin-top: 1px;
+    }
+
+    .footer-hint {
+      margin-top: 16px;
+      padding-top: 10px;
+      border-top: 1px dashed #e2e8f0;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+
+    .footer-hint code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+      font-size: 11px;
+      background: #f8fafc;
+      padding: 1px 4px;
+      border-radius: 4px;
+      border: 1px solid #e2e8f0;
+    }
+
+    @media (max-width: 480px) {
+      .login-card {
+        padding: 20px 18px 18px;
+        border-radius: 20px;
+      }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h2 style="margin:0 0 12px;">SuperTable Admin</h2>
-    <form method="post" action="/admin/login">
-      <label for="token" class="muted">Enter ADMIN_TOKEN</label>
-      <input id="token" name="token" type="password" placeholder="••••••••" autofocus />
-      <button type="submit">Sign in</button>
-    </form>
-    {% if message %}
-      <div class="error">{{ message }}</div>
-    {% endif %}
-    <div class="muted">You must provide the correct ADMIN_TOKEN to view this page.</div>
+  <div class="page-wrap">
+    <div class="login-card">
+      <div class="login-header">
+        <span class="data-reflection-icon">
+          <span class="data-cube">
+            <span class="reflection"></span>
+            <span class="data-grid"></span>
+          </span>
+        </span>
+        <div class="logo-text">
+          <div class="logo-main">Data Reflection</div>
+          <div class="logo-sub">SuperTable Admin Console</div>
+        </div>
+      </div>
+
+      <h2>Sign in</h2>
+      <div class="subtitle">
+        Enter the <strong>ADMIN_TOKEN</strong> to access Redis Admin &amp; SQL tools.
+      </div>
+
+      <form method="post" action="/admin/login">
+        <label for="token">ADMIN_TOKEN</label>
+        <input
+          id="token"
+          name="token"
+          type="password"
+          placeholder="••••••••••••"
+          autofocus
+        />
+        <button type="submit">
+          <span>Sign in</span>
+        </button>
+      </form>
+
+      {% if message %}
+        <div class="error">
+          <span class="error-icon">⚠️</span>
+          <span>{{ message }}</span>
+        </div>
+      {% endif %}
+
+      <div class="muted">
+        Only users who know the configured <strong>ADMIN_TOKEN</strong> may access the admin UI.
+      </div>
+
+      <div class="footer-hint">
+        This token is typically configured via <code>ADMIN_TOKEN</code> in your
+        environment or <code>.env</code> file.
+      </div>
+    </div>
   </div>
 </body>
 </html>

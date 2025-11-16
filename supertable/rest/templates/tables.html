@@ -1,0 +1,766 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Tables</title>
+
+  <!-- Fonts & Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+  <!-- Bootstrap -->
+  <link rel="stylesheet"
+        href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+
+  <!-- DataTables -->
+  <link rel="stylesheet"
+        href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
+
+  <style>
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --secondary-color: #147ba3;
+      --dark-color: #1a1a2e;
+      --light-color: #f8f9fa;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+      --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+      background: #f3f6fb;
+      color: var(--text-color);
+    }
+
+    a {
+      color: var(--primary-color);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+
+    /* ------------ SIDEBAR (same pattern as admin/execute) ------------ */
+
+    .sidebar {
+      width: 280px;
+      height: 100vh;
+      position: fixed;
+      left: 0;
+      top: 0;
+      background: linear-gradient(180deg, #ffffff 0%, #f5faff 100%);
+      box-shadow: 4px 0 15px rgba(0, 0, 0, 0.05);
+      display: flex;
+      flex-direction: column;
+      z-index: 1100;
+      transition: var(--transition);
+      overflow: hidden;
+    }
+
+    .sidebar-collapsed { width: 80px; }
+
+    .sidebar-logo {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 20px 15px;
+      cursor: pointer;
+      background: white;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+      height: 80px;
+    }
+
+    .data-reflection-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .data-cube {
+      width: 30px;
+      height: 30px;
+      background: var(--primary-color);
+      position: relative;
+      overflow: hidden;
+      transition: var(--transition);
+      box-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
+    }
+
+    #toggleSidebar:hover .data-cube {
+      transform: rotate(90deg);
+      box-shadow: 0 4px 12px rgba(28, 150, 202, 0.5);
+    }
+
+    .data-cube:before {
+      content: '';
+      position: absolute;
+      width: 150%;
+      height: 40%;
+      background: linear-gradient(90deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,0.7) 50%,
+        rgba(255,255,255,0) 100%);
+      transform: translateX(-100%) rotate(45deg);
+      top: -10%;
+      left: -10%;
+      transition: transform 0.8s ease;
+    }
+
+    #toggleSidebar:hover .data-cube:before {
+      transform: translateX(100%) rotate(45deg);
+    }
+
+    .reflection {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: rgba(255,255,255,0.8);
+      border-radius: 2px;
+      bottom: 5px;
+      right: 5px;
+      transition: var(--transition);
+      opacity: 0.7;
+    }
+
+    #toggleSidebar:hover .reflection {
+      opacity: 1;
+      transform: scale(1.3) translate(-2px, -2px);
+    }
+
+    .data-grid {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      background:
+        linear-gradient(0deg, rgba(0,0,0,0.1) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px);
+      background-size: 7px 7px;
+      opacity: 0.6;
+    }
+
+    .logo-text {
+      font-size: 18px;
+      font-weight: 700;
+      color: transparent;
+      background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+      -webkit-background-clip: text;
+      background-clip: text;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      transition: var(--transition);
+      white-space: nowrap;
+      margin-left: 12px;
+    }
+
+    .sidebar-collapsed .logo-text { display: none; }
+
+    #toggleSidebar:hover .logo-text {
+      text-shadow: 0 2px 6px rgba(28, 150, 202, 0.4);
+    }
+
+    .sidebar-nav {
+      flex: 1;
+      overflow-y: auto;
+      padding: 15px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--primary-light) transparent;
+    }
+
+    .sidebar-nav::-webkit-scrollbar { width: 4px; }
+    .sidebar-nav::-webkit-scrollbar-thumb {
+      background-color: var(--primary-light);
+      border-radius: 4px;
+    }
+
+    .sidebar-link {
+      color: var(--text-color);
+      padding: 10px 12px;
+      border-radius: 8px;
+      transition: var(--transition);
+      font-weight: 500;
+      margin-bottom: 4px;
+      background: linear-gradient(to right, transparent 50%, var(--primary-light) 50%);
+      background-size: 200% 100%;
+      background-position: right bottom;
+      border-left: 3px solid transparent;
+      display: flex;
+      align-items: center;
+    }
+
+    .sidebar-link i {
+      margin-right: 10px;
+      width: 18px;
+      text-align: center;
+    }
+
+    .sidebar-collapsed .sidebar-link span { display: none; }
+    .sidebar-collapsed .sidebar-link i { margin-right: 0; }
+
+    .sidebar-link:hover {
+      background-position: left bottom;
+      border-left-color: var(--primary-color);
+      text-decoration: none;
+    }
+
+    .sidebar-link.active {
+      background: #e6f0ff;
+      border-left-color: var(--primary-color);
+      font-weight: 600;
+      color: var(--primary-color);
+    }
+
+    .profile-section {
+      padding: 12px 15px;
+      border-top: 1px solid rgba(0, 0, 0, 0.05);
+      background: white;
+      flex-shrink: 0;
+    }
+
+    .profile-section-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: var(--text-light);
+    }
+
+    .profile-section-inner strong { color: var(--text-color); }
+
+    /* ------------ MAIN CONTENT ------------ */
+
+    .content-container {
+      margin-left: 280px;
+      min-height: 100vh;
+      background-color: #f3f6fb;
+      transition: var(--transition);
+      padding-bottom: 40px;
+    }
+
+    .sidebar-collapsed ~ .content-container {
+      margin-left: 80px;
+    }
+
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .card {
+      background: var(--panel-bg);
+      border-radius: 16px;
+      box-shadow: var(--panel-shadow);
+      border: 1px solid var(--panel-border);
+    }
+
+    .section { padding: 16px 20px; }
+    .muted { color: var(--text-light); }
+    .text-xs { font-size: 11px; }
+    .text-sm { font-size: 12px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .header-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:12px;
+    }
+
+    .btn-ghost {
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid #d0d7e7;
+      background: transparent;
+      color: #475569;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .btn-ghost:hover { background: #e2e8f0; }
+
+    /* Tables page specifics */
+
+    .tables-header {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+    }
+
+    .tables-header h1 {
+      font-size: 22px;
+      margin: 0;
+    }
+
+    .badge-pill {
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      background: #e2e8f0;
+      color: #475569;
+    }
+
+    .summary-chip {
+      display:inline-flex;
+      align-items:center;
+      padding:4px 8px;
+      border-radius:999px;
+      background:#e5f6fd;
+      color:#0369a1;
+      font-size:11px;
+      margin-left:8px;
+    }
+
+    #tablesTable {
+      width: 100%;
+    }
+
+    #tablesTable thead {
+      background:#f1f5f9;
+    }
+
+    #tablesTable th {
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.04em;
+      color:#6b7280;
+      border-bottom:1px solid #e5e7eb !important;
+    }
+
+    #tablesTable td {
+      font-size:13px;
+      vertical-align:middle;
+    }
+
+    .table-name-cell {
+      font-weight:600;
+      color:#0f172a;
+      display:flex;
+      align-items:center;
+      gap:6px;
+    }
+
+    .table-name-cell i {
+      color:#1c96ca;
+      font-size:12px;
+    }
+
+    .tag-version {
+      font-size:11px;
+      border-radius:999px;
+      padding:2px 6px;
+      background:#eff6ff;
+      color:#1d4ed8;
+    }
+
+    .tag-new {
+      font-size:10px;
+      border-radius:999px;
+      padding:2px 6px;
+      background:#ecfdf3;
+      color:#16a34a;
+    }
+
+    .path-cell {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:11px;
+      color:#6b7280;
+      max-width:360px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .actions-cell .btn-sm {
+      font-size:11px;
+      border-radius:999px;
+      padding:3px 8px;
+    }
+
+    /* Modal */
+
+    #modal {
+      position:fixed;
+      inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      background:rgba(15,23,42,0.55);
+      z-index:1200;
+    }
+
+    #modal-card {
+      width: min(800px, 90vw);
+      max-height: 80vh;
+      background:white;
+      border-radius:16px;
+      box-shadow:0 20px 60px rgba(15,23,42,0.4);
+      display:flex;
+      flex-direction:column;
+    }
+
+    #m-header {
+      padding:12px 16px;
+      border-bottom:1px solid #e5e7eb;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+    }
+
+    #m-body {
+      padding:12px 16px;
+      overflow:auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      background:#0f172a;
+      color:#e5e7eb;
+      border-bottom-left-radius:16px;
+      border-bottom-right-radius:16px;
+      white-space:pre;
+    }
+  </style>
+
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js">
+  </script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+
+  <script>
+    // Shared admin API helper
+    function api(path, opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (window.__admintoken) opts.headers['X-Admin-Token'] = window.__admintoken;
+      return fetch(path, opts).then(async res => {
+        const ct = res.headers.get('content-type') || '';
+        const payload = ct.includes('application/json')
+          ? await res.json()
+          : await res.text();
+        if (!res.ok) {
+          const msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
+          throw new Error(msg);
+        }
+        return payload;
+      });
+    }
+
+    function onPairChange() {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = (sel.value || '|').split('|');
+      const url = new URL(window.location.href);
+      url.searchParams.set('org', org);
+      url.searchParams.set('sup', sup);
+      // reset page when tenant changes
+      url.searchParams.delete('page');
+      window.location.href = url.toString();
+    }
+
+    function goBackAdmin() {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = (sel.value || '|').split('|');
+      const url = new URL('/admin', window.location.origin);
+      if (org) url.searchParams.set('org', org);
+      if (sup) url.searchParams.set('sup', sup);
+      window.location.href = url.toString();
+    }
+
+    function gotoPage(p) {
+      const params = new URLSearchParams(window.location.search);
+      params.set('page', p);
+      window.location.search = params.toString();
+    }
+
+    function showModal(title, body) {
+      document.getElementById('m-title').textContent = title;
+      document.getElementById('m-body').textContent = body;
+      document.getElementById('modal').style.display = 'flex';
+    }
+
+    function closeModal() {
+      document.getElementById('modal').style.display = 'none';
+    }
+
+    async function viewLeaf(simple) {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      try {
+        const data = await api(`/api/leaf/${encodeURIComponent(simple)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+        showModal('Leaf: ' + simple, JSON.stringify(data, null, 2));
+      } catch (e) {
+        showModal('Leaf: ' + simple, 'Error loading leaf: ' + (e.message || e));
+      }
+    }
+
+    function goExecuteWithLeaf(simple) {
+      // convenience: jump to execute with tenant preselected
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const url = new URL('/admin/execute', window.location.origin);
+      if (org) url.searchParams.set('org', org);
+      if (sup) url.searchParams.set('sup', sup);
+      url.searchParams.set('leaf', simple);
+      window.location.href = url.toString();
+    }
+
+    $(document).ready(function(){
+      window.__admintoken = "{{ token|e }}";
+
+      $("#toggleSidebar").on("click", function() {
+        $("#sidebar").toggleClass("sidebar-collapsed");
+        localStorage.setItem('st_sidebar_collapsed',
+          $("#sidebar").hasClass("sidebar-collapsed"));
+      });
+
+      if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+        $("#sidebar").addClass("sidebar-collapsed");
+      }
+
+      // Highlight current nav item
+      $("#link-tables").addClass("active");
+
+      // DataTables for the tables grid
+      $('#tablesTable').DataTable({
+        pageLength: 25,
+        lengthMenu: [10, 25, 50, 100],
+        order: [[0, 'asc']],
+        dom: 'tip',  // just table + pagination + search
+        language: {
+          search: "",
+          searchPlaceholder: "Filter tables..."
+        }
+      });
+    });
+  </script>
+</head>
+<body>
+  <!-- SIDEBAR -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-logo" id="toggleSidebar">
+      <span class="data-reflection-icon">
+        <span class="data-cube">
+          <span class="reflection"></span>
+          <span class="data-grid"></span>
+        </span>
+      </span>
+      <span class="logo-text">Data Reflection</span>
+    </div>
+
+    <nav class="nav flex-column sidebar-nav">
+      <a href="/admin" class="sidebar-link" id="link-admin">
+        <i class="fas fa-database"></i>
+        <span>Redis Admin</span>
+      </a>
+      <a href="/admin/tables" class="sidebar-link" id="link-tables">
+        <i class="fas fa-table"></i>
+        <span>Tables</span>
+      </a>
+      <a href="/admin/execute" class="sidebar-link" id="link-execute">
+        <i class="fas fa-terminal"></i>
+        <span>Execute SQL</span>
+      </a>
+      <a href="/admin/config" class="sidebar-link" id="link-config">
+        <i class="fas fa-sliders-h"></i>
+        <span>Config</span>
+      </a>
+    </nav>
+
+    <div class="profile-section">
+      <div class="profile-section-inner">
+        <div>
+          <strong>SuperTable Admin</strong><br/>
+          <span class="text-xs">Token session</span>
+        </div>
+        <a href="/admin/logout" class="text-xs">
+          <i class="fas fa-sign-out-alt"></i> Logout
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <div class="content-container">
+    <div class="wrap">
+      <div class="tables-header">
+        <div>
+          <h1>
+            <i class="fas fa-table" style="color:#1c96ca;"></i>&nbsp;
+            Tables
+          </h1>
+          {% if has_tenant %}
+          <div class="text-xs muted">
+            {{ sel_org }} / {{ sel_sup }}
+            <span class="summary-chip">
+              <i class="fas fa-leaf"></i>&nbsp;{{ total }} leaves
+            </span>
+          </div>
+          {% else %}
+          <div class="text-xs muted">
+            Select a tenant to view tables.
+          </div>
+          {% endif %}
+        </div>
+        <div class="text-xs">
+          <a href="/admin/config">Config</a> ·
+          <a href="/admin/logout">Sign out</a>
+        </div>
+      </div>
+
+      <!-- Tenant selection -->
+      <div class="card" style="margin-top:12px;">
+        <div class="section">
+          <div class="grid">
+            <div>
+              <label class="text-sm muted">Tenant</label><br/>
+              <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
+                {% for t in tenants %}
+                  <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
+                    {{t.org}} / {{t.sup}}
+                  </option>
+                {% endfor %}
+              </select>
+              {% if has_tenant %}
+              <div class="text-xs muted" style="margin-top:6px;">
+                Selected: {{ sel_org }} / {{ sel_sup }}
+              </div>
+              {% else %}
+              <div class="text-xs muted" style="margin-top:6px;">
+                No tenant discovered in Redis.
+              </div>
+              {% endif %}
+            </div>
+            <div style="text-align:right;">
+              <button class="btn-ghost" onclick="goBackAdmin()">
+                <i class="fas fa-arrow-left"></i>&nbsp;Back to Redis Admin
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {% if has_tenant %}
+      <!-- Tables / Leaves grid -->
+      <div class="card" style="margin-top:16px;">
+        <div class="section">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="text-sm muted">
+              Leaves as tables · Total: {{ total }}
+              {% if pages and pages > 1 %}
+                <span class="badge-pill">Server page {{ page }} / {{ pages }}</span>
+              {% endif %}
+            </div>
+            <div class="text-xs muted">
+              Showing {{ items|length }} items from Redis
+            </div>
+          </div>
+
+          <div class="table-responsive">
+            <table id="tablesTable" class="display table table-sm">
+              <thead>
+                <tr>
+                  <th>Table</th>
+                  <th>Version</th>
+                  <th>Updated</th>
+                  <th>Path</th>
+                  <th style="width:130px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for it in items %}
+                <tr>
+                  <td>
+                    <div class="table-name-cell">
+                      <i class="fas fa-leaf"></i>
+                      <span>{{ it.simple }}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <span class="tag-version">v{{ it.version }}</span>
+                    {% if it.version == root_version %}
+                      <span class="tag-new">latest</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <span class="text-xs muted">
+                      {{ it.ts_iso|default:it.ts }}
+                    </span>
+                  </td>
+                  <td>
+                    <div class="path-cell" title="{{ it.path }}">
+                      {{ it.path }}
+                    </div>
+                  </td>
+                  <td class="actions-cell">
+                    <button class="btn btn-outline-secondary btn-sm"
+                            type="button"
+                            onclick="viewLeaf('{{ it.simple }}')">
+                      <i class="fas fa-eye"></i>&nbsp;View
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm mt-1"
+                            type="button"
+                            onclick="goExecuteWithLeaf('{{ it.simple }}')">
+                      <i class="fas fa-terminal"></i>
+                    </button>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Server-side pagination (optional if you keep page/page_size) -->
+          {% if pages and pages > 1 %}
+          <div class="mt-3 text-right">
+            {% for i in range(1, (pages or 1)+1) %}
+              <button class="btn-ghost"
+                      onclick="gotoPage({{i}})"
+                      {% if i == page %}style="opacity:.6"{% endif %}>
+                {{i}}
+              </button>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- JSON modal -->
+  <div id="modal">
+    <div id="modal-card">
+      <div id="m-header">
+        <div id="m-title" class="text-sm" style="font-weight:600;"></div>
+        <button class="btn-ghost btn-sm" onclick="closeModal()">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <pre id="m-body"></pre>
+    </div>
+  </div>
+</body>
+</html>
