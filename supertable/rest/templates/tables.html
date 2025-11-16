@@ -558,49 +558,7 @@
   </script>
 </head>
 <body>
-  <!-- SIDEBAR -->
-  <div class="sidebar" id="sidebar">
-    <div class="sidebar-logo" id="toggleSidebar">
-      <span class="data-reflection-icon">
-        <span class="data-cube">
-          <span class="reflection"></span>
-          <span class="data-grid"></span>
-        </span>
-      </span>
-      <span class="logo-text">Data Reflection</span>
-    </div>
-
-    <nav class="nav flex-column sidebar-nav">
-      <a href="/admin" class="sidebar-link" id="link-admin">
-        <i class="fas fa-database"></i>
-        <span>Redis Admin</span>
-      </a>
-      <a href="/admin/tables" class="sidebar-link" id="link-tables">
-        <i class="fas fa-table"></i>
-        <span>Tables</span>
-      </a>
-      <a href="/admin/execute" class="sidebar-link" id="link-execute">
-        <i class="fas fa-terminal"></i>
-        <span>Execute SQL</span>
-      </a>
-      <a href="/admin/config" class="sidebar-link" id="link-config">
-        <i class="fas fa-sliders-h"></i>
-        <span>Config</span>
-      </a>
-    </nav>
-
-    <div class="profile-section">
-      <div class="profile-section-inner">
-        <div>
-          <strong>SuperTable Admin</strong><br/>
-          <span class="text-xs">Token session</span>
-        </div>
-        <a href="/admin/logout" class="text-xs">
-          <i class="fas fa-sign-out-alt"></i> Logout
-        </a>
-      </div>
-    </div>
-  </div>
+  {% include "sidebar.html" %}
 
   <!-- MAIN CONTENT -->
   <div class="content-container">

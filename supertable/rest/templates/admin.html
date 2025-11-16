@@ -307,6 +307,24 @@
       gap: 12px;
     }
 
+    .top-row {
+      display: flex;
+      justify-content: flex-start;
+      gap: 12px;
+      margin-top: 16px;
+      flex-wrap: wrap;
+    }
+
+    /* change this if you already have it, or add if not */
+    .top-row .card {
+      flex: 1 1 280px;   /* Tenant + Mirrors are wider, flexible */
+    }
+
+    /* NEW: make Root card narrower */
+    .top-row .root-card {
+      flex: 0 0 250px;   /* smaller fixed-ish width for the middle card */
+    }
+
     .muted { color: var(--text-light); }
     .btn {
       padding: 8px 12px;
@@ -521,49 +539,7 @@
   </script>
 </head>
 <body>
-  <!-- SIDEBAR -->
-  <div class="sidebar" id="sidebar">
-    <div class="sidebar-logo" id="toggleSidebar">
-      <span class="data-reflection-icon">
-        <span class="data-cube">
-          <span class="reflection"></span>
-          <span class="data-grid"></span>
-        </span>
-      </span>
-      <span class="logo-text">Data Reflection</span>
-    </div>
-
-    <nav class="nav flex-column sidebar-nav">
-      <a href="/admin" class="sidebar-link" id="link-admin">
-        <i class="fas fa-database"></i>
-        <span>Redis Admin</span>
-      </a>
-      <a href="/admin/tables" class="sidebar-link" id="link-tables">
-        <i class="fas fa-table"></i>
-        <span>Tables</span>
-      </a>
-      <a href="/admin/execute" class="sidebar-link" id="link-execute">
-        <i class="fas fa-terminal"></i>
-        <span>Execute SQL</span>
-      </a>
-      <a href="/admin/config" class="sidebar-link" id="link-config">
-        <i class="fas fa-sliders-h"></i>
-        <span>Config</span>
-      </a>
-    </nav>
-
-    <div class="profile-section">
-      <div class="profile-section-inner">
-        <div>
-          <strong>SuperTable Admin</strong><br/>
-          <span class="text-xs">Token session</span>
-        </div>
-        <a href="/admin/logout" class="text-xs">
-          <i class="fas fa-sign-out-alt"></i> Logout
-        </a>
-      </div>
-    </div>
-  </div>
+  {% include "sidebar.html" %}
 
   <!-- MAIN CONTENT -->
   <div class="content-container">
@@ -582,34 +558,35 @@
         </div>
       </div>
 
-      <!-- Tenant card -->
-      <div class="card">
-        <div class="section">
-          <div class="grid">
-            <div>
-              <label class="muted text-sm">Tenant</label><br/>
-              <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
-                {% for t in tenants %}
-                  <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
-                    {{t.org}} / {{t.sup}}
-                  </option>
-                {% endfor %}
-              </select>
-              {% if has_tenant %}
-                <div class="muted text-xs mt-2">Showing: {{ sel_org }} / {{ sel_sup }}</div>
-              {% else %}
-                <div class="muted text-xs mt-2">No tenant discovered in Redis.</div>
-              {% endif %}
+      <!-- Tenant + Root / Mirrors / Tables in a single row -->
+      <div class="top-row">
+        <!-- Tenant card -->
+        <div class="card">
+          <div class="section">
+            <div class="grid">
+              <div>
+                <label class="muted text-sm">Tenant</label><br/>
+                <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
+                  {% for t in tenants %}
+                    <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
+                      {{t.org}} / {{t.sup}}
+                    </option>
+                  {% endfor %}
+                </select>
+                {% if has_tenant %}
+                  <div class="muted text-xs mt-2">Showing: {{ sel_org }} / {{ sel_sup }}</div>
+                {% else %}
+                  <div class="muted text-xs mt-2">No tenant discovered in Redis.</div>
+                {% endif %}
+              </div>
+              <div class="right"></div>
             </div>
-            <div class="right"></div>
           </div>
         </div>
-      </div>
 
-      {% if has_tenant %}
-      <!-- Root / Mirrors / Tables link -->
-      <div class="grid-3 mt-4">
-        <div class="card">
+        {% if has_tenant %}
+        <!-- Root card -->
+        <div class="card root-card">
           <div class="section">
             <div class="muted text-sm">Root</div>
             <div class="mt-2">
@@ -622,6 +599,7 @@
           </div>
         </div>
 
+        <!-- Mirrors card -->
         <div class="card">
           <div class="section">
             <div class="muted text-sm">Mirrors</div>
@@ -637,23 +615,7 @@
             </div>
           </div>
         </div>
-
-        <div class="card">
-          <div class="section">
-            <div class="muted text-sm">Tables</div>
-            <div class="mt-2">
-              <div class="muted text-xs">
-                Browse all leaves as logical tables with filtering and actions.
-              </div>
-              <div class="mt-2 right">
-                <a class="btn-ghost"
-                   href="/admin/tables{% if has_tenant %}?org={{ sel_org }}&sup={{ sel_sup }}{% endif %}">
-                  <i class="fas fa-table"></i>&nbsp;Open Tables
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
+        {% endif %}
       </div>
 
       <!-- Users / Roles tabs (non-table stuff) -->
@@ -750,9 +712,8 @@
         </div>
       </div>
 
-      {% endif %}
-    </div>
-    {% endif %}
+    </div>  {# closes .wrap #}
+    {% endif %}  {# closes {% if not authorized %} #}
   </div>
 </body>
 </html>
