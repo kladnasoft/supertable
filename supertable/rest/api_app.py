@@ -1,7 +1,8 @@
-
 from __future__ import annotations
 
+import logging
 from typing import Optional, Any, Dict, Tuple
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -26,6 +27,7 @@ except Exception:
 
 
 router = APIRouter(prefix="", tags=["API"])
+logger = logging.getLogger(__name__)
 
 
 class ExecuteRequest(BaseModel):
@@ -109,8 +111,16 @@ def api_execute_sql(
                 except Exception:
                     rows_preview = []
 
-        shape = getattr(df, "shape", (len(rows_preview), len(rows_preview[0]) if rows_preview else 0))
-        columns = list(getattr(df, "columns", [])) if hasattr(df, "columns") else []
+        shape = getattr(
+            df,
+            "shape",
+            (len(rows_preview), len(rows_preview[0]) if rows_preview else 0),
+        )
+        columns = (
+            list(getattr(df, "columns", []))
+            if hasattr(df, "columns")
+            else []
+        )
 
         return {
             "ok": True,
@@ -124,7 +134,11 @@ def api_execute_sql(
                 "result_1": meta1,
                 "result_2": meta2,
                 "timings": getattr(getattr(dr, "timer", None), "timings", None),
-                "plan_stats": getattr(getattr(dr, "plan_stats", None), "stats", None),
+                "plan_stats": getattr(
+                    getattr(dr, "plan_stats", None),
+                    "stats",
+                    None,
+                ),
             },
         }
     except HTTPException:
@@ -135,13 +149,18 @@ def api_execute_sql(
 
 # ---------- META ENDPOINTS ----------
 
+
 @router.get("/meta/supers")
 def api_list_supers(
     organization: str = Query(..., description="Organization identifier"),
     _: Any = Depends(admin_guard_api),
 ):
     try:
-        return {"ok": True, "organization": organization, "supers": list_supers(organization=organization)}
+        return {
+            "ok": True,
+            "organization": organization,
+            "supers": list_supers(organization=organization),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
@@ -157,7 +176,10 @@ def api_list_tables(
             "ok": True,
             "organization": organization,
             "super_name": super_name,
-            "tables": list_tables(organization=organization, super_name=super_name),
+            "tables": list_tables(
+                organization=organization,
+                super_name=super_name,
+            ),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"List tables failed: {e}")
@@ -188,7 +210,9 @@ def api_get_table_schema(
     """Correct usage: pass the table (simple) name — NOT the super_name."""
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
-        return {"ok": True, "schema": mr.get_table_schema(table, user_hash)}
+        schema = mr.get_table_schema(table, user_hash)
+        logger.info(f"table.schema.result: {schema}")
+        return {"ok": True, "schema": schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
@@ -204,9 +228,83 @@ def api_get_table_stats(
     """Correct usage: pass the table (simple) name — NOT the super_name."""
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
-        return {"ok": True, "stats": mr.get_table_stats(table, user_hash)}
+        stats = mr.get_table_stats(table, user_hash)
+        logger.info(f"table.stats.result: {stats}")
+        return {"ok": True, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
+
+
+# ---------- LEAF ENDPOINT WITH MODE HANDLING ----------
+
+
+@router.get("/leaf/{simple_name}")
+def api_leaf(
+    simple_name: str,
+    organization: str = Query(..., alias="org"),
+    super_name: str = Query(..., alias="sup"),
+    mode: str = Query("meta"),
+    user_hash: Optional[str] = Query(
+        None,
+        description="User hash; optional, defaults to 'ui' if not provided",
+    ),
+    _: Any = Depends(admin_guard_api),
+):
+    """
+    Leaf endpoint with mode-based behavior.
+
+      - mode=schema -> MetaReader.get_table_schema(simple_name, user_hash)
+                       returns the *schema*, e.g.
+                       [{'client': 'String', ...}, ...]
+
+      - mode=stats  -> MetaReader.get_table_stats(simple_name, user_hash)
+
+      - otherwise   -> minimal/meta placeholder
+    """
+    try:
+        mr = MetaReader(organization=organization, super_name=super_name)
+        effective_user_hash = user_hash
+
+        # --- SCHEMA MODE ---
+        if mode.lower() == "schema":
+            result = mr.get_table_schema(simple_name, effective_user_hash)
+            logger.info(f"simple_name.schema.result: {result}")
+            return {
+                "ok": True,
+                "mode": "schema",
+                "org": organization,
+                "sup": super_name,
+                "simple": simple_name,
+                # expected shape: [{'client': 'String', ...}, ...]
+                "schema": result,
+            }
+
+        # --- STATS MODE ---
+        if mode.lower() == "stats":
+            result = mr.get_table_stats(simple_name, effective_user_hash)
+            logger.info(f"simple_name.stats.result: {result}")
+            return {
+                "ok": True,
+                "mode": "stats",
+                "org": organization,
+                "sup": super_name,
+                "simple": simple_name,
+                "stats": result,
+            }
+
+        # Fallback for other modes
+        return {
+            "ok": True,
+            "mode": mode,
+            "org": organization,
+            "sup": super_name,
+            "simple": simple_name,
+            "message": "Use mode=schema or mode=stats for detailed info.",
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Leaf handler failed: {e}")
+
 
 
 # Health check
