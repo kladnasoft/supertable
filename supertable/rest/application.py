@@ -18,7 +18,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
-    port = int(os.getenv("SUPERTABLE_PORT", "8000"))
+    port = int(os.getenv("SUPERTABLE_PORT", "8080"))
     reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
 
     uvicorn.run(app, host=host, port=port, reload=reload_flag)

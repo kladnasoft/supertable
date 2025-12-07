@@ -1,4 +1,3 @@
-# supertable/redis_catalog.py
 from __future__ import annotations
 
 import os
@@ -11,6 +10,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 import redis
+from redis.sentinel import Sentinel
 from supertable.config.defaults import logger
 
 load_dotenv()
@@ -64,11 +64,16 @@ class RedisOptions:
     Reads Redis connection options from environment variables.
 
     Supported:
-      - REDIS_URL (e.g. redis://:pass@host:6379/0 or rediss://:pass@host:6380/1)
-      - or split vars: REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
+      - SUPERTABLE_REDIS_URL (e.g. redis://:pass@host:6379/0 or rediss://:pass@host:6380/1)
+      - or split vars: SUPERTABLE_REDIS_HOST, SUPERTABLE_REDIS_PORT, SUPERTABLE_REDIS_DB, SUPERTABLE_REDIS_PASSWORD
 
     Optional:
-      - REDIS_DECODE_RESPONSES (default: "true")
+      - SUPERTABLE_REDIS_DECODE_RESPONSES (default: "true")
+
+    Sentinel (optional):
+      - SUPERTABLE_REDIS_SENTINEL (true/false)
+      - SUPERTABLE_REDIS_SENTINELS="host1:26379,host2:26379"
+      - SUPERTABLE_REDIS_SENTINEL_MASTER="mymaster"
     """
     host: str = field(init=False)
     port: int = field(init=False)
@@ -76,6 +81,11 @@ class RedisOptions:
     password: Optional[str] = field(init=False)
     use_ssl: bool = field(init=False)
     decode_responses: bool = field(default=True)
+
+    # Sentinel-related
+    is_sentinel: bool = field(init=False)
+    sentinel_hosts: List[tuple] = field(init=False)
+    sentinel_master: str = field(init=False)
 
     def __post_init__(self):
         url = os.getenv("SUPERTABLE_REDIS_URL")
@@ -94,7 +104,36 @@ class RedisOptions:
             password = os.getenv("SUPERTABLE_REDIS_PASSWORD")
             use_ssl = False
 
-        decode = os.getenv("SUPERTABLE_REDIS_DECODE_RESPONSES", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+        decode = os.getenv("SUPERTABLE_REDIS_DECODE_RESPONSES", "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+
+        # Sentinel mode configuration
+        is_sentinel = os.getenv("SUPERTABLE_REDIS_SENTINEL", "false").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        sentinel_raw = os.getenv("SUPERTABLE_REDIS_SENTINELS", "").strip()
+        sentinels: List[tuple] = []
+        if sentinel_raw:
+            for part in sentinel_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    h, p = part.split(":")
+                    sentinels.append((h.strip(), int(p)))
+                except ValueError:
+                    logger.warning(f"[redis-options] Invalid sentinel spec: {part}")
+
+        sentinel_master = os.getenv("SUPERTABLE_REDIS_SENTINEL_MASTER", "mymaster")
 
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
@@ -102,6 +141,10 @@ class RedisOptions:
         object.__setattr__(self, "password", password)
         object.__setattr__(self, "use_ssl", use_ssl)
         object.__setattr__(self, "decode_responses", decode)
+
+        object.__setattr__(self, "is_sentinel", is_sentinel)
+        object.__setattr__(self, "sentinel_hosts", sentinels)
+        object.__setattr__(self, "sentinel_master", sentinel_master)
 
 
 class RedisCatalog:
@@ -177,14 +220,42 @@ return 0
 
     def __init__(self, options: Optional[RedisOptions] = None):
         opts = options or RedisOptions()
-        self.r = redis.Redis(
-            host=opts.host,
-            port=opts.port,
-            db=opts.db,
-            password=opts.password,
-            decode_responses=opts.decode_responses,
-            ssl=opts.use_ssl,
-        )
+
+        # Decide between standard Redis and Sentinel-based Redis
+        if opts.is_sentinel and opts.sentinel_hosts:
+            logger.info(
+                f"[redis-catalog] Using Redis Sentinel mode. master={opts.sentinel_master}, "
+                f"sentinels={opts.sentinel_hosts}"
+            )
+            sentinel = Sentinel(
+                opts.sentinel_hosts,
+                socket_timeout=0.5,
+                password=opts.password,
+                decode_responses=opts.decode_responses,
+            )
+            self.r = sentinel.master_for(
+                opts.sentinel_master,
+                db=opts.db,
+                password=opts.password,
+                decode_responses=opts.decode_responses,
+            )
+        else:
+            if opts.is_sentinel and not opts.sentinel_hosts:
+                logger.warning(
+                    "[redis-catalog] SUPERTABLE_REDIS_SENTINEL=true but no "
+                    "SUPERTABLE_REDIS_SENTINELS set. Falling back to standard Redis."
+                )
+            logger.info(
+                f"[redis-catalog] Using standard Redis mode. host={opts.host}, port={opts.port}, db={opts.db}"
+            )
+            self.r = redis.Redis(
+                host=opts.host,
+                port=opts.port,
+                db=opts.db,
+                password=opts.password,
+                decode_responses=opts.decode_responses,
+                ssl=opts.use_ssl,
+            )
 
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
