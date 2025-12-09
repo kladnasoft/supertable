@@ -7,8 +7,8 @@ from fastapi import FastAPI
 app = FastAPI(title="SuperTable App", version="1.0.0")
 
 # include the two modules' routers (no circular imports)
-from supertable.rest.admin_app import router as admin_router  # noqa: E402
-from supertable.rest.api_app import router as api_router      # noqa: E402
+from supertable.reflection.admin_app import router as admin_router  # noqa: E402
+from supertable.reflection.api_app import router as api_router      # noqa: E402
 
 app.include_router(admin_router)
 app.include_router(api_router)

@@ -42,11 +42,11 @@ class Settings:
 
         self.DOTENV_PATH: str = os.getenv("DOTENV_PATH", ".env")
 
-        # IMPORTANT: keep templates in the original folder (parent of /rest)
+        # IMPORTANT: keep templates in the original folder (parent of /reflection)
         # This preserves behavior from before the move of this file.
         self.TEMPLATES_DIR: str = os.getenv(
             "TEMPLATES_DIR",
-            str(Path(__file__).resolve().parent.parent / "rest/templates")
+            str(Path(__file__).resolve().parent.parent / "reflection/templates")
         )
 
         # set to 1 in HTTPS environments
@@ -741,8 +741,8 @@ def admin_config(request: Request):
 
     # ---- restore original project-root search order ----
     here = Path(__file__).resolve()
-    rest_dir = here.parent
-    pkg_dir = rest_dir.parent                  # .../supertable
+    reflection_dir = here.parent
+    pkg_dir = reflection_dir.parent                  # .../supertable
     repo_root = pkg_dir.parent                 # .../dev/supertable   (project root)
 
     dotenv_paths = [
@@ -750,7 +750,7 @@ def admin_config(request: Request):
         ".env",                                # relative to CWD
         str(repo_root / ".env"),               # project root
         str(pkg_dir / ".env"),                 # package dir
-        str(rest_dir / ".env"),                # rest dir
+        str(reflection_dir / ".env"),          # reflection dir
         str(Path.cwd() / ".env"),              # CWD absolute
         str(Path.home() / ".env"),             # $HOME
     ]

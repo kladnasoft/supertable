@@ -563,14 +563,13 @@
     <div class="wrap">
       <div class="header-row">
         <div>
-          <h1 style="font-size:22px; margin:0;">SuperTable – Execute SQL</h1>
+            <h4>
+            <i class="fas fa-terminal" style="color:#1c96ca;"></i>&nbsp;
+            Execute SQL
+            </h4>
           <div class="text-xs muted">
             Interactive SQL runner with RBAC enforced by selected user hash.
           </div>
-        </div>
-        <div class="text-xs">
-          <a href="/admin/config">Config</a> ·
-          <a href="/admin/logout">Sign out</a>
         </div>
       </div>
 
@@ -596,11 +595,6 @@
                   No tenant discovered in Redis.
                 </div>
               {% endif %}
-            </div>
-            <div style="text-align:right;">
-              <button class="btn-ghost" onclick="goBackAdmin()">
-                <i class="fas fa-arrow-left"></i>&nbsp;Back to Redis Admin
-              </button>
             </div>
           </div>
         </div>

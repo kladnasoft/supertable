@@ -223,7 +223,7 @@ return 0
 
         # Decide between standard Redis and Sentinel-based Redis
         if opts.is_sentinel and opts.sentinel_hosts:
-            logger.info(
+            logger.debug(
                 f"[redis-catalog] Using Redis Sentinel mode. master={opts.sentinel_master}, "
                 f"sentinels={opts.sentinel_hosts}"
             )
