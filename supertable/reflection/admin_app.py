@@ -1033,12 +1033,12 @@ def _sanitize_for_json(obj: Any) -> Any:
     # Fallback to string representation
     return str(obj)
 
-
 @router.get("/admin/execute", response_class=HTMLResponse)
 def admin_execute_page(
     request: Request,
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
+    leaf: Optional[str] = Query(None),  # <-- NEW
 ):
     if not _is_authorized(request):
         resp = RedirectResponse("/admin/login", status_code=302)
@@ -1061,11 +1061,13 @@ def admin_execute_page(
         "sel_org": sel_org,
         "sel_sup": sel_sup,
         "has_tenant": bool(sel_org and sel_sup),
-        "users": users,  # used for user selection (hash) at execution time
+        "users": users,         # used for user selection (hash) at execution time
+        "initial_leaf": leaf,   # <-- pass through to execute.html if you want
     }
     resp = templates.TemplateResponse("execute.html", ctx)
     _no_store(resp)
     return resp
+
 
 
 class ExecutePayload(Dict[str, Any]):

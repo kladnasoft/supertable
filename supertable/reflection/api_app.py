@@ -59,7 +59,7 @@ def _engine_from_str(s: Optional[str]) -> Any:
     return getattr(engine, mapped, getattr(engine, "DUCKDB", s))
 
 
-@router.post("/execute")
+@router.post("/api/execute")
 def api_execute_sql(
     payload: ExecuteRequest = Body(...),
     _: Any = Depends(admin_guard_api),
@@ -211,7 +211,7 @@ def api_get_table_schema(
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
         schema = mr.get_table_schema(table, user_hash)
-        logger.info(f"table.schema.result: {schema}")
+        logger.debug(f"table.schema.result: {schema}")
         return {"ok": True, "schema": schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
@@ -229,7 +229,7 @@ def api_get_table_stats(
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
         stats = mr.get_table_stats(table, user_hash)
-        logger.info(f"table.stats.result: {stats}")
+        logger.debug(f"table.stats.result: {stats}")
         return {"ok": True, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
@@ -268,7 +268,7 @@ def api_leaf(
         # --- SCHEMA MODE ---
         if mode.lower() == "schema":
             result = mr.get_table_schema(simple_name, effective_user_hash)
-            logger.info(f"simple_name.schema.result: {result}")
+            logger.debug(f"simple_name.schema.result: {result}")
             return {
                 "ok": True,
                 "mode": "schema",

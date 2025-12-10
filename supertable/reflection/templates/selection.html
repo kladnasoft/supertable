@@ -1,0 +1,48 @@
+<!-- SuperTables selection + summary (reusable) -->
+<div class="card" style="margin-top:12px;">
+  <div class="section">
+    <div class="grid">
+      <!-- LEFT: SuperTables selector -->
+      <div>
+        <label class="text-sm muted">SuperTables</label><br/>
+        <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
+          <!-- Filled dynamically from /meta/supers -->
+        </select>
+        <div class="text-xs muted" style="margin-top:6px;">
+          Select a SuperTable to view its tables.
+        </div>
+      </div>
+
+      <!-- RIGHT: summary cards -->
+      <div>
+        <div class="tenant-summary-grid">
+          <div class="metric-card">
+            <div class="metric-icon"><i class="fas fa-file"></i></div>
+            <div class="metric-content">
+              <div class="metric-label">Files</div>
+              <div class="metric-value" id="tenantFilesValue">n/a</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-icon"><i class="fas fa-bars"></i></div>
+            <div class="metric-content">
+              <div class="metric-label">Rows</div>
+              <div class="metric-value" id="tenantRowsValue">n/a</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-icon"><i class="fas fa-database"></i></div>
+            <div class="metric-content">
+              <div class="metric-label">Byte Size</div>
+              <div class="metric-value" id="tenantSizeValue">n/a</div>
+            </div>
+          </div>
+        </div>
+        <div class="tenant-updated">
+          Last updated: <span id="tenantUpdatedValue">n/a</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>

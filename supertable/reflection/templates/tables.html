@@ -12,15 +12,13 @@
   <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
         integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
-        crossorigin="anonymous" referrerpolicy="no-referrer" />
+        crossorigin="anonymous" referrerpolicy="no-referrer"/>
 
   <!-- Bootstrap -->
-  <link rel="stylesheet"
-        href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
 
   <!-- DataTables -->
-  <link rel="stylesheet"
-        href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
 
   <style>
     :root {
@@ -32,13 +30,14 @@
       --text-color: #2b2d42;
       --text-light: #8d99ae;
       --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
       --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
     }
 
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+    }
 
     html, body {
       margin: 0;
@@ -52,10 +51,12 @@
       color: var(--primary-color);
       text-decoration: none;
     }
-    a:hover { text-decoration: underline; }
+
+    a:hover {
+      text-decoration: underline;
+    }
 
     /* ------------ MAIN CONTENT ------------ */
-
     .content-container {
       margin-left: 280px;
       min-height: 100vh;
@@ -81,23 +82,35 @@
       border: 1px solid var(--panel-border);
     }
 
-    .section { padding: 16px 20px; }
-    .muted { color: var(--text-light); }
-    .text-xs { font-size: 11px; }
-    .text-sm { font-size: 12px; }
+    .section {
+      padding: 16px 20px;
+    }
+
+    .muted {
+      color: var(--text-light);
+    }
+
+    .text-xs {
+      font-size: 11px;
+    }
+
+    .text-sm {
+      font-size: 12px;
+    }
 
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 12px;
+      align-items: center;
     }
 
     .header-row {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      margin-bottom:12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
     }
 
     .btn-ghost {
@@ -110,39 +123,28 @@
       font-size: 12px;
     }
 
-    .btn-ghost:hover { background: #e2e8f0; }
-
-    /* Tables page specifics */
-
-    .tables-header {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
+    .btn-ghost:hover {
+      background: #e2e8f0;
     }
 
-    .tables-header h1 {
+    /* Tables page specifics */
+    .tables-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .tables-header h4 {
       font-size: 22px;
       margin: 0;
     }
 
-    .badge-pill {
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 11px;
-      background: #e2e8f0;
-      color: #475569;
-    }
-
-    .summary-chip {
-      display:inline-flex;
-      align-items:center;
-      padding:4px 8px;
-      border-radius:999px;
-      background:#e5f6fd;
-      color:#0369a1;
-      font-size:11px;
-      margin-left:8px;
+    .total-count {
+      font-weight: 700;
+      color: #111827;
+      font-size: 14px;
+      margin-left: 4px;
     }
 
     #tablesTable {
@@ -150,127 +152,496 @@
     }
 
     #tablesTable thead {
-      background:#f1f5f9;
+      background: #f1f5f9;
     }
 
     #tablesTable th {
-      font-size:11px;
-      text-transform:uppercase;
-      letter-spacing:.04em;
-      color:#6b7280;
-      border-bottom:1px solid #e5e7eb !important;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: #6b7280;
+      border-bottom: 1px solid #e5e7eb !important;
     }
 
     #tablesTable td {
-      font-size:13px;
-      vertical-align:middle;
+      font-size: 13px;
+      vertical-align: middle;
     }
 
     .table-name-cell {
-      font-weight:600;
-      color:#0f172a;
-      display:flex;
-      align-items:center;
-      gap:6px;
+      font-weight: 600;
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .table-name-cell i {
-      color:#1c96ca;
-      font-size:12px;
-    }
-
-    .tag-version {
-      font-size:11px;
-      border-radius:999px;
-      padding:2px 6px;
-      background:#eff6ff;
-      color:#1d4ed8;
-    }
-
-    .tag-new {
-      font-size:10px;
-      border-radius:999px;
-      padding:2px 6px;
-      background:#ecfdf3;
-      color:#16a34a;
-    }
-
-    .path-cell {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size:11px;
-      color:#6b7280;
-      max-width:360px;
-      white-space:nowrap;
-      overflow:hidden;
-      text-overflow:ellipsis;
+      color: #1c96ca;
+      font-size: 12px;
     }
 
     .actions-cell .btn-sm {
-      font-size:11px;
-      border-radius:999px;
-      padding:3px 8px;
+      font-size: 11px;
+      border-radius: 999px;
+      padding: 3px 8px;
     }
 
-    /* Modal */
-
+    /* JSON Modal */
     #modal {
-      position:fixed;
-      inset:0;
-      display:none;
-      align-items:center;
-      justify-content:center;
-      background:rgba(15,23,42,0.55);
-      z-index:1200;
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.55);
+      z-index: 1200;
     }
 
     #modal-card {
       width: min(800px, 90vw);
       max-height: 80vh;
-      background:white;
-      border-radius:16px;
-      box-shadow:0 20px 60px rgba(15,23,42,0.4);
-      display:flex;
-      flex-direction:column;
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 20px 60px rgba(15, 23, 42, 0.4);
+      display: flex;
+      flex-direction: column;
     }
 
     #m-header {
-      padding:12px 16px;
-      border-bottom:1px solid #e5e7eb;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
 
     #m-body {
-      padding:12px 16px;
-      overflow:auto;
+      padding: 12px 16px;
+      overflow: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size:12px;
-      background:#0f172a;
-      color:#e5e7eb;
-      border-bottom-left-radius:16px;
-      border-bottom-right-radius:16px;
-      white-space:pre;
+      font-size: 12px;
+      background: #0f172a;
+      color: #e5e7eb;
+      border-bottom-left-radius: 16px;
+      border-bottom-right-radius: 16px;
+      white-space: pre;
     }
+
+    /* ---------- SHARED METRIC CARDS ---------- */
+
+    .metric-card {
+      display: flex;
+      align-items: center;
+      padding: 10px 10px;
+      border-radius: 12px;
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      min-height: 60px;
+    }
+
+    .metric-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-right: 10px;
+      background: #e0f2fe;
+      color: #0369a1;
+      flex-shrink: 0;
+      font-size: 14px;
+    }
+
+    .metric-content {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .metric-label {
+      font-size: 11px;
+      color: #6b7280;
+    }
+
+    .metric-value {
+      font-size: 14px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+
+    .tenant-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .tenant-updated {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #6b7280;
+      text-align: right;
+    }
+
+    .btn-xs {
+      padding: 3px 7px;
+      font-size: 11px;
+      border-radius: 999px;
+      border: 1px solid #d0d7e7;
+      background: #f9fafb;
+      cursor: pointer;
+    }
+
+    .btn-xs:hover {
+      background: #e5f3ff;
+    }
+
+    .icon-button {
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 999px;
+      color: #6b7280;
+    }
+
+    .icon-button:hover {
+      background: #e5e7eb;
+      color: #111827;
+    }
+
+    .table-row-highlight {
+      background: #e0f2fe !important;
+      transition: background 0.2s ease;
+    }
+
+    /* ---------- OVERVIEW CONTENT (inside overlay) ---------- */
+
+    .overview-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .overview-title {
+      font-weight: 600;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .overview-subtitle {
+      font-size: 11px;
+      color: #6b7280;
+    }
+
+    .overview-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 10px 0 0 0;
+    }
+
+    @media (max-width: 768px) {
+      .overview-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* ---------- GENERIC CENTERED OVERLAYS (OVERVIEW + SCHEMA + STATS) ---------- */
+
+    .inline-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.55);
+      z-index: 1400;
+    }
+
+    .inline-card {
+      width: min(900px, 94vw);
+      max-height: 84vh;
+      background: #ffffff;
+      border-radius: 16px;
+      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.4);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--panel-border);
+      overflow: hidden;
+    }
+
+    .inline-card-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .inline-card-title {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .inline-card-title-main {
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .inline-card-title-sub {
+      font-size: 11px;
+      color: #6b7280;
+    }
+
+    .inline-card-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .inline-card-body {
+      padding: 12px 16px;
+      overflow: auto;
+      background: #f9fafb;
+      font-size: 12px;
+    }
+
+    .schema-peek {
+      margin-top: 4px;
+      padding-top: 4px;
+    }
+
+    .schema-peek-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #4b5563;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .schema-peek-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+      background: #ffffff;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .schema-peek-table th,
+    .schema-peek-table td {
+      padding: 4px 6px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .schema-peek-table th {
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      font-size: 10px;
+      background: #f1f5f9;
+    }
+
+    .schema-peek-more {
+      font-size: 10px;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+
+    /* Schema search + type pills */
+    .schema-search-wrapper {
+      margin: 8px 0 6px 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .schema-search-input {
+      flex: 1;
+      font-size: 11px;
+      border-radius: 999px;
+      border: 1px solid #d0d7e7;
+      padding: 4px 10px;
+      outline: none;
+    }
+
+    .schema-search-input:focus {
+      border-color: var(--primary-color);
+      box-shadow: 0 0 0 1px rgba(28, 150, 202, 0.2);
+    }
+
+    .schema-type-pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 6px;
+      font-size: 10px;
+      font-weight: 500;
+    }
+
+    .schema-type-string {
+      background: #eff6ff;
+      color: #1d4ed8;
+    }
+
+    .schema-type-number {
+      background: #ecfdf3;
+      color: #16a34a;
+    }
+
+    .schema-type-date {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .schema-type-bool {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+
+    .schema-type-other {
+      background: #e5e7eb;
+      color: #374151;
+    }
+
+    /* ---------- STATS OVERLAY EXTRA ---------- */
+
+    .stats-card {
+      /* base size; fullscreen via .overlay-fullscreen */
+    }
+
+    .overlay-fullscreen {
+      width: 96vw !important;
+      height: 94vh !important;
+      max-height: 94vh !important;
+    }
+
+    .stats-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .stats-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+      gap: 12px;
+    }
+
+    .stats-panel {
+      background: #ffffff;
+      border-radius: 12px;
+      border: 1px solid #e5e7eb;
+      padding: 10px 10px;
+    }
+
+    .stats-panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #4b5563;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .stats-colstats-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+
+    .stats-colstats-table th,
+    .stats-colstats-table td {
+      padding: 4px 6px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .stats-colstats-table th {
+      background: #f1f5f9;
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      font-size: 10px;
+    }
+
+    .stats-search-input {
+      width: 100%;
+      font-size: 11px;
+      border-radius: 999px;
+      border: 1px solid #d0d7e7;
+      padding: 4px 10px;
+      outline: none;
+      margin-bottom: 4px;
+    }
+
+    .stats-search-input:focus {
+      border-color: var(--primary-color);
+      box-shadow: 0 0 0 1px rgba(28, 150, 202, 0.2);
+    }
+
+    @media (max-width: 900px) {
+      .stats-layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .stats-summary-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Column width tweaks */
+    #tablesTable th.col-files {
+      width: 80px;
+    }
+
+    #tablesTable th.col-rows {
+      width: 110px;
+    }
+
+    #tablesTable th.col-size {
+      width: 140px;
+    }
+
+    #tablesTable th.col-updated {
+      width: 190px;
+    }
+
+    #tablesTable th.col-details {
+      width: 260px;
+    }
+
   </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-  <script
-    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js">
-  </script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
 
   <script>
-    // Shared admin API helper
+    // Shared admin API helper function
     function api(path, opts) {
       opts = opts || {};
       opts.headers = opts.headers || {};
       if (window.__admintoken) opts.headers['X-Admin-Token'] = window.__admintoken;
       return fetch(path, opts).then(async res => {
         const ct = res.headers.get('content-type') || '';
-        const payload = ct.includes('application/json')
-          ? await res.json()
-          : await res.text();
+        const payload = ct.includes('application/json') ? await res.json() : await res.text();
         if (!res.ok) {
           const msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
           throw new Error(msg);
@@ -279,27 +650,40 @@
       });
     }
 
+    // --- Meta service constants ---
+    const META_BASE = 'http://0.0.0.0:8080';
+    const ORGANIZATION = 'kladna-soft';
+    const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
+
+    let currentSuper = null;
+    let currentStatsResources = [];
+    let currentStatsSelectedIndex = -1;
+    let currentOverviewRow = null;
+
     function onPairChange() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = (sel.value || '|').split('|');
-      const url = new URL(window.location.href);
-      url.searchParams.set('org', org);
-      url.searchParams.set('sup', sup);
-      // reset page when tenant changes
-      url.searchParams.delete('page');
-      window.location.href = url.toString();
+      if (!sel) return;
+      const sup = sel.value;
+      if (!sup) return;
+      currentSuper = sup;
+      const label = document.getElementById('tenantLabel');
+      if (label) {
+        label.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + sup;
+      }
+      loadTenantSuper(sup);
     }
 
     function goBackAdmin() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = (sel.value || '|').split('|');
+      const sup = sel ? sel.value : currentSuper;
       const url = new URL('/admin', window.location.origin);
-      if (org) url.searchParams.set('org', org);
+      url.searchParams.set('org', ORGANIZATION);
       if (sup) url.searchParams.set('sup', sup);
       window.location.href = url.toString();
     }
 
     function gotoPage(p) {
+      // no longer used (client-side paging with DataTables)
       const params = new URLSearchParams(window.location.search);
       params.set('page', p);
       window.location.search = params.toString();
@@ -315,19 +699,123 @@
       document.getElementById('modal').style.display = 'none';
     }
 
-    // ---------- Pretty render helpers ----------
+    // ---------- Small helpers ----------
 
-    function renderSchema(schema) {
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, function (c) {
+        return {
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;'
+        }[c] || c;
+      });
+    }
+
+    function normalizeTypeCategory(type) {
+      const t = (type || '').toLowerCase();
+      if (/(int|bigint|smallint|tinyint|long)/.test(t)) return 'number';
+      if (/(float|double|real|decimal|numeric)/.test(t)) return 'number';
+      if (/(char|string|text|varchar|nvarchar)/.test(t)) return 'string';
+      if (/(date|time|timestamp)/.test(t)) return 'date';
+      if (/(bool)/.test(t)) return 'bool';
+      return 'other';
+    }
+
+    function getSchemaTypeClass(type) {
+      const cat = normalizeTypeCategory(type);
+      if (cat === 'string') return 'schema-type-string';
+      if (cat === 'number') return 'schema-type-number';
+      if (cat === 'date') return 'schema-type-date';
+      if (cat === 'bool') return 'schema-type-bool';
+      return 'schema-type-other';
+    }
+
+    function tryParseNumber(v) {
+      if (v === null || v === undefined) return null;
+      const n = parseFloat(v);
+      if (Number.isNaN(n)) return null;
+      return n;
+    }
+
+    function tryParseDate(v) {
+      if (!v && v !== 0) return null;
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return null;
+      return d;
+    }
+
+    function humanizeCount(n) {
+      if (n == null) return '0';
+      const abs = Math.abs(n);
+      if (abs < 1000) return String(n);
+      const units = ['K', 'M', 'B', 'T', 'P'];
+      let value = n;
+      let unitIndex = -1;
+      while (Math.abs(value) >= 1000 && unitIndex < units.length - 1) {
+        value = value / 1000;
+        unitIndex++;
+      }
+      return Math.round(value) + units[unitIndex];
+    }
+
+    function humanizeBytes(bytes) {
+      if (bytes == null) return '0 B';
+      const abs = Math.abs(bytes);
+      if (abs < 1024) return bytes + ' B';
+      const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+      let value = bytes;
+      let unitIndex = -1;
+      while (Math.abs(value) >= 1024 && unitIndex < units.length - 1) {
+        value = value / 1024;
+        unitIndex++;
+      }
+      const rounded = (Math.abs(value) < 10) ? value.toFixed(1) : Math.round(value);
+      return rounded + ' ' + units[unitIndex];
+    }
+
+    function formatNumber(n) {
+      if (n == null) return 'n/a';
+      try {
+        return n.toLocaleString();
+      } catch (e) {
+        return String(n);
+      }
+    }
+
+    function formatDateMs(ms) {
+      if (!ms && ms !== 0) return 'n/a';
+      try {
+        const d = new Date(ms);
+        if (isNaN(d.getTime())) return String(ms);
+        return d.toISOString().replace('T', ' ').replace('Z', '');
+      } catch (e) {
+        return String(ms);
+      }
+    }
+
+    function formatDateMsLocal(ms) {
+      if (!ms && ms !== 0) return 'n/a';
+      try {
+        const d = new Date(ms);
+        if (isNaN(d.getTime())) return String(ms);
+        return d.toLocaleString();
+      } catch (e) {
+        return String(ms);
+      }
+    }
+
+    // ---------- Schema helpers ----------
+
+    function extractSchemaPairs(schema) {
       const pairs = [];
-
       if (Array.isArray(schema)) {
         schema.forEach(entry => {
           if (entry && typeof entry === 'object') {
             Object.entries(entry).forEach(([col, type]) => {
               pairs.push([String(col), String(type)]);
             });
-          } else {
-            pairs.push([String(entry), '']);
           }
         });
       } else if (schema && typeof schema === 'object') {
@@ -335,330 +823,941 @@
           pairs.push([String(col), String(type)]);
         });
       }
-
-      if (!pairs.length) {
-        return JSON.stringify(schema, null, 2);
-      }
-
-      const maxLen = Math.max.apply(null, pairs.map(([col]) => col.length));
-      const lines = pairs.map(([col, type]) => {
-        if (type) {
-          return col.padEnd(maxLen + 2, ' ') + type;
-        }
-        return col;
-      });
-
-      return 'Column schema:\n\n' + lines.join('\n');
+      return pairs;
     }
 
-    function renderStats(statsData, simple) {
-      const lines = [];
-      const arr = Array.isArray(statsData) ? statsData : [statsData];
+    // ---------- TENANT + TABLES (meta/supers + meta/super) ----------
 
-      arr.forEach((item, idx) => {
-        const tableName = item.simple_name || simple || '';
-        if (tableName) {
-          lines.push('Table: ' + tableName);
+    function updateTenantSummary(superMeta) {
+      const filesEl = document.getElementById('tenantFilesValue');
+      const rowsEl = document.getElementById('tenantRowsValue');
+      const sizeEl = document.getElementById('tenantSizeValue');
+      const updEl = document.getElementById('tenantUpdatedValue');
+
+      if (!superMeta) {
+        if (filesEl) filesEl.textContent = 'n/a';
+        if (rowsEl) rowsEl.textContent = 'n/a';
+        if (sizeEl) sizeEl.textContent = 'n/a';
+        if (updEl) updEl.textContent = 'n/a';
+        return;
+      }
+
+      if (filesEl) filesEl.textContent = superMeta.files != null ? humanizeCount(superMeta.files) : '0';
+      if (rowsEl) rowsEl.textContent = superMeta.rows != null ? humanizeCount(superMeta.rows) : '0';
+      if (sizeEl) sizeEl.textContent = superMeta.size != null ? humanizeBytes(superMeta.size) : '0 B';
+      if (updEl) updEl.textContent = superMeta.updated_utc != null ? formatDateMsLocal(superMeta.updated_utc) : 'n/a';
+    }
+
+    function renderTables(superName, tables) {
+      const tbody = document.getElementById('tablesBody');
+      const totalEl = document.getElementById('tablesTotalCount');
+      const shownEl = document.getElementById('tablesShownCount');
+      if (!tbody) return;
+
+      tbody.innerHTML = '';
+      if (!Array.isArray(tables)) tables = [];
+
+      tables.forEach(t => {
+        const tr = document.createElement('tr');
+        const name = t.name || '';
+        const files = typeof t.files === 'number' ? t.files : null;
+        const rows = typeof t.rows === 'number' ? t.rows : null;
+        const size = typeof t.size === 'number' ? t.size : null;
+        const updated = t.updated_utc;
+
+        const tdName = document.createElement('td');
+        tdName.innerHTML = '<div class="table-name-cell"><i class="fas fa-leaf"></i><span>' + escapeHtml(name) + '</span></div>';
+        tr.appendChild(tdName);
+
+        const tdFiles = document.createElement('td');
+        tdFiles.textContent = files != null ? files.toLocaleString() : '0';
+        tr.appendChild(tdFiles);
+
+        const tdRows = document.createElement('td');
+        tdRows.textContent = rows != null ? rows.toLocaleString() : '0';
+        tr.appendChild(tdRows);
+
+        const tdSize = document.createElement('td');
+        tdSize.textContent = size != null ? humanizeBytes(size) : '0 B';
+        tr.appendChild(tdSize);
+
+        const tdUpdated = document.createElement('td');
+        tdUpdated.innerHTML = '<span class="text-xs muted">' + escapeHtml(formatDateMsLocal(updated)) + '</span>';
+        tr.appendChild(tdUpdated);
+
+        const safeName = name.replace(/'/g, "\\'");
+        const tdActions = document.createElement('td');
+        tdActions.className = 'actions-cell';
+        tdActions.innerHTML =
+          '<button class="btn btn-outline-primary btn-sm" type="button" onclick="openSchema(\'' + safeName + '\')">' +
+          '<i class="fas fa-table"></i>&nbsp;Schema</button>' +
+          ' <button class="btn btn-outline-secondary btn-sm mt-1" type="button" onclick="openStats(\'' + safeName + '\')">' +
+          '<i class="fas fa-chart-bar"></i>&nbsp;Stats</button>' +
+          ' <button class="btn btn-outline-primary btn-sm mt-1" type="button" onclick="goExecuteWithLeaf(\'' + safeName + '\')">' +
+          '<i class="fas fa-terminal"></i></button>';
+        tr.appendChild(tdActions);
+
+        tbody.appendChild(tr);
+      });
+
+      if (totalEl) totalEl.textContent = tables.length;
+      if (shownEl) shownEl.textContent = tables.length;
+
+      if ($.fn.DataTable.isDataTable('#tablesTable')) {
+        $('#tablesTable').DataTable().destroy();
+      }
+      $('#tablesTable').DataTable({
+        pageLength: 25,
+        lengthMenu: [10, 25, 50, 100],
+        order: [[0, 'asc']],
+        dom: 'frtip',
+        language: {
+          search: "",
+          searchPlaceholder: "Filter tables..."
         }
-        if (item.snapshot_version !== undefined) {
-          lines.push('Snapshot version: ' + item.snapshot_version);
+      });
+    }
+
+    function loadTenantSuper(superName) {
+      if (!superName) {
+        updateTenantSummary(null);
+        renderTables(null, []);
+        return;
+      }
+
+      const label = document.getElementById('tenantLabel');
+      if (label) {
+        label.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + superName;
+      }
+
+      api(
+        META_BASE + '/meta/super?organization=' +
+        encodeURIComponent(ORGANIZATION) +
+        '&super_name=' + encodeURIComponent(superName) +
+        '&user_hash=' + encodeURIComponent(USER_HASH)
+      )
+        .then(data => {
+          const s = data && data.meta && data.meta.super ? data.meta.super : null;
+          if (!s) {
+            updateTenantSummary(null);
+            renderTables(superName, []);
+            return;
+          }
+          updateTenantSummary(s);
+          renderTables(superName, Array.isArray(s.tables) ? s.tables : []);
+        })
+        .catch(err => {
+          console.error('Failed to load tenant super', err);
+          updateTenantSummary(null);
+          renderTables(superName, []);
+        });
+    }
+
+    function loadTenants() {
+      const labelEl = document.getElementById('tenantLabel');
+      const selEl = document.getElementById('pairSel');
+      if (!selEl) return;
+      if (labelEl) labelEl.textContent = 'Loading tenants...';
+
+      api(META_BASE + '/meta/supers?organization=' + encodeURIComponent(ORGANIZATION))
+        .then(data => {
+          const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
+          selEl.innerHTML = '';
+
+          if (!supers.length) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'No tenants found';
+            selEl.appendChild(opt);
+            if (labelEl) labelEl.textContent = 'No tenants discovered.';
+            updateTenantSummary(null);
+            renderTables(null, []);
+            return;
+          }
+
+          supers.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s;
+            opt.textContent = ORGANIZATION + ' / ' + s;
+            selEl.appendChild(opt);
+          });
+
+          currentSuper = supers[0];
+          selEl.value = currentSuper;
+          if (labelEl) labelEl.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + currentSuper;
+
+          loadTenantSuper(currentSuper);
+        })
+        .catch(err => {
+          console.error('Failed to load tenants', err);
+          if (labelEl) labelEl.textContent = 'Failed to load tenants.';
+          updateTenantSummary(null);
+          renderTables(null, []);
+        });
+    }
+
+    // ---------- STATS + SCHEMA (meta/stats + meta/schema) ----------
+
+    function buildSchemaPeekHtml(schemaPairs, moreSchema) {
+      let schemaTableHtml = '';
+      if (schemaPairs.length) {
+        schemaTableHtml += '<table class="schema-peek-table"><thead><tr>';
+        schemaTableHtml += '<th>Column</th><th>Type</th></tr></thead><tbody>';
+        schemaPairs.forEach(([col, type]) => {
+          const typeClass = getSchemaTypeClass(type);
+          schemaTableHtml += '<tr>';
+          schemaTableHtml += '<td>' + escapeHtml(col) + '</td>';
+          schemaTableHtml += '<td><span class="schema-type-pill ' + typeClass + '">' + escapeHtml(type) + '</span></td>';
+          schemaTableHtml += '</tr>';
+        });
+        schemaTableHtml += '</tbody></table>';
+
+        if (moreSchema) {
+          schemaTableHtml += '<div class="schema-peek-more">…and more columns. Use a full schema view if needed.</div>';
         }
-        if (item.last_updated_ms !== undefined) {
-          try {
-            const d = new Date(item.last_updated_ms);
-            lines.push('Last updated: ' + d.toISOString());
-          } catch (e) {
-            lines.push('Last updated ms: ' + item.last_updated_ms);
+      } else {
+        schemaTableHtml = '<div class="schema-peek-more">Schema not available.</div>';
+      }
+      return schemaTableHtml;
+    }
+
+    async function openSchema(simple) {
+      const sel = document.getElementById('pairSel');
+      const sup = sel && sel.value ? sel.value : currentSuper;
+
+      const overlay = document.getElementById('schemaOverlay');
+      const bodyEl = document.getElementById('schemaBody');
+      const titleMain = document.getElementById('schemaTitleMain');
+      const titleSub = document.getElementById('schemaTitleSub');
+
+      overlay.style.display = 'flex';
+      titleMain.innerHTML = '<i class="fas fa-table" style="color:#1c96ca;"></i><span>Schema · ' + escapeHtml(simple) + '</span>';
+      titleSub.textContent = 'Schema of table: ' + (sup ? (ORGANIZATION + ' / ' + sup) : '');
+
+      bodyEl.innerHTML =
+        '<div class="schema-peek-title">' +
+        '  <i class="fas fa-spinner fa-spin"></i>' +
+        '  <span>Loading schema…</span>' +
+        '</div>';
+
+      try {
+        const data = await api(
+          META_BASE + '/meta/schema?organization=' +
+          encodeURIComponent(ORGANIZATION) +
+          '&super_name=' + encodeURIComponent(sup) +
+          '&table=' + encodeURIComponent(simple) +
+          '&user_hash=' + encodeURIComponent(USER_HASH)
+        );
+
+        const schemaRaw = data && data.schema !== undefined ? data.schema : (data || null);
+        const schemaPairsAll = schemaRaw ? extractSchemaPairs(schemaRaw) : [];
+        const peekRows = schemaPairsAll.slice(0, 50);
+        const moreSchema = schemaPairsAll.length > peekRows.length;
+
+        bodyEl.innerHTML =
+          '<div class="schema-peek">' +
+          '  <div class="schema-peek-title">' +
+          '    <i class="fas fa-table"></i>' +
+          '    <span>Schema</span>' +
+          '  </div>' +
+          buildSchemaPeekHtml(peekRows, moreSchema) +
+          '</div>';
+      } catch (e) {
+        bodyEl.innerHTML =
+          '<div class="schema-peek-more" style="color:#b91c1c;">Error loading schema: ' + escapeHtml(e.message || e) + '</div>';
+      }
+    }
+
+    function closeSchemaOverlay() {
+      document.getElementById('schemaOverlay').style.display = 'none';
+    }
+
+    function aggregateStats(statsPayload) {
+      const statsArr = Array.isArray(statsPayload) ? statsPayload : [statsPayload];
+      if (!statsArr.length) {
+        return {
+          rows: null,
+          columns: null,
+          files: null,
+          snapshot_version: null,
+          last_updated_ms: null
+        };
+      }
+
+      const first = statsArr[0] || {};
+      const lastUpdated = first.last_updated_ms || null;
+      const snapshotVersion = first.snapshot_version !== undefined ? first.snapshot_version : null;
+
+      let totalRows = 0;
+      let totalColumns = null;
+      let files = 0;
+
+      if (first.resources && Array.isArray(first.resources)) {
+        files = first.resources.length;
+        first.resources.forEach(r => {
+          if (typeof r.rows === 'number') {
+            totalRows += r.rows;
+          }
+          if (typeof r.columns === 'number' && totalColumns == null) {
+            totalColumns = r.columns;
+          }
+        });
+      }
+
+      if (totalRows === 0) totalRows = null;
+
+      return {
+        rows: totalRows,
+        columns: totalColumns,
+        files: files || null,
+        snapshot_version: snapshotVersion,
+        last_updated_ms: lastUpdated
+      };
+    }
+
+    function parseResourcesFromStats(statsPayload) {
+      const res = [];
+      const arr = Array.isArray(statsPayload) ? statsPayload : [statsPayload];
+      arr.forEach(item => {
+        if (item && Array.isArray(item.resources)) {
+          item.resources.forEach(r => res.push(r));
+        }
+      });
+      return res;
+    }
+
+    function buildStatsColumnStatsHtml(resource, index) {
+      if (!resource || !resource.stats || typeof resource.stats !== 'object') {
+        return '<div class="schema-peek-more">No column stats available for this file.</div>';
+      }
+
+      const entries = Object.entries(resource.stats);
+      if (!entries.length) {
+        return '<div class="schema-peek-more">No column stats available for this file.</div>';
+      }
+
+      let html = '';
+      html += '<div class="schema-peek-more" style="margin-bottom:4px;">Showing column stats for file #' + (index + 1) + '</div>';
+      html += '<table class="stats-colstats-table"><thead><tr>';
+      html += '<th>Column</th><th>Min</th><th>Max</th></tr></thead><tbody>';
+
+      entries.forEach(([col, range]) => {
+        let minVal = range;
+        let maxVal = range;
+        if (range && typeof range === 'object') {
+          if ('min' in range) minVal = range.min;
+          if ('max' in range) maxVal = range.max;
+        } else {
+          minVal = String(range);
+          maxVal = String(range);
+        }
+        html += '<tr>';
+        html += '<td>' + escapeHtml(col) + '</td>';
+        html += '<td>' + escapeHtml(minVal) + '</td>';
+        html += '<td>' + escapeHtml(maxVal) + '</td>';
+        html += '</tr>';
+      });
+
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderStatsColumnPanel(resources, index) {
+      const panel = document.getElementById('statsColumnPanel');
+      if (!panel) return;
+      if (!resources || !resources.length || index < 0 || index >= resources.length) {
+        panel.innerHTML = '<div class="schema-peek-more">No file selected.</div>';
+        return;
+      }
+      const res = resources[index];
+      panel.innerHTML = buildStatsColumnStatsHtml(res, index);
+    }
+
+    function searchStatsByValue(query, searchAcrossAll) {
+      const results = [];
+      if (!currentStatsResources || !currentStatsResources.length) return results;
+
+      const qStr = String(query);
+      const qNum = tryParseNumber(qStr);
+      const qDate = tryParseDate(qStr);
+
+      const filesToScan = [];
+
+      if (searchAcrossAll || currentStatsSelectedIndex < 0 || currentStatsSelectedIndex >= currentStatsResources.length) {
+        currentStatsResources.forEach((r, idx) => {
+          filesToScan.push({ res: r, idx });
+        });
+      } else {
+        filesToScan.push({ res: currentStatsResources[currentStatsSelectedIndex], idx: currentStatsSelectedIndex });
+      }
+
+      filesToScan.forEach(({ res, idx: fileIdx }) => {
+        const stats = res && res.stats && typeof res.stats === 'object' ? res.stats : {};
+        const fileName = res.file || '';
+
+        Object.entries(stats).forEach(([col, range]) => {
+          let minVal = range;
+          let maxVal = range;
+          if (range && typeof range === 'object') {
+            if ('min' in range) minVal = range.min;
+            if ('max' in range) maxVal = range.max;
+          }
+
+          let match = false;
+
+          if (qNum !== null && !match) {
+            const minNum = tryParseNumber(minVal);
+            const maxNum = tryParseNumber(maxVal);
+            if (minNum !== null && maxNum !== null && qNum >= minNum && qNum <= maxNum) {
+              match = true;
+            }
+          }
+
+          if (!match && qDate !== null) {
+            const minDate = tryParseDate(minVal);
+            const maxDate = tryParseDate(maxVal);
+            if (minDate !== null && maxDate !== null && qDate >= minDate && qDate <= maxDate) {
+              match = true;
+            }
+          }
+
+          if (!match) {
+            const minStr = String(minVal);
+            const maxStr = String(maxVal);
+            if (qStr >= minStr && qStr <= maxStr) {
+              match = true;
+            }
+          }
+
+          if (match) {
+            results.push({
+              fileIndex: fileIdx,
+              fileName: fileName,
+              column: col,
+              min: minVal,
+              max: maxVal
+            });
+          }
+        });
+      });
+
+      return results;
+    }
+
+    function buildStatsSearchResultsHtml(query, results) {
+      let html = '';
+      html += '<div class="schema-peek-title">';
+      html += '  <i class="fas fa-magnifying-glass"></i>';
+      html += '  <span>Search results for "' + escapeHtml(query) + '"</span>';
+      html += '</div>';
+
+      if (!results.length) {
+        html += '<div class="schema-peek-more">No columns found where the value lies between min and max.</div>';
+        return html;
+      }
+
+      html += '<div class="schema-peek-more" style="margin-bottom:4px;">' +
+              'Found ' + results.length + ' matching column(s) across file(s).' +
+              '</div>';
+
+      html += '<div class="table-responsive">';
+      html += '  <table class="stats-colstats-table">';
+      html += '    <thead><tr>';
+      html += '      <th>#</th><th>File #</th><th>File</th><th>Column</th><th>Min</th><th>Max</th>';
+      html += '    </tr></thead><tbody>';
+
+      results.forEach((r, idx) => {
+        html += '    <tr>';
+        html += '      <td>' + (idx + 1) + '</td>';
+        html += '      <td>' + (r.fileIndex + 1) + '</td>';
+        html += '      <td>' + escapeHtml(r.fileName || '') + '</td>';
+        html += '      <td>' + escapeHtml(r.column) + '</td>';
+        html += '      <td>' + escapeHtml(r.min) + '</td>';
+        html += '      <td>' + escapeHtml(r.max) + '</td>';
+        html += '    </tr>';
+      });
+
+      html += '    </tbody></table>';
+      html += '</div>';
+
+      return html;
+    }
+
+    function onStatsValueSearchChange() {
+      const input = document.getElementById('statsValueSearch');
+      const panel = document.getElementById('statsColumnPanel');
+      const chk = document.getElementById('statsSearchAcrossAll');
+      if (!input || !panel) return;
+
+      const q = input.value.trim();
+      if (!q) {
+        if (currentStatsSelectedIndex < 0 && currentStatsResources.length) {
+          currentStatsSelectedIndex = 0;
+        }
+        renderStatsColumnPanel(currentStatsResources, currentStatsSelectedIndex);
+        return;
+      }
+
+      const searchAcrossAll = !!(chk && chk.checked);
+      const results = searchStatsByValue(q, searchAcrossAll);
+      panel.innerHTML = buildStatsSearchResultsHtml(q, results);
+    }
+
+    function initStatsTable(resources) {
+      currentStatsResources = resources || [];
+      currentStatsSelectedIndex = -1;
+
+      if ($.fn.DataTable.isDataTable('#statsTable')) {
+        $('#statsTable').DataTable().destroy();
+      }
+
+      const tableEl = $('#statsTable').DataTable({
+        pageLength: 10,
+        lengthMenu: [10, 100, 1000],
+        order: [[0, 'asc']],
+        dom: 'rtip'
+      });
+
+      $('#statsTable tbody').off('click').on('click', 'tr', function () {
+        const idx = $(this).data('resIndex');
+        if (typeof idx === 'number') {
+          $('tr', tableEl.table().body()).removeClass('table-row-highlight');
+          $(this).addClass('table-row-highlight');
+          currentStatsSelectedIndex = idx;
+
+          const searchInput = document.getElementById('statsValueSearch');
+          if (searchInput && searchInput.value.trim()) {
+            onStatsValueSearchChange();
+          } else {
+            renderStatsColumnPanel(currentStatsResources, idx);
           }
         }
-
-        if (item.resources && item.resources.length) {
-          lines.push('');
-          lines.push('Resources:');
-          item.resources.forEach((r, rIdx) => {
-            lines.push('  [' + (rIdx + 1) + '] file: ' + (r.file || ''));
-            if (r.file_size !== undefined) {
-              lines.push('      size: ' + r.file_size + ' bytes');
-            }
-            if (r.rows !== undefined || r.columns !== undefined) {
-              lines.push(
-                '      rows: ' + (r.rows !== undefined ? r.rows : 'n/a') +
-                ', columns: ' + (r.columns !== undefined ? r.columns : 'n/a')
-              );
-            }
-
-            if (r.stats && typeof r.stats === 'object') {
-              lines.push('      column stats:');
-
-              const colPairs = Object.entries(r.stats).map(([col, range]) => {
-                let txt;
-                if (range && typeof range === 'object') {
-                  const min = 'min' in range ? range.min : '?';
-                  const max = 'max' in range ? range.max : '?';
-                  txt = 'min=' + min + ', max=' + max;
-                } else {
-                  txt = String(range);
-                }
-                return [String(col), txt];
-              });
-
-              const maxLen = Math.max.apply(null, colPairs.map(([col]) => col.length));
-              colPairs.forEach(([col, txt]) => {
-                lines.push('        ' + col.padEnd(maxLen + 2, ' ') + txt);
-              });
-            }
-          });
-        }
-
-        if (idx < arr.length - 1) {
-          lines.push('');
-        }
       });
 
-      return lines.join('\n');
-    }
-
-    // View schema via /meta/schema (MetaReader.get_table_schema)
-    async function viewSchema(simple) {
-      const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
-      const userHash = '0b85b786b16d195439c0da18fd4478df';
-
-      try {
-        const data = await api(
-          `/meta/schema?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}&table=${encodeURIComponent(simple)}&user_hash=${encodeURIComponent(userHash)}`
-        );
-
-        let body = '';
-        if (data && data.schema !== undefined) {
-          body = renderSchema(data.schema);
-        } else {
-          body = JSON.stringify(data, null, 2);
-        }
-
-        showModal('Schema: ' + simple, body);
-      } catch (e) {
-        showModal('Schema: ' + simple, 'Error loading schema: ' + (e.message || e));
+      if (resources.length) {
+        const firstRow = $('#statsTable tbody tr').first();
+        firstRow.addClass('table-row-highlight');
+        currentStatsSelectedIndex = firstRow.data('resIndex') || 0;
+        renderStatsColumnPanel(resources, currentStatsSelectedIndex);
+      } else {
+        renderStatsColumnPanel(resources, -1);
       }
     }
 
-    // View stats via /meta/stats (MetaReader.get_table_stats)
-    async function viewStats(simple) {
+    async function openStats(simple) {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
-      const userHash = '0b85b786b16d195439c0da18fd4478df';
+      const sup = sel && sel.value ? sel.value : currentSuper;
+
+      const overlay = document.getElementById('statsOverlay');
+      const card = document.getElementById('statsCard');
+      const bodyEl = document.getElementById('statsBody');
+      const titleMain = document.getElementById('statsTitleMain');
+      const titleSub = document.getElementById('statsTitleSub');
+
+      overlay.style.display = 'flex';
+      card.classList.remove('overlay-fullscreen');
+
+      titleMain.innerHTML = '<i class="fas fa-chart-bar" style="color:#1c96ca;"></i><span>Stats · ' + escapeHtml(simple) + '</span>';
+      titleSub.textContent = 'Per-file statistics for table ' + simple;
+
+      bodyEl.innerHTML =
+        '<div class="schema-peek-title">' +
+        '  <i class="fas fa-spinner fa-spin"></i>' +
+        '  <span>Loading stats…</span>' +
+        '</div>';
 
       try {
         const data = await api(
-          `/meta/stats?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}&table=${encodeURIComponent(simple)}&user_hash=${encodeURIComponent(userHash)}`
+          META_BASE + '/meta/stats?organization=' +
+          encodeURIComponent(ORGANIZATION) +
+          '&super_name=' + encodeURIComponent(sup) +
+          '&table=' + encodeURIComponent(simple) +
+          '&user_hash=' + encodeURIComponent(USER_HASH)
         );
 
-        let body = '';
-        if (data && data.stats !== undefined) {
-          body = renderStats(data.stats, simple);
-        } else {
-          body = JSON.stringify(data, null, 2);
-        }
+        const statsRaw = data && data.stats !== undefined ? data.stats : null;
+        const statsAgg = statsRaw ? aggregateStats(statsRaw) : aggregateStats(null);
+        const resources = statsRaw ? parseResourcesFromStats(statsRaw) : [];
 
-        showModal('Stats: ' + simple, body);
+        const rowsVal = formatNumber(statsAgg.rows);
+        const colsVal = formatNumber(statsAgg.columns);
+        const filesVal = formatNumber(statsAgg.files);
+        const lastUpd = formatDateMs(statsAgg.last_updated_ms);
+        const snapVer = statsAgg.snapshot_version != null ? statsAgg.snapshot_version : 'n/a';
+
+        let html = '';
+
+        html += '<div class="stats-summary-grid">';
+        html += '  <div class="metric-card">';
+        html += '    <div class="metric-icon"><i class="fas fa-file"></i></div>';
+        html += '    <div class="metric-content">';
+        html += '      <div class="metric-label">Files</div>';
+        html += '      <div class="metric-value">' + filesVal + '</div>';
+        html += '    </div>';
+        html += '  </div>';
+        html += '  <div class="metric-card">';
+        html += '    <div class="metric-icon"><i class="fas fa-bars"></i></div>';
+        html += '    <div class="metric-content">';
+        html += '      <div class="metric-label">Rows (approx)</div>';
+        html += '      <div class="metric-value">' + rowsVal + '</div>';
+        html += '    </div>';
+        html += '  </div>';
+        html += '  <div class="metric-card">';
+        html += '    <div class="metric-icon"><i class="fas fa-columns"></i></div>';
+        html += '    <div class="metric-content">';
+        html += '      <div class="metric-label">Columns</div>';
+        html += '      <div class="metric-value">' + colsVal + '</div>';
+        html += '    </div>';
+        html += '  </div>';
+        html += '</div>';
+
+        html += '<div class="schema-peek-more" style="margin-bottom:8px;">Snapshot: ' +
+                escapeHtml(String(snapVer)) + ' · Last updated: ' + escapeHtml(lastUpd) + '</div>';
+
+        html += '<div class="stats-layout">';
+
+        html += '  <div class="stats-panel">';
+        html += '    <div class="stats-panel-title">';
+        html += '      <i class="fas fa-folder-open"></i>';
+        html += '      <span>Resources</span>';
+        html += '    </div>';
+        html += '    <div class="table-responsive">';
+        html += '      <table id="statsTable" class="display table table-sm">';
+        html += '        <thead><tr>';
+        html += '          <th>#</th>';
+        html += '          <th>File</th>';
+        html += '          <th>Size (bytes)</th>';
+        html += '          <th>Rows</th>';
+        html += '          <th>Columns</th>';
+        html += '        </tr></thead><tbody>';
+
+        resources.forEach((r, idx) => {
+          const size = (typeof r.file_size === 'number') ? r.file_size : (r.size || '');
+          const rows = (typeof r.rows === 'number') ? r.rows : '';
+          const cols = (typeof r.columns === 'number') ? r.columns : '';
+          const file = r.file || '';
+          html += '<tr data-res-index="' + idx + '">';
+          html += '<td>' + (idx + 1) + '</td>';
+          html += '<td>' + escapeHtml(file) + '</td>';
+          html += '<td>' + (size !== '' ? (size.toLocaleString ? size.toLocaleString() : size) : '') + '</td>';
+          html += '<td>' + (rows !== '' ? rows : '') + '</td>';
+          html += '<td>' + (cols !== '' ? cols : '') + '</td>';
+          html += '</tr>';
+        });
+
+        html += '        </tbody></table>';
+        html += '    </div>';
+        html += '  </div>';
+
+        html += '  <div class="stats-panel">';
+        html += '    <div class="stats-panel-title">';
+        html += '      <i class="fas fa-table-columns"></i>';
+        html += '      <span>Column stats</span>';
+        html += '    </div>';
+        html += '    <div class="d-flex align-items-center" style="margin-bottom:4px;">';
+        html += '      <input type="checkbox" id="statsSearchAcrossAll" style="margin-right:4px;" checked>';
+        html += '      <label for="statsSearchAcrossAll" class="text-xs muted mb-0">Search across all files</label>';
+        html += '    </div>';
+        html += '    <input type="text" id="statsValueSearch" class="stats-search-input" placeholder="Search by value (min/max)…"/>';
+        html += '    <div class="schema-peek-more" style="margin-bottom:6px;">';
+        html += '      Type a number, date, or string to find columns where the value lies between min and max.';
+        html += '    </div>';
+        html += '    <div id="statsColumnPanel">';
+        html += '      <div class="schema-peek-more">Select a file from the left to view column min/max, or search by value.</div>';
+        html += '    </div>';
+        html += '  </div>';
+
+        html += '</div>';
+
+        bodyEl.innerHTML = html;
+
+        initStatsTable(resources);
+
+        const searchInput = document.getElementById('statsValueSearch');
+        const searchChk = document.getElementById('statsSearchAcrossAll');
+        if (searchInput) {
+          searchInput.addEventListener('input', onStatsValueSearchChange);
+        }
+        if (searchChk) {
+          searchChk.addEventListener('change', onStatsValueSearchChange);
+        }
       } catch (e) {
-        showModal('Stats: ' + simple, 'Error loading stats: ' + (e.message || e));
+        bodyEl.innerHTML =
+          '<div class="schema-peek-more" style="color:#b91c1c;">Error loading stats: ' + escapeHtml(e.message || e) + '</div>';
       }
     }
+
+    function closeStatsOverlay() {
+      document.getElementById('statsOverlay').style.display = 'none';
+      const card = document.getElementById('statsCard');
+      card.classList.remove('overlay-fullscreen');
+      if ($.fn.DataTable.isDataTable('#statsTable')) {
+        $('#statsTable').DataTable().destroy();
+      }
+      currentStatsResources = [];
+      currentStatsSelectedIndex = -1;
+    }
+
+    function toggleStatsSize() {
+      document.getElementById('statsCard').classList.toggle('overlay-fullscreen');
+    }
+
+    // ---------- Misc ----------
 
     function goExecuteWithLeaf(simple) {
-      // convenience: jump to execute with tenant preselected
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const sup = sel && sel.value ? sel.value : currentSuper;
       const url = new URL('/admin/execute', window.location.origin);
-      if (org) url.searchParams.set('org', org);
+      url.searchParams.set('org', ORGANIZATION);
       if (sup) url.searchParams.set('sup', sup);
       url.searchParams.set('leaf', simple);
       window.location.href = url.toString();
     }
 
-    $(document).ready(function(){
+    // ---------- Document ready ----------
+    $(document).ready(function () {
       window.__admintoken = "{{ token|e }}";
 
-      $("#toggleSidebar").on("click", function() {
+      $("#toggleSidebar").on("click", function () {
         $("#sidebar").toggleClass("sidebar-collapsed");
-        localStorage.setItem('st_sidebar_collapsed',
-          $("#sidebar").hasClass("sidebar-collapsed"));
+        localStorage.setItem('st_sidebar_collapsed', $("#sidebar").hasClass("sidebar-collapsed"));
       });
 
       if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
         $("#sidebar").addClass("sidebar-collapsed");
       }
 
-      // Highlight current nav item
       $("#link-tables").addClass("active");
 
-      // DataTables for the tables grid
-      $('#tablesTable').DataTable({
-        pageLength: 25,
-        lengthMenu: [10, 25, 50, 100],
-        order: [[0, 'asc']],
-        dom: 'frtip',  // filter + table + info + pagination
-        language: {
-          search: "",
-          searchPlaceholder: "Filter tables..."
+      // Load tenants and initial data via meta service
+      loadTenants();
+
+      // Close overlays on ESC
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') {
+          closeSchemaOverlay();
+          closeStatsOverlay();
+          closeOverviewOverlay();
+        }
+      });
+
+      document.getElementById('schemaOverlay').addEventListener('click', function (e) {
+        if (e.target === this) {
+          closeSchemaOverlay();
+        }
+      });
+      document.getElementById('statsOverlay').addEventListener('click', function (e) {
+        if (e.target === this) {
+          closeStatsOverlay();
+        }
+      });
+      document.getElementById('overviewOverlay').addEventListener('click', function (e) {
+        if (e.target === this) {
+          closeOverviewOverlay();
         }
       });
     });
+
+    // ---------- Overview overlay (currently unused button, kept for future) ----------
+
+    function closeOverviewOverlay() {
+      const overlay = document.getElementById('overviewOverlay');
+      overlay.style.display = 'none';
+      const card = document.getElementById('overviewCard');
+      card.classList.remove('overlay-fullscreen');
+      if (currentOverviewRow) {
+        currentOverviewRow.classList.remove('table-row-highlight');
+        currentOverviewRow = null;
+      }
+    }
+
+    function toggleOverviewSize() {
+      const card = document.getElementById('overviewCard');
+      card.classList.toggle('overlay-fullscreen');
+    }
   </script>
 </head>
+
 <body>
-  {% include "sidebar.html" %}
+{% include "sidebar.html" %}
 
-  <!-- MAIN CONTENT -->
-  <div class="content-container">
-    <div class="wrap">
-      <div class="tables-header">
-        <div>
-          <h4>
-            <i class="fas fa-table" style="color:#1c96ca;"></i>&nbsp;
-            Tables
-          </h4>
-          {% if has_tenant %}
-          <div class="text-xs muted">
-            {{ sel_org }} / {{ sel_sup }}
-            <span class="summary-chip">
-              <i class="fas fa-leaf"></i>&nbsp;{{ total }} tables
-            </span>
-          </div>
-          {% else %}
-          <div class="text-xs muted">
-            Select a tenant to view tables.
-          </div>
-          {% endif %}
+<!-- MAIN CONTENT -->
+<div class="content-container">
+  <div class="wrap">
+    <div class="tables-header">
+      <div>
+        <h4>
+          <i class="fas fa-table" style="color:#1c96ca;"></i>&nbsp; Tables
+        </h4>
+        <div class="text-xs muted" id="tenantLabel">
+          Loading tenants...
         </div>
       </div>
-
-      <!-- Tenant selection -->
-      <div class="card" style="margin-top:12px;">
-        <div class="section">
-          <div class="grid">
-            <div>
-              <label class="text-sm muted">Tenant</label><br/>
-              <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
-                {% for t in tenants %}
-                  <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
-                    {{t.org}} / {{t.sup}}
-                  </option>
-                {% endfor %}
-              </select>
-              {% if has_tenant %}
-              <div class="text-xs muted" style="margin-top:6px;">
-                Selected: {{ sel_org }} / {{ sel_sup }}
-              </div>
-              {% else %}
-              <div class="text-xs muted" style="margin-top:6px;">
-                No tenant discovered in Redis.
-              </div>
-              {% endif %}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {% if has_tenant %}
-      <!-- Tables / Leaves grid -->
-      <div class="card" style="margin-top:16px;">
-        <div class="section">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <div class="text-sm muted">
-              Leaves as tables · Total: {{ total }}
-              {% if pages and pages > 1 %}
-                <span class="badge-pill">Server page {{ page }} / {{ pages }}</span>
-              {% endif %}
-            </div>
-            <div class="text-xs muted">
-              Showing {{ items|length }} items from Redis
-            </div>
-          </div>
-
-          <div class="table-responsive">
-            <table id="tablesTable" class="display table table-sm">
-              <thead>
-                <tr>
-                  <th>Table</th>
-                  <th>Version</th>
-                  <th>Updated</th>
-                  <th style="width:130px;">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for it in items %}
-                <tr>
-                  <td>
-                    <div class="table-name-cell">
-                      <i class="fas fa-leaf"></i>
-                      <span>{{ it.simple }}</span>
-                    </div>
-                  </td>
-                  <td>
-                    <span class="tag-version">v{{ it.version }}</span>
-                    {% if root_version is not none and it.version == root_version %}
-                      <span class="tag-new">latest</span>
-                    {% endif %}
-                  </td>
-                  <td>
-                    <span class="text-xs muted">
-                      {{ it.ts_iso or it.ts }}
-                    </span>
-                  </td>
-                  <td class="actions-cell">
-                    <button class="btn btn-outline-secondary btn-sm"
-                            type="button"
-                            onclick="viewSchema('{{ it.simple }}')">
-                      <i class="fas fa-eye"></i>&nbsp;Schema
-                    </button>
-                    <button class="btn btn-outline-secondary btn-sm mt-1"
-                            type="button"
-                            onclick="viewStats('{{ it.simple }}')">
-                      <i class="fas fa-chart-bar"></i>&nbsp;Stats
-                    </button>
-                    <button class="btn btn-outline-primary btn-sm mt-1"
-                            type="button"
-                            onclick="goExecuteWithLeaf('{{ it.simple }}')">
-                      <i class="fas fa-terminal"></i>
-                    </button>
-                  </td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-
-          <!-- Server-side pagination (optional if you keep page/page_size) -->
-          {% if pages and pages > 1 %}
-          <div class="mt-3 text-right">
-            {% for i in range(1, (pages or 1)+1) %}
-              <button class="btn-ghost"
-                      onclick="gotoPage({{i}})"
-                      {% if i == page %}style="opacity:.6"{% endif %}>
-                {{i}}
-              </button>
-            {% endfor %}
-          </div>
-          {% endif %}
-        </div>
-      </div>
-      {% endif %}
     </div>
-  </div>
 
-  <!-- JSON modal -->
-  <div id="modal">
-    <div id="modal-card">
-      <div id="m-header">
-        <div id="m-title" class="text-sm" style="font-weight:600;"></div>
-        <button class="btn-ghost btn-sm" onclick="closeModal()">
+    <!-- Tenant selection + summary -->
+    <div class="card" style="margin-top:12px;">
+      <div class="section">
+        <div class="grid">
+          <!-- LEFT: tenant selector -->
+          <div>
+            <label class="text-sm muted">Tenant</label><br/>
+            <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
+              <!-- Filled dynamically from /meta/supers -->
+            </select>
+            <div class="text-xs muted" style="margin-top:6px;">
+              Select a tenant to view tables.
+            </div>
+          </div>
+
+          <!-- RIGHT: summary cards -->
+          <div>
+            <div class="tenant-summary-grid">
+              <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-file"></i></div>
+                <div class="metric-content">
+                  <div class="metric-label">Files</div>
+                  <div class="metric-value" id="tenantFilesValue">n/a</div>
+                </div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-bars"></i></div>
+                <div class="metric-content">
+                  <div class="metric-label">Rows</div>
+                  <div class="metric-value" id="tenantRowsValue">n/a</div>
+                </div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-database"></i></div>
+                <div class="metric-content">
+                  <div class="metric-label">Byte Size</div>
+                  <div class="metric-value" id="tenantSizeValue">n/a</div>
+                </div>
+              </div>
+            </div>
+            <div class="tenant-updated">
+              Last updated: <span id="tenantUpdatedValue">n/a</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- Tables grid -->
+    <div class="card" style="margin-top:16px;">
+      <div class="section">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="text-sm muted">
+            Tables · Total:
+            <span class="total-count" id="tablesTotalCount">0</span>
+          </div>
+          <div class="text-xs muted">
+            Showing <span id="tablesShownCount">0</span> tables
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table id="tablesTable" class="display table table-sm">
+            <thead>
+            <tr>
+              <th>Table</th>
+              <th class="col-files">Files</th>
+              <th class="col-rows">Rows</th>
+              <th class="col-size">Size</th>
+              <th class="col-updated">Updated</th>
+              <th class="col-details">Details</th>
+            </tr>
+            </thead>
+            <tbody id="tablesBody">
+            <!-- Filled dynamically from /meta/super.meta.super.tables -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- JSON modal -->
+<div id="modal">
+  <div id="modal-card">
+    <div id="m-header">
+      <div id="m-title" class="text-sm" style="font-weight:600;"></div>
+      <button class="btn-ghost btn-sm" onclick="closeModal()">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <pre id="m-body"></pre>
+  </div>
+</div>
+
+<!-- Overview overlay (kept in case you reuse it later) -->
+<div id="overviewOverlay" class="inline-overlay">
+  <div id="overviewCard" class="inline-card">
+    <div class="inline-card-header">
+      <div class="inline-card-title">
+        <div id="overviewTitleMain" class="inline-card-title-main"></div>
+        <div id="overviewTitleSub" class="inline-card-title-sub"></div>
+      </div>
+      <div class="inline-card-actions">
+        <button class="icon-button" type="button" onclick="toggleOverviewSize()" title="Maximize / Normalize">
+          <i class="fas fa-up-right-and-down-left-from-center"></i>
+        </button>
+        <button class="icon-button" type="button" onclick="closeOverviewOverlay()" title="Close">
           <i class="fas fa-times"></i>
         </button>
       </div>
-      <pre id="m-body"></pre>
+    </div>
+    <div id="overviewBody" class="inline-card-body">
+      <!-- overview content -->
     </div>
   </div>
+</div>
+
+<!-- Schema overlay -->
+<div id="schemaOverlay" class="inline-overlay">
+  <div class="inline-card">
+    <div class="inline-card-header">
+      <div class="inline-card-title">
+        <div id="schemaTitleMain" class="inline-card-title-main"></div>
+        <div id="schemaTitleSub" class="inline-card-title-sub"></div>
+      </div>
+      <div class="inline-card-actions">
+        <button class="icon-button" type="button" onclick="closeSchemaOverlay()" title="Close">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+    </div>
+    <div id="schemaBody" class="inline-card-body">
+      <!-- schema content -->
+    </div>
+  </div>
+</div>
+
+<!-- Stats overlay -->
+<div id="statsOverlay" class="inline-overlay">
+  <div id="statsCard" class="inline-card stats-card">
+    <div class="inline-card-header">
+      <div class="inline-card-title">
+        <div id="statsTitleMain" class="inline-card-title-main"></div>
+        <div id="statsTitleSub" class="inline-card-title-sub"></div>
+      </div>
+      <div class="inline-card-actions">
+        <button class="icon-button" type="button" onclick="toggleStatsSize()" title="Maximize / Normalize">
+          <i class="fas fa-up-right-and-down-left-from-center"></i>
+        </button>
+        <button class="icon-button" type="button" onclick="closeStatsOverlay()" title="Close">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+    </div>
+    <div id="statsBody" class="inline-card-body">
+      <!-- stats content -->
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
