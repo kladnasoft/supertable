@@ -1,48 +1,155 @@
-<!-- SuperTables selection + summary (reusable) -->
-<div class="card" style="margin-top:12px;">
-  <div class="section">
-    <div class="grid">
-      <!-- LEFT: SuperTables selector -->
-      <div>
-        <label class="text-sm muted">SuperTables</label><br/>
-        <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
-          <!-- Filled dynamically from /meta/supers -->
-        </select>
-        <div class="text-xs muted" style="margin-top:6px;">
-          Select a SuperTable to view its tables.
-        </div>
-      </div>
+<div class="super-container" style="
+    /* Using the main content background color from the sidebar CSS */
+    background-color: #f3f6fb;
+    font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    padding: 24px;
+">
+    <div class="card-professional-themed" style="
+        background-color: #ffffff;
+        border-radius: 16px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+        /* INCREASED PADDING: 24px top/bottom, 50px left/right */
+        padding: 24px 50px;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        border-left: 5px solid #1c96ca; /* Primary Accent Color */
+    ">
+        <div class="grid-professional" style="
+            display: flex;
+            gap: 40px; /* Increased gap for better separation */
+            align-items: flex-start;
+        ">
+            <div style="flex-shrink: 0; min-width: 300px;">
+                <label style="
+                    display: block;
+                    font-size: 14px;
+                    color: #475569;
+                    margin-bottom: 8px;
+                    font-weight: 600;
+                ">Select SuperTable</label>
+                <select id="pairSel" onchange="onPairChange()" style="
+                    width: 100%;
+                    padding: 10px 12px;
+                    border: 1px solid #d0d7e7;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    background-color: #ffffff;
+                    cursor: pointer;
+                    appearance: none;
+                    background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fsvg%3E');
+                    background-repeat: no-repeat;
+                    background-position: right 10px center;
+                ">
+                    </select>
+                <div style="
+                    font-size: 12px;
+                    color: #8894a8;
+                    margin-top: 10px;
+                ">
+                    Select a SuperTable to view its aggregated data metrics.
+                </div>
+            </div>
 
-      <!-- RIGHT: summary cards -->
-      <div>
-        <div class="tenant-summary-grid">
-          <div class="metric-card">
-            <div class="metric-icon"><i class="fas fa-file"></i></div>
-            <div class="metric-content">
-              <div class="metric-label">Files</div>
-              <div class="metric-value" id="tenantFilesValue">n/a</div>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-icon"><i class="fas fa-bars"></i></div>
-            <div class="metric-content">
-              <div class="metric-label">Rows</div>
-              <div class="metric-value" id="tenantRowsValue">n/a</div>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-icon"><i class="fas fa-database"></i></div>
-            <div class="metric-content">
-              <div class="metric-label">Byte Size</div>
-              <div class="metric-value" id="tenantSizeValue">n/a</div>
-            </div>
-          </div>
-        </div>
-        <div class="tenant-updated">
-          Last updated: <span id="tenantUpdatedValue">n/a</span>
-        </div>
-      </div>
+            <div style="flex-grow: 1;">
+                <div class="summary-grid" style="
+                    display: grid;
+                    grid-template-columns: repeat(3, 1fr);
+                    gap: 15px;
+                ">
+                    <div class="metric-card-themed" style="
+                        background-color: #f5faff;
+                        border: 1px solid #e2e8f0;
+                        border-radius: 8px;
+                        padding: 15px;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                    ">
+                        <div class="metric-icon" style="
+                            color: #1c96ca; /* Primary Accent Color */
+                            font-size: 20px;
+                        "><i class="fas fa-file"></i></div>
+                        <div class="metric-content">
+                            <div class="metric-label" style="
+                                font-size: 12px;
+                                color: #475569;
+                                font-weight: 500;
+                            ">FILES</div>
+                            <div class="metric-value" id="tenantFilesValue" style="
+                                font-size: 20px;
+                                font-weight: 700;
+                                color: #34475e;
+                            ">n/a</div>
+                        </div>
+                    </div>
 
+                    <div class="metric-card-themed" style="
+                        background-color: #ffffff;
+                        border: 1px solid #d0d7e7;
+                        border-radius: 8px;
+                        padding: 15px;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                    ">
+                        <div class="metric-icon" style="
+                            color: #475569;
+                            font-size: 20px;
+                        "><i class="fas fa-bars"></i></div>
+                        <div class="metric-content">
+                            <div class="metric-label" style="
+                                font-size: 12px;
+                                color: #475569;
+                                font-weight: 500;
+                            ">ROWS</div>
+                            <div class="metric-value" id="tenantRowsValue" style="
+                                font-size: 20px;
+                                font-weight: 700;
+                                color: #34475e;
+                            ">n/a</div>
+                        </div>
+                    </div>
+
+                    <div class="metric-card-themed" style="
+                        background-color: #f5faff;
+                        border: 1px solid #e2e8f0;
+                        border-radius: 8px;
+                        padding: 15px;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                    ">
+                        <div class="metric-icon" style="
+                            color: #1c96ca; /* Primary Accent Color */
+                            font-size: 20px;
+                        "><i class="fas fa-database"></i></div>
+                        <div class="metric-content">
+                            <div class="metric-label" style="
+                                font-size: 12px;
+                                color: #475569;
+                                font-weight: 500;
+                            ">BYTE SIZE</div>
+                            <div class="metric-value" id="tenantSizeValue" style="
+                                font-size: 20px;
+                                font-weight: 700;
+                                color: #34475e;
+                            ">n/a</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tenant-updated" style="
+                    margin-top: 15px;
+                    text-align: right;
+                    font-size: 13px;
+                    color: #475569;
+                ">
+                    Last updated: <span id="tenantUpdatedValue" style="
+                        font-weight: 600;
+                        color: #34475e;
+                    ">n/a</span>
+                </div>
+            </div>
+
+        </div>
     </div>
-  </div>
 </div>

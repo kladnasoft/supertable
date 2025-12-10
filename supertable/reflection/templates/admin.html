@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SuperTable - Admin</title>
 
-  <!-- Fonts & Icons -->
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
@@ -14,7 +13,6 @@
         integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
         crossorigin="anonymous" referrerpolicy="no-referrer" />
 
-  <!-- jQuery + Bootstrap -->
   <link rel="stylesheet"
         href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -110,14 +108,12 @@
       flex-wrap: wrap;
     }
 
-    /* change this if you already have it, or add if not */
     .top-row .card {
-      flex: 1 1 280px;   /* Tenant + Mirrors are wider, flexible */
+      flex: 1 1 280px;
     }
 
-    /* NEW: make Root card narrower */
     .top-row .root-card {
-      flex: 0 0 250px;   /* smaller fixed-ish width for the middle card */
+      flex: 0 0 250px;
     }
 
     .muted { color: var(--text-light); }
@@ -188,6 +184,7 @@
       background: #f1f5f9;
       border: 1px solid #d0d7e7;
       font-size: 11px;
+      height: 22px; /* Uniform height for alignment in tabs */
     }
 
     .flex { display:flex; align-items:center; gap:10px; }
@@ -201,18 +198,31 @@
     }
 
     .tab {
-      padding:8px 12px;
-      border:1px solid #d0d7e7;
-      border-radius:10px;
-      cursor:pointer;
+      padding: 8px 12px;
+      border: 1px solid #d0d7e7;
+      border-radius: 10px;
+      cursor: pointer;
       font-size: 13px;
       background: #ffffff;
+      /* NEW: Flex to align icon, text, count, and button */
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .tab.active {
       background: #e6f4fa;
       border-color: var(--primary-color);
       color: var(--primary-color);
+    }
+
+    /* Styling for the small + button inside the tab */
+    .tab .btn-ghost-plus {
+        padding: 2px 6px;
+        font-size: 11px;
+        height: 22px;
+        line-height: 1;
+        margin-left: 2px; /* Small separation from the count chip */
     }
 
     .hidden { display:none; }
@@ -244,6 +254,66 @@
       word-wrap: break-word;
       font-size: 12px;
     }
+
+    /* --- Configuration styles --- */
+    .badge-ok {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 8px;
+      border-radius:999px;
+      background:#dcfce7;
+      border:1px solid #bbf7d0;
+      color:#166534;
+      font-size:11px;
+    }
+
+    .badge-warn {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 8px;
+      border-radius:999px;
+      background:#fef3c7;
+      border:1px solid #fde68a;
+      color:#92400e;
+      font-size:11px;
+    }
+
+    .list-compact {
+      list-style:none;
+      padding:0;
+      margin:0;
+    }
+    .list-compact li {
+      font-size:12px;
+      padding:4px 0;
+      border-bottom:1px dashed #e2e8f0;
+    }
+    .list-compact li:last-child { border-bottom:none; }
+
+    .pill {
+      display:inline-block;
+      border-radius:999px;
+      padding:2px 8px;
+      font-size:10px;
+      border:1px solid #cbd5e1;
+      background:#f8fafc;
+      color:#475569;
+    }
+
+    .value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      word-break: break-all;
+    }
+
+    .value-muted {
+      color:#94a3b8;
+      font-style:italic;
+    }
+    /* ----------------------------------------------- */
   </style>
 
   <script>
@@ -290,6 +360,22 @@
       showModal('Role '+hash, JSON.stringify(data, null, 2));
     }
 
+    async function viewMirror(hash) {
+      const sel = document.getElementById('pairSel');
+      const [org, sup] = sel.value.split('|');
+      const data = await api(`/api/mirror/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      showModal('Mirror '+hash, JSON.stringify(data, null, 2));
+    }
+
+    // Placeholder functions for the '+' buttons
+    function createUserModal() {
+        showModal('Create New User', 'User creation form would appear here.');
+    }
+    function createRoleModal() {
+        showModal('Create New Role', 'Role creation form would appear here.');
+    }
+
+    // FIX: Ensure this function correctly hides/shows the panes
     function switchTab(id) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tabpane').forEach(p => p.classList.add('hidden'));
@@ -320,14 +406,14 @@
         $("#sidebar").addClass("sidebar-collapsed");
       }
 
+      // Set active link for sidebar
       var path = window.location.pathname;
-      if (path.startsWith("/admin/config")) {
-        $("#link-config").addClass("active");
-      } else if (path.startsWith("/admin/execute")) {
+      if (path.startsWith("/admin/execute")) {
         $("#link-execute").addClass("active");
       } else if (path.startsWith("/admin/tables")) {
         $("#link-tables").addClass("active");
       } else {
+        // If on /admin, link-admin is active
         $("#link-admin").addClass("active");
       }
     });
@@ -336,7 +422,6 @@
 <body>
   {% include "sidebar.html" %}
 
-  <!-- MAIN CONTENT -->
   <div class="content-container">
     {% if not authorized %}
       <div class="wrap"><p>Unauthorized</p></div>
@@ -352,9 +437,7 @@
         </div>
       </div>
 
-      <!-- Tenant + Root / Mirrors / Tables in a single row -->
       <div class="top-row">
-        <!-- Tenant card -->
         <div class="card">
           <div class="section">
             <div class="grid">
@@ -379,7 +462,6 @@
         </div>
 
         {% if has_tenant %}
-        <!-- Root card -->
         <div class="card root-card">
           <div class="section">
             <div class="muted text-sm">Root</div>
@@ -393,15 +475,14 @@
           </div>
         </div>
 
-        <!-- Mirrors card -->
         <div class="card">
           <div class="section">
-            <div class="muted text-sm">Mirrors</div>
+            <div class="muted text-sm">Mirrors (Formats)</div>
             <div class="mt-2 flex">
               {% for fmt in ["DELTA","ICEBERG","PARQUET"] %}
                 <label class="chip" style="gap:6px;">
                   <input type="checkbox"
-                         {% if fmt in mirrors %}checked{% endif %}
+                         {% if fmt in mirrors_enabled_formats %}checked{% endif %}
                          onchange="toggleMirror('{{fmt}}', this)"/>
                   {{fmt}}
                 </label>
@@ -412,17 +493,31 @@
         {% endif %}
       </div>
 
-      <!-- Users / Roles tabs (non-table stuff) -->
       <div class="tabs">
         <div id="tab-users" class="tab active" onclick="switchTab('users')">
           <i class="fas fa-users"></i>&nbsp;Users
+          <span class="chip">{{ users | length }}</span>
+          <button class="btn-ghost btn-ghost-plus" onclick="createUserModal()">
+              <i class="fas fa-plus"></i>
+          </button>
         </div>
         <div id="tab-roles" class="tab" onclick="switchTab('roles')">
           <i class="fas fa-user-shield"></i>&nbsp;Roles
+          <span class="chip">{{ roles | length }}</span>
+          <button class="btn-ghost btn-ghost-plus" onclick="createRoleModal()">
+              <i class="fas fa-plus"></i>
+          </button>
+        </div>
+        <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
+          <i class="fas fa-mirror"></i>&nbsp;Mirrors
+          <span class="chip">{{ mirrors | length }}</span>
+        </div>
+        <div id="tab-config" class="tab" onclick="switchTab('config')">
+          <i class="fas fa-cog"></i>&nbsp;Config
+          <span class="chip">{% if dotenv_found %}Loaded{% else %}Missing{% endif %}</span>
         </div>
       </div>
 
-      <!-- Users pane -->
       <div id="pane-users" class="tabpane">
         <div class="card mt-4">
           <div class="section">
@@ -459,7 +554,6 @@
         </div>
       </div>
 
-      <!-- Roles pane -->
       <div id="pane-roles" class="tabpane hidden">
         <div class="card mt-4">
           <div class="section">
@@ -494,7 +588,163 @@
         </div>
       </div>
 
-      <!-- Modal -->
+      <div id="pane-mirrors" class="tabpane hidden">
+        <div class="card mt-4">
+          <div class="section">
+            <div class="muted text-sm">Mirrors</div>
+            <div class="mt-2">
+              <table>
+                <thead>
+                  <tr class="border-b">
+                    <th class="px-3 py-2 text-xs muted">hash</th>
+                    <th class="px-3 py-2 text-xs muted">Source Leaf</th>
+                    <th class="px-3 py-2 text-xs muted">Target Leaf</th>
+                    <th class="px-3 py-2 text-xs muted">Enabled Formats</th>
+                    <th class="px-3 py-2 text-xs muted">actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for m in mirrors %}
+                  <tr class="border-b">
+                    <td class="px-3 py-2 font-mono text-sm">{{ m.hash }}</td>
+                    <td class="px-3 py-2 text-sm break-all">{{ m.get('source_leaf','') }}</td>
+                    <td class="px-3 py-2 text-sm break-all">{{ m.get('target_leaf','') }}</td>
+                    <td class="px-3 py-2 text-sm">
+                        {% for fmt in m.get('formats', []) %}
+                            <span class="chip">{{ fmt }}</span>
+                        {% endfor %}
+                    </td>
+                    <td class="px-3 py-2 text-sm">
+                      <button class="btn-ghost" onclick="viewMirror('{{ m.hash }}')">
+                        Display
+                      </button>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="pane-config" class="tabpane hidden">
+        <div class="text-sm muted" style="margin-top:16px;">
+          .env discovery and effective settings (Python settings vs. dotenv file).
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <div class="section">
+            <div class="row">
+              <div class="col-md-7">
+                <div class="text-sm muted">Loaded .env</div>
+                <div style="margin-top:6px;">
+                  {% if dotenv_found %}
+                    <span class="badge-ok">
+                      <i class="fas fa-check-circle"></i>
+                      .env file found and loaded
+                    </span>
+                    <div class="text-xs" style="margin-top:8px;">
+                      <strong>Path:</strong>
+                      <span class="value">{{ dotenv_path }}</span>
+                    </div>
+                  {% else %}
+                    <span class="badge-warn">
+                      <i class="fas fa-exclamation-triangle"></i>
+                      No .env file found in the searched locations
+                    </span>
+                  {% endif %}
+                </div>
+              </div>
+              <div class="col-md-5">
+                <div class="text-sm muted">Search order</div>
+                <ul class="list-compact" style="margin-top:4px;">
+                  {% for p, exists in tried %}
+                    <li>
+                      {% if exists %}
+                        <i class="fas fa-dot-circle" style="color:#16a34a; font-size:8px;"></i>
+                      {% else %}
+                        <i class="far fa-circle" style="color:#94a3b8; font-size:8px;"></i>
+                      {% endif %}
+                      <span class="value{% if not exists %} value-muted{% endif %}">
+                        {{ p }}
+                      </span>
+                      {% if exists %}
+                        <span class="pill" style="margin-left:6px;">exists</span>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div class="section">
+            <div class="text-sm muted">Settings</div>
+            <div class="text-xs muted" style="margin-top:4px;">
+              Comparison of values coming from the loaded <code>.env</code> (if any) vs.
+              effective runtime settings. Sensitive values are hidden.
+            </div>
+
+            <div style="margin-top:12px; overflow:auto; max-height:65vh;">
+              <table>
+                <thead>
+                  <tr class="border-b">
+                    <th class="px-3 py-2 text-xs muted">Key</th>
+                    <th class="px-3 py-2 text-xs muted">.env value</th>
+                    <th class="px-3 py-2 text-xs muted">Effective value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rows %}
+                    <tr class="border-b">
+                      <td class="px-3 py-2 text-sm">
+                        <span class="value">{{ row.key }}</span>
+                        {% if row.is_sensitive %}
+                          <span class="pill" style="margin-left:6px;">
+                            <i class="fas fa-lock" style="font-size:9px;"></i>&nbsp;sensitive
+                          </span>
+                        {% endif %}
+                      </td>
+                      <td class="px-3 py-2 text-sm">
+                        {% if row.env_val is not none %}
+                          {% if row.is_sensitive %}
+                            <span class="value value-muted">••••••••</span>
+                          {% else %}
+                            <span class="value">{{ row.env_val }}</span>
+                          {% endif %}
+                        {% else %}
+                          <span class="value value-muted">—</span>
+                        {% endif %}
+                      </td>
+                      <td class="px-3 py-2 text-sm">
+                        {% if row.eff_val is not none %}
+                          {% if row.is_sensitive %}
+                            <span class="value value-muted">••••••••</span>
+                          {% else %}
+                            <span class="value">{{ row.eff_val }}</span>
+                          {% endif %}
+                        {% else %}
+                          <span class="value value-muted">—</span>
+                        {% endif %}
+                      </td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+
+            <div style="margin-top:10px; text-align:right;">
+              <button class="btn-ghost" onclick="location.reload()">
+                <i class="fas fa-sync-alt"></i>&nbsp;Reload
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+
       <div id="modal" class="modal"
            onclick="if(event.target.id==='modal'){closeModal()}">
         <div class="panel">

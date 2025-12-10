@@ -25,7 +25,6 @@ try:
 except Exception:
     from data_reader import DataReader, engine  # type: ignore
 
-
 router = APIRouter(prefix="", tags=["API"])
 logger = logging.getLogger(__name__)
 
@@ -61,8 +60,8 @@ def _engine_from_str(s: Optional[str]) -> Any:
 
 @router.post("/api/execute")
 def api_execute_sql(
-    payload: ExecuteRequest = Body(...),
-    _: Any = Depends(admin_guard_api),
+        payload: ExecuteRequest = Body(...),
+        _: Any = Depends(admin_guard_api),
 ):
     """Execute SQL against a SuperTable using DataReader, returning a small preview + meta."""
     try:
@@ -122,6 +121,20 @@ def api_execute_sql(
             else []
         )
 
+        # --- FIX START: Ensure meta1 and meta2 are JSON-serializable ---
+        # If meta1 or meta2 are complex objects (e.g., Pydantic models) they might
+        # cause serialization issues if they contain lists. Explicitly convert them.
+        if hasattr(meta1, 'dict'):
+            meta1 = meta1.dict()
+        elif hasattr(meta1, 'to_dict'):
+            meta1 = meta1.to_dict()
+
+        if hasattr(meta2, 'dict'):
+            meta2 = meta2.dict()
+        elif hasattr(meta2, 'to_dict'):
+            meta2 = meta2.to_dict()
+        # --- FIX END: Ensure meta1 and meta2 are JSON-serializable ---
+
         return {
             "ok": True,
             "engine": str(eng),
@@ -152,8 +165,8 @@ def api_execute_sql(
 
 @router.get("/meta/supers")
 def api_list_supers(
-    organization: str = Query(..., description="Organization identifier"),
-    _: Any = Depends(admin_guard_api),
+        organization: str = Query(..., description="Organization identifier"),
+        _: Any = Depends(admin_guard_api),
 ):
     try:
         return {
@@ -167,9 +180,9 @@ def api_list_supers(
 
 @router.get("/meta/tables")
 def api_list_tables(
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    _: Any = Depends(admin_guard_api),
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        _: Any = Depends(admin_guard_api),
 ):
     try:
         return {
@@ -187,10 +200,10 @@ def api_list_tables(
 
 @router.get("/meta/super")
 def api_get_super_meta(
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    user_hash: str = Query(...),
-    _: Any = Depends(admin_guard_api),
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        user_hash: str = Query(...),
+        _: Any = Depends(admin_guard_api),
 ):
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
@@ -201,11 +214,11 @@ def api_get_super_meta(
 
 @router.get("/meta/schema")
 def api_get_table_schema(
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    table: str = Query(..., description="Table simple name"),
-    user_hash: str = Query(...),
-    _: Any = Depends(admin_guard_api),
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Table simple name"),
+        user_hash: str = Query(...),
+        _: Any = Depends(admin_guard_api),
 ):
     """Correct usage: pass the table (simple) name — NOT the super_name."""
     try:
@@ -219,11 +232,11 @@ def api_get_table_schema(
 
 @router.get("/meta/stats")
 def api_get_table_stats(
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    table: str = Query(..., description="Table simple name"),
-    user_hash: str = Query(...),
-    _: Any = Depends(admin_guard_api),
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Table simple name"),
+        user_hash: str = Query(...),
+        _: Any = Depends(admin_guard_api),
 ):
     """Correct usage: pass the table (simple) name — NOT the super_name."""
     try:
@@ -240,15 +253,15 @@ def api_get_table_stats(
 
 @router.get("/leaf/{simple_name}")
 def api_leaf(
-    simple_name: str,
-    organization: str = Query(..., alias="org"),
-    super_name: str = Query(..., alias="sup"),
-    mode: str = Query("meta"),
-    user_hash: Optional[str] = Query(
-        None,
-        description="User hash; optional, defaults to 'ui' if not provided",
-    ),
-    _: Any = Depends(admin_guard_api),
+        simple_name: str,
+        organization: str = Query(..., alias="org"),
+        super_name: str = Query(..., alias="sup"),
+        mode: str = Query("meta"),
+        user_hash: Optional[str] = Query(
+            None,
+            description="User hash; optional, defaults to 'ui' if not provided",
+        ),
+        _: Any = Depends(admin_guard_api),
 ):
     """
     Leaf endpoint with mode-based behavior.
@@ -304,7 +317,6 @@ def api_leaf(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Leaf handler failed: {e}")
-
 
 
 # Health check

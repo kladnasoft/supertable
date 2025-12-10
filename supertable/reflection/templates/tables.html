@@ -20,7 +20,12 @@
   <!-- DataTables -->
   <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
 
-  <style>
+<style>
+    /*
+     * Professional Styling Refinements
+     * Focus: Cleanliness, Readability, Hierarchy.
+     * Colors: Kept as per original.
+     */
     :root {
       --primary-color: #1c96ca;
       --primary-light: #e6f4fa;
@@ -32,7 +37,9 @@
       --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
-      --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05); /* Slightly softer shadow */
+      --header-bg: #f8fafc; /* New: light background for card headers */
+      --data-table-header-bg: #f1f5f9; /* Existing: Light grey for table headers */
     }
 
     * {
@@ -42,9 +49,10 @@
     html, body {
       margin: 0;
       padding: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; /* Added common fallbacks */
       background: #f3f6fb;
       color: var(--text-color);
+      line-height: 1.5; /* Improved readability */
     }
 
     a {
@@ -56,7 +64,6 @@
       text-decoration: underline;
     }
 
-    /* ------------ MAIN CONTENT ------------ */
     .content-container {
       margin-left: 280px;
       min-height: 100vh;
@@ -77,13 +84,13 @@
 
     .card {
       background: var(--panel-bg);
-      border-radius: 16px;
+      border-radius: 12px; /* Slightly smaller radius for a cleaner look */
       box-shadow: var(--panel-shadow);
       border: 1px solid var(--panel-border);
     }
 
     .section {
-      padding: 16px 20px;
+      padding: 20px 24px; /* Increased padding */
     }
 
     .muted {
@@ -91,11 +98,12 @@
     }
 
     .text-xs {
-      font-size: 11px;
+      font-size: 10.5px; /* Slightly smaller for subtle text */
+      font-weight: 500;
     }
 
     .text-sm {
-      font-size: 12px;
+      font-size: 13px; /* Slightly larger for main text */
     }
 
     .grid {
@@ -105,29 +113,24 @@
       align-items: center;
     }
 
-    .header-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-
     .btn-ghost {
-      padding: 6px 10px;
+      padding: 6px 12px;
       border-radius: 8px;
-      border: 1px solid #d0d7e7;
+      border: 1px solid var(--panel-border); /* Used variable */
       background: transparent;
       color: #475569;
       cursor: pointer;
-      font-size: 12px;
+      font-size: 13px; /* Slightly larger text */
+      transition: var(--transition);
+      font-weight: 500;
     }
 
     .btn-ghost:hover {
-      background: #e2e8f0;
+      background: #f1f5f9; /* Subtle hover color */
+      border-color: #cbd5e1;
     }
 
-    /* Tables page specifics */
+    /* --- Tables Header Refinement --- */
     .tables-header {
       display: flex;
       align-items: center;
@@ -136,36 +139,99 @@
     }
 
     .tables-header h4 {
-      font-size: 22px;
+      font-size: 20px; /* Refined size */
       margin: 0;
+      font-weight: 600;
+      color: var(--text-color);
     }
 
     .total-count {
       font-weight: 700;
-      color: #111827;
+      color: var(--text-color);
       font-size: 14px;
       margin-left: 4px;
     }
 
+    /* --- DataTables & Table Styling --- */
     #tablesTable {
       width: 100%;
+      margin-top: 10px !important;
     }
 
     #tablesTable thead {
-      background: #f1f5f9;
+      background: var(--data-table-header-bg);
     }
 
     #tablesTable th {
-      font-size: 11px;
+      font-size: 10.5px;
       text-transform: uppercase;
-      letter-spacing: .04em;
+      letter-spacing: .05em; /* Increased spacing */
       color: #6b7280;
       border-bottom: 1px solid #e5e7eb !important;
+      padding: 10px 18px 10px 10px; /* Improved vertical padding */
+      font-weight: 600;
+    }
+
+    #tablesTable th:first-child {
+        padding-left: 18px;
     }
 
     #tablesTable td {
       font-size: 13px;
       vertical-align: middle;
+      padding: 12px 18px 12px 10px; /* Improved vertical padding */
+      border-bottom: 1px solid #f1f5f9; /* Lighter separator */
+    }
+
+    #tablesTable td:first-child {
+        padding-left: 18px;
+    }
+
+    /* DataTables search input professional style */
+    div.dataTables_wrapper div.dataTables_filter input {
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        padding: 5px 10px;
+        font-size: 13px;
+        color: var(--text-color);
+        width: 180px;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        margin-left: 0.5em; /* Keep it right of the label */
+        height: 34px;
+    }
+
+    div.dataTables_wrapper div.dataTables_filter input:focus {
+        border-color: var(--primary-color);
+        outline: none;
+        box-shadow: 0 0 0 2px var(--primary-light);
+    }
+
+    div.dataTables_wrapper div.dataTables_filter label {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text-light);
+    }
+
+    /* DataTables info and pagination text */
+    div.dataTables_wrapper div.dataTables_info,
+    div.dataTables_wrapper div.dataTables_paginate {
+        font-size: 12px;
+        color: var(--text-light);
+    }
+
+    /* DataTables pagination buttons */
+    div.dataTables_wrapper div.dataTables_paginate .paginate_button {
+        padding: 4px 8px;
+        font-size: 12px;
+        border-radius: 6px;
+        transition: background-color 0.2s;
+    }
+
+    div.dataTables_wrapper div.dataTables_paginate .paginate_button.current,
+    div.dataTables_wrapper div.dataTables_paginate .paginate_button.current:hover {
+        background-color: var(--primary-color);
+        color: white !important;
+        border: 1px solid var(--primary-color);
     }
 
     .table-name-cell {
@@ -173,28 +239,39 @@
       color: #0f172a;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px; /* Slightly larger gap */
     }
 
     .table-name-cell i {
-      color: #1c96ca;
-      font-size: 12px;
+      color: var(--primary-color);
+      font-size: 14px; /* Slightly larger icon */
+      flex-shrink: 0;
     }
 
-    .actions-cell .btn-sm {
-      font-size: 11px;
-      border-radius: 999px;
-      padding: 3px 8px;
-    }
+ /* Custom styling for SOLID primary buttons */
+.actions-cell .btn-primary {
+    background-color: var(--primary-color);
+    border-color: var(--primary-color);
+    color: white; /* Ensure text is white for contrast */
+}
 
-    /* JSON Modal */
+.actions-cell .btn-primary:hover,
+.actions-cell .btn-primary:focus,
+.actions-cell .btn-primary:active {
+    /* Slightly darker blue for a professional hover effect */
+    background-color: var(--secondary-color); /* Uses the darker blue: #147ba3 */
+    border-color: var(--secondary-color);
+    color: white;
+}
+
+    /* --- Modal & Overlay Styling --- */
     #modal {
       position: fixed;
       inset: 0;
       display: none;
       align-items: center;
       justify-content: center;
-      background: rgba(15, 23, 42, 0.55);
+      background: rgba(15, 23, 42, 0.65); /* Darker overlay */
       z-index: 1200;
     }
 
@@ -202,56 +279,64 @@
       width: min(800px, 90vw);
       max-height: 80vh;
       background: white;
-      border-radius: 16px;
+      border-radius: 12px; /* Smaller radius */
       box-shadow: 0 20px 60px rgba(15, 23, 42, 0.4);
       display: flex;
       flex-direction: column;
     }
 
     #m-header {
-      padding: 12px 16px;
+      padding: 14px 18px; /* Improved padding */
       border-bottom: 1px solid #e5e7eb;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      background: var(--header-bg); /* Light header background */
+      border-top-left-radius: 12px;
+      border-top-right-radius: 12px;
     }
 
     #m-body {
-      padding: 12px 16px;
+      padding: 16px; /* Improved padding */
       overflow: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size: 12px;
-      background: #0f172a;
-      color: #e5e7eb;
-      border-bottom-left-radius: 16px;
-      border-bottom-right-radius: 16px;
-      white-space: pre;
+      background: #1e293b; /* Darker background for code */
+      color: #e2e8f0; /* Lighter text color */
+      border-bottom-left-radius: 12px;
+      border-bottom-right-radius: 12px;
+      white-space: pre-wrap; /* Allows long lines to wrap */
+      word-break: break-all;
     }
 
-    /* ---------- SHARED METRIC CARDS ---------- */
-
+    /* --- Metric Cards --- */
     .metric-card {
       display: flex;
       align-items: center;
-      padding: 10px 10px;
-      border-radius: 12px;
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      min-height: 60px;
+      padding: 12px; /* Increased padding */
+      border-radius: 10px;
+      background: var(--panel-bg); /* Changed from f9fafb to white for cleaner look */
+      border: 1px solid var(--panel-border);
+      min-height: 70px; /* Taller card */
+      transition: box-shadow 0.2s;
+    }
+
+    .metric-card:hover {
+        box-shadow: 0 4px 15px rgba(28, 150, 202, 0.08);
     }
 
     .metric-icon {
-      width: 32px;
-      height: 32px;
+      width: 40px; /* Larger icon container */
+      height: 40px;
       border-radius: 999px;
       display: flex;
       align-items: center;
       justify-content: center;
-      margin-right: 10px;
-      background: #e0f2fe;
-      color: #0369a1;
+      margin-right: 12px;
+      background: var(--primary-light);
+      color: var(--primary-color);
       flex-shrink: 0;
-      font-size: 14px;
+      font-size: 16px; /* Larger icon */
     }
 
     .metric-content {
@@ -262,48 +347,43 @@
     .metric-label {
       font-size: 11px;
       color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
     }
 
     .metric-value {
-      font-size: 14px;
-      font-weight: 600;
-      margin-top: 2px;
-    }
-
-    .tenant-summary-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 8px;
+      font-size: 16px; /* Larger value */
+      font-weight: 700;
       margin-top: 4px;
+      color: #111827;
     }
 
-    .tenant-updated {
-      margin-top: 6px;
-      font-size: 11px;
-      color: #6b7280;
-      text-align: right;
-    }
-
+    /* --- Utility/Action Buttons --- */
     .btn-xs {
-      padding: 3px 7px;
+      padding: 4px 9px;
       font-size: 11px;
-      border-radius: 999px;
+      border-radius: 6px;
       border: 1px solid #d0d7e7;
       background: #f9fafb;
       cursor: pointer;
+      font-weight: 500;
     }
 
     .btn-xs:hover {
       background: #e5f3ff;
+      border-color: #a3c4dc;
     }
 
     .icon-button {
       border: none;
       background: transparent;
       cursor: pointer;
-      padding: 4px;
-      border-radius: 999px;
+      padding: 6px; /* Larger hit area */
+      border-radius: 8px;
       color: #6b7280;
+      transition: var(--transition);
+      font-size: 14px;
     }
 
     .icon-button:hover {
@@ -316,51 +396,14 @@
       transition: background 0.2s ease;
     }
 
-    /* ---------- OVERVIEW CONTENT (inside overlay) ---------- */
-
-    .overview-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-
-    .overview-title {
-      font-weight: 600;
-      font-size: 14px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .overview-subtitle {
-      font-size: 11px;
-      color: #6b7280;
-    }
-
-    .overview-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-      margin: 10px 0 0 0;
-    }
-
-    @media (max-width: 768px) {
-      .overview-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    /* ---------- GENERIC CENTERED OVERLAYS (OVERVIEW + SCHEMA + STATS) ---------- */
-
+    /* --- Inline Overlay/Card --- */
     .inline-overlay {
       position: fixed;
       inset: 0;
       display: none;
       align-items: center;
       justify-content: center;
-      background: rgba(15, 23, 42, 0.55);
+      background: rgba(15, 23, 42, 0.65); /* Darker overlay */
       z-index: 1400;
     }
 
@@ -368,7 +411,7 @@
       width: min(900px, 94vw);
       max-height: 84vh;
       background: #ffffff;
-      border-radius: 16px;
+      border-radius: 12px; /* Smaller radius */
       box-shadow: 0 24px 60px rgba(15, 23, 42, 0.4);
       display: flex;
       flex-direction: column;
@@ -377,26 +420,28 @@
     }
 
     .inline-card-header {
-      padding: 12px 16px;
+      padding: 14px 18px; /* Improved padding */
       border-bottom: 1px solid #e5e7eb;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+      background: var(--header-bg); /* Light header background */
     }
 
     .inline-card-title {
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      gap: 4px; /* Increased gap */
     }
 
     .inline-card-title-main {
-      font-size: 14px;
+      font-size: 16px; /* Larger title */
       font-weight: 600;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
+      color: #111827;
     }
 
     .inline-card-title-sub {
@@ -411,40 +456,42 @@
     }
 
     .inline-card-body {
-      padding: 12px 16px;
+      padding: 16px; /* Increased padding */
       overflow: auto;
       background: #f9fafb;
-      font-size: 12px;
+      font-size: 13px;
     }
 
+    /* --- Schema/Stats Specific Styles --- */
     .schema-peek {
       margin-top: 4px;
       padding-top: 4px;
     }
 
     .schema-peek-title {
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 600;
       color: #4b5563;
-      margin-bottom: 4px;
+      margin-bottom: 8px; /* Increased bottom margin */
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
     }
 
     .schema-peek-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 11px;
+      font-size: 12px;
       background: #ffffff;
-      border-radius: 10px;
+      border-radius: 8px; /* Smaller radius */
       overflow: hidden;
+      border: 1px solid #e5e7eb; /* Border for the table block */
     }
 
     .schema-peek-table th,
     .schema-peek-table td {
-      padding: 4px 6px;
-      border-bottom: 1px solid #e5e7eb;
+      padding: 8px 10px;
+      border-bottom: 1px solid #f1f5f9;
       text-align: left;
       white-space: nowrap;
     }
@@ -453,17 +500,17 @@
       font-weight: 600;
       color: #6b7280;
       text-transform: uppercase;
-      font-size: 10px;
-      background: #f1f5f9;
+      font-size: 10.5px;
+      background: #f8fafc; /* Lighter header */
     }
 
     .schema-peek-more {
-      font-size: 10px;
+      font-size: 11px;
       color: #6b7280;
-      margin-top: 4px;
+      margin-top: 8px;
+      padding: 0 2px;
     }
 
-    /* Schema search + type pills */
     .schema-search-wrapper {
       margin: 8px 0 6px 0;
       display: flex;
@@ -473,57 +520,106 @@
 
     .schema-search-input {
       flex: 1;
-      font-size: 11px;
-      border-radius: 999px;
+      font-size: 13px;
+      border-radius: 8px; /* Squarer input */
       border: 1px solid #d0d7e7;
-      padding: 4px 10px;
+      padding: 6px 12px; /* Better padding */
       outline: none;
+      margin-bottom: 4px;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
 
     .schema-search-input:focus {
       border-color: var(--primary-color);
-      box-shadow: 0 0 0 1px rgba(28, 150, 202, 0.2);
+      box-shadow: 0 0 0 2px var(--primary-light);
     }
 
     .schema-type-pill {
       display: inline-block;
-      border-radius: 999px;
-      padding: 2px 6px;
-      font-size: 10px;
+      border-radius: 6px; /* Squarer pill */
+      padding: 3px 8px;
+      font-size: 11px;
       font-weight: 500;
+      line-height: 1;
     }
 
-    .schema-type-string {
-      background: #eff6ff;
-      color: #1d4ed8;
+    /* --- Professional Schema Group Styles --- */
+    .schema-group {
+      margin-bottom: 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px; /* Smaller radius */
+      background: #ffffff;
+      box-shadow: none; /* Removed internal shadow for cleaner look */
+      overflow: hidden;
     }
 
-    .schema-type-number {
-      background: #ecfdf3;
-      color: #16a34a;
+    .schema-group-header {
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #1f2937;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #f8fafc;
+      border-bottom: 1px solid #e5e7eb;
+      transition: background 0.2s;
     }
 
-    .schema-type-date {
-      background: #fef3c7;
-      color: #92400e;
+    .schema-group-header:hover {
+      background: #f1f5f9;
     }
 
-    .schema-type-bool {
-      background: #fee2e2;
-      color: #b91c1c;
+    .schema-group-header i {
+        transition: transform 0.2s ease;
     }
 
-    .schema-type-other {
-      background: #e5e7eb;
-      color: #374151;
+    .schema-group-body.open ~ .schema-group-header i {
+        transform: rotate(180deg);
     }
 
-    /* ---------- STATS OVERLAY EXTRA ---------- */
-
-    .stats-card {
-      /* base size; fullscreen via .overlay-fullscreen */
+    .schema-group-body {
+      padding: 0; /* Padding moved to table */
+      display: none;
+      max-height: 400px;
+      overflow-y: auto;
     }
 
+    .schema-group-body.open {
+      display: block;
+      padding-bottom: 8px;
+    }
+
+    .schema-table {
+      width: 100%;
+      font-size: 12px;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+
+    .schema-table th {
+      background: #f1f5f9;
+      text-transform: uppercase;
+      font-weight: 600;
+      font-size: 10px;
+      color: #6b7280;
+      padding: 6px 12px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+
+    .schema-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid #f1f5f9;
+      white-space: nowrap;
+    }
+
+    .schema-colname {
+      font-weight: 500;
+      color: #1e293b;
+    }
+
+    /* --- Stats Panel Refinements --- */
     .overlay-fullscreen {
       width: 96vw !important;
       height: 94vh !important;
@@ -533,69 +629,93 @@
     .stats-summary-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
+      gap: 12px; /* Increased gap */
+      margin-bottom: 16px; /* Increased margin */
     }
 
     .stats-layout {
       display: grid;
       grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-      gap: 12px;
+      gap: 16px; /* Increased gap */
     }
 
     .stats-panel {
       background: #ffffff;
-      border-radius: 12px;
+      border-radius: 10px;
       border: 1px solid #e5e7eb;
-      padding: 10px 10px;
+      padding: 12px 16px; /* Increased padding */
+      box-shadow: 0 2px 4px rgba(15,23,42,0.02);
     }
 
     .stats-panel-title {
-      font-size: 11px;
-      font-weight: 600;
-      color: #4b5563;
-      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #374151;
+      margin-bottom: 8px;
       display: flex;
       align-items: center;
       gap: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .stats-panel-title i {
+        color: var(--primary-color);
+        font-size: 14px;
     }
 
     .stats-colstats-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 11px;
+      font-size: 12px;
+      margin-top: 8px;
     }
 
     .stats-colstats-table th,
     .stats-colstats-table td {
-      padding: 4px 6px;
-      border-bottom: 1px solid #e5e7eb;
+      padding: 6px 8px;
+      border-bottom: 1px solid #f1f5f9;
       text-align: left;
       white-space: nowrap;
     }
 
     .stats-colstats-table th {
-      background: #f1f5f9;
+      background: #f8fafc;
       font-weight: 600;
       color: #6b7280;
       text-transform: uppercase;
       font-size: 10px;
     }
 
+    .stats-colstats-table tbody tr:last-child td {
+        border-bottom: none;
+    }
+
     .stats-search-input {
       width: 100%;
-      font-size: 11px;
-      border-radius: 999px;
+      font-size: 13px;
+      border-radius: 8px;
       border: 1px solid #d0d7e7;
-      padding: 4px 10px;
+      padding: 6px 12px;
       outline: none;
       margin-bottom: 4px;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
 
     .stats-search-input:focus {
       border-color: var(--primary-color);
-      box-shadow: 0 0 0 1px rgba(28, 150, 202, 0.2);
+      box-shadow: 0 0 0 2px var(--primary-light);
     }
+
+    /* Stats Table */
+    #statsTable tbody tr {
+        cursor: pointer;
+    }
+
+    #statsTable tbody tr:hover {
+        background-color: #f1f5f9;
+    }
+
 
     @media (max-width: 900px) {
       .stats-layout {
@@ -606,35 +726,36 @@
       }
     }
 
-    /* Column width tweaks */
-    #tablesTable th.col-files {
-      width: 80px;
+    /* --- Table Column Widths (Keep these specific) --- */
+    #tablesTable th.col-files { width: 80px; }
+    #tablesTable th.col-rows { width: 110px; }
+    #tablesTable th.col-size { width: 140px; }
+    #tablesTable th.col-updated { width: 190px; }
+    #tablesTable th.col-details { width: 260px; }
+
+    /* Fix for the professional header bar separator */
+    .d-flex.justify-content-between.align-items-center.mb-3 {
+        border-bottom: 1px solid #e5e7eb;
+        padding-bottom: 12px !important;
+        margin-bottom: 16px !important;
     }
 
-    #tablesTable th.col-rows {
-      width: 110px;
+    .d-flex.align-items-center.mb-3 {
+      gap: 12px;
     }
 
-    #tablesTable th.col-size {
-      width: 140px;
+    /* Ensure action buttons in DataTables don't wrap too aggressively */
+    .actions-cell {
+        white-space: nowrap;
     }
 
-    #tablesTable th.col-updated {
-      width: 190px;
-    }
-
-    #tablesTable th.col-details {
-      width: 260px;
-    }
-
-  </style>
+</style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
   <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
 
   <script>
-    // Shared admin API helper function
     function api(path, opts) {
       opts = opts || {};
       opts.headers = opts.headers || {};
@@ -650,7 +771,6 @@
       });
     }
 
-    // --- Meta service constants ---
     const META_BASE = 'http://0.0.0.0:8080';
     const ORGANIZATION = 'kladna-soft';
     const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
@@ -668,25 +788,9 @@
       currentSuper = sup;
       const label = document.getElementById('tenantLabel');
       if (label) {
-        label.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + sup;
+        label.textContent = 'SuperTable: ' + sup;
       }
       loadTenantSuper(sup);
-    }
-
-    function goBackAdmin() {
-      const sel = document.getElementById('pairSel');
-      const sup = sel ? sel.value : currentSuper;
-      const url = new URL('/admin', window.location.origin);
-      url.searchParams.set('org', ORGANIZATION);
-      if (sup) url.searchParams.set('sup', sup);
-      window.location.href = url.toString();
-    }
-
-    function gotoPage(p) {
-      // no longer used (client-side paging with DataTables)
-      const params = new URLSearchParams(window.location.search);
-      params.set('page', p);
-      window.location.search = params.toString();
     }
 
     function showModal(title, body) {
@@ -699,14 +803,12 @@
       document.getElementById('modal').style.display = 'none';
     }
 
-    // ---------- Small helpers ----------
-
     function escapeHtml(str) {
       return String(str).replace(/[&<>"']/g, function (c) {
         return {
           '&': '&amp;',
           '<': '&lt;',
-          '>': '&gt;',
+          '>': '&lt;',
           '"': '&quot;',
           "'": '&#39;'
         }[c] || c;
@@ -733,17 +835,15 @@
     }
 
     function tryParseNumber(v) {
-      if (v === null || v === undefined) return null;
+      if (v == null) return null;
       const n = parseFloat(v);
-      if (Number.isNaN(n)) return null;
-      return n;
+      return Number.isNaN(n) ? null : n;
     }
 
     function tryParseDate(v) {
       if (!v && v !== 0) return null;
       const d = new Date(v);
-      if (Number.isNaN(d.getTime())) return null;
-      return d;
+      return Number.isNaN(d.getTime()) ? null : d;
     }
 
     function humanizeCount(n) {
@@ -777,11 +877,7 @@
 
     function formatNumber(n) {
       if (n == null) return 'n/a';
-      try {
-        return n.toLocaleString();
-      } catch (e) {
-        return String(n);
-      }
+      try { return n.toLocaleString(); } catch (e) { return String(n); }
     }
 
     function formatDateMs(ms) {
@@ -806,8 +902,6 @@
       }
     }
 
-    // ---------- Schema helpers ----------
-
     function extractSchemaPairs(schema) {
       const pairs = [];
       if (Array.isArray(schema)) {
@@ -825,8 +919,6 @@
       }
       return pairs;
     }
-
-    // ---------- TENANT + TABLES (meta/supers + meta/super) ----------
 
     function updateTenantSummary(superMeta) {
       const filesEl = document.getElementById('tenantFilesValue');
@@ -854,6 +946,12 @@
       const shownEl = document.getElementById('tablesShownCount');
       if (!tbody) return;
 
+      // 1) Tear down any existing DataTable FIRST
+      if ($.fn.DataTable.isDataTable('#tablesTable')) {
+        $('#tablesTable').DataTable().clear().destroy();
+      }
+
+      // 2) Now safely rebuild the tbody
       tbody.innerHTML = '';
       if (!Array.isArray(tables)) tables = [];
 
@@ -866,7 +964,10 @@
         const updated = t.updated_utc;
 
         const tdName = document.createElement('td');
-        tdName.innerHTML = '<div class="table-name-cell"><i class="fas fa-leaf"></i><span>' + escapeHtml(name) + '</span></div>';
+        tdName.innerHTML =
+          '<div class="table-name-cell"><i class="fas fa-leaf"></i><span>' +
+          escapeHtml(name) +
+          '</span></div>';
         tr.appendChild(tdName);
 
         const tdFiles = document.createElement('td');
@@ -882,30 +983,35 @@
         tr.appendChild(tdSize);
 
         const tdUpdated = document.createElement('td');
-        tdUpdated.innerHTML = '<span class="text-xs muted">' + escapeHtml(formatDateMsLocal(updated)) + '</span>';
+        tdUpdated.innerHTML =
+          '<span class="text-xs muted">' +
+          escapeHtml(formatDateMsLocal(updated)) +
+          '</span>';
         tr.appendChild(tdUpdated);
 
         const safeName = name.replace(/'/g, "\\'");
         const tdActions = document.createElement('td');
         tdActions.className = 'actions-cell';
         tdActions.innerHTML =
-          '<button class="btn btn-outline-primary btn-sm" type="button" onclick="openSchema(\'' + safeName + '\')">' +
+          // Changed btn-outline-primary to btn-primary
+          '<button class="btn btn-primary btn-sm" type="button" onclick="openSchema(\'' + safeName + '\')">' +
           '<i class="fas fa-table"></i>&nbsp;Schema</button>' +
-          ' <button class="btn btn-outline-secondary btn-sm mt-1" type="button" onclick="openStats(\'' + safeName + '\')">' +
+          // Changed btn-outline-primary to btn-primary
+          ' <button class="btn btn-primary btn-sm" type="button" onclick="openStats(\'' + safeName + '\')">' +
           '<i class="fas fa-chart-bar"></i>&nbsp;Stats</button>' +
-          ' <button class="btn btn-outline-primary btn-sm mt-1" type="button" onclick="goExecuteWithLeaf(\'' + safeName + '\')">' +
+          // Changed btn-outline-primary to btn-primary
+          ' <button class="btn btn-primary btn-sm" type="button" onclick="goExecuteWithLeaf(\'' + safeName + '\')">' +
           '<i class="fas fa-terminal"></i></button>';
         tr.appendChild(tdActions);
 
         tbody.appendChild(tr);
       });
 
+      // 3) Update counts
       if (totalEl) totalEl.textContent = tables.length;
       if (shownEl) shownEl.textContent = tables.length;
 
-      if ($.fn.DataTable.isDataTable('#tablesTable')) {
-        $('#tablesTable').DataTable().destroy();
-      }
+      // 4) Re-initialise DataTables on the fresh DOM
       $('#tablesTable').DataTable({
         pageLength: 25,
         lengthMenu: [10, 25, 50, 100],
@@ -919,6 +1025,9 @@
     }
 
     function loadTenantSuper(superName) {
+      const small = document.getElementById("tenantLabelSmall");
+      if (small) small.textContent = superName;
+
       if (!superName) {
         updateTenantSummary(null);
         renderTables(null, []);
@@ -927,7 +1036,7 @@
 
       const label = document.getElementById('tenantLabel');
       if (label) {
-        label.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + superName;
+        label.textContent = 'SuperTable: ' + superName;
       }
 
       api(
@@ -947,7 +1056,7 @@
           renderTables(superName, Array.isArray(s.tables) ? s.tables : []);
         })
         .catch(err => {
-          console.error('Failed to load tenant super', err);
+          console.error('Failed to load super', err);
           updateTenantSummary(null);
           renderTables(superName, []);
         });
@@ -957,7 +1066,7 @@
       const labelEl = document.getElementById('tenantLabel');
       const selEl = document.getElementById('pairSel');
       if (!selEl) return;
-      if (labelEl) labelEl.textContent = 'Loading tenants...';
+      if (labelEl) labelEl.textContent = 'Loading SuperTables...';
 
       api(META_BASE + '/meta/supers?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
@@ -967,9 +1076,9 @@
           if (!supers.length) {
             const opt = document.createElement('option');
             opt.value = '';
-            opt.textContent = 'No tenants found';
+            opt.textContent = 'No SuperTables found';
             selEl.appendChild(opt);
-            if (labelEl) labelEl.textContent = 'No tenants discovered.';
+            if (labelEl) labelEl.textContent = 'No SuperTables discovered.';
             updateTenantSummary(null);
             renderTables(null, []);
             return;
@@ -978,25 +1087,23 @@
           supers.forEach(s => {
             const opt = document.createElement('option');
             opt.value = s;
-            opt.textContent = ORGANIZATION + ' / ' + s;
+            opt.textContent = s;            // show only super name, no organization
             selEl.appendChild(opt);
           });
 
           currentSuper = supers[0];
           selEl.value = currentSuper;
-          if (labelEl) labelEl.textContent = 'Tenant: ' + ORGANIZATION + ' / ' + currentSuper;
+          if (labelEl) labelEl.textContent = 'SuperTable: ' + currentSuper;
 
           loadTenantSuper(currentSuper);
         })
         .catch(err => {
-          console.error('Failed to load tenants', err);
-          if (labelEl) labelEl.textContent = 'Failed to load tenants.';
+          console.error('Failed to load supers', err);
+          if (labelEl) labelEl.textContent = 'Failed to load SuperTables.';
           updateTenantSummary(null);
           renderTables(null, []);
         });
     }
-
-    // ---------- STATS + SCHEMA (meta/stats + meta/schema) ----------
 
     function buildSchemaPeekHtml(schemaPairs, moreSchema) {
       let schemaTableHtml = '';
@@ -1032,7 +1139,7 @@
 
       overlay.style.display = 'flex';
       titleMain.innerHTML = '<i class="fas fa-table" style="color:#1c96ca;"></i><span>Schema · ' + escapeHtml(simple) + '</span>';
-      titleSub.textContent = 'Schema of table: ' + (sup ? (ORGANIZATION + ' / ' + sup) : '');
+      titleSub.textContent = 'Schema of table: ' + (sup ? ('SuperTable ' + sup) : '');
 
       bodyEl.innerHTML =
         '<div class="schema-peek-title">' +
@@ -1051,17 +1158,99 @@
 
         const schemaRaw = data && data.schema !== undefined ? data.schema : (data || null);
         const schemaPairsAll = schemaRaw ? extractSchemaPairs(schemaRaw) : [];
-        const peekRows = schemaPairsAll.slice(0, 50);
-        const moreSchema = schemaPairsAll.length > peekRows.length;
 
-        bodyEl.innerHTML =
-          '<div class="schema-peek">' +
-          '  <div class="schema-peek-title">' +
-          '    <i class="fas fa-table"></i>' +
-          '    <span>Schema</span>' +
-          '  </div>' +
-          buildSchemaPeekHtml(peekRows, moreSchema) +
-          '</div>';
+        // Group by normalized type category
+        const groups = {
+          string: [],
+          number: [],
+          date: [],
+          bool: [],
+          other: []
+        };
+
+        schemaPairsAll.forEach(function (pair) {
+          const col = pair[0];
+          const type = pair[1];
+          const cat = normalizeTypeCategory(type);
+          if (!groups[cat]) {
+            groups[cat] = [];
+          }
+          groups[cat].push([col, type]);
+        });
+
+        // Build grouped HTML
+        let html = '';
+
+        // Search input
+        html += '<input type="text" id="schemaSearch" class="schema-search-input" placeholder="Search columns or types…">';
+
+        const orderedGroups = [
+          ['string', 'String columns'],
+          ['number', 'Numeric columns'],
+          ['date', 'Date/Time columns'],
+          ['bool', 'Boolean columns'],
+          ['other', 'Other columns']
+        ];
+
+        orderedGroups.forEach(function (entry) {
+          const key = entry[0];
+          const label = entry[1];
+          const entries = groups[key] || [];
+          if (!entries.length) return;
+
+          html +=
+            '<div class="schema-group">' +
+            '  <div class="schema-group-header" onclick="this.nextElementSibling.classList.toggle(\'open\')">' +
+            '    <span>' + escapeHtml(label) + ' (' + entries.length + ')</span>' +
+            '    <i class="fas fa-chevron-down"></i>' +
+            '  </div>' +
+            '  <div class="schema-group-body">' +
+            '    <table class="schema-table">' +
+            '      <thead><tr><th>Column</th><th>Type</th></tr></thead>' +
+            '      <tbody>';
+
+          entries.forEach(function (pair) {
+            const col = pair[0];
+            const type = pair[1];
+            const typeClass = getSchemaTypeClass(type);
+            html +=
+              '<tr>' +
+              '  <td class="schema-colname">' + escapeHtml(col) + '</td>' +
+              '  <td><span class="schema-type-pill ' + typeClass + '">' + escapeHtml(type) + '</span></td>' +
+              '</tr>';
+          });
+
+          html +=
+            '      </tbody>' +
+            '    </table>' +
+            '  </div>' +
+            '</div>';
+        });
+
+        if (!schemaPairsAll.length) {
+          html =
+            '<div class="schema-peek-more">Schema not available.</div>';
+        }
+
+        bodyEl.innerHTML = html;
+
+        // Open all groups by default
+        document.querySelectorAll('#schemaBody .schema-group-body').forEach(function (el) {
+          el.classList.add('open');
+        });
+
+        // Wire search
+        const searchInput = document.getElementById('schemaSearch');
+        if (searchInput) {
+          searchInput.addEventListener('input', function () {
+            const q = this.value.toLowerCase();
+            const rows = document.querySelectorAll('#schemaBody .schema-group-body tr');
+            rows.forEach(function (tr) {
+              const txt = tr.innerText.toLowerCase();
+              tr.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
+            });
+          });
+        }
       } catch (e) {
         bodyEl.innerHTML =
           '<div class="schema-peek-more" style="color:#b91c1c;">Error loading schema: ' + escapeHtml(e.message || e) + '</div>';
@@ -1502,8 +1691,6 @@
       document.getElementById('statsCard').classList.toggle('overlay-fullscreen');
     }
 
-    // ---------- Misc ----------
-
     function goExecuteWithLeaf(simple) {
       const sel = document.getElementById('pairSel');
       const sup = sel && sel.value ? sel.value : currentSuper;
@@ -1514,7 +1701,22 @@
       window.location.href = url.toString();
     }
 
-    // ---------- Document ready ----------
+    function closeOverviewOverlay() {
+      const overlay = document.getElementById('overviewOverlay');
+      overlay.style.display = 'none';
+      const card = document.getElementById('overviewCard');
+      card.classList.remove('overlay-fullscreen');
+      if (currentOverviewRow) {
+        currentOverviewRow.classList.remove('table-row-highlight');
+        currentOverviewRow = null;
+      }
+    }
+
+    function toggleOverviewSize() {
+      const card = document.getElementById('overviewCard');
+      card.classList.toggle('overlay-fullscreen');
+    }
+
     $(document).ready(function () {
       window.__admintoken = "{{ token|e }}";
 
@@ -1529,10 +1731,8 @@
 
       $("#link-tables").addClass("active");
 
-      // Load tenants and initial data via meta service
       loadTenants();
 
-      // Close overlays on ESC
       document.addEventListener('keydown', function (ev) {
         if (ev.key === 'Escape') {
           closeSchemaOverlay();
@@ -1557,123 +1757,76 @@
         }
       });
     });
-
-    // ---------- Overview overlay (currently unused button, kept for future) ----------
-
-    function closeOverviewOverlay() {
-      const overlay = document.getElementById('overviewOverlay');
-      overlay.style.display = 'none';
-      const card = document.getElementById('overviewCard');
-      card.classList.remove('overlay-fullscreen');
-      if (currentOverviewRow) {
-        currentOverviewRow.classList.remove('table-row-highlight');
-        currentOverviewRow = null;
-      }
-    }
-
-    function toggleOverviewSize() {
-      const card = document.getElementById('overviewCard');
-      card.classList.toggle('overlay-fullscreen');
-    }
   </script>
 </head>
 
 <body>
 {% include "sidebar.html" %}
 
-<!-- MAIN CONTENT -->
 <div class="content-container">
   <div class="wrap">
-    <div class="tables-header">
-      <div>
-        <h4>
-          <i class="fas fa-table" style="color:#1c96ca;"></i>&nbsp; Tables
-        </h4>
-        <div class="text-xs muted" id="tenantLabel">
-          Loading tenants...
-        </div>
-      </div>
-    </div>
 
-    <!-- Tenant selection + summary -->
-    <div class="card" style="margin-top:12px;">
+    <!-- 1) SuperTables selection block -->
+    {% include "selection.html" %}
+
+    <!-- 2) Tables card -->
+    <div class="card" style="margin-top:20px;">
       <div class="section">
-        <div class="grid">
-          <!-- LEFT: tenant selector -->
+
+        <!-- Professional header bar -->
+        <div class="d-flex justify-content-between align-items-center mb-3"
+             style="border-bottom:1px solid #e5e7eb;padding-bottom:8px;">
+
+          <!-- Left: title + subtle description -->
           <div>
-            <label class="text-sm muted">Tenant</label><br/>
-            <select id="pairSel" onchange="onPairChange()" style="min-width:260px">
-              <!-- Filled dynamically from /meta/supers -->
-            </select>
-            <div class="text-xs muted" style="margin-top:6px;">
-              Select a tenant to view tables.
+            <div class="d-flex align-items-center">
+              <h4 class="mb-0" style="font-size:18px;font-weight:600;">
+                <i class="fas fa-table" style="color:#1c96ca;"></i>&nbsp; Tables
+              </h4>
+            </div>
+            <div class="text-xs muted mt-1">
+              Overview of tables for the selected SuperTable.
             </div>
           </div>
 
-          <!-- RIGHT: summary cards -->
-          <div>
-            <div class="tenant-summary-grid">
-              <div class="metric-card">
-                <div class="metric-icon"><i class="fas fa-file"></i></div>
-                <div class="metric-content">
-                  <div class="metric-label">Files</div>
-                  <div class="metric-value" id="tenantFilesValue">n/a</div>
-                </div>
-              </div>
-              <div class="metric-card">
-                <div class="metric-icon"><i class="fas fa-bars"></i></div>
-                <div class="metric-content">
-                  <div class="metric-label">Rows</div>
-                  <div class="metric-value" id="tenantRowsValue">n/a</div>
-                </div>
-              </div>
-              <div class="metric-card">
-                <div class="metric-icon"><i class="fas fa-database"></i></div>
-                <div class="metric-content">
-                  <div class="metric-label">Byte Size</div>
-                  <div class="metric-value" id="tenantSizeValue">n/a</div>
-                </div>
-              </div>
-            </div>
-            <div class="tenant-updated">
-              Last updated: <span id="tenantUpdatedValue">n/a</span>
-            </div>
-          </div>
+          <!-- Right: compact stats chips -->
+          <div class="d-flex align-items-center" style="gap:8px;">
 
-        </div>
-      </div>
-    </div>
+            <!-- Total tables -->
+            <div class="text-xs"
+                 style="border-radius:999px;background:#f3f4f6;padding:4px 10px;min-width:110px;text-align:center;">
+              <span class="muted">Total</span>
+              <span class="total-count" id="tablesTotalCount" style="font-weight:600;margin-left:4px;">0</span>
+            </div>
 
-    <!-- Tables grid -->
-    <div class="card" style="margin-top:16px;">
-      <div class="section">
-        <div class="d-flex justify-content-between align-items-center mb-2">
-          <div class="text-sm muted">
-            Tables · Total:
-            <span class="total-count" id="tablesTotalCount">0</span>
-          </div>
-          <div class="text-xs muted">
-            Showing <span id="tablesShownCount">0</span> tables
+            <!-- Currently shown -->
+            <div class="text-xs"
+                 style="border-radius:999px;background:#e5f3ff;padding:4px 10px;min-width:130px;text-align:center;">
+              <span class="muted">Showing</span>
+              <span id="tablesShownCount" style="font-weight:600;margin-left:4px;">0</span>
+              <span class="muted">tables</span>
+            </div>
+
           </div>
         </div>
 
+        <!-- 3) Tables grid -->
         <div class="table-responsive">
           <table id="tablesTable" class="display table table-sm">
             <thead>
-            <tr>
-              <th>Table</th>
-              <th class="col-files">Files</th>
-              <th class="col-rows">Rows</th>
-              <th class="col-size">Size</th>
-              <th class="col-updated">Updated</th>
-              <th class="col-details">Details</th>
-            </tr>
+              <tr>
+                <th>Table</th>
+                <th class="col-files">Files</th>
+                <th class="col-rows">Rows</th>
+                <th class="col-size">Size</th>
+                <th class="col-updated">Updated</th>
+                <th class="col-details">Details</th>
+              </tr>
             </thead>
-            <tbody id="tablesBody">
-            <!-- Filled dynamically from /meta/super.meta.super.tables -->
-            </tbody>
+            <tbody id="tablesBody"></tbody>
           </table>
         </div>
+
       </div>
     </div>
 
@@ -1693,7 +1846,7 @@
   </div>
 </div>
 
-<!-- Overview overlay (kept in case you reuse it later) -->
+<!-- Overview overlay (currently unused) -->
 <div id="overviewOverlay" class="inline-overlay">
   <div id="overviewCard" class="inline-card">
     <div class="inline-card-header">
@@ -1710,9 +1863,7 @@
         </button>
       </div>
     </div>
-    <div id="overviewBody" class="inline-card-body">
-      <!-- overview content -->
-    </div>
+    <div id="overviewBody" class="inline-card-body"></div>
   </div>
 </div>
 
@@ -1730,9 +1881,7 @@
         </button>
       </div>
     </div>
-    <div id="schemaBody" class="inline-card-body">
-      <!-- schema content -->
-    </div>
+    <div id="schemaBody" class="inline-card-body"></div>
   </div>
 </div>
 
@@ -1753,9 +1902,7 @@
         </button>
       </div>
     </div>
-    <div id="statsBody" class="inline-card-body">
-      <!-- stats content -->
-    </div>
+    <div id="statsBody" class="inline-card-body"></div>
   </div>
 </div>
 

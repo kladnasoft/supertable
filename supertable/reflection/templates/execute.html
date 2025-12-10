@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SuperTable – Execute SQL</title>
 
-  <!-- Fonts & Icons -->
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
@@ -14,17 +13,22 @@
         integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
         crossorigin="anonymous" referrerpolicy="no-referrer" />
 
-  <!-- Bootstrap for basic layout (matches admin sidebar) -->
   <link rel="stylesheet"
         href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
 
-  <!-- CodeMirror styles -->
   <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
   <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/show-hint.min.css">
 
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
   <style>
+    /*
+     * Professional Styling Refinements for Execute SQL page
+     * Focus: Cleanliness, Readability, Hierarchy, and Eye-Catching Execute Button.
+     * Colors maintained from existing palette.
+     */
     :root {
       --primary-color: #1c96ca;
       --primary-light: #e6f4fa;
@@ -34,10 +38,10 @@
       --text-color: #2b2d42;
       --text-light: #8d99ae;
       --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
-      --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05); /* Softer shadow */
+      --header-bg: #f8fafc;
     }
 
     * { box-sizing: border-box; }
@@ -45,9 +49,10 @@
     html, body {
       margin: 0;
       padding: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background: #f3f6fb;
       color: var(--text-color);
+      line-height: 1.5; /* Improved readability */
     }
 
     a {
@@ -78,103 +83,199 @@
 
     .card {
       background: var(--panel-bg);
-      border-radius: 16px;
+      border-radius: 12px; /* Professional size */
       box-shadow: var(--panel-shadow);
       border: 1px solid var(--panel-border);
     }
 
-    .section { padding: 16px 20px; }
+    .section { padding: 20px 24px; } /* Increased padding */
     .muted { color: var(--text-light); }
     .text-xs { font-size: 11px; }
-    .text-sm { font-size: 12px; }
+    .text-sm { font-size: 13px; } /* Slightly larger base text */
 
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      gap: 16px; /* Increased gap */
+      align-items: flex-start;
+    }
+    
+    /* --- Tab Navigation --- */
+    #tab-navigation {
+        display: flex;
+        gap: 0; /* Tabs should touch */
+        border-bottom: 2px solid var(--panel-border);
+        margin-bottom: 16px;
+        margin-top: 16px;
+        padding-left: 8px; /* Slight left padding to match wrapper spacing */
     }
 
-    .header-row {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      margin-bottom:12px;
+    .tab {
+        padding: 10px 18px;
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--text-light);
+        cursor: pointer;
+        transition: color 0.2s, border-bottom 0.2s;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -2px; /* Pulls the border up to overlap the container border */
+        display: flex;
+        align-items: center;
+        gap: 6px;
     }
 
-    .btn {
-      padding: 8px 12px;
-      border-radius: 10px;
-      background: #0b2940;
-      border: 1px solid #1d3b57;
-      color: #e2e8f0;
-      font-weight: 500;
-      cursor: pointer;
-      font-size: 13px;
+    .tab:hover {
+        color: var(--primary-color);
     }
 
-    .btn:hover { filter: brightness(1.05); }
-
-    .btn-ghost {
-      padding: 6px 10px;
-      border-radius: 8px;
-      border: 1px solid #d0d7e7;
-      background: transparent;
-      color: #475569;
-      cursor: pointer;
-      font-size: 12px;
+    .tab.active {
+        color: var(--primary-color);
+        border-bottom: 2px solid var(--primary-color);
+        font-weight: 600;
     }
 
-    .btn-ghost:hover { background: #e2e8f0; }
+    .chip {
+        background: #e0e5f0;
+        color: var(--text-color);
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+
+    .tab.active .chip {
+        background: var(--primary-color);
+        color: white;
+    }
+
+    /* --- Tab Content Containers --- */
+    .tab-content {
+        display: none;
+    }
+    /* Only the active content should be block/visible, this is handled in JS */
+    .tab-content.active {
+        display: block;
+    }
+    
+    /* FIX: The card margin in the tab-content should be 0 or small */
+    #tab-content-container .card {
+        margin-top: 0 !important;
+    }
+
+    /* --- Execute Card Styling (Simplified from Header) --- */
+    .sql-editor-card .card-body {
+        padding: 24px;
+    }
+
+    /* --- Collapsible Content FIX (REMOVED) --- */
+
+
+    /* --- Form Elements (Base Styles) --- */
 
     input, select, textarea {
       background: #ffffff;
       border: 1px solid #d0d7e7;
       color: var(--text-color);
-      border-radius: 10px;
-      padding: 8px 10px;
+      border-radius: 8px; /* Sharper radius */
+      padding: 8px 12px;
       font-size: 13px;
       width: 100%;
+      transition: var(--transition);
+      margin-top: 4px; /* Space below label */
     }
+
+    /* Removed the generic 'select' rule that set conflicting height and padding */
 
     input:focus, select:focus, textarea:focus {
       outline: none;
-      box-shadow: 0 0 0 3px rgba(28,150,202,0.15);
+      box-shadow: 0 0 0 3px var(--primary-light); /* Use primary-light for soft focus ring */
       border-color: var(--primary-color);
     }
 
-    textarea { resize: vertical; min-height: 120px; }
+    textarea { resize: vertical; min-height: 140px; } /* Slightly taller default */
 
-    /* CodeMirror styling – white editor */
+    /* --- SuperTable Selector Custom Style FIX --- */
+    #pairSel {
+      /* FIX 1: Overrides global `width: auto` to ensure 100% of parent width */
+      width: 100% !important;
+      display: block;
+      margin-top: 0;
+
+      /* FIX 2: Apply user's desired sizing, overriding generic form styles */
+      padding: 10px 12px !important;
+      font-size: 16px !important;
+      height: auto !important;
+
+      /* FIX 3: Apply custom arrow styles */
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fpath%3E%0A%3C%2Fsvg%3E');
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      cursor: pointer; /* Ensure cursor is applied */
+      background-color: #ffffff; /* Ensure background is applied */
+    }
+
+    /* --- Buttons (Standard) --- */
+    .btn {
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--dark-color);
+      border: 1px solid var(--dark-color);
+      color: #e2e8f0;
+      font-weight: 500;
+      cursor: pointer;
+      font-size: 13px;
+      transition: var(--transition);
+    }
+
+    .btn:hover {
+        filter: brightness(1.1);
+        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
+    }
+
+    /* --- CodeMirror styling (INCREASED HEIGHT to 500px) --- */
     .CodeMirror {
-      border-radius: 12px;
+      border-radius: 8px; /* Match form elements */
       border: 1px solid #d0d7e7;
       background: #ffffff;
       color: #0b1220;
-      font-size: 13px;
-      min-height: 200px;
+      font-size: 14px; /* Slightly larger code font */
+      min-height: 500px; /* Taller editor */
     }
 
     .CodeMirror-focused {
       border-color: var(--primary-color);
-      box-shadow: 0 0 0 3px rgba(28,150,202,0.25);
+      box-shadow: 0 0 0 3px var(--primary-light);
     }
 
+    /* --- Eye-Catching Execute Button --- */
     .btn-exec {
-      color: #0b1220;
-      background: linear-gradient(135deg, #38bdf8 0%, #1ac8ff 100%);
-      border: none;
-      padding: 10px 18px;
-      border-radius: 10px;
+      color: white;
+      background: var(--primary-color);
+      border: 1px solid var(--primary-color);
+      padding: 10px 20px;
+      border-radius: 8px;
       font-weight: 700;
       cursor: pointer;
-      font-size: 13px;
-      box-shadow: 0 4px 15px rgba(28,150,202,.35);
-      transition: transform .1s ease;
+      font-size: 14px;
+      box-shadow: 0 6px 20px rgba(28, 150, 202, 0.25);
+      transition: transform .1s ease, box-shadow .2s ease, background-color .2s ease;
       white-space: nowrap;
+    }
+    .btn-exec:hover {
+        background: var(--secondary-color);
+        border-color: var(--secondary-color);
+        box-shadow: 0 8px 25px rgba(28, 150, 202, 0.4);
     }
     .btn-exec:active { transform: translateY(1px); }
 
+    /* --- Status Bar --- */
+    #status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
     #status i { color: #10b981; }
     #status.executing i { color: #f59e0b; animation: spin 1s linear infinite; }
     #status.error i { color: #ef4444; }
@@ -184,17 +285,71 @@
       100% { transform:rotate(360deg); }
     }
 
+    /* --- Error Block --- */
+    #query-error-display {
+        background-color: #fee2e2;
+        color: #b91c1c;
+        border: 1px solid #fca5a5;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 20px;
+        display: none; /* Hidden by default, JS controls visibility */
+        font-weight: 500;
+        font-size: 14px;
+    }
+    #query-error-display strong {
+        font-weight: 700;
+        margin-right: 8px;
+    }
+    #query-error-message {
+        font-family: monospace;
+        background-color: #fecaca;
+        padding: 8px;
+        border-radius: 4px;
+        display: block;
+        margin-top: 8px;
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+    
+    /* --- Visualization --- */
+    #timings-visualization-card {
+        /* Set a fixed height for the canvas to ensure Chart.js renders correctly */
+        height: 350px; 
+        display: none; /* Hidden by default, JS controls visibility */
+    }
+    .chart-container {
+        position: relative;
+        height: 100%;
+        width: 100%;
+        padding: 20px;
+    }
+    /* Ensure canvas is block-level and max size of container for Chart.js responsiveness */
+    .chart-container canvas {
+        height: 100% !important;
+        width: 100% !important;
+    }
+
+
+    /* --- Results Table --- */
     #result table {
       width:100%;
       border-collapse: separate;
       border-spacing: 0;
       font-size: 13px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow: hidden;
     }
 
     #result th, #result td {
-      padding: 8px 10px;
-      border:1px solid #e2e8f0;
-      background:#ffffff;
+      padding: 10px 15px;
+      border:none;
+      border-right: 1px solid #e2e8f0;
+    }
+
+    #result td:last-child {
+        border-right: none;
     }
 
     #result thead th {
@@ -202,6 +357,20 @@
       top: 0;
       background: #f1f5f9;
       z-index: 1;
+      font-weight: 600;
+      color: #4b5563;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      border-bottom: 2px solid #e2e8f0;
+    }
+
+    #result tbody tr td {
+        border-bottom: 1px solid #f1f5f9;
+    }
+
+    #result tbody tr:last-child td {
+        border-bottom: none;
     }
 
     #result tr:nth-child(even) td {
@@ -209,50 +378,119 @@
     }
 
     #result tr:hover td {
-      background: #e0f2fe;
+      background: #e6f4fa;
     }
 
     #result .row-index {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       color: #64748b;
+      font-weight: 500;
     }
 
+    /* --- Download/Copy Row --- */
     .download-row {
-      margin-top: 12px;
+      margin-top: 16px;
       text-align: right;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px; /* Space between buttons */
     }
 
-    .btn-download {
-      padding: 6px 10px;
+    /* Styles for copy button (same as download, slightly different icon) */
+    .btn-clipboard {
+      padding: 8px 12px;
       border-radius: 8px;
-      border: 1px solid #0f172a;
-      background: #0f172a;
+      border: 1px solid var(--dark-color);
+      background: var(--dark-color);
       color: #e2e8f0;
       cursor: pointer;
-      font-size: 12px;
+      font-size: 13px;
+      font-weight: 500;
+      transition: var(--transition);
     }
-    .btn-download:hover { filter: brightness(1.08); }
-
-    .pagination {
-      margin-top: 12px;
-      text-align: right;
+    .btn-clipboard:hover {
+        filter: brightness(1.1);
+        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
     }
-
-    .page-btn {
-      padding: 4px 8px;
-      margin-left: 4px;
-      border-radius: 6px;
-      border: 1px solid #d0d7e7;
-      background: #ffffff;
+    .btn-download {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--dark-color);
+      background: var(--dark-color);
+      color: #e2e8f0;
       cursor: pointer;
-      font-size: 11px;
+      font-size: 13px;
+      font-weight: 500;
+      transition: var(--transition);
+    }
+    .btn-download:hover {
+        filter: brightness(1.1);
+        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
     }
 
-    .page-btn.active {
-      border-color: var(--primary-color);
+
+    /* --- Shared metric / summary styles --- */
+    .metric-card {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      border-radius: 10px;
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      min-height: 70px;
+      transition: box-shadow 0.2s;
+    }
+
+    .metric-card:hover {
+        box-shadow: 0 4px 15px rgba(28, 150, 202, 0.08);
+    }
+
+    .metric-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-right: 12px;
+      background: var(--primary-light);
       color: var(--primary-color);
+      flex-shrink: 0;
+      font-size: 16px;
+    }
+
+    .metric-content {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .metric-label {
+      font-size: 11px;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
       font-weight: 600;
-      background: #e6f4fa;
+    }
+
+    .metric-value {
+      font-size: 16px;
+      font-weight: 700;
+      margin-top: 4px;
+      color: #111827;
+    }
+
+    .tenant-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .tenant-updated {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #6b7280;
+      text-align: right;
     }
   </style>
 
@@ -262,6 +500,14 @@
   </script>
 
   <script>
+    // --- Utility to parse URL parameters ---
+    function getURLParameter(name) {
+      name = name.replace(/[\[]/, '\\[').replace(/[\]]/, '\\]');
+      const regex = new RegExp('[\\?&]' + name + '=([^&#]*)');
+      const results = regex.exec(location.search);
+      return results === null ? '' : decodeURIComponent(results[1].replace(/\+/g, ' '));
+    }
+
     // --- Shared admin API helper ---
     function api(path, opts) {
       opts = opts || {};
@@ -280,28 +526,170 @@
       });
     }
 
+    // --- SuperTable metadata (same pattern as tables.html) ---
+    const META_BASE = 'http://0.0.0.0:8080';
+    const ORGANIZATION = 'kladna-soft';
+    const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
+
+    let currentSuper = null;
+    let timingsChart = null; // NEW: Global variable for Chart.js instance
+    window.__curRows = []; // Keep track of current rows
+    window.__curHeaders = []; // Keep track of current headers
+
+    function updateTenantSummary(superMeta) {
+      const filesEl = document.getElementById('tenantFilesValue');
+      const rowsEl = document.getElementById('tenantRowsValue');
+      const sizeEl = document.getElementById('tenantSizeValue');
+      const updEl = document.getElementById('tenantUpdatedValue');
+
+      function humanizeCount(n) {
+        if (n == null) return '0';
+        const abs = Math.abs(n);
+        if (abs < 1000) return String(n);
+        const units = ['K', 'M', 'B', 'T', 'P'];
+        let value = n;
+        let unitIndex = -1;
+        while (Math.abs(value) >= 1000 && unitIndex < units.length - 1) {
+          value = value / 1000;
+          unitIndex++;
+        }
+        return Math.round(value) + units[unitIndex];
+      }
+
+      function humanizeBytes(bytes) {
+        if (bytes == null) return '0 B';
+        const abs = Math.abs(bytes);
+        if (abs < 1024) return bytes + ' B';
+        const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+        let value = bytes;
+        let unitIndex = -1;
+        while (Math.abs(value) >= 1024 && unitIndex < units.length - 1) {
+          value = value / 1024;
+          unitIndex++;
+        }
+        const rounded = (Math.abs(value) < 10) ? value.toFixed(1) : Math.round(value);
+        return rounded + ' ' + units[unitIndex];
+      }
+
+      function formatDateMsLocal(ms) {
+        if (!ms && ms !== 0) return 'n/a';
+        try {
+          const d = new Date(ms);
+          if (isNaN(d.getTime())) return String(ms);
+          return d.toLocaleString();
+        } catch (e) {
+          return String(ms);
+        }
+      }
+
+      if (!superMeta) {
+        if (filesEl) filesEl.textContent = 'n/a';
+        if (rowsEl) rowsEl.textContent = 'n/a';
+        if (sizeEl) sizeEl.textContent = 'n/a';
+        if (updEl) updEl.textContent = 'n/a';
+        return;
+      }
+
+      if (filesEl) filesEl.textContent = superMeta.files != null ? humanizeCount(superMeta.files) : '0';
+      if (rowsEl) rowsEl.textContent = superMeta.rows != null ? humanizeCount(superMeta.rows) : '0';
+      if (sizeEl) sizeEl.textContent = superMeta.size != null ? humanizeBytes(superMeta.size) : '0 B';
+      if (updEl) updEl.textContent = superMeta.updated_utc != null ? formatDateMsLocal(superMeta.updated_utc) : 'n/a';
+    }
+
+    function loadTenantSuper(superName) {
+      if (!superName) {
+        updateTenantSummary(null);
+        return;
+      }
+
+      api(
+        META_BASE + '/meta/super?organization=' +
+        encodeURIComponent(ORGANIZATION) +
+        '&super_name=' + encodeURIComponent(superName) +
+        '&user_hash=' + encodeURIComponent(USER_HASH)
+      )
+        .then(data => {
+          const s = data && data.meta && data.meta.super ? data.meta.super : null;
+          if (!s) {
+            updateTenantSummary(null);
+            return;
+          }
+          updateTenantSummary(s);
+        })
+        .catch(err => {
+          console.error('Failed to load super', err);
+          updateTenantSummary(null);
+        });
+    }
+
+    function loadTenants() {
+      const selEl = document.getElementById('pairSel');
+      if (!selEl) return;
+
+      api(META_BASE + '/meta/supers?organization=' + encodeURIComponent(ORGANIZATION))
+        .then(data => {
+          const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
+          selEl.innerHTML = '';
+
+          if (!supers.length) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'No SuperTables found';
+            selEl.appendChild(opt);
+            updateTenantSummary(null);
+            return;
+          }
+
+          supers.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s;
+            opt.textContent = s;
+            selEl.appendChild(opt);
+          });
+
+          currentSuper = supers[0];
+          selEl.value = currentSuper;
+          loadTenantSuper(currentSuper);
+          // initial schema hints once we have a tenant
+          loadSchema();
+        })
+        .catch(err => {
+          console.error('Failed to load supers', err);
+          updateTenantSummary(null);
+        });
+    }
+
     function onPairChange() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = (sel.value || '|').split('|');
-      const url = new URL(window.location.href);
-      url.searchParams.set('org', org);
-      url.searchParams.set('sup', sup);
-      window.location.href = url.toString();
+      if (!sel) return;
+      const sup = sel.value;
+      if (!sup) return;
+      currentSuper = sup;
+      loadTenantSuper(sup);
+      loadSchema();
+
+      // Update the CodeMirror content when the SuperTable changes
+      if (window.editor) {
+          const leaf = getURLParameter('leaf');
+          const defaultQuery = leaf
+            ? `SELECT * FROM ${sup}.${leaf} LIMIT 1000`
+            : `SELECT * FROM ${sup} LIMIT 100`;
+
+          window.editor.setValue(defaultQuery);
+      }
     }
 
     function goBackAdmin() {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = (sel.value || '|').split('|');
+      const sup = sel ? sel.value : '';
       const url = new URL('/admin', window.location.origin);
-      if (org) url.searchParams.set('org', org);
       if (sup) url.searchParams.set('sup', sup);
+      url.searchParams.set('org', ORGANIZATION);
       window.location.href = url.toString();
     }
 
     function getTenant() {
-      const sel = document.getElementById('pairSel');
-      const [organization, superName] = (sel?.value || '|').split('|');
-      return { organization, superName };
+      return { organization: ORGANIZATION, superName: currentSuper };
     }
 
     function setStatus(text, cls) {
@@ -309,24 +697,77 @@
       el.className = 'text-sm muted ' + (cls || '');
       el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
     }
+    
+    // NEW: Function to switch tabs
+    function switchTab(tabName) {
+        // 1. Deactivate all tabs and content
+        document.querySelectorAll('#tab-navigation .tab').forEach(tab => {
+            tab.classList.remove('active');
+        });
+        document.querySelectorAll('.tab-content').forEach(content => {
+            content.classList.remove('active');
+            content.style.display = 'none';
+        });
 
+        // 2. Activate the selected tab and content
+        const selectedTab = document.getElementById(`tab-${tabName}`);
+        const selectedContent = document.getElementById(`tab-content-${tabName}`);
+
+        if (selectedTab) selectedTab.classList.add('active');
+        if (selectedContent) selectedContent.classList.add('active');
+        if (selectedContent) selectedContent.style.display = 'block';
+
+        // 3. Special handling for CodeMirror/Chart.js when switching
+        if (tabName === 'execute' && window.editor) {
+            // Refresh CodeMirror layout to fix rendering issues
+            // Use setTimeout to ensure the container is fully expanded before refresh
+            setTimeout(() => {
+                window.editor.refresh();
+            }, 0);
+        }
+    }
+
+
+    // NEW: Centralized error display function
+    function displayError(title, message) {
+        const statusEl = document.getElementById('status');
+        const errorDisplay = document.getElementById('query-error-display');
+        const resultDiv = document.getElementById('result');
+        const timingCard = document.getElementById('timings-visualization-card');
+
+        statusEl.className = 'text-sm muted error';
+        statusEl.innerHTML = '<i class="fas fa-times-circle"></i>&nbsp;Failed';
+        
+        // Show the error on the Result tab
+        errorDisplay.style.display = 'block';
+        document.getElementById('query-error-display').querySelector('strong').textContent = title + ':';
+        document.getElementById('query-error-message').textContent = message;
+
+        // Clear rows, headers, results area and timing chart
+        window.__curRows = []; 
+        window.__curHeaders = [];
+        resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Query failed. See error details above.</div>';
+        timingCard.style.display = 'none';
+
+        if (timingsChart) {
+            timingsChart.destroy();
+            timingsChart = null;
+        }
+        
+        // Switch to the Result tab to show the error
+        switchTab('result');
+    }
+    
+    // OLD function replaced/redirected to new one
     function renderError(msg) {
-      document.getElementById('result').innerHTML = `
-        <div style="
-            border:1px solid #fecaca;
-            background:#fef2f2;
-            color:#7f1d1d;
-            border-radius:10px;
-            padding:12px;">
-          <strong>Error:</strong>
-          <pre style="white-space:pre-wrap; margin:4px 0 0 0;">${(msg||'').toString()}</pre>
-        </div>`;
+        // Intercept old calls to renderError and use the new displayError structure
+        displayError('Query Error', msg);
     }
 
     function renderTable(rows, total, page, pageSize, onPage) {
       if (!rows || !rows.length) {
         document.getElementById('result').innerHTML =
-          '<div class="muted text-sm">No results</div>';
+          '<div class="muted text-sm" style="padding: 15px;">No results</div>';
         window.__curRows = []; window.__curHeaders = [];
         return;
       }
@@ -338,7 +779,7 @@
       html += '</tr></thead><tbody>';
 
       rows.forEach((r, i) => {
-        const absIdx = (page-1)*pageSize + i + 1;
+        const absIdx = i + 1;
         html += '<tr>';
         html += `<td class="row-index">${absIdx}</td>`;
         headers.forEach(h => {
@@ -352,48 +793,119 @@
 
       html += '</tbody></table></div>';
 
-      const totalPages = Math.max(1, Math.ceil(total / pageSize));
-      if (totalPages > 1) {
-        html += '<div class="pagination">';
-        for (let p = 1; p <= totalPages; p++) {
-          const cls = p === page ? 'page-btn active' : 'page-btn';
-          html += `<button class="${cls}" onclick="(${onPage.toString()})(${p})">${p}</button>`;
-        }
-        html += '</div>';
-      }
-
       document.getElementById('result').innerHTML = html;
       window.__curRows = rows;
       window.__curHeaders = headers;
     }
+    
+    // NEW: Function to render the Chart.js timeline
+    function renderTimingsChart(timings) {
+        const chartContainer = document.getElementById('timings-visualization-card');
+        const ctx = document.getElementById('timingsChart').getContext('2d');
+        
+        if (!timings || timings.length === 0) {
+            chartContainer.style.display = 'none';
+            return;
+        }
 
-    function downloadCSV() {
-      const rows = window.__curRows || [];
-      const headers = window.__curHeaders || [];
-      if (!rows.length || !headers.length) return;
-      const csv = [
-        headers.join(','),
-        ...rows.map(r =>
-          headers.map(h => {
-            let v = r[h];
-            if (v === null || v === undefined) v = '';
-            if (typeof v === 'object') v = JSON.stringify(v);
-            const s = String(v).replace(/"/g, '""');
-            return `"${s}"`;
-          }).join(',')
-        )
-      ].join('\n');
-      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `query_results_${new Date().toISOString().slice(0,10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+        chartContainer.style.display = 'block';
+
+        const labels = [];
+        const data = [];
+        const backgroundColors = [];
+        
+        // Define a color palette for visualization
+        const colors = ['#1c96ca', '#147ba3', '#34d399', '#fbb663', '#93c5fd', '#f472b6'];
+        let colorIndex = 0;
+
+        timings.forEach(timing => {
+            const key = Object.keys(timing)[0];
+            // Filter out 'total_execute' or similar keys
+            if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
+                return; 
+            }
+            
+            const value = timing[key];
+            labels.push(key.replace(/_/g, ' '));
+            data.push(value.toFixed(4));
+            backgroundColors.push(colors[colorIndex % colors.length]);
+            colorIndex++;
+        });
+
+        // If after filtering, no data is left, hide the chart
+        if (data.length === 0) {
+            chartContainer.style.display = 'none';
+            return;
+        }
+
+        const totalTime = data.reduce((sum, val) => sum + parseFloat(val), 0).toFixed(4);
+
+        // Destroy existing chart instance if it exists
+        if (timingsChart) {
+            timingsChart.destroy();
+        }
+
+        // Render new chart
+        timingsChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Duration (s)',
+                    data: data,
+                    backgroundColor: backgroundColors,
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false, // Allows the chart to fit the container's fixed height
+                indexAxis: 'y', // Horizontal bar chart for a timeline effect
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    title: {
+                        display: true,
+                        text: `Execution Timeline (Internal Steps Total: ${totalTime} s)`,
+                        font: { size: 16, weight: '600' }
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                label += new Intl.NumberFormat('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 }).format(context.raw) + ' s';
+                                return label;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        stacked: false,
+                        title: {
+                            display: true,
+                            text: 'Time (seconds)'
+                        },
+                        beginAtZero: true
+                    },
+                    y: {
+                        stacked: false,
+                        grid: {
+                            display: false
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async function loadSchema() {
-      const userHash = document.getElementById('userHash')?.value;
+      // User hash is removed from the form, so we use a constant value here.
+      const userHash = USER_HASH;
       const { organization, superName } = getTenant();
       if (!organization || !superName || !userHash) return;
 
@@ -432,17 +944,34 @@
     let execTimerId = null;
 
     async function executeSQL(page) {
-      const userHash = document.getElementById('userHash').value;
-      const pageSize = parseInt(document.getElementById('pageSize').value || '100', 10);
+      const userHash = USER_HASH;
+      const pageSize = 1000;
       const query = window.editor.getValue().trim();
       const { organization, superName } = getTenant();
+      
+      const errorDisplay = document.getElementById('query-error-display');
+      const timingCard = document.getElementById('timings-visualization-card');
+      const resultDiv = document.getElementById('result');
+
+      // Reset error and timing display
+      errorDisplay.style.display = 'none';
+      timingCard.style.display = 'none';
+      resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Loading results...</div>';
+      if (timingsChart) {
+        timingsChart.destroy();
+        timingsChart = null;
+      }
+      
+      // Ensure we switch to results immediately after starting execution
+      // to give user a feedback screen and see the error if it happens.
+      switchTab('result');
 
       if (!organization || !superName || !userHash) {
-        setStatus('Please select a tenant and a user hash.', 'error');
+        displayError('Input Error', 'Please select a SuperTable.');
         return;
       }
       if (!/^\s*(select|with)\b/i.test(query)) {
-        setStatus('Only SELECT/WITH queries are allowed.', 'error');
+        displayError('Input Error', 'Only SELECT/WITH queries are allowed.');
         return;
       }
 
@@ -473,7 +1002,7 @@
             super_name: superName,
             user_hash: userHash,
             query,
-            page: page || 1,
+            page: 1,
             page_size: pageSize
           })
         });
@@ -492,10 +1021,15 @@
           renderTable(
             data.result || [],
             data.total_count || 0,
-            page || 1,
+            1,
             pageSize,
             (p) => executeSQL(p)
           );
+
+          // Render Timings Chart (NEW) - but keep it hidden on the timings tab
+          if (data.meta && data.meta.timings) {
+              renderTimingsChart(data.meta.timings);
+          }
 
           // prefer backend duration if available, else client timing
           let durationMs = null;
@@ -515,14 +1049,19 @@
             `Success — ${rowsLen} rows (total ${total}) in ${durationStr}`;
 
           setStatus(statusText);
+          
+          // Result tab is already active from the start of execution
         } else {
+          // Logic error from API
           const finishedAtError = Date.now();
           const elapsedErrorSec = ((finishedAtError - startedAt) / 1000).toFixed(3);
-
+          
           setStatus(`Error executing query after ${elapsedErrorSec}s`, 'error');
-          renderError(data.message || 'Unknown error');
+          // Use new displayError for nice display, which also ensures Result tab is active
+          displayError('Query Error', data.message || 'Unknown error');
         }
       } catch (e) {
+        // Network/fetch error
         const finishedAt = Date.now();
         const elapsedSec = ((finishedAt - startedAt) / 1000).toFixed(3);
 
@@ -533,9 +1072,98 @@
         }
 
         setStatus(`Error executing query after ${elapsedSec}s`, 'error');
-        renderError(e.message || String(e));
+        // Use new displayError for nice display, which also ensures Result tab is active
+        displayError('Network Error', e.message || String(e));
       }
     }
+    
+    /**
+     * Converts the current result set into a tab-separated value (TSV) string
+     * suitable for pasting directly into Excel or Google Sheets.
+     */
+    function copyToClipboard() {
+      if (!window.__curRows || window.__curRows.length === 0) {
+        alert("No results to copy.");
+        return;
+      }
+
+      const headers = window.__curHeaders;
+      const rows = window.__curRows;
+      
+      // 1. Create Header Row (TSV format)
+      let tsv = headers.join('\\t') + '\\n';
+
+      // 2. Create Data Rows
+      rows.forEach(row => {
+        const values = headers.map(header => {
+          let value = row[header];
+          if (value === null || value === undefined) value = '';
+          if (typeof value === 'object') value = JSON.stringify(value);
+          
+          // Escape quotes and ensure content does not break TSV format
+          // By wrapping in double quotes if it contains tabs or newlines.
+          // Excel/Sheets typically handles basic string content fine, but 
+          // wrapping ensures robustness against embedded newlines/tabs.
+          value = String(value).replace(/\\r?\\n/g, ' '); // Replace newlines with space
+          
+          // Simple heuristic for TSV: wrap in quotes if it contains a tab or quotes
+          if (value.includes('\\t') || value.includes('"')) {
+              value = '"' + value.replace(/"/g, '""') + '"';
+          }
+          return value;
+        });
+        tsv += values.join('\\t') + '\\n';
+      });
+
+      // 3. Write to clipboard
+      navigator.clipboard.writeText(tsv)
+        .then(() => {
+          alert('Successfully copied ' + rows.length + ' rows to clipboard (TSV format).');
+        })
+        .catch(err => {
+          console.error('Failed to copy to clipboard:', err);
+          alert('Failed to copy to clipboard. Check console for details.');
+        });
+    }
+
+    // Function to download CSV (retained and simplified)
+    function downloadCSV() {
+        if (!window.__curRows || window.__curRows.length === 0) {
+            alert("No results to download.");
+            return;
+        }
+
+        const headers = window.__curHeaders;
+        const rows = window.__curRows;
+        
+        let csv = headers.join(',') + '\\n'; // CSV header
+
+        rows.forEach(row => {
+            const values = headers.map(header => {
+                let value = row[header];
+                if (value === null || value === undefined) value = '';
+                if (typeof value === 'object') value = JSON.stringify(value);
+                
+                // Escape: If value contains comma, double quote, or newline, wrap in double quotes
+                value = String(value).replace(/"/g, '""'); // Escape double quotes
+                if (value.includes(',') || value.includes('\\n') || value.includes('\\r')) {
+                    value = '"' + value + '"';
+                }
+                return value;
+            });
+            csv += values.join(',') + '\\n';
+        });
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        
+        const superName = currentSuper ? currentSuper.replace(/\\s/g, '_') : 'query_result';
+        link.download = `${superName}_${new Date().toISOString().slice(0, 10)}.csv`;
+        link.href = URL.createObjectURL(blob);
+        link.click();
+        URL.revokeObjectURL(link.href);
+    }
+
 
     // Sidebar toggle + nav highlight
     $(document).ready(function(){
@@ -552,112 +1180,100 @@
       }
 
       $("#link-execute").addClass("active");
+
+      // Load SuperTables + summary + initial schema hints
+      loadTenants();
+
+      // Initialize tabs. 'execute' is default, but for robustness:
+      switchTab('execute'); 
     });
   </script>
 </head>
 <body>
   {% include "sidebar.html" %}
 
-  <!-- MAIN CONTENT -->
   <div class="content-container">
     <div class="wrap">
-      <div class="header-row">
-        <div>
-            <h4>
-            <i class="fas fa-terminal" style="color:#1c96ca;"></i>&nbsp;
-            Execute SQL
-            </h4>
-          <div class="text-xs muted">
-            Interactive SQL runner with RBAC enforced by selected user hash.
-          </div>
-        </div>
-      </div>
 
-      <!-- Tenant selection -->
-      <div class="card">
-        <div class="section">
-          <div class="grid">
-            <div>
-              <label class="text-sm muted">Tenant</label><br/>
-              <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
-                {% for t in tenants %}
-                  <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
-                    {{t.org}} / {{t.sup}}
-                  </option>
-                {% endfor %}
-              </select>
-              {% if has_tenant %}
-                <div class="text-xs muted" style="margin-top:6px;">
-                  Selected: {{ sel_org }} / {{ sel_sup }}
-                </div>
-              {% else %}
-                <div class="text-xs muted" style="margin-top:6px;">
-                  No tenant discovered in Redis.
-                </div>
-              {% endif %}
-            </div>
-          </div>
-        </div>
-      </div>
+      {% include "selection.html" %}
 
       {% if has_tenant %}
-      <!-- User + SQL editor -->
-      <div class="card" style="margin-top:16px;">
-        <div class="section">
-          <div class="grid">
-            <div>
-              <label class="text-sm muted">User (hash)</label>
-              <select id="userHash" onchange="loadSchema()">
-                {% for u in users %}
-                  <option value="{{u.hash}}">
-                    {{u.hash}}{% if u.get('name') %} — {{u.get('name')}}{% endif %}
-                  </option>
-                {% endfor %}
-              </select>
-              <div class="text-xs muted" style="margin-top:6px;">
-                RBAC is enforced via the selected user hash.
+      
+      <div id="tab-navigation">
+          <div id="tab-execute" class="tab active" onclick="switchTab('execute')">
+              <i class="fas fa-terminal"></i>&nbsp;Execute
+          </div>
+          <div id="tab-result" class="tab" onclick="switchTab('result')">
+              <i class="fas fa-table"></i>&nbsp;Result
+          </div>
+          <div id="tab-timings" class="tab" onclick="switchTab('timings')">
+              <i class="fas fa-chart-bar"></i>&nbsp;Timings
+          </div>
+      </div>
+      
+      <div id="tab-content-container">
+          
+          <div id="tab-content-execute" class="tab-content active">
+              <div class="card sql-editor-card">
+                  <div class="card-body">
+                      <div style="margin-top:0;">
+                        <label class="text-sm muted">SQL Query</label>
+                        <textarea id="sql" rows="8"></textarea>
+                      </div>
+            
+                      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
+                        <div id="status" class="text-sm muted">
+                          <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
+                        </div>
+                        <div style="display:flex; gap:8px;">
+                          <button id="btnExec" class="btn-exec">
+                            <i class="fas fa-play"></i>&nbsp;Execute
+                          </button>
+                        </div>
+                      </div>
+                  </div>
               </div>
-            </div>
-            <div>
-              <label class="text-sm muted">Page size</label>
-              <input id="pageSize" type="number" min="1" max="5000" value="100"/>
-            </div>
           </div>
-
-          <div style="margin-top:12px;">
-            <label class="text-sm muted">SQL Query</label>
-            <textarea id="sql" rows="8">SELECT * FROM {{ sel_sup }} LIMIT 100</textarea>
+          
+          <div id="tab-content-result" class="tab-content">
+              <div id="query-error-display" class="mb-4">
+                  <strong>Query Error:</strong>
+                  <span id="query-error-message"></span>
+              </div>
+              
+              <div class="card" id="result-card">
+                <div class="section">
+                  <div id="result"></div>
+                  <div class="download-row">
+                    <button class="btn-clipboard" onclick="copyToClipboard()">
+                      <i class="fas fa-clipboard"></i>&nbsp;Copy to Clipboard
+                    </button>
+                    <button class="btn-download" onclick="downloadCSV()">
+                      <i class="fas fa-file-csv"></i>&nbsp;Download CSV
+                    </button>
+                  </div>
+                </div>
+              </div>
           </div>
-
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
-            <div id="status" class="text-sm muted">
-              <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button id="btnExec" class="btn-exec">
-                <i class="fas fa-play"></i>&nbsp;Execute
-              </button>
-            </div>
+          
+          <div id="tab-content-timings" class="tab-content">
+              <div id="timings-visualization-card" class="card">
+                  <div class="section" style="padding-bottom: 0; border-bottom: 1px solid var(--panel-border);">
+                      <h4>Query Execution Timings</h4>
+                      <div class="text-xs muted" style="margin-bottom: 16px;">
+                          Internal execution steps excluding total query time.
+                      </div>
+                  </div>
+                  <div class="chart-container">
+                      <canvas id="timingsChart"></canvas>
+                  </div>
+              </div>
           </div>
-        </div>
-      </div>
-
-      <!-- Results -->
-      <div class="card" style="margin-top:16px;">
-        <div class="section">
-          <div id="result"></div>
-          <div class="download-row">
-            <button class="btn-download" onclick="downloadCSV()">
-              <i class="fas fa-file-csv"></i>&nbsp;Download CSV
-            </button>
-          </div>
-        </div>
-      </div>
-      {% endif %}
+          
+      </div> {% endif %}
     </div>
   </div>
 
-  <!-- CodeMirror scripts -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/edit/matchbrackets.min.js"></script>
@@ -667,6 +1283,22 @@
   <script>
     // Initialize CodeMirror + hooks
     window.__admintoken = "{{ token|e }}";
+
+    // --- Dynamic Query Setup ---
+    const leaf = getURLParameter('leaf');
+    const defaultSuperName = '{{ sel_sup }}';
+
+    let initialQuery;
+    if (leaf) {
+        // Use the selected SuperTable name and the leaf table name with LIMIT 1000
+        initialQuery = `SELECT * FROM ${defaultSuperName}.${leaf} LIMIT 1000`;
+    } else {
+        // Fallback to the original default LIMIT 100
+        initialQuery = `SELECT * FROM ${defaultSuperName} LIMIT 100`;
+    }
+
+    // Set the textarea value before CodeMirror initializes
+    document.getElementById('sql').value = initialQuery;
 
     window.editor = CodeMirror.fromTextArea(document.getElementById('sql'), {
       mode: "text/x-sql",
@@ -688,11 +1320,14 @@
       hintOptions: { completeSingle:false, tables: {} }
     });
 
-    document.getElementById('btnExec')
-            .addEventListener('click', () => executeSQL(1));
+    // Initial CodeMirror refresh after initialization
+    window.editor.refresh();
 
-    // Load schema hints once UI is ready
-    loadSchema();
+
+    const execBtn = document.getElementById('btnExec');
+    if (execBtn) {
+      execBtn.addEventListener('click', () => executeSQL(1));
+    }
   </script>
 </body>
 </html>
