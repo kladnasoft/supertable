@@ -226,6 +226,7 @@ class MetaReader:
             )
             return None
 
+        root = self.catalog.get_root(org=self.super_table.organization, sup=self.super_table.super_name)
         # Get all tables from Redis
         tables = self._get_all_tables()
 
@@ -267,7 +268,8 @@ class MetaReader:
                 "files": total_files,
                 "rows": total_rows,
                 "size": total_size,
-                "updated_utc": int(datetime.now().timestamp() * 1000),
+                "version": root.get("version", 0),
+                "updated_utc": root.get("ts", int(datetime.now().timestamp() * 1000)),
                 "tables": simple_table_info,
                 "meta_path": f"redis://{self.super_table.organization}/{self.super_table.super_name}",
             }

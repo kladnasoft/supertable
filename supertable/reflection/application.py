@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import os
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 # single FastAPI app lives here only
 app = FastAPI(title="SuperTable App", version="1.0.0")
 
-# include the two modules' routers (no circular imports)
-from supertable.reflection.admin_app import router as admin_router  # noqa: E402
-from supertable.reflection.api_app import router as api_router      # noqa: E402
+# 1. Define the base directory (where application.py resides)
+STATIC_DIR = str(Path(__file__).resolve().parent / "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# include the two modules' routers (no circular imports)
+from supertable.reflection.admin_app import router as admin_router
+from supertable.reflection.api_app import router as api_router
+from supertable.reflection.selection import router as selection_router
+
+app.include_router(selection_router)
 app.include_router(admin_router)
 app.include_router(api_router)
 

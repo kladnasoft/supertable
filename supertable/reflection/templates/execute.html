@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SuperTable – Execute SQL</title>
 
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
@@ -68,7 +69,7 @@
       min-height: 100vh;
       background-color: #f3f6fb;
       transition: var(--transition);
-      padding-bottom: 40px;
+      padding-bottom: 0px;
     }
 
     .sidebar-collapsed ~ .content-container {
@@ -78,7 +79,7 @@
     .wrap {
       max-width: 1200px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 0px;
     }
 
     .card {
@@ -798,110 +799,205 @@
       window.__curHeaders = headers;
     }
     
-    // NEW: Function to render the Chart.js timeline
-    function renderTimingsChart(timings) {
-        const chartContainer = document.getElementById('timings-visualization-card');
-        const ctx = document.getElementById('timingsChart').getContext('2d');
-        
-        if (!timings || timings.length === 0) {
-            chartContainer.style.display = 'none';
+    // Function to render the Chart.js timeline
+// Make sure you have a global chart var somewhere:
+// let timingsChart = null;
+
+function renderTimingsChart(timings) {
+    const chartContainer = document.getElementById('timings-visualization-card');
+    const canvas = document.getElementById('timingsChart');
+    const ctx = canvas.getContext('2d');
+
+    if (!timings || timings.length === 0) {
+        chartContainer.style.display = 'none';
+        return;
+    }
+
+    chartContainer.style.display = 'block';
+
+    const rawData = [];
+    const labels = [];
+
+const pastelColors = [
+    "#6BAED6", // clean blue
+    "#9ECAE1", // light blue
+    "#74C476", // green
+    "#A1D99B", // light green
+    "#FDAE6B", // orange-peach
+    "#FDD0A2", // light peach
+    "#C6DBEF", // blue-gray
+    "#E7CB94"  // sand-gold
+];
+
+
+
+
+    timings.forEach(timing => {
+        const key = Object.keys(timing)[0];
+
+        // Filter out total/duration style keys
+        if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
             return;
         }
 
-        chartContainer.style.display = 'block';
+        const value = timing[key];
+        rawData.push(value * 1000); // store as ms
+        labels.push(key.replace(/_/g, ' ').toUpperCase());
+    });
 
-        const labels = [];
-        const data = [];
-        const backgroundColors = [];
-        
-        // Define a color palette for visualization
-        const colors = ['#1c96ca', '#147ba3', '#34d399', '#fbb663', '#93c5fd', '#f472b6'];
-        let colorIndex = 0;
+    if (rawData.length === 0) {
+        chartContainer.style.display = 'none';
+        return;
+    }
 
-        timings.forEach(timing => {
-            const key = Object.keys(timing)[0];
-            // Filter out 'total_execute' or similar keys
-            if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
-                return; 
-            }
-            
-            const value = timing[key];
-            labels.push(key.replace(/_/g, ' '));
-            data.push(value.toFixed(4));
-            backgroundColors.push(colors[colorIndex % colors.length]);
-            colorIndex++;
-        });
+    const totalTimeMs = rawData.reduce((sum, val) => sum + val, 0);
+    const totalTimeSeconds = (totalTimeMs / 1000).toFixed(4);
 
-        // If after filtering, no data is left, hide the chart
-        if (data.length === 0) {
-            chartContainer.style.display = 'none';
-            return;
-        }
+    if (timingsChart) {
+        timingsChart.destroy();
+    }
 
-        const totalTime = data.reduce((sum, val) => sum + parseFloat(val), 0).toFixed(4);
-
-        // Destroy existing chart instance if it exists
-        if (timingsChart) {
-            timingsChart.destroy();
-        }
-
-        // Render new chart
-        timingsChart = new Chart(ctx, {
-            type: 'bar',
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: 'Duration (s)',
-                    data: data,
-                    backgroundColor: backgroundColors,
-                    borderWidth: 1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false, // Allows the chart to fit the container's fixed height
-                indexAxis: 'y', // Horizontal bar chart for a timeline effect
-                plugins: {
-                    legend: {
-                        display: false
-                    },
-                    title: {
-                        display: true,
-                        text: `Execution Timeline (Internal Steps Total: ${totalTime} s)`,
-                        font: { size: 16, weight: '600' }
-                    },
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                let label = context.dataset.label || '';
-                                if (label) {
-                                    label += ': ';
-                                }
-                                label += new Intl.NumberFormat('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 }).format(context.raw) + ' s';
-                                return label;
-                            }
+    timingsChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['QUERY TIMELINE'],
+            datasets: rawData.map((dataPoint, index) => ({
+                label: labels[index] + ' (' + (dataPoint / 1000).toFixed(4) + ' s)',
+                data: [dataPoint],
+                backgroundColor: pastelColors[index % pastelColors.length],
+                stack: 'timeline',
+                barPercentage: 0.9,
+                categoryPercentage: 0.9,
+                borderRadius: 0,          // NO rounded corners
+                borderSkipped: false,
+                borderWidth: 1,
+                borderColor: 'rgba(15, 23, 42, 0.1)'
+            }))
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            indexAxis: 'y', // horizontal
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'bottom',
+                    labels: {
+                        boxWidth: 12,
+                        boxHeight: 12,
+                        padding: 14,
+                        font: {
+                            size: 11,
+                            weight: '500'
                         }
                     }
                 },
-                scales: {
-                    x: {
-                        stacked: false,
-                        title: {
-                            display: true,
-                            text: 'Time (seconds)'
-                        },
-                        beginAtZero: true
+                title: {
+                    display: true,
+                    text: `Execution Timeline (Total: ${totalTimeSeconds} s)`,
+                    font: {
+                        size: 16,
+                        weight: '600'
                     },
-                    y: {
-                        stacked: false,
-                        grid: {
-                            display: false
+                    padding: {
+                        top: 8,
+                        bottom: 16
+                    }
+                },
+                tooltip: {
+                    mode: 'index',
+                    intersect: false,
+                    backgroundColor: 'rgba(15,23,42,0.92)',
+                    titleFont: {
+                        size: 13,
+                        weight: '600'
+                    },
+                    bodyFont: {
+                        size: 12
+                    },
+                    padding: 10,
+                    callbacks: {
+                        label: function (context) {
+                            const durationSeconds = (context.raw / 1000).toFixed(4) + ' s';
+                            const name = context.dataset.label.split(' (')[0];
+                            return `${name}: ${durationSeconds}`;
+                        },
+                        title: function () {
+                            return 'Internal Step Duration';
                         }
                     }
                 }
+            },
+
+            // Key part for the "fluid fill" feel
+            animation: {
+                // Disable global easing that can cause floating
+                easing: 'linear',
+                // We control per-axis in `animations` below
+            },
+            animations: {
+                // X controls the bar LENGTH (ms → pixels) → fluid fill
+                x: {
+                    type: 'number',
+                    from: 0,              // start from 0 ms → grows left→right
+                    easing: 'easeOutQuad',
+                    duration: function (ctx) {
+                        // Same duration for all segments (feel like same flow speed)
+                        return 600;
+                    },
+                    delay: function (ctx) {
+                        // Fill box by box: datasetIndex = segment order in stack
+                        if (ctx.type === 'data' && ctx.dataIndex === 0) {
+                            return ctx.datasetIndex * 300; // 0, 300, 600, ...
+                        }
+                        return 0;
+                    }
+                },
+                // Disable vertical movement completely (no floating up/down)
+                y: {
+                    duration: 0
+                }
+            },
+
+            scales: {
+                x: {
+                    stacked: true,
+                    title: {
+                        display: true,
+                        text: 'Time (milliseconds)',
+                        font: { size: 13, weight: '500' }
+                    },
+                    beginAtZero: true,
+                    max: totalTimeMs * 1.05,
+                    grid: {
+                        display: true,
+                        drawBorder: false,
+                        lineWidth: 0.5,
+                        color: 'rgba(148, 163, 184, 0.25)'
+                    },
+                    ticks: {
+                        font: { size: 11 }
+                    }
+                },
+                y: {
+                    stacked: true,
+                    grid: { display: false },
+                    ticks: { display: false }
+                }
+            },
+            layout: {
+                padding: {
+                    top: 8,
+                    right: 16,
+                    bottom: 8,
+                    left: 8
+                }
             }
-        });
-    }
+        }
+    });
+}
+
+
 
     async function loadSchema() {
       // User hash is removed from the form, so we use a constant value here.
@@ -957,10 +1053,10 @@
       errorDisplay.style.display = 'none';
       timingCard.style.display = 'none';
       resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Loading results...</div>';
-      if (timingsChart) {
-        timingsChart.destroy();
-        timingsChart = null;
-      }
+      if (window.timingsChartInstance) {
+            window.timingsChartInstance.destroy();
+            window.timingsChartInstance = null;
+        }
       
       // Ensure we switch to results immediately after starting execution
       // to give user a feedback screen and see the error if it happens.
@@ -1077,54 +1173,106 @@
       }
     }
     
-    /**
-     * Converts the current result set into a tab-separated value (TSV) string
-     * suitable for pasting directly into Excel or Google Sheets.
-     */
-    function copyToClipboard() {
-      if (!window.__curRows || window.__curRows.length === 0) {
-        alert("No results to copy.");
-        return;
+/**
+ * Converts the current result set into a tab-separated value (TSV) string
+ * and copies it to the clipboard (with robust fallback).
+ */
+function copyToClipboard() {
+  if (!window.__curRows || window.__curRows.length === 0) {
+    alert("No results to copy.");
+    return;
+  }
+
+  const headers = window.__curHeaders || [];
+  const rows = window.__curRows;
+
+  if (!headers.length) {
+    alert("No headers available to copy.");
+    console.error("Clipboard failed: __curHeaders is empty.", { headers, rows });
+    return;
+  }
+
+  // 1. Header row (TSV)
+  let tsv = headers.join('\t') + '\n';
+
+  // 2. Data rows
+  rows.forEach(row => {
+    const values = headers.map(header => {
+      let value = row[header];
+      if (value === null || value === undefined) value = '';
+      if (typeof value === 'object') value = JSON.stringify(value);
+
+      // Remove newlines to keep TSV clean
+      value = String(value).replace(/(\r\n|\n|\r)/g, ' ');
+
+      // Escape quotes/tabs if needed
+      if (value.includes('\t') || value.includes('"')) {
+        value = '"' + value.replace(/"/g, '""') + '"';
+      }
+      return value;
+    });
+    tsv += values.join('\t') + '\n';
+  });
+
+  if (tsv.trim().length <= 1) {
+    alert('Error: Data for clipboard is empty. Check if headers are available.');
+    console.error('Clipboard failed: TSV string is empty or nearly empty. TSV content:', tsv);
+    return;
+  }
+
+  const textToCopy = tsv;
+
+  const btn = document.querySelector('.btn-clipboard');
+  const originalText = btn ? btn.innerHTML : null;
+
+  const showSuccess = () => {
+    if (!btn) return;
+    btn.innerHTML = '<i class="fas fa-check"></i>&nbsp;Copied!';
+    setTimeout(() => { btn.innerHTML = originalText; }, 1500);
+  };
+
+  const fallbackCopy = () => {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = textToCopy;
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      textarea.style.top = '0';
+      textarea.setAttribute('readonly', '');
+      document.body.appendChild(textarea);
+      textarea.select();
+      const successful = document.execCommand('copy');
+      document.body.removeChild(textarea);
+
+      if (!successful) {
+        throw new Error('document.execCommand("copy") returned false');
       }
 
-      const headers = window.__curHeaders;
-      const rows = window.__curRows;
-      
-      // 1. Create Header Row (TSV format)
-      let tsv = headers.join('\\t') + '\\n';
-
-      // 2. Create Data Rows
-      rows.forEach(row => {
-        const values = headers.map(header => {
-          let value = row[header];
-          if (value === null || value === undefined) value = '';
-          if (typeof value === 'object') value = JSON.stringify(value);
-          
-          // Escape quotes and ensure content does not break TSV format
-          // By wrapping in double quotes if it contains tabs or newlines.
-          // Excel/Sheets typically handles basic string content fine, but 
-          // wrapping ensures robustness against embedded newlines/tabs.
-          value = String(value).replace(/\\r?\\n/g, ' '); // Replace newlines with space
-          
-          // Simple heuristic for TSV: wrap in quotes if it contains a tab or quotes
-          if (value.includes('\\t') || value.includes('"')) {
-              value = '"' + value.replace(/"/g, '""') + '"';
-          }
-          return value;
-        });
-        tsv += values.join('\\t') + '\\n';
-      });
-
-      // 3. Write to clipboard
-      navigator.clipboard.writeText(tsv)
-        .then(() => {
-          alert('Successfully copied ' + rows.length + ' rows to clipboard (TSV format).');
-        })
-        .catch(err => {
-          console.error('Failed to copy to clipboard:', err);
-          alert('Failed to copy to clipboard. Check console for details.');
-        });
+      console.log('Successfully copied (fallback) ' + rows.length + ' rows to clipboard.');
+      showSuccess();
+    } catch (err) {
+      console.error('Fallback copy failed:', err);
+      alert('Failed to copy to clipboard. Your browser or environment may block clipboard access.');
     }
+  };
+
+  // Modern API first
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(textToCopy)
+      .then(() => {
+        console.log('Successfully copied ' + rows.length + ' rows to clipboard (TSV format).');
+        showSuccess();
+      })
+      .catch(err => {
+        console.warn('navigator.clipboard.writeText failed, trying fallback. Error:', err);
+        fallbackCopy();
+      });
+  } else {
+    // No clipboard API → use fallback
+    fallbackCopy();
+  }
+}
+
 
     // Function to download CSV (retained and simplified)
     function downloadCSV() {

@@ -2,7 +2,7 @@
     /* Using the main content background color from the sidebar CSS */
     background-color: #f3f6fb;
     font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-    padding: 24px;
+    padding: 0px;
 ">
     <div class="card-professional-themed" style="
         background-color: #ffffff;
@@ -39,7 +39,7 @@
                     background-repeat: no-repeat;
                     background-position: right 10px center;
                 ">
-                    </select>
+                </select>
                 <div style="
                     font-size: 12px;
                     color: #8894a8;
@@ -52,9 +52,11 @@
             <div style="flex-grow: 1;">
                 <div class="summary-grid" style="
                     display: grid;
-                    grid-template-columns: repeat(3, 1fr);
+                    grid-template-columns: repeat(4, 1fr);
                     gap: 15px;
                 ">
+
+                    <!-- FILES -->
                     <div class="metric-card-themed" style="
                         background-color: #f5faff;
                         border: 1px solid #e2e8f0;
@@ -82,6 +84,7 @@
                         </div>
                     </div>
 
+                    <!-- ROWS -->
                     <div class="metric-card-themed" style="
                         background-color: #ffffff;
                         border: 1px solid #d0d7e7;
@@ -109,6 +112,35 @@
                         </div>
                     </div>
 
+                    <!-- VERSION (NEW) -->
+                    <div class="metric-card-themed" style="
+                        background-color: #f5faff;
+                        border: 1px solid #e2e8f0;
+                        border-radius: 8px;
+                        padding: 15px;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                    ">
+                        <div class="metric-icon" style="
+                            color: #1c96ca;
+                            font-size: 20px;
+                        "><i class="fas fa-code-branch"></i></div>
+                        <div class="metric-content">
+                            <div class="metric-label" style="
+                                font-size: 12px;
+                                color: #475569;
+                                font-weight: 500;
+                            ">VERSION</div>
+                            <div class="metric-value" id="tenantVersionValue" style="
+                                font-size: 20px;
+                                font-weight: 700;
+                                color: #34475e;
+                            ">n/a</div>
+                        </div>
+                    </div>
+
+                    <!-- BYTE SIZE -->
                     <div class="metric-card-themed" style="
                         background-color: #f5faff;
                         border: 1px solid #e2e8f0;
