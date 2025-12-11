@@ -22,7 +22,6 @@
 
   <style>
     :root {
-      /* Sidebar palette (from Data Reflection) */
       --primary-color: #1c96ca;
       --primary-light: #e6f4fa;
       --secondary-color: #147ba3;
@@ -32,7 +31,6 @@
       --text-light: #8d99ae;
       --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 
-      /* Cards / panels */
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
       --panel-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
@@ -56,8 +54,6 @@
     a:hover {
       text-decoration: underline;
     }
-
-    /* --------- CONTENT AREA --------- */
 
     .content-container {
       margin-left: 280px;
@@ -88,48 +84,7 @@
       padding: 16px 20px;
     }
 
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-    }
-
-    .grid-3 {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
-    }
-
-    .top-row {
-      display: flex;
-      justify-content: flex-start;
-      gap: 12px;
-      margin-top: 16px;
-      flex-wrap: wrap;
-    }
-
-    .top-row .card {
-      flex: 1 1 280px;
-    }
-
-    .top-row .root-card {
-      flex: 0 0 250px;
-    }
-
     .muted { color: var(--text-light); }
-    .btn {
-      padding: 8px 12px;
-      border-radius: 10px;
-      background: #0b2940;
-      border: 1px solid #1d3b57;
-      color: #e2e8f0;
-      font-weight: 500;
-      cursor: pointer;
-      font-size: 13px;
-    }
-
-    .btn:hover { filter: brightness(1.1); }
-
     .btn-ghost {
       padding: 6px 10px;
       border-radius: 8px;
@@ -144,21 +99,6 @@
       background: #e2e8f0;
     }
 
-    input, select {
-      background: #ffffff;
-      border: 1px solid #d0d7e7;
-      color: var(--text-color);
-      border-radius: 10px;
-      padding: 8px 10px;
-      font-size: 13px;
-    }
-
-    input:focus, select:focus {
-      outline: none;
-      box-shadow: 0 0 0 3px rgba(28,150,202,0.15);
-      border-color: var(--primary-color);
-    }
-
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; }
 
@@ -168,61 +108,66 @@
     .mt-2 { margin-top: 8px; }
     .mt-3 { margin-top: 12px; }
     .mt-4 { margin-top: 16px; }
-    .rounded { border-radius: 10px; }
     .text-sm { font-size: 12px; }
     .text-xs { font-size: 11px; }
     .font-mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
                    "Liberation Mono", "Courier New", monospace;
     }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 8px;
-      border-radius: 999px;
-      background: #f1f5f9;
-      border: 1px solid #d0d7e7;
-      font-size: 11px;
-      height: 22px; /* Uniform height for alignment in tabs */
-    }
-
-    .flex { display:flex; align-items:center; gap:10px; }
-    .right { text-align: right; }
     .break-all { word-break: break-all; }
 
-    .tabs {
-      display:flex;
-      gap:8px;
-      margin-top:12px;
+    /* Execute / Result / Timings–style tab bar */
+    #tab-navigation {
+      display: flex;
+      gap: 24px;
+      margin-top: 16px;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 0 2px;
     }
 
     .tab {
-      padding: 8px 12px;
-      border: 1px solid #d0d7e7;
-      border-radius: 10px;
+      padding: 8px 0;
+      margin-bottom: -1px;
+      border: none;
+      border-bottom: 2px solid transparent;
+      background: transparent;
       cursor: pointer;
       font-size: 13px;
-      background: #ffffff;
-      /* NEW: Flex to align icon, text, count, and button */
-      display: flex;
+      color: #64748b;
+      display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+    }
+
+    .tab i {
+      font-size: 13px;
     }
 
     .tab.active {
-      background: #e6f4fa;
-      border-color: var(--primary-color);
-      color: var(--primary-color);
+      color: #1c96ca;
+      border-bottom-color: #1c96ca;
+      font-weight: 500;
     }
 
-    /* Styling for the small + button inside the tab */
-    .tab .btn-ghost-plus {
-        padding: 2px 6px;
-        font-size: 11px;
-        height: 22px;
-        line-height: 1;
-        margin-left: 2px; /* Small separation from the count chip */
+    /* visible + button in tab header */
+    .tab-add {
+      margin-left: 4px;
+      min-width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      cursor: pointer;
+      color: #0f172a;
+      padding: 0;
+    }
+
+    .tab-add:hover {
+      background: #e2e8f0;
     }
 
     .hidden { display:none; }
@@ -255,7 +200,6 @@
       font-size: 12px;
     }
 
-    /* --- Configuration styles --- */
     .badge-ok {
       display:inline-flex;
       align-items:center;
@@ -313,7 +257,120 @@
       color:#94a3b8;
       font-style:italic;
     }
-    /* ----------------------------------------------- */
+
+    /* Mirror cards + switches inside Mirrors tab */
+    .mirror-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .mirror-card {
+      border-radius: 12px;
+      border: 1px solid #e2e8f0;
+      background: #f9fafb;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .mirror-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .mirror-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .mirror-format {
+      font-weight: 600;
+      font-size: 13px;
+      color: #0f172a;
+    }
+
+    .mirror-desc {
+      font-size: 12px;
+      color: #64748b;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 34px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #cbd5f5;
+      border-radius: 999px;
+      transition: var(--transition);
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 14px;
+      width: 14px;
+      left: 2px;
+      top: 2px;
+      background-color: #ffffff;
+      border-radius: 50%;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.35);
+      transition: var(--transition);
+    }
+
+    .switch input:checked + .slider {
+      background: #1c96ca;
+    }
+
+    .switch input:checked + .slider:before {
+      transform: translateX(16px);
+    }
+
+    /* Simple form styles for create modals */
+    .form-group {
+      margin-bottom: 10px;
+    }
+    .form-group label {
+      font-size: 12px;
+      color: #475569;
+      display:block;
+      margin-bottom: 4px;
+    }
+    .form-group input,
+    .form-group select {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+
+    /* From original config.html */
+    .header-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:12px;
+    }
   </style>
 
   <script>
@@ -327,60 +384,261 @@
       });
     }
 
-    function onPairChange() {
-      const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
-      const params = new URLSearchParams(window.location.search);
-      params.set('org', org);
-      params.set('sup', sup);
-      params.set('page','1');
-      window.location.search = params.toString();
+    // --- tiny helpers for safe HTML ---
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
     }
 
+    function escapeHtmlAttr(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    // Mirrors & detail viewers use the selected super from selection.html (pairSel)
+    // and a fixed organization = "kladna-soft".
     async function toggleMirror(fmt, el) {
       const enable = el.checked;
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const sup = sel ? sel.value : '';
+      const org = 'kladna-soft';
+
       const ep = enable ? '/api/mirrors/enable' : '/api/mirrors/disable';
-      await api(`${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`, {method:'POST'});
+      await api(
+        `${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`,
+        { method: 'POST' }
+      );
       location.reload();
     }
 
     async function viewUser(hash) {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const sup = sel ? sel.value : '';
+      const org = 'kladna-soft';
       const data = await api(`/api/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('User '+hash, JSON.stringify(data, null, 2));
     }
 
     async function viewRole(hash) {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const sup = sel ? sel.value : '';
+      const org = 'kladna-soft';
       const data = await api(`/api/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Role '+hash, JSON.stringify(data, null, 2));
     }
 
     async function viewMirror(hash) {
       const sel = document.getElementById('pairSel');
-      const [org, sup] = sel.value.split('|');
+      const sup = sel ? sel.value : '';
+      const org = 'kladna-soft';
       const data = await api(`/api/mirror/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Mirror '+hash, JSON.stringify(data, null, 2));
     }
 
-    // Placeholder functions for the '+' buttons
+    /* --- Simple create modals --- */
+
     function createUserModal() {
-        showModal('Create New User', 'User creation form would appear here.');
-    }
-    function createRoleModal() {
-        showModal('Create New Role', 'Role creation form would appear here.');
+      document.getElementById('modal-create-user').style.display = 'flex';
     }
 
-    // FIX: Ensure this function correctly hides/shows the panes
+    function closeCreateUserModal() {
+      document.getElementById('modal-create-user').style.display = 'none';
+    }
+
+    function createRoleModal() {
+      document.getElementById('modal-create-role').style.display = 'flex';
+    }
+
+    function closeCreateRoleModal() {
+      document.getElementById('modal-create-role').style.display = 'none';
+    }
+
+    // Placeholder submit handlers (hook to your API later)
+    function submitCreateUser(event) {
+      event.preventDefault();
+      alert('User would be created here.');
+      closeCreateUserModal();
+    }
+
+    function submitCreateRole(event) {
+      event.preventDefault();
+      alert('Role would be created here.');
+      closeCreateRoleModal();
+    }
+
+    /* --- .env CONFIG TAB LOGIC --- */
+
+    async function loadEnvConfig() {
+      const infoEl = document.getElementById('env-config-info');
+      const pathEl = document.getElementById('env-config-path');
+      const tbody = document.getElementById('env-config-table-body');
+      if (!infoEl || !pathEl || !tbody) return;
+
+      tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-2 text-sm muted">Loading...</td></tr>';
+
+      try {
+        const data = await api('/admin/env');
+        if (data.found) {
+          infoEl.innerHTML = `
+            <span class="badge-ok">
+              <i class="fas fa-check-circle"></i>
+              .env file found and loaded
+            </span>
+          `;
+        } else {
+          infoEl.innerHTML = `
+            <span class="badge-warn">
+              <i class="fas fa-exclamation-triangle"></i>
+              No .env file found
+            </span>
+          `;
+        }
+
+        pathEl.textContent = data.path || '—';
+
+        renderEnvRows(data.items || []);
+      } catch (err) {
+        console.error(err);
+        infoEl.innerHTML = `
+          <span class="badge-warn">
+            <i class="fas fa-exclamation-triangle"></i>
+            Error loading .env (${escapeHtml(err.message || String(err))})
+          </span>
+        `;
+        tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-2 text-sm muted">Failed to load .env.</td></tr>';
+      }
+    }
+
+    function renderEnvRows(items) {
+      const tbody = document.getElementById('env-config-table-body');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+
+      if (!items || !items.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-2 text-sm muted">No variables found in .env.</td></tr>';
+        return;
+      }
+
+      items.forEach((item) => {
+        const key = item.key || '';
+        const val = item.value || '';
+        const isSensitive = !!item.is_sensitive;
+
+        const tr = document.createElement('tr');
+        tr.className = 'border-b';
+        tr.setAttribute('data-key', key);
+        tr.setAttribute('data-sensitive', isSensitive ? '1' : '0');
+
+        tr.innerHTML = `
+          <td class="px-3 py-2 text-sm">
+            <span class="value">${escapeHtml(key)}</span>
+            ${isSensitive ? '<span class="pill" style="margin-left:6px;"><i class="fas fa-lock" style="font-size:9px;"></i>&nbsp;sensitive</span>' : ''}
+          </td>
+          <td class="px-3 py-2 text-sm">
+            <input
+              type="${isSensitive ? 'password' : 'text'}"
+              class="env-value-input"
+              value="${escapeHtmlAttr(val)}"
+              style="width:100%; border-radius:8px; border:1px solid #cbd5e1; padding:4px 6px; font-size:12px;"
+            />
+          </td>
+          <td class="px-3 py-2 text-xs">
+            ${isSensitive
+              ? '<i class="fas fa-eye-slash"></i>&nbsp;hidden'
+              : '<i class="fas fa-eye"></i>&nbsp;visible'}
+          </td>
+          <td class="px-3 py-2 text-sm">
+            ${isSensitive
+              ? '<button type="button" class="btn-ghost env-toggle-secret"><i class="fas fa-eye"></i>&nbsp;Show</button>'
+              : ''}
+          </td>
+        `;
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function saveEnvConfig() {
+      const tbody = document.getElementById('env-config-table-body');
+      if (!tbody) return;
+
+      const rows = Array.from(tbody.querySelectorAll('tr[data-key]'));
+      const items = rows.map(row => {
+        const key = row.getAttribute('data-key') || '';
+        const input = row.querySelector('.env-value-input');
+        const value = input ? input.value : '';
+        return { key, value };
+      });
+
+      try {
+        await api('/admin/env', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items })
+        });
+
+        const saveMsg = document.getElementById('env-save-message');
+        if (saveMsg) {
+          saveMsg.innerHTML = `
+            <span class="badge-ok">
+              <i class="fas fa-check-circle"></i>
+              Saved to .env
+            </span>
+          `;
+          setTimeout(() => { saveMsg.innerHTML = ''; }, 2500);
+        }
+      } catch (err) {
+        console.error(err);
+        const saveMsg = document.getElementById('env-save-message');
+        if (saveMsg) {
+          saveMsg.innerHTML = `
+            <span class="badge-warn">
+              <i class="fas fa-exclamation-triangle"></i>
+              Save failed (${escapeHtml(err.message || String(err))})
+            </span>
+          `;
+          setTimeout(() => { saveMsg.innerHTML = ''; }, 4000);
+        }
+      }
+    }
+
+    function toggleAllSecrets() {
+      const inputs = document.querySelectorAll('#env-config-table-body tr[data-sensitive="1"] .env-value-input');
+      if (!inputs.length) return;
+      // check the first sensitive input to decide target state
+      const show = Array.from(inputs).some(input => input.type === 'password');
+      inputs.forEach(input => {
+        input.type = show ? 'text' : 'password';
+      });
+
+      // update all row buttons text/icons
+      const buttons = document.querySelectorAll('#env-config-table-body .env-toggle-secret');
+      buttons.forEach(btn => {
+        btn.innerHTML = show
+          ? '<i class="fas fa-eye-slash"></i>&nbsp;Hide'
+          : '<i class="fas fa-eye"></i>&nbsp;Show';
+      });
+    }
+
+    /* --- Tab + details modal --- */
+
     function switchTab(id) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tabpane').forEach(p => p.classList.add('hidden'));
       document.getElementById('tab-'+id).classList.add('active');
       document.getElementById('pane-'+id).classList.remove('hidden');
+
+      if (id === 'config') {
+        loadEnvConfig();
+      }
     }
 
     function showModal(title, body) {
@@ -393,7 +651,6 @@
       document.getElementById('modal').style.display = 'none';
     }
 
-    // Sidebar toggle + active link handling
     $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
@@ -406,16 +663,28 @@
         $("#sidebar").addClass("sidebar-collapsed");
       }
 
-      // Set active link for sidebar
       var path = window.location.pathname;
       if (path.startsWith("/admin/execute")) {
         $("#link-execute").addClass("active");
       } else if (path.startsWith("/admin/tables")) {
         $("#link-tables").addClass("active");
       } else {
-        // If on /admin, link-admin is active
         $("#link-admin").addClass("active");
       }
+
+      // per-row secret toggle (event delegation)
+      $('#env-config-table-body').on('click', '.env-toggle-secret', function() {
+        const row = this.closest('tr');
+        const input = row ? row.querySelector('.env-value-input') : null;
+        if (!input) return;
+        if (input.type === 'password') {
+          input.type = 'text';
+          this.innerHTML = '<i class="fas fa-eye-slash"></i>&nbsp;Hide';
+        } else {
+          input.type = 'password';
+          this.innerHTML = '<i class="fas fa-eye"></i>&nbsp;Show';
+        }
+      });
     });
   </script>
 </head>
@@ -427,97 +696,32 @@
       <div class="wrap"><p>Unauthorized</p></div>
     {% else %}
     <div class="wrap">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;">
-        <div>
-            <h4>
-              <i class="fas fa-user-shield" style="color:#1c96ca;"></i>&nbsp;
-              Admin
-            </h4>
-          <div class="text-xs muted">Manage SuperTable Redis metadata and users.</div>
-        </div>
-      </div>
 
-      <div class="top-row">
-        <div class="card">
-          <div class="section">
-            <div class="grid">
-              <div>
-                <label class="muted text-sm">Tenant</label><br/>
-                <select id="pairSel" onchange="onPairChange()" style="min-width:300px">
-                  {% for t in tenants %}
-                    <option value="{{t.org}}|{{t.sup}}" {% if t.selected %}selected{% endif %}>
-                      {{t.org}} / {{t.sup}}
-                    </option>
-                  {% endfor %}
-                </select>
-                {% if has_tenant %}
-                  <div class="muted text-xs mt-2">Showing: {{ sel_org }} / {{ sel_sup }}</div>
-                {% else %}
-                  <div class="muted text-xs mt-2">No tenant discovered in Redis.</div>
-                {% endif %}
-              </div>
-              <div class="right"></div>
-            </div>
-          </div>
-        </div>
+      {# SuperTable selection + metrics block #}
+      {% include "selection.html" %}
 
-        {% if has_tenant %}
-        <div class="card root-card">
-          <div class="section">
-            <div class="muted text-sm">Root</div>
-            <div class="mt-2">
-              <span class="chip">
-                <span style="text-transform:uppercase; font-weight:600;">version</span>
-                <strong>{{ root_version }}</strong>
-              </span>
-            </div>
-            <div class="mt-2 text-xs">Updated: {{ root_ts }}</div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="section">
-            <div class="muted text-sm">Mirrors (Formats)</div>
-            <div class="mt-2 flex">
-              {% for fmt in ["DELTA","ICEBERG","PARQUET"] %}
-                <label class="chip" style="gap:6px;">
-                  <input type="checkbox"
-                         {% if fmt in mirrors_enabled_formats %}checked{% endif %}
-                         onchange="toggleMirror('{{fmt}}', this)"/>
-                  {{fmt}}
-                </label>
-              {% endfor %}
-            </div>
-          </div>
-        </div>
-        {% endif %}
-      </div>
-
-      <div class="tabs">
+      <div id="tab-navigation">
         <div id="tab-users" class="tab active" onclick="switchTab('users')">
-          <i class="fas fa-users"></i>&nbsp;Users
-          <span class="chip">{{ users | length }}</span>
-          <button class="btn-ghost btn-ghost-plus" onclick="createUserModal()">
-              <i class="fas fa-plus"></i>
+          <i class="fas fa-users"></i><span>Users</span>
+          <button type="button" class="tab-add" onclick="createUserModal(); event.stopPropagation();">
+            +
           </button>
         </div>
         <div id="tab-roles" class="tab" onclick="switchTab('roles')">
-          <i class="fas fa-user-shield"></i>&nbsp;Roles
-          <span class="chip">{{ roles | length }}</span>
-          <button class="btn-ghost btn-ghost-plus" onclick="createRoleModal()">
-              <i class="fas fa-plus"></i>
+          <i class="fas fa-user-shield"></i><span>Roles</span>
+          <button type="button" class="tab-add" onclick="createRoleModal(); event.stopPropagation();">
+            +
           </button>
         </div>
         <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
-          <i class="fas fa-mirror"></i>&nbsp;Mirrors
-          <span class="chip">{{ mirrors | length }}</span>
+          <i class="fas fa-mirror"></i><span>Mirrors</span>
         </div>
         <div id="tab-config" class="tab" onclick="switchTab('config')">
-          <i class="fas fa-cog"></i>&nbsp;Config
-          <span class="chip">{% if dotenv_found %}Loaded{% else %}Missing{% endif %}</span>
+          <i class="fas fa-cog"></i><span>Config</span>
         </div>
       </div>
 
+      <!-- USERS TAB -->
       <div id="pane-users" class="tabpane">
         <div class="card mt-4">
           <div class="section">
@@ -529,21 +733,46 @@
                     <th class="px-3 py-2 text-xs muted">hash</th>
                     <th class="px-3 py-2 text-xs muted">name</th>
                     <th class="px-3 py-2 text-xs muted">roles</th>
-                    <th class="px-3 py-2 text-xs muted">actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for u in users %}
                   <tr class="border-b">
+                    <!-- hash -->
                     <td class="px-3 py-2 font-mono text-sm">{{ u.hash }}</td>
-                    <td class="px-3 py-2 text-sm">{{ u.get('name','') }}</td>
-                    <td class="px-3 py-2 text-sm">
-                      {{ (u.get('roles') or []) | join(', ') }}
-                    </td>
+
+                    <!-- name / username as button -->
                     <td class="px-3 py-2 text-sm">
                       <button class="btn-ghost" onclick="viewUser('{{ u.hash }}')">
-                        Display
+                        {{ u.get('name') or u.get('username') or '' }}
                       </button>
+                    </td>
+
+                    <!-- roles as buttons with same style -->
+                    <td class="px-3 py-2 text-sm">
+                      {% set user_roles = u.get('roles') or [] %}
+                      {% if not user_roles %}
+                        <span class="value-muted">—</span>
+                      {% else %}
+                        {% for rh in user_roles %}
+                          {% set r = (roles | selectattr('hash', 'equalto', rh) | list | first) %}
+                          {% if r %}
+                            <button class="btn-ghost"
+                                    style="margin-right:4px; margin-bottom:2px;"
+                                    title="{{ rh }}"
+                                    onclick="viewRole('{{ rh }}')">
+                              {{ r.get('role') or r.get('type') or r.get('description') or rh }}
+                            </button>
+                          {% else %}
+                            <button class="btn-ghost"
+                                    style="margin-right:4px; margin-bottom:2px;"
+                                    title="{{ rh }}"
+                                    onclick="viewRole('{{ rh }}')">
+                              {{ rh }}
+                            </button>
+                          {% endif %}
+                        {% endfor %}
+                      {% endif %}
                     </td>
                   </tr>
                   {% endfor %}
@@ -554,6 +783,7 @@
         </div>
       </div>
 
+      <!-- ROLES TAB -->
       <div id="pane-roles" class="tabpane hidden">
         <div class="card mt-4">
           <div class="section">
@@ -563,21 +793,74 @@
                 <thead>
                   <tr class="border-b">
                     <th class="px-3 py-2 text-xs muted">hash</th>
-                    <th class="px-3 py-2 text-xs muted">type</th>
+                    <th class="px-3 py-2 text-xs muted">name</th>
                     <th class="px-3 py-2 text-xs muted">description</th>
-                    <th class="px-3 py-2 text-xs muted">actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for r in roles %}
                   <tr class="border-b">
+                    <!-- hash -->
                     <td class="px-3 py-2 font-mono text-sm">{{ r.hash }}</td>
-                    <td class="px-3 py-2 text-sm">{{ r.get('type','') }}</td>
-                    <td class="px-3 py-2 text-sm">{{ r.get('description','') }}</td>
+
+                    <!-- name as button -->
                     <td class="px-3 py-2 text-sm">
                       <button class="btn-ghost" onclick="viewRole('{{ r.hash }}')">
-                        Display
+                        {{ r.get('role') or r.get('type') or r.get('description') or 'View role' }}
                       </button>
+                    </td>
+
+                    <!-- description: tables/columns/filters nicely formatted -->
+                    <td class="px-3 py-2 text-sm">
+                      {% set tables_raw = r.get('tables') or '' %}
+                      {% set columns_raw = r.get('columns') or '' %}
+                      {% set filters_raw = r.get('filters') or '' %}
+
+                      {% if tables_raw in ['["*"]', '*'] %}
+                        {% set tables_fmt = 'All tables' %}
+                      {% elif tables_raw %}
+                        {% set tables_fmt = tables_raw
+                          |replace('["','')
+                          |replace('"]','')
+                          |replace('","',', ') %}
+                      {% else %}
+                        {% set tables_fmt = '—' %}
+                      {% endif %}
+
+                      {% if columns_raw in ['["*"]', '*'] %}
+                        {% set columns_fmt = 'All columns' %}
+                      {% elif columns_raw %}
+                        {% set columns_fmt = columns_raw
+                          |replace('["','')
+                          |replace('"]','')
+                          |replace('","',', ') %}
+                      {% else %}
+                        {% set columns_fmt = '—' %}
+                      {% endif %}
+
+                      {% if filters_raw in ['["*"]', '*'] %}
+                        {% set filters_fmt = 'All filters' %}
+                      {% elif filters_raw %}
+                        {% set filters_fmt = filters_raw
+                          |replace('["','')
+                          |replace('"]','')
+                          |replace('","',', ') %}
+                      {% else %}
+                        {% set filters_fmt = '—' %}
+                      {% endif %}
+
+                      <div class="text-xs">
+                        <strong>tables:</strong>
+                        <span class="value">{{ tables_fmt }}</span>
+                      </div>
+                      <div class="text-xs">
+                        <strong>columns:</strong>
+                        <span class="value">{{ columns_fmt }}</span>
+                      </div>
+                      <div class="text-xs">
+                        <strong>filters:</strong>
+                        <span class="value">{{ filters_fmt }}</span>
+                      </div>
                     </td>
                   </tr>
                   {% endfor %}
@@ -588,163 +871,123 @@
         </div>
       </div>
 
+      <!-- MIRRORS TAB -->
       <div id="pane-mirrors" class="tabpane hidden">
         <div class="card mt-4">
           <div class="section">
             <div class="muted text-sm">Mirrors</div>
-            <div class="mt-2">
-              <table>
-                <thead>
-                  <tr class="border-b">
-                    <th class="px-3 py-2 text-xs muted">hash</th>
-                    <th class="px-3 py-2 text-xs muted">Source Leaf</th>
-                    <th class="px-3 py-2 text-xs muted">Target Leaf</th>
-                    <th class="px-3 py-2 text-xs muted">Enabled Formats</th>
-                    <th class="px-3 py-2 text-xs muted">actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for m in mirrors %}
-                  <tr class="border-b">
-                    <td class="px-3 py-2 font-mono text-sm">{{ m.hash }}</td>
-                    <td class="px-3 py-2 text-sm break-all">{{ m.get('source_leaf','') }}</td>
-                    <td class="px-3 py-2 text-sm break-all">{{ m.get('target_leaf','') }}</td>
-                    <td class="px-3 py-2 text-sm">
-                        {% for fmt in m.get('formats', []) %}
-                            <span class="chip">{{ fmt }}</span>
-                        {% endfor %}
-                    </td>
-                    <td class="px-3 py-2 text-sm">
-                      <button class="btn-ghost" onclick="viewMirror('{{ m.hash }}')">
-                        Display
-                      </button>
-                    </td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
+            <div class="mt-2 text-xs muted">
+              Enable or disable supported mirror formats for the selected SuperTable.
             </div>
-          </div>
-        </div>
-      </div>
-
-      <div id="pane-config" class="tabpane hidden">
-        <div class="text-sm muted" style="margin-top:16px;">
-          .env discovery and effective settings (Python settings vs. dotenv file).
-        </div>
-        <div class="card" style="margin-top:16px;">
-          <div class="section">
-            <div class="row">
-              <div class="col-md-7">
-                <div class="text-sm muted">Loaded .env</div>
-                <div style="margin-top:6px;">
-                  {% if dotenv_found %}
-                    <span class="badge-ok">
-                      <i class="fas fa-check-circle"></i>
-                      .env file found and loaded
-                    </span>
-                    <div class="text-xs" style="margin-top:8px;">
-                      <strong>Path:</strong>
-                      <span class="value">{{ dotenv_path }}</span>
-                    </div>
-                  {% else %}
-                    <span class="badge-warn">
-                      <i class="fas fa-exclamation-triangle"></i>
-                      No .env file found in the searched locations
-                    </span>
+            <div class="mirror-grid">
+              {% for fmt in ["DELTA","ICEBERG","PARQUET"] %}
+              <div class="mirror-card">
+                <div class="mirror-card-header">
+                  <div class="mirror-title">
+                    <span class="mirror-format">{{ fmt }}</span>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox"
+                           {% if fmt in mirrors_enabled_formats %}checked{% endif %}
+                           onchange="toggleMirror('{{fmt}}', this)">
+                    <span class="slider"></span>
+                  </label>
+                </div>
+                <div class="mirror-desc">
+                  {% if fmt == "DELTA" %}
+                    Delta Lake compatible transactional tables with ACID semantics.
+                  {% elif fmt == "ICEBERG" %}
+                    Apache Iceberg tables optimized for large analytical datasets.
+                  {% elif fmt == "PARQUET" %}
+                    Plain Parquet files for lightweight interoperability.
                   {% endif %}
                 </div>
               </div>
-              <div class="col-md-5">
-                <div class="text-sm muted">Search order</div>
-                <ul class="list-compact" style="margin-top:4px;">
-                  {% for p, exists in tried %}
-                    <li>
-                      {% if exists %}
-                        <i class="fas fa-dot-circle" style="color:#16a34a; font-size:8px;"></i>
-                      {% else %}
-                        <i class="far fa-circle" style="color:#94a3b8; font-size:8px;"></i>
-                      {% endif %}
-                      <span class="value{% if not exists %} value-muted{% endif %}">
-                        {{ p }}
-                      </span>
-                      {% if exists %}
-                        <span class="pill" style="margin-left:6px;">exists</span>
-                      {% endif %}
-                    </li>
-                  {% endfor %}
-                </ul>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:16px;">
-          <div class="section">
-            <div class="text-sm muted">Settings</div>
-            <div class="text-xs muted" style="margin-top:4px;">
-              Comparison of values coming from the loaded <code>.env</code> (if any) vs.
-              effective runtime settings. Sensitive values are hidden.
-            </div>
-
-            <div style="margin-top:12px; overflow:auto; max-height:65vh;">
-              <table>
-                <thead>
-                  <tr class="border-b">
-                    <th class="px-3 py-2 text-xs muted">Key</th>
-                    <th class="px-3 py-2 text-xs muted">.env value</th>
-                    <th class="px-3 py-2 text-xs muted">Effective value</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for row in rows %}
-                    <tr class="border-b">
-                      <td class="px-3 py-2 text-sm">
-                        <span class="value">{{ row.key }}</span>
-                        {% if row.is_sensitive %}
-                          <span class="pill" style="margin-left:6px;">
-                            <i class="fas fa-lock" style="font-size:9px;"></i>&nbsp;sensitive
-                          </span>
-                        {% endif %}
-                      </td>
-                      <td class="px-3 py-2 text-sm">
-                        {% if row.env_val is not none %}
-                          {% if row.is_sensitive %}
-                            <span class="value value-muted">••••••••</span>
-                          {% else %}
-                            <span class="value">{{ row.env_val }}</span>
-                          {% endif %}
-                        {% else %}
-                          <span class="value value-muted">—</span>
-                        {% endif %}
-                      </td>
-                      <td class="px-3 py-2 text-sm">
-                        {% if row.eff_val is not none %}
-                          {% if row.is_sensitive %}
-                            <span class="value value-muted">••••••••</span>
-                          {% else %}
-                            <span class="value">{{ row.eff_val }}</span>
-                          {% endif %}
-                        {% else %}
-                          <span class="value value-muted">—</span>
-                        {% endif %}
-                      </td>
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-
-            <div style="margin-top:10px; text-align:right;">
-              <button class="btn-ghost" onclick="location.reload()">
-                <i class="fas fa-sync-alt"></i>&nbsp;Reload
-              </button>
+              {% endfor %}
             </div>
           </div>
         </div>
       </div>
 
+      <!-- CONFIG TAB -->
+      <div id="pane-config" class="tabpane hidden">
+        <div class="mt-4">
+          <!-- .env info card WITH header-row inside -->
+          <div class="card">
+            <div class="section">
+              <div class="header-row">
+                <div>
+                  <h4>
+                    <i class="fas fa-cog" style="color:#1c96ca;"></i>&nbsp;
+                    Environment configuration (.env)
+                  </h4>
+                  <div class="text-xs muted">
+                    View and edit values from the project <code>.env</code> file. Sensitive values are hidden by default.
+                  </div>
+                </div>
+                <div id="env-save-message"></div>
+              </div>
 
+              <div class="text-sm muted" style="margin-top:4px;">.env file</div>
+              <div id="env-config-info" class="mt-2 text-xs">
+                <!-- status badge injected by loadEnvConfig() -->
+              </div>
+              <div class="text-xs" style="margin-top:8px;">
+                <strong>Path:</strong>
+                <span class="value" id="env-config-path">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Variables card -->
+          <div class="card" style="margin-top:16px;">
+            <div class="section">
+              <div class="text-sm muted">Variables</div>
+              <div class="text-xs muted" style="margin-top:4px;">
+                Values are read from the <code>.env</code> file on disk (via <code>python-dotenv</code>).
+                Sensitive keys (passwords, tokens, secrets, keys) are masked by default; you can reveal them locally.
+              </div>
+
+              <div style="margin-top:12px; overflow:auto; max-height:65vh;">
+                <table>
+                  <thead>
+                    <tr class="border-b">
+                      <th class="px-3 py-2 text-xs muted">Key</th>
+                      <th class="px-3 py-2 text-xs muted">Value</th>
+                      <th class="px-3 py-2 text-xs muted">Visibility</th>
+                      <th class="px-3 py-2 text-xs muted">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="env-config-table-body">
+                    <tr>
+                      <td colspan="4" class="px-3 py-2 text-sm muted">Loading...</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div style="margin-top:10px; display:flex; align-items:center; justify-content:space-between;">
+                <div>
+                  <button type="button" class="btn-ghost" onclick="loadEnvConfig()">
+                    <i class="fas fa-sync-alt"></i>&nbsp;Reload from disk
+                  </button>
+                </div>
+                <div>
+                  <button type="button" class="btn-ghost" onclick="toggleAllSecrets()">
+                    <i class="fas fa-eye"></i>&nbsp;Toggle all secrets
+                  </button>
+                  <button type="button" class="btn-ghost" style="margin-left:8px;" onclick="saveEnvConfig()">
+                    <i class="fas fa-save"></i>&nbsp;Save changes to .env
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- END CONFIG TAB -->
+
+      <!-- Detail view modal -->
       <div id="modal" class="modal"
            onclick="if(event.target.id==='modal'){closeModal()}">
         <div class="panel">
@@ -756,8 +999,66 @@
         </div>
       </div>
 
-    </div>  {# closes .wrap #}
-    {% endif %}  {# closes {% if not authorized %} #}
+      <!-- Create User modal -->
+      <div id="modal-create-user" class="modal"
+           onclick="if(event.target.id==='modal-create-user'){closeCreateUserModal()}">
+        <div class="panel" style="max-width:500px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <h3 style="margin:0; font-size:16px;">Create User</h3>
+            <button class="btn-ghost" onclick="closeCreateUserModal()">Close</button>
+          </div>
+          <form class="mt-3" onsubmit="submitCreateUser(event)">
+            <div class="form-group">
+              <label for="new-user-name">Name</label>
+              <input id="new-user-name" name="name" type="text" required>
+            </div>
+            <div class="form-group">
+              <label for="new-user-email">Email</label>
+              <input id="new-user-email" name="email" type="email">
+            </div>
+            <div class="form-group">
+              <label for="new-user-roles">Roles (comma separated)</label>
+              <input id="new-user-roles" name="roles" type="text">
+            </div>
+            <div style="margin-top:12px; text-align:right;">
+              <button type="button" class="btn-ghost" onclick="closeCreateUserModal()">Cancel</button>
+              <button type="submit" class="btn-ghost" style="margin-left:8px;">
+                <i class="fas fa-check"></i>&nbsp;Create
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Create Role modal -->
+      <div id="modal-create-role" class="modal"
+           onclick="if(event.target.id==='modal-create-role'){closeCreateRoleModal()}">
+        <div class="panel" style="max-width:500px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <h3 style="margin:0; font-size:16px;">Create Role</h3>
+            <button class="btn-ghost" onclick="closeCreateRoleModal()">Close</button>
+          </div>
+          <form class="mt-3" onsubmit="submitCreateRole(event)">
+            <div class="form-group">
+              <label for="new-role-type">Role type</label>
+              <input id="new-role-type" name="type" type="text" required>
+            </div>
+            <div class="form-group">
+              <label for="new-role-desc">Description</label>
+              <input id="new-role-desc" name="description" type="text">
+            </div>
+            <div style="margin-top:12px; text-align:right;">
+              <button type="button" class="btn-ghost" onclick="closeCreateRoleModal()">Cancel</button>
+              <button type="submit" class="btn-ghost" style="margin-left:8px;">
+                <i class="fas fa-check"></i>&nbsp;Create
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+    </div>
+    {% endif %}
   </div>
 </body>
 </html>

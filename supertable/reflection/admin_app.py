@@ -17,14 +17,18 @@ from fastapi import APIRouter, Query, HTTPException, Request, Depends, Form, Bod
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from supertable.redis_catalog import RedisCatalog
+
 # Load environment variables from .env file (optional)
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv, dotenv_values, set_key
     load_dotenv()
 except ImportError:
+    dotenv_values = None  # type: ignore[assignment]
+    set_key = None        # type: ignore[assignment]
     pass
 
-
+logger = logging.getLogger(__name__)
 # ------------------------------ Settings ------------------------------
 
 class Settings:
@@ -640,6 +644,126 @@ def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Opti
     return {"hash": role_hash, "data": obj}
 
 
+# ------------------------------ .env helpers + /admin/env endpoints ------------------------------
+
+_SENSITIVE_KEY_PARTS = (
+    "PASSWORD",
+    "PASS",
+    "SECRET",
+    "TOKEN",
+    "KEY",
+    "ACCESS_KEY",
+    "CONNECTION_STRING",
+    "API_KEY",
+    "CLIENT_SECRET",
+)
+
+
+def _env_file_path() -> Path:
+    """
+    Resolve the project .env path relative to this file.
+
+    Given the layout:
+
+      /home/.../dev/supertable/.env
+      /home/.../dev/supertable/supertable/reflection/admin_app.py
+
+    This returns /home/.../dev/supertable/.env
+    """
+    here = Path(__file__).resolve()
+    reflection_dir = here.parent              # .../supertable/supertable/reflection
+    pkg_dir = reflection_dir.parent           # .../supertable/supertable
+    repo_root = pkg_dir.parent                # .../supertable (project root)
+
+    dotenv_path = settings.DOTENV_PATH or ".env"
+    p = Path(dotenv_path)
+    if not p.is_absolute():
+        p = (repo_root / dotenv_path).resolve()
+    return p
+
+
+def _is_sensitive_env_key(key: str) -> bool:
+    up = (key or "").upper()
+    return any(part in up for part in _SENSITIVE_KEY_PARTS)
+
+
+@router.get("/admin/env")
+def admin_env_get(_=Depends(admin_guard_api)):
+    """
+    Return the current .env values from the project root.
+
+    Response:
+    {
+      "found": bool,
+      "path": str,
+      "items": [
+        {"key": "...", "value": "...", "is_sensitive": bool}
+      ]
+    }
+    """
+    if dotenv_values is None:
+        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
+
+    env_path = _env_file_path()
+    found = env_path.exists() and env_path.is_file()
+    items: List[Dict[str, Any]] = []
+
+    if found:
+        values = dotenv_values(str(env_path)) or {}
+        for k, v in values.items():
+            # dotenv_values may return None for some entries
+            val = "" if v is None else str(v)
+            items.append(
+                {
+                    "key": k,
+                    "value": val,
+                    "is_sensitive": _is_sensitive_env_key(k),
+                }
+            )
+
+    return {
+        "found": found,
+        "path": str(env_path),
+        "items": items,
+    }
+
+
+@router.post("/admin/env")
+def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
+    """
+    Update the project .env with provided items.
+
+    Request body:
+    {
+      "items": [
+        {"key": "NAME", "value": "VAL"},
+        ...
+      ]
+    }
+    """
+    if set_key is None:
+        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
+
+    env_path = _env_file_path()
+    env_path.touch(exist_ok=True)
+
+    items = payload.get("items") or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="items must be a list")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        value = item.get("value", "")
+        # Cast to str and avoid auto-quoting to preserve readability
+        set_key(str(env_path), key, str(value), quote_mode="never")
+
+    return {"ok": True, "path": str(env_path)}
+
+
 # ------------------------------ Admin page & auth routes ------------------------------
 
 @router.get("/admin/login", response_class=HTMLResponse)
@@ -1231,6 +1355,70 @@ def admin_schema_api(
         return JSONResponse({"status": "error", "message": f"Get schema failed: {e}"}, status_code=500)
 
 
+def _get_redis_items(pattern) -> List[str]:
+    """
+    Get all tables for this super table by scanning Redis keys.
+    """
+    catalog = RedisCatalog()
+    try:
+        items = []
+        cursor = 0
+        while True:
+            cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
+            for key in keys:
+                # Handle both bytes and string keys
+                if isinstance(key, bytes):
+                    key_str = key.decode('utf-8')
+                else:
+                    key_str = str(key)
+
+                items.append(key_str)
+            if cursor == 0:
+                break
+        return items
+    except Exception as e:
+        logger.error(f"Error getting tables from Redis: {e}")
+        return []
+
+def list_supers(organization: str) -> List[str]:
+    """
+    Searches the organization's directory for subdirectories that contain a
+    "super" folder and a "_super.json" file. Uses the storage interface's
+    get_directory_structure() for portability.
+    """
+    result = []
+    pattern = f"supertable:{organization}:*:meta:root"
+
+    items = _get_redis_items(pattern)
+    for item in items:
+        super_name = item.split(':')[2]
+        result.append(super_name)
+
+    return sorted(result)
+
+
+
+@router.get("/admin/supers")
+def api_list_supers(
+        request: Request,
+        organization: str = Query(..., description="Organization identifier"),
+        _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+      resp = RedirectResponse("/admin/login", status_code=302)
+      _no_store(resp)
+      return resp
+
+    try:
+        return {
+            "ok": True,
+            "organization": organization,
+            "supers": list_supers(organization=organization),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
+
+
 @router.get("/admin/tables", response_class=HTMLResponse)
 def tables_page(
     request: Request,
@@ -1317,3 +1505,60 @@ def tables_page(
     resp = templates.TemplateResponse("tables.html", ctx)
     _no_store(resp)
     return resp
+
+
+@router.get("/admin/super")
+def api_get_super_meta(
+    request: Request,
+    organization: str = Query(...),
+    super_name: str = Query(...),
+    user_hash: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+      resp = RedirectResponse("/admin/login", status_code=302)
+      _no_store(resp)
+      return resp
+
+    try:
+        mr = MetaReader(organization=organization, super_name=super_name)
+        return {"ok": True, "meta": mr.get_super_meta(user_hash)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
+
+
+
+@router.get("/admin/schema")
+def api_get_table_schema(
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Table simple name"),
+        user_hash: str = Query(...),
+        _: Any = Depends(admin_guard_api),
+):
+    """Correct usage: pass the table (simple) name — NOT the super_name."""
+    try:
+        mr = MetaReader(organization=organization, super_name=super_name)
+        schema = mr.get_table_schema(table, user_hash)
+        logger.debug(f"table.schema.result: {schema}")
+        return {"ok": True, "schema": schema}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
+
+
+@router.get("/admin/stats")
+def api_get_table_stats(
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Table simple name"),
+        user_hash: str = Query(...),
+        _: Any = Depends(admin_guard_api),
+):
+    """Correct usage: pass the table (simple) name — NOT the super_name."""
+    try:
+        mr = MetaReader(organization=organization, super_name=super_name)
+        stats = mr.get_table_stats(table, user_hash)
+        logger.debug(f"table.stats.result: {stats}")
+        return {"ok": True, "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")

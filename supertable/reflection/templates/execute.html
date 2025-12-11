@@ -100,7 +100,7 @@
       gap: 16px; /* Increased gap */
       align-items: flex-start;
     }
-    
+
     /* --- Tab Navigation --- */
     #tab-navigation {
         display: flex;
@@ -157,7 +157,7 @@
     .tab-content.active {
         display: block;
     }
-    
+
     /* FIX: The card margin in the tab-content should be 0 or small */
     #tab-content-container .card {
         margin-top: 0 !important;
@@ -167,9 +167,6 @@
     .sql-editor-card .card-body {
         padding: 24px;
     }
-
-    /* --- Collapsible Content FIX (REMOVED) --- */
-
 
     /* --- Form Elements (Base Styles) --- */
 
@@ -184,8 +181,6 @@
       transition: var(--transition);
       margin-top: 4px; /* Space below label */
     }
-
-    /* Removed the generic 'select' rule that set conflicting height and padding */
 
     input:focus, select:focus, textarea:focus {
       outline: none;
@@ -312,11 +307,11 @@
         white-space: pre-wrap;
         word-break: break-all;
     }
-    
+
     /* --- Visualization --- */
     #timings-visualization-card {
         /* Set a fixed height for the canvas to ensure Chart.js renders correctly */
-        height: 350px; 
+        height: 350px;
         display: none; /* Hidden by default, JS controls visibility */
     }
     .chart-container {
@@ -397,7 +392,6 @@
       gap: 8px; /* Space between buttons */
     }
 
-    /* Styles for copy button (same as download, slightly different icon) */
     .btn-clipboard {
       padding: 8px 12px;
       border-radius: 8px;
@@ -493,6 +487,25 @@
       color: #6b7280;
       text-align: right;
     }
+
+    /* Optional: style hints dropdown a bit */
+    .CodeMirror-hints {
+      z-index: 9999;
+      font-family: 'Fira Code', 'Consolas', monospace;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      border: none;
+      background: #ffffff;
+    }
+    .CodeMirror-hint {
+      padding: 6px 12px;
+      color: #111827;
+      transition: all 0.2s ease;
+    }
+    .CodeMirror-hint-active {
+      background: var(--primary-color);
+      color: white;
+    }
   </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -536,6 +549,7 @@
     let timingsChart = null; // NEW: Global variable for Chart.js instance
     window.__curRows = []; // Keep track of current rows
     window.__curHeaders = []; // Keep track of current headers
+    window.__hintTables = {}; // Global schema map for IntelliSense
 
     function updateTenantSummary(superMeta) {
       const filesEl = document.getElementById('tenantFilesValue');
@@ -698,7 +712,7 @@
       el.className = 'text-sm muted ' + (cls || '');
       el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
     }
-    
+
     // NEW: Function to switch tabs
     function switchTab(tabName) {
         // 1. Deactivate all tabs and content
@@ -738,14 +752,14 @@
 
         statusEl.className = 'text-sm muted error';
         statusEl.innerHTML = '<i class="fas fa-times-circle"></i>&nbsp;Failed';
-        
+
         // Show the error on the Result tab
         errorDisplay.style.display = 'block';
         document.getElementById('query-error-display').querySelector('strong').textContent = title + ':';
         document.getElementById('query-error-message').textContent = message;
 
         // Clear rows, headers, results area and timing chart
-        window.__curRows = []; 
+        window.__curRows = [];
         window.__curHeaders = [];
         resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Query failed. See error details above.</div>';
         timingCard.style.display = 'none';
@@ -754,11 +768,11 @@
             timingsChart.destroy();
             timingsChart = null;
         }
-        
+
         // Switch to the Result tab to show the error
         switchTab('result');
     }
-    
+
     // OLD function replaced/redirected to new one
     function renderError(msg) {
         // Intercept old calls to renderError and use the new displayError structure
@@ -798,237 +812,235 @@
       window.__curRows = rows;
       window.__curHeaders = headers;
     }
-    
+
     // Function to render the Chart.js timeline
-// Make sure you have a global chart var somewhere:
-// let timingsChart = null;
+    function renderTimingsChart(timings) {
+        const chartContainer = document.getElementById('timings-visualization-card');
+        const canvas = document.getElementById('timingsChart');
+        const ctx = canvas.getContext('2d');
 
-function renderTimingsChart(timings) {
-    const chartContainer = document.getElementById('timings-visualization-card');
-    const canvas = document.getElementById('timingsChart');
-    const ctx = canvas.getContext('2d');
-
-    if (!timings || timings.length === 0) {
-        chartContainer.style.display = 'none';
-        return;
-    }
-
-    chartContainer.style.display = 'block';
-
-    const rawData = [];
-    const labels = [];
-
-const pastelColors = [
-    "#6BAED6", // clean blue
-    "#9ECAE1", // light blue
-    "#74C476", // green
-    "#A1D99B", // light green
-    "#FDAE6B", // orange-peach
-    "#FDD0A2", // light peach
-    "#C6DBEF", // blue-gray
-    "#E7CB94"  // sand-gold
-];
-
-
-
-
-    timings.forEach(timing => {
-        const key = Object.keys(timing)[0];
-
-        // Filter out total/duration style keys
-        if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
+        if (!timings || timings.length === 0) {
+            chartContainer.style.display = 'none';
             return;
         }
 
-        const value = timing[key];
-        rawData.push(value * 1000); // store as ms
-        labels.push(key.replace(/_/g, ' ').toUpperCase());
-    });
+        chartContainer.style.display = 'block';
 
-    if (rawData.length === 0) {
-        chartContainer.style.display = 'none';
-        return;
-    }
+        const rawData = [];
+        const labels = [];
 
-    const totalTimeMs = rawData.reduce((sum, val) => sum + val, 0);
-    const totalTimeSeconds = (totalTimeMs / 1000).toFixed(4);
+        const pastelColors = [
+            "#6BAED6", // clean blue
+            "#9ECAE1", // light blue
+            "#74C476", // green
+            "#A1D99B", // light green
+            "#FDAE6B", // orange-peach
+            "#FDD0A2", // light peach
+            "#C6DBEF", // blue-gray
+            "#E7CB94"  // sand-gold
+        ];
 
-    if (timingsChart) {
-        timingsChart.destroy();
-    }
+        timings.forEach(timing => {
+            const key = Object.keys(timing)[0];
 
-    timingsChart = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: ['QUERY TIMELINE'],
-            datasets: rawData.map((dataPoint, index) => ({
-                label: labels[index] + ' (' + (dataPoint / 1000).toFixed(4) + ' s)',
-                data: [dataPoint],
-                backgroundColor: pastelColors[index % pastelColors.length],
-                stack: 'timeline',
-                barPercentage: 0.9,
-                categoryPercentage: 0.9,
-                borderRadius: 0,          // NO rounded corners
-                borderSkipped: false,
-                borderWidth: 1,
-                borderColor: 'rgba(15, 23, 42, 0.1)'
-            }))
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            indexAxis: 'y', // horizontal
-            plugins: {
-                legend: {
-                    display: true,
-                    position: 'bottom',
-                    labels: {
-                        boxWidth: 12,
-                        boxHeight: 12,
-                        padding: 14,
-                        font: {
-                            size: 11,
-                            weight: '500'
-                        }
-                    }
-                },
-                title: {
-                    display: true,
-                    text: `Execution Timeline (Total: ${totalTimeSeconds} s)`,
-                    font: {
-                        size: 16,
-                        weight: '600'
-                    },
-                    padding: {
-                        top: 8,
-                        bottom: 16
-                    }
-                },
-                tooltip: {
-                    mode: 'index',
-                    intersect: false,
-                    backgroundColor: 'rgba(15,23,42,0.92)',
-                    titleFont: {
-                        size: 13,
-                        weight: '600'
-                    },
-                    bodyFont: {
-                        size: 12
-                    },
-                    padding: 10,
-                    callbacks: {
-                        label: function (context) {
-                            const durationSeconds = (context.raw / 1000).toFixed(4) + ' s';
-                            const name = context.dataset.label.split(' (')[0];
-                            return `${name}: ${durationSeconds}`;
-                        },
-                        title: function () {
-                            return 'Internal Step Duration';
-                        }
-                    }
-                }
+            // Filter out total/duration style keys
+            if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
+                return;
+            }
+
+            const value = timing[key];
+            rawData.push(value * 1000); // store as ms
+            labels.push(key.replace(/_/g, ' ').toUpperCase());
+        });
+
+        if (rawData.length === 0) {
+            chartContainer.style.display = 'none';
+            return;
+        }
+
+        const totalTimeMs = rawData.reduce((sum, val) => sum + val, 0);
+        const totalTimeSeconds = (totalTimeMs / 1000).toFixed(4);
+
+        if (timingsChart) {
+            timingsChart.destroy();
+            timingsChart = null;
+        }
+
+        timingsChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['QUERY TIMELINE'],
+                datasets: rawData.map((dataPoint, index) => ({
+                    label: labels[index] + ' (' + (dataPoint / 1000).toFixed(4) + ' s)',
+                    data: [dataPoint],
+                    backgroundColor: pastelColors[index % pastelColors.length],
+                    stack: 'timeline',
+                    barPercentage: 0.9,
+                    categoryPercentage: 0.9,
+                    borderRadius: 0,
+                    borderSkipped: false,
+                    borderWidth: 1,
+                    borderColor: 'rgba(15, 23, 42, 0.1)'
+                }))
             },
-
-            // Key part for the "fluid fill" feel
-            animation: {
-                // Disable global easing that can cause floating
-                easing: 'linear',
-                // We control per-axis in `animations` below
-            },
-            animations: {
-                // X controls the bar LENGTH (ms → pixels) → fluid fill
-                x: {
-                    type: 'number',
-                    from: 0,              // start from 0 ms → grows left→right
-                    easing: 'easeOutQuad',
-                    duration: function (ctx) {
-                        // Same duration for all segments (feel like same flow speed)
-                        return 600;
-                    },
-                    delay: function (ctx) {
-                        // Fill box by box: datasetIndex = segment order in stack
-                        if (ctx.type === 'data' && ctx.dataIndex === 0) {
-                            return ctx.datasetIndex * 300; // 0, 300, 600, ...
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                indexAxis: 'y', // horizontal
+                plugins: {
+                    legend: {
+                        display: true,
+                        position: 'bottom',
+                        labels: {
+                            boxWidth: 12,
+                            boxHeight: 12,
+                            padding: 14,
+                            font: {
+                                size: 11,
+                                weight: '500'
+                            }
                         }
-                        return 0;
-                    }
-                },
-                // Disable vertical movement completely (no floating up/down)
-                y: {
-                    duration: 0
-                }
-            },
-
-            scales: {
-                x: {
-                    stacked: true,
+                    },
                     title: {
                         display: true,
-                        text: 'Time (milliseconds)',
-                        font: { size: 13, weight: '500' }
+                        text: `Execution Timeline (Total: ${totalTimeSeconds} s)`,
+                        font: {
+                            size: 16,
+                            weight: '600'
+                        },
+                        padding: {
+                            top: 8,
+                            bottom: 16
+                        }
                     },
-                    beginAtZero: true,
-                    max: totalTimeMs * 1.05,
-                    grid: {
-                        display: true,
-                        drawBorder: false,
-                        lineWidth: 0.5,
-                        color: 'rgba(148, 163, 184, 0.25)'
-                    },
-                    ticks: {
-                        font: { size: 11 }
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false,
+                        backgroundColor: 'rgba(15,23,42,0.92)',
+                        titleFont: {
+                            size: 13,
+                            weight: '600'
+                        },
+                        bodyFont: {
+                            size: 12
+                        },
+                        padding: 10,
+                        callbacks: {
+                            label: function (context) {
+                                const durationSeconds = (context.raw / 1000).toFixed(4) + ' s';
+                                const name = context.dataset.label.split(' (')[0];
+                                return `${name}: ${durationSeconds}`;
+                            },
+                            title: function () {
+                                return 'Internal Step Duration';
+                            }
+                        }
                     }
                 },
-                y: {
-                    stacked: true,
-                    grid: { display: false },
-                    ticks: { display: false }
-                }
-            },
-            layout: {
-                padding: {
-                    top: 8,
-                    right: 16,
-                    bottom: 8,
-                    left: 8
+                animation: {
+                    easing: 'linear',
+                },
+                animations: {
+                    x: {
+                        type: 'number',
+                        from: 0,
+                        easing: 'easeOutQuad',
+                        duration: function (ctx) {
+                            return 600;
+                        },
+                        delay: function (ctx) {
+                            if (ctx.type === 'data' && ctx.dataIndex === 0) {
+                                return ctx.datasetIndex * 300;
+                            }
+                            return 0;
+                        }
+                    },
+                    y: {
+                        duration: 0
+                    }
+                },
+                scales: {
+                    x: {
+                        stacked: true,
+                        title: {
+                            display: true,
+                            text: 'Time (milliseconds)',
+                            font: { size: 13, weight: '500' }
+                        },
+                        beginAtZero: true,
+                        max: totalTimeMs * 1.05,
+                        grid: {
+                            display: true,
+                            drawBorder: false,
+                            lineWidth: 0.5,
+                            color: 'rgba(148, 163, 184, 0.25)'
+                        },
+                        ticks: {
+                            font: { size: 11 }
+                        }
+                    },
+                    y: {
+                        stacked: true,
+                        grid: { display: false },
+                        ticks: { display: false }
+                    }
+                },
+                layout: {
+                    padding: {
+                        top: 8,
+                        right: 16,
+                        bottom: 8,
+                        left: 8
+                    }
                 }
             }
-        }
-    });
-}
+        });
+    }
 
-
-
+    // NEW loadSchema: uses FastAPI meta endpoints to build schema for IntelliSense
     async function loadSchema() {
-      // User hash is removed from the form, so we use a constant value here.
       const userHash = USER_HASH;
       const { organization, superName } = getTenant();
       if (!organization || !superName || !userHash) return;
 
       try {
-        const data = await api('/admin/schema', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            organization,
-            super_name: superName,
-            user_hash: userHash
-          })
-        });
-        if (data.status === 'ok') {
-          const hint = {};
-          (data.schema || []).forEach(obj => {
-            const t = Object.keys(obj)[0];
-            const cols = obj[t] || [];
-            hint[t] = { columns: cols };
-          });
-          window.__hintTables = hint;
-          if (window.editor) {
-            window.editor.setOption('hintOptions', {
-              completeSingle:false,
-              tables: hint
-            });
+        // 1) list tables in the selected SuperTable
+        const tablesResp = await api(
+          META_BASE +
+          '/meta/tables?organization=' + encodeURIComponent(organization) +
+          '&super_name=' + encodeURIComponent(superName)
+        );
+        const tables = (tablesResp && Array.isArray(tablesResp.tables))
+          ? tablesResp.tables
+          : [];
+
+        const hint = {};
+
+        // 2) for each table, get its schema and derive column names
+        for (const tableName of tables) {
+          try {
+            const schemaResp = await api(
+              META_BASE +
+              '/meta/schema?organization=' + encodeURIComponent(organization) +
+              '&super_name=' + encodeURIComponent(superName) +
+              '&table=' + encodeURIComponent(tableName) +
+              '&user_hash=' + encodeURIComponent(userHash)
+            );
+
+            if (schemaResp && schemaResp.ok && Array.isArray(schemaResp.schema) && schemaResp.schema.length > 0) {
+              const firstRow = schemaResp.schema[0];
+              const cols = Object.keys(firstRow || {});
+              hint[tableName] = { columns: cols };
+            }
+          } catch (e) {
+            console.error('Failed to load schema for table', tableName, e);
           }
+        }
+
+        window.__hintTables = hint;
+
+        if (window.editor) {
+          window.editor.setOption('hintOptions', buildSqlHintOptions());
         }
       } catch (e) {
         console.error('Schema load failed:', e);
@@ -1044,7 +1056,7 @@ const pastelColors = [
       const pageSize = 1000;
       const query = window.editor.getValue().trim();
       const { organization, superName } = getTenant();
-      
+
       const errorDisplay = document.getElementById('query-error-display');
       const timingCard = document.getElementById('timings-visualization-card');
       const resultDiv = document.getElementById('result');
@@ -1057,9 +1069,7 @@ const pastelColors = [
             window.timingsChartInstance.destroy();
             window.timingsChartInstance = null;
         }
-      
-      // Ensure we switch to results immediately after starting execution
-      // to give user a feedback screen and see the error if it happens.
+
       switchTab('result');
 
       if (!organization || !superName || !userHash) {
@@ -1079,7 +1089,6 @@ const pastelColors = [
         execTimerId = null;
       }
 
-      // live timer while executing
       execTimerId = setInterval(() => {
         if (execStartTime === null) return;
         const elapsedSec = (Date.now() - execStartTime) / 1000;
@@ -1106,7 +1115,6 @@ const pastelColors = [
         const finishedAt = Date.now();
         const elapsedMsClient = finishedAt - startedAt;
 
-        // stop timer
         execStartTime = null;
         if (execTimerId) {
           clearInterval(execTimerId);
@@ -1122,12 +1130,10 @@ const pastelColors = [
             (p) => executeSQL(p)
           );
 
-          // Render Timings Chart (NEW) - but keep it hidden on the timings tab
           if (data.meta && data.meta.timings) {
               renderTimingsChart(data.meta.timings);
           }
 
-          // prefer backend duration if available, else client timing
           let durationMs = null;
           if (typeof data.duration_ms === 'number') {
             durationMs = data.duration_ms;
@@ -1145,19 +1151,14 @@ const pastelColors = [
             `Success — ${rowsLen} rows (total ${total}) in ${durationStr}`;
 
           setStatus(statusText);
-          
-          // Result tab is already active from the start of execution
         } else {
-          // Logic error from API
           const finishedAtError = Date.now();
           const elapsedErrorSec = ((finishedAtError - startedAt) / 1000).toFixed(3);
-          
+
           setStatus(`Error executing query after ${elapsedErrorSec}s`, 'error');
-          // Use new displayError for nice display, which also ensures Result tab is active
           displayError('Query Error', data.message || 'Unknown error');
         }
       } catch (e) {
-        // Network/fetch error
         const finishedAt = Date.now();
         const elapsedSec = ((finishedAt - startedAt) / 1000).toFixed(3);
 
@@ -1168,113 +1169,100 @@ const pastelColors = [
         }
 
         setStatus(`Error executing query after ${elapsedSec}s`, 'error');
-        // Use new displayError for nice display, which also ensures Result tab is active
         displayError('Network Error', e.message || String(e));
       }
     }
-    
-/**
- * Converts the current result set into a tab-separated value (TSV) string
- * and copies it to the clipboard (with robust fallback).
- */
-function copyToClipboard() {
-  if (!window.__curRows || window.__curRows.length === 0) {
-    alert("No results to copy.");
-    return;
-  }
 
-  const headers = window.__curHeaders || [];
-  const rows = window.__curRows;
-
-  if (!headers.length) {
-    alert("No headers available to copy.");
-    console.error("Clipboard failed: __curHeaders is empty.", { headers, rows });
-    return;
-  }
-
-  // 1. Header row (TSV)
-  let tsv = headers.join('\t') + '\n';
-
-  // 2. Data rows
-  rows.forEach(row => {
-    const values = headers.map(header => {
-      let value = row[header];
-      if (value === null || value === undefined) value = '';
-      if (typeof value === 'object') value = JSON.stringify(value);
-
-      // Remove newlines to keep TSV clean
-      value = String(value).replace(/(\r\n|\n|\r)/g, ' ');
-
-      // Escape quotes/tabs if needed
-      if (value.includes('\t') || value.includes('"')) {
-        value = '"' + value.replace(/"/g, '""') + '"';
-      }
-      return value;
-    });
-    tsv += values.join('\t') + '\n';
-  });
-
-  if (tsv.trim().length <= 1) {
-    alert('Error: Data for clipboard is empty. Check if headers are available.');
-    console.error('Clipboard failed: TSV string is empty or nearly empty. TSV content:', tsv);
-    return;
-  }
-
-  const textToCopy = tsv;
-
-  const btn = document.querySelector('.btn-clipboard');
-  const originalText = btn ? btn.innerHTML : null;
-
-  const showSuccess = () => {
-    if (!btn) return;
-    btn.innerHTML = '<i class="fas fa-check"></i>&nbsp;Copied!';
-    setTimeout(() => { btn.innerHTML = originalText; }, 1500);
-  };
-
-  const fallbackCopy = () => {
-    try {
-      const textarea = document.createElement('textarea');
-      textarea.value = textToCopy;
-      textarea.style.position = 'fixed';
-      textarea.style.left = '-9999px';
-      textarea.style.top = '0';
-      textarea.setAttribute('readonly', '');
-      document.body.appendChild(textarea);
-      textarea.select();
-      const successful = document.execCommand('copy');
-      document.body.removeChild(textarea);
-
-      if (!successful) {
-        throw new Error('document.execCommand("copy") returned false');
+    function copyToClipboard() {
+      if (!window.__curRows || window.__curRows.length === 0) {
+        alert("No results to copy.");
+        return;
       }
 
-      console.log('Successfully copied (fallback) ' + rows.length + ' rows to clipboard.');
-      showSuccess();
-    } catch (err) {
-      console.error('Fallback copy failed:', err);
-      alert('Failed to copy to clipboard. Your browser or environment may block clipboard access.');
-    }
-  };
+      const headers = window.__curHeaders || [];
+      const rows = window.__curRows;
 
-  // Modern API first
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(textToCopy)
-      .then(() => {
-        console.log('Successfully copied ' + rows.length + ' rows to clipboard (TSV format).');
-        showSuccess();
-      })
-      .catch(err => {
-        console.warn('navigator.clipboard.writeText failed, trying fallback. Error:', err);
-        fallbackCopy();
+      if (!headers.length) {
+        alert("No headers available to copy.");
+        console.error("Clipboard failed: __curHeaders is empty.", { headers, rows });
+        return;
+      }
+
+      let tsv = headers.join('\t') + '\n';
+
+      rows.forEach(row => {
+        const values = headers.map(header => {
+          let value = row[header];
+          if (value === null || value === undefined) value = '';
+          if (typeof value === 'object') value = JSON.stringify(value);
+
+          value = String(value).replace(/(\r\n|\n|\r)/g, ' ');
+
+          if (value.includes('\t') || value.includes('"')) {
+            value = '"' + value.replace(/"/g, '""') + '"';
+          }
+          return value;
+        });
+        tsv += values.join('\t') + '\n';
       });
-  } else {
-    // No clipboard API → use fallback
-    fallbackCopy();
-  }
-}
 
+      if (tsv.trim().length <= 1) {
+        alert('Error: Data for clipboard is empty. Check if headers are available.');
+        console.error('Clipboard failed: TSV string is empty or nearly empty. TSV content:', tsv);
+        return;
+      }
 
-    // Function to download CSV (retained and simplified)
+      const textToCopy = tsv;
+
+      const btn = document.querySelector('.btn-clipboard');
+      const originalText = btn ? btn.innerHTML : null;
+
+      const showSuccess = () => {
+        if (!btn) return;
+        btn.innerHTML = '<i class="fas fa-check"></i>&nbsp;Copied!';
+        setTimeout(() => { btn.innerHTML = originalText; }, 1500);
+      };
+
+      const fallbackCopy = () => {
+        try {
+          const textarea = document.createElement('textarea');
+          textarea.value = textToCopy;
+          textarea.style.position = 'fixed';
+          textarea.style.left = '-9999px';
+          textarea.style.top = '0';
+          textarea.setAttribute('readonly', '');
+          document.body.appendChild(textarea);
+          textarea.select();
+          const successful = document.execCommand('copy');
+          document.body.removeChild(textarea);
+
+          if (!successful) {
+            throw new Error('document.execCommand("copy") returned false');
+          }
+
+          console.log('Successfully copied (fallback) ' + rows.length + ' rows to clipboard.');
+          showSuccess();
+        } catch (err) {
+          console.error('Fallback copy failed:', err);
+          alert('Failed to copy to clipboard. Your browser or environment may block clipboard access.');
+        }
+      };
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(textToCopy)
+          .then(() => {
+            console.log('Successfully copied ' + rows.length + ' rows to clipboard (TSV format).');
+            showSuccess();
+          })
+          .catch(err => {
+            console.warn('navigator.clipboard.writeText failed, trying fallback. Error:', err);
+            fallbackCopy();
+          });
+      } else {
+        fallbackCopy();
+      }
+    }
+
     function downloadCSV() {
         if (!window.__curRows || window.__curRows.length === 0) {
             alert("No results to download.");
@@ -1283,37 +1271,34 @@ function copyToClipboard() {
 
         const headers = window.__curHeaders;
         const rows = window.__curRows;
-        
-        let csv = headers.join(',') + '\\n'; // CSV header
+
+        let csv = headers.join(',') + '\n';
 
         rows.forEach(row => {
             const values = headers.map(header => {
                 let value = row[header];
                 if (value === null || value === undefined) value = '';
                 if (typeof value === 'object') value = JSON.stringify(value);
-                
-                // Escape: If value contains comma, double quote, or newline, wrap in double quotes
-                value = String(value).replace(/"/g, '""'); // Escape double quotes
-                if (value.includes(',') || value.includes('\\n') || value.includes('\\r')) {
+
+                value = String(value).replace(/"/g, '""');
+                if (value.includes(',') || value.includes('\n') || value.includes('\r')) {
                     value = '"' + value + '"';
                 }
                 return value;
             });
-            csv += values.join(',') + '\\n';
+            csv += values.join(',') + '\n';
         });
 
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement('a');
-        
-        const superName = currentSuper ? currentSuper.replace(/\\s/g, '_') : 'query_result';
+
+        const superName = currentSuper ? currentSuper.replace(/\s/g, '_') : 'query_result';
         link.download = `${superName}_${new Date().toISOString().slice(0, 10)}.csv`;
         link.href = URL.createObjectURL(blob);
         link.click();
         URL.revokeObjectURL(link.href);
     }
 
-
-    // Sidebar toggle + nav highlight
     $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
@@ -1329,11 +1314,9 @@ function copyToClipboard() {
 
       $("#link-execute").addClass("active");
 
-      // Load SuperTables + summary + initial schema hints
       loadTenants();
 
-      // Initialize tabs. 'execute' is default, but for robustness:
-      switchTab('execute'); 
+      switchTab('execute');
     });
   </script>
 </head>
@@ -1346,7 +1329,7 @@ function copyToClipboard() {
       {% include "selection.html" %}
 
       {% if has_tenant %}
-      
+
       <div id="tab-navigation">
           <div id="tab-execute" class="tab active" onclick="switchTab('execute')">
               <i class="fas fa-terminal"></i>&nbsp;Execute
@@ -1358,9 +1341,9 @@ function copyToClipboard() {
               <i class="fas fa-chart-bar"></i>&nbsp;Timings
           </div>
       </div>
-      
+
       <div id="tab-content-container">
-          
+
           <div id="tab-content-execute" class="tab-content active">
               <div class="card sql-editor-card">
                   <div class="card-body">
@@ -1368,7 +1351,7 @@ function copyToClipboard() {
                         <label class="text-sm muted">SQL Query</label>
                         <textarea id="sql" rows="8"></textarea>
                       </div>
-            
+
                       <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
                         <div id="status" class="text-sm muted">
                           <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
@@ -1382,13 +1365,13 @@ function copyToClipboard() {
                   </div>
               </div>
           </div>
-          
+
           <div id="tab-content-result" class="tab-content">
               <div id="query-error-display" class="mb-4">
                   <strong>Query Error:</strong>
                   <span id="query-error-message"></span>
               </div>
-              
+
               <div class="card" id="result-card">
                 <div class="section">
                   <div id="result"></div>
@@ -1403,7 +1386,7 @@ function copyToClipboard() {
                 </div>
               </div>
           </div>
-          
+
           <div id="tab-content-timings" class="tab-content">
               <div id="timings-visualization-card" class="card">
                   <div class="section" style="padding-bottom: 0; border-bottom: 1px solid var(--panel-border);">
@@ -1417,7 +1400,7 @@ function copyToClipboard() {
                   </div>
               </div>
           </div>
-          
+
       </div> {% endif %}
     </div>
   </div>
@@ -1429,8 +1412,135 @@ function copyToClipboard() {
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/hint/sql-hint.min.js"></script>
 
   <script>
-    // Initialize CodeMirror + hooks
+    // Initialize CodeMirror + IntelliSense hooks
     window.__admintoken = "{{ token|e }}";
+
+    // Helper to build consistent hintOptions from the current schema
+    function buildSqlHintOptions() {
+      return {
+        completeSingle: false,
+        tables: window.__hintTables || {},
+        keywords: {
+          "WITH": { className: "cm-cte" },
+          "RECURSIVE": { className: "cm-cte" }
+        }
+      };
+    }
+
+    // Custom SQL IntelliSense helper: table/column aware
+    CodeMirror.registerHelper("hint", "sqlEnhanced", function(cm, options) {
+      const cursor = cm.getCursor();
+      const token = cm.getTokenAt(cursor);
+      const line = cm.getLine(cursor.line);
+      const start = token.start;
+      const end = token.end;
+      const currentWord = token.string.toLowerCase();
+      const lineText = line.substring(0, cursor.ch);
+
+      const isAfterSelect = /SELECT\s+([^,]*)$/i.test(lineText);
+      const isAfterFrom   = /FROM\s+([^,]*)$/i.test(lineText);
+      const isAfterDot    = /(\w+)\.([^,]*)$/i.test(lineText);
+
+      const tables = (options && options.tables) || window.__hintTables || {};
+      const completions = [];
+
+      if (isAfterSelect && !isAfterFrom) {
+        // After SELECT: show columns + functions
+        for (const tableName in tables) {
+          const columns = tables[tableName].columns || [];
+          columns.forEach(column => {
+            completions.push({ text: column, displayText: column, className: "cm-column" });
+            completions.push({
+              text: `${tableName}.${column}`,
+              displayText: `${tableName}.${column}`,
+              className: "cm-column"
+            });
+          });
+        }
+
+        const sqlFunctions = [
+          "COUNT", "SUM", "AVG", "MIN", "MAX",
+          "CONCAT", "SUBSTRING", "UPPER", "LOWER"
+        ];
+        sqlFunctions.forEach(func => {
+          completions.push({
+            text: `${func}()`,
+            displayText: `${func}()`,
+            className: "cm-function"
+          });
+        });
+      } else if (isAfterFrom) {
+        // After FROM: show tables
+        for (const tableName in tables) {
+          completions.push({
+            text: tableName,
+            displayText: tableName + " (table)",
+            className: "cm-table"
+          });
+        }
+      } else if (isAfterDot) {
+        // After table.: show columns of that table
+        const matches = lineText.match(/(\w+)\.([^,]*)$/i);
+        const tableName = matches ? matches[1] : null;
+        const table = tableName ? tables[tableName] : null;
+
+        if (table) {
+          const columns = table.columns || [];
+          columns.forEach(column => {
+            completions.push({
+              text: column,
+              displayText: column,
+              className: "cm-column"
+            });
+          });
+        }
+      } else {
+        // Default: tables + columns + keywords
+        for (const tableName in tables) {
+          completions.push({
+            text: tableName,
+            displayText: tableName + " (table)",
+            className: "cm-table"
+          });
+
+          const columns = tables[tableName].columns || [];
+          columns.forEach(column => {
+            completions.push({
+              text: column,
+              displayText: column + " (" + tableName + ")",
+              className: "cm-column"
+            });
+            completions.push({
+              text: `${tableName}.${column}`,
+              displayText: `${tableName}.${column}`,
+              className: "cm-column"
+            });
+          });
+        }
+
+        const keywords = [
+          "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY",
+          "LIMIT", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "WITH"
+        ];
+        keywords.forEach(keyword => {
+          completions.push({
+            text: keyword,
+            displayText: keyword,
+            className: "cm-keyword"
+          });
+        });
+      }
+
+      const filtered = completions
+        .filter(item => item.text.toLowerCase().includes(currentWord))
+        .sort((a, b) => a.text.localeCompare(b.text));
+
+      return {
+        list: filtered,
+        from: CodeMirror.Pos(cursor.line, start),
+        to: CodeMirror.Pos(cursor.line, end)
+      };
+    });
 
     // --- Dynamic Query Setup ---
     const leaf = getURLParameter('leaf');
@@ -1438,14 +1548,11 @@ function copyToClipboard() {
 
     let initialQuery;
     if (leaf) {
-        // Use the selected SuperTable name and the leaf table name with LIMIT 1000
         initialQuery = `SELECT * FROM ${defaultSuperName}.${leaf} LIMIT 1000`;
     } else {
-        // Fallback to the original default LIMIT 100
         initialQuery = `SELECT * FROM ${defaultSuperName} LIMIT 100`;
     }
 
-    // Set the textarea value before CodeMirror initializes
     document.getElementById('sql').value = initialQuery;
 
     window.editor = CodeMirror.fromTextArea(document.getElementById('sql'), {
@@ -1460,17 +1567,37 @@ function copyToClipboard() {
         "Ctrl-Space": function(cm){
           cm.showHint({
             completeSingle:false,
-            hint: CodeMirror.hint.sql,
+            hint: CodeMirror.hint.sqlEnhanced,
             tables: window.__hintTables || {}
           });
+        },
+        "Tab": function(cm){
+          cm.showHint({
+            completeSingle:false,
+            hint: CodeMirror.hint.sqlEnhanced,
+            tables: window.__hintTables || {}
+          });
+          return false;
         }
       },
-      hintOptions: { completeSingle:false, tables: {} }
+      hintOptions: buildSqlHintOptions()
     });
 
-    // Initial CodeMirror refresh after initialization
-    window.editor.refresh();
+    // Auto-trigger IntelliSense on common trigger characters
+    window.editor.on('inputRead', function(cm, input) {
+      const triggerChars = ['.', ' ', ',', '(', ')'];
+      if (input.text && triggerChars.includes(input.text[0])) {
+        setTimeout(function() {
+          cm.showHint({
+            completeSingle: false,
+            hint: CodeMirror.hint.sqlEnhanced,
+            tables: window.__hintTables || {}
+          });
+        }, 120);
+      }
+    });
 
+    window.editor.refresh();
 
     const execBtn = document.getElementById('btnExec');
     if (execBtn) {
