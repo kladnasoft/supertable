@@ -8,16 +8,16 @@
         background-color: #ffffff;
         border-radius: 16px;
         box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-        /* INCREASED PADDING: 24px top/bottom, 50px left/right */
         padding: 24px 50px;
         border: 1px solid rgba(0, 0, 0, 0.05);
         border-left: 5px solid #1c96ca; /* Primary Accent Color */
     ">
         <div class="grid-professional" style="
             display: flex;
-            gap: 40px; /* Increased gap for better separation */
+            gap: 40px;
             align-items: flex-start;
         ">
+            <!-- LEFT: SuperTable selector -->
             <div style="flex-shrink: 0; min-width: 300px;">
                 <label style="
                     display: block;
@@ -49,6 +49,7 @@
                 </div>
             </div>
 
+            <!-- RIGHT: Metric cards -->
             <div style="flex-grow: 1;">
                 <div class="summary-grid" style="
                     display: grid;
@@ -67,7 +68,7 @@
                         gap: 12px;
                     ">
                         <div class="metric-icon" style="
-                            color: #1c96ca; /* Primary Accent Color */
+                            color: #1c96ca;
                             font-size: 20px;
                         "><i class="fas fa-file"></i></div>
                         <div class="metric-content">
@@ -112,7 +113,7 @@
                         </div>
                     </div>
 
-                    <!-- VERSION (NEW) -->
+                    <!-- VERSION -->
                     <div class="metric-card-themed" style="
                         background-color: #f5faff;
                         border: 1px solid #e2e8f0;
@@ -151,7 +152,7 @@
                         gap: 12px;
                     ">
                         <div class="metric-icon" style="
-                            color: #1c96ca; /* Primary Accent Color */
+                            color: #1c96ca;
                             font-size: 20px;
                         "><i class="fas fa-database"></i></div>
                         <div class="metric-content">
@@ -175,7 +176,8 @@
                     font-size: 13px;
                     color: #475569;
                 ">
-                    Last updated: <span id="tenantUpdatedValue" style="
+                    Last updated:
+                    <span id="tenantUpdatedValue" style="
                         font-weight: 600;
                         color: #34475e;
                     ">n/a</span>
@@ -185,3 +187,136 @@
         </div>
     </div>
 </div>
+
+<!-- Selection logic: calls /meta/supers and /meta/super -->
+<script>
+(function () {
+    // TODO: if you want these dynamic, inject them server-side.
+    const ORG_NAME = "kladna-soft";
+    const USER_HASH = "0b85b786b16d195439c0da18fd4478df";
+
+    const pairSel = document.getElementById("pairSel");
+    const filesEl = document.getElementById("tenantFilesValue");
+    const rowsEl = document.getElementById("tenantRowsValue");
+    const sizeEl = document.getElementById("tenantSizeValue");
+    const versionEl = document.getElementById("tenantVersionValue");
+    const updatedEl = document.getElementById("tenantUpdatedValue");
+
+    function formatBytes(bytes) {
+        if (bytes === null || bytes === undefined || isNaN(bytes)) {
+            return "n/a";
+        }
+        let val = Number(bytes);
+        const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+        let i = 0;
+        while (val >= 1024 && i < units.length - 1) {
+            val /= 1024;
+            i++;
+        }
+        return val.toFixed(1) + " " + units[i];
+    }
+
+    function formatDate(ms) {
+        if (!ms && ms !== 0) return "n/a";
+        const d = new Date(ms);
+        if (isNaN(d.getTime())) return "n/a";
+        return d.toLocaleString();
+    }
+
+    function applySuperMeta(superMeta) {
+        if (!superMeta) {
+            filesEl.textContent = "n/a";
+            rowsEl.textContent = "n/a";
+            sizeEl.textContent = "n/a";
+            versionEl.textContent = "n/a";
+            updatedEl.textContent = "n/a";
+            return;
+        }
+
+        filesEl.textContent = superMeta.files != null ? superMeta.files : "0";
+        rowsEl.textContent = superMeta.rows != null ? superMeta.rows : "0";
+        sizeEl.textContent = superMeta.size != null ? formatBytes(superMeta.size) : "n/a";
+        versionEl.textContent = superMeta.version != null ? superMeta.version : "n/a";
+        updatedEl.textContent = formatDate(superMeta.updated_utc);
+    }
+
+    async function loadSupers() {
+        try {
+            const resp = await fetch(
+                "/meta/supers?organization=" + encodeURIComponent(ORG_NAME)
+            );
+            if (!resp.ok) {
+                throw new Error("Failed to load supers: " + resp.status);
+            }
+            const data = await resp.json();
+            const supers = (data && data.supers) || [];
+
+            pairSel.innerHTML = "";
+
+            if (!supers.length) {
+                const opt = document.createElement("option");
+                opt.value = "";
+                opt.textContent = "No SuperTables found";
+                pairSel.appendChild(opt);
+                applySuperMeta(null);
+                return;
+            }
+
+            supers.forEach(function (name) {
+                const opt = document.createElement("option");
+                opt.value = name;
+                opt.textContent = name;
+                pairSel.appendChild(opt);
+            });
+
+            // Auto-load first SuperTable
+            if (pairSel.value) {
+                await loadSuperMeta(pairSel.value);
+            } else {
+                applySuperMeta(null);
+            }
+        } catch (err) {
+            console.error("Error loading supers:", err);
+            applySuperMeta(null);
+        }
+    }
+
+    async function loadSuperMeta(superName) {
+        if (!superName) {
+            applySuperMeta(null);
+            return;
+        }
+
+        try {
+            const params = new URLSearchParams({
+                organization: ORG_NAME,
+                super_name: superName,
+                user_hash: USER_HASH
+            });
+
+            const resp = await fetch("/meta/super?" + params.toString());
+            if (!resp.ok) {
+                throw new Error("Failed to load super meta: " + resp.status);
+            }
+            const data = await resp.json();
+            const superMeta = data && data.meta && data.meta.super;
+            applySuperMeta(superMeta || null);
+        } catch (err) {
+            console.error("Error loading super meta:", err);
+            applySuperMeta(null);
+        }
+    }
+
+    // Expose for onchange="onPairChange()"
+    window.onPairChange = function onPairChange() {
+        const superName = pairSel.value;
+        loadSuperMeta(superName);
+    };
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", loadSupers);
+    } else {
+        loadSupers();
+    }
+})();
+</script>
