@@ -294,7 +294,28 @@
         border-radius: 20px;
       }
     }
-  </style>
+  
+    .mode-toggle{
+      display:flex;
+      gap:10px;
+      margin-bottom:14px;
+    }
+    .mode-btn{
+      flex:1;
+      border:1px solid var(--panel-border);
+      background:#f8fafc;
+      color:var(--text-color);
+      padding:10px 12px;
+      border-radius:12px;
+      cursor:pointer;
+      font-weight:600;
+    }
+    .mode-btn.active{
+      border-color: rgba(28,150,202,.6);
+      background: rgba(28,150,202,.10);
+      color:#0f172a;
+    }
+</style>
 </head>
 <body>
   <div class="page-wrap">
@@ -317,19 +338,68 @@
         Enter the <strong>ADMIN_TOKEN</strong> to access Admin &amp; SQL tools.
       </div>
 
-      <form method="post" action="/admin/login">
-        <label for="token">ADMIN_TOKEN</label>
-        <input
-          id="token"
-          name="token"
-          type="password"
-          placeholder="••••••••••••"
-          autofocus
-        />
+      <form method="post" action="/admin/login" id="loginForm">
+        <input type="hidden" name="mode" id="mode" value="user"/>
+
+        <div class="mode-toggle">
+          <button type="button" class="mode-btn active" id="btnUser">
+            <span>User</span>
+          </button>
+          <button type="button" class="mode-btn" id="btnSuper">
+            <span>Superuser</span>
+          </button>
+        </div>
+
+        <div id="userFields">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" placeholder="e.g. alice" autocomplete="username"/>
+
+          <label for="token">Access Token</label>
+          <input id="token" name="token" type="password" placeholder="••••••••••••" autocomplete="current-password"/>
+        </div>
+
+        <div id="superFields" style="display:none;">
+          <label for="supertoken">SUPERTABLE_SUPERTOKEN</label>
+          <input id="supertoken" name="supertoken" type="password" placeholder="••••••••••••" autocomplete="current-password"/>
+        </div>
+
         <button type="submit">
           <span>Sign in</span>
         </button>
       </form>
+
+      <script>
+        (function() {
+          const btnUser = document.getElementById('btnUser');
+          const btnSuper = document.getElementById('btnSuper');
+          const mode = document.getElementById('mode');
+          const userFields = document.getElementById('userFields');
+          const superFields = document.getElementById('superFields');
+
+          function setMode(next) {
+            mode.value = next;
+            if (next === 'super') {
+              btnSuper.classList.add('active');
+              btnUser.classList.remove('active');
+              userFields.style.display = 'none';
+              superFields.style.display = '';
+              const st = document.getElementById('supertoken');
+              if (st) st.focus();
+            } else {
+              btnUser.classList.add('active');
+              btnSuper.classList.remove('active');
+              userFields.style.display = '';
+              superFields.style.display = 'none';
+              const u = document.getElementById('username');
+              if (u) u.focus();
+            }
+          }
+
+          btnUser.addEventListener('click', () => setMode('user'));
+          btnSuper.addEventListener('click', () => setMode('super'));
+        })();
+      </script>
+
 
       {% if message %}
         <div class="error">
@@ -339,12 +409,11 @@
       {% endif %}
 
       <div class="muted">
-        Only users who know the configured <strong>ADMIN_TOKEN</strong> may access the admin UI.
+        Users sign in with a <strong>Username + Access Token</strong>. Superusers sign in with <strong>SUPERTABLE_SUPERTOKEN</strong>.
       </div>
 
       <div class="footer-hint">
-        This token is typically configured via <code>ADMIN_TOKEN</code> in your
-        environment or <code>.env</code> file.
+        Superuser token is configured via <code>SUPERTABLE_SUPERTOKEN</code> in your environment or <code>.env</code> file. User access tokens are managed by superusers in the Admin UI.
       </div>
     </div>
   </div>

@@ -630,7 +630,88 @@
 
     /* --- Tab + details modal --- */
 
-    function switchTab(id) {
+    
+    function _fmtDate(ms) {
+      if (!ms && ms !== 0) return '—';
+      try { return new Date(ms).toLocaleString(); } catch (e) { return String(ms); }
+    }
+
+    function _maskTokenId(tokenId) {
+      const s = String(tokenId || '');
+      if (s.length <= 12) return s;
+      return s.slice(0, 8) + '…' + s.slice(-6);
+    }
+
+    async function loadTokens() {
+      const body = document.getElementById('tokensBody');
+      if (!body) return;
+      body.innerHTML = '<tr><td colspan="4" class="muted">Loading…</td></tr>';
+      try {
+        const org = window.__org || 'kladna-soft';
+        const data = await api(`/api/tokens?org=${encodeURIComponent(org)}`);
+        const tokens = (data && data.tokens) || [];
+        if (!tokens.length) {
+          body.innerHTML = '<tr><td colspan="4" class="muted">No tokens yet.</td></tr>';
+          return;
+        }
+        body.innerHTML = '';
+        tokens.forEach(t => {
+          const tokenId = t.token_id || '';
+          const label = t.label || '';
+          const created = _fmtDate(t.created_ms);
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td title="${escapeHtml(tokenId)}"><code>${escapeHtml(_maskTokenId(tokenId))}</code></td>
+            <td>${escapeHtml(label)}</td>
+            <td>${escapeHtml(created)}</td>
+            <td>
+              <button class="btn btn-sm btn-outline-danger" onclick="deleteToken('${escapeJs(tokenId)}')">Delete</button>
+            </td>
+          `;
+          body.appendChild(tr);
+        });
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="4" class="text-danger">Failed to load tokens: '+escapeHtml(e.message)+'</td></tr>';
+      }
+    }
+
+    async function createTokenModal() {
+      const html = `
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <label class="muted text-sm">Label (optional)</label>
+          <input id="tokenLabel" class="form-control" placeholder="e.g. dev, shared, read-only"/>
+          <div class="muted text-sm">The plaintext token will be shown once after creation.</div>
+        </div>
+      `;
+      showModal('Create Login Token', html, async () => {
+        const labelEl = document.getElementById('tokenLabel');
+        const label = labelEl ? labelEl.value : '';
+        const org = window.__org || 'kladna-soft';
+        const res = await api(`/api/tokens?org=${encodeURIComponent(org)}&label=${encodeURIComponent(label || '')}`, {
+          method: 'POST'
+        });
+        const token = res && res.token ? res.token : '';
+        const tokenId = res && res.token_id ? res.token_id : '';
+        showModal('Token Created', `
+          <div class="muted text-sm" style="margin-bottom:8px;">Copy this token now. It will not be shown again.</div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div><div class="muted text-sm">Token</div><pre style="margin:0; white-space:pre-wrap;">${escapeHtml(token)}</pre></div>
+            <div><div class="muted text-sm">Token ID (sha256)</div><pre style="margin:0; white-space:pre-wrap;">${escapeHtml(tokenId)}</pre></div>
+          </div>
+        `);
+        await loadTokens();
+      });
+    }
+
+    async function deleteToken(tokenId) {
+      if (!tokenId) return;
+      const org = window.__org || 'kladna-soft';
+      if (!confirm('Delete token ' + tokenId + '?')) return;
+      await api(`/api/tokens/${encodeURIComponent(tokenId)}?org=${encodeURIComponent(org)}`, { method: 'DELETE' });
+      await loadTokens();
+    }
+
+function switchTab(id) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tabpane').forEach(p => p.classList.add('hidden'));
       document.getElementById('tab-'+id).classList.add('active');
@@ -716,6 +797,11 @@
         <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
           <i class="fas fa-mirror"></i><span>Mirrors</span>
         </div>
+        <div id="tab-tokens" class="tab" onclick="switchTab('tokens')">
+          <i class="fas fa-key"></i><span>Tokens</span>
+          <button type="button" class="tab-add" onclick="createTokenModal(); event.stopPropagation();">+</button>
+        </div>
+
         <div id="tab-config" class="tab" onclick="switchTab('config')">
           <i class="fas fa-cog"></i><span>Config</span>
         </div>
@@ -909,7 +995,38 @@
         </div>
       </div>
 
-      <!-- CONFIG TAB -->
+      
+      <!-- TOKENS TAB -->
+      <div id="pane-tokens" class="tabpane" style="display:none;">
+        <div class="card mt-4">
+          <div class="section">
+            <div class="d-flex align-items-center justify-content-between">
+              <div class="muted text-sm">Login Tokens</div>
+              <button class="btn btn-sm btn-primary" onclick="createTokenModal()">Create Token</button>
+            </div>
+            <div class="mt-2">
+              <table>
+                <thead>
+                  <tr class="border-top">
+                    <th style="width: 36%;">Token ID</th>
+                    <th style="width: 24%;">Label</th>
+                    <th style="width: 20%;">Created</th>
+                    <th style="width: 20%;">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="tokensBody">
+                  <tr><td colspan="4" class="muted">Loading…</td></tr>
+                </tbody>
+              </table>
+              <div class="muted text-sm mt-2">
+                Tokens are stored hashed (sha256) in Redis. When you create a token, the plaintext value is shown once.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+<!-- CONFIG TAB -->
       <div id="pane-config" class="tabpane hidden">
         <div class="mt-4">
           <!-- .env info card WITH header-row inside -->

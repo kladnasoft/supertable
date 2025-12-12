@@ -618,7 +618,7 @@
       }
 
       api(
-        META_BASE + '/meta/super?organization=' +
+        META_BASE + '/admin/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
         '&user_hash=' + encodeURIComponent(USER_HASH)
@@ -641,7 +641,7 @@
       const selEl = document.getElementById('pairSel');
       if (!selEl) return;
 
-      api(META_BASE + '/meta/supers?organization=' + encodeURIComponent(ORGANIZATION))
+      api(META_BASE + '/admin/supers?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
           const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
           selEl.innerHTML = '';
@@ -1021,7 +1021,7 @@
           try {
             const schemaResp = await api(
               META_BASE +
-              '/meta/schema?organization=' + encodeURIComponent(organization) +
+              '/admin/schema?organization=' + encodeURIComponent(organization) +
               '&super_name=' + encodeURIComponent(superName) +
               '&table=' + encodeURIComponent(tableName) +
               '&user_hash=' + encodeURIComponent(userHash)

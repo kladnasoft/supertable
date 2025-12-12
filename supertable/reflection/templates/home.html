@@ -1,0 +1,568 @@
+{% extends "sidebar.html" %}
+{% load static %}
+
+{% block title %}Welcome to KladnaSoft{% endblock %}
+
+{% block content %}
+<!-- CSS -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+
+<style>
+  :root {
+      --primary: #1c96ca;
+      --primary-hover: #147ba3;
+      --primary-light: rgba(28, 150, 202, 0.1);
+      --text: #495057;
+      --text-light: #6b7280;
+      --text-dark: #111827;
+      --bg-white: #ffffff;
+      --bg-light: #f8fafc;
+      --bg-lighter: #f1f5f9;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --border: #e2e8f0;
+  }
+
+  #main-content {
+      margin-left: 20px;
+      margin-right: 20px;
+      transition: margin-left 0.3s ease;
+      width: calc(100% - 280px);
+      padding: 20px;
+  }
+
+  body.sidebar-collapsed #main-content {
+      margin-left: 80px;
+      width: calc(100% - 80px);
+  }
+
+  @media (max-width: 992px) {
+      #main-content {
+          margin-left: 0 !important;
+          width: 100% !important;
+          padding: 15px;
+      }
+  }
+
+  /* Hero Section */
+  .hero-section {
+      background: linear-gradient(135deg, rgba(28, 150, 202, 0.05) 0%, rgba(16, 185, 129, 0.05) 100%);
+      border-radius: 16px;
+      padding: 40px;
+      margin-bottom: 30px;
+      text-align: center;
+      border: 1px solid var(--border);
+      position: relative;
+      overflow: hidden;
+  }
+
+  .hero-section::before {
+      content: "";
+      position: absolute;
+      top: -50px;
+      right: -50px;
+      width: 200px;
+      height: 200px;
+      background: radial-gradient(circle, rgba(28, 150, 202, 0.1) 0%, rgba(28, 150, 202, 0) 70%);
+      z-index: 0;
+  }
+
+  .hero-section::after {
+      content: "";
+      position: absolute;
+      bottom: -30px;
+      left: -30px;
+      width: 150px;
+      height: 150px;
+      background: radial-gradient(circle, rgba(16, 185, 129, 0.1) 0%, rgba(16, 185, 129, 0) 70%);
+      z-index: 0;
+  }
+
+  .hero-title {
+      font-size: 2.5rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 15px;
+      position: relative;
+      z-index: 1;
+  }
+
+  .hero-subtitle {
+      font-size: 1.2rem;
+      color: var(--text);
+      max-width: 800px;
+      margin: 0 auto 25px;
+      position: relative;
+      z-index: 1;
+  }
+
+  /* Feature Cards */
+  .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 25px;
+      margin-bottom: 40px;
+  }
+
+  .feature-card {
+      background: white;
+      border-radius: 12px;
+      padding: 25px;
+      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05), 0 4px 6px -2px rgba(0,0,0,0.02);
+      transition: all 0.3s ease;
+      border: 1px solid var(--border);
+      position: relative;
+      overflow: hidden;
+  }
+
+  .feature-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.04);
+  }
+
+  .feature-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 4px;
+      height: 100%;
+      background: var(--primary);
+  }
+
+  .feature-icon {
+      width: 60px;
+      height: 60px;
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 1.5rem;
+      margin-bottom: 20px;
+  }
+
+  .feature-title {
+      font-size: 1.3rem;
+      font-weight: 600;
+      color: var(--text-dark);
+      margin-bottom: 15px;
+  }
+
+  .feature-description {
+      color: var(--text);
+      margin-bottom: 15px;
+  }
+
+  .feature-link {
+      display: inline-flex;
+      align-items: center;
+      color: var(--primary);
+      font-weight: 500;
+      text-decoration: none;
+      transition: all 0.2s;
+  }
+
+  .feature-link:hover {
+      color: var(--primary-hover);
+      text-decoration: underline;
+  }
+
+  .feature-link i {
+      margin-left: 5px;
+      transition: transform 0.2s;
+  }
+
+  .feature-link:hover i {
+      transform: translateX(3px);
+  }
+
+  /* Quick Start Section */
+  .quick-start {
+      background: white;
+      border-radius: 16px;
+      padding: 30px;
+      margin-bottom: 30px;
+      border: 1px solid var(--border);
+  }
+
+  .section-title {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: var(--text-dark);
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+  }
+
+  .section-title i {
+      margin-right: 10px;
+      color: var(--primary);
+  }
+
+  .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 20px;
+  }
+
+  .step {
+      display: flex;
+      align-items: flex-start;
+  }
+
+  .step-number {
+      width: 30px;
+      height: 30px;
+      background: var(--primary);
+      color: white;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      margin-right: 15px;
+      flex-shrink: 0;
+  }
+
+  .step-content {
+      flex-grow: 1;
+  }
+
+  .step-title {
+      font-weight: 600;
+      color: var(--text-dark);
+      margin-bottom: 5px;
+  }
+
+  .step-description {
+      color: var(--text);
+      font-size: 0.9rem;
+  }
+
+  /* Stats Section */
+  .stats-section {
+      background: linear-gradient(135deg, var(--primary) 0%, #0a678f 100%);
+      border-radius: 16px;
+      padding: 30px;
+      color: white;
+      margin-bottom: 30px;
+  }
+
+  .stats-title {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin-bottom: 25px;
+      text-align: center;
+  }
+
+  .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+  }
+
+  .stat-item {
+      text-align: center;
+      padding: 20px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      backdrop-filter: blur(5px);
+  }
+
+  .stat-value {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 5px;
+  }
+
+  .stat-label {
+      font-size: 0.9rem;
+      opacity: 0.9;
+  }
+
+  /* Call to Action */
+  .cta-section {
+      text-align: center;
+      padding: 40px 20px;
+  }
+
+  .cta-title {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 15px;
+  }
+
+  .cta-button {
+      display: inline-flex;
+      align-items: center;
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
+      color: white;
+      padding: 12px 30px;
+      border-radius: 8px;
+      font-weight: 600;
+      text-decoration: none;
+      box-shadow: 0 4px 15px rgba(28, 150, 202, 0.3);
+      transition: all 0.3s ease;
+  }
+
+  .cta-button:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 25px rgba(28, 150, 202, 0.4);
+      color: white;
+  }
+
+  .cta-button i {
+      margin-left: 8px;
+      transition: transform 0.3s;
+  }
+
+  .cta-button:hover i {
+      transform: translateX(5px);
+  }
+
+  /* Animation */
+  @keyframes float {
+      0% { transform: translateY(0px); }
+      50% { transform: translateY(-10px); }
+      100% { transform: translateY(0px); }
+  }
+
+  .floating {
+      animation: float 6s ease-in-out infinite;
+  }
+</style>
+
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-md-12" id="main-content">
+
+
+
+
+            <!-- Hero Section -->
+            <div class="hero-section">
+                <h1 class="hero-title">Welcome to KladnaSoft Modular Data Platform</h1>
+                <p class="hero-subtitle">
+                    Your powerful data management solution with Super Tables, SQL execution, monitoring,
+                    and AI-powered analytics - all in one intuitive interface.
+                </p>
+            </div>
+
+
+
+              <!-- Quick Start Section -->
+            <div class="quick-start" id="quick-start">
+                <h2 class="section-title">
+                    <i class="fas fa-bolt"></i>Quick Start Guide
+                </h2>
+                <div class="steps">
+                    <div class="step">
+                        <div class="step-number">1</div>
+                        <div class="step-content">
+                            <h4 class="step-title">Create a Super Table</h4>
+                            <p class="step-description">
+                                Start by creating a Super Table to organize your related data tables.
+                                Click the "Super Tables" menu and use the creation controls.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <div class="step-content">
+                            <h4 class="step-title">Import Your Data</h4>
+                            <p class="step-description">
+                                Use the Import Hub to upload CSV, JSON, or Excel files. Preview your data
+                                before final import to ensure quality.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <div class="step-content">
+                            <h4 class="step-title">Query Your Data</h4>
+                            <p class="step-description">
+                                Navigate to the SQL Editor and run queries against your tables.
+                                Use the autocomplete features for faster query writing.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">4</div>
+                        <div class="step-content">
+                            <h4 class="step-title">Monitor Performance</h4>
+                            <p class="step-description">
+                                Check the Monitoring section to analyze query performance and
+                                optimize your database operations.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+
+
+            <!-- Features Section -->
+            <div id="features">
+                <h2 class="section-title">
+                    <i class="fas fa-star"></i>Key Features
+                </h2>
+                <div class="features-grid">
+
+                    <!-- Super Tables Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-layer-group"></i>
+                        </div>
+                        <h3 class="feature-title">Super Tables</h3>
+                        <p class="feature-description">
+                            Manage your data effortlessly with Super Tables — smart collections of related tables designed to streamline organization and access control. Unlike traditional databases, Super Tables let you query across multiple tables directly, without the need for unions.
+                        </p>
+
+
+                    </div>
+
+                    <!-- SQL Execution Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-terminal"></i>
+                        </div>
+                        <h3 class="feature-title">SQL Execution</h3>
+                        <p class="feature-description">
+                            Write and execute queries effortlessly with our advanced SQL editor — featuring syntax highlighting, autocomplete, and real-time, paginated results. Simply click on a Super Table to expand its contents and run your queries instantly.
+                        </p>
+                    </div>
+
+                    <!-- Data Import Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-file-import"></i>
+                        </div>
+                        <h3 class="feature-title">Data Import Hub</h3>
+                       <p class="feature-description">
+                            Quickly upload CSV, JSON, and PARQUET files with built-in preview and automatic schema detection. Use the staging area to validate your data before importing. You can create a new table on your first upload or store files for Data Staging, allowing you to reload them anytime as needed.
+                       </p>
+                    </div>
+
+                    <!-- AI Tools Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-robot"></i>
+                        </div>
+                        <h3 class="feature-title">AI Tools</h3>
+                        <p class="feature-description">
+                            Unlock AI-powered tools for query generation, data analysis, and natural language to SQL conversion. With Docu Genie, a semantic layer is automatically created, giving you full visibility into your available data.
+                        </p>
+
+                    </div>
+
+                    <!-- Monitoring Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-chart-line"></i>
+                        </div>
+                        <h3 class="feature-title">Query Monitoring</h3>
+                        <p class="feature-description">
+                            Monitor query performance with detailed statistics, visualized execution plans, and comprehensive write operation metrics — giving you deeper insights into your data flow.
+                        </p>
+
+                    </div>
+
+
+
+                    <!-- User Management Feature -->
+                    <div class="feature-card">
+                        <div class="feature-icon">
+                            <i class="fas fa-users-cog"></i>
+                        </div>
+                        <h3 class="feature-title">User Management</h3>
+                        <p class="feature-description">
+                            Administer user roles and permissions with fine-grained access control
+                            for your organization's data.
+                        </p>
+                        <a href="{% url 'reflection:users' %}" class="feature-link">
+                            Manage Users
+                            <i class="fas fa-arrow-right"></i>
+                        </a>
+                    </div>
+                </div>
+            </div>
+
+             <!-- Stats Section -->
+            <div class="stats-section">
+                <h3 class="stats-title">Platform at a Glance</h3>
+                <div class="stats-grid">
+                    <div class="stat-item floating" style="animation-delay: 0s;">
+                        <div class="stat-value">{{ stats.supertables }}</div>
+                        <div class="stat-label">Super Tables</div>
+                    </div>
+                    <div class="stat-item floating" style="animation-delay: 0.5s;">
+                        <div class="stat-value">{{ stats.tables }}</div>
+                        <div class="stat-label">Import Data</div>
+                    </div>
+                    <div class="stat-item floating" style="animation-delay: 1s;">
+                        <div class="stat-value">{{ stats.queries }}</div>
+                        <div class="stat-label">Queries Executed</div>
+                    </div>
+                    <div class="stat-item floating" style="animation-delay: 1.5s;">
+                        <div class="stat-value">{{ stats.users }}</div>
+                        <div class="stat-label">AI Tools</div>
+                    </div>
+                </div>
+            </div>
+
+
+
+            <!-- Call to Action -->
+            <div class="cta-section">
+                <h3 class="cta-title">Ready to Elevate Your Data Experience?</h3>
+                <p class="text-muted mb-4">Discover the power of KladnaSoft by exploring our Example SuperTable.</p>
+                <a href="{% url 'reflection:execute' %}?supertable=example" class="cta-button">
+                    Launch SQL Editor <i class="fas fa-arrow-right"></i>
+                </a>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<!-- Footer -->
+{% include 'bottom.html' %}
+
+<script>
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function (e) {
+            e.preventDefault();
+            document.querySelector(this.getAttribute('href')).scrollIntoView({
+                behavior: 'smooth'
+            });
+        });
+    });
+
+    // Animation on scroll
+    document.addEventListener('DOMContentLoaded', function() {
+        const featureCards = document.querySelectorAll('.feature-card');
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.style.opacity = 1;
+                    entry.target.style.transform = 'translateY(0)';
+                }
+            });
+        }, { threshold: 0.1 });
+
+        featureCards.forEach(card => {
+            card.style.opacity = 0;
+            card.style.transform = 'translateY(20px)';
+            card.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
+            observer.observe(card);
+        });
+    });
+</script>
+{% endblock %}

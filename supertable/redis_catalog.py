@@ -4,6 +4,8 @@ import os
 import json
 import time
 import uuid
+import hashlib
+import secrets
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Any
 from urllib.parse import urlparse
@@ -54,6 +56,11 @@ def _role_hash_key(org: str, sup: str, role_hash: str) -> str:
 def _user_name_to_hash_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:users:name_to_hash"
 
+
+def _auth_tokens_key(org: str) -> str:
+    # Store hashed tokens (sha256) -> JSON metadata in a single Redis hash.
+    # Value example: {"created_ms": 123, "created_by": "superuser", "label": "dev", "enabled": true}
+    return f"supertable:{org}:auth:tokens"
 def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
     return f"supertable:{org}:{sup}:meta:roles:type_to_hash:{role_type}"
 
@@ -525,7 +532,81 @@ return 0
             logger.error(f"[redis-catalog] get_user_details error: {e}")
         return None
 
-    # ------------- Listings via SCAN -------------
+    
+    # ------------- Organization auth tokens (login tokens) -------------
+
+    def list_auth_tokens(self, org: str) -> List[Dict[str, Any]]:
+        """List auth tokens for an organization (tokens are stored hashed; only token_id is returned)."""
+        key = _auth_tokens_key(org)
+        out: List[Dict[str, Any]] = []
+        try:
+            raw_map = self.r.hgetall(key) or {}
+            for token_id, raw in raw_map.items():
+                try:
+                    meta = json.loads(raw) if raw else {}
+                except Exception:
+                    meta = {"value": raw}
+                if isinstance(meta, dict):
+                    meta = dict(meta)
+                else:
+                    meta = {"value": meta}
+                meta.setdefault("token_id", token_id)
+                out.append(meta)
+            out.sort(key=lambda x: int(x.get("created_ms") or 0), reverse=True)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_auth_tokens error: {e}")
+        return out
+
+    def create_auth_token(
+        self,
+        org: str,
+        created_by: str,
+        label: Optional[str] = None,
+        enabled: bool = True,
+    ) -> Dict[str, Any]:
+        """Create a new auth token.
+
+        The plaintext token is returned ONLY once. Redis stores only token_id (sha256(token)).
+        """
+        token = secrets.token_urlsafe(24)
+        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        meta = {
+            "token_id": token_id,
+            "created_ms": _now_ms(),
+            "created_by": str(created_by or ""),
+            "label": (str(label).strip() if label is not None else ""),
+            "enabled": bool(enabled),
+        }
+        try:
+            self.r.hset(_auth_tokens_key(org), token_id, json.dumps(meta))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] create_auth_token error: {e}")
+            raise
+        return {"token": token, **meta}
+
+    def delete_auth_token(self, org: str, token_id: str) -> bool:
+        """Delete an auth token by token_id (sha256)."""
+        if not token_id:
+            return False
+        try:
+            return bool(self.r.hdel(_auth_tokens_key(org), token_id))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_auth_token error: {e}")
+            return False
+
+    def validate_auth_token(self, org: str, token: str) -> bool:
+        """Validate a plaintext auth token."""
+        if not token:
+            return False
+        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            return bool(self.r.hexists(_auth_tokens_key(org), token_id))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] validate_auth_token error: {e}")
+            return False
+
+
+# ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
         """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:*"""

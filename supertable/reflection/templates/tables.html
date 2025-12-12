@@ -1041,7 +1041,7 @@
       }
 
       api(
-        META_BASE + '/meta/super?organization=' +
+        META_BASE + '/admin/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
         '&user_hash=' + encodeURIComponent(USER_HASH)
@@ -1069,7 +1069,7 @@
       if (!selEl) return;
       if (labelEl) labelEl.textContent = 'Loading SuperTables...';
 
-      api(META_BASE + '/meta/supers?organization=' + encodeURIComponent(ORGANIZATION))
+      api(META_BASE + '/admin/supers?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
           const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
           selEl.innerHTML = '';
@@ -1150,7 +1150,7 @@
 
       try {
         const data = await api(
-          META_BASE + '/meta/schema?organization=' +
+          META_BASE + '/admin/schema?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +
@@ -1558,7 +1558,7 @@
 
       try {
         const data = await api(
-          META_BASE + '/meta/stats?organization=' +
+          META_BASE + '/admin/stats?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +

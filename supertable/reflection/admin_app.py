@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import json
 import html
@@ -11,13 +12,20 @@ from urllib.parse import urlparse
 import re
 import uuid
 import enum
+import hashlib
+import secrets
+import base64
+import hmac
+import time
+
 
 import redis
-from fastapi import APIRouter, Query, HTTPException, Request, Depends, Form, Body
+from fastapi import APIRouter, Query, HTTPException, Request, Response, Depends, Form, Body
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from supertable.redis_catalog import RedisCatalog
+from supertable.super_table import SuperTable
 
 # Load environment variables from .env file (optional)
 try:
@@ -34,6 +42,10 @@ logger = logging.getLogger(__name__)
 class Settings:
     def __init__(self) -> None:
         # SUPERTABLE_* — as requested
+        self.SUPERTABLE_ORGANIZATION: str = os.getenv("SUPERTABLE_ORGANIZATION", "").strip()
+        self.SUPERTABLE_SUPERTOKEN: str = os.getenv("SUPERTABLE_SUPERTOKEN", "").strip()
+        self.SUPERTABLE_SESSION_SECRET: str = os.getenv("SUPERTABLE_SESSION_SECRET", "").strip()
+
         self.SUPERTABLE_REDIS_URL: Optional[str] = os.getenv("SUPERTABLE_REDIS_URL")
 
         self.SUPERTABLE_REDIS_HOST: str = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
@@ -59,10 +71,108 @@ class Settings:
 
 settings = Settings()
 
-
 def _required_token() -> str:
-    # Trim to avoid surprises from .env quoting/spacing
-    return (settings.SUPERTABLE_ADMIN_TOKEN or "").strip()
+    """Superuser token required for privileged admin actions."""
+    return (settings.SUPERTABLE_SUPERTOKEN or settings.SUPERTABLE_ADMIN_TOKEN or "").strip()
+
+_missing_envs: List[str] = []
+if not settings.SUPERTABLE_ORGANIZATION:
+    _missing_envs.append("SUPERTABLE_ORGANIZATION")
+if not (settings.SUPERTABLE_SUPERTOKEN or "").strip():
+    _missing_envs.append("SUPERTABLE_SUPERTOKEN")
+if _missing_envs:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(_missing_envs))
+
+
+
+
+
+
+# ------------------------------ Signed session cookie ------------------------------
+
+_SESSION_COOKIE_NAME = "st_session"
+_ADMIN_COOKIE_NAME = "st_admin_token"
+
+def _session_secret() -> bytes:
+    if settings.SUPERTABLE_SESSION_SECRET:
+        return settings.SUPERTABLE_SESSION_SECRET.encode("utf-8")
+    derived = hashlib.sha256(("st_session:" + _required_token()).encode("utf-8")).hexdigest()
+    return derived.encode("utf-8")
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
+
+def _sign_payload(payload: bytes) -> str:
+    sig = hmac.new(_session_secret(), payload, hashlib.sha256).digest()
+    return _b64url_encode(sig)
+
+
+def _encode_session(data: Dict[str, Any]) -> str:
+    payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return _b64url_encode(payload) + "." + _sign_payload(payload)
+
+
+def _decode_session(value: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not value or "." not in value:
+            return None
+        b64_payload, b64_sig = value.split(".", 1)
+        payload = _b64url_decode(b64_payload)
+        expected = _sign_payload(payload)
+        if not hmac.compare_digest(expected, b64_sig):
+            return None
+        data = json.loads(payload.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def get_session(request: Request) -> Optional[Dict[str, Any]]:
+    return _decode_session(request.cookies.get(_SESSION_COOKIE_NAME, ""))
+
+
+def _set_session_cookie(resp: Response, data: Dict[str, Any]) -> None:
+    resp.set_cookie(
+        _SESSION_COOKIE_NAME,
+        _encode_session(data),
+        httponly=True,
+        samesite="lax",
+        secure=settings.SECURE_COOKIES,
+        max_age=7 * 24 * 3600,
+        path="/",
+    )
+
+
+def _clear_session_cookie(resp: Response) -> None:
+    resp.delete_cookie(_SESSION_COOKIE_NAME, path="/")
+
+
+def is_logged_in(request: Request) -> bool:
+    sess = get_session(request) or {}
+    return bool(sess.get("org") and sess.get("username") and sess.get("user_hash"))
+
+
+def is_superuser(request: Request) -> bool:
+    sess = get_session(request) or {}
+    if sess.get("is_superuser") is True:
+        return True
+    tok = (request.cookies.get(_ADMIN_COOKIE_NAME) or "").strip()
+    return bool(tok and tok == _required_token())
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _user_hash(org: str, username: str) -> str:
+    return _sha256_hex(f"{org}:{username}")
 
 
 def _now_ms() -> int:
@@ -309,18 +419,79 @@ def _escape(s: str) -> str:
 
 # ------------------------------ Auth helpers ------------------------------
 
+
+def _get_org_from_env_fallback() -> str:
+    return (os.getenv("SUPERTABLE_ORGANIZATION") or "").strip()
+
+
+def _catalog_list_tokens(org: str) -> List[Dict[str, Any]]:
+    if not org:
+        return []
+    try:
+        return catalog.list_auth_tokens(org)  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            raw = redis_client.hgetall(f"supertable:{org}:auth:tokens") or {}
+            out: List[Dict[str, Any]] = []
+            for token_id, meta_raw in raw.items():
+                try:
+                    meta = json.loads(meta_raw) if meta_raw else {}
+                except Exception:
+                    meta = {"value": meta_raw}
+                if isinstance(meta, dict):
+                    meta = dict(meta)
+                else:
+                    meta = {"value": meta}
+                meta.setdefault("token_id", token_id)
+                out.append(meta)
+            out.sort(key=lambda x: int(x.get("created_ms") or 0), reverse=True)
+            return out
+        except Exception:
+            return []
+
+
+def _catalog_create_token(org: str, created_by: str, label: Optional[str]) -> Dict[str, Any]:
+    if not org:
+        raise HTTPException(status_code=400, detail="Missing organization")
+    try:
+        return catalog.create_auth_token(org=org, created_by=created_by, label=label)  # type: ignore[attr-defined]
+    except Exception:
+        token = secrets.token_urlsafe(24)
+        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        meta = {
+            "token_id": token_id,
+            "created_ms": int(time.time() * 1000),
+            "created_by": str(created_by or ""),
+            "label": (str(label).strip() if label is not None else ""),
+            "enabled": True,
+        }
+        try:
+            redis_client.hset(f"supertable:{org}:auth:tokens", token_id, json.dumps(meta))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Token creation failed: {e}")
+        return {"token": token, **meta}
+
+
+def _catalog_delete_token(org: str, token_id: str) -> bool:
+    if not org or not token_id:
+        return False
+    try:
+        return bool(catalog.delete_auth_token(org=org, token_id=token_id))  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            return bool(redis_client.hdel(f"supertable:{org}:auth:tokens", token_id))
+        except Exception:
+            return False
+
+
+
 def _get_provided_token(request: Request) -> Optional[str]:
-    # Only trust the cookie to mark a session
-    cookie = request.cookies.get("st_admin_token")
+    cookie = request.cookies.get(_ADMIN_COOKIE_NAME)
     return cookie.strip() if isinstance(cookie, str) else None
 
 
 def _is_authorized(request: Request) -> bool:
-    req = _required_token()
-    if not req:
-        return False
-    provided = _get_provided_token(request)
-    return provided == req
+    return is_logged_in(request)
 
 
 def _no_store(resp: Response):
@@ -768,36 +939,65 @@ def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_
 
 @router.get("/admin/login", response_class=HTMLResponse)
 def admin_login_form(request: Request):
-    msg = None if _required_token() else "Admin token not configured. Set SUPERTABLE_ADMIN_TOKEN in your .env and restart."
-    return _render_login(request, message=msg, clear_cookie=True)
+    return _render_login(request, message=None, clear_cookie=True)
 
 
 @router.post("/admin/login")
-def admin_login(request: Request, token: str = Form("")):
-    req = _required_token()
-    if not req:
-        return _render_login(request,
-                             message="Admin token not configured. Set SUPERTABLE_ADMIN_TOKEN in your .env and restart.",
-                             clear_cookie=True)
+def admin_login(
+    request: Request,
+    mode: str = Form("user"),
+    username: str = Form(""),
+    token: str = Form(""),
+    supertoken: str = Form(""),
+):
+    org = settings.SUPERTABLE_ORGANIZATION
+    mode = (mode or "").strip().lower()
+    username = (username or "").strip()
 
-    # Properly validate the token
-    provided_token = token.strip()
+    if mode == "super":
+        required = _required_token()
+        provided = (supertoken or "").strip()
+        if not provided or provided != required:
+            return _render_login(request, message="Invalid superuser token.", clear_cookie=True)
+
+        username_eff = "superuser"
+        user_hash = _user_hash(org, username_eff)
+
+        resp = RedirectResponse(url="/admin", status_code=302)
+        resp.set_cookie(
+            _ADMIN_COOKIE_NAME,
+            provided,
+            httponly=True,
+            samesite="lax",
+            secure=settings.SECURE_COOKIES,
+            max_age=7 * 24 * 3600,
+            path="/",
+        )
+        _set_session_cookie(resp, {"org": org, "username": username_eff, "user_hash": user_hash, "is_superuser": True})
+        _no_store(resp)
+        return resp
+
+    # Regular user: username + redis token
+    if not username:
+        return _render_login(request, message="Username is required.", clear_cookie=True)
+
+    provided_token = (token or "").strip()
     if not provided_token:
-        return _render_login(request, message="Please enter a token", clear_cookie=True)
+        return _render_login(request, message="Token is required.", clear_cookie=True)
 
-    if provided_token != req:
-        return _render_login(request, message="Invalid token", clear_cookie=True)
+    try:
+        ok = bool(catalog.validate_auth_token(org=org, token=provided_token))
+    except Exception:
+        ok = False
 
-    resp = RedirectResponse("/admin", status_code=302)
-    resp.set_cookie(
-        "st_admin_token",
-        req,
-        httponly=True,
-        samesite="lax",
-        path="/",
-        secure=settings.SECURE_COOKIES,
-        max_age=7 * 24 * 3600
-    )
+    if not ok:
+        return _render_login(request, message="Invalid token.", clear_cookie=True)
+
+    user_hash = _user_hash(org, username)
+    resp = RedirectResponse(url="/admin", status_code=302)
+    resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
+    _clear_session_cookie(resp)
+    _set_session_cookie(resp, {"org": org, "username": username, "user_hash": user_hash, "is_superuser": False})
     _no_store(resp)
     return resp
 
@@ -854,6 +1054,50 @@ def _effective_settings() -> Dict[str, str]:
         "UVICORN_RELOAD",
     ]
     return {k: os.getenv(k) for k in keys}
+
+
+
+@router.get("/api/tokens")
+def api_list_tokens(
+    request: Request,
+    org: str = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    org_eff = (org or _get_org_from_env_fallback()).strip()
+    tokens = _catalog_list_tokens(org_eff)
+    return {"ok": True, "organization": org_eff, "tokens": tokens}
+
+
+@router.post("/api/tokens")
+def api_create_token(
+    request: Request,
+    org: str = Query(None),
+    label: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    org_eff = (org or _get_org_from_env_fallback()).strip()
+    created = _catalog_create_token(org_eff, created_by="superuser", label=label)
+    return {"ok": True, "organization": org_eff, **created}
+
+
+@router.delete("/api/tokens/{token_id}")
+def api_delete_token(
+    request: Request,
+    token_id: str,
+    org: str = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    org_eff = (org or _get_org_from_env_fallback()).strip()
+    ok = _catalog_delete_token(org_eff, token_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return {"ok": True, "organization": org_eff, "token_id": token_id}
 
 
 @router.get("/admin/config", response_class=HTMLResponse)
@@ -950,12 +1194,17 @@ def admin_page(
     if not sel_org or not sel_sup:
         resp = templates.TemplateResponse("admin.html", {
             "request": request,
+            "session_org": (get_session(request) or {}).get("org") or settings.SUPERTABLE_ORGANIZATION,
+            "session_username": (get_session(request) or {}).get("username") or "",
+            "session_user_hash": (get_session(request) or {}).get("user_hash") or "",
+            "session_is_superuser": bool((get_session(request) or {}).get("is_superuser")),
             "authorized": True,
             "token": provided,
             "tenants": tenants,
             "sel_org": sel_org,
             "sel_sup": sel_sup,
             "has_tenant": False,
+            "default_user_hash": "",
         })
         _no_store(resp)
         return resp
@@ -971,6 +1220,8 @@ def admin_page(
 
     users = list_users(sel_org, sel_sup)
     roles = list_roles(sel_org, sel_sup)
+    # Choose a default user hash (first user) for meta/super calls
+    default_user_hash = users[0]["hash"] if users else ""
 
     ctx = {
         "request": request,
@@ -985,6 +1236,7 @@ def admin_page(
         "mirrors": mirrors,
         "users": users,
         "roles": roles,
+        "default_user_hash": default_user_hash,
     }
     resp = templates.TemplateResponse("admin.html", ctx)
     _no_store(resp)
@@ -1177,6 +1429,8 @@ def admin_execute_page(
     tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
 
     users = list_users(sel_org, sel_sup) if sel_org and sel_sup else []
+    # Default user hash for selection/metrics on the execute page
+    default_user_hash = users[0]["hash"] if users else ""
     ctx = {
         "request": request,
         "authorized": True,
@@ -1187,6 +1441,7 @@ def admin_execute_page(
         "has_tenant": bool(sel_org and sel_sup),
         "users": users,         # used for user selection (hash) at execution time
         "initial_leaf": leaf,   # <-- pass through to execute.html if you want
+        "default_user_hash": default_user_hash,
     }
     resp = templates.TemplateResponse("execute.html", ctx)
     _no_store(resp)
@@ -1487,6 +1742,9 @@ def tables_page(
             root_version = None
             root_ts = None
 
+    # Users are needed for a default user hash on stats/meta calls
+    users = list_users(sel_org, sel_sup) if has_tenant else []
+    default_user_hash = users[0]["hash"] if users else ""
     ctx = {
         "request": request,
         "authorized": True,
@@ -1501,6 +1759,7 @@ def tables_page(
         "items": items,
         "root_version": root_version,
         "root_ts": root_ts,
+        "default_user_hash": default_user_hash,
     }
     resp = templates.TemplateResponse("tables.html", ctx)
     _no_store(resp)
@@ -1526,6 +1785,47 @@ def api_get_super_meta(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
 
+
+
+@router.post("/admin/super")
+def api_get_super_meta(
+    request: Request,
+    organization: str = Query(...),
+    super_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+      resp = RedirectResponse("/admin/login", status_code=302)
+      _no_store(resp)
+      return resp
+
+    try:
+        st = SuperTable(organization=organization, super_name=super_name)
+        return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": st.storage}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
+
+
+
+@router.delete("/admin/super")
+def api_get_super_meta(
+    request: Request,
+    organization: str = Query(...),
+    super_name: str = Query(...),
+    user_hash: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _is_authorized(request):
+      resp = RedirectResponse("/admin/login", status_code=302)
+      _no_store(resp)
+      return resp
+
+    try:
+        super_table = SuperTable(super_name=super_name, organization=organization)
+        super_table.delete(user_hash)
+        return {"ok": True, "organization": organization, "name": super_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SuperTable deletion failed: {e}")
 
 
 @router.get("/admin/schema")

@@ -12,6 +12,42 @@
         border: 1px solid rgba(0, 0, 0, 0.05);
         border-left: 5px solid #1c96ca; /* Primary Accent Color */
     ">
+        
+        {% if session_username %}
+        <div style="
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            margin-bottom:18px;
+            padding:10px 14px;
+            border:1px solid rgba(15,23,42,.08);
+            border-radius:12px;
+            background: linear-gradient(180deg, rgba(28,150,202,.08), rgba(28,150,202,.03));
+            font-size: 13px;
+            color:#334155;
+        ">
+          <div>
+            <strong style="color:#0f172a;">{{ session_username }}</strong>
+            <span style="color:#94a3b8;">•</span>
+            <span>Org:</span> <strong style="color:#0f172a;">{{ session_org }}</strong>
+          </div>
+          <div style="color:#64748b;">
+            {% if session_is_superuser %}
+              <span style="display:inline-flex;align-items:center;gap:6px;">
+                <span style="width:8px;height:8px;border-radius:999px;background:#10b981;display:inline-block;"></span>
+                Superuser
+              </span>
+            {% else %}
+              <span style="display:inline-flex;align-items:center;gap:6px;">
+                <span style="width:8px;height:8px;border-radius:999px;background:#3b82f6;display:inline-block;"></span>
+                User
+              </span>
+            {% endif %}
+          </div>
+        </div>
+        {% endif %}
+
         <div class="grid-professional" style="
             display: flex;
             gap: 40px;
@@ -40,6 +76,12 @@
                     background-position: right 10px center;
                 ">
                 </select>
+                {% if session_is_superuser %}
+                <div style="display:flex; gap:10px; margin-top:12px;">
+                  <button type="button" id="btnCreateSuper" style="flex:1; padding:10px 12px; border-radius:12px; border:1px solid rgba(28,150,202,.35); background: rgba(28,150,202,.10); color:#0f172a; font-weight:700; cursor:pointer;">+ Create</button>
+                  <button type="button" id="btnDeleteSuper" style="flex:1; padding:10px 12px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:700; cursor:pointer;">− Delete</button>
+                </div>
+                {% endif %}
                 <div style="
                     font-size: 12px;
                     color: #8894a8;
@@ -189,13 +231,41 @@
 </div>
 
 <!-- Selection logic: calls /meta/supers and /meta/super -->
+
+<!-- Create/Delete SuperTable Modal -->
+<div id="superModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:9999; align-items:center; justify-content:center; padding:16px;">
+  <div style="width: min(560px, 100%); background:#fff; border-radius:16px; border:1px solid rgba(15,23,42,.12); box-shadow: 0 18px 45px rgba(15,23,42,.25); overflow:hidden;">
+    <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 16px; background:linear-gradient(180deg, rgba(28,150,202,.10), rgba(28,150,202,.03));">
+      <div style="font-weight:800; color:#0f172a;" id="superModalTitle">Action</div>
+      <button type="button" id="superModalClose" style="border:0; background:transparent; font-size:18px; cursor:pointer; color:#334155;">✕</button>
+    </div>
+    <div style="padding:16px;">
+      <div style="font-size:13px; color:#64748b; margin-bottom:10px;" id="superModalHint"></div>
+      <label style="display:block; font-size:12px; font-weight:700; color:#334155; margin-bottom:8px;" for="superNameInput">SuperTable name</label>
+      <input id="superNameInput" type="text" placeholder="e.g. example" style="width:100%; padding:12px 12px; border-radius:12px; border:1px solid rgba(15,23,42,.15); outline:none; font-size:14px;">
+      <div style="display:flex; gap:10px; margin-top:14px;">
+        <button type="button" id="superModalPrimary" style="flex:1; padding:12px 12px; border-radius:12px; border:0; background:#1c96ca; color:#fff; font-weight:800; cursor:pointer;">Confirm</button>
+        <button type="button" id="superModalCancel" style="flex:1; padding:12px 12px; border-radius:12px; border:1px solid rgba(15,23,42,.15); background:#fff; color:#0f172a; font-weight:800; cursor:pointer;">Cancel</button>
+      </div>
+      <div style="margin-top:12px; font-size:12px; color:#ef4444; display:none;" id="superModalError"></div>
+      <div style="margin-top:10px; font-size:12px; color:#10b981; display:none;" id="superModalOk"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
-    // TODO: if you want these dynamic, inject them server-side.
-    const ORG_NAME = "kladna-soft";
-    const USER_HASH = "0b85b786b16d195439c0da18fd4478df";
+    // Organization and user hash are injected server-side from the current tenant / selected user.
+    // sel_org comes from the backend tenant resolution; default_user_hash is derived from the first admin user.
+    const ORG_NAME = {{ session_org|default(sel_org|default("", true), true)|tojson }};
+    const USER_HASH = {{ session_user_hash|default(default_user_hash|default("", true), true)|tojson }};
+    const IS_SUPERUSER = {{ session_is_superuser|default(false, true)|tojson }};
 
     const pairSel = document.getElementById("pairSel");
+    let lastSupers = [];
+
+    const btnCreate = document.getElementById("btnCreateSuper");
+    const btnDelete = document.getElementById("btnDeleteSuper");
     const filesEl = document.getElementById("tenantFilesValue");
     const rowsEl = document.getElementById("tenantRowsValue");
     const sizeEl = document.getElementById("tenantSizeValue");
@@ -243,7 +313,7 @@
     async function loadSupers() {
         try {
             const resp = await fetch(
-                "/meta/supers?organization=" + encodeURIComponent(ORG_NAME)
+                "/admin/supers?organization=" + encodeURIComponent(ORG_NAME)
             );
             if (!resp.ok) {
                 throw new Error("Failed to load supers: " + resp.status);
@@ -294,7 +364,7 @@
                 user_hash: USER_HASH
             });
 
-            const resp = await fetch("/meta/super?" + params.toString());
+            const resp = await fetch("/admin/super?" + params.toString());
             if (!resp.ok) {
                 throw new Error("Failed to load super meta: " + resp.status);
             }
@@ -318,5 +388,108 @@
     } else {
         loadSupers();
     }
+
+    function showModal(mode, supersList) {
+        const modal = document.getElementById("superModal");
+        const title = document.getElementById("superModalTitle");
+        const hint = document.getElementById("superModalHint");
+        const input = document.getElementById("superNameInput");
+        const btnPrimary = document.getElementById("superModalPrimary");
+        const btnClose = document.getElementById("superModalClose");
+        const btnCancel = document.getElementById("superModalCancel");
+        const err = document.getElementById("superModalError");
+        const ok = document.getElementById("superModalOk");
+
+        err.style.display = "none";
+        ok.style.display = "none";
+        input.value = "";
+        input.setAttribute("list", "");
+        input.removeAttribute("list");
+
+        if (mode === "create") {
+            title.textContent = "Create SuperTable";
+            hint.textContent = "Enter a new SuperTable name and press Create.";
+            btnPrimary.textContent = "Create";
+        } else {
+            title.textContent = "Delete SuperTable";
+            hint.textContent = "Type an existing SuperTable name (autocomplete) and press Delete.";
+            btnPrimary.textContent = "Delete";
+        }
+
+        // datalist for delete autocomplete
+        let dl = document.getElementById("superNameDatalist");
+        if (!dl) {
+            dl = document.createElement("datalist");
+            dl.id = "superNameDatalist";
+            document.body.appendChild(dl);
+        }
+        dl.innerHTML = "";
+        (supersList || []).forEach(s => {
+            const opt = document.createElement("option");
+            opt.value = s;
+            dl.appendChild(opt);
+        });
+        if (mode === "delete") {
+            input.setAttribute("list", "superNameDatalist");
+        }
+
+        function close() {
+            modal.style.display = "none";
+            modal.style.alignItems = "";
+            modal.style.justifyContent = "";
+        }
+
+        btnClose.onclick = close;
+        btnCancel.onclick = close;
+        modal.onclick = (e) => { if (e.target === modal) close(); };
+
+        btnPrimary.onclick = async () => {
+            err.style.display = "none";
+            ok.style.display = "none";
+            const name = (input.value || "").trim();
+            if (!name) {
+                err.textContent = "SuperTable name is required.";
+                err.style.display = "";
+                return;
+            }
+
+            try {
+                if (mode === "create") {
+                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}`;
+                    const res = await fetch(url, { method: "POST" });
+                    const js = await res.json();
+                    if (!js || !js.ok) throw new Error((js && js.detail) || "Create failed");
+                    ok.textContent = `Created: ${js.name || name}`;
+                    ok.style.display = "";
+                } else {
+                    // validate exists
+                    if (!Array.isArray(supersList) || !supersList.includes(name)) {
+                        err.textContent = "Please choose an existing SuperTable name.";
+                        err.style.display = "";
+                        return;
+                    }
+                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}&user_hash=${encodeURIComponent(USER_HASH)}`;
+                    const res = await fetch(url, { method: "DELETE" });
+                    const js = await res.json();
+                    if (!js || !js.ok) throw new Error((js && js.detail) || "Delete failed");
+                    ok.textContent = `Deleted: ${js.name || name}`;
+                    ok.style.display = "";
+                }
+
+                // refresh list
+                await loadSupers();
+                close();
+            } catch (e) {
+                err.textContent = e && e.message ? e.message : "Operation failed.";
+                err.style.display = "";
+            }
+        };
+
+        modal.style.display = "flex";
+        modal.style.alignItems = "center";
+        modal.style.justifyContent = "center";
+        setTimeout(() => input.focus(), 50);
+    }
+
 })();
 </script>
