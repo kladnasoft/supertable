@@ -40,6 +40,37 @@ def clean_sql_query(query):
     return query.strip()
 
 
+_FORBIDDEN_SQL_PATTERNS = [
+    r"\battach\b",
+    r"\bdetach\b",
+    r"\bcopy\b",
+    r"\bexport\b",
+    r"\bimport\b",
+    r"\binstall\b",
+    r"\bload\b",
+    r"\bpragma\b",
+    r"\bcreate\b",
+    r"\bdrop\b",
+    r"\balter\b",
+    r"\binsert\b",
+    r"\bupdate\b",
+    r"\bdelete\b",
+    r"\bgrant\b",
+    r"\brevoke\b",
+]
+
+
+def validate_readonly_sql(query: str) -> None:
+    """Reject multiple statements and common non-readonly operations."""
+    # Single statement only.
+    if ";" in query:
+        raise ValueError("Only single-statement SELECT/WITH queries are allowed")
+    ql = query.lower()
+    for pat in _FORBIDDEN_SQL_PATTERNS:
+        if re.search(pat, ql, flags=re.IGNORECASE):
+            raise ValueError("Query contains a forbidden operation")
+
+
 def apply_limit_safely(query: str, max_rows: int) -> str:
     """
     Ensures the query has a proper LIMIT clause no larger than max_rows + 1.
@@ -96,6 +127,11 @@ def execute(request):
                     'status': 'error',
                     'message': 'Only SELECT or WITH (CTE) queries are allowed'
                 }, status=400)
+
+            try:
+                validate_readonly_sql(query)
+            except Exception as e:
+                return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
             profile = get_profile(request)
             user_hash = get_user_hash(super_name, profile.organization, str(profile.user))

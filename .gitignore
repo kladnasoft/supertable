@@ -48,3 +48,15 @@ ENV/
 *.bak
 
 TOKEN
+/.venv-test/lib64/
+/.venv-testpypi/lib64/
+/.venv-test/bin/python
+/.venv-testpypi/bin/python
+/.venv-test/bin/python3
+/.venv-testpypi/bin/python3
+/.venv-test/bin/python3.10
+/.venv-testpypi/bin/python3.10
+/.venv-test/pyvenv.cfg
+/.venv-testpypi/pyvenv.cfg
+/.venv-test/lib64/
+/.venv-testpypi/lib64/

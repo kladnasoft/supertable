@@ -542,9 +542,8 @@
 
     // --- SuperTable metadata (same pattern as tables.html) ---
     const META_BASE = 'http://0.0.0.0:8080';
-    // Organization + user_hash must be per-login (session cookie). No hardcoded tenants.
-    const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
-    const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
+    const ORGANIZATION = 'kladna-soft';
+    const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
 
     let currentSuper = null;
     let timingsChart = null; // NEW: Global variable for Chart.js instance
@@ -1005,14 +1004,16 @@
       if (!organization || !superName || !userHash) return;
 
       try {
-        // 1) list tables in the selected SuperTable
-        const tablesResp = await api(
+        // 1) list tables in the selected SuperTable (use /admin/super meta; do NOT use /meta/tables)
+        const superResp = await api(
           META_BASE +
-          '/meta/tables?organization=' + encodeURIComponent(organization) +
-          '&super_name=' + encodeURIComponent(superName)
+          '/admin/super?organization=' + encodeURIComponent(organization) +
+          '&super_name=' + encodeURIComponent(superName) +
+          '&user_hash=' + encodeURIComponent(userHash)
         );
-        const tables = (tablesResp && Array.isArray(tablesResp.tables))
-          ? tablesResp.tables
+        const superMeta = superResp && superResp.meta && superResp.meta.super ? superResp.meta.super : null;
+        const tables = (superMeta && Array.isArray(superMeta.tables))
+          ? superMeta.tables.map(t => (t && t.name) ? String(t.name) : '').filter(Boolean)
           : [];
 
         const hint = {};

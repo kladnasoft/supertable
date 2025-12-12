@@ -109,6 +109,7 @@ if not _re.fullmatch(r"[0-9a-fA-F]{16,128}", settings.SUPERTABLE_SUPERHASH or ""
 
 _SESSION_COOKIE_NAME = "st_session"
 _ADMIN_COOKIE_NAME = "st_admin_token"
+_SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 def _session_secret() -> bytes:
     if settings.SUPERTABLE_SESSION_SECRET:
@@ -146,7 +147,17 @@ def _decode_session(value: str) -> Optional[Dict[str, Any]]:
         if not hmac.compare_digest(expected, b64_sig):
             return None
         data = json.loads(payload.decode("utf-8"))
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # Enforce server-side expiry in addition to cookie max-age.
+        exp = data.get("exp")
+        if exp is not None:
+            try:
+                if int(exp) < int(time.time()):
+                    return None
+            except Exception:
+                return None
+        return data
     except Exception:
         return None
 
@@ -156,13 +167,16 @@ def get_session(request: Request) -> Optional[Dict[str, Any]]:
 
 
 def _set_session_cookie(resp: Response, data: Dict[str, Any]) -> None:
+    # Ensure an expiry exists to prevent indefinite replay if the cookie is copied.
+    data = dict(data)
+    data.setdefault("exp", int(time.time()) + _SESSION_MAX_AGE_SECONDS)
     resp.set_cookie(
         _SESSION_COOKIE_NAME,
         _encode_session(data),
         httponly=True,
         samesite="lax",
         secure=settings.SECURE_COOKIES,
-        max_age=7 * 24 * 3600,
+        max_age=_SESSION_MAX_AGE_SECONDS,
         path="/",
     )
 
@@ -181,7 +195,8 @@ def is_superuser(request: Request) -> bool:
     if sess.get("is_superuser") is True:
         return True
     tok = (request.cookies.get(_ADMIN_COOKIE_NAME) or "").strip()
-    return bool(tok and tok == _required_token())
+    required = _required_token()
+    return bool(tok and required and hmac.compare_digest(tok, required))
 
 
 def session_context(request: Request) -> Dict[str, Any]:
@@ -541,6 +556,20 @@ def _no_store(resp: Response):
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
+    _security_headers(resp)
+
+
+def _security_headers(resp: Response) -> None:
+    # Keep this strict-but-compatible (the UI uses inline styles/scripts).
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline' https:; connect-src 'self' https:; font-src 'self' data: https:; base-uri 'self'; frame-ancestors 'none'",
+    )
 
 
 def _render_login(request: Request, message: Optional[str] = None, clear_cookie: bool = False) -> HTMLResponse:
@@ -554,14 +583,21 @@ def _render_login(request: Request, message: Optional[str] = None, clear_cookie:
     if clear_cookie:
         resp.delete_cookie("st_admin_token", path="/")
     _no_store(resp)
+    _security_headers(resp)
     return resp
 
 
-def admin_guard_api(request: Request):
+def logged_in_guard_api(request: Request):
     if _is_authorized(request):
         return True
-    # For API calls, we keep a JSON 401
-    raise HTTPException(status_code=401, detail="Invalid or missing admin token")
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def admin_guard_api(request: Request):
+    # Admin-only (superuser) guard for any privileged operations.
+    if _is_authorized(request) and is_superuser(request):
+        return True
+    raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # ------------------------------ Users/Roles readers ------------------------------
@@ -711,13 +747,13 @@ def healthz():
 # -------- JSON API (read-only) --------
 
 @router.get("/api/tenants")
-def api_tenants():
+def api_tenants(_: Any = Depends(logged_in_guard_api)):
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
 @router.get("/api/root")
-def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
+def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
         return {"org": org, "sup": sup, "root": None}
@@ -734,7 +770,7 @@ def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(No
 
 
 @router.get("/api/mirrors")
-def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
+def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
         return {"org": org, "sup": sup, "formats": []}
@@ -752,6 +788,7 @@ def api_list_leaves(
         q: Optional[str] = Query(None),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=500),
+        _: Any = Depends(logged_in_guard_api),
 ):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -810,7 +847,7 @@ def api_list_leaves(
 
 
 @router.get("/api/leaf/{simple}")
-def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
+def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
         raise HTTPException(404, "Tenant not found")
@@ -906,6 +943,18 @@ def _is_sensitive_env_key(key: str) -> bool:
     return any(part in up for part in _SENSITIVE_KEY_PARTS)
 
 
+_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+
+
+def _mask_secret(value: str) -> str:
+    v = str(value or "")
+    if not v:
+        return ""
+    if len(v) <= 4:
+        return "****"
+    return "****" + v[-4:]
+
+
 @router.get("/admin/env")
 def admin_env_get(_=Depends(admin_guard_api)):
     """
@@ -932,11 +981,12 @@ def admin_env_get(_=Depends(admin_guard_api)):
         for k, v in values.items():
             # dotenv_values may return None for some entries
             val = "" if v is None else str(v)
+            is_sensitive = _is_sensitive_env_key(k)
             items.append(
                 {
                     "key": k,
-                    "value": val,
-                    "is_sensitive": _is_sensitive_env_key(k),
+                    "value": _mask_secret(val) if is_sensitive else val,
+                    "is_sensitive": is_sensitive,
                 }
             )
 
@@ -974,11 +1024,19 @@ def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_
         if not isinstance(item, dict):
             continue
         key = str(item.get("key") or "").strip()
+        if not key or not _ENV_KEY_RE.fullmatch(key):
+            continue
         if not key:
             continue
         value = item.get("value", "")
+        # Prevent newline injection / file corruption.
+        value_str = str(value)
+        if "\n" in value_str or "\r" in value_str:
+            raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
+        if len(value_str) > 8192:
+            raise HTTPException(status_code=400, detail=f"Value too long for {key}")
         # Cast to str and avoid auto-quoting to preserve readability
-        set_key(str(env_path), key, str(value), quote_mode="never")
+        set_key(str(env_path), key, value_str, quote_mode="never")
 
     return {"ok": True, "path": str(env_path)}
 
@@ -1011,7 +1069,7 @@ def admin_login(
     if mode == "super":
         required = _required_token()
         provided = (supertoken or "").strip()
-        if not provided or provided != required:
+        if not provided or not required or not hmac.compare_digest(provided, required):
             return _render_login(request, message="Invalid superuser token.", clear_cookie=True)
 
         username_eff = "superuser"
@@ -1157,7 +1215,7 @@ def api_delete_token(
 
 @router.get("/admin/config", response_class=HTMLResponse)
 def admin_config(request: Request):
-    if not _is_authorized(request):
+    if not (_is_authorized(request) and is_superuser(request)):
         resp = RedirectResponse("/admin/login", status_code=302)
         _no_store(resp)
         return resp
@@ -1202,12 +1260,22 @@ def admin_config(request: Request):
     effective = _effective_settings()
 
     all_keys = sorted(set(list(dotenv_vars.keys()) + list(effective.keys())))
-    rows = [{
-        "key": k,
-        "env_val": dotenv_vars.get(k),
-        "eff_val": effective.get(k),
-        "is_sensitive": any(x in k.lower() for x in ("pass", "token", "secret", "key")),
-    } for k in all_keys]
+    rows = []
+    for k in all_keys:
+        is_sensitive = any(x in k.lower() for x in ("pass", "token", "secret", "key"))
+        env_val = dotenv_vars.get(k)
+        eff_val = effective.get(k)
+        if is_sensitive:
+            env_val = _mask_secret(env_val or "") if env_val is not None else None
+            eff_val = _mask_secret(eff_val or "") if eff_val is not None else None
+        rows.append(
+            {
+                "key": k,
+                "env_val": env_val,
+                "eff_val": eff_val,
+                "is_sensitive": is_sensitive,
+            }
+        )
 
     # Render (same templates as before)
     ctx = {
