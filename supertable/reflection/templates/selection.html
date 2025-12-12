@@ -32,7 +32,7 @@
             <span style="color:#94a3b8;">•</span>
             <span>Org:</span> <strong style="color:#0f172a;">{{ session_org }}</strong>
           </div>
-          <div style="color:#64748b;">
+          <div style="display:inline-flex;align-items:center;gap:12px;color:#64748b;">
             {% if session_is_superuser %}
               <span style="display:inline-flex;align-items:center;gap:6px;">
                 <span style="width:8px;height:8px;border-radius:999px;background:#10b981;display:inline-block;"></span>
@@ -75,7 +75,9 @@
 
                 <div style="display:grid; grid-template-columns:42px 1fr 42px; gap:10px; align-items:center;">
                   <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
-                    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">−</button>
+                    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background:transparent; color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;"
+                    onmouseover="this.style.background='rgba(239,68,68,.08)'"
+                    onmouseout="this.style.background='transparent'">−</button>
 
                   <select id="pairSel" onchange="onPairChange()" style="
                         width: 100%;
@@ -93,7 +95,9 @@
                   </select>
 
                   <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
-                    style="width:42px; height:42px; border-radius:12px; border:0; background:#1c96ca; color:#fff; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">+</button>
+                    style="width:42px; height:42px; border-radius:12px; border:1px solid #b1dbec; background:transparent; color:#1c96ca; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;"
+                    onmouseover="this.style.background='#b1dbec'"
+                    onmouseout="this.style.background='transparent'">+</button>
 
                   <div style="
                         grid-column: 2;
@@ -146,7 +150,7 @@
 
                     <!-- ROWS -->
                     <div class="metric-card-themed" style="
-                        background-color: #ffffff;
+                        background-color: #f5faff;
                         border: 1px solid #d0d7e7;
                         border-radius: 8px;
                         padding: 15px;

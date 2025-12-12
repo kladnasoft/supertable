@@ -417,12 +417,12 @@
     }
 
     // Mirrors & detail viewers use the selected super from selection.html (pairSel)
-    // and a fixed organization = "kladna-soft".
+    // and a fixed organization.
     async function toggleMirror(fmt, el) {
       const enable = el.checked;
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
-      const org = 'kladna-soft';
+      const org = (window.__org || '');
 
       const ep = enable ? '/api/mirrors/enable' : '/api/mirrors/disable';
       await api(
@@ -435,7 +435,7 @@
     async function viewUser(hash) {
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
-      const org = 'kladna-soft';
+      const org = (window.__org || '');
       const data = await api(`/api/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('User '+hash, JSON.stringify(data, null, 2));
     }
@@ -443,7 +443,7 @@
     async function viewRole(hash) {
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
-      const org = 'kladna-soft';
+      const org = (window.__org || '');
       const data = await api(`/api/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Role '+hash, JSON.stringify(data, null, 2));
     }
@@ -451,7 +451,7 @@
     async function viewMirror(hash) {
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
-      const org = 'kladna-soft';
+      const org = (window.__org || '');
       const data = await api(`/api/mirror/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Mirror '+hash, JSON.stringify(data, null, 2));
     }
@@ -660,7 +660,7 @@
       if (!body) return;
       body.innerHTML = '<tr><td colspan="4" class="muted">Loading…</td></tr>';
       try {
-        const org = window.__org || 'kladna-soft';
+        const org = window.__org || '';
         const data = await api(`/api/tokens?org=${encodeURIComponent(org)}`);
         const tokens = (data && data.tokens) || [];
         if (!tokens.length) {
@@ -699,7 +699,7 @@
       showModal('Create Login Token', html, async () => {
         const labelEl = document.getElementById('tokenLabel');
         const label = labelEl ? labelEl.value : '';
-        const org = window.__org || 'kladna-soft';
+        const org = window.__org || '';
         const res = await api(`/api/tokens?org=${encodeURIComponent(org)}&label=${encodeURIComponent(label || '')}`, {
           method: 'POST'
         });
@@ -718,7 +718,7 @@
 
     async function deleteToken(tokenId) {
       if (!tokenId) return;
-      const org = window.__org || 'kladna-soft';
+      const org = window.__org || '';
       if (!confirm('Delete token ' + tokenId + '?')) return;
       await api(`/api/tokens/${encodeURIComponent(tokenId)}?org=${encodeURIComponent(org)}`, { method: 'DELETE' });
       await loadTokens();
@@ -780,7 +780,7 @@ function switchTab(id) {
 
     $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
-      window.__org = {{ session_org|default(sel_org|default("kladna-soft", true), true)|tojson }};
+      window.__org = {{ session_org|default(sel_org|default("", true), true)|tojson }};
 
       $("#toggleSidebar").on("click", function() {
         $("#sidebar").toggleClass("sidebar-collapsed");

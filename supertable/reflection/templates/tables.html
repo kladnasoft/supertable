@@ -773,8 +773,9 @@
     }
 
     const META_BASE = 'http://0.0.0.0:8080';
-    const ORGANIZATION = 'kladna-soft';
-    const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
+    // Organization + user_hash must be per-login (session cookie). No hardcoded tenants.
+    const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
+    const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
 
     let currentSuper = null;
     let currentStatsResources = [];
