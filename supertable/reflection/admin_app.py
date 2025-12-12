@@ -60,9 +60,9 @@ class Settings:
 
         # 1 = only superuser can login, 2 = only regular users can login, 3 = both
         try:
-            self.SUPERTABLE_LOGIN_MASK: int = int((os.getenv("SUPERTABLE_LOGIN_MASK", "3") or "3").strip())
+            self.SUPERTABLE_LOGIN_MASK: int = int((os.getenv("SUPERTABLE_LOGIN_MASK", "1") or "1").strip())
         except ValueError:
-            self.SUPERTABLE_LOGIN_MASK = 3
+            self.SUPERTABLE_LOGIN_MASK = 1
 
         self.DOTENV_PATH: str = os.getenv("DOTENV_PATH", ".env")
 
