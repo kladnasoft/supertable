@@ -369,6 +369,8 @@
       </form>
 
       <script>
+        const LOGIN_MASK = {{ SUPERTABLE_LOGIN_MASK|default(3, true)|tojson }};
+
         (function() {
           const btnUser = document.getElementById('btnUser');
           const btnSuper = document.getElementById('btnSuper');
@@ -395,8 +397,21 @@
             }
           }
 
-          btnUser.addEventListener('click', () => setMode('user'));
-          btnSuper.addEventListener('click', () => setMode('super'));
+          // ---------- APPLY LOGIN MASK ----------
+          // 1 = superuser only, 2 = user only, 3 = both
+          if (LOGIN_MASK === 1) {
+            // Superuser only
+            if (btnUser) btnUser.style.display = 'none';
+            setMode('super');
+          } else if (LOGIN_MASK === 2) {
+            // User only
+            if (btnSuper) btnSuper.style.display = 'none';
+            setMode('user');
+          } else {
+            // Both
+            btnUser.addEventListener('click', () => setMode('user'));
+            btnSuper.addEventListener('click', () => setMode('super'));
+          }
         })();
       </script>
 

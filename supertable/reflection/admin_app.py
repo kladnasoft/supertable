@@ -44,6 +44,8 @@ class Settings:
         # SUPERTABLE_* — as requested
         self.SUPERTABLE_ORGANIZATION: str = os.getenv("SUPERTABLE_ORGANIZATION", "").strip()
         self.SUPERTABLE_SUPERTOKEN: str = os.getenv("SUPERTABLE_SUPERTOKEN", "").strip()
+        # Expected user_hash for the superuser (must match the underlying SuperTable user registry)
+        self.SUPERTABLE_SUPERHASH: str = os.getenv("SUPERTABLE_SUPERHASH", "").strip()
         self.SUPERTABLE_SESSION_SECRET: str = os.getenv("SUPERTABLE_SESSION_SECRET", "").strip()
 
         self.SUPERTABLE_REDIS_URL: Optional[str] = os.getenv("SUPERTABLE_REDIS_URL")
@@ -55,6 +57,12 @@ class Settings:
         self.SUPERTABLE_REDIS_USERNAME: Optional[str] = os.getenv("SUPERTABLE_REDIS_USERNAME")
 
         self.SUPERTABLE_ADMIN_TOKEN: Optional[str] = os.getenv("SUPERTABLE_ADMIN_TOKEN")
+
+        # 1 = only superuser can login, 2 = only regular users can login, 3 = both
+        try:
+            self.SUPERTABLE_LOGIN_MASK: int = int((os.getenv("SUPERTABLE_LOGIN_MASK", "3") or "3").strip())
+        except ValueError:
+            self.SUPERTABLE_LOGIN_MASK = 3
 
         self.DOTENV_PATH: str = os.getenv("DOTENV_PATH", ".env")
 
@@ -70,6 +78,11 @@ class Settings:
 
 
 settings = Settings()
+if settings.SUPERTABLE_LOGIN_MASK not in (1, 2, 3):
+    raise RuntimeError(
+        f"Invalid SUPERTABLE_LOGIN_MASK (must be 1, 2, or 3): {settings.SUPERTABLE_LOGIN_MASK}"
+    )
+
 
 def _required_token() -> str:
     """Superuser token required for privileged admin actions."""
@@ -82,6 +95,10 @@ if not (settings.SUPERTABLE_SUPERTOKEN or "").strip():
     _missing_envs.append("SUPERTABLE_SUPERTOKEN")
 if _missing_envs:
     raise RuntimeError("Missing required environment variables: " + ", ".join(_missing_envs))
+
+import re as _re
+if not _re.fullmatch(r"[0-9a-fA-F]{16,128}", settings.SUPERTABLE_SUPERHASH or ""):
+    raise RuntimeError("Invalid SUPERTABLE_SUPERHASH (expected hex string)")
 
 
 
@@ -501,7 +518,11 @@ def _no_store(resp: Response):
 
 
 def _render_login(request: Request, message: Optional[str] = None, clear_cookie: bool = False) -> HTMLResponse:
-    ctx = {"request": request, "message": message or ""}
+    ctx = {
+        "request": request,
+        "message": message or "",
+        "SUPERTABLE_LOGIN_MASK": settings.SUPERTABLE_LOGIN_MASK,
+    }
     resp = templates.TemplateResponse("login.html", ctx, status_code=200)
     if clear_cookie:
         resp.delete_cookie("st_admin_token", path="/")
@@ -954,6 +975,12 @@ def admin_login(
     mode = (mode or "").strip().lower()
     username = (username or "").strip()
 
+    # Enforce login mask (1=superuser only, 2=regular users only, 3=both)
+    if settings.SUPERTABLE_LOGIN_MASK == 1 and mode != "super":
+        return _render_login(request, message="Login is restricted to superuser only.", clear_cookie=True)
+    if settings.SUPERTABLE_LOGIN_MASK == 2 and mode == "super":
+        return _render_login(request, message="Login is restricted to regular users only.", clear_cookie=True)
+
     if mode == "super":
         required = _required_token()
         provided = (supertoken or "").strip()
@@ -961,7 +988,7 @@ def admin_login(
             return _render_login(request, message="Invalid superuser token.", clear_cookie=True)
 
         username_eff = "superuser"
-        user_hash = _user_hash(org, username_eff)
+        user_hash = settings.SUPERTABLE_SUPERHASH
 
         resp = RedirectResponse(url="/admin", status_code=302)
         resp.set_cookie(

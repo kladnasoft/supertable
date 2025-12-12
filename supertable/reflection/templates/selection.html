@@ -45,6 +45,23 @@
               </span>
             {% endif %}
           </div>
+
+          <a href="/admin/logout" title="Logout" style="
+              display:inline-flex;
+              align-items:center;
+              gap:8px;
+              padding:8px 12px;
+              border-radius:999px;
+              border:1px solid rgba(15,23,42,.10);
+              background:#ffffff;
+              color:#334155;
+              text-decoration:none;
+              font-weight:700;
+          ">
+            <i class="fas fa-sign-out-alt" style="color:#1c96ca;"></i>
+            <span style="font-size:12px;">Logout</span>
+          </a>
+
         </div>
         {% endif %}
 
@@ -62,7 +79,10 @@
                     margin-bottom: 8px;
                     font-weight: 600;
                 ">Select SuperTable</label>
-                <select id="pairSel" onchange="onPairChange()" style="
+                <div style="display:flex; align-items:center; gap:10px;">
+  <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
+    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">−</button>
+  <select id="pairSel" onchange="onPairChange()" style="
                     width: 100%;
                     padding: 10px 12px;
                     border: 1px solid #d0d7e7;
@@ -76,13 +96,10 @@
                     background-position: right 10px center;
                 ">
                 </select>
-                {% if session_is_superuser %}
-                <div style="display:flex; gap:10px; margin-top:12px;">
-                  <button type="button" id="btnCreateSuper" style="flex:1; padding:10px 12px; border-radius:12px; border:1px solid rgba(28,150,202,.35); background: rgba(28,150,202,.10); color:#0f172a; font-weight:700; cursor:pointer;">+ Create</button>
-                  <button type="button" id="btnDeleteSuper" style="flex:1; padding:10px 12px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:700; cursor:pointer;">− Delete</button>
-                </div>
-                {% endif %}
-                <div style="
+  <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
+    style="width:42px; height:42px; border-radius:12px; border:0; background:#1c96ca; color:#fff; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">+</button>
+</div>
+<div style="
                     font-size: 12px;
                     color: #8894a8;
                     margin-top: 10px;
@@ -263,10 +280,9 @@
 
     const pairSel = document.getElementById("pairSel");
     let lastSupers = [];
-
-    const btnCreate = document.getElementById("btnCreateSuper");
-    const btnDelete = document.getElementById("btnDeleteSuper");
-    const filesEl = document.getElementById("tenantFilesValue");
+    const btnCreateInline = document.getElementById("btnCreateSuperInline");
+    const btnDeleteInline = document.getElementById("btnDeleteSuperInline");
+const filesEl = document.getElementById("tenantFilesValue");
     const rowsEl = document.getElementById("tenantRowsValue");
     const sizeEl = document.getElementById("tenantSizeValue");
     const versionEl = document.getElementById("tenantVersionValue");
@@ -320,6 +336,7 @@
             }
             const data = await resp.json();
             const supers = (data && data.supers) || [];
+            lastSupers = supers;
 
             pairSel.innerHTML = "";
 
@@ -389,7 +406,7 @@
         loadSupers();
     }
 
-    function showModal(mode, supersList) {
+    function showModal(mode, supersList, selectedName) {
         const modal = document.getElementById("superModal");
         const title = document.getElementById("superModalTitle");
         const hint = document.getElementById("superModalHint");
@@ -403,6 +420,10 @@
         err.style.display = "none";
         ok.style.display = "none";
         input.value = "";
+        if (mode === "delete" && (selectedName || "").trim()) {
+            input.value = String(selectedName).trim();
+            input.select();
+        }
         input.setAttribute("list", "");
         input.removeAttribute("list");
 
@@ -412,7 +433,10 @@
             btnPrimary.textContent = "Create";
         } else {
             title.textContent = "Delete SuperTable";
-            hint.textContent = "Type an existing SuperTable name (autocomplete) and press Delete.";
+            const sel = (selectedName || "").trim();
+            hint.textContent = sel
+              ? ("Only the selected SuperTable can be deleted. Type \"" + sel + "\" to confirm, then press Delete.")
+              : "Select a SuperTable first, then click − to delete. You must type its name to confirm.";
             btnPrimary.textContent = "Delete";
         }
 
@@ -429,8 +453,9 @@
             opt.value = s;
             dl.appendChild(opt);
         });
+        // For delete: restrict to selectedName; no datalist.
         if (mode === "delete") {
-            input.setAttribute("list", "superNameDatalist");
+            input.removeAttribute("list");
         }
 
         function close() {
@@ -462,13 +487,18 @@
                     ok.textContent = `Created: ${js.name || name}`;
                     ok.style.display = "";
                 } else {
-                    // validate exists
-                    if (!Array.isArray(supersList) || !supersList.includes(name)) {
-                        err.textContent = "Please choose an existing SuperTable name.";
+                    const selected = (selectedName || "").trim();
+                    if (!selected) {
+                        err.textContent = "Select a SuperTable first.";
                         err.style.display = "";
                         return;
                     }
-                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}&user_hash=${encodeURIComponent(USER_HASH)}`;
+                    if (name !== selected) {
+                        err.textContent = "Type the selected SuperTable name exactly to confirm deletion.";
+                        err.style.display = "";
+                        return;
+                    }
+                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(USER_HASH)}`;
                     const res = await fetch(url, { method: "DELETE" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Delete failed");
@@ -489,6 +519,27 @@
         modal.style.alignItems = "center";
         modal.style.justifyContent = "center";
         setTimeout(() => input.focus(), 50);
+    }
+
+
+    // Inline create/delete buttons next to SuperTable selector
+    function setInlineSuperButtonsVisibility() {
+      const show = !!IS_SUPERUSER;
+      if (btnCreateInline) btnCreateInline.style.display = show ? "flex" : "none";
+      if (btnDeleteInline) btnDeleteInline.style.display = show ? "flex" : "none";
+    }
+    setInlineSuperButtonsVisibility();
+
+    if (btnCreateInline) {
+      btnCreateInline.addEventListener("click", () => {
+        showModal("create", Array.isArray(lastSupers) ? lastSupers : [], pairSel ? pairSel.value : "");
+      });
+    }
+
+    if (btnDeleteInline) {
+      btnDeleteInline.addEventListener("click", () => {
+        showModal("delete", Array.isArray(lastSupers) ? lastSupers : [], pairSel ? pairSel.value : "");
+      });
     }
 
 })();

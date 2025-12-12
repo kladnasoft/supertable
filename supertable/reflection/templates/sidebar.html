@@ -307,7 +307,63 @@
     justify-content: center;
     width: 100%;
   }
+
+  /* ------------ Logged-in user display (sidebar footer) ------------ */
+
+  .profile-section-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .profile-left {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .profile-user {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    padding-left: 10px;
+    border-left: 1px solid rgba(208, 215, 231, 0.9);
+    min-width: 0;
+  }
+
+  .profile-user .user-label {
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #64748b;
+    line-height: 1.1;
+  }
+
+  .profile-user .user-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.2;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sidebar-collapsed .profile-user {
+    display: none;
+  }
+
+
+  /* --- selection-only footer --- */
+  .profile-section-inner { justify-content: center; }
 </style>
+
+
 
 <!-- Shared sidebar for SuperTable Admin -->
 <div class="sidebar" id="sidebar">
@@ -337,19 +393,19 @@
   </nav>
 
   <div class="profile-section">
+    
     <div class="profile-section-inner">
-      <!-- kladna Soft logo -->
+      <div style="display:flex; align-items:center; justify-content:center; width:100%;">
+        <!-- kladna Soft logo -->
       <a class="footer-logo-link" href="https://kladnasoft.com/kladnasoft/index/">
         <span class="footer-dna-icon">
           <i class="fas fa-dna"></i>
         </span>
         <span class="footer-brand-text">kladna Soft</span>
       </a>
-      <!-- Logout link -->
-      <a href="/admin/logout" class="text-xs logout-link">
-        <i class="fas fa-sign-out-alt"></i>
-        <span>Logout</span>
-      </a>
+      </div>
+    </div>
+      </div>
     </div>
   </div>
 </div>

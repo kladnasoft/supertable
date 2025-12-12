@@ -722,10 +722,40 @@ function switchTab(id) {
       }
     }
 
-    function showModal(title, body) {
-      document.getElementById('m-title').textContent = title;
-      document.getElementById('m-body').textContent = body;
-      document.getElementById('modal').style.display = 'flex';
+    function showModal(title, bodyHtml, onConfirm, confirmText) {
+      const titleEl = document.getElementById('m-title');
+      const bodyEl = document.getElementById('m-body');
+      const modalEl = document.getElementById('modal');
+      const confirmBtn = document.getElementById('m-confirm');
+
+      titleEl.textContent = title;
+
+      // Render as HTML (callers should use escapeHtml() when injecting untrusted strings)
+      bodyEl.innerHTML = bodyHtml || "";
+
+      // Reset confirm button
+      if (confirmBtn) {
+        confirmBtn.style.display = 'none';
+        confirmBtn.textContent = (confirmText && String(confirmText)) || 'OK';
+
+        // Remove any previous handler safely by cloning
+        const newBtn = confirmBtn.cloneNode(true);
+        confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
+
+        if (typeof onConfirm === 'function') {
+          newBtn.style.display = 'inline-flex';
+          newBtn.onclick = async () => {
+            try {
+              newBtn.disabled = true;
+              await onConfirm();
+            } finally {
+              newBtn.disabled = false;
+            }
+          };
+        }
+      }
+
+      modalEl.style.display = 'flex';
     }
 
     function closeModal() {
@@ -1110,9 +1140,9 @@ function switchTab(id) {
         <div class="panel">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
             <h3 id="m-title" style="margin:0; font-size:16px;"></h3>
-            <button class="btn-ghost" onclick="closeModal()">Close</button>
+            <div style="display:flex; gap:8px; align-items:center;"><button id="m-confirm" class="btn-primary" style="display:none;" type="button">OK</button><button class="btn-ghost" onclick="closeModal()">Close</button></div>
           </div>
-          <pre id="m-body" class="mt-2" style="max-height:60vh; overflow:auto;"></pre>
+          <div id="m-body" class="mt-2" style="max-height:60vh; overflow:auto;"></div>
         </div>
       </div>
 
