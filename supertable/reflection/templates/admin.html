@@ -403,6 +403,19 @@
         .replace(/>/g, '&gt;');
     }
 
+
+    function escapeJs(str) {
+      if (str === null || str === undefined) return '';
+      // Safe for single-quoted JS strings in inline onclick handlers.
+      return String(str)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+    }
+
     // Mirrors & detail viewers use the selected super from selection.html (pairSel)
     // and a fixed organization = "kladna-soft".
     async function toggleMirror(fmt, el) {
@@ -720,6 +733,9 @@ function switchTab(id) {
       if (id === 'config') {
         loadEnvConfig();
       }
+      if (id === 'tokens') {
+        loadTokens();
+      }
     }
 
     function showModal(title, bodyHtml, onConfirm, confirmText) {
@@ -764,6 +780,7 @@ function switchTab(id) {
 
     $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
+      window.__org = {{ session_org|default(sel_org|default("kladna-soft", true), true)|tojson }};
 
       $("#toggleSidebar").on("click", function() {
         $("#sidebar").toggleClass("sidebar-collapsed");
@@ -1027,7 +1044,7 @@ function switchTab(id) {
 
       
       <!-- TOKENS TAB -->
-      <div id="pane-tokens" class="tabpane" style="display:none;">
+      <div id="pane-tokens" class="tabpane hidden">
         <div class="card mt-4">
           <div class="section">
             <div class="d-flex align-items-center justify-content-between">

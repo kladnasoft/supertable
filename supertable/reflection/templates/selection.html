@@ -72,39 +72,39 @@
         ">
             <!-- LEFT: SuperTable selector -->
             <div style="flex-shrink: 0; min-width: 300px;">
-                <label style="
-                    display: block;
-                    font-size: 14px;
-                    color: #475569;
-                    margin-bottom: 8px;
-                    font-weight: 600;
-                ">Select SuperTable</label>
-                <div style="display:flex; align-items:center; gap:10px;">
-  <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
-    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">−</button>
-  <select id="pairSel" onchange="onPairChange()" style="
-                    width: 100%;
-                    padding: 10px 12px;
-                    border: 1px solid #d0d7e7;
-                    border-radius: 8px;
-                    font-size: 16px;
-                    background-color: #ffffff;
-                    cursor: pointer;
-                    appearance: none;
-                    background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fsvg%3E');
-                    background-repeat: no-repeat;
-                    background-position: right 10px center;
-                ">
-                </select>
-  <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
-    style="width:42px; height:42px; border-radius:12px; border:0; background:#1c96ca; color:#fff; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">+</button>
-</div>
-<div style="
-                    font-size: 12px;
-                    color: #8894a8;
-                    margin-top: 10px;
-                ">
-                    Select a SuperTable to view its aggregated data metrics.
+
+                <div style="display:grid; grid-template-columns:42px 1fr 42px; gap:10px; align-items:center;">
+                  <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
+                    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background: rgba(239,68,68,.08); color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">−</button>
+
+                  <select id="pairSel" onchange="onPairChange()" style="
+                        width: 100%;
+                        padding: 10px 12px;
+                        border: 1px solid #d0d7e7;
+                        border-radius: 8px;
+                        font-size: 16px;
+                        background-color: #ffffff;
+                        cursor: pointer;
+                        appearance: none;
+                        background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fsvg%3E');
+                        background-repeat: no-repeat;
+                        background-position: right 10px center;
+                    ">
+                  </select>
+
+                  <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
+                    style="width:42px; height:42px; border-radius:12px; border:0; background:#1c96ca; color:#fff; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;">+</button>
+
+                  <div style="
+                        grid-column: 2;
+                        margin-top: 6px;
+                        text-align: center;
+                        font-size: 13px;
+                        color: #475569;
+                    ">
+                      Last updated:
+                      <span id="tenantUpdatedValue" style="font-weight: 600; color: #34475e;">n/a</span>
+                  </div>
                 </div>
             </div>
 
@@ -228,20 +228,7 @@
                         </div>
                     </div>
                 </div>
-
-                <div class="tenant-updated" style="
-                    margin-top: 15px;
-                    text-align: right;
-                    font-size: 13px;
-                    color: #475569;
-                ">
-                    Last updated:
-                    <span id="tenantUpdatedValue" style="
-                        font-weight: 600;
-                        color: #34475e;
-                    ">n/a</span>
-                </div>
-            </div>
+</div>
 
         </div>
     </div>

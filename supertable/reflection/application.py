@@ -15,9 +15,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # include the two modules' routers (no circular imports)
 from supertable.reflection.admin_app import router as admin_router
 from supertable.reflection.api_app import router as api_router
-from supertable.reflection.selection import router as selection_router
 
-app.include_router(selection_router)
 app.include_router(admin_router)
 app.include_router(api_router)
 

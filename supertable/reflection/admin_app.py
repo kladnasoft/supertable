@@ -184,6 +184,32 @@ def is_superuser(request: Request) -> bool:
     return bool(tok and tok == _required_token())
 
 
+def session_context(request: Request) -> Dict[str, Any]:
+    """Return template-safe session values (always present keys)."""
+    sess = get_session(request) or {}
+    return {
+        "session_username": (sess.get("username") or "").strip(),
+        "session_org": (sess.get("org") or "").strip(),
+        "session_user_hash": (sess.get("user_hash") or "").strip(),
+        "session_is_superuser": bool(sess.get("is_superuser") is True) or is_superuser(request),
+        "session_logged_in": bool(sess.get("org") and sess.get("username") and sess.get("user_hash")),
+    }
+
+
+def inject_session_into_ctx(ctx: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    """Mutates and returns ctx with session_* keys for Jinja templates."""
+    try:
+        ctx.update(session_context(request))
+    except Exception:
+        # Never fail template rendering due to session issues
+        ctx.setdefault("session_username", "")
+        ctx.setdefault("session_org", "")
+        ctx.setdefault("session_user_hash", "")
+        ctx.setdefault("session_is_superuser", False)
+        ctx.setdefault("session_logged_in", False)
+    return ctx
+
+
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -523,6 +549,7 @@ def _render_login(request: Request, message: Optional[str] = None, clear_cookie:
         "message": message or "",
         "SUPERTABLE_LOGIN_MASK": settings.SUPERTABLE_LOGIN_MASK,
     }
+    inject_session_into_ctx(ctx, request)
     resp = templates.TemplateResponse("login.html", ctx, status_code=200)
     if clear_cookie:
         resp.delete_cookie("st_admin_token", path="/")
@@ -1032,7 +1059,8 @@ def admin_login(
 @router.get("/admin/logout")
 def admin_logout():
     resp = RedirectResponse("/admin/login", status_code=302)
-    resp.delete_cookie("st_admin_token", path="/")
+    resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
+    _clear_session_cookie(resp)
     _no_store(resp)
     return resp
 
@@ -1190,6 +1218,8 @@ def admin_config(request: Request):
         "rows": rows,
     }
 
+    inject_session_into_ctx(ctx, request)
+
     resp = templates.TemplateResponse("config.html", ctx)
     _no_store(resp)
     return resp
@@ -1265,6 +1295,7 @@ def admin_page(
         "roles": roles,
         "default_user_hash": default_user_hash,
     }
+    inject_session_into_ctx(ctx, request)
     resp = templates.TemplateResponse("admin.html", ctx)
     _no_store(resp)
     return resp
@@ -1304,6 +1335,7 @@ def admin_tables_page(
             "sel_sup": sel_sup,
             "has_tenant": False,
         }
+        inject_session_into_ctx(ctx, request)
         resp = templates.TemplateResponse("tables.html", ctx)
         _no_store(resp)
         return resp
@@ -1344,6 +1376,7 @@ def admin_tables_page(
         "total": total,
         "items": items,
     }
+    inject_session_into_ctx(ctx, request)
     resp = templates.TemplateResponse("tables.html", ctx)
     _no_store(resp)
     return resp
@@ -1470,6 +1503,7 @@ def admin_execute_page(
         "initial_leaf": leaf,   # <-- pass through to execute.html if you want
         "default_user_hash": default_user_hash,
     }
+    inject_session_into_ctx(ctx, request)
     resp = templates.TemplateResponse("execute.html", ctx)
     _no_store(resp)
     return resp
@@ -1788,6 +1822,7 @@ def tables_page(
         "root_ts": root_ts,
         "default_user_hash": default_user_hash,
     }
+    inject_session_into_ctx(ctx, request)
     resp = templates.TemplateResponse("tables.html", ctx)
     _no_store(resp)
     return resp
