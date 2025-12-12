@@ -727,6 +727,13 @@ except Exception:
 # ------------------------------ Router + templates ------------------------------
 
 router = APIRouter()
+
+# --- Reflection root redirect (NEW) ---
+@router.get("/reflection", include_in_schema=False)
+async def reflection_root_redirect() -> RedirectResponse:
+    # Keep /reflection landing stable and explicit
+    return RedirectResponse(url="/reflection/admin", status_code=302)
+
 templates = Jinja2Templates(directory=settings.TEMPLATES_DIR)
 
 
@@ -746,12 +753,14 @@ def healthz():
 
 # -------- JSON API (read-only) --------
 
+@router.get("/reflection/api/tenants")
 @router.get("/api/tenants")
 def api_tenants(_: Any = Depends(logged_in_guard_api)):
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
+@router.get("/reflection/api/root")
 @router.get("/api/root")
 def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -769,6 +778,7 @@ def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(No
     return {"org": org, "sup": sup, "root": root}
 
 
+@router.get("/reflection/api/mirrors")
 @router.get("/api/mirrors")
 def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -781,6 +791,7 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
     return {"org": org, "sup": sup, "formats": fmts}
 
 
+@router.get("/reflection/api/leaves")
 @router.get("/api/leaves")
 def api_list_leaves(
         org: Optional[str] = Query(None),
@@ -846,6 +857,7 @@ def api_list_leaves(
     return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
 
 
+@router.get("/reflection/api/leaf/{simple}")
 @router.get("/api/leaf/{simple}")
 def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -860,6 +872,7 @@ def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[st
     return {"org": org, "sup": sup, "simple": simple, "data": obj}
 
 
+@router.get("/reflection/api/users")
 @router.get("/api/users")
 def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -868,6 +881,7 @@ def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"users": list_users(org, sup)}
 
 
+@router.get("/reflection/api/roles")
 @router.get("/api/roles")
 def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -876,6 +890,7 @@ def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"roles": list_roles(org, sup)}
 
 
+@router.get("/reflection/api/user/{user_hash}")
 @router.get("/api/user/{user_hash}")
 def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
@@ -888,6 +903,7 @@ def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Opti
     return {"hash": user_hash, "data": obj}
 
 
+@router.get("/reflection/api/role/{role_hash}")
 @router.get("/api/role/{role_hash}")
 def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
@@ -955,6 +971,7 @@ def _mask_secret(value: str) -> str:
     return "****" + v[-4:]
 
 
+@router.get("/reflection/admin/env")
 @router.get("/admin/env")
 def admin_env_get(_=Depends(admin_guard_api)):
     """
@@ -997,6 +1014,7 @@ def admin_env_get(_=Depends(admin_guard_api)):
     }
 
 
+@router.post("/reflection/admin/env")
 @router.post("/admin/env")
 def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
     """
@@ -1043,11 +1061,15 @@ def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_
 
 # ------------------------------ Admin page & auth routes ------------------------------
 
+@router.get("/reflection/admin/login", response_class=HTMLResponse)
+@router.get("/reflection/login", response_class=HTMLResponse)
 @router.get("/admin/login", response_class=HTMLResponse)
 def admin_login_form(request: Request):
     return _render_login(request, message=None, clear_cookie=True)
 
 
+@router.post("/reflection/admin/login")
+@router.post("/reflection/login")
 @router.post("/admin/login")
 def admin_login(
     request: Request,
@@ -1075,7 +1097,7 @@ def admin_login(
         username_eff = "superuser"
         user_hash = settings.SUPERTABLE_SUPERHASH
 
-        resp = RedirectResponse(url="/admin", status_code=302)
+        resp = RedirectResponse(url="/reflection/admin", status_code=302)
         resp.set_cookie(
             _ADMIN_COOKIE_NAME,
             provided,
@@ -1106,7 +1128,7 @@ def admin_login(
         return _render_login(request, message="Invalid token.", clear_cookie=True)
 
     user_hash = _user_hash(org, username)
-    resp = RedirectResponse(url="/admin", status_code=302)
+    resp = RedirectResponse(url="/reflection/admin", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _set_session_cookie(resp, {"org": org, "username": username, "user_hash": user_hash, "is_superuser": False})
@@ -1114,9 +1136,11 @@ def admin_login(
     return resp
 
 
+@router.get("/reflection/admin/logout")
+@router.get("/reflection/logout")
 @router.get("/admin/logout")
 def admin_logout():
-    resp = RedirectResponse("/admin/login", status_code=302)
+    resp = RedirectResponse("/reflection/login", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _no_store(resp)
@@ -1170,6 +1194,7 @@ def _effective_settings() -> Dict[str, str]:
 
 
 
+@router.get("/reflection/api/tokens")
 @router.get("/api/tokens")
 def api_list_tokens(
     request: Request,
@@ -1183,6 +1208,7 @@ def api_list_tokens(
     return {"ok": True, "organization": org_eff, "tokens": tokens}
 
 
+@router.post("/reflection/api/tokens")
 @router.post("/api/tokens")
 def api_create_token(
     request: Request,
@@ -1213,10 +1239,11 @@ def api_delete_token(
     return {"ok": True, "organization": org_eff, "token_id": token_id}
 
 
+@router.get("/reflection/admin/config")
 @router.get("/admin/config", response_class=HTMLResponse)
 def admin_config(request: Request):
     if not (_is_authorized(request) and is_superuser(request)):
-        resp = RedirectResponse("/admin/login", status_code=302)
+        resp = RedirectResponse("/reflection/login", status_code=302)
         _no_store(resp)
         return resp
 
@@ -1293,6 +1320,7 @@ def admin_config(request: Request):
     return resp
 
 
+@router.get("/reflection/admin", response_class=HTMLResponse)
 @router.get("/admin", response_class=HTMLResponse)
 def admin_page(
         request: Request,
@@ -1305,7 +1333,7 @@ def admin_page(
     """
     if not _is_authorized(request):
         # Always redirect to the login page if not authed
-        resp = RedirectResponse("/admin/login", status_code=302)
+        resp = RedirectResponse("/reflection/login", status_code=302)
         _no_store(resp)
         return resp
 
@@ -1369,6 +1397,7 @@ def admin_page(
     return resp
 
 
+@router.get("/reflection/admin/tables")
 @router.get("/admin/tables", response_class=HTMLResponse)
 def admin_tables_page(
         request: Request,
@@ -1382,7 +1411,7 @@ def admin_tables_page(
     All table-related UI has been moved here from admin.html.
     """
     if not _is_authorized(request):
-        resp = RedirectResponse("/admin/login", status_code=302)
+        resp = RedirectResponse("/reflection/login", status_code=302)
         _no_store(resp)
         return resp
 
@@ -1452,7 +1481,7 @@ def admin_tables_page(
 
 @router.get("/", response_class=HTMLResponse)
 def root_redirect():
-    resp = RedirectResponse("/admin/login", status_code=302)
+    resp = RedirectResponse("/reflection/login", status_code=302)
     _no_store(resp)
     return resp
 
@@ -1537,6 +1566,7 @@ def _sanitize_for_json(obj: Any) -> Any:
     # Fallback to string representation
     return str(obj)
 
+@router.get("/reflection/admin/execute")
 @router.get("/admin/execute", response_class=HTMLResponse)
 def admin_execute_page(
     request: Request,
@@ -1545,7 +1575,7 @@ def admin_execute_page(
     leaf: Optional[str] = Query(None),  # <-- NEW
 ):
     if not _is_authorized(request):
-        resp = RedirectResponse("/admin/login", status_code=302)
+        resp = RedirectResponse("/reflection/login", status_code=302)
         _no_store(resp)
         return resp
 
@@ -1587,6 +1617,7 @@ class ExecutePayload(Dict[str, Any]):
     page_size: int
 
 
+@router.post("/reflection/admin/execute")
 @router.post("/admin/execute")
 def admin_execute_api(
     request: Request,
@@ -1698,6 +1729,7 @@ def admin_execute_api(
         return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
 
 
+@router.post("/reflection/admin/schema")
 @router.post("/admin/schema")
 def admin_schema_api(
     request: Request,
@@ -1782,6 +1814,7 @@ def list_supers(organization: str) -> List[str]:
 
 
 
+@router.get("/reflection/admin/supers")
 @router.get("/admin/supers")
 def api_list_supers(
         request: Request,
@@ -1789,7 +1822,7 @@ def api_list_supers(
         _: Any = Depends(admin_guard_api),
 ):
     if not _is_authorized(request):
-      resp = RedirectResponse("/admin/login", status_code=302)
+      resp = RedirectResponse("/reflection/login", status_code=302)
       _no_store(resp)
       return resp
 
@@ -1803,6 +1836,7 @@ def api_list_supers(
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
 
+@router.get("/reflection/admin/tables")
 @router.get("/admin/tables", response_class=HTMLResponse)
 def tables_page(
     request: Request,
@@ -1815,7 +1849,7 @@ def tables_page(
     Tables view: shows Redis leaves as logical tables.
     """
     if not _is_authorized(request):
-      resp = RedirectResponse("/admin/login", status_code=302)
+      resp = RedirectResponse("/reflection/login", status_code=302)
       _no_store(resp)
       return resp
 
@@ -1896,6 +1930,7 @@ def tables_page(
     return resp
 
 
+@router.get("/reflection/admin/super")
 @router.get("/admin/super")
 def api_get_super_meta(
     request: Request,
@@ -1905,7 +1940,7 @@ def api_get_super_meta(
     _: Any = Depends(admin_guard_api),
 ):
     if not _is_authorized(request):
-      resp = RedirectResponse("/admin/login", status_code=302)
+      resp = RedirectResponse("/reflection/login", status_code=302)
       _no_store(resp)
       return resp
 
@@ -1917,6 +1952,7 @@ def api_get_super_meta(
 
 
 
+@router.post("/reflection/admin/super")
 @router.post("/admin/super")
 def api_get_super_meta(
     request: Request,
@@ -1925,7 +1961,7 @@ def api_get_super_meta(
     _: Any = Depends(admin_guard_api),
 ):
     if not _is_authorized(request):
-      resp = RedirectResponse("/admin/login", status_code=302)
+      resp = RedirectResponse("/reflection/login", status_code=302)
       _no_store(resp)
       return resp
 
@@ -1946,7 +1982,7 @@ def api_get_super_meta(
     _: Any = Depends(admin_guard_api),
 ):
     if not _is_authorized(request):
-      resp = RedirectResponse("/admin/login", status_code=302)
+      resp = RedirectResponse("/reflection/login", status_code=302)
       _no_store(resp)
       return resp
 
@@ -1958,6 +1994,7 @@ def api_get_super_meta(
         raise HTTPException(status_code=500, detail=f"SuperTable deletion failed: {e}")
 
 
+@router.get("/reflection/admin/schema")
 @router.get("/admin/schema")
 def api_get_table_schema(
         organization: str = Query(...),
@@ -1976,6 +2013,7 @@ def api_get_table_schema(
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
 
+@router.get("/reflection/admin/stats")
 @router.get("/admin/stats")
 def api_get_table_stats(
         organization: str = Query(...),
@@ -1992,3 +2030,76 @@ def api_get_table_stats(
         return {"ok": True, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
+# ------------------------------ Route aliases: /admin -> /reflection, /api -> /reflection ------------------------------
+
+def _add_reflection_alias_routes(_router: APIRouter) -> None:
+    """Add backward-compatible aliases under /reflection for legacy /admin and /api routes.
+
+    Notes:
+    - We keep the original routes to avoid regressions.
+    - Aliases are excluded from the OpenAPI schema to avoid duplicate entries.
+    """
+    try:
+        from fastapi.routing import APIRoute
+    except Exception:
+        return
+
+    existing = set()
+    for r in _router.routes:
+        try:
+            methods = tuple(sorted(getattr(r, "methods", None) or []))
+            existing.add((getattr(r, "path", None), methods))
+        except Exception:
+            continue
+
+    def _try_add_alias(path: str, methods: set, endpoint, name: str) -> None:
+        key = (path, tuple(sorted(methods or [])))
+        if key in existing:
+            return
+        _router.add_api_route(
+            path,
+            endpoint,
+            methods=list(methods or []),
+            name=name,
+            include_in_schema=False,
+        )
+        existing.add(key)
+
+    # Snapshot routes to avoid iterating over newly added aliases
+    routes = list(_router.routes)
+    for r in routes:
+        if not hasattr(r, "path") or not hasattr(r, "endpoint"):
+            continue
+        path = str(getattr(r, "path") or "")
+        if not path:
+            continue
+        methods = set(getattr(r, "methods", None) or [])
+        endpoint = getattr(r, "endpoint")
+        name = str(getattr(r, "name", "") or "route")
+
+        # /admin/* -> /reflection/*
+        if path == "/admin":
+            # Keep /reflection reserved for an explicit redirect to /reflection/admin
+            continue
+        if path.startswith("/admin"):
+            _try_add_alias(
+                "/reflection" + path[len("/admin"):],
+                methods,
+                endpoint,
+                name + "_reflection_alias",
+            )
+
+        # /api/* -> /reflection/*
+        if path == "/api":
+            # Avoid colliding with /reflection root redirect
+            continue
+        if path.startswith("/api"):
+            _try_add_alias(
+                "/reflection" + path[len("/api"):],
+                methods,
+                endpoint,
+                name + "_reflection_alias",
+            )
+
+
+_add_reflection_alias_routes(router)

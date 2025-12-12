@@ -424,7 +424,7 @@
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
 
-      const ep = enable ? '/api/mirrors/enable' : '/api/mirrors/disable';
+      const ep = enable ? '/reflection/mirrors/enable' : '/reflection/mirrors/disable';
       await api(
         `${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`,
         { method: 'POST' }
@@ -436,7 +436,7 @@
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
-      const data = await api(`/api/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      const data = await api(`/reflection/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('User '+hash, JSON.stringify(data, null, 2));
     }
 
@@ -444,7 +444,7 @@
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
-      const data = await api(`/api/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      const data = await api(`/reflection/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Role '+hash, JSON.stringify(data, null, 2));
     }
 
@@ -452,7 +452,7 @@
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
-      const data = await api(`/api/mirror/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+      const data = await api(`/reflection/mirror/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
       showModal('Mirror '+hash, JSON.stringify(data, null, 2));
     }
 
@@ -498,7 +498,7 @@
       tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-2 text-sm muted">Loading...</td></tr>';
 
       try {
-        const data = await api('/admin/env');
+        const data = await api('/reflection/env');
         if (data.found) {
           infoEl.innerHTML = `
             <span class="badge-ok">
@@ -592,7 +592,7 @@
       });
 
       try {
-        await api('/admin/env', {
+        await api('/reflection/env', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: items })
@@ -661,7 +661,7 @@
       body.innerHTML = '<tr><td colspan="4" class="muted">Loading…</td></tr>';
       try {
         const org = window.__org || '';
-        const data = await api(`/api/tokens?org=${encodeURIComponent(org)}`);
+        const data = await api(`/reflection/tokens?org=${encodeURIComponent(org)}`);
         const tokens = (data && data.tokens) || [];
         if (!tokens.length) {
           body.innerHTML = '<tr><td colspan="4" class="muted">No tokens yet.</td></tr>';
@@ -700,7 +700,7 @@
         const labelEl = document.getElementById('tokenLabel');
         const label = labelEl ? labelEl.value : '';
         const org = window.__org || '';
-        const res = await api(`/api/tokens?org=${encodeURIComponent(org)}&label=${encodeURIComponent(label || '')}`, {
+        const res = await api(`/reflection/tokens?org=${encodeURIComponent(org)}&label=${encodeURIComponent(label || '')}`, {
           method: 'POST'
         });
         const token = res && res.token ? res.token : '';
@@ -720,7 +720,7 @@
       if (!tokenId) return;
       const org = window.__org || '';
       if (!confirm('Delete token ' + tokenId + '?')) return;
-      await api(`/api/tokens/${encodeURIComponent(tokenId)}?org=${encodeURIComponent(org)}`, { method: 'DELETE' });
+      await api(`/reflection/tokens/${encodeURIComponent(tokenId)}?org=${encodeURIComponent(org)}`, { method: 'DELETE' });
       await loadTokens();
     }
 
@@ -792,9 +792,9 @@ function switchTab(id) {
       }
 
       var path = window.location.pathname;
-      if (path.startsWith("/admin/execute")) {
+      if (path.startsWith("/reflection/execute")) {
         $("#link-execute").addClass("active");
-      } else if (path.startsWith("/admin/tables")) {
+      } else if (path.startsWith("/reflection/tables")) {
         $("#link-tables").addClass("active");
       } else {
         $("#link-admin").addClass("active");

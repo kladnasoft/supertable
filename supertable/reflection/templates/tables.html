@@ -1042,7 +1042,7 @@
       }
 
       api(
-        META_BASE + '/admin/super?organization=' +
+        META_BASE + '/reflection/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
         '&user_hash=' + encodeURIComponent(USER_HASH)
@@ -1070,7 +1070,7 @@
       if (!selEl) return;
       if (labelEl) labelEl.textContent = 'Loading SuperTables...';
 
-      api(META_BASE + '/admin/supers?organization=' + encodeURIComponent(ORGANIZATION))
+      api(META_BASE + '/reflection/supers?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
           const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
           selEl.innerHTML = '';
@@ -1151,7 +1151,7 @@
 
       try {
         const data = await api(
-          META_BASE + '/admin/schema?organization=' +
+          META_BASE + '/reflection/schema?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +
@@ -1559,7 +1559,7 @@
 
       try {
         const data = await api(
-          META_BASE + '/admin/stats?organization=' +
+          META_BASE + '/reflection/stats?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +
@@ -1696,7 +1696,7 @@
     function goExecuteWithLeaf(simple) {
       const sel = document.getElementById('pairSel');
       const sup = sel && sel.value ? sel.value : currentSuper;
-      const url = new URL('/admin/execute', window.location.origin);
+      const url = new URL('/reflection/execute', window.location.origin);
       url.searchParams.set('org', ORGANIZATION);
       if (sup) url.searchParams.set('sup', sup);
       url.searchParams.set('leaf', simple);

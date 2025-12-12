@@ -618,7 +618,7 @@
       }
 
       api(
-        META_BASE + '/admin/super?organization=' +
+        META_BASE + '/reflection/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
         '&user_hash=' + encodeURIComponent(USER_HASH)
@@ -641,7 +641,7 @@
       const selEl = document.getElementById('pairSel');
       if (!selEl) return;
 
-      api(META_BASE + '/admin/supers?organization=' + encodeURIComponent(ORGANIZATION))
+      api(META_BASE + '/reflection/supers?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
           const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
           selEl.innerHTML = '';
@@ -697,7 +697,7 @@
     function goBackAdmin() {
       const sel = document.getElementById('pairSel');
       const sup = sel ? sel.value : '';
-      const url = new URL('/admin', window.location.origin);
+      const url = new URL('/reflection', window.location.origin);
       if (sup) url.searchParams.set('sup', sup);
       url.searchParams.set('org', ORGANIZATION);
       window.location.href = url.toString();
@@ -1004,10 +1004,10 @@
       if (!organization || !superName || !userHash) return;
 
       try {
-        // 1) list tables in the selected SuperTable (use /admin/super meta; do NOT use /meta/tables)
+        // 1) list tables in the selected SuperTable (use /reflection/super meta; do NOT use /meta/tables)
         const superResp = await api(
           META_BASE +
-          '/admin/super?organization=' + encodeURIComponent(organization) +
+          '/reflection/super?organization=' + encodeURIComponent(organization) +
           '&super_name=' + encodeURIComponent(superName) +
           '&user_hash=' + encodeURIComponent(userHash)
         );
@@ -1023,7 +1023,7 @@
           try {
             const schemaResp = await api(
               META_BASE +
-              '/admin/schema?organization=' + encodeURIComponent(organization) +
+              '/reflection/schema?organization=' + encodeURIComponent(organization) +
               '&super_name=' + encodeURIComponent(superName) +
               '&table=' + encodeURIComponent(tableName) +
               '&user_hash=' + encodeURIComponent(userHash)
@@ -1101,7 +1101,7 @@
       setStatus('Executing…', 'executing');
 
       try {
-        const data = await api('/admin/execute', {
+        const data = await api('/reflection/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

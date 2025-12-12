@@ -46,7 +46,7 @@
             {% endif %}
           </div>
 
-          <a href="/admin/logout" title="Logout" style="
+          <a href="/reflection/logout" title="Logout" style="
               display:inline-flex;
               align-items:center;
               gap:8px;
@@ -341,7 +341,7 @@ const filesEl = document.getElementById("tenantFilesValue");
     async function loadSupers() {
         try {
             const resp = await fetch(
-                "/admin/supers?organization=" + encodeURIComponent(ORG_NAME)
+                "/reflection/supers?organization=" + encodeURIComponent(ORG_NAME)
             );
             if (!resp.ok) {
                 throw new Error("Failed to load supers: " + resp.status);
@@ -393,7 +393,7 @@ const filesEl = document.getElementById("tenantFilesValue");
                 user_hash: USER_HASH
             });
 
-            const resp = await fetch("/admin/super?" + params.toString());
+            const resp = await fetch("/reflection/super?" + params.toString());
             if (!resp.ok) {
                 throw new Error("Failed to load super meta: " + resp.status);
             }
@@ -492,7 +492,7 @@ const filesEl = document.getElementById("tenantFilesValue");
 
             try {
                 if (mode === "create") {
-                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}`;
+                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}`;
                     const res = await fetch(url, { method: "POST" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Create failed");
@@ -510,7 +510,7 @@ const filesEl = document.getElementById("tenantFilesValue");
                         err.style.display = "";
                         return;
                     }
-                    const url = `/admin/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(USER_HASH)}`;
+                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(USER_HASH)}`;
                     const res = await fetch(url, { method: "DELETE" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Delete failed");
