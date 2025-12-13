@@ -491,7 +491,21 @@
       border-color: rgba(28, 150, 202, 0.35);
     }
 
-  </style>
+  
+    /* Azure-style outline button (Tokens tab) */
+    .btn-azure-outline {
+      border: 1px solid #1c96ca;
+      background: transparent;
+      color: #1c96ca;
+      font-weight: 600;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+    .btn-azure-outline:hover {
+      background: #1c96ca;
+      color: #ffffff;
+    }
+
+</style>
 
   <script>
     function api(path, opts) {
@@ -1260,7 +1274,7 @@ function switchTab(id) {
           <div class="section">
             <div class="d-flex align-items-center justify-content-between">
               <div class="muted text-sm">Login Tokens</div>
-              <button class="btn btn-sm btn-primary" onclick="createTokenModal()">Create Token</button>
+              <button class="btn btn-sm btn-azure-outline" onclick="createTokenModal()">Create Token</button>
             </div>
             <div class="mt-2">
               <table>

@@ -1967,7 +1967,9 @@ def api_get_super_meta(
 
     try:
         st = SuperTable(organization=organization, super_name=super_name)
-        return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": st.storage}
+        storage_label = getattr(getattr(st, "storage", None), "__class__", None)
+        storage_name = getattr(storage_label, "__name__", None) if storage_label else None
+        return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": storage_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
 
