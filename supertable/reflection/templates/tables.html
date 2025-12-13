@@ -230,6 +230,12 @@
 
     div.dataTables_wrapper div.dataTables_paginate .paginate_button.current,
     div.dataTables_wrapper div.dataTables_paginate .paginate_button.current:hover {
+        background-color: transparent;
+        color: var(--primary-color) !important;
+        border: 1px solid var(--primary-color);
+    }
+
+    div.dataTables_wrapper div.dataTables_paginate .paginate_button.current:hover {
         background-color: var(--primary-color);
         color: white !important;
         border: 1px solid var(--primary-color);
@@ -249,23 +255,21 @@
       flex-shrink: 0;
     }
 
- /* Custom styling for SOLID primary buttons */
+ /* Custom styling for OUTLINE primary buttons (blue border, no fill) */
 .actions-cell .btn-primary {
-    background-color: var(--primary-color);
+    background-color: transparent;
     border-color: var(--primary-color);
-    color: white; /* Ensure text is white for contrast */
+    color: var(--primary-color);
 }
 
 .actions-cell .btn-primary:hover,
 .actions-cell .btn-primary:focus,
 .actions-cell .btn-primary:active {
-    /* Slightly darker blue for a professional hover effect */
-    background-color: var(--secondary-color); /* Uses the darker blue: #147ba3 */
+    background-color: var(--primary-light);
     border-color: var(--secondary-color);
-    color: white;
+    color: var(--secondary-color);
 }
-
-    /* --- Modal & Overlay Styling --- */
+/* --- Modal & Overlay Styling --- */
     #modal {
       position: fixed;
       inset: 0;
@@ -750,7 +754,143 @@
         white-space: nowrap;
     }
 
-</style>
+
+    /* --- Schema overlay: grid + typed pills --- */
+    .schema-peek {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    
+    .schema-count {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: rgba(15, 23, 42, 0.72);
+      margin: 0 0 6px 0;
+      padding: 0 2px;
+    }
+
+    .schema-count-num {
+      font-weight: 800;
+      color: #0f172a;
+    }
+
+    .schema-col-idx {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 42px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+      font-size: 12px;
+      color: rgba(15, 23, 42, 0.55);
+      margin-right: 6px;
+    }
+
+.schema-search-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid rgba(15, 23, 42, 0.10);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.03);
+    }
+
+    .schema-search-row i {
+      color: var(--primary-color);
+      font-size: 12px;
+    }
+
+    .schema-search {
+      border: none;
+      outline: none;
+      width: 100%;
+      font-size: 12px;
+      background: transparent;
+      color: #0f172a;
+    }
+
+    .schema-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .schema-grid-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 6px;
+      border: none;
+      border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .schema-grid-item:last-child {
+      border-bottom: none;
+    }
+
+    .schema-grid-name {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      color: #0f172a;
+      min-width: 0;
+    }
+
+    .schema-grid-name span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    .schema-grid-name i {
+      color: rgba(15, 23, 42, 0.35);
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    .schema-type-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      background: rgba(15, 23, 42, 0.04);
+      color: #0f172a;
+      flex-shrink: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .schema-type-pill.type-text { background: rgba(28, 150, 202, 0.12); border-color: rgba(28, 150, 202, 0.35); }
+    .schema-type-pill.type-number { background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.35); }
+    .schema-type-pill.type-date { background: rgba(245, 158, 11, 0.12); border-color: rgba(245, 158, 11, 0.35); }
+    .schema-type-pill.type-bool { background: rgba(139, 92, 246, 0.12); border-color: rgba(139, 92, 246, 0.35); }
+    .schema-type-pill.type-json { background: rgba(236, 72, 153, 0.12); border-color: rgba(236, 72, 153, 0.35); }
+    .schema-type-pill.type-bin { background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.35); }
+    .schema-type-pill.type-other { background: rgba(15, 23, 42, 0.06); border-color: rgba(15, 23, 42, 0.18); }
+
+    .schema-empty {
+      padding: 16px;
+      border: 1px dashed rgba(15, 23, 42, 0.20);
+      border-radius: 12px;
+      text-align: center;
+      color: rgba(15, 23, 42, 0.70);
+      font-size: 12px;
+    }
+
+  </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
   <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
@@ -967,7 +1107,7 @@
 
         const tdName = document.createElement('td');
         tdName.innerHTML =
-          '<div class="table-name-cell"><i class="fas fa-leaf"></i><span>' +
+          '<div class="table-name-cell"><i class="fas fa-table"></i><span>' +
           escapeHtml(name) +
           '</span></div>';
         tr.appendChild(tdName);
@@ -1108,29 +1248,53 @@
     }
 
     function buildSchemaPeekHtml(schemaPairs, moreSchema) {
-      let schemaTableHtml = '';
-      if (schemaPairs.length) {
-        schemaTableHtml += '<table class="schema-peek-table"><thead><tr>';
-        schemaTableHtml += '<th>Column</th><th>Type</th></tr></thead><tbody>';
-        schemaPairs.forEach(([col, type]) => {
-          const typeClass = getSchemaTypeClass(type);
-          schemaTableHtml += '<tr>';
-          schemaTableHtml += '<td>' + escapeHtml(col) + '</td>';
-          schemaTableHtml += '<td><span class="schema-type-pill ' + typeClass + '">' + escapeHtml(type) + '</span></td>';
-          schemaTableHtml += '</tr>';
-        });
-        schemaTableHtml += '</tbody></table>';
+      const pairs = Array.isArray(schemaPairs) ? schemaPairs : [];
 
-        if (moreSchema) {
-          schemaTableHtml += '<div class="schema-peek-more">…and more columns. Use a full schema view if needed.</div>';
-        }
-      } else {
-        schemaTableHtml = '<div class="schema-peek-more">Schema not available.</div>';
-      }
+      const typeClass = (t) => {
+        const s = String(t || '').toLowerCase();
+        if (!s) return 'type-other';
+        if (s.includes('int') || s.includes('decimal') || s.includes('numeric') || s.includes('double') || s.includes('float') || s.includes('real')) return 'type-number';
+        if (s.includes('bool')) return 'type-bool';
+        if (s.includes('date') || s.includes('time') || s.includes('timestamp')) return 'type-date';
+        if (s.includes('json') || s.includes('struct') || s.includes('map') || s.includes('array')) return 'type-json';
+        if (s.includes('blob') || s.includes('binary') || s.includes('byte')) return 'type-bin';
+        if (s.includes('char') || s.includes('text') || s.includes('string') || s.includes('uuid')) return 'type-text';
+        return 'type-other';
+      };
+
+      const header = `
+        <div class="schema-count">Columns: <span class="schema-count-num">${pairs.length}</span></div>
+        <div class="schema-search-row">
+          <i class="fas fa-search"></i>
+          <input id="schemaSearch" class="schema-search" placeholder="Search columns or types…" />
+        </div>
+      `;
+
+      const gridItems = pairs
+      .map((p, idx) => {
+        const name = (p && (p.name || p.column || p.col)) ? String(p.name || p.column || p.col) : String((p && p[0]) || '');
+        const typ = (p && (p.type || p.dtype)) ? String(p.type || p.dtype) : String((p && p[1]) || '');
+        const cls = typeClass(typ);
+        return `
+          <div class="schema-grid-item" data-name="${escapeHtml(name)}" data-type="${escapeHtml(typ)}">
+            <div class="schema-grid-name">
+              <span class="schema-col-idx">#${idx + 1}</span>
+              <i class="fas fa-grip-lines-vertical"></i>
+              <span>${escapeHtml(name)}</span>
+            </div>
+            <span class="schema-type-pill ${cls}">${escapeHtml(typ || '—')}</span>
+          </div>
+        `;
+      }).join('');
+
+      const grid = `<div id="schemaGrid" class="schema-grid">${gridItems || '<div class="schema-empty">No columns found.</div>'}</div>`;
+
+      const footer = moreSchema ? `<div class="schema-peek-more">Showing a subset. Refine search to narrow results.</div>` : '';
+
+      const schemaTableHtml = `<div class="schema-peek">${header}${grid}${footer}</div>`;
       return schemaTableHtml;
     }
-
-    async function openSchema(simple) {
+async function openSchema(simple) {
       const sel = document.getElementById('pairSel');
       const sup = sel && sel.value ? sel.value : currentSuper;
 
@@ -1139,123 +1303,72 @@
       const titleMain = document.getElementById('schemaTitleMain');
       const titleSub = document.getElementById('schemaTitleSub');
 
-      overlay.style.display = 'flex';
-      titleMain.innerHTML = '<i class="fas fa-table" style="color:#1c96ca;"></i><span>Schema · ' + escapeHtml(simple) + '</span>';
-      titleSub.textContent = 'Schema of table: ' + (sup ? ('SuperTable ' + sup) : '');
+      if (overlay) overlay.style.display = 'flex';
+      if (titleMain) {
+        titleMain.innerHTML =
+          '<i class="fas fa-columns" style="color:#1c96ca;"></i><span>Schema · ' +
+          escapeHtml(simple) +
+          '</span>';
+      }
+      if (titleSub) {
+        titleSub.textContent = sup ? ('SuperTable: ' + sup) : '';
+      }
 
-      bodyEl.innerHTML =
-        '<div class="schema-peek-title">' +
-        '  <i class="fas fa-spinner fa-spin"></i>' +
-        '  <span>Loading schema…</span>' +
-        '</div>';
+      if (bodyEl) {
+        bodyEl.innerHTML =
+          '<div class="schema-peek-title">' +
+          '  <i class="fas fa-spinner fa-spin"></i>' +
+          '  <span>Loading schema…</span>' +
+          '</div>';
+      }
 
       try {
         const data = await api(
           META_BASE + '/reflection/schema?organization=' +
           encodeURIComponent(ORGANIZATION) +
-          '&super_name=' + encodeURIComponent(sup) +
+          '&super_name=' + encodeURIComponent(sup || '') +
           '&table=' + encodeURIComponent(simple) +
           '&user_hash=' + encodeURIComponent(USER_HASH)
         );
 
-        const schemaRaw = data && data.schema !== undefined ? data.schema : (data || null);
+        const schemaRaw = (data && data.schema !== undefined) ? data.schema : (data || null);
         const schemaPairsAll = schemaRaw ? extractSchemaPairs(schemaRaw) : [];
 
-        // Group by normalized type category
-        const groups = {
-          string: [],
-          number: [],
-          date: [],
-          bool: [],
-          other: []
-        };
-
-        schemaPairsAll.forEach(function (pair) {
-          const col = pair[0];
-          const type = pair[1];
-          const cat = normalizeTypeCategory(type);
-          if (!groups[cat]) {
-            groups[cat] = [];
-          }
-          groups[cat].push([col, type]);
-        });
-
-        // Build grouped HTML
-        let html = '';
-
-        // Search input
-        html += '<input type="text" id="schemaSearch" class="schema-search-input" placeholder="Search columns or types…">';
-
-        const orderedGroups = [
-          ['string', 'String columns'],
-          ['number', 'Numeric columns'],
-          ['date', 'Date/Time columns'],
-          ['bool', 'Boolean columns'],
-          ['other', 'Other columns']
-        ];
-
-        orderedGroups.forEach(function (entry) {
-          const key = entry[0];
-          const label = entry[1];
-          const entries = groups[key] || [];
-          if (!entries.length) return;
-
-          html +=
-            '<div class="schema-group">' +
-            '  <div class="schema-group-header" onclick="this.nextElementSibling.classList.toggle(\'open\')">' +
-            '    <span>' + escapeHtml(label) + ' (' + entries.length + ')</span>' +
-            '    <i class="fas fa-chevron-down"></i>' +
-            '  </div>' +
-            '  <div class="schema-group-body">' +
-            '    <table class="schema-table">' +
-            '      <thead><tr><th>Column</th><th>Type</th></tr></thead>' +
-            '      <tbody>';
-
-          entries.forEach(function (pair) {
-            const col = pair[0];
-            const type = pair[1];
-            const typeClass = getSchemaTypeClass(type);
-            html +=
-              '<tr>' +
-              '  <td class="schema-colname">' + escapeHtml(col) + '</td>' +
-              '  <td><span class="schema-type-pill ' + typeClass + '">' + escapeHtml(type) + '</span></td>' +
-              '</tr>';
-          });
-
-          html +=
-            '      </tbody>' +
-            '    </table>' +
-            '  </div>' +
-            '</div>';
-        });
+        if (!bodyEl) return;
 
         if (!schemaPairsAll.length) {
-          html =
-            '<div class="schema-peek-more">Schema not available.</div>';
+          bodyEl.innerHTML = '<div class="schema-empty">Schema not available.</div>';
+          return;
         }
 
-        bodyEl.innerHTML = html;
+        bodyEl.innerHTML = buildSchemaPeekHtml(schemaPairsAll, false);
 
-        // Open all groups by default
-        document.querySelectorAll('#schemaBody .schema-group-body').forEach(function (el) {
-          el.classList.add('open');
-        });
-
-        // Wire search
         const searchInput = document.getElementById('schemaSearch');
         if (searchInput) {
           searchInput.addEventListener('input', function () {
-            const q = this.value.toLowerCase();
-            const rows = document.querySelectorAll('#schemaBody .schema-group-body tr');
-            rows.forEach(function (tr) {
-              const txt = tr.innerText.toLowerCase();
-              tr.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
+            const q = (this.value || '').toLowerCase().trim();
+            const items = bodyEl.querySelectorAll('.schema-grid-item');
+            let anyVisible = false;
+
+            items.forEach(function (el) {
+              const n = (el.getAttribute('data-name') || '').toLowerCase();
+              const t = (el.getAttribute('data-type') || '').toLowerCase();
+              const show = !q || n.includes(q) || t.includes(q);
+              el.style.display = show ? '' : 'none';
+              if (show) anyVisible = true;
             });
+
+            const empty = bodyEl.querySelector('.schema-empty');
+            if (empty) empty.style.display = anyVisible ? 'none' : '';
           });
         }
       } catch (e) {
-        bodyEl.innerHTML =
-          '<div class="schema-peek-more" style="color:#b91c1c;">Error loading schema: ' + escapeHtml(e.message || e) + '</div>';
+        if (bodyEl) {
+          bodyEl.innerHTML =
+            '<div class="schema-peek-more" style="color:#b91c1c;">Error loading schema: ' +
+            escapeHtml(e && (e.message || e.toString()) ? (e.message || e.toString()) : String(e)) +
+            '</div>';
+        }
       }
     }
 

@@ -371,6 +371,126 @@
       gap:12px;
       margin-bottom:12px;
     }
+  
+    .tab-sep {
+      width: 1px;
+      height: 22px;
+      background: rgba(15, 23, 42, 0.12);
+      margin: 0 10px;
+      align-self: center;
+      border-radius: 1px;
+    }
+
+    /* --- Readable details blocks in modal --- */
+    .details-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .details-card {
+      border: 1px solid rgba(15, 23, 42, 0.10);
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04);
+      overflow: hidden;
+    }
+
+    .details-card-header {
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: rgba(28, 150, 202, 0.06);
+      border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+    }
+
+    .details-card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      color: #0f172a;
+      font-size: 13px;
+    }
+
+    .details-card-title i {
+      color: var(--accent);
+    }
+
+    .details-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #0f172a;
+      background: rgba(15, 23, 42, 0.06);
+      border: 1px solid rgba(15, 23, 42, 0.10);
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .details-grid {
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .details-row {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    @media (max-width: 740px) {
+      .details-row { grid-template-columns: 1fr; }
+    }
+
+    .details-label {
+      font-size: 12px;
+      color: rgba(15, 23, 42, 0.72);
+      font-weight: 600;
+    }
+
+    .details-value {
+      font-size: 12px;
+      color: #0f172a;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      background: rgba(15, 23, 42, 0.04);
+      border: 1px solid rgba(15, 23, 42, 0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      line-height: 1.45;
+    }
+
+    .details-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      background: rgba(15, 23, 42, 0.04);
+      color: #0f172a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .chip-strong {
+      background: rgba(28, 150, 202, 0.10);
+      border-color: rgba(28, 150, 202, 0.35);
+    }
+
   </style>
 
   <script>
@@ -393,7 +513,93 @@
         .replace(/>/g, '&gt;');
     }
 
-    function escapeHtmlAttr(str) {
+    
+    function safeJsonParseList(val) {
+      if (val === null || val === undefined) return [];
+      if (Array.isArray(val)) return val;
+      const s = String(val);
+      try {
+        const parsed = JSON.parse(s);
+        return Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        return s ? [s] : [];
+      }
+    }
+
+    function fmtUtcFromMs(msLike) {
+      const n = Number(msLike);
+      if (!Number.isFinite(n) || n <= 0) return '';
+      const d = new Date(n);
+      return d.toISOString().replace('T', ' ').replace('Z', ' UTC');
+    }
+
+    function renderChips(items, strong) {
+      const arr = (items || []).filter(x => x !== null && x !== undefined).map(x => String(x));
+      if (!arr.length) return '<span class="details-value" style="display:inline-block;">—</span>';
+      return '<div class="details-chips">' + arr.map(v => `<span class="chip ${strong ? 'chip-strong' : ''}">${escapeHtml(v)}</span>`).join('') + '</div>';
+    }
+
+    function renderDetailsModal(payload, iconClass) {
+      const hash = payload && payload.hash ? String(payload.hash) : '';
+      const data = (payload && payload.data) ? payload.data : {};
+
+      // Normalize common fields
+      const role = data && data.role ? String(data.role) : '';
+      const username = data && data.username ? String(data.username) : '';
+
+      const headerTitle = role ? `Role: ${escapeHtml(role)}` : (username ? `User: ${escapeHtml(username)}` : 'Details');
+
+      const metaBadge = hash ? `<span class="details-badge"><i class="fas fa-fingerprint"></i>${escapeHtml(hash)}</span>` : '';
+
+      const rows = [];
+
+      // Role fields
+      if (role) {
+        rows.push({ k: 'Role', v: `<div class="details-value">${escapeHtml(role)}</div>` });
+        rows.push({ k: 'Tables', v: renderChips(safeJsonParseList(data.tables), true) });
+        rows.push({ k: 'Columns', v: renderChips(safeJsonParseList(data.columns), false) });
+        rows.push({ k: 'Filters', v: renderChips(safeJsonParseList(data.filters), false) });
+      }
+
+      // User fields
+      if (username) {
+        rows.push({ k: 'Username', v: `<div class="details-value">${escapeHtml(username)}</div>` });
+        rows.push({ k: 'Roles', v: renderChips(safeJsonParseList(data.roles), true) });
+        if (data.created_ms) rows.push({ k: 'Created', v: `<div class="details-value">${escapeHtml(fmtUtcFromMs(data.created_ms))}</div>` });
+        if (data.modified_ms) rows.push({ k: 'Modified', v: `<div class="details-value">${escapeHtml(fmtUtcFromMs(data.modified_ms))}</div>` });
+      }
+
+      // Always show raw data keys not already covered (compact)
+      const covered = new Set(rows.map(r => r.k.toLowerCase()));
+      Object.keys(data || {}).forEach((k) => {
+        if (!k) return;
+        const keyLower = String(k).toLowerCase();
+        if (covered.has(keyLower)) return;
+        rows.push({ k: k, v: `<div class="details-value">${escapeHtml(String(data[k]))}</div>` });
+      });
+
+      const gridHtml = rows.map(r => `
+        <div class="details-row">
+          <div class="details-label">${escapeHtml(r.k)}</div>
+          <div>${r.v}</div>
+        </div>
+      `).join('');
+
+      return `
+        <div class="details-wrap">
+          <div class="details-card">
+            <div class="details-card-header">
+              <div class="details-card-title"><i class="fas ${escapeHtml(iconClass || 'fa-info-circle')}"></i><span>${headerTitle}</span></div>
+              ${metaBadge}
+            </div>
+            <div class="details-grid">
+              ${gridHtml}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+function escapeHtmlAttr(str) {
       if (str === null || str === undefined) return '';
       return String(str)
         .replace(/&/g, '&amp;')
@@ -437,7 +643,7 @@
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
       const data = await api(`/reflection/user/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-      showModal('User '+hash, JSON.stringify(data, null, 2));
+      showModal('User ' + hash, renderDetailsModal(data, 'fa-user'));
     }
 
     async function viewRole(hash) {
@@ -445,7 +651,7 @@
       const sup = sel ? sel.value : '';
       const org = (window.__org || '');
       const data = await api(`/reflection/role/${encodeURIComponent(hash)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-      showModal('Role '+hash, JSON.stringify(data, null, 2));
+      showModal('Role ' + hash, renderDetailsModal(data, 'fa-user-shield'));
     }
 
     async function viewMirror(hash) {
@@ -558,9 +764,9 @@
           <td class="px-3 py-2 text-sm">
             <input
               type="${isSensitive ? 'password' : 'text'}"
-              class="env-value-input"
+              class="env-value-input" readonly
               value="${escapeHtmlAttr(val)}"
-              style="width:100%; border-radius:8px; border:1px solid #cbd5e1; padding:4px 6px; font-size:12px;"
+              style="width:100%; border-radius:8px; border:1px solid #cbd5e1; padding:4px 6px; font-size:12px; background:#f8fafc; color:#0f172a; cursor:default;"
             />
           </td>
           <td class="px-3 py-2 text-xs">
@@ -841,16 +1047,21 @@ function switchTab(id) {
             +
           </button>
         </div>
-        <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
-          <i class="fas fa-mirror"></i><span>Mirrors</span>
-        </div>
         <div id="tab-tokens" class="tab" onclick="switchTab('tokens')">
           <i class="fas fa-key"></i><span>Tokens</span>
           <button type="button" class="tab-add" onclick="createTokenModal(); event.stopPropagation();">+</button>
         </div>
 
+        <div class="tab-sep" aria-hidden="true"></div>
+
+        <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
+          <i class="fas fa-mirror"></i><span>Mirrors</span>
+        </div>
+
+        <div class="tab-sep" aria-hidden="true"></div>
+
         <div id="tab-config" class="tab" onclick="switchTab('config')">
-          <i class="fas fa-cog"></i><span>Config</span>
+          <i class="fas fa-cog"></i><span>.env</span>
         </div>
       </div>
 
@@ -1076,7 +1287,6 @@ function switchTab(id) {
 <!-- CONFIG TAB -->
       <div id="pane-config" class="tabpane hidden">
         <div class="mt-4">
-          <!-- .env info card WITH header-row inside -->
           <div class="card">
             <div class="section">
               <div class="header-row">
@@ -1086,7 +1296,7 @@ function switchTab(id) {
                     Environment configuration (.env)
                   </h4>
                   <div class="text-xs muted">
-                    View and edit values from the project <code>.env</code> file. Sensitive values are hidden by default.
+                    Display values from the project <code>.env</code> file. Sensitive values are hidden by default.
                   </div>
                 </div>
                 <div id="env-save-message"></div>
@@ -1100,13 +1310,8 @@ function switchTab(id) {
                 <strong>Path:</strong>
                 <span class="value" id="env-config-path">—</span>
               </div>
-            </div>
-          </div>
 
-          <!-- Variables card -->
-          <div class="card" style="margin-top:16px;">
-            <div class="section">
-              <div class="text-sm muted">Variables</div>
+              <div class="mt-3 text-sm muted">Variables</div>
               <div class="text-xs muted" style="margin-top:4px;">
                 Values are read from the <code>.env</code> file on disk (via <code>python-dotenv</code>).
                 Sensitive keys (passwords, tokens, secrets, keys) are masked by default; you can reveal them locally.
@@ -1139,9 +1344,6 @@ function switchTab(id) {
                 <div>
                   <button type="button" class="btn-ghost" onclick="toggleAllSecrets()">
                     <i class="fas fa-eye"></i>&nbsp;Toggle all secrets
-                  </button>
-                  <button type="button" class="btn-ghost" style="margin-left:8px;" onclick="saveEnvConfig()">
-                    <i class="fas fa-save"></i>&nbsp;Save changes to .env
                   </button>
                 </div>
               </div>
