@@ -78,3 +78,23 @@ class SuperTable:
         if self.storage.size(simple_table_path) == 0:
             raise ValueError(f"Simple table snapshot is empty: {simple_table_path}")
         return self.storage.read_json(simple_table_path)
+
+
+    # ------------------------------------------------------------------ delete
+    def delete(self) -> None:
+        """Delete this SuperTable's Redis metadata and underlying storage folder.
+
+        WARNING: This is destructive and intended for admin flows.
+        """
+        base_dir = os.path.join(self.organization, self.super_name)
+
+        # Delete storage first; if this fails (other than missing), do not remove Redis meta.
+        try:
+            if self.storage.exists(base_dir):
+                self.storage.delete(base_dir)
+        except FileNotFoundError:
+            # Missing storage is fine; still delete Redis meta
+            pass
+
+        # Best-effort delete all Redis keys under this supertable prefix
+        self.catalog.delete_super_table(self.organization, self.super_name)

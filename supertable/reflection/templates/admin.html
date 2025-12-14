@@ -1051,25 +1051,20 @@ function switchTab(id) {
       <div id="tab-navigation">
         <div id="tab-users" class="tab active" onclick="switchTab('users')">
           <i class="fas fa-users"></i><span>Users</span>
-          <button type="button" class="tab-add" onclick="createUserModal(); event.stopPropagation();">
-            +
-          </button>
-        </div>
+</div>
         <div id="tab-roles" class="tab" onclick="switchTab('roles')">
           <i class="fas fa-user-shield"></i><span>Roles</span>
-          <button type="button" class="tab-add" onclick="createRoleModal(); event.stopPropagation();">
-            +
-          </button>
-        </div>
+</div>
+        <div class="tab-sep" aria-hidden="true"></div>
+
         <div id="tab-tokens" class="tab" onclick="switchTab('tokens')">
           <i class="fas fa-key"></i><span>Tokens</span>
-          <button type="button" class="tab-add" onclick="createTokenModal(); event.stopPropagation();">+</button>
-        </div>
+</div>
 
         <div class="tab-sep" aria-hidden="true"></div>
 
         <div id="tab-mirrors" class="tab" onclick="switchTab('mirrors')">
-          <i class="fas fa-mirror"></i><span>Mirrors</span>
+          <i class="fas fa-clone"></i><span>Mirrors</span>
         </div>
 
         <div class="tab-sep" aria-hidden="true"></div>
@@ -1083,7 +1078,10 @@ function switchTab(id) {
       <div id="pane-users" class="tabpane">
         <div class="card mt-4">
           <div class="section">
-            <div class="muted text-sm">Users</div>
+            <div class="d-flex align-items-center justify-content-between">
+              <div class="muted text-sm">Users</div>
+              <button class="btn btn-sm btn-azure-outline" onclick="createUserModal()">Create User</button>
+            </div>
             <div class="mt-2">
               <table>
                 <thead>
@@ -1145,7 +1143,10 @@ function switchTab(id) {
       <div id="pane-roles" class="tabpane hidden">
         <div class="card mt-4">
           <div class="section">
-            <div class="muted text-sm">Roles</div>
+            <div class="d-flex align-items-center justify-content-between">
+              <div class="muted text-sm">Roles</div>
+              <button class="btn btn-sm btn-azure-outline" onclick="createRoleModal()">Create Role</button>
+            </div>
             <div class="mt-2">
               <table>
                 <thead>

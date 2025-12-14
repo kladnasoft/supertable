@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
+from supertable.storage.storage_factory import get_storage
 
 # Load environment variables from .env file (optional)
 try:
@@ -754,14 +755,12 @@ def healthz():
 # -------- JSON API (read-only) --------
 
 @router.get("/reflection/api/tenants")
-@router.get("/api/tenants")
 def api_tenants(_: Any = Depends(logged_in_guard_api)):
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
 @router.get("/reflection/api/root")
-@router.get("/api/root")
 def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -779,7 +778,6 @@ def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(No
 
 
 @router.get("/reflection/api/mirrors")
-@router.get("/api/mirrors")
 def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -792,7 +790,6 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
 
 
 @router.get("/reflection/api/leaves")
-@router.get("/api/leaves")
 def api_list_leaves(
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
@@ -858,7 +855,6 @@ def api_list_leaves(
 
 
 @router.get("/reflection/api/leaf/{simple}")
-@router.get("/api/leaf/{simple}")
 def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -873,7 +869,6 @@ def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[st
 
 
 @router.get("/reflection/api/users")
-@router.get("/api/users")
 def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -882,7 +877,6 @@ def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
 
 
 @router.get("/reflection/api/roles")
-@router.get("/api/roles")
 def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -891,7 +885,6 @@ def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
 
 
 @router.get("/reflection/api/user/{user_hash}")
-@router.get("/api/user/{user_hash}")
 def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -904,7 +897,6 @@ def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Opti
 
 
 @router.get("/reflection/api/role/{role_hash}")
-@router.get("/api/role/{role_hash}")
 def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -972,7 +964,6 @@ def _mask_secret(value: str) -> str:
 
 
 @router.get("/reflection/admin/env")
-@router.get("/admin/env")
 def admin_env_get(_=Depends(admin_guard_api)):
     """
     Return the current .env values from the project root.
@@ -1015,7 +1006,6 @@ def admin_env_get(_=Depends(admin_guard_api)):
 
 
 @router.post("/reflection/admin/env")
-@router.post("/admin/env")
 def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
     """
     Update the project .env with provided items.
@@ -1060,17 +1050,12 @@ def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_
 
 
 # ------------------------------ Admin page & auth routes ------------------------------
-
-@router.get("/reflection/admin/login", response_class=HTMLResponse)
 @router.get("/reflection/login", response_class=HTMLResponse)
-@router.get("/admin/login", response_class=HTMLResponse)
 def admin_login_form(request: Request):
     return _render_login(request, message=None, clear_cookie=True)
 
 
-@router.post("/reflection/admin/login")
 @router.post("/reflection/login")
-@router.post("/admin/login")
 def admin_login(
     request: Request,
     mode: str = Form("user"),
@@ -1136,9 +1121,7 @@ def admin_login(
     return resp
 
 
-@router.get("/reflection/admin/logout")
 @router.get("/reflection/logout")
-@router.get("/admin/logout")
 def admin_logout():
     resp = RedirectResponse("/reflection/login", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
@@ -1195,7 +1178,6 @@ def _effective_settings() -> Dict[str, str]:
 
 
 @router.get("/reflection/api/tokens")
-@router.get("/api/tokens")
 def api_list_tokens(
     request: Request,
     org: str = Query(None),
@@ -1209,7 +1191,6 @@ def api_list_tokens(
 
 
 @router.post("/reflection/api/tokens")
-@router.post("/api/tokens")
 def api_create_token(
     request: Request,
     org: str = Query(None),
@@ -1240,7 +1221,6 @@ def api_delete_token(
 
 
 @router.get("/reflection/admin/config")
-@router.get("/admin/config", response_class=HTMLResponse)
 def admin_config(request: Request):
     if not (_is_authorized(request) and is_superuser(request)):
         resp = RedirectResponse("/reflection/login", status_code=302)
@@ -1321,7 +1301,6 @@ def admin_config(request: Request):
 
 
 @router.get("/reflection/admin", response_class=HTMLResponse)
-@router.get("/admin", response_class=HTMLResponse)
 def admin_page(
         request: Request,
         org: Optional[str] = Query(None),
@@ -1397,8 +1376,7 @@ def admin_page(
     return resp
 
 
-@router.get("/reflection/admin/tables")
-@router.get("/admin/tables", response_class=HTMLResponse)
+@router.get("/reflection/admin/tables-legacy")
 def admin_tables_page(
         request: Request,
         org: Optional[str] = Query(None),
@@ -1566,8 +1544,7 @@ def _sanitize_for_json(obj: Any) -> Any:
     # Fallback to string representation
     return str(obj)
 
-@router.get("/reflection/admin/execute")
-@router.get("/admin/execute", response_class=HTMLResponse)
+@router.get("/reflection/execute")
 def admin_execute_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -1617,8 +1594,7 @@ class ExecutePayload(Dict[str, Any]):
     page_size: int
 
 
-@router.post("/reflection/admin/execute")
-@router.post("/admin/execute")
+@router.post("/reflection/execute")
 def admin_execute_api(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -1836,6 +1812,79 @@ def api_list_supers(
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
 
+@router.delete("/reflection/super")
+@router.delete("/admin/super")
+def api_delete_super(
+    request: Request,
+    organization: str = Query(..., description="Organization identifier"),
+    super_name: str = Query(..., description="SuperTable name"),
+    _: Any = Depends(admin_guard_api),
+):
+    """Delete a SuperTable from Redis and storage (destructive)."""
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+    storage = get_storage()
+    catalog = RedisCatalog()
+
+    base_dir = os.path.join(organization, super_name)
+
+    # Delete storage first; if it fails (other than missing), do not remove Redis meta.
+    try:
+        if storage.exists(base_dir):
+            storage.delete(base_dir)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
+
+    deleted_keys = 0
+    try:
+        deleted_keys = catalog.delete_super_table(organization, super_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
+
+    return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
+
+
+@router.delete("/reflection/table")
+@router.delete("/admin/table")
+def api_delete_table(
+    request: Request,
+    organization: str = Query(..., description="Organization identifier"),
+    super_name: str = Query(..., description="SuperTable name"),
+    table: Optional[str] = Query(None, description="Simple table name (preferred query param: table)"),
+    table_name: Optional[str] = Query(None, description="Simple table name (compat)"),
+    _: Any = Depends(admin_guard_api),
+):
+    """Delete a simple table (leaf) from Redis and its folder from storage (destructive)."""
+    simple = (table or table_name or "").strip()
+    if not organization or not super_name or not simple:
+        raise HTTPException(status_code=400, detail="organization, super_name and table are required")
+
+    storage = get_storage()
+    catalog = RedisCatalog()
+
+    simple_folder = os.path.join(organization, super_name, "tables", simple)
+
+    try:
+        if storage.exists(simple_folder):
+            storage.delete(simple_folder)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
+
+    try:
+        catalog.delete_simple_table(organization, super_name, simple)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
+
+    return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
+
+
+
+@router.get("/reflection/tables")
 @router.get("/reflection/admin/tables")
 @router.get("/admin/tables", response_class=HTMLResponse)
 def tables_page(

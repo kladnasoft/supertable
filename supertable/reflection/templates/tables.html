@@ -737,6 +737,7 @@
     #tablesTable th.col-size { width: 140px; }
     #tablesTable th.col-updated { width: 190px; }
     #tablesTable th.col-details { width: 260px; }
+    .col-delete { width: 120px; text-align: right; }
 
     /* Fix for the professional header bar separator */
     .d-flex.justify-content-between.align-items-center.mb-3 {
@@ -752,6 +753,19 @@
     /* Ensure action buttons in DataTables don't wrap too aggressively */
     .actions-cell {
         white-space: nowrap;
+    }
+
+    /* Delete button: outline only, fills on hover (prevents accidental 'solid red') */
+    .btn-delete-outline {
+        background: transparent;
+        border: 1px solid #dc3545;
+        color: #dc3545;
+        font-weight: 700;
+        transition: var(--transition);
+    }
+    .btn-delete-outline:hover {
+        background: #dc3545;
+        color: #ffffff;
     }
 
 
@@ -932,6 +946,7 @@
       if (label) {
         label.textContent = 'SuperTable: ' + sup;
       }
+      renderTables(sup, []);
       loadTenantSuper(sup);
     }
 
@@ -1146,6 +1161,13 @@
           '<i class="fas fa-terminal"></i></button>';
         tr.appendChild(tdActions);
 
+        const tdDelete = document.createElement('td');
+        tdDelete.className = 'actions-cell text-right';
+        tdDelete.innerHTML =
+          '<button class="btn btn-sm btn-delete-outline" type="button" onclick="deleteTable(\'' + safeName + '\')">' +
+          '<i class="fas fa-trash"></i>&nbsp;Delete</button>';
+        tr.appendChild(tdDelete);
+
         tbody.appendChild(tr);
       });
 
@@ -1181,7 +1203,9 @@
         label.textContent = 'SuperTable: ' + superName;
       }
 
-      api(
+      renderTables(superName, []);
+
+            api(
         META_BASE + '/reflection/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
@@ -1816,6 +1840,29 @@ async function openSchema(simple) {
       window.location.href = url.toString();
     }
 
+function deleteTable(simple) {
+      const sel = document.getElementById('pairSel');
+      const sup = sel && sel.value ? sel.value : currentSuper;
+
+      if (!simple || !sup) return;
+
+      const typed = prompt('Type the table name "' + simple + '" to permanently delete it.');
+      if (typed !== simple) return;
+
+      api(
+        META_BASE + '/reflection/table?organization=' +
+        encodeURIComponent(ORGANIZATION) +
+        '&super_name=' + encodeURIComponent(sup) +
+        '&table=' + encodeURIComponent(simple),
+        { method: 'DELETE' }
+      ).then(() => {
+        // Refresh current super meta/tables
+        loadTenantSuper(sup);
+      }).catch(err => {
+        showModal('Delete failed', escapeHtml(err.message || err));
+      });
+    }
+
     function closeOverviewOverlay() {
       const overlay = document.getElementById('overviewOverlay');
       overlay.style.display = 'none';
@@ -1936,6 +1983,7 @@ async function openSchema(simple) {
                 <th class="col-size">Size</th>
                 <th class="col-updated">Updated</th>
                 <th class="col-details">Details</th>
+                <th class="col-delete">Delete</th>
               </tr>
             </thead>
             <tbody id="tablesBody"></tbody>

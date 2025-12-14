@@ -102,7 +102,18 @@ class SimpleTable:
         simple_table_folder = os.path.join(
             self.super_table.organization, self.super_table.super_name, self.identity, self.simple_name
         )
-        self.storage.delete(simple_table_folder)
+        try:
+            if self.storage.exists(simple_table_folder):
+                self.storage.delete(simple_table_folder)
+        except FileNotFoundError:
+            pass
+
+        # Remove Redis meta (leaf pointer + lock)
+        self.catalog.delete_simple_table(
+            self.super_table.organization,
+            self.super_table.super_name,
+            self.simple_name,
+        )
 
         logger.info(f"Deleted Table (storage): {simple_table_folder}")
 

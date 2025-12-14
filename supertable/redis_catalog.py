@@ -658,3 +658,57 @@ return 0
                 }
             except Exception:
                 continue
+
+
+# ------------- Deletions (dangerous) -------------
+
+    def delete_simple_table(self, org: str, sup: str, simple: str) -> bool:
+        """Delete a simple table's Redis meta (leaf pointer + lock).
+
+        This does **not** delete storage. Callers should delete storage first, then call this.
+        """
+        if not (org and sup and simple):
+            return False
+        keys = [_leaf_key(org, sup, simple), _lock_key(org, sup, simple)]
+        try:
+            # DEL returns number of keys removed
+            self.r.delete(*keys)
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_simple_table error: {e}")
+            return False
+
+    def delete_super_table(self, org: str, sup: str, count: int = 1000) -> int:
+        """Delete **all** Redis keys for a given supertable (meta + locks + RBAC, etc).
+
+        This is implemented via SCAN to avoid blocking Redis.
+        Returns the number of keys deleted (best-effort).
+        """
+        if not (org and sup):
+            return 0
+        pattern = f"supertable:{org}:{sup}:*"
+        return self._delete_by_scan(pattern=pattern, count=count)
+
+    def _delete_by_scan(self, pattern: str, count: int = 1000) -> int:
+        deleted = 0
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
+                # redis-py may return list[str] or list[bytes]
+                str_keys = [k if isinstance(k, str) else k.decode("utf-8") for k in (keys or [])]
+                if str_keys:
+                    try:
+                        with self.r.pipeline() as p:
+                            for k in str_keys:
+                                p.delete(k)
+                            res = p.execute()
+                        # Each delete returns 0/1, sum them
+                        deleted += sum(int(x or 0) for x in res)
+                    except redis.RedisError as e:
+                        logger.error(f"[redis-catalog] pipeline DEL error: {e}")
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] SCAN delete error: {e}")
+        return deleted

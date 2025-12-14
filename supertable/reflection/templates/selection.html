@@ -321,6 +321,15 @@ const filesEl = document.getElementById("tenantFilesValue");
         return d.toLocaleString();
     }
 
+    function clearEmbeddedTablesIfPresent() {
+        const tbody = document.getElementById('tablesBody');
+        if (tbody) tbody.innerHTML = '';
+        const totalEl = document.getElementById('tablesTotalCount');
+        const shownEl = document.getElementById('tablesShownCount');
+        if (totalEl) totalEl.textContent = '0';
+        if (shownEl) shownEl.textContent = '0';
+    }
+
     function applySuperMeta(superMeta) {
         if (!superMeta) {
             filesEl.textContent = "n/a";
@@ -328,6 +337,7 @@ const filesEl = document.getElementById("tenantFilesValue");
             sizeEl.textContent = "n/a";
             versionEl.textContent = "n/a";
             updatedEl.textContent = "n/a";
+            clearEmbeddedTablesIfPresent();
             return;
         }
 
@@ -381,6 +391,7 @@ const filesEl = document.getElementById("tenantFilesValue");
     }
 
     async function loadSuperMeta(superName) {
+        clearEmbeddedTablesIfPresent();
         if (!superName) {
             applySuperMeta(null);
             return;
@@ -410,6 +421,11 @@ const filesEl = document.getElementById("tenantFilesValue");
     window.onPairChange = function onPairChange() {
         const superName = pairSel.value;
         loadSuperMeta(superName);
+        try {
+            window.dispatchEvent(new CustomEvent('supertable-changed', { detail: { super_name: superName } }));
+        } catch (e) {
+            // ignore
+        }
     };
 
     if (document.readyState === "loading") {
