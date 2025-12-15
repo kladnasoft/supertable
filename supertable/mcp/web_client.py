@@ -54,6 +54,15 @@ class MCPWebClient:
         self._pending: Dict[int, asyncio.Future[Dict[str, Any]]] = {}
         self.events: list[McpEvent] = []
 
+
+    def _subprocess_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        # Ensure the spawned server uses stdio transport even if the parent process
+        # is configured for streamable-http (remote server mode).
+        env["SUPERTABLE_MCP_TRANSPORT"] = "stdio"
+        return env
+
+
     async def start(self) -> None:
         if self._proc:
             return
@@ -67,6 +76,7 @@ class MCPWebClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
+            env=self._subprocess_env(),
         )
         if not self._proc.stdin or not self._proc.stdout:
             raise RuntimeError("Failed to open stdio pipes to MCP server process")

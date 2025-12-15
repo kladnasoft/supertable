@@ -46,15 +46,39 @@ logging.basicConfig(
 logger = logging.getLogger("supertable.mcp")
 
 # ---------- MCP SDK ----------
+_MCP_SDK_AVAILABLE = True
 try:
     from mcp.server.fastmcp import FastMCP  # modern SDK
 except Exception:
     try:
         from mcp import FastMCP  # legacy fallback
     except Exception:
-        logger.error("MCP SDK not installed. Run: pip install mcp")
-        raise
+        _MCP_SDK_AVAILABLE = False
+        logger.error("MCP SDK not installed. Install with: pip install mcp")
 
+        class FastMCP:  # type: ignore[no-redef]
+            """Fallback shim so this module can import without the MCP SDK.
+
+            The real implementation comes from the `mcp` package. Without it, we
+            keep decorators as no-ops and raise a clear error at runtime.
+            """
+
+            def __init__(self, *_: object, **__: object) -> None:
+                return
+
+            def tool(self, *_: object, **__: object):
+                def _decorator(fn):
+                    return fn
+                return _decorator
+
+            def run(self, *_: object, **__: object) -> None:
+                raise RuntimeError("MCP SDK not installed. Install with: pip install mcp")
+
+            def streamable_http_app(self, *_: object, **__: object):
+                raise RuntimeError("MCP SDK not installed. Install with: pip install mcp")
+
+            def sse_app(self, *_: object, **__: object):
+                raise RuntimeError("MCP SDK not installed. Install with: pip install mcp")
 # ---------- AnyIO ----------
 try:
     import anyio
@@ -85,6 +109,76 @@ USER_HASH_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _normalize_transport_value(value: Optional[str], default: str = "stdio") -> str:
+    """Normalize transport names across MCP SDK versions and docs.
+
+    Notes:
+    - Claude Desktop "Remote MCP servers" use the Streamable HTTP transport.
+    - Some docs and SDKs refer to this as "http"; others use "streamable-http".
+    - We normalize all Streamable HTTP aliases to "streamable-http".
+    """
+    v = (value or default).strip().lower()
+    if v in {"", "stdio"}:
+        return "stdio"
+    if v in {"http", "streamable-http", "streamable_http", "streamablehttp"}:
+        return "streamable-http"
+    if v == "sse":
+        return "sse"
+    return v
+
+
+
+def _serve_streamable_http_via_uvicorn(*, mcp: FastMCP, host: str, port: int, path: str) -> None:
+    """Serve the MCP server via Streamable HTTP using an external ASGI server.
+
+    Compatibility note:
+    - Some MCP SDK / FastMCP versions do not support passing `host`/`port` to
+      `mcp.run(transport="streamable-http")`.
+    - The most reliable approach is to build the ASGI app and run it via Uvicorn.
+    """
+    # Build the ASGI app. Different SDK versions expose different helpers.
+    app_factory = None
+    if hasattr(mcp, "http_app"):
+        app_factory = getattr(mcp, "http_app")
+    elif hasattr(mcp, "streamable_http_app"):
+        app_factory = getattr(mcp, "streamable_http_app")
+
+    if app_factory is None:
+        raise RuntimeError(
+            "This FastMCP version does not provide http_app()/streamable_http_app(); "
+            "upgrade the MCP Python SDK / FastMCP to enable remote HTTP transport."
+        )
+
+    normalized_path = (path or "/mcp").strip() or "/mcp"
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+
+    # Prefer first-class `path` support if the SDK exposes it.
+    try:
+        sig = inspect.signature(app_factory)
+        if "path" in sig.parameters:
+            app = app_factory(path=normalized_path)
+        else:
+            app = app_factory()
+            if normalized_path not in {"/mcp", "/mcp/"}:
+                logger.warning(
+                    "Configured SUPERTABLE_MCP_HTTP_PATH=%s but the installed FastMCP SDK "
+                    "does not support custom paths on http_app(); using the default /mcp.",
+                    normalized_path,
+                )
+    except Exception:
+        app = app_factory()
+
+    try:
+        import uvicorn
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("uvicorn must be installed to serve MCP over HTTP") from exc
+
+    uvicorn.run(app, host=host, port=port)
+
+def _env_transport(name: str, default: str = "stdio") -> str:
+    return _normalize_transport_value(os.getenv(name), default=default)
 
 def _env_hashes(name: str) -> Optional[Set[str]]:
     v = (os.getenv(name) or "").strip()
@@ -140,8 +234,12 @@ class Config:
     require_explicit_user_hash: bool = _env_bool("SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH", True)
     allowed_user_hashes: Optional[Set[str]] = field(default_factory=lambda: _env_hashes("SUPERTABLE_ALLOWED_USER_HASHES"))
     allow_sysadmin_default: bool = _env_bool("SUPERTABLE_ALLOW_SYSADMIN_DEFAULT", False)
-    require_token: bool = True
+    require_token: bool = _env_bool("SUPERTABLE_REQUIRE_TOKEN", True)
     shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", ""))
+    transport: str = _env_transport("SUPERTABLE_MCP_TRANSPORT", "stdio")
+    http_host: str = os.getenv("SUPERTABLE_MCP_HTTP_HOST", "0.0.0.0")
+    http_port: int = int(os.getenv("SUPERTABLE_MCP_HTTP_PORT", "8000"))
+    http_path: str = os.getenv("SUPERTABLE_MCP_HTTP_PATH", "/mcp")
 
 CFG = Config()
 
@@ -156,7 +254,15 @@ def _build_mcp(name: str, version: str) -> FastMCP:
         return FastMCP(name)
 
 mcp = _build_mcp(CFG.name, CFG.version)
-limiter = anyio.CapacityLimiter(CFG.max_concurrency)
+_LIMITER: Optional["anyio.CapacityLimiter"] = None
+
+def _get_limiter() -> "anyio.CapacityLimiter":
+    global _LIMITER
+    if _LIMITER is None:
+        # Initialize lazily inside an async context (required by AnyIO/sniffio).
+        _LIMITER = anyio.CapacityLimiter(CFG.max_concurrency)
+    return _LIMITER
+
 
 # ---------- Auth helpers ----------
 def _check_token(auth_token: Optional[str]) -> None:
@@ -302,7 +408,7 @@ async def list_tables(super_name: str, organization: str, user_hash: Optional[st
         reader = MetaReader(super_name=sup, organization=org)  # class helper  :contentReference[oaicite:5]{index=5}
         return list(reader.get_tables(user_hash=u))            # correct method: get_tables
 
-    async with limiter:
+    async with _get_limiter():
         tables = await anyio.to_thread.run_sync(_work)
     return {"result": tables}
 
@@ -320,7 +426,7 @@ async def describe_table(super_name: str, organization: str, table: str, user_ha
         reader = MetaReader(super_name=sup, organization=org)
         return reader.get_table_schema(tbl, user_hash=u)
 
-    async with limiter:
+    async with _get_limiter():
         schema = await anyio.to_thread.run_sync(_work)
     return {"result": schema}
 
@@ -338,7 +444,7 @@ async def get_table_stats(super_name: str, organization: str, table: str, user_h
         reader = MetaReader(super_name=sup, organization=org)
         return reader.get_table_stats(tbl, user_hash=u)
 
-    async with limiter:
+    async with _get_limiter():
         stats = await anyio.to_thread.run_sync(_work)
     return {"result": stats}
 
@@ -355,7 +461,7 @@ async def get_super_meta(super_name: str, organization: str, user_hash: Optional
         reader = MetaReader(super_name=sup, organization=org)
         return reader.get_super_meta(user_hash=u)
 
-    async with limiter:
+    async with _get_limiter():
         meta = await anyio.to_thread.run_sync(_work)
     return {"result": meta}
 
@@ -415,7 +521,7 @@ async def query_sql(
     eng = _resolve_engine(engine)
     timeout = float(query_timeout_sec or CFG.default_query_timeout_sec)
 
-    async with limiter:
+    async with _get_limiter():
         try:
             if hasattr(anyio, "fail_after"):
                 with anyio.fail_after(timeout):
@@ -462,18 +568,61 @@ async def query_sql(
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
     try:
+        transport = _normalize_transport_value(getattr(CFG, "transport", "stdio"))
         logger.info(
-            "Starting MCP server (stdio). max_concurrency=%d require_explicit_user_hash=%s require_token=%s",
+            "Starting MCP server. transport=%s max_concurrency=%d require_explicit_user_hash=%s require_token=%s",
+            transport,
             CFG.max_concurrency,
             str(CFG.require_explicit_user_hash),
             str(CFG.require_token),
         )
-        if not (CFG.shared_token or '').strip():
-            raise RuntimeError('SUPERTABLE_MCP_AUTH_TOKEN must be set (token auth is always required).')
-        mcp.run()
+        if CFG.require_token and not (CFG.shared_token or "").strip():
+            raise RuntimeError(
+                "SUPERTABLE_MCP_AUTH_TOKEN must be set when SUPERTABLE_REQUIRE_TOKEN=1."
+            )
+
+        run_kwargs: Dict[str, Any] = {"transport": transport}
+        if transport != "stdio":
+            logger.info(
+                "HTTP transport configured. host=%s port=%s path=%s",
+                CFG.http_host,
+                str(CFG.http_port),
+                CFG.http_path,
+            )
+
+        if transport == "streamable-http":
+            _serve_streamable_http_via_uvicorn(
+                mcp=mcp, host=CFG.http_host, port=CFG.http_port, path=CFG.http_path
+            )
+            sys.exit(0)
+
+        if transport != "stdio":
+            run_kwargs.update({"host": CFG.http_host, "port": CFG.http_port})
+            # Prefer explicit path support when available; otherwise rely on SDK defaults.
+            try:
+                run_sig = inspect.signature(mcp.run)
+                if "path" in run_sig.parameters:
+                    run_kwargs["path"] = CFG.http_path
+                elif "mcp_path" in run_sig.parameters:
+                    run_kwargs["mcp_path"] = CFG.http_path
+            except Exception:
+                pass
+
+
+        try:
+            mcp.run(**run_kwargs)
+        except TypeError:
+            # Backward/forward compatibility across MCP SDK versions.
+            # Some transports (e.g. older streamable-http aliases) may not accept host/port/path kwargs.
+            run_kwargs.pop("path", None)
+            run_kwargs.pop("mcp_path", None)
+            run_kwargs.pop("host", None)
+            run_kwargs.pop("port", None)
+            mcp.run(**run_kwargs)
     except KeyboardInterrupt:
         logger.info("Shutting down MCP server (KeyboardInterrupt).")
         sys.exit(0)
     except Exception as exc:
         logger.exception("Fatal error in MCP server: %s", exc)
         sys.exit(1)
+
