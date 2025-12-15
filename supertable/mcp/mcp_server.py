@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, List, Optional, Set, Tuple
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------- Import path: allow `from supertable.*` ----------
 # This file lives at `supertable/mcp/mcp_server.py`. When executed as a script,
@@ -138,8 +140,8 @@ class Config:
     require_explicit_user_hash: bool = _env_bool("SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH", True)
     allowed_user_hashes: Optional[Set[str]] = field(default_factory=lambda: _env_hashes("SUPERTABLE_ALLOWED_USER_HASHES"))
     allow_sysadmin_default: bool = _env_bool("SUPERTABLE_ALLOW_SYSADMIN_DEFAULT", False)
-    require_token: bool = _env_bool("SUPERTABLE_MCP_REQUIRE_TOKEN", False)
-    shared_token: str = os.getenv("SUPERTABLE_MCP_TOKEN", "")
+    require_token: bool = True
+    shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", ""))
 
 CFG = Config()
 
@@ -178,7 +180,7 @@ def _resolve_user(user_hash: Optional[str]) -> str:
         if not _allowed_user_hash(u):
             raise PermissionError("user_hash not permitted by server policy.")
         return u
-    u = user_hash or os.getenv("SUPERTABLE_TEST_USER_HASH") or ""
+    u = user_hash or os.getenv("SUPERTABLE_SUPERHASH") or os.getenv("SUPERTABLE_TEST_USER_HASH") or ""
     if not u:
         raise PermissionError("user_hash missing and no default configured.")
     return _validate_user_hash(u)
@@ -271,11 +273,6 @@ async def info() -> Dict[str, Any]:
 @mcp.tool()
 @log_tool
 async def whoami(user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
-    _check_token(auth_token)
-    _check_token(auth_token)
-    _check_token(auth_token)
-    _check_token(auth_token)
-    _check_token(auth_token)
     _check_token(auth_token)
     u = _resolve_user(user_hash)
     return {"result": {"user_hash": u}}
@@ -471,6 +468,8 @@ if __name__ == "__main__":
             str(CFG.require_explicit_user_hash),
             str(CFG.require_token),
         )
+        if not (CFG.shared_token or '').strip():
+            raise RuntimeError('SUPERTABLE_MCP_AUTH_TOKEN must be set (token auth is always required).')
         mcp.run()
     except KeyboardInterrupt:
         logger.info("Shutting down MCP server (KeyboardInterrupt).")

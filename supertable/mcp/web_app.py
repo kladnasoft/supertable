@@ -2,8 +2,10 @@
 # web_app.py — minimal FastAPI UI for exercising the MCP server
 from __future__ import annotations
 
+import hmac
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -11,14 +13,24 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from supertable.mcp.web_client import MCPWebClient
 
-app = FastAPI(title="Supertable MCP Web Tester")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Replaces deprecated @app.on_event startup/shutdown.
+    await _startup()
+    try:
+        yield
+    finally:
+        await _shutdown()
+
+app = FastAPI(title="Supertable MCP Web Tester", lifespan=lifespan)
 
 _client: Optional[MCPWebClient] = None
 
 def _client_or_raise() -> MCPWebClient:
-    if _client is None:
+    c = getattr(app.state, 'mcp_client', None) or _client
+    if c is None:
         raise HTTPException(status_code=503, detail="MCP client not initialized")
-    return _client
+    return c
 
 
 def _parse_bearer(auth_header: str) -> str:
@@ -30,35 +42,58 @@ def _parse_bearer(auth_header: str) -> str:
     return v
 
 
-def _require_gateway_auth(req: Request) -> None:
-    """Optional auth for the HTTP gateway itself (separate from MCP tool auth).
-
-    This is intended for remote clients (e.g., Claude Desktop) hitting your K8s service.
-    It defaults to disabled for backward compatibility.
+def _expected_gateway_token() -> str:
     """
-    if os.getenv("SUPERTABLE_MCP_HTTP_REQUIRE_TOKEN", "false").strip().lower() not in {"1", "true", "yes"}:
-        return
-    expected = os.getenv("SUPERTABLE_MCP_HTTP_TOKEN", "").strip()
+    Token required to access the HTTP gateway + web API.
+
+    By default we use SUPERTABLE_SUPERTOKEN (same token you already use for the web UI),
+    and fall back to SUPERTABLE_MCP_HTTP_TOKEN for deployments that prefer a dedicated
+    gateway secret.
+    """
+    return (os.getenv("SUPERTABLE_SUPERTOKEN") or os.getenv("SUPERTABLE_MCP_HTTP_TOKEN") or "").strip()
+
+
+def _require_gateway_auth(req: Request) -> None:
+    """Require a shared-secret token for ALL HTTP access (robust by default).
+
+    Supported ways to pass the token:
+      - Authorization: Bearer <token>
+      - X-Auth-Code: <token>
+      - ?auth=<token> (useful for loading the UI in a browser without extensions)
+
+    Notes:
+      - This protects the HTTP surface area. The stdio MCP server has its own tool auth
+        (auth_token) as an additional layer.
+    """
+    expected = _expected_gateway_token()
     if not expected:
-        raise HTTPException(status_code=500, detail="Gateway auth enabled but SUPERTABLE_MCP_HTTP_TOKEN is not set")
+        raise HTTPException(
+            status_code=500,
+            detail="SUPERTABLE_SUPERTOKEN (or SUPERTABLE_MCP_HTTP_TOKEN) must be set to protect the web gateway",
+        )
 
     got = _parse_bearer(req.headers.get("authorization", ""))
     if not got:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    if got != expected:
+        got = (req.headers.get("x-auth-code") or "").strip()
+    if not got:
+        got = (req.query_params.get("auth") or "").strip()
+
+    if not got:
+        raise HTTPException(status_code=401, detail="Missing auth token (Authorization / X-Auth-Code / ?auth=)")
+    if not hmac.compare_digest(got, expected):
         raise HTTPException(status_code=403, detail="Invalid token")
 
-@app.on_event("startup")
 async def _startup() -> None:
     global _client
+    if os.getenv("SUPERTABLE_MCP_WEB_DISABLE_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}:
+        return
     if _client is None:
         _client = MCPWebClient(
             server_path=os.getenv("MCP_SERVER_PATH"),
-            auth_token=os.getenv("SUPERTABLE_MCP_TOKEN", ""),
+            auth_token=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", "")),
         )
         await _client.start()
 
-@app.on_event("shutdown")
 async def _shutdown() -> None:
     global _client
     if _client is not None:
@@ -66,7 +101,9 @@ async def _shutdown() -> None:
         _client = None
 
 @app.get("/", response_class=HTMLResponse)
-async def home() -> str:
+async def home(req: Request) -> str:
+    _require_gateway_auth(req)
+
     return """
 <!doctype html>
 <html>
@@ -88,7 +125,10 @@ async def home() -> str:
 </head>
 <body>
   <h2>Supertable MCP Web Tester</h2>
-  <p class="muted">This page calls your MCP server via a persistent stdio subprocess and shows request/response payloads.</p>
+  <p class="muted">
+    This UI is protected. Open this page with <code>?auth=&lt;SUPERTABLE_SUPERTOKEN&gt;</code> or send
+    <code>Authorization: Bearer …</code>. The token is also attached to API calls from the browser.
+  </p>
 
   <div class="grid">
     <div class="card">
@@ -166,15 +206,30 @@ async function callApi(name){
   if(name === 'info') return await getJson('/api/info');
   if(name === 'events') return await getJson('/api/events');
 }
+async function getAuthToken(){
+  // Prefer URL ?auth=... (handy for first load), else localStorage.
+  const params = new URLSearchParams(window.location.search);
+  const q = (params.get('auth') || '').trim();
+  if(q){ localStorage.setItem('supertable_auth', q); return q; }
+  return (localStorage.getItem('supertable_auth') || '').trim();
+}
+function authHeaders(token){
+  const h = {};
+  if(token){ h['authorization'] = 'Bearer ' + token; }
+  return h;
+}
 async function getJson(url){
-  const r = await fetch(url);
+  const token = await getAuthToken();
+  const r = await fetch(url, { headers: authHeaders(token) });
   const j = await r.json();
   if(url.endsWith('/events')) document.getElementById('events').textContent = JSON.stringify(j, null, 2);
   else document.getElementById('out').textContent = JSON.stringify(j, null, 2);
   return j;
 }
 async function postJson(url, body){
-  const r = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+  const token = await getAuthToken();
+  const headers = {'content-type':'application/json', ...authHeaders(token)};
+  const r = await fetch(url, {method:'POST', headers, body: JSON.stringify(body)});
   const j = await r.json();
   document.getElementById('out').textContent = JSON.stringify(j, null, 2);
   return j;
@@ -185,8 +240,8 @@ async function postJson(url, body){
 """
 
 
-@app.post("/mcp")
-async def mcp_http_gateway(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+@app.post("/mcp_v1")
+async def mcp_http_gateway_v1(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     """Claude/Desktop-friendly MCP over HTTP.
 
     Accepts JSON-RPC 2.0 requests and forwards them to the stdio MCP server.
@@ -240,19 +295,22 @@ async def mcp_http_gateway(req: Request, payload: Dict[str, Any] = Body(...)) ->
     return JSONResponse(resp)
 
 @app.get("/api/health")
-async def api_health() -> JSONResponse:
+async def api_health(req: Request) -> JSONResponse:
+    _require_gateway_auth(req)
     c = _client_or_raise()
     resp = await c.tool("health", {})
     return JSONResponse(resp)
 
 @app.get("/api/info")
-async def api_info() -> JSONResponse:
+async def api_info(req: Request) -> JSONResponse:
+    _require_gateway_auth(req)
     c = _client_or_raise()
     resp = await c.tool("info", {})
     return JSONResponse(resp)
 
 @app.get("/api/events")
-async def api_events() -> JSONResponse:
+async def api_events(req: Request) -> JSONResponse:
+    _require_gateway_auth(req)
     c = _client_or_raise()
     # keep it lightweight for the browser
     tail = c.events[-200:]
@@ -303,7 +361,8 @@ async def mcp_http_gateway(req: Request, body: Dict[str, Any] = Body(...)) -> JS
     return JSONResponse(resp)
 
 @app.post("/api/list_supers")
-async def api_list_supers(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_list_supers(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     if not org:
         raise HTTPException(status_code=400, detail="organization required")
@@ -312,7 +371,8 @@ async def api_list_supers(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     return JSONResponse(resp)
 
 @app.post("/api/list_tables")
-async def api_list_tables(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_list_tables(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     u = (payload.get("user_hash") or "").strip()
@@ -323,7 +383,8 @@ async def api_list_tables(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     return JSONResponse(resp)
 
 @app.post("/api/describe_table")
-async def api_describe_table(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_describe_table(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     tbl = (payload.get("table") or "").strip()
@@ -335,7 +396,8 @@ async def api_describe_table(payload: Dict[str, Any] = Body(...)) -> JSONRespons
     return JSONResponse(resp)
 
 @app.post("/api/get_table_stats")
-async def api_get_table_stats(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_get_table_stats(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     tbl = (payload.get("table") or "").strip()
@@ -347,7 +409,8 @@ async def api_get_table_stats(payload: Dict[str, Any] = Body(...)) -> JSONRespon
     return JSONResponse(resp)
 
 @app.post("/api/get_super_meta")
-async def api_get_super_meta(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_get_super_meta(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     u = (payload.get("user_hash") or "").strip()
@@ -358,7 +421,8 @@ async def api_get_super_meta(payload: Dict[str, Any] = Body(...)) -> JSONRespons
     return JSONResponse(resp)
 
 @app.post("/api/query_sql")
-async def api_query_sql(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def api_query_sql(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     sql = (payload.get("sql") or "").strip()

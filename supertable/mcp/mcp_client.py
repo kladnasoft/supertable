@@ -136,7 +136,7 @@ def load_config(server_path: str, verbose: bool) -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
     cfg["server_path"] = os.getenv("MCP_SERVER_PATH", json_cfg.get("server_path", server_path or "mcp_server.py"))
     cfg["wire"] = os.getenv("MCP_WIRE", json_cfg.get("wire", "ndjson"))
-    cfg["org"] = os.getenv("SUPERTABLE_TEST_ORG", json_cfg.get("org", ""))
+    cfg["org"] = os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", json_cfg.get("org", "")))
     cfg["super"] = os.getenv("SUPERTABLE_TEST_SUPER", json_cfg.get("super", ""))
     cfg["user_hash"] = os.getenv(
         "SUPERTABLE_TEST_USER_HASH",
@@ -527,7 +527,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local MCP stdio client")
     parser.add_argument("--server", dest="server_path", default=os.getenv("MCP_SERVER_PATH", _DEFAULT_SERVER_PATH))
     parser.add_argument("--wire", dest="wire", default=os.getenv("MCP_WIRE", "ndjson"), choices=["ndjson", "lsp"])
-    parser.add_argument("--org", dest="org", default=os.getenv("SUPERTABLE_TEST_ORG", ""))
+    parser.add_argument("--org", dest="org", default=os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", "")))
     parser.add_argument("--super", dest="super_name", default=os.getenv("SUPERTABLE_TEST_SUPER", ""))
     parser.add_argument(
         "--hash",
@@ -546,7 +546,7 @@ def main() -> None:
             ),
         ),
     )
-    parser.add_argument("--token", dest="auth_token", default=os.getenv("SUPERTABLE_MCP_TOKEN", ""))
+    parser.add_argument("--token", dest="auth_token", default=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", "")))
     # Default SQL may be empty; if env gives SELECT 1, we will show it and then fallback
     parser.add_argument("--sql", dest="sql", default=os.getenv("SUPERTABLE_TEST_QUERY", ""))
     parser.add_argument("--engine", dest="engine", default=os.getenv("SUPERTABLE_TEST_ENGINE", ""))
@@ -635,7 +635,7 @@ def main() -> None:
     if not org:
         org = _prompt_from_tty("Enter organization: ").strip()
     if not org:
-        print("ERROR: missing organization. Supply --org or SUPERTABLE_TEST_ORG.", file=sys.stderr, flush=True)
+        print("ERROR: missing organization. Supply --org or SUPERTABLE_ORGANIZATION.", file=sys.stderr, flush=True)
         proc.terminate()
         try:
             proc.wait(timeout=5)
