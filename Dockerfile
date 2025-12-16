@@ -16,7 +16,7 @@ RUN apt-get update -o Acquire::Retries=3 \
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the codebase (includes supertable/rest)
+# Copy the codebase (includes supertable/reflection)
 COPY supertable/ ./supertable/
 
 # Entrypoint
