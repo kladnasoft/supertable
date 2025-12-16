@@ -19,7 +19,7 @@ A high‑performance, lightweight transaction catalog that defaults to **Redis (
 - [Architecture](#architecture)
 - [Quick start (Docker Compose)](#quick-start-docker-compose)
 - [Profiles & run matrix](#profiles--run-matrix)
-- [Admin UI](#admin-ui)
+- [Reflection UI](#reflection-ui)
 - [MCP server (stdio)](#mcp-server-stdio)
 - [Configuration](#configuration)
   - [Redis](#redis)
@@ -39,7 +39,7 @@ A high‑performance, lightweight transaction catalog that defaults to **Redis (
 ## What’s new
 
 - **Default backends:** `LOCKING_BACKEND=redis` and `STORAGE_TYPE=MINIO`.
-- **Out-of-the-box Admin UI** (FastAPI + Jinja2) on port **8000**.
+- **Out-of-the-box Reflection UI** (FastAPI + Jinja2) on port **8000**.
 - **MCP stdio server** (`mcp_server.py`) with optional hash enforcement.
 - **Profiles** for flexible runtime: host-backed by default, `infra` when you want built-in Redis+MinIO.
 
@@ -105,9 +105,9 @@ SUPERTABLE_TEST_QUERY=
 SUPERTABLE_ADMIN_TOKEN=replace-me
 ENV
 
-# 3) Start Admin against HOST services (default)
+# 3) Start Reflection UI against HOST services (default)
 docker compose --profile admin up -d
-# Open http://localhost:8000  (login with SUPERTABLE_ADMIN_TOKEN)
+# Open http://localhost:8000  (redirects to /reflection/login)
 ```
 
 > Linux note: this stack uses `host.docker.internal` (provided via `extra_hosts`) so containers can reach services on the host. Replace with your host IP if needed.
@@ -118,7 +118,7 @@ docker compose --profile admin up -d
 
 **Profiles:**
 
-- `admin` — run the Admin UI/API (port 8000)
+- `admin` — run the Reflection UI (port 8000)
 - `mcp` — run the MCP server (stdio; no port)
 - `infra` — optional Redis + MinIO inside the stack
 
@@ -151,18 +151,82 @@ STORAGE_ENDPOINT_URL=http://minio:9000 REDIS_HOST=redis REDIS_DB=0 docker compos
 
 ---
 
-## Admin UI
+## Reflection UI
 
-- `/` → `/admin/login`
-- `/admin` → overview of tenants / tables, etc.
-- `/admin/config` → effective env values (secrets redacted)
+**Reflection** is SuperTable’s built‑in browser UI (FastAPI + Jinja2 templates) for operating a SuperTable instance:
+
+- browse **SuperTables** and their tables/files (“leaves”)
+- inspect metadata and basic stats
+- manage **users/roles/tokens** (for UI/API access)
+- run **read‑only SQL** in the in‑browser editor (with syntax highlighting + autocomplete)
+
+### Routes
+
+- `/` → redirects to `/reflection/login`
+- `/reflection/login` → sign‑in page
+- `/reflection/admin` → main dashboard (tenants, mirrors, users/roles/tokens, config)
+- `/reflection/tables` → table/leaf browser
+- `/reflection/execute` → SQL editor + results
+- `/reflection/admin/config` → effective env values (secrets redacted)
 - `/healthz` → `ok` when Redis is reachable
 
-Auth uses a cookie set with `SUPERTABLE_ADMIN_TOKEN`.
+### Authentication model
+
+Reflection supports two login modes (controlled by `SUPERTABLE_LOGIN_MASK`):
+
+- **Superuser login** (recommended for administration)  
+  Uses `SUPERTABLE_SUPERTOKEN` (or the legacy fallback `SUPERTABLE_ADMIN_TOKEN`).  
+  On success it sets two cookies: `st_admin_token` (superuser token) and `st_session` (signed session).
+
+- **Regular user login** (least privilege)  
+  Uses **Username + Access Token** (tokens are created by a superuser in Reflection).  
+  On success it sets only `st_session`.
+
+### Important environment variables
+
+- `SUPERTABLE_ORGANIZATION` — default organization used by the UI.
+- `SUPERTABLE_SUPERTOKEN` — superuser token for privileged admin actions (preferred).
+- `SUPERTABLE_ADMIN_TOKEN` — legacy fallback for `SUPERTABLE_SUPERTOKEN` (kept for compatibility).
+- `SUPERTABLE_SUPERHASH` — user hash for the superuser identity (must exist in the underlying user registry).
+- `SUPERTABLE_LOGIN_MASK` — `1` superuser only, `2` regular users only, `3` both.
+- `SUPERTABLE_SESSION_SECRET` — **required in production** (signs/encrypts the `st_session` cookie).
+- `SECURE_COOKIES=1` — set when serving Reflection over HTTPS.
+
+### Production hardening (recommended)
+
+- Put Reflection behind TLS (HTTPS) and set `SECURE_COOKIES=1`.
+- Set a strong `SUPERTABLE_SESSION_SECRET` and rotate `SUPERTABLE_SUPERTOKEN` periodically.
+- Prefer regular-user tokens for day‑to‑day usage; reserve the superuser token for administration.
+- If exposed outside a trusted network: add IP allowlisting / VPN and consider an upstream auth proxy.
 
 ---
 
 ## MCP server (stdio)
+
+SuperTable ships an **MCP (Model Context Protocol) server** that exposes your SuperTables as **read‑only tools** for LLM clients (Claude Desktop, Claude Code, etc.). Under the hood it speaks **JSON‑RPC 2.0** and can run in two ways:
+
+- **stdio (local)**: the client spawns the server process and talks over stdin/stdout (newline‑delimited JSON).
+- **streamable-http (remote)**: the server runs as an HTTP endpoint (POST JSON‑RPC; SSE for streams) for “Remote MCP servers”.
+
+### What tools does SuperTable expose?
+
+These are the MCP tools implemented by `supertable/mcp/mcp_server.py`:
+
+- `health` / `info` (service status + policy flags)
+- `whoami` (validates/normalizes `user_hash`)
+- `list_supers(organization)`
+- `list_tables(super_name, organization, user_hash, auth_token)`
+- `describe_table(super_name, organization, table, user_hash, auth_token)`
+- `get_table_stats(super_name, organization, table, user_hash, auth_token)`
+- `get_super_meta(super_name, organization, user_hash, auth_token)`
+- `query_sql(super_name, organization, sql, limit, engine, query_timeout_sec, user_hash, auth_token)`
+
+**Safety defaults (important):**
+- **Read‑only SQL enforcement**: only `SELECT` / `WITH … SELECT` are allowed; write/DDL keywords are rejected.
+- **Concurrency limiting + per‑request timeout** to keep the server stable under parallel calls.
+- Optional **shared secret token** (`auth_token`) plus optional **explicit user hash** enforcement for auditability/tenant isolation.
+
+### Run as a local MCP server (stdio)
 
 Wrapper commands in the image: `admin-server` and `mcp-server`.
 
@@ -174,9 +238,141 @@ docker compose --profile mcp up
 docker compose run --rm -i supertable-mcp mcp-server
 ```
 
-Use `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1` and `SUPERTABLE_ALLOWED_USER_HASHES` to enforce access.
+If you run it directly (dev mode):
 
----
+```bash
+python -u supertable/mcp/mcp_server.py
+```
+
+### Run as a remote MCP server (streamable-http)
+
+Set the transport to **streamable-http** and start the server (it will run an ASGI app via Uvicorn):
+
+```bash
+export SUPERTABLE_MCP_TRANSPORT=streamable-http
+export SUPERTABLE_MCP_HTTP_HOST=0.0.0.0
+export SUPERTABLE_MCP_HTTP_PORT=8000
+export SUPERTABLE_MCP_HTTP_PATH=/mcp
+
+python -u supertable/mcp/mcp_server.py
+# Listening on http://0.0.0.0:8000/mcp
+```
+
+> **HTTP transport tip:** In MCP “streamable HTTP”, every JSON‑RPC message is a new **HTTP POST** to the MCP endpoint.
+
+### Use with Claude Desktop
+
+Claude Desktop supports **two** integration modes:
+
+1) **Local MCP servers (stdio)** — configured in `claude_desktop_config.json` (Claude Desktop “Developer” settings).  
+2) **Remote MCP servers (streamable-http)** — added via **Settings → Connectors → Add Custom Connector** (not by editing the JSON config directly).
+
+#### Option A — Local (stdio) via config
+
+Typical Claude Desktop config (paths vary by OS; Claude opens it for you via **Settings → Developer → Edit Config**):
+
+```json
+{
+  "mcpServers": {
+    "supertable": {
+      "command": "python",
+      "args": ["-u", "/absolute/path/to/supertable/mcp/mcp_server.py"],
+      "env": {
+        "SUPERTABLE_MCP_TRANSPORT": "stdio",
+        "SUPERTABLE_REQUIRE_TOKEN": "1",
+        "SUPERTABLE_MCP_AUTH_TOKEN": "replace-with-strong-token",
+        "SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH": "1",
+        "SUPERTABLE_ALLOWED_USER_HASHES": "0b85b786b16d195439c0da18fd4478df",
+        "SUPERTABLE_ORGANIZATION": "kladna-soft"
+      }
+    }
+  }
+}
+```
+
+Notes:
+- If `SUPERTABLE_REQUIRE_TOKEN=1`, Claude must include `auth_token` in tool calls. The server enforces it.
+- If `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1`, each request must include `user_hash` (32/64 hex). This is recommended for multi-tenant use.
+
+#### Option B — Remote (streamable-http) via Connectors
+
+1. Run the server with `SUPERTABLE_MCP_TRANSPORT=streamable-http`.
+2. In Claude Desktop: **Settings → Connectors → Add Custom Connector**.
+3. Use the URL:
+
+```text
+http://<host>:8000/mcp
+```
+
+If you expose it on the internet:
+- put it behind TLS (HTTPS),
+- lock it down with an allowlist / private network,
+- keep `SUPERTABLE_REQUIRE_TOKEN=1` and rotate `SUPERTABLE_MCP_AUTH_TOKEN`.
+
+### Web tester (optional)
+
+For quick manual testing, there is a minimal FastAPI UI (`supertable/mcp/web_app.py`) that spawns the MCP server as a stdio subprocess and exposes an authenticated browser UI + HTTP JSON‑RPC gateway.
+
+Run it with:
+
+```bash
+python -u supertable/mcp/web_server.py
+# default: http://0.0.0.0:8099/?auth=<SUPERTABLE_SUPERTOKEN>
+```
+
+### Example `.env` (as used in this project)
+
+Below is a complete example `.env` you can use as a starting point:
+
+```dotenv
+LOG_LEVEL=INFO
+
+# STORAGE
+STORAGE_TYPE=MINIO
+STORAGE_REGION=eu-central-1
+STORAGE_ENDPOINT_URL=http://localhost:9000
+STORAGE_ACCESS_KEY=minioadmin
+STORAGE_SECRET_KEY=minioadmin123!
+STORAGE_BUCKET=supertable
+STORAGE_FORCE_PATH_STYLE=true
+
+# === Redis auth ===
+LOCKING_BACKEND=redis
+#SUPERTABLE_REDIS_URL=redis://localhost:6379/1
+#SUPERTABLE_REDIS_HOST=localhost
+#SUPERTABLE_REDIS_PORT=6379
+SUPERTABLE_REDIS_DB=1
+SUPERTABLE_REDIS_PASSWORD=change_me_to_a_strong_password
+SUPERTABLE_REDIS_DECODE_RESPONSES=true
+
+# SENTINEL
+SUPERTABLE_REDIS_SENTINEL=true
+SUPERTABLE_REDIS_SENTINELS=127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+SUPERTABLE_REDIS_SENTINEL_MASTER=mymaster
+
+# ENGINE
+SUPERTABLE_DUCKDB_PRESIGNED=1
+SUPERTABLE_DUCKDB_THREADS=4
+SUPERTABLE_DUCKDB_EXTERNAL_THREADS=2
+SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60
+SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE=1
+
+# REFLECTION
+SUPERTABLE_HOME=~/supertable
+SUPERTABLE_ORGANIZATION=kladna-soft
+SUPERTABLE_SUPERTOKEN=token
+SUPERTABLE_SUPERHASH=0b85b786b16d195439c0da18fd4478df
+SUPERTABLE_LOGIN_MASK=1
+
+# MCP
+SUPERTABLE_MCP_TRANSPORT='streamable-http'
+SUPERTABLE_MCP_HTTP_HOST='0.0.0.0'
+SUPERTABLE_MCP_HTTP_PORT=8000
+SUPERTABLE_MCP_HTTP_PATH=/mcp
+SUPERTABLE_REQUIRE_TOKEN=0
+SUPERTABLE_MCP_AUTH_TOKEN=some-strong-random-string
+SUPERTABLE_TEST_QUERY="select * from facts"
+```
 
 ## Configuration
 
@@ -245,7 +441,7 @@ Use `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1` and `SUPERTABLE_ALLOWED_USER_HASHE
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Run Admin
+# Run Reflection UI
 uvicorn supertable.admin:app --host 0.0.0.0 --port 8000
 
 # Run MCP server (stdio)
@@ -258,7 +454,7 @@ python -u supertable/mcp_server.py
 
 ### Docker Hub
 
-Admin only:
+Reflection UI only:
 ```bash
 docker run -d --name supertable-admin   -e LOCKING_BACKEND=redis   -e REDIS_HOST=your-redis -e REDIS_PORT=6379 -e REDIS_DB=0   -e STORAGE_TYPE=MINIO   -e STORAGE_ENDPOINT_URL=http://your-minio:9000   -e STORAGE_ACCESS_KEY=... -e STORAGE_SECRET_KEY=...   -e STORAGE_BUCKET=supertable -e STORAGE_FORCE_PATH_STYLE=true   -e SUPERTABLE_ADMIN_TOKEN=replace-me   -p 8000:8000   kladnasoft/supertable:latest
 ```

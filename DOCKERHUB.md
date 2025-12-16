@@ -4,38 +4,74 @@
 ![License: STPUL](https://img.shields.io/badge/license-STPUL-blue)
 
 This image bundles:
-- **Admin API (FastAPI)** on port **8000**
-- **MCP server** (`mcp_server.py`) over **stdio**
+- **Reflection UI (FastAPI)** on port **8000**
+- **MCP server** (`mcp_server.py`) over **stdio** or **streamable-http**
 - SuperTable runtime (Redis catalog/locks + MINIO/S3/Azure/GCS object backends via DuckDB httpfs)
 
 > **What changed in this revision**
 > - Corrected environment variables (`STORAGE_*`, `REDIS_*`), DB **0** default.
 > - Clear host-backed vs clean-start usage (Compose profiles).
 > - Added wrapper commands: **`admin-server`** and **`mcp-server`**.
-> - Clarified MCP is **stdio** only (no HTTP).
+> - Clarified MCP supports **stdio** and **streamable-http** (HTTP transport).
 
 ---
 
-## Quick run – Admin (host Redis & MinIO)
+## Quick run – Reflection UI (host Redis & MinIO)
 
 ```bash
 docker run -d --name supertable-admin   -e LOCKING_BACKEND=redis   -e REDIS_HOST=host.docker.internal -e REDIS_PORT=6379 -e REDIS_DB=0   -e STORAGE_TYPE=MINIO   -e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000   -e STORAGE_FORCE_PATH_STYLE=true   -e STORAGE_ACCESS_KEY=minioadmin   -e STORAGE_SECRET_KEY=minioadmin123!   -e STORAGE_BUCKET=supertable   -e SUPERTABLE_ADMIN_TOKEN=replace-me   -p 8000:8000   kladnasoft/supertable:latest admin-server
 ```
 
-Open **http://localhost:8000** and log in with `SUPERTABLE_ADMIN_TOKEN`.
+Open **http://localhost:8000** (redirects to `/reflection/login`). Log in as **superuser** with `SUPERTABLE_SUPERTOKEN` (or legacy `SUPERTABLE_ADMIN_TOKEN`).
 
 > Linux tip: use `host.docker.internal` (or your host IP if not available).
 
 ---
 
-## MCP (stdio)
+## MCP (stdio or HTTP)
+
+This image can run the SuperTable MCP server in two modes:
+
+- **stdio**: best when your MCP host (Claude Desktop, IDEs, etc.) spawns the process/container and speaks MCP over stdin/stdout.
+- **streamable-http**: best when you want a long-running remote MCP server reachable over HTTP (e.g., LAN/VPN, container platform).
+
+### MCP via stdio
 
 ```bash
 # Important: -i to keep stdio open
-docker run --rm -i --name supertable-mcp   -e LOCKING_BACKEND=redis   -e REDIS_HOST=host.docker.internal -e REDIS_PORT=6379 -e REDIS_DB=0   -e STORAGE_TYPE=MINIO   -e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000   -e STORAGE_FORCE_PATH_STYLE=true   -e STORAGE_ACCESS_KEY=minioadmin   -e STORAGE_SECRET_KEY=minioadmin123!   -e STORAGE_BUCKET=supertable   kladnasoft/supertable:latest mcp-server
+docker run --rm -i --name supertable-mcp \
+  -e LOCKING_BACKEND=redis \
+  -e REDIS_HOST=host.docker.internal -e REDIS_PORT=6379 -e REDIS_DB=0 \
+  -e STORAGE_TYPE=MINIO \
+  -e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000 \
+  -e STORAGE_FORCE_PATH_STYLE=true \
+  -e STORAGE_ACCESS_KEY=minioadmin \
+  -e STORAGE_SECRET_KEY=minioadmin123! \
+  -e STORAGE_BUCKET=supertable \
+  kladnasoft/supertable:latest mcp-server
 ```
 
-> This image doesn’t ship an interactive “MCP client”. Integrate with your tool/editor that supports MCP and spawn this container or use Compose.
+### MCP via streamable-http (HTTP transport)
+
+```bash
+docker run -d --name supertable-mcp-http \
+  -e LOCKING_BACKEND=redis \
+  -e REDIS_HOST=host.docker.internal -e REDIS_PORT=6379 -e REDIS_DB=0 \
+  -e STORAGE_TYPE=MINIO \
+  -e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000 \
+  -e STORAGE_FORCE_PATH_STYLE=true \
+  -e STORAGE_ACCESS_KEY=minioadmin \
+  -e STORAGE_SECRET_KEY=minioadmin123! \
+  -e STORAGE_BUCKET=supertable \
+  -e SUPERTABLE_MCP_TRANSPORT=streamable-http \
+  -e SUPERTABLE_MCP_HTTP_HOST=0.0.0.0 \
+  -e SUPERTABLE_MCP_HTTP_PORT=8000 \
+  -e SUPERTABLE_MCP_HTTP_PATH=/mcp \
+  -p 8000:8000 \
+  kladnasoft/supertable:latest mcp-server
+```
+
+> This image doesn’t ship an interactive “MCP client”. Integrate with your tool/editor that supports MCP (e.g., Claude Desktop) and either spawn this container (stdio) or point your client at the HTTP endpoint.
 
 ---
 
@@ -61,11 +97,11 @@ docker run -d --name supertable-admin   -e LOCKING_BACKEND=redis   -e REDIS_HOST
 
 ## Health
 
-- Admin health endpoint: `GET /healthz` → `ok` if Redis is reachable.
+- Health endpoint: `GET /healthz` → `ok` if Redis is reachable.
 
 ---
 
 ## Security
 
-- Always set a strong `SUPERTABLE_ADMIN_TOKEN`.
+- Always set a strong `SUPERTABLE_SUPERTOKEN` (or legacy `SUPERTABLE_ADMIN_TOKEN`).
 - For MCP: set `SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1` and `SUPERTABLE_ALLOWED_USER_HASHES` as needed.
