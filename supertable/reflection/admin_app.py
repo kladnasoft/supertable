@@ -21,7 +21,7 @@ import time
 
 import redis
 from fastapi import APIRouter, Query, HTTPException, Request, Response, Depends, Form, Body
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from supertable.redis_catalog import RedisCatalog
@@ -97,8 +97,7 @@ if not (settings.SUPERTABLE_SUPERTOKEN or "").strip():
 if _missing_envs:
     raise RuntimeError("Missing required environment variables: " + ", ".join(_missing_envs))
 
-import re as _re
-if not _re.fullmatch(r"[0-9a-fA-F]{16,128}", settings.SUPERTABLE_SUPERHASH or ""):
+if not re.fullmatch(r"[0-9a-fA-F]{16,128}", settings.SUPERTABLE_SUPERHASH or ""):
     raise RuntimeError("Invalid SUPERTABLE_SUPERHASH (expected hex string)")
 
 
@@ -738,9 +737,9 @@ async def reflection_root_redirect() -> RedirectResponse:
 templates = Jinja2Templates(directory=settings.TEMPLATES_DIR)
 
 
-@router.get("/favicon.ico")
+@router.get("/favicon.ico", include_in_schema=False)
 def favicon():
-    return Response(status_code=204)
+    return RedirectResponse(url="/static/favicon.ico")
 
 
 @router.get("/healthz", response_class=PlainTextResponse)
@@ -754,30 +753,14 @@ def healthz():
 
 # -------- JSON API (read-only) --------
 
-@router.get("/reflection/api/tenants")
+@router.get("/reflection/tenants")
 def api_tenants(_: Any = Depends(logged_in_guard_api)):
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
-@router.get("/reflection/api/root")
-def api_get_root(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "root": None}
-    if hasattr(catalog, "ensure_root"):
-        try:
-            catalog.ensure_root(org, sup)
-        except Exception:
-            pass
-    try:
-        root = catalog.get_root(org, sup)
-    except Exception:
-        root = None
-    return {"org": org, "sup": sup, "root": root}
 
-
-@router.get("/reflection/api/mirrors")
+@router.get("/reflection/mirrors")
 def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -789,8 +772,8 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
     return {"org": org, "sup": sup, "formats": fmts}
 
 
-@router.get("/reflection/api/leaves")
-def api_list_leaves(
+
+def _list_leaves(
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
         q: Optional[str] = Query(None),
@@ -854,21 +837,7 @@ def api_list_leaves(
     return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
 
 
-@router.get("/reflection/api/leaf/{simple}")
-def api_get_leaf(simple: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    try:
-        obj = catalog.get_leaf(org, sup, simple)
-    except Exception:
-        obj = None
-    if not obj:
-        raise HTTPException(status_code=404, detail="Leaf not found")
-    return {"org": org, "sup": sup, "simple": simple, "data": obj}
-
-
-@router.get("/reflection/api/users")
+@router.get("/reflection/users")
 def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -876,7 +845,7 @@ def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"users": list_users(org, sup)}
 
 
-@router.get("/reflection/api/roles")
+@router.get("/reflection/roles")
 def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -884,7 +853,7 @@ def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"roles": list_roles(org, sup)}
 
 
-@router.get("/reflection/api/user/{user_hash}")
+@router.get("/reflection/user/{user_hash}")
 def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -896,7 +865,7 @@ def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Opti
     return {"hash": user_hash, "data": obj}
 
 
-@router.get("/reflection/api/role/{role_hash}")
+@router.get("/reflection/role/{role_hash}")
 def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -963,7 +932,7 @@ def _mask_secret(value: str) -> str:
     return "****" + v[-4:]
 
 
-@router.get("/reflection/admin/env")
+@router.get("/reflection/env")
 def admin_env_get(_=Depends(admin_guard_api)):
     """
     Return the current .env values from the project root.
@@ -1005,7 +974,7 @@ def admin_env_get(_=Depends(admin_guard_api)):
     }
 
 
-@router.post("/reflection/admin/env")
+@router.post("/reflection/env")
 def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
     """
     Update the project .env with provided items.
@@ -1177,7 +1146,7 @@ def _effective_settings() -> Dict[str, str]:
 
 
 
-@router.get("/reflection/api/tokens")
+@router.get("/reflection/tokens")
 def api_list_tokens(
     request: Request,
     org: str = Query(None),
@@ -1190,7 +1159,7 @@ def api_list_tokens(
     return {"ok": True, "organization": org_eff, "tokens": tokens}
 
 
-@router.post("/reflection/api/tokens")
+@router.post("/reflection/tokens")
 def api_create_token(
     request: Request,
     org: str = Query(None),
@@ -1204,7 +1173,7 @@ def api_create_token(
     return {"ok": True, "organization": org_eff, **created}
 
 
-@router.delete("/api/tokens/{token_id}")
+@router.delete("/reflection/tokens/{token_id}")
 def api_delete_token(
     request: Request,
     token_id: str,
@@ -1219,85 +1188,6 @@ def api_delete_token(
         raise HTTPException(status_code=404, detail="Token not found")
     return {"ok": True, "organization": org_eff, "token_id": token_id}
 
-
-@router.get("/reflection/admin/config")
-def admin_config(request: Request):
-    if not (_is_authorized(request) and is_superuser(request)):
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
-
-    # ---- restore original project-root search order ----
-    here = Path(__file__).resolve()
-    reflection_dir = here.parent
-    pkg_dir = reflection_dir.parent                  # .../supertable
-    repo_root = pkg_dir.parent                 # .../dev/supertable   (project root)
-
-    dotenv_paths = [
-        settings.DOTENV_PATH,                  # explicit override (env)
-        ".env",                                # relative to CWD
-        str(repo_root / ".env"),               # project root
-        str(pkg_dir / ".env"),                 # package dir
-        str(reflection_dir / ".env"),          # reflection dir
-        str(Path.cwd() / ".env"),              # CWD absolute
-        str(Path.home() / ".env"),             # $HOME
-    ]
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_paths: List[str] = []
-    for p in dotenv_paths:
-        if p and p not in seen:
-            seen.add(p)
-            unique_paths.append(p)
-
-    tried: List[Tuple[str, bool]] = []
-    dotenv_found = False
-    dotenv_loaded_path = ""
-
-    for path_str in unique_paths:
-        path = Path(path_str)
-        exists = path.exists() and path.is_file()
-        tried.append((str(path), exists))
-        if exists and not dotenv_found:
-            dotenv_found = True
-            dotenv_loaded_path = str(path)
-
-    dotenv_vars = _parse_dotenv(dotenv_loaded_path) if dotenv_found else {}
-    effective = _effective_settings()
-
-    all_keys = sorted(set(list(dotenv_vars.keys()) + list(effective.keys())))
-    rows = []
-    for k in all_keys:
-        is_sensitive = any(x in k.lower() for x in ("pass", "token", "secret", "key"))
-        env_val = dotenv_vars.get(k)
-        eff_val = effective.get(k)
-        if is_sensitive:
-            env_val = _mask_secret(env_val or "") if env_val is not None else None
-            eff_val = _mask_secret(eff_val or "") if eff_val is not None else None
-        rows.append(
-            {
-                "key": k,
-                "env_val": env_val,
-                "eff_val": eff_val,
-                "is_sensitive": is_sensitive,
-            }
-        )
-
-    # Render (same templates as before)
-    ctx = {
-        "request": request,
-        "dotenv_found": dotenv_found,
-        "dotenv_path": dotenv_loaded_path,
-        "tried": tried,
-        "rows": rows,
-    }
-
-    inject_session_into_ctx(ctx, request)
-
-    resp = templates.TemplateResponse("config.html", ctx)
-    _no_store(resp)
-    return resp
 
 
 @router.get("/reflection/admin", response_class=HTMLResponse)
@@ -1376,7 +1266,7 @@ def admin_page(
     return resp
 
 
-@router.get("/reflection/admin/tables-legacy")
+@router.get("/reflection/tables")
 def admin_tables_page(
         request: Request,
         org: Optional[str] = Query(None),
@@ -1421,7 +1311,7 @@ def admin_tables_page(
         root = {}
 
     # Reuse the existing leaves API logic for listing
-    listing = api_list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
+    listing = _list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
     raw_items = listing.get("items", [])
 
     items: List[Dict[str, Any]] = []
@@ -1629,7 +1519,6 @@ def admin_execute_api(
         dr = DataReader(super_name=super_name, organization=organization, query=q)
         res = dr.execute(user_hash=user_hash)
 
-        # Defensive unpacking similar to api_app.py
         df = meta1 = meta2 = None
         if isinstance(res, tuple):
             if len(res) >= 1:
@@ -1705,8 +1594,7 @@ def admin_execute_api(
         return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
 
 
-@router.post("/reflection/admin/schema")
-@router.post("/admin/schema")
+@router.post("/reflection/schema")
 def admin_schema_api(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -1790,8 +1678,7 @@ def list_supers(organization: str) -> List[str]:
 
 
 
-@router.get("/reflection/admin/supers")
-@router.get("/admin/supers")
+@router.get("/reflection/supers")
 def api_list_supers(
         request: Request,
         organization: str = Query(..., description="Organization identifier"),
@@ -1813,7 +1700,6 @@ def api_list_supers(
 
 
 @router.delete("/reflection/super")
-@router.delete("/admin/super")
 def api_delete_super(
     request: Request,
     organization: str = Query(..., description="Organization identifier"),
@@ -1848,7 +1734,6 @@ def api_delete_super(
 
 
 @router.delete("/reflection/table")
-@router.delete("/admin/table")
 def api_delete_table(
     request: Request,
     organization: str = Query(..., description="Organization identifier"),
@@ -1883,10 +1768,7 @@ def api_delete_table(
     return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
 
 
-
-@router.get("/reflection/tables")
-@router.get("/reflection/admin/tables")
-@router.get("/admin/tables", response_class=HTMLResponse)
+@router.get("/reflection/tables", response_class=HTMLResponse)
 def tables_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -1920,7 +1802,7 @@ def tables_page(
     pages = 1
 
     if has_tenant:
-        listing = api_list_leaves(
+        listing = _list_leaves(
             org=sel_org,
             sup=sel_sup,
             q=None,
@@ -1979,8 +1861,7 @@ def tables_page(
     return resp
 
 
-@router.get("/reflection/admin/super")
-@router.get("/admin/super")
+@router.get("/reflection/super")
 def api_get_super_meta(
     request: Request,
     organization: str = Query(...),
@@ -2001,8 +1882,7 @@ def api_get_super_meta(
 
 
 
-@router.post("/reflection/admin/super")
-@router.post("/admin/super")
+@router.post("/reflection/super")
 def api_get_super_meta(
     request: Request,
     organization: str = Query(...),
@@ -2024,7 +1904,7 @@ def api_get_super_meta(
 
 
 
-@router.delete("/admin/super")
+@router.delete("/reflection/super")
 def api_get_super_meta(
     request: Request,
     organization: str = Query(...),
@@ -2045,8 +1925,7 @@ def api_get_super_meta(
         raise HTTPException(status_code=500, detail=f"SuperTable deletion failed: {e}")
 
 
-@router.get("/reflection/admin/schema")
-@router.get("/admin/schema")
+@router.get("/reflection/schema")
 def api_get_table_schema(
         organization: str = Query(...),
         super_name: str = Query(...),
@@ -2064,8 +1943,7 @@ def api_get_table_schema(
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
 
-@router.get("/reflection/admin/stats")
-@router.get("/admin/stats")
+@router.get("/reflection/stats")
 def api_get_table_stats(
         organization: str = Query(...),
         super_name: str = Query(...),
