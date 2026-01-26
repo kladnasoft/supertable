@@ -237,8 +237,8 @@ class Config:
     require_token: bool = _env_bool("SUPERTABLE_REQUIRE_TOKEN", True)
     shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", ""))
     transport: str = _env_transport("SUPERTABLE_MCP_TRANSPORT", "stdio")
-    http_host: str = os.getenv("SUPERTABLE_MCP_HTTP_HOST", "0.0.0.0")
-    http_port: int = int(os.getenv("SUPERTABLE_MCP_HTTP_PORT", "8000"))
+    http_host: str = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
+    http_port: int = int(os.getenv("SUPERTABLE_MCP_PORT", "8000"))
     http_path: str = os.getenv("SUPERTABLE_MCP_HTTP_PATH", "/mcp")
 
 CFG = Config()

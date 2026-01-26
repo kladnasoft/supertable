@@ -22,15 +22,42 @@ from supertable.config.defaults import logger
 
 
 def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
-    # Prefer native copy when available
+    """Copy bytes from src_path to dst_path as efficiently as the backend allows.
+
+    For MinIO, prefer server-side copy_object using CopySource (no download/upload).
+    Falls back to storage.copy(), then read_bytes/write_bytes.
+    """
+
+    # --- MinIO fast-path (server-side copy) ---------------------------------
+    client = getattr(storage, "client", None)
+    if client is not None and hasattr(client, "copy_object"):
+        # Try to discover bucket name from common attributes
+        bucket = (
+            getattr(storage, "bucket", None)
+            or getattr(storage, "bucket_name", None)
+            or getattr(storage, "_bucket", None)
+            or getattr(storage, "_bucket_name", None)
+        )
+        if isinstance(bucket, str) and bucket:
+            try:
+                from minio.commonconfig import CopySource  # type: ignore
+
+                storage.makedirs(os.path.dirname(dst_path))
+                client.copy_object(bucket, dst_path, CopySource(bucket, src_path))
+                return True
+            except Exception as e:
+                logger.warning(f"[mirror][minio] copy_object failed ({src_path} -> {dst_path}): {e}")
+
+    # --- Generic backend copy ------------------------------------------------
     if hasattr(storage, "copy"):
         try:
             storage.makedirs(os.path.dirname(dst_path))
             storage.copy(src_path, dst_path)
             return True
         except Exception as e:
-            logger.warning(f"[mirror][parquet] storage.copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(f"[mirror] storage.copy failed ({src_path} -> {dst_path}): {e}")
 
+    # --- Byte copy fallback --------------------------------------------------
     read_bytes = getattr(storage, "read_bytes", None)
     write_bytes = getattr(storage, "write_bytes", None)
     if callable(read_bytes) and callable(write_bytes):
@@ -39,7 +66,7 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
             storage.write_bytes(dst_path, read_bytes(src_path))
             return True
         except Exception as e:
-            logger.warning(f"[mirror][parquet] byte copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(f"[mirror] byte copy failed ({src_path} -> {dst_path}): {e}")
 
     return False
 

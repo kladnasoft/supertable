@@ -9,6 +9,80 @@ from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
+import json
+from typing import Any, Dict, List
+
+
+def _spark_type_from_polars_dtype(dtype: Any) -> str:
+    """Best-effort mapping from Polars dtype to Spark/Delta type string."""
+    try:
+        import polars as pl
+    except Exception:  # pragma: no cover
+        return "string"
+
+    if dtype in (pl.Utf8, pl.String):
+        return "string"
+    if dtype == pl.Boolean:
+        return "boolean"
+
+    if dtype == pl.Int8:
+        return "byte"
+    if dtype == pl.Int16:
+        return "short"
+    if dtype == pl.Int32:
+        return "integer"
+    if dtype == pl.Int64:
+        return "long"
+
+    if dtype == pl.UInt8:
+        return "short"
+    if dtype == pl.UInt16:
+        return "integer"
+    if dtype == pl.UInt32:
+        return "long"
+    if dtype == pl.UInt64:
+        return "decimal(20,0)"
+
+    if dtype == pl.Float32:
+        return "float"
+    if dtype == pl.Float64:
+        return "double"
+
+    if dtype == pl.Date:
+        return "date"
+    if dtype == pl.Datetime:
+        return "timestamp"
+    if dtype == pl.Binary:
+        return "binary"
+
+    # Decimal can be parametric; treat conservatively
+    try:
+        if isinstance(dtype, pl.Decimal):
+            return f"decimal({dtype.precision},{dtype.scale})"
+    except Exception:
+        pass
+
+    return "string"
+
+
+def _schema_list_from_polars_df(model_df: Any) -> List[Dict[str, Any]]:
+    """Build a Delta-friendly schema list from a Polars DataFrame."""
+    try:
+        schema = model_df.schema
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for name, dtype in schema.items():
+        out.append(
+            {
+                "name": name,
+                "type": _spark_type_from_polars_dtype(dtype),
+                "nullable": True,
+                "metadata": {},
+            }
+        )
+    return out
 from supertable.rbac.access_control import check_write_access
 
 
@@ -145,7 +219,16 @@ class SimpleTable:
         last_simple_table["previous_snapshot"] = last_simple_table_path
         last_simple_table["last_updated_ms"] = int(datetime.now().timestamp() * 1000)
         last_simple_table["snapshot_version"] = int(last_simple_table.get("snapshot_version", 0)) + 1
-        last_simple_table["schema"] = collect_schema(model_df)
+        schema_list = collect_schema(model_df)
+        if not schema_list:
+            # Fallback: derive schema from Polars dtypes if helper returns empty.
+            schema_list = _schema_list_from_polars_df(model_df)
+        last_simple_table["schema"] = schema_list
+        # Also store a Spark StructType JSON for downstream Delta mirrors.
+        try:
+            last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
+        except Exception:
+            pass
 
         # Write new heavy snapshot file
         new_simple_path = os.path.join(self.snapshot_dir, generate_filename(alias=self.identity))

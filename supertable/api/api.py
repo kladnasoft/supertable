@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
-
-from fastapi import APIRouter, Body, HTTPException, Query
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any, List, Optional
+from supertable.api.auth import build_auth_dependency
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 # Guard dependency (authN/authZ) from sibling module
@@ -42,7 +45,29 @@ except Exception:  # pragma: no cover
 
         engine = _EngineStub()  # type: ignore
 
-router = APIRouter(prefix="", tags=["API"])
+
+try:
+    from supertable.data_writer import DataWriter  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from data_writer import DataWriter  # type: ignore
+    except Exception:  # pragma: no cover
+        DataWriter = None  # type: ignore
+
+try:
+    from supertable.staging_area import Staging  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from staging_area import Staging  # type: ignore
+    except Exception:  # pragma: no cover
+        Staging = None  # type: ignore
+
+
+router = APIRouter(
+    prefix="",
+    tags=["API"],
+    dependencies=[Depends(build_auth_dependency())],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +79,51 @@ class ExecuteRequest(BaseModel):
     engine: str = "DUCKDB"
     with_scan: bool = False
     preview_rows: int = 10
+
+
+def _parse_overwrite_columns(values: Optional[List[str]], csv: Optional[str]) -> List[str]:
+    if values:
+        return [v for v in values if v]
+    if not csv:
+        return []
+    return [v.strip() for v in csv.split(",") if v.strip()]
+
+
+def _read_arrow_table_from_upload(upload: UploadFile) -> Any:
+    """Read an Arrow table from an uploaded file.
+
+    Supported:
+    - Parquet (.parquet)
+    - Arrow IPC file/stream (.arrow/.feather) or raw IPC bytes
+
+    Implementation spools to a temp file to avoid holding large payloads in memory.
+    """
+    suffix = Path(upload.filename or "").suffix.lower()
+    with tempfile.NamedTemporaryFile(prefix="supertable_upload_", suffix=suffix or ".bin", delete=False) as tmp:
+        tmp_path = tmp.name
+        shutil.copyfileobj(upload.file, tmp)
+
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.ipc as ipc  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+
+        if suffix == ".parquet":
+            return pq.read_table(tmp_path)
+
+        source = pa.memory_map(tmp_path, "r")
+        try:
+            with ipc.open_file(source) as reader:
+                return reader.read_all()
+        except Exception:
+            source = pa.memory_map(tmp_path, "r")
+            with ipc.open_stream(source) as reader:
+                return reader.read_all()
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _engine_from_str(s: str | None) -> Any:
@@ -75,7 +145,7 @@ def _engine_from_str(s: str | None) -> Any:
     return getattr(engine, mapped, getattr(engine, "DUCKDB", s))
 
 
-@router.post("/api/execute")
+@router.post("/api/v1/execute")
 def api_execute_sql(
         payload: ExecuteRequest = Body(...),
 ):
@@ -181,7 +251,84 @@ def api_execute_sql(
 # ---------- META ENDPOINTS ----------
 
 
-@router.get("/meta/supers")
+
+@router.post("/api/v1/write")
+async def api_write_table(
+        organization: str = Form(...),
+        super_name: str = Form(...),
+        user_hash: str = Form(...),
+        simple_name: str = Form(...),
+        overwrite_columns: List[str] = Form(default=[]),
+        overwrite_columns_csv: str = Form(default=""),
+        data_file: UploadFile = File(..., description="Arrow IPC (.arrow/.feather) or Parquet (.parquet)"),
+):
+    """Write an uploaded Arrow table into a simple table."""
+    try:
+        if DataWriter is None:
+            raise RuntimeError("DataWriter unavailable (missing dependency)")
+        table = _read_arrow_table_from_upload(data_file)
+        ow = _parse_overwrite_columns(overwrite_columns, overwrite_columns_csv)
+
+        dw = DataWriter(super_name=super_name, organization=organization)
+        columns, rows, inserted, deleted = dw.write(
+            user_hash=user_hash,
+            simple_name=simple_name,
+            data=table,
+            overwrite_columns=ow,
+        )
+        return {
+            "ok": True,
+            "organization": organization,
+            "super_name": super_name,
+            "simple_name": simple_name,
+            "overwrite_columns": ow,
+            "columns": columns,
+            "rows": rows,
+            "inserted": inserted,
+            "deleted": deleted,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Write failed: {e}")
+
+
+@router.post("/api/v1/stage/upload")
+async def api_stage_upload(
+        organization: str = Form(...),
+        super_name: str = Form(...),
+        staging_name: str = Form(...),
+        base_file_name: str = Form(...),
+        data_file: UploadFile = File(..., description="Arrow IPC (.arrow/.feather) or Parquet (.parquet)"),
+):
+    """Upload an Arrow table into staging as parquet and return the saved file name."""
+    try:
+        if Staging is None:
+            raise RuntimeError("Staging unavailable (missing dependency)")
+        table = _read_arrow_table_from_upload(data_file)
+        staging = Staging(
+            organization=organization,
+            super_name=super_name,
+            staging_name=staging_name,
+        )
+        saved_file_name = staging.save_as_parquet(
+            arrow_table=table,
+            base_file_name=base_file_name,
+        )
+        return {
+            "ok": True,
+            "organization": organization,
+            "super_name": super_name,
+            "staging_name": staging_name,
+            "saved_file_name": saved_file_name,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stage upload failed: {e}")
+
+
+@router.get("/api/v1/supers")
 def api_list_supers(
         organization: str = Query(..., description="Organization identifier"),
 ):
@@ -195,7 +342,7 @@ def api_list_supers(
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
 
-@router.get("/meta/tables")
+@router.get("/api/v1/tables")
 def api_list_tables(
         organization: str = Query(...),
         super_name: str = Query(...),
@@ -214,7 +361,7 @@ def api_list_tables(
         raise HTTPException(status_code=500, detail=f"List tables failed: {e}")
 
 
-@router.get("/meta/super")
+@router.get("/api/v1/super")
 def api_get_super_meta(
         organization: str = Query(...),
         super_name: str = Query(...),
@@ -231,7 +378,7 @@ def api_get_super_meta(
         raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
 
 
-@router.get("/meta/schema")
+@router.get("/api/v1/schema")
 def api_get_table_schema(
         organization: str = Query(...),
         super_name: str = Query(...),
@@ -252,7 +399,7 @@ def api_get_table_schema(
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
 
-@router.get("/meta/stats")
+@router.get("/api/v1/stats")
 def api_get_table_stats(
         organization: str = Query(...),
         super_name: str = Query(...),
@@ -276,7 +423,7 @@ def api_get_table_stats(
 # ---------- LEAF ENDPOINT WITH MODE HANDLING ----------
 
 
-@router.get("/leaf/{simple_name}")
+@router.get("/api/v1/table/{simple_name}")
 def api_leaf(
         simple_name: str,
         organization: str = Query(..., alias="org"),

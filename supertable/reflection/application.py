@@ -13,7 +13,7 @@ STATIC_DIR = str(Path(__file__).resolve().parent / "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # include the two modules' routers (no circular imports)
-from supertable.reflection.admin_app import router as admin_router
+from supertable.reflection.ui import router as admin_router
 
 app.include_router(admin_router)
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
-    port = int(os.getenv("SUPERTABLE_PORT", "8080"))
+    port = int(os.getenv("SUPERTABLE_REFLECTION_PORT", "8080"))
     reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
 
     uvicorn.run(app, host=host, port=port, reload=reload_flag)

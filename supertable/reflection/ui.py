@@ -899,7 +899,7 @@ def _env_file_path() -> Path:
     Given the layout:
 
       /home/.../dev/supertable/.env
-      /home/.../dev/supertable/supertable/reflection/admin_app.py
+      /home/.../dev/supertable/supertable/reflection/ui.py
 
     This returns /home/.../dev/supertable/.env
     """

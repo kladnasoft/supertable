@@ -47,9 +47,21 @@ def _normalize_type(t: str) -> str:
     if not isinstance(t, str):
         return "string"
     ts = t.strip().lower()
+
+    # Common non-Spark dtype strings we may get from Arrow/Polars helpers
+    # Examples:
+    #   "Datetime(time_unit='us', time_zone=None)"
+    #   "datetime(time_unit='us', time_zone=none)"
+    # Delta expects Spark SQL types, so normalize these to "timestamp".
+    if ts.startswith("datetime") or "datetime(time_unit" in ts:
+        return "timestamp"
+    if ts.startswith("timestamp") or "timestamp(" in ts:
+        return "timestamp"
+
     if ts.startswith("decimal(") and ts.endswith(")"):
         return ts
     return _SPARK_TYPE_MAP.get(ts, ts)
+
 
 def _schema_to_structtype_json(schema_string: Any = None, schema_list: Any = None) -> str:
     """
@@ -96,6 +108,178 @@ def _schema_to_structtype_json(schema_string: Any = None, schema_list: Any = Non
     return json.dumps({"type": "struct", "fields": []}, separators=(",", ":"))
 
 
+
+# ---- Best-effort schema inference (when snapshot lacks schema) ----
+
+def _spark_type_from_pyarrow(pa_type: Any) -> str:
+    """Map a PyArrow DataType to a Spark/Delta type string."""
+    try:
+        import pyarrow as pa  # type: ignore
+    except Exception:  # pragma: no cover
+        return "string"
+
+    if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
+        return "string"
+    if pa.types.is_boolean(pa_type):
+        return "boolean"
+    if pa.types.is_int8(pa_type):
+        return "byte"
+    if pa.types.is_int16(pa_type):
+        return "short"
+    if pa.types.is_int32(pa_type):
+        return "integer"
+    if pa.types.is_int64(pa_type):
+        return "long"
+    if pa.types.is_uint8(pa_type):
+        return "short"
+    if pa.types.is_uint16(pa_type):
+        return "integer"
+    if pa.types.is_uint32(pa_type):
+        return "long"
+    if pa.types.is_uint64(pa_type):
+        return "decimal(20,0)"
+    if pa.types.is_float32(pa_type):
+        return "float"
+    if pa.types.is_float64(pa_type):
+        return "double"
+    if pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type):
+        return "date"
+    if pa.types.is_timestamp(pa_type):
+        return "timestamp"
+    if pa.types.is_binary(pa_type) or pa.types.is_large_binary(pa_type):
+        return "binary"
+    if pa.types.is_decimal(pa_type):
+        return f"decimal({pa_type.precision},{pa_type.scale})"
+
+    return "string"
+
+
+def _schema_list_from_arrow_table(table: Any) -> List[Dict[str, Any]]:
+    """Build a Delta-friendly schema list from a PyArrow Table."""
+    try:
+        schema = table.schema
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for field in schema:
+        out.append(
+            {
+                "name": field.name,
+                "type": _spark_type_from_pyarrow(field.type),
+                "nullable": bool(getattr(field, "nullable", True)),
+                "metadata": {},
+            }
+        )
+    return out
+
+
+def _infer_schema_list_from_any_parquet(storage, paths: List[str]) -> List[Dict[str, Any]]:
+    """Best-effort: read schema from the first readable parquet file."""
+    read_parquet = getattr(storage, "read_parquet", None)
+    if callable(read_parquet):
+        for p in paths:
+            try:
+                table = read_parquet(p)
+                return _schema_list_from_arrow_table(table)
+            except Exception:
+                continue
+
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+        for p in paths:
+            try:
+                sch = pq.read_schema(p)
+                fields: List[Dict[str, Any]] = []
+                for f in sch:
+                    fields.append(
+                        {
+                            "name": f.name,
+                            "type": _spark_type_from_pyarrow(f.type),
+                            "nullable": bool(getattr(f, "nullable", True)),
+                            "metadata": {},
+                        }
+                    )
+                return fields
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return []
+
+# ---- Delta stats normalization helpers ----
+
+def _normalize_delta_stats(stats: Any, *, num_records: Any = None) -> Optional[str]:
+    """Return a Delta-compatible stats JSON string.
+
+    Delta's add.stats is a JSON string with structure like:
+        {"numRecords": N, "minValues": {...}, "maxValues": {...}, "nullCount": {...}}
+
+    We accept legacy formats like:
+        {"col": {"min": ..., "max": ...}, ...}
+    and convert them.
+    """
+    if stats is None:
+        return None
+
+    # Accept JSON string
+    if isinstance(stats, str):
+        try:
+            stats_obj = json.loads(stats)
+        except Exception:
+            return None
+    else:
+        stats_obj = stats
+
+    if not isinstance(stats_obj, dict):
+        return None
+
+    # Already Delta-like
+    if any(k in stats_obj for k in ("numRecords", "minValues", "maxValues", "nullCount")):
+        out: Dict[str, Any] = dict(stats_obj)
+        if num_records is not None and "numRecords" not in out:
+            try:
+                out["numRecords"] = int(num_records)
+            except Exception:
+                pass
+        return json.dumps(out, separators=(",", ":"))
+
+    # Legacy per-column {col: {min,max}}
+    min_values: Dict[str, Any] = {}
+    max_values: Dict[str, Any] = {}
+    null_count: Dict[str, Any] = {}
+
+    legacy = True
+    for col, v in stats_obj.items():
+        if not isinstance(v, dict):
+            legacy = False
+            break
+        if "min" in v:
+            min_values[col] = v.get("min")
+        if "max" in v:
+            max_values[col] = v.get("max")
+        if "nullCount" in v:
+            null_count[col] = v.get("nullCount")
+
+    if not legacy:
+        return None
+
+    out2: Dict[str, Any] = {
+        "minValues": min_values,
+        "maxValues": max_values,
+        "nullCount": null_count,
+    }
+    if num_records is not None:
+        try:
+            out2["numRecords"] = int(num_records)
+        except Exception:
+            pass
+
+    return json.dumps(out2, separators=(",", ":"))
+
+
+
 # --------- Tunables -----------------------------------------------------------
 
 # Always co-locate data files into the Delta table folder, as requested.
@@ -126,7 +310,32 @@ def _stable_table_id(organization: str, super_name: str, table_name: str) -> str
 
 
 def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
-    # Prefer native copy when available
+    """Copy bytes from src_path to dst_path as efficiently as the backend allows.
+
+    For MinIO, prefer server-side copy_object using CopySource (no download/upload).
+    Falls back to storage.copy(), then read_bytes/write_bytes.
+    """
+
+    # --- MinIO fast-path (server-side copy) ---------------------------------
+    client = getattr(storage, "client", None)
+    if client is not None and hasattr(client, "copy_object"):
+        bucket = (
+            getattr(storage, "bucket", None)
+            or getattr(storage, "bucket_name", None)
+            or getattr(storage, "_bucket", None)
+            or getattr(storage, "_bucket_name", None)
+        )
+        if isinstance(bucket, str) and bucket:
+            try:
+                from minio.commonconfig import CopySource  # type: ignore
+
+                storage.makedirs(os.path.dirname(dst_path))
+                client.copy_object(bucket, dst_path, CopySource(bucket, src_path))
+                return True
+            except Exception as e:
+                logger.warning(f"[mirror][minio] copy_object failed ({src_path} -> {dst_path}): {e}")
+
+    # --- Generic backend copy ------------------------------------------------
     if hasattr(storage, "copy"):
         try:
             storage.makedirs(os.path.dirname(dst_path))
@@ -135,6 +344,7 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
         except Exception as e:
             logger.warning(f"[mirror][delta] storage.copy failed ({src_path} -> {dst_path}): {e}")
 
+    # --- Byte copy fallback --------------------------------------------------
     read_bytes = getattr(storage, "read_bytes", None)
     write_bytes = getattr(storage, "write_bytes", None)
     if callable(read_bytes) and callable(write_bytes):
@@ -232,6 +442,20 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
     )
     schema_list = simple_snapshot.get("schema", [])
 
+    # If snapshot doesn't include schema, infer it from the first available parquet resource.
+    if not schema_string_from_snapshot and not schema_list:
+        try:
+            resource_paths: List[str] = []
+            for r in simple_snapshot.get("resources", []) or []:
+                if not isinstance(r, dict):
+                    continue
+                p = r.get("path") or r.get("file")
+                if p:
+                    resource_paths.append(str(p))
+            schema_list = _infer_schema_list_from_any_parquet(super_table.storage, resource_paths)
+        except Exception:
+            pass
+
     resources: List[Dict[str, Any]] = simple_snapshot.get("resources", [])
 
     # Derive/override meta id & createdTime if provided
@@ -256,6 +480,16 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         path_records.append((used_rel_path, size, r))
 
     current_set = set(current_paths)
+
+    # If schema is still missing, infer it from the first co-located parquet file.
+    if not schema_string_from_snapshot and not schema_list and current_paths:
+        try:
+            first_rel = current_paths[0]
+            # current_paths are relative to delta table root (e.g., "files/<name>.parquet")
+            first_full = os.path.join(base, first_rel)
+            schema_list = _infer_schema_list_from_any_parquet(super_table.storage, [first_full])
+        except Exception:
+            pass
 
     # Files to remove = those present before but not now
     to_remove = sorted(list(prev_paths - current_set))
@@ -358,14 +592,19 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         for p, size, res in to_add:
             stats_val = None
             try:
+                rows_val = res.get("rows") or res.get("numRecords")
+                raw_stats = None
                 if isinstance(res.get("stats_json"), str):
-                    stats_val = res["stats_json"]
+                    raw_stats = res["stats_json"]
                 elif isinstance(res.get("stats"), dict):
-                    stats_val = json.dumps(res["stats"], separators=(",", ":"))
-                else:
-                    rows_val = res.get("rows") or res.get("numRecords")
-                    if isinstance(rows_val, (int, float)) or (isinstance(rows_val, str) and rows_val.isdigit()):
-                        stats_val = json.dumps({"numRecords": int(rows_val)}, separators=(",", ":"))
+                    raw_stats = res["stats"]
+
+                # Normalize to Delta stats format (or None)
+                stats_val = _normalize_delta_stats(raw_stats, num_records=rows_val)
+
+                # If no stats dict provided, but we have rows -> emit minimal Delta stats
+                if stats_val is None and rows_val is not None:
+                    stats_val = _normalize_delta_stats({"numRecords": int(rows_val)}, num_records=rows_val)
             except Exception:
                 stats_val = None
 
