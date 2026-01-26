@@ -772,6 +772,52 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
     return {"org": org, "sup": sup, "formats": fmts}
 
 
+_SUPPORTED_MIRROR_FORMATS = ("DELTA", "ICEBERG", "PARQUET")
+
+
+def _normalize_mirror_fmt(fmt: str) -> str:
+    fu = str(fmt or "").upper().strip()
+    if fu not in _SUPPORTED_MIRROR_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported mirror format: {fmt}")
+    return fu
+
+
+@router.post("/reflection/mirrors/enable")
+def api_enable_mirror(
+        fmt: str = Query(...),
+        org: Optional[str] = Query(None),
+        sup: Optional[str] = Query(None),
+        _: Any = Depends(admin_guard_api),
+):
+    org, sup = resolve_pair(org, sup)
+    if not org or not sup:
+        raise HTTPException(404, "Tenant not found")
+    fu = _normalize_mirror_fmt(fmt)
+    try:
+        fmts = catalog.enable_mirror(org, sup, fu)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Enable mirror failed: {e}")
+    return {"ok": True, "org": org, "sup": sup, "formats": fmts}
+
+
+@router.post("/reflection/mirrors/disable")
+def api_disable_mirror(
+        fmt: str = Query(...),
+        org: Optional[str] = Query(None),
+        sup: Optional[str] = Query(None),
+        _: Any = Depends(admin_guard_api),
+):
+    org, sup = resolve_pair(org, sup)
+    if not org or not sup:
+        raise HTTPException(404, "Tenant not found")
+    fu = _normalize_mirror_fmt(fmt)
+    try:
+        fmts = catalog.disable_mirror(org, sup, fu)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Disable mirror failed: {e}")
+    return {"ok": True, "org": org, "sup": sup, "formats": fmts}
+
+
 
 def _list_leaves(
         org: Optional[str] = Query(None),
@@ -1256,6 +1302,7 @@ def admin_page(
         "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
         "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
         "mirrors": mirrors,
+        "mirrors_enabled_formats": mirrors,
         "users": users,
         "roles": roles,
         "default_user_hash": default_user_hash,

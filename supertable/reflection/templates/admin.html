@@ -649,6 +649,7 @@ function escapeHtmlAttr(str) {
         `${ep}?fmt=${encodeURIComponent(fmt)}&org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`,
         { method: 'POST' }
       );
+      try { history.replaceState(null, '', window.location.pathname + window.location.search + '#mirrors'); } catch (e) { window.location.hash = 'mirrors'; }
       location.reload();
     }
 
@@ -956,6 +957,10 @@ function switchTab(id) {
       if (id === 'tokens') {
         loadTokens();
       }
+    
+
+      // Persist active tab in the URL so refresh/actions keep the same tab
+      try { history.replaceState(null, '', window.location.pathname + window.location.search + '#' + id); } catch (e) { window.location.hash = id; }
     }
 
     function showModal(title, bodyHtml, onConfirm, confirmText) {
@@ -1033,6 +1038,24 @@ function switchTab(id) {
           this.innerHTML = '<i class="fas fa-eye"></i>&nbsp;Show';
         }
       });
+
+
+      // Activate initial tab from URL (?tab=...) or hash (#...)
+      try {
+        const params = new URLSearchParams(window.location.search || '');
+        const tabFromQuery = params.get('tab');
+        const tabFromHash = (window.location.hash || '').replace('#', '');
+        const tab = tabFromQuery || tabFromHash;
+        if (tab) {
+          const tabEl = document.getElementById('tab-' + tab);
+          const paneEl = document.getElementById('pane-' + tab);
+          if (tabEl && paneEl) {
+            switchTab(tab);
+          }
+        }
+      } catch (e) {
+        // no-op (older browsers)
+      }
     });
   </script>
 </head>
