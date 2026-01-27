@@ -1,212 +1,116 @@
-import os
 import time
-from dataclasses import dataclass
+import uuid
 from typing import Any, Dict, List, Optional
 
 from supertable.config.defaults import logger
-
-
-@dataclass(frozen=True)
-class SuperPipeDefinition:
-    pipe_name: str
-    organization: str
-    super_name: str
-    staging_name: str
-    user_hash: str
-    simple_name: str
-    overwrite_columns: List[str]
-    enabled: bool = True
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "pipe_name": self.pipe_name,
-            "organization": self.organization,
-            "super_name": self.super_name,
-            "staging_name": self.staging_name,
-            "user_hash": self.user_hash,
-            "simple_name": self.simple_name,
-            "overwrite_columns": self.overwrite_columns,
-            "enabled": self.enabled,
-            "updated_at_ns": time.time_ns(),
-        }
+from supertable.redis_catalog import RedisCatalog
 
 
 class SuperPipe:
-    """Snowpipe-like loader configuration stored in *storage* under a staging.
-
-    Storage layout (under an existing supertable):
-        <org>/<super>/staging/<staging_name>/pipes/<pipe_name>.json
-
-    Notes:
-    - Definitions are stored in storage (not Redis).
-    - Locks/deduplication should be handled elsewhere (Redis), per your design.
+    """
+    Redis-only Pipe Management:
+    - Validates staging existence in Redis.
+    - Stores definitions purely in Redis.
+    - Prevents semantic duplicates (simple_name + overwrite_columns).
     """
 
     def __init__(self, *, organization: str, super_name: str, staging_name: str):
         self.organization = organization
         self.super_name = super_name
         self.staging_name = staging_name
-        self.identity = "staging"
-
-        from supertable.storage.storage_factory import get_storage  # noqa: WPS433
-        from supertable.redis_catalog import RedisCatalog  # noqa: WPS433
-
-        self.storage = get_storage()
         self.catalog = RedisCatalog()
 
-        # Validate supertable exists (do not create).
-        if not self.catalog.root_exists(self.organization, self.super_name):
-            raise FileNotFoundError(
-                f"SuperTable does not exist: organization={self.organization!r}, super_name={self.super_name!r}"
-            )
+        # Check if staging exists in Redis before allowing pipe operations
+        staging_meta = self.catalog.get_staging_meta(organization, super_name, staging_name)
+        if not staging_meta:
+            raise FileNotFoundError(f"Staging '{staging_name}' does not exist in Redis for {organization}/{super_name}")
 
-        self.staging_dir = os.path.join(self.organization, self.super_name, self.identity, self.staging_name)
-        self.pipes_dir = os.path.join(self.staging_dir, "pipes")
-
-        if not self.storage.exists(self.pipes_dir):
-            # Best-effort: staging init may not have run yet
-            self.storage.makedirs(self.pipes_dir)
-
-
-    def _list_pipe_definition_paths(self) -> List[str]:
-        """Return all pipe definition JSON paths under this staging's pipes directory."""
+    def _with_lock(self, fn):
+        # Lock against the staging area to prevent concurrent pipe/stage mutations
+        lock_key = f"supertable:{self.organization}:{self.super_name}:lock:stage:{self.staging_name}"
+        token = uuid.uuid4().hex
+        acquired = self.catalog.r.set(lock_key, token, nx=True, ex=10)
+        if not acquired:
+            raise RuntimeError(f"Cannot modify pipes: Stage {self.staging_name} is currently locked.")
         try:
-            tree = self.storage.get_directory_structure(self.pipes_dir)
-        except Exception:
-            # If the storage backend can't list, fall back to empty (no duplicate detection)
-            return []
+            return fn()
+        finally:
+            # Simple release
+            current_val = self.catalog.r.get(lock_key)
+            if current_val and current_val.decode() == token:
+                self.catalog.r.delete(lock_key)
 
-        paths: List[str] = []
+    def create(self, *, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
+               enabled: bool = True) -> str:
+        def _op():
+            # 1. Check for duplicate simple_name/overwrite_columns combo
+            existing_pipes = self.catalog.list_pipe_metas(self.organization, self.super_name, self.staging_name)
+            for p in existing_pipes:
+                if p.get("simple_name") == simple_name and p.get("overwrite_columns") == overwrite_columns:
+                    if p.get("pipe_name") != pipe_name:
+                        raise ValueError(
+                            f"A pipe with this simple_name and column configuration already exists: {p.get('pipe_name')}")
 
-        def dfs(prefix: str, node) -> None:
-            if node is None:
-                if prefix.endswith(".json"):
-                    paths.append(prefix)
-                return
-            if not isinstance(node, dict):
-                return
-            for name, child in node.items():
-                dfs(os.path.join(prefix, name), child)
+            # 3. Define the payload
+            definition = {
+                "staging_name": self.staging_name,
+                "pipe_name": pipe_name,
+                "user_hash": user_hash,
+                "simple_name": simple_name,
+                "overwrite_columns": overwrite_columns or [],
+                "transformation": [],
+                "updated_at_ns": time.time_ns(),
+                "enabled": enabled
+            }
 
-        dfs(self.pipes_dir, tree)
-        return paths
-
-    def _find_duplicate_pipe(
-        self,
-        *,
-        pipe_name: str,
-        user_hash: str,
-        simple_name: str,
-        overwrite_columns: List[str],
-    ) -> Optional[Dict[str, Any]]:
-        """Detect an existing pipe with the same semantics but a different name.
-
-        We treat a pipe as "the same" if it targets the same:
-          - organization/super_name/staging_name (this instance)
-          - user_hash
-          - simple_name
-          - overwrite_columns (exact list match)
-
-        Returns:
-            dict with keys: pipe_name, path if a duplicate is found; otherwise None.
-        """
-        for path in self._list_pipe_definition_paths():
-            try:
-                data = self.storage.read_json(path)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-
-            existing_name = data.get("pipe_name")
-            if existing_name == pipe_name:
-                # same name is handled by the caller via exists(path)
-                continue
-
-            if data.get("organization") != self.organization:
-                continue
-            if data.get("super_name") != self.super_name:
-                continue
-            if data.get("staging_name") != self.staging_name:
-                continue
-            if data.get("user_hash") != user_hash:
-                continue
-            if data.get("simple_name") != simple_name:
-                continue
-
-            existing_overwrite = data.get("overwrite_columns") or []
-            if list(existing_overwrite) != list(overwrite_columns):
-                continue
-
-            return {"pipe_name": existing_name, "path": path}
-
-        return None
-
-    def _pipe_path(self, pipe_name: str) -> str:
-        return os.path.join(self.pipes_dir, f"{pipe_name}.json")
-
-    def create(
-        self,
-        *,
-        pipe_name: str,
-        user_hash: str,
-        simple_name: str,
-        overwrite_columns: Optional[List[str]] = None,
-        enabled: bool = True,
-    ) -> str:
-        """Create a new pipe definition (must be unique). Returns the storage path."""
-        overwrite_columns = overwrite_columns or []
-        path = self._pipe_path(pipe_name)
-
-        dup = self._find_duplicate_pipe(
-            pipe_name=pipe_name,
-            user_hash=user_hash,
-            simple_name=simple_name,
-            overwrite_columns=overwrite_columns,
-        )
-        if dup:
-            raise ValueError(
-                "Pipe already exists with different name: "
-                f"requested={pipe_name!r}, existing={dup.get('pipe_name')!r} at {dup.get('path')}"
+            # 4. Save to Redis only
+            self.catalog.upsert_pipe_meta(
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                pipe_name,
+                meta=definition
             )
+            logger.info(f"[pipe] created in redis: {pipe_name}")
+            return f"redis://{self.organization}/{self.super_name}/{self.staging_name}/{pipe_name}"
 
-        if self.storage.exists(path):
-            raise FileExistsError(f"Pipe already exists: {pipe_name!r} at {path}")
+        return self._with_lock(_op)
 
-        definition = SuperPipeDefinition(
-            pipe_name=pipe_name,
-            organization=self.organization,
-            super_name=self.super_name,
-            staging_name=self.staging_name,
-            user_hash=user_hash,
-            simple_name=simple_name,
-            overwrite_columns=overwrite_columns,
-            enabled=enabled,
-        )
+    def set_enabled(self, pipe_name: str, enabled: bool) -> None:
+        """Updates the enabled status of a pipe in Redis."""
 
-        self.storage.write_json(path, definition.to_dict())
-        logger.info(f"[pipe] created: {pipe_name} -> {path}")
-        return path
+        def _op():
+            meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
+            if not meta:
+                raise FileNotFoundError(f"Pipe '{pipe_name}' not found.")
 
-    def set_enabled(self, *, pipe_name: str, enabled: bool) -> None:
-        path = self._pipe_path(pipe_name)
-        if not self.storage.exists(path):
-            raise FileNotFoundError(f"Pipe not found: {pipe_name!r}")
+            meta["enabled"] = enabled
+            meta["updated_at_ns"] = time.time_ns()
 
-        data = self.storage.read_json(path)
-        if not isinstance(data, dict):
-            raise ValueError(f"Invalid pipe definition at {path}")
+            self.catalog.upsert_pipe_meta(
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                pipe_name,
+                meta=meta
+            )
+            logger.info(f"[pipe] updated enabled={enabled} for {pipe_name}")
 
-        data["enabled"] = bool(enabled)
-        data["updated_at_ns"] = time.time_ns()
-        self.storage.write_json(path, data)
-        logger.info(f"[pipe] updated enabled={enabled} for {pipe_name}")
+        return self._with_lock(_op)
 
-    def read(self, *, pipe_name: str) -> Dict[str, Any]:
-        path = self._pipe_path(pipe_name)
-        if not self.storage.exists(path):
-            raise FileNotFoundError(f"Pipe not found: {pipe_name!r}")
-        data = self.storage.read_json(path)
-        if not isinstance(data, dict):
-            raise ValueError(f"Invalid pipe definition at {path}")
-        return data
+    def delete(self, pipe_name: str) -> bool:
+        def _op():
+            return self.catalog.delete_pipe_meta(
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                pipe_name
+            ) > 0
+
+        return self._with_lock(_op)
+
+    def read(self, pipe_name: str) -> Dict[str, Any]:
+        meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
+        if not meta:
+            raise FileNotFoundError(f"Pipe '{pipe_name}' not found.")
+        return meta

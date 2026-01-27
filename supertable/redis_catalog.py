@@ -64,6 +64,33 @@ def _auth_tokens_key(org: str) -> str:
 def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
     return f"supertable:{org}:{sup}:meta:roles:type_to_hash:{role_type}"
 
+# --------------------------------------------------------------------------- #
+# Staging / Pipe meta keys (Redis-backed UI listing)
+# --------------------------------------------------------------------------- #
+
+def _staging_key(org: str, sup: str, staging_name: str) -> str:
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}"
+
+
+def _stagings_meta_key(org: str, sup: str) -> str:
+    # Set of staging names for fast listing
+    return f"supertable:{org}:{sup}:meta:staging:meta"
+
+
+def _pipe_key(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}"
+
+
+def _pipes_meta_key(org: str, sup: str, staging_name: str) -> str:
+    # Set of pipe names for a staging for fast listing
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta"
+
+
+
+
+def _stage_lock_key(org: str, sup: str, stage_name: str) -> str:
+    return f"supertable:{org}:{sup}:lock:stage:{stage_name}"
+
 
 @dataclass(frozen=True)
 class RedisOptions:
@@ -303,6 +330,50 @@ return 0
             return int(res or 0) == 1
         except redis.RedisError as e:
             logger.debug(f"[redis-lock] extend error: {e}")
+            return False
+
+    # ---- Stage lock (staging + pipe mutations) ----
+
+    def acquire_stage_lock(
+        self,
+        org: str,
+        sup: str,
+        stage_name: str,
+        ttl_s: int = 30,
+        timeout_s: int = 30,
+    ) -> Optional[str]:
+        """Acquire lock for staging/pipe operations:
+            supertable:{org}:{sup}:lock:stage:{stage_name}
+        """
+        key = _stage_lock_key(org, sup, stage_name)
+        token = uuid.uuid4().hex
+        deadline = time.time() + max(1, int(timeout_s))
+        while time.time() < deadline:
+            try:
+                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
+                if ok:
+                    return token
+            except redis.RedisError as e:
+                logger.debug(f"[redis-stage-lock] acquire error on {key}: {e}")
+            time.sleep(0.05)
+        return None
+
+    def release_stage_lock(self, org: str, sup: str, stage_name: str, token: str) -> bool:
+        """Release stage lock if token matches."""
+        try:
+            res = self._lock_release_if_token(keys=[_stage_lock_key(org, sup, stage_name)], args=[token])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-stage-lock] release error: {e}")
+            return False
+
+    def extend_stage_lock(self, org: str, sup: str, stage_name: str, token: str, ttl_ms: int) -> bool:
+        """Optionally extend stage lock TTL if token matches."""
+        try:
+            res = self._lock_extend_if_token(keys=[_stage_lock_key(org, sup, stage_name)], args=[token, int(ttl_ms)])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-stage-lock] extend error: {e}")
             return False
 
     # ---- Stats lock (for monitoring _stats.json updates) ----
@@ -712,3 +783,251 @@ return 0
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] SCAN delete error: {e}")
         return deleted
+
+
+# --------------------------------------------------------------------------- #
+# Staging / Pipe meta (for website UI)
+# --------------------------------------------------------------------------- #
+
+    def upsert_staging_meta(self, org: str, sup: str, staging_name: str, meta: Dict[str, Any]) -> bool:
+        """Upsert staging metadata and ensure it is indexed for listing."""
+        if not (org and sup and staging_name):
+            return False
+        payload = dict(meta or {})
+        payload.setdefault("organization", org)
+        payload.setdefault("super_name", sup)
+        payload.setdefault("staging_name", staging_name)
+        payload["updated_at_ms"] = _now_ms()
+
+        try:
+            with self.r.pipeline() as p:
+                p.set(_staging_key(org, sup, staging_name), json.dumps(payload))
+                p.sadd(_stagings_meta_key(org, sup), staging_name)
+                p.execute()
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] upsert_staging_meta error: {e}")
+            raise
+
+    def staging_exists(self, org: str, sup: str, staging_name: str) -> bool:
+        """Fast existence check for a staging (Redis-backed)."""
+        if not (org and sup and staging_name):
+            return False
+        try:
+            return bool(self.r.exists(_staging_key(org, sup, staging_name)))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] staging_exists error: {e}")
+            return False
+
+    def get_staging_meta(self, org: str, sup: str, staging_name: str) -> Optional[Dict[str, Any]]:
+        if not (org and sup and staging_name):
+            return None
+        try:
+            raw = self.r.get(_staging_key(org, sup, staging_name))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_staging_meta error: {e}")
+            return None
+        if not raw:
+            return None
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def list_stagings(self, org: str, sup: str, *, count: int = 1000) -> List[str]:
+        """List staging names. Prefers the staging index set; falls back to SCAN."""
+        if not (org and sup):
+            return []
+        try:
+            names = list(self.r.smembers(_stagings_meta_key(org, sup)) or [])
+            if names:
+                return sorted({str(n) for n in names if str(n)})
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_stagings smembers error: {e}")
+
+        # Fallback (migration/back-compat): scan exact staging meta keys.
+        pattern = f"supertable:{org}:{sup}:meta:staging:*"
+        seen = set()
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
+                for k in keys or []:
+                    kk = k if isinstance(k, str) else k.decode("utf-8")
+                    if ":pipe:" in kk:
+                        continue
+                    if kk.endswith(":meta"):
+                        continue
+                    name = kk.rsplit("meta:staging:", 1)[-1]
+                    if name:
+                        seen.add(name)
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_stagings scan error: {e}")
+        return sorted(seen)
+
+    def delete_staging_meta(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> int:
+        """Delete staging meta and *all* related keys under the staging prefix.
+
+        This removes the staging from the staging index set, deletes the staging meta key,
+        and deletes any keys matching:
+            supertable:{org}:{sup}:meta:staging:{staging_name}:*
+        Returns number of keys deleted (best-effort; does not include SREM).
+        """
+        if not (org and sup and staging_name):
+            return 0
+
+        deleted = 0
+        try:
+            # Remove from list index
+            self.r.srem(_stagings_meta_key(org, sup), staging_name)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_staging_meta srem error: {e}")
+
+        try:
+            # Delete the base meta key
+            deleted += int(self.r.delete(_staging_key(org, sup, staging_name)) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_staging_meta del error: {e}")
+
+        # Delete everything under the staging namespace (pipes, pipe meta set, etc.)
+        pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:*"
+        deleted += self._delete_by_scan(pattern=pattern, count=count)
+        return deleted
+
+    def upsert_pipe_meta(
+        self,
+        org: str,
+        sup: str,
+        staging_name: str,
+        pipe_name: str,
+        meta: Dict[str, Any],
+    ) -> bool:
+        """Upsert pipe metadata and ensure it is indexed for listing under a staging."""
+        if not (org and sup and staging_name and pipe_name):
+            return False
+        payload = dict(meta or {})
+        payload.setdefault("organization", org)
+        payload.setdefault("super_name", sup)
+        payload.setdefault("staging_name", staging_name)
+        payload.setdefault("pipe_name", pipe_name)
+        payload["updated_at_ms"] = _now_ms()
+
+        try:
+            with self.r.pipeline() as p:
+                p.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(payload))
+                p.sadd(_pipes_meta_key(org, sup, staging_name), pipe_name)
+                p.execute()
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] upsert_pipe_meta error: {e}")
+            raise
+
+    def get_pipe_meta(self, org: str, sup: str, staging_name: str, pipe_name: str) -> Optional[Dict[str, Any]]:
+        if not (org and sup and staging_name and pipe_name):
+            return None
+        try:
+            raw = self.r.get(_pipe_key(org, sup, staging_name, pipe_name))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_pipe_meta error: {e}")
+            return None
+        if not raw:
+            return None
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def get_pipe_defs(self, org: str, sup: str, staging_name: str, pipe_name: str) -> List[Dict[str, Any]]:
+        """Read a pipe definition payload stored as a JSON **list** (spec).
+
+        Back-compat: if a dict is stored, it is returned as a single-item list.
+        """
+        if not (org and sup and staging_name and pipe_name):
+            return []
+        try:
+            raw = self.r.get(_pipe_key(org, sup, staging_name, pipe_name))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_pipe_defs error: {e}")
+            return []
+        if not raw:
+            return []
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return []
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+        if isinstance(obj, dict):
+            return [obj]
+        return []
+
+    def upsert_pipe_defs(
+        self,
+        org: str,
+        sup: str,
+        staging_name: str,
+        pipe_name: str,
+        defs: List[Dict[str, Any]],
+    ) -> bool:
+        """Store a pipe definition payload as a JSON **list** and index it for listing."""
+        if not (org and sup and staging_name and pipe_name):
+            return False
+        safe_defs = [d for d in (defs or []) if isinstance(d, dict)]
+        try:
+            with self.r.pipeline() as p:
+                p.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(safe_defs))
+                p.sadd(_pipes_meta_key(org, sup, staging_name), pipe_name)
+                p.execute()
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] upsert_pipe_defs error: {e}")
+            raise
+
+    def list_pipes(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> List[str]:
+        """List pipe names for a staging. Prefers the pipe index set; falls back to SCAN."""
+        if not (org and sup and staging_name):
+            return []
+        try:
+            names = list(self.r.smembers(_pipes_meta_key(org, sup, staging_name)) or [])
+            if names:
+                return sorted({str(n) for n in names if str(n)})
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_pipes smembers error: {e}")
+
+        # Fallback: scan pipe definition keys.
+        pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:*"
+        seen = set()
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
+                for k in keys or []:
+                    kk = k if isinstance(k, str) else k.decode("utf-8")
+                    if kk.endswith(":meta"):
+                        continue
+                    name = kk.rsplit(":pipe:", 1)[-1]
+                    if name:
+                        seen.add(name)
+                if cursor == 0:
+                    break
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_pipes scan error: {e}")
+        return sorted(seen)
+
+    def delete_pipe_meta(self, org: str, sup: str, staging_name: str, pipe_name: str) -> int:
+        """Delete a pipe meta key and remove it from the pipe index set."""
+        if not (org and sup and staging_name and pipe_name):
+            return 0
+        try:
+            self.r.srem(_pipes_meta_key(org, sup, staging_name), pipe_name)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_pipe_meta srem error: {e}")
+        try:
+            return int(self.r.delete(_pipe_key(org, sup, staging_name, pipe_name)) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_pipe_meta del error: {e}")
+            return 0

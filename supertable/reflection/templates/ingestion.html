@@ -1,0 +1,994 @@
+{% extends "base.html" %}
+
+{% block title %}Ingestion{% endblock %}
+
+{% block head_extra %}
+<style>
+    /* ---- Tabs (match admin.html style) ---- */
+  #tab-navigation,
+  .tabs-row {
+    display: flex;
+    gap: 24px;
+    margin-top: 16px;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 0 2px;
+    flex-wrap: wrap;
+  }
+
+  .tab {
+    padding: 8px 0;
+    margin-bottom: -1px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    font-size: 13px;
+    color: #64748b;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab i { font-size: 13px; }
+
+  .tab:hover { color: #0f172a; }
+
+  .tab.active {
+    color: #1c96ca;
+    border-bottom-color: #1c96ca;
+    font-weight: 500;
+  }
+
+  .tabpane { margin-top: 16px; }
+  .tabpane.hidden { display:none; }
+
+  /* ---- List rows ---- */
+  .rowcard {
+    margin-top: 10px;
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 14px;
+    background: #fff;
+    padding: 12px 14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+  }
+  .rowcard .title { font-weight: 900; color:#0f172a; }
+  .rowcard .sub { font-size: 12px; color:#64748b; margin-top:3px; }
+
+  /* ---- Pipe editor ---- */
+  .split {
+    display:flex;
+    gap: 12px;
+    margin-top: 12px;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+  .split .left {
+    flex: 1;
+    min-width: 260px;
+  }
+  .split .right {
+    flex: 2;
+    min-width: 320px;
+  }
+  #pipeEditor {
+    width: 100%;
+    min-height: 320px;
+    resize: vertical;
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.14);
+    padding: 12px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 13px;
+    line-height: 1.35;
+    background: rgba(248,250,252,.9);
+  }
+
+  /* ---- Enable pill ---- */
+  .pill { font-size: 12px; padding: 4px 9px; border-radius: 999px; border:1px solid; font-weight: 900; }
+  .pill.on { border-color: rgba(16,185,129,35); background: rgba(16,185,129,08); color:#065f46; }
+  .pill.off { border-color: rgba(148,163,184,55); background: rgba(148,163,184,10); color:#334155; }
+
+  /* ---- Modal footer ---- */
+  #m-footer {
+    padding: 12px 15px;
+    border-top: 1px solid rgba(15,23,42,.08);
+    display:flex;
+    justify-content:flex-end;
+    gap:10px;
+    background: #fff;
+  }
+
+  /* Azure-style outline button (match admin.html) */
+  .btn-azure-outline {
+    border: 1px solid #1c96ca;
+    background: transparent;
+    color: #1c96ca;
+    font-weight: 600;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-azure-outline:hover {
+    background: #1c96ca;
+    color: #ffffff;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+
+{% include "selection.html" %}
+
+<div style="height: 18px;"></div>
+
+<div id="stagingRoot"
+     data-org="{{ sel_org }}"
+     data-sup="{{ sel_sup }}"
+     data-user-hash="{{ session_user_hash }}"
+     style="
+        background: #ffffff;
+        border-radius: 16px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+        padding: 24px 28px;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        border-left: 5px solid #1c96ca;
+     ">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
+    <div>
+      <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Ingestion</div>
+    </div>
+  </div>
+
+  <div id="tab-navigation" style="margin-top: 16px;">
+    <div id="tab-staging" class="tab active" onclick="switchTab('staging')">
+      <i class="fas fa-folder-open"></i><span>Staging</span>
+    </div>
+    <div id="tab-pipe" class="tab" onclick="switchTab('pipe')">
+      <i class="fas fa-diagram-project"></i><span>Pipe</span>
+    </div>
+    <div id="tab-load" class="tab" onclick="switchTab('load')">
+      <i class="fas fa-upload"></i><span>Load Data</span>
+    </div>
+  </div>
+
+  <!-- -------------------- STAGING TAB -------------------- -->
+  <div class="tabpane" id="pane-staging">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Staging (Redis)</div>
+      <button type="button" id="btnCreateStaging" class="btn btn-sm btn-azure-outline">
+        <i class="fas fa-plus"></i> Create staging
+      </button>
+    </div>
+
+    {% if not has_tenant %}
+      <div style="margin-top: 10px; color:#64748b;">Select a SuperTable above.</div>
+    {% else %}
+      <input id="stagingFilter" class="input" placeholder="Filter staging…" style="width:100%; max-width: 420px; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14); margin-top: 10px;" />
+      <div id="stagingList" style="margin-top: 10px;"></div>
+    {% endif %}
+  </div>
+
+  <!-- -------------------- PIPE TAB -------------------- -->
+  <div class="tabpane hidden" id="pane-pipe">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Pipe (Redis)</div>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <select id="pipeStagingSelect" class="input" style="min-width: 240px; border-radius: 12px; padding: 8px 10px; border: 1px solid rgba(15,23,42,.14);">
+          <option value="">Select staging…</option>
+        </select>
+        <button type="button" id="btnNewPipe" class="btn btn-sm btn-azure-outline">
+          <i class="fas fa-plus"></i> New pipe
+        </button>
+        <button type="button" id="btnSavePipe" class="btn btn-sm btn-azure-outline">
+          <i class="fas fa-save"></i> Save
+        </button>
+      </div>
+    </div>
+
+    {% if not has_tenant %}
+      <div style="margin-top: 10px; color:#64748b;">Select a SuperTable above.</div>
+    {% else %}
+      <div class="split">
+        <div class="left">
+          <div style="font-size: 12px; font-weight: 900; color:#0f172a; margin: 6px 0;">Pipes</div>
+          <input id="pipeFilter" class="input" placeholder="Filter pipes (name or simple_name)…" style="width:100%; padding:9px 10px; border-radius:12px; border:1px solid rgba(15,23,42,.14); margin-bottom: 10px;" />
+          <div id="pipeList"></div>
+        </div>
+        <div class="right">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin: 6px 0;">
+            <div style="font-size: 12px; font-weight: 900; color:#0f172a;">Pipe definition (JSON)</div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span id="pipeEnabledPill" class="pill off" style="display:none;">disabled</span>
+              <button type="button" id="btnTogglePipe" class="btn btn-sm btn-azure-outline" style="display:none;">
+                <i class="fas fa-toggle-on"></i> Toggle
+              </button>
+              <button type="button" id="btnDeletePipe" class="btn btn-sm btn-danger-outline" style="display:none;">
+                <i class="fas fa-trash"></i> Delete
+              </button>
+            </div>
+          </div>
+          <textarea id="pipeEditor" placeholder="Select a staging, then create/select a pipe…"></textarea>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+
+  <!-- -------------------- LOAD DATA TAB -------------------- -->
+  <div class="tabpane hidden" id="pane-load">
+    <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Load data</div>
+  </div>
+
+</div>
+
+<!-- Modal (shared styling from base.html) -->
+<div id="modal">
+  <div id="modal-card">
+    <div id="m-header">
+      <div id="m-title">Modal</div>
+      <button type="button" id="m-close" style="border:0;background:transparent;font-size:18px;cursor:pointer;color:#334155;">✕</button>
+    </div>
+    <div id="m-body"></div>
+    <div id="m-footer">
+      <button type="button" id="m-cancel" class="btn btn-sm btn-secondary">Cancel</button>
+      <button type="button" id="m-confirm" class="btn btn-sm btn-primary">Confirm</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+(function () {
+  function enc(v) { return encodeURIComponent(v || ""); }
+
+  function root() { return document.getElementById("stagingRoot"); }
+  function currentOrgSup() {
+    const el = root();
+    return {
+      org: el ? (el.dataset.org || "") : "",
+      sup: el ? (el.dataset.sup || "") : "",
+      userHash: el ? (el.dataset.userHash || "") : "",
+    };
+  }
+
+  function escapeHtml(str) {
+    return String(str || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function nsToLocalString(nsVal) {
+    const raw = (nsVal === undefined || nsVal === null) ? "" : String(nsVal);
+    if (!raw) return "";
+    try {
+      const ms = Number(BigInt(raw) / 1000000n);
+      if (!Number.isFinite(ms)) return raw;
+      return new Date(ms).toLocaleString();
+    } catch (e) {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return raw;
+      return new Date(Math.floor(n / 1e6)).toLocaleString();
+    }
+  }
+
+  async function getJSON(url) {
+    const resp = await fetch(url, { credentials: "same-origin" });
+    let js = null;
+    try { js = await resp.json(); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || ("Request failed: " + resp.status + " " + resp.statusText);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  async function postJSON(url, payload) {
+    const opts = {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: payload === undefined ? null : JSON.stringify(payload),
+    };
+    const resp = await fetch(url, opts);
+    let js = null;
+    try { js = await resp.json(); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || ("Request failed: " + resp.status + " " + resp.statusText);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  function showModal(title, bodyHtml, onConfirm, confirmText) {
+    const modal = document.getElementById("modal");
+    const titleEl = document.getElementById("m-title");
+    const bodyEl = document.getElementById("m-body");
+    const btnClose = document.getElementById("m-close");
+    const btnCancel = document.getElementById("m-cancel");
+    const btnConfirm = document.getElementById("m-confirm");
+
+    titleEl.textContent = title || "Modal";
+    bodyEl.innerHTML = bodyHtml || "";
+    btnConfirm.textContent = confirmText || "Confirm";
+
+    function close() {
+      modal.style.display = "none";
+      btnClose.removeEventListener("click", close);
+      btnCancel.removeEventListener("click", close);
+      btnConfirm.removeEventListener("click", confirm);
+    }
+
+    async function confirm() {
+      try {
+        if (onConfirm) await onConfirm();
+        close();
+      } catch (e) {
+        alert(e && e.message ? e.message : String(e));
+      }
+    }
+
+    btnClose.addEventListener("click", close);
+    btnCancel.addEventListener("click", close);
+    btnConfirm.addEventListener("click", confirm);
+
+    modal.style.display = "flex";
+  }
+
+  function showJson(obj) {
+    const pretty = JSON.stringify(obj || {}, null, 2);
+    showModal(
+      "JSON",
+      `<pre style="margin:0;white-space:pre-wrap;font-family:monospace;font-size:13px;">${escapeHtml(pretty)}</pre>`,
+      async () => {},
+      "Close"
+    );
+  }
+
+  window.showJson = showJson;
+
+  window.switchTab = function switchTab(name) {
+    const tabs = ["staging", "pipe", "load"];
+    for (const t of tabs) {
+      const btn = document.getElementById("tab-" + t);
+      const pane = document.getElementById("pane-" + t);
+      if (btn) btn.classList.toggle("active", t === name);
+      if (pane) pane.classList.toggle("hidden", t !== name);
+    }
+    const u = new URL(window.location.href);
+    u.hash = "#" + name;
+    history.replaceState(null, "", u.toString());
+  };
+
+  // -------------------- Staging (expandable, scrollable, lazy-load) --------------------
+
+  let selectedStagingName = "";
+  let expandedStagingName = "";
+  let expandedBodyEl = null;
+
+  let lastStagingNames = [];
+  const STAGING_FILES_PAGE_SIZE = 50;
+  const stagingFilesState = {}; // { [stg]: { offset:number, total:number|null, loading:boolean } }
+
+  function setSelectedStaging(stg) {
+    selectedStagingName = (stg || "").trim();
+
+    // sync pipe tab selector
+    const sel = document.getElementById("pipeStagingSelect");
+    if (sel && selectedStagingName) {
+      const has = Array.from(sel.options || []).some(o => o.value === selectedStagingName);
+      if (has) sel.value = selectedStagingName;
+    }
+  }
+
+  function _filterList(items, q) {
+    q = (q || "").trim().toLowerCase();
+    if (!q) return items;
+    return (items || []).filter(x => String(x || "").toLowerCase().includes(q));
+  }
+
+  async function fetchStagingFilesPage(stg, offset, limit) {
+    const { org, sup } = currentOrgSup();
+    return await getJSON(`/reflection/ingestion/staging/files?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&offset=${enc(String(offset))}&limit=${enc(String(limit))}`);
+  }
+
+  function ensureStagingFilesState(stg) {
+    if (!stagingFilesState[stg]) stagingFilesState[stg] = { offset: 0, total: null, loading: false };
+    return stagingFilesState[stg];
+  }
+
+  function ensureFilesTable(bodyEl) {
+    if (bodyEl.querySelector("table[data-files-table='1']")) return;
+
+    bodyEl.innerHTML = `
+      <div style="min-width:0;">
+        <table data-files-table="1" style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px;">file</th>
+              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px; width:90px;">rows</th>
+              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px; width:220px;">written_at</th>
+            </tr>
+          </thead>
+          <tbody data-files-tbody="1"></tbody>
+        </table>
+        <div data-files-footer="1" style="color:#64748b; font-size:12px; margin-top:10px;"></div>
+      </div>
+    `;
+  }
+
+  function setFilesFooter(bodyEl, shown, total) {
+    const footer = bodyEl.querySelector("[data-files-footer='1']");
+    if (!footer) return;
+    const t = (total === null || total === undefined) ? "?" : String(total);
+    footer.textContent = `Showing ${shown} / ${t}`;
+  }
+
+  function appendFileRows(bodyEl, items) {
+    const tbody = bodyEl.querySelector("[data-files-tbody='1']");
+    if (!tbody) return;
+
+    for (const it of (items || [])) {
+      const file = it && it.file ? String(it.file) : "";
+      const rows = (it && it.rows !== undefined && it.rows !== null) ? String(it.rows) : "";
+      const ns = (it && it.written_at_ns !== undefined && it.written_at_ns !== null) ? String(it.written_at_ns) : "";
+      const dt = nsToLocalString(ns);
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px; word-break:break-all;">
+          ${escapeHtml(file)}
+        </td>
+        <td style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-size:12px;">
+          ${escapeHtml(rows)}
+        </td>
+        <td title="${escapeHtml(ns)}" style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-size:12px;">
+          ${escapeHtml(dt)}
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function loadMoreStagingFiles(stg, bodyEl, reset) {
+    const state = ensureStagingFilesState(stg);
+    if (state.loading) return;
+    if (!reset && state.total !== null && state.offset >= state.total) return;
+
+    state.loading = true;
+    try {
+      if (reset) {
+        state.offset = 0;
+        state.total = null;
+        ensureFilesTable(bodyEl);
+        const tbody = bodyEl.querySelector("[data-files-tbody='1']");
+        if (tbody) tbody.innerHTML = "";
+        setFilesFooter(bodyEl, 0, null);
+      }
+
+      // Loading marker
+      let marker = bodyEl.querySelector("[data-loading='1']");
+      if (!marker) {
+        marker = document.createElement("div");
+        marker.dataset.loading = "1";
+        marker.style.color = "#64748b";
+        marker.style.fontSize = "12px";
+        marker.style.marginTop = "8px";
+        marker.textContent = reset ? "Loading…" : "Loading more…";
+        bodyEl.appendChild(marker);
+      } else {
+        marker.textContent = reset ? "Loading…" : "Loading more…";
+      }
+
+      const data = await fetchStagingFilesPage(stg, state.offset, STAGING_FILES_PAGE_SIZE);
+      const items = (data && data.items) ? data.items : [];
+      const total = (data && data.total !== undefined && data.total !== null) ? Number(data.total) : 0;
+
+      if (marker) marker.remove();
+
+      // No files case
+      if (reset && (!items || !items.length) && total === 0) {
+        bodyEl.innerHTML = "<div style='color:#64748b; font-size:12px;'>No files recorded yet for this staging.</div>";
+        return;
+      }
+
+      ensureFilesTable(bodyEl);
+      appendFileRows(bodyEl, items);
+
+      state.total = Number.isFinite(total) ? total : (state.total || null);
+      state.offset += (items || []).length;
+
+      setFilesFooter(bodyEl, state.offset, state.total);
+    } finally {
+      state.loading = false;
+    }
+  }
+
+  function bindLazyScroll(stg, bodyEl) {
+    if (bodyEl.dataset.lazyBound === "1") return;
+    bodyEl.dataset.lazyBound = "1";
+
+    bodyEl.addEventListener("scroll", async () => {
+      const nearBottom = bodyEl.scrollTop + bodyEl.clientHeight >= bodyEl.scrollHeight - 40;
+      if (!nearBottom) return;
+      await loadMoreStagingFiles(stg, bodyEl, false);
+    });
+  }
+
+  function collapseExpandedIfAny() {
+    if (expandedBodyEl) {
+      expandedBodyEl.style.display = "none";
+    }
+    expandedStagingName = "";
+    expandedBodyEl = null;
+  }
+
+  async function toggleStaging(stg, bodyEl, hintEl) {
+    const alreadyExpanded = (expandedStagingName === stg) && bodyEl.style.display !== "none";
+
+    if (alreadyExpanded) {
+      bodyEl.style.display = "none";
+      if (hintEl) hintEl.style.display = "";
+      expandedStagingName = "";
+      expandedBodyEl = null;
+      return;
+    }
+
+    // Collapse previous expanded
+    if (expandedBodyEl && expandedBodyEl !== bodyEl) {
+      expandedBodyEl.style.display = "none";
+      const prevHint = expandedBodyEl.closest("[data-stg-row='1']")?.querySelector("[data-stg-hint='1']");
+      if (prevHint) prevHint.style.display = "";
+    }
+
+    // Expand this one
+    expandedStagingName = stg;
+    expandedBodyEl = bodyEl;
+    setSelectedStaging(stg);
+
+    if (hintEl) hintEl.style.display = "none";
+    bodyEl.style.display = "";
+    bodyEl.style.maxHeight = "280px";
+    bodyEl.style.overflow = "auto";
+    bodyEl.style.paddingRight = "6px";
+
+    // Sync pipe tab and refresh pipes in background
+    const sel = document.getElementById("pipeStagingSelect");
+    if (sel && sel.value !== stg) {
+      sel.value = stg;
+      try { await refreshPipes(); } catch (e) {}
+    }
+
+    if (bodyEl.dataset.loaded !== "1") {
+      bodyEl.dataset.loaded = "1";
+      await loadMoreStagingFiles(stg, bodyEl, true);
+      bindLazyScroll(stg, bodyEl);
+    }
+  }
+
+  async function refreshStagings() {
+    const { org, sup } = currentOrgSup();
+    const list = document.getElementById("stagingList");
+    const sel = document.getElementById("pipeStagingSelect");
+    if (!org || !sup) return;
+
+    if (list) list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
+
+    const data = await getJSON(`/reflection/ingestion/stagings?org=${enc(org)}&sup=${enc(sup)}`);
+    const names = (data && data.staging_names) ? data.staging_names : [];
+    lastStagingNames = Array.isArray(names) ? names : [];
+
+    if (sel) {
+      const prev = (selectedStagingName || sel.value || "").trim();
+      sel.innerHTML = "<option value=''>Select staging…</option>";
+      for (const n of lastStagingNames) {
+        const opt = document.createElement("option");
+        opt.value = n;
+        opt.textContent = n;
+        sel.appendChild(opt);
+      }
+      if (prev && lastStagingNames.includes(prev)) sel.value = prev;
+      if (sel.value) setSelectedStaging(sel.value);
+    }
+
+    renderStagingList();
+  }
+
+  function renderStagingList() {
+    const { org, sup } = currentOrgSup();
+    const list = document.getElementById("stagingList");
+    if (!list) return;
+
+    if (!lastStagingNames.length) {
+      list.innerHTML = "<div style='color:#64748b;'>No staging found in Redis.</div>";
+      return;
+    }
+
+    const filterEl = document.getElementById("stagingFilter");
+    const q = filterEl ? (filterEl.value || "") : "";
+    const names = _filterList(lastStagingNames, q);
+
+    if (!names.length) {
+      list.innerHTML = "<div style='color:#64748b;'>No staging matches the filter.</div>";
+      return;
+    }
+
+    list.innerHTML = "";
+
+    for (const n of names) {
+      const row = document.createElement("div");
+      row.className = "rowcard";
+      row.dataset.stgRow = "1";
+      row.style.display = "grid";
+      row.style.gridTemplateColumns = "minmax(160px, 240px) 1fr auto";
+      row.style.alignItems = "start";
+      row.style.gap = "12px";
+
+      row.innerHTML = `
+        <div data-stg-name="1" style="cursor:pointer; min-width:0;">
+          <div class="title">${escapeHtml(n)}</div>
+        </div>
+
+        <div style="min-width:0;">
+          <div data-stg-hint="1" class="sub" style="margin-top:2px;">Click the staging name to view files.</div>
+          <div data-stg-body="1" style="display:none; margin-top:8px;"></div>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <button type="button" class="btn btn-sm btn-azure-outline" onclick="viewStagingMeta('${escapeHtml(n)}'); event.stopPropagation();">
+            <i class="fas fa-code"></i> Meta
+          </button>
+          <button type="button" class="btn btn-sm btn-danger-outline" onclick="deleteStaging('${escapeHtml(n)}'); event.stopPropagation();">
+            <i class="fas fa-trash"></i> Delete
+          </button>
+        </div>
+      `;
+
+      const nameEl = row.querySelector("[data-stg-name='1']");
+      const hintEl = row.querySelector("[data-stg-hint='1']");
+      const bodyEl = row.querySelector("[data-stg-body='1']");
+      if (nameEl && bodyEl) {
+        nameEl.addEventListener("click", async () => await toggleStaging(n, bodyEl, hintEl));
+      }
+
+      list.appendChild(row);
+    }
+
+    const filter = document.getElementById("stagingFilter");
+    if (filter && filter.dataset.bound !== "1") {
+      filter.dataset.bound = "1";
+      filter.addEventListener("input", () => renderStagingList());
+    }
+  }
+
+  window.viewStagingMeta = async function viewStagingMeta(stagingName) {
+    const { org, sup } = currentOrgSup();
+    if (!org || !sup) return;
+    const data = await getJSON(`/reflection/ingestion/staging/meta?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}`);
+    showJson((data && data.meta) ? data.meta : {});
+  };
+
+  window.deleteStaging = async function deleteStaging(stagingName) {
+    const { org, sup } = currentOrgSup();
+    if (!org || !sup) return;
+    if (!confirm("Delete staging '" + stagingName + "'? This removes files and pipes under it.")) return;
+    await postJSON(`/reflection/staging/delete?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}`);
+    // If we deleted the expanded one, clear it
+    if (expandedStagingName === stagingName) collapseExpandedIfAny();
+    await refreshStagings();
+    const u = new URL(window.location.href);
+    u.hash = "#staging";
+    history.replaceState(null, "", u.toString());
+  };
+
+  // -------------------- Pipe tab (filterable) --------------------
+
+  let selectedPipeName = "";
+  let selectedPipeEnabled = false;
+  let lastPipeItems = [];
+
+  function setPipeButtonsVisible(visible) {
+    const pill = document.getElementById("pipeEnabledPill");
+    const btnToggle = document.getElementById("btnTogglePipe");
+    const btnDelete = document.getElementById("btnDeletePipe");
+    if (pill) pill.style.display = visible ? "" : "none";
+    if (btnToggle) btnToggle.style.display = visible ? "" : "none";
+    if (btnDelete) btnDelete.style.display = visible ? "" : "none";
+  }
+
+  function updateEnabledPill(enabled) {
+    const pill = document.getElementById("pipeEnabledPill");
+    if (!pill) return;
+    pill.classList.toggle("on", !!enabled);
+    pill.classList.toggle("off", !enabled);
+    pill.textContent = enabled ? "enabled" : "disabled";
+  }
+
+  async function refreshPipes() {
+    const { org, sup } = currentOrgSup();
+    const stgSel = document.getElementById("pipeStagingSelect");
+    const list = document.getElementById("pipeList");
+    const editor = document.getElementById("pipeEditor");
+    if (!org || !sup || !stgSel || !list) return;
+
+    const stg = (stgSel.value || "").trim();
+
+    selectedPipeName = "";
+    selectedPipeEnabled = false;
+    setPipeButtonsVisible(false);
+    updateEnabledPill(false);
+    if (editor) editor.value = "";
+
+    if (!stg) {
+      list.innerHTML = "<div style='color:#64748b;'>Please select a staging area first.</div>";
+      lastPipeItems = [];
+      return;
+    }
+
+    list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
+    const data = await getJSON(`/reflection/ingestion/pipes?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}`);
+    const items = (data && data.items) ? data.items : [];
+    lastPipeItems = Array.isArray(items) ? items : [];
+    renderPipeList();
+  }
+
+  function renderPipeList() {
+    const stgSel = document.getElementById("pipeStagingSelect");
+    const list = document.getElementById("pipeList");
+    if (!stgSel || !list) return;
+
+    const stg = (stgSel.value || "").trim();
+    if (!stg) return;
+
+    let items = lastPipeItems || [];
+    const filterEl = document.getElementById("pipeFilter");
+    const q = filterEl ? String(filterEl.value || "").trim().toLowerCase() : "";
+    if (q) {
+      items = items.filter(it => {
+        const pn = String(it && it.pipe_name ? it.pipe_name : "").toLowerCase();
+        const sn = String(it && it.simple_name ? it.simple_name : "").toLowerCase();
+        return pn.includes(q) || sn.includes(q);
+      });
+    }
+
+    if (!items.length) {
+      list.innerHTML = "<div style='color:#64748b;'>No pipes found in Redis.</div>";
+      return;
+    }
+
+    list.innerHTML = "";
+    for (const it of items) {
+      const pn = it.pipe_name;
+      const sn = it.simple_name || "";
+      const enabled = !!it.enabled;
+      const row = document.createElement("div");
+      row.className = "rowcard";
+      row.style.cursor = "pointer";
+      row.innerHTML = `
+        <div style="min-width:0;">
+          <div class="title">${escapeHtml(pn)}</div>
+          <div class="sub">
+            ${sn ? `simple_name: <code>${escapeHtml(sn)}</code> · ` : ""}
+            <code>...:meta:staging:${escapeHtml(stg)}:pipe:${escapeHtml(pn)}</code>
+          </div>
+        </div>
+        <div><span class="pill ${enabled ? "on" : "off"}">${enabled ? "enabled" : "disabled"}</span></div>
+      `;
+      row.addEventListener("click", () => selectPipe(stg, pn));
+      list.appendChild(row);
+    }
+
+    const filter = document.getElementById("pipeFilter");
+    if (filter && filter.dataset.bound !== "1") {
+      filter.dataset.bound = "1";
+      filter.addEventListener("input", () => renderPipeList());
+    }
+  }
+
+  async function selectPipe(stagingName, pipeName) {
+    const { org, sup } = currentOrgSup();
+    const editor = document.getElementById("pipeEditor");
+    if (!org || !sup || !editor) return;
+
+    const data = await getJSON(`/reflection/ingestion/pipe/meta?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}&pipe_name=${enc(pipeName)}`);
+    const meta = (data && data.meta) ? data.meta : {};
+    selectedPipeName = String(meta.pipe_name || pipeName || "");
+    selectedPipeEnabled = !!meta.enabled;
+    editor.value = JSON.stringify(meta || {}, null, 2);
+    setPipeButtonsVisible(true);
+    updateEnabledPill(selectedPipeEnabled);
+  }
+
+  function newPipeTemplate(stg) {
+    const { org, sup, userHash } = currentOrgSup();
+    return {
+      pipe_name: "pipe_01",
+      organization: org,
+      super_name: sup,
+      staging_name: stg,
+      user_hash: userHash || "",
+      simple_name: "",
+      overwrite_columns: ["day"],
+      enabled: true,
+      meta: {},
+    };
+  }
+
+  const stgSel = document.getElementById("pipeStagingSelect");
+  if (stgSel) {
+    stgSel.addEventListener("change", async () => {
+      setSelectedStaging(stgSel.value || "");
+      await refreshPipes();
+    });
+  }
+
+  const btnNewPipe = document.getElementById("btnNewPipe");
+  if (btnNewPipe) {
+    btnNewPipe.addEventListener("click", async () => {
+      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
+      if (!stg) { alert("Please select a staging area first."); return; }
+
+      showModal(
+        "New pipe (draft)",
+        `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <label style="font-weight:800;">Pipe name</label>
+            <input id="modalPipeName" class="input" placeholder="pipe_01" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
+
+            <label style="font-weight:800; margin-top:6px;">simple_name</label>
+            <input id="modalPipeSimple" class="input" placeholder="" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
+
+            <label style="font-weight:800; margin-top:6px;">overwrite_columns</label>
+            <input id="modalPipeOverwrite" class="input" placeholder="day" value="day" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
+            <div style="font-size:12px;color:#64748b;">Comma-separated list (e.g. <code>day,month</code>).</div>
+
+            <label style="display:flex; align-items:center; gap:10px; font-weight:800; margin-top:6px;">
+              <input id="modalPipeEnabled" type="checkbox" checked /> enabled
+            </label>
+          </div>
+        `,
+        async () => {
+          const editor = document.getElementById("pipeEditor");
+          const pn = (document.getElementById("modalPipeName").value || "").trim() || "pipe_01";
+          const sn = (document.getElementById("modalPipeSimple").value || "").trim();
+          const rawCols = (document.getElementById("modalPipeOverwrite").value || "").trim();
+          const cols = rawCols ? rawCols.split(",").map(x => x.trim()).filter(Boolean) : [];
+          const enabled = !!document.getElementById("modalPipeEnabled").checked;
+
+          selectedPipeName = "";
+          selectedPipeEnabled = false;
+          setPipeButtonsVisible(false);
+          updateEnabledPill(false);
+
+          const obj = newPipeTemplate(stg);
+          obj.pipe_name = pn;
+          obj.simple_name = sn;
+          obj.overwrite_columns = cols;
+          obj.enabled = enabled;
+
+          if (editor) editor.value = JSON.stringify(obj, null, 2);
+        },
+        "Create draft"
+      );
+
+      setTimeout(() => {
+        const el = document.getElementById("modalPipeName");
+        if (el) el.focus();
+      }, 20);
+    });
+  }
+
+  const btnSavePipe = document.getElementById("btnSavePipe");
+  if (btnSavePipe) {
+    btnSavePipe.addEventListener("click", async () => {
+      const editor = document.getElementById("pipeEditor");
+      if (!editor) return;
+      let obj = null;
+      try { obj = JSON.parse(editor.value || "{}"); } catch (e) { alert("Invalid JSON: " + e.message); return; }
+      if (!obj || typeof obj !== "object") { alert("Pipe definition must be a JSON object."); return; }
+      await postJSON("/reflection/pipes/save", obj);
+      await refreshPipes();
+      alert("Saved.");
+    });
+  }
+
+  const btnToggle = document.getElementById("btnTogglePipe");
+  if (btnToggle) {
+    btnToggle.addEventListener("click", async () => {
+      const { org, sup } = currentOrgSup();
+      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
+      if (!org || !sup || !stg || !selectedPipeName) return;
+      const endpoint = selectedPipeEnabled ? "disable" : "enable";
+      await postJSON(`/reflection/pipes/${endpoint}?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&pipe_name=${enc(selectedPipeName)}`);
+      selectedPipeEnabled = !selectedPipeEnabled;
+      updateEnabledPill(selectedPipeEnabled);
+      await refreshPipes();
+    });
+  }
+
+  const btnDelete = document.getElementById("btnDeletePipe");
+  if (btnDelete) {
+    btnDelete.addEventListener("click", async () => {
+      const { org, sup } = currentOrgSup();
+      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
+      if (!org || !sup || !stg || !selectedPipeName) return;
+      if (!confirm("Delete pipe '" + selectedPipeName + "'?")) return;
+      await postJSON(`/reflection/pipes/delete?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&pipe_name=${enc(selectedPipeName)}`);
+      selectedPipeName = "";
+      selectedPipeEnabled = false;
+      setPipeButtonsVisible(false);
+      updateEnabledPill(false);
+      const editor = document.getElementById("pipeEditor");
+      if (editor) editor.value = "";
+      await refreshPipes();
+    });
+  }
+
+  // -------------------- Create staging modal --------------------
+
+  const btnCreateStaging = document.getElementById("btnCreateStaging");
+  if (btnCreateStaging) {
+    btnCreateStaging.addEventListener("click", async () => {
+      const { org, sup } = currentOrgSup();
+      if (!org || !sup) return;
+
+      showModal(
+        "Create staging",
+        `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <label style="font-weight:800;">Staging name</label>
+            <input id="modalStagingName" class="input" placeholder="staging_01" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
+            <div style="font-size:12px;color:#64748b;">Will create folders under <code>${escapeHtml(org)}/${escapeHtml(sup)}/staging/&lt;name&gt;</code>.</div>
+          </div>
+        `,
+        async () => {
+          const name = (document.getElementById("modalStagingName").value || "").trim();
+          if (!name) throw new Error("staging_name is required.");
+          await postJSON(`/reflection/staging/create?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(name)}`);
+          await refreshStagings();
+        },
+        "Create"
+      );
+      setTimeout(() => {
+        const el = document.getElementById("modalStagingName");
+        if (el) el.focus();
+      }, 20);
+    });
+  }
+
+  // -------------------- Cross-page tenant change --------------------
+
+  window.addEventListener("supertable-changed", function(e) {
+    const detail = (e && e.detail) ? e.detail : {};
+    const org = detail.org || "";
+    const sup = detail.sup || "";
+    const u = new URL(window.location.href);
+    u.pathname = "/reflection/ingestion";
+    u.searchParams.set("org", org);
+    u.searchParams.set("sup", sup);
+    u.hash = "#staging";
+    window.location.href = u.toString();
+  });
+
+  // Initial tab from hash
+  const h = (window.location.hash || "").replace("#", "");
+  if (h === "pipe" || h === "load" || h === "staging") {
+    window.switchTab(h);
+  }
+
+  // Initial load
+  refreshStagings().then(async () => {
+    const stgSel2 = document.getElementById("pipeStagingSelect");
+    if (stgSel2 && stgSel2.value) await refreshPipes();
+  });
+
+  window.refreshStagings = refreshStagings;
+  window.refreshPipes = refreshPipes;
+})();
+</script>
+{% endblock %}

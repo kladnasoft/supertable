@@ -48,7 +48,7 @@
 
     /* ---------------- Sidebar Styles ---------------- */
     .app-layout {
-      display: flex;
+      display: block;
       min-height: 100vh;
     }
 
@@ -58,14 +58,14 @@
       background-color: var(--dark-color);
       color: #fff;
       padding: 20px 0;
-      display: flex;
+      display: block;
       flex-direction: column;
       justify-content: space-between;
       box-shadow: 2px 0 5px rgba(0,0,0,0.1);
     }
 
     .logo-box {
-      display: flex;
+      display: block;
       align-items: center;
       gap: 12px;
       padding: 0 20px 20px;
@@ -90,7 +90,7 @@
     }
 
     .nav-link {
-      display: flex;
+      display: block;
       align-items: center;
       gap: 10px;
       padding: 10px 10px;
@@ -178,7 +178,7 @@
       padding: 10px 15px;
       border-radius: 8px;
       margin-bottom: 20px;
-      display: flex;
+      display: block;
       align-items: center;
       gap: 10px;
       font-size: 15px;
@@ -241,7 +241,7 @@
       max-width: 90vw;
       width: 600px;
       max-height: 90vh;
-      display: flex;
+      display: block;
       flex-direction: column;
       overflow: hidden;
       box-shadow: 0 10px 30px rgba(0,0,0,0.2);
@@ -250,7 +250,7 @@
     #m-header {
       padding: 15px;
       border-bottom: 1px solid var(--panel-border);
-      display: flex;
+      display: block;
       justify-content: space-between;
       align-items: center;
       font-weight: 600;
@@ -271,8 +271,10 @@
   <div class="app-layout">
     {% include "sidebar.html" %}
 
-    <div class="content-area">
-      {% block content %}{% endblock %}
+    <div class="content-container">
+      <div class="wrap">
+        {% block content %}{% endblock %}
+      </div>
     </div>
   </div>
 

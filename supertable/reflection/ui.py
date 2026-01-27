@@ -772,52 +772,6 @@ def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query
     return {"org": org, "sup": sup, "formats": fmts}
 
 
-_SUPPORTED_MIRROR_FORMATS = ("DELTA", "ICEBERG", "PARQUET")
-
-
-def _normalize_mirror_fmt(fmt: str) -> str:
-    fu = str(fmt or "").upper().strip()
-    if fu not in _SUPPORTED_MIRROR_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Unsupported mirror format: {fmt}")
-    return fu
-
-
-@router.post("/reflection/mirrors/enable")
-def api_enable_mirror(
-        fmt: str = Query(...),
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-        _: Any = Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    fu = _normalize_mirror_fmt(fmt)
-    try:
-        fmts = catalog.enable_mirror(org, sup, fu)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Enable mirror failed: {e}")
-    return {"ok": True, "org": org, "sup": sup, "formats": fmts}
-
-
-@router.post("/reflection/mirrors/disable")
-def api_disable_mirror(
-        fmt: str = Query(...),
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-        _: Any = Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    fu = _normalize_mirror_fmt(fmt)
-    try:
-        fmts = catalog.disable_mirror(org, sup, fu)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Disable mirror failed: {e}")
-    return {"ok": True, "org": org, "sup": sup, "formats": fmts}
-
-
 
 def _list_leaves(
         org: Optional[str] = Query(None),
@@ -1302,7 +1256,6 @@ def admin_page(
         "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
         "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
         "mirrors": mirrors,
-        "mirrors_enabled_formats": mirrors,
         "users": users,
         "roles": roles,
         "default_user_hash": default_user_hash,
@@ -2079,3 +2032,931 @@ def _add_reflection_alias_routes(_router: APIRouter) -> None:
 
 
 _add_reflection_alias_routes(router)
+
+# ------------------------------ Staging / Pipes ------------------------------
+
+_STAGING_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def _staging_base_dir(org: str, sup: str) -> str:
+    return os.path.join(org, sup, "staging")
+
+
+def _staging_index_path(org: str, sup: str) -> str:
+    return os.path.join(_staging_base_dir(org, sup), "_staging.json")
+
+
+def _pipe_index_path(org: str, sup: str) -> str:
+    return os.path.join(_staging_base_dir(org, sup), "_pipe.json")
+
+
+def _staging_key(org: str, sup: str, staging_name: str) -> str:
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}"
+
+
+def _staging_index_key(org: str, sup: str) -> str:
+    # Index of staging names for website/UI listing.
+    return f"supertable:{org}:{sup}:meta:staging:meta"
+
+
+def _pipe_key(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}"
+
+
+def _pipe_index_key(org: str, sup: str, staging_name: str) -> str:
+    # Index of pipe names for a given staging for website/UI listing.
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta"
+
+
+def _redis_json_load(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+        return {"value": obj}
+    except Exception:
+        return {"value": raw}
+
+
+def _redis_get_staging_meta(org: str, sup: str, staging_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _redis_json_load(redis_client.get(_staging_key(org, sup, staging_name)))
+    except Exception:
+        return None
+
+
+def _redis_get_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _redis_json_load(redis_client.get(_pipe_key(org, sup, staging_name, pipe_name)))
+    except Exception:
+        return None
+
+
+def _redis_list_stagings(org: str, sup: str) -> List[str]:
+    idx = _staging_index_key(org, sup)
+    try:
+        names = redis_client.smembers(idx) or set()
+        if names:
+            return sorted({str(x) for x in names if str(x).strip() and str(x) != "meta"})
+    except Exception:
+        pass
+
+    # Fallback for older data: scan for staging meta keys.
+    pattern = f"supertable:{org}:{sup}:meta:staging:*"
+    cursor = 0
+    out: Set[str] = set()
+    while True:
+        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+        for key in keys:
+            k = key if isinstance(key, str) else key.decode("utf-8")
+            tail = k.rsplit("meta:staging:", 1)[-1]
+            if not tail or tail == "meta":
+                continue
+            # staging meta key has no further ":" segments (pipe keys do)
+            if ":" in tail:
+                continue
+            out.add(tail)
+        if cursor == 0:
+            break
+    return sorted(out)
+
+
+def _redis_list_pipes(org: str, sup: str, staging_name: str) -> List[str]:
+    idx = _pipe_index_key(org, sup, staging_name)
+    try:
+        names = redis_client.smembers(idx) or set()
+        if names:
+            return sorted({str(x) for x in names if str(x).strip() and str(x) != "meta"})
+    except Exception:
+        pass
+
+    pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:*"
+    cursor = 0
+    out: Set[str] = set()
+    while True:
+        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+        for key in keys:
+            k = key if isinstance(key, str) else key.decode("utf-8")
+            tail = k.rsplit(":pipe:", 1)[-1]
+            if not tail or tail == "meta":
+                continue
+            if ":" in tail:
+                continue
+            out.add(tail)
+        if cursor == 0:
+            break
+    return sorted(out)
+
+
+def _redis_upsert_staging_meta(org: str, sup: str, staging_name: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    payload: Dict[str, Any] = dict(meta or {})
+    payload.setdefault("organization", org)
+    payload.setdefault("super_name", sup)
+    payload.setdefault("staging_name", staging_name)
+    payload["updated_at_ms"] = int(time.time() * 1000)
+
+    try:
+        redis_client.set(_staging_key(org, sup, staging_name), json.dumps(payload, ensure_ascii=False))
+        redis_client.sadd(_staging_index_key(org, sup), staging_name)
+    except Exception:
+        # UI should not fail hard if Redis is unavailable
+        pass
+
+
+def _redis_upsert_pipe_meta(
+    org: str,
+    sup: str,
+    staging_name: str,
+    pipe_name: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = dict(meta or {})
+    payload.setdefault("organization", org)
+    payload.setdefault("super_name", sup)
+    payload.setdefault("staging_name", staging_name)
+    payload.setdefault("pipe_name", pipe_name)
+    payload["updated_at_ms"] = int(time.time() * 1000)
+
+    try:
+        redis_client.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(payload, ensure_ascii=False))
+        redis_client.sadd(_pipe_index_key(org, sup, staging_name), pipe_name)
+        redis_client.sadd(_staging_index_key(org, sup), staging_name)
+    except Exception:
+        pass
+
+
+def _redis_delete_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> None:
+    try:
+        redis_client.srem(_pipe_index_key(org, sup, staging_name), pipe_name)
+    except Exception:
+        pass
+    try:
+        redis_client.delete(_pipe_key(org, sup, staging_name, pipe_name))
+    except Exception:
+        pass
+
+
+def _redis_delete_staging_cascade(org: str, sup: str, staging_name: str) -> None:
+    # Remove from index + delete the base meta key.
+    try:
+        redis_client.srem(_staging_index_key(org, sup), staging_name)
+    except Exception:
+        pass
+    try:
+        redis_client.delete(_staging_key(org, sup, staging_name))
+    except Exception:
+        pass
+
+    # Delete everything under the staging namespace (pipes + indices + any future keys).
+    pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:*"
+    cursor = 0
+    while True:
+        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+        if keys:
+            try:
+                pipe = redis_client.pipeline()
+                for k in keys:
+                    pipe.delete(k)
+                pipe.execute()
+            except Exception:
+                # best effort
+                pass
+        if cursor == 0:
+            break
+
+    try:
+        redis_client.delete(_pipe_index_key(org, sup, staging_name))
+    except Exception:
+        pass
+
+
+def _read_json_if_exists(storage: Any, path: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not storage.exists(path):
+            return None
+    except Exception:
+        return None
+    try:
+        data = storage.read_json(path)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_json_atomic(storage: Any, path: str, data: Dict[str, Any]) -> None:
+    # Storage interface is expected to handle overwrite atomically enough for our UI use.
+    base = os.path.dirname(path)
+    try:
+        if base and not storage.exists(base):
+            storage.makedirs(base)
+    except Exception:
+        # best effort; write_json might still create prefixes on object stores
+        pass
+    storage.write_json(path, data)
+
+
+def _flatten_tree_leaves(prefix: str, node: Any) -> List[str]:
+    out: List[str] = []
+
+    def dfs(p: str, n: Any) -> None:
+        if n is None:
+            out.append(p)
+            return
+        if not isinstance(n, dict):
+            return
+        for k, v in n.items():
+            dfs(os.path.join(p, k), v)
+
+    dfs(prefix, node)
+    return out
+
+
+def _scan_staging_names(storage: Any, org: str, sup: str) -> List[str]:
+    base = _staging_base_dir(org, sup)
+    try:
+        if not storage.exists(base):
+            return []
+        tree = storage.get_directory_structure(base)
+    except Exception:
+        return []
+    if not isinstance(tree, dict):
+        return []
+    names: List[str] = []
+    for name, child in tree.items():
+        if not isinstance(name, str):
+            continue
+        if name.startswith("_"):
+            continue
+        # staging folders appear as dict nodes
+        if isinstance(child, dict):
+            names.append(name)
+    return sorted(set(names))
+
+
+def _get_staging_names(storage: Any, org: str, sup: str) -> List[str]:
+    idx_path = _staging_index_path(org, sup)
+    data = _read_json_if_exists(storage, idx_path)
+    names: List[str] = []
+    if data:
+        raw = data.get("staging_names")
+        if isinstance(raw, list):
+            names = [str(x) for x in raw if isinstance(x, (str, int, float))]
+    # Merge with a best-effort scan in case index is missing/stale.
+    scanned = _scan_staging_names(storage, org, sup)
+    merged = sorted(set(names) | set(scanned))
+    if merged and (not data or sorted(set(names)) != merged):
+        _write_json_atomic(storage, idx_path, {"staging_names": merged, "updated_at_ns": time.time_ns()})
+    return merged
+
+
+def _load_pipe_index(storage: Any, org: str, sup: str) -> List[Dict[str, Any]]:
+    idx_path = _pipe_index_path(org, sup)
+    data = _read_json_if_exists(storage, idx_path)
+    pipes: List[Dict[str, Any]] = []
+    if data:
+        raw = data.get("pipes")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("pipe_name") and item.get("staging_name"):
+                    pipes.append(item)
+    return pipes
+
+
+def _scan_pipes(storage: Any, org: str, sup: str, staging_names: List[str]) -> List[Dict[str, Any]]:
+    pipes: List[Dict[str, Any]] = []
+    from supertable.super_pipe import SuperPipe  # noqa: WPS433
+
+    for stg in staging_names:
+        try:
+            sp = SuperPipe(organization=org, super_name=sup, staging_name=stg)
+        except Exception:
+            continue
+        try:
+            tree = storage.get_directory_structure(os.path.join(_staging_base_dir(org, sup), stg, "pipes"))
+        except Exception:
+            continue
+        for path in _flatten_tree_leaves(os.path.join(_staging_base_dir(org, sup), stg, "pipes"), tree):
+            if not path.endswith(".json"):
+                continue
+            try:
+                data = storage.read_json(path)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            # normalize minimal keys
+            if not data.get("pipe_name"):
+                data["pipe_name"] = os.path.splitext(os.path.basename(path))[0]
+            if not data.get("staging_name"):
+                data["staging_name"] = stg
+            pipes.append(data)
+    return pipes
+
+
+def _get_pipes(storage: Any, org: str, sup: str, staging_names: List[str]) -> List[Dict[str, Any]]:
+    pipes = _load_pipe_index(storage, org, sup)
+    if pipes:
+        # best-effort freshness: merge with scan if index seems incomplete
+        scanned = _scan_pipes(storage, org, sup, staging_names)
+        if scanned:
+            existing_keys = {(p.get("staging_name"), p.get("pipe_name")) for p in pipes}
+            for p in scanned:
+                key = (p.get("staging_name"), p.get("pipe_name"))
+                if key not in existing_keys:
+                    pipes.append(p)
+            # persist merged index
+            _write_json_atomic(
+                storage,
+                _pipe_index_path(org, sup),
+                {"pipes": pipes, "updated_at_ns": time.time_ns()},
+            )
+        return pipes
+
+    scanned = _scan_pipes(storage, org, sup, staging_names)
+    if scanned:
+        _write_json_atomic(
+            storage,
+            _pipe_index_path(org, sup),
+            {"pipes": scanned, "updated_at_ns": time.time_ns()},
+        )
+    return scanned
+
+
+@router.get("/reflection/staging", response_class=HTMLResponse)
+def staging_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    if not _is_authorized(request):
+        resp = RedirectResponse("/reflection/login", status_code=302)
+        _no_store(resp)
+        return resp
+
+    provided = _get_provided_token(request) or ""
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
+
+    ctx: Dict[str, Any] = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": bool(sel_org and sel_sup),
+        "staging_names": [],
+        "staging_folders": [],
+        "pipes_by_staging": {},
+        "pipes_flat": [],
+    }
+    inject_session_into_ctx(ctx, request)
+
+    if not sel_org or not sel_sup:
+        resp = templates.TemplateResponse("staging.html", ctx)
+        _no_store(resp)
+        return resp
+
+    storage = get_storage()
+    staging_names = _get_staging_names(storage, sel_org, sel_sup)
+    pipes = _get_pipes(storage, sel_org, sel_sup, staging_names)
+
+    # group pipes by staging
+    by_staging: Dict[str, List[Dict[str, Any]]] = {}
+    for p in pipes:
+        stg = str(p.get("staging_name") or "")
+        if not stg:
+            continue
+        by_staging.setdefault(stg, []).append(p)
+    for stg, arr in by_staging.items():
+        arr.sort(key=lambda x: str(x.get("pipe_name") or ""))
+
+    # staging folders + files (best-effort)
+    folders: List[Dict[str, Any]] = []
+    base = _staging_base_dir(sel_org, sel_sup)
+    for stg in staging_names:
+        files_dir = os.path.join(base, stg, "files")
+        files: List[str] = []
+        try:
+            if storage.exists(files_dir):
+                tree = storage.get_directory_structure(files_dir)
+                leaves = _flatten_tree_leaves(files_dir, tree)
+                # make paths relative to files_dir
+                files = [os.path.relpath(p, files_dir) for p in leaves if p.endswith(".parquet")]
+                files.sort()
+        except Exception:
+            files = []
+        folders.append({"name": stg, "files": files})
+
+    ctx.update(
+        {
+            "staging_names": staging_names,
+            "staging_folders": folders,
+            "pipes_by_staging": by_staging,
+            "pipes_flat": sorted(
+                pipes,
+                key=lambda x: (str(x.get("staging_name") or ""), str(x.get("pipe_name") or "")),
+            ),
+        }
+    )
+
+    resp = templates.TemplateResponse("staging.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+@router.get("/reflection/ingestion", response_class=HTMLResponse)
+def ingestion_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    if not _is_authorized(request):
+        resp = RedirectResponse("/reflection/login", status_code=302)
+        _no_store(resp)
+        return resp
+
+    provided = _get_provided_token(request) or ""
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
+
+    ctx: Dict[str, Any] = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": bool(sel_org and sel_sup),
+    }
+    inject_session_into_ctx(ctx, request)
+
+    resp = templates.TemplateResponse("ingestion.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+@router.get("/reflection/ingestion/stagings")
+def api_ingestion_list_stagings(
+    org: str = Query(...),
+    sup: str = Query(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    names = _redis_list_stagings(org, sup)
+    return {"staging_names": names}
+
+
+@router.get("/reflection/ingestion/staging/meta")
+def api_ingestion_get_staging_meta(
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    meta = _redis_get_staging_meta(org, sup, staging_name) or {}
+    return {"meta": meta}
+
+
+@router.get("/reflection/ingestion/staging/files")
+def api_ingestion_list_staging_files(
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Paged read of staging/{staging_name}_files.json for UI (lazy-load)."""
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    storage = get_storage()
+    base_dir = os.path.join(org, sup, "staging")
+    index_path = os.path.join(base_dir, f"{staging_name}_files.json")
+
+    if not storage.exists(index_path):
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+
+    data = storage.read_json(index_path) or []
+    if not isinstance(data, list):
+        data = []
+
+    total = len(data)
+    items = data[offset : offset + limit]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
+
+@router.get("/reflection/ingestion/pipes")
+def api_ingestion_list_pipes(
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    pipe_names = _redis_list_pipes(org, sup, staging_name)
+    if not pipe_names:
+        return {"items": []}
+
+    keys = [_pipe_key(org, sup, staging_name, pn) for pn in pipe_names]
+    try:
+        pipe = redis_client.pipeline()
+        for k in keys:
+            pipe.get(k)
+        raws = pipe.execute()
+    except Exception:
+        raws = [redis_client.get(k) for k in keys]
+
+    items: List[Dict[str, Any]] = []
+    for pn, raw in zip(pipe_names, raws):
+        meta = _redis_json_load(raw) or {}
+        items.append({"pipe_name": pn, "simple_name": str(meta.get("simple_name") or ""), "enabled": bool(meta.get("enabled"))})
+
+    items.sort(key=lambda x: str(x.get("pipe_name") or ""))
+    return {"items": items}
+
+
+@router.get("/reflection/ingestion/pipe/meta")
+def api_ingestion_get_pipe_meta(
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_name: str = Query(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+
+    meta = _redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {}
+    return {"meta": meta}
+
+
+@router.post("/reflection/staging/create")
+def api_create_staging(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    # Create staging folders (and validate super exists) via the canonical interface
+    from supertable.staging_area import Staging  # noqa: WPS433
+
+    try:
+        Staging(organization=org, super_name=sup, staging_name=staging_name)  # side effects: ensure folders
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create staging failed: {e}")
+
+    # Persist index at super-level for fast listing (object stores don't list empty folders reliably)
+    storage = get_storage()
+    names = _get_staging_names(storage, org, sup)
+    if staging_name not in names:
+        names = sorted(set(names + [staging_name]))
+        _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
+
+    _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
+
+
+@router.post("/reflection/staging/delete")
+def api_delete_staging(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    storage = get_storage()
+    target = os.path.join(_staging_base_dir(org, sup), staging_name)
+
+    try:
+        if storage.exists(target):
+            storage.delete(target)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete staging failed: {e}")
+
+    # Update indices
+    names = _get_staging_names(storage, org, sup)
+    if staging_name in names:
+        names = [n for n in names if n != staging_name]
+        _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
+
+    pipes = _load_pipe_index(storage, org, sup)
+    if pipes:
+        pipes2 = [p for p in pipes if str(p.get("staging_name") or "") != staging_name]
+        if pipes2 != pipes:
+            _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes2, "updated_at_ns": time.time_ns()})
+
+    _redis_delete_staging_cascade(org, sup, staging_name)
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
+
+
+def _parse_overwrite_columns(raw: Optional[str]) -> List[str]:
+    if raw is None:
+        # Default from docs/examples
+        return ["day"]
+    s = (raw or "").strip()
+    if not s:
+        return []
+    cols = [c.strip() for c in s.split(",")]
+    return [c for c in cols if c]
+
+
+@router.post("/reflection/pipes/save")
+def api_save_pipe(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    org = str(payload.get("organization") or payload.get("org") or "").strip()
+    sup = str(payload.get("super_name") or payload.get("sup") or "").strip()
+    staging_name = str(payload.get("staging_name") or "").strip()
+    pipe_name = str(payload.get("pipe_name") or "").strip()
+
+    if not org or not sup:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+    if not _STAGING_NAME_RE.fullmatch(staging_name):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    if not _STAGING_NAME_RE.fullmatch(pipe_name):
+        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+
+    storage = get_storage()
+    stg_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
+    try:
+        if not storage.exists(stg_dir):
+            raise HTTPException(status_code=404, detail="Staging not found")
+    except HTTPException:
+        raise
+    except Exception:
+        # best-effort: proceed; object stores may not list prefixes reliably
+        pass
+
+    # Canonicalize and persist the pipe definition.
+    pipe_def: Dict[str, Any] = dict(payload)
+    pipe_def["organization"] = org
+    pipe_def["super_name"] = sup
+    pipe_def["staging_name"] = staging_name
+    pipe_def["pipe_name"] = pipe_name
+    pipe_def.setdefault("enabled", True)
+    pipe_def.setdefault("overwrite_columns", ["day"])
+    pipe_def.setdefault("meta", {})
+    pipe_def["updated_at_ns"] = time.time_ns()
+
+    pipe_path = os.path.join(stg_dir, "pipes", f"{pipe_name}.json")
+    try:
+        _write_json_atomic(storage, pipe_path, pipe_def)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Save pipe failed: {e}")
+
+    # Ensure indices remain consistent for legacy pages.
+    names = _get_staging_names(storage, org, sup)
+    if staging_name not in names:
+        names = sorted(set(names + [staging_name]))
+        _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
+
+    pipes = _load_pipe_index(storage, org, sup)
+    pipes = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name)]
+    overwrite_cols = pipe_def.get("overwrite_columns")
+    if not isinstance(overwrite_cols, list):
+        overwrite_cols = []
+    pipes.append(
+        {
+            "pipe_name": pipe_name,
+            "organization": org,
+            "super_name": sup,
+            "staging_name": staging_name,
+            "user_hash": str(pipe_def.get("user_hash") or "").strip(),
+            "simple_name": str(pipe_def.get("simple_name") or "").strip(),
+            "overwrite_columns": overwrite_cols,
+            "enabled": bool(pipe_def.get("enabled")),
+            "path": pipe_path,
+            "updated_at_ns": time.time_ns(),
+        }
+    )
+    _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
+
+    # Mirror to Redis for website/UI listing.
+    _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
+    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, pipe_def)
+
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "path": pipe_path}
+
+
+@router.post("/reflection/pipes/create")
+def api_create_pipe(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_name: str = Query(...),
+    user_hash: str = Query(...),
+    simple_name: str = Query(...),
+    overwrite_columns: Optional[str] = Query(None),
+    enabled: bool = Query(True),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+
+    from supertable.super_pipe import SuperPipe  # noqa: WPS433
+
+    overwrite_cols = _parse_overwrite_columns(overwrite_columns)
+
+    try:
+        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
+        path = pipe.create(
+            pipe_name=pipe_name.strip(),
+            user_hash=user_hash.strip(),
+            simple_name=simple_name.strip(),
+            overwrite_columns=overwrite_cols,
+            enabled=bool(enabled),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create pipe failed: {e}")
+
+    storage = get_storage()
+
+    # ensure staging index includes this staging (nice UX for dropdowns)
+    names = _get_staging_names(storage, org, sup)
+    if staging_name not in names:
+        names = sorted(set(names + [staging_name]))
+        _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
+
+    # update pipe index
+    pipes = _load_pipe_index(storage, org, sup)
+    # remove existing entry (if any) and append fresh definition
+    pipes = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name.strip())]
+    pipes.append(
+        {
+            "pipe_name": pipe_name.strip(),
+            "organization": org,
+            "super_name": sup,
+            "staging_name": staging_name,
+            "user_hash": user_hash.strip(),
+            "simple_name": simple_name.strip(),
+            "overwrite_columns": overwrite_cols,
+            "enabled": bool(enabled),
+            "path": path,
+            "updated_at_ns": time.time_ns(),
+        }
+    )
+    _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
+
+    _redis_upsert_pipe_meta(
+        org,
+        sup,
+        staging_name,
+        pipe_name.strip(),
+        {
+            "pipe_name": pipe_name.strip(),
+            "organization": org,
+            "super_name": sup,
+            "staging_name": staging_name,
+            "user_hash": user_hash.strip(),
+            "simple_name": simple_name.strip(),
+            "overwrite_columns": overwrite_cols,
+            "enabled": bool(enabled),
+            "path": path,
+        },
+    )
+    _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip(), "path": path}
+
+
+@router.post("/reflection/pipes/delete")
+def api_delete_pipe(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+
+    storage = get_storage()
+    path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
+
+    try:
+        if storage.exists(path):
+            storage.delete(path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete pipe failed: {e}")
+
+    pipes = _load_pipe_index(storage, org, sup)
+    if pipes:
+        pipes2 = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name.strip())]
+        if pipes2 != pipes:
+            _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes2, "updated_at_ns": time.time_ns()})
+
+    _redis_delete_pipe_meta(org, sup, staging_name, pipe_name.strip())
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip()}
+
+
+@router.post("/reflection/pipes/enable")
+def api_enable_pipe(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    from supertable.super_pipe import SuperPipe  # noqa: WPS433
+
+    try:
+        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
+        pipe.set_enabled(pipe_name=pipe_name, enabled=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Enable pipe failed: {e}")
+
+    storage = get_storage()
+    pipes = _load_pipe_index(storage, org, sup)
+    if pipes:
+        for p in pipes:
+            if p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name:
+                p["enabled"] = True
+                p["updated_at_ns"] = time.time_ns()
+        _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
+
+    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
+    meta = _read_json_if_exists(storage, p_path) or _redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {}
+    if isinstance(meta, dict):
+        meta["enabled"] = True
+    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    return {"ok": True}
+
+
+@router.post("/reflection/pipes/disable")
+def api_disable_pipe(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_name: str = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    from supertable.super_pipe import SuperPipe  # noqa: WPS433
+
+    try:
+        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
+        pipe.set_enabled(pipe_name=pipe_name, enabled=False)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Disable pipe failed: {e}")
+
+    storage = get_storage()
+    pipes = _load_pipe_index(storage, org, sup)
+    if pipes:
+        for p in pipes:
+            if p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name:
+                p["enabled"] = False
+                p["updated_at_ns"] = time.time_ns()
+        _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
+
+    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
+    meta = _read_json_if_exists(storage, p_path) or _redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {}
+    if isinstance(meta, dict):
+        meta["enabled"] = False
+    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    return {"ok": True}
