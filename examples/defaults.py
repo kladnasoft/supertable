@@ -12,7 +12,7 @@ simple_name = "facts"
 organization = "kladna-soft"
 overwrite_columns = ["partition"]
 generated_data_dir = "generated_data"
-staging_name = "new1"
+staging_name = "new3"
 
 class MonitorType(Enum):
     PLANS = "plans"

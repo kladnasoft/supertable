@@ -156,7 +156,7 @@
   <!-- -------------------- STAGING TAB -------------------- -->
   <div class="tabpane" id="pane-staging">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Staging (Redis)</div>
+      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Staging</div>
       <button type="button" id="btnCreateStaging" class="btn btn-sm btn-azure-outline">
         <i class="fas fa-plus"></i> Create staging
       </button>
@@ -173,7 +173,7 @@
   <!-- -------------------- PIPE TAB -------------------- -->
   <div class="tabpane hidden" id="pane-pipe">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Pipe (Redis)</div>
+      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Pipe</div>
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
         <select id="pipeStagingSelect" class="input" style="min-width: 240px; border-radius: 12px; padding: 8px 10px; border: 1px solid rgba(15,23,42,.14);">
           <option value="">Select staging…</option>
@@ -193,7 +193,12 @@
       <div class="split">
         <div class="left">
           <div style="font-size: 12px; font-weight: 900; color:#0f172a; margin: 6px 0;">Pipes</div>
-          <input id="pipeFilter" class="input" placeholder="Filter pipes (name or simple_name)…" style="width:100%; padding:9px 10px; border-radius:12px; border:1px solid rgba(15,23,42,.14); margin-bottom: 10px;" />
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom: 10px; flex-wrap:wrap;">
+          <input id="pipeFilter" class="input" placeholder="Filter pipes (name or simple_name)…" style="flex:1; min-width: 220px; padding:9px 10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
+          <button type="button" id="btnDeletePipe" class="btn btn-sm btn-danger-outline" style="display:none; white-space:nowrap;">
+                <i class="fas fa-trash"></i> Delete
+              </button>
+        </div>
           <div id="pipeList"></div>
         </div>
         <div class="right">
@@ -203,9 +208,6 @@
               <span id="pipeEnabledPill" class="pill off" style="display:none;">disabled</span>
               <button type="button" id="btnTogglePipe" class="btn btn-sm btn-azure-outline" style="display:none;">
                 <i class="fas fa-toggle-on"></i> Toggle
-              </button>
-              <button type="button" id="btnDeletePipe" class="btn btn-sm btn-danger-outline" style="display:none;">
-                <i class="fas fa-trash"></i> Delete
               </button>
             </div>
           </div>
@@ -363,6 +365,14 @@
     const u = new URL(window.location.href);
     u.hash = "#" + name;
     history.replaceState(null, "", u.toString());
+    if (name === "pipe") {
+      setTimeout(async () => {
+        const stgSel = document.getElementById("pipeStagingSelect");
+        if (stgSel && stgSel.value && String(stgSel.value).trim() && String(stgSel.value).trim() !== lastPipesStagingLoaded) {
+          try { await refreshPipes(); } catch (e) {}
+        }
+      }, 0);
+    }
   };
 
   // -------------------- Staging (expandable, scrollable, lazy-load) --------------------
@@ -584,7 +594,7 @@
     lastStagingNames = Array.isArray(names) ? names : [];
 
     if (sel) {
-      const prev = (selectedStagingName || sel.value || "").trim();
+      const prev = "";
       sel.innerHTML = "<option value=''>Select staging…</option>";
       for (const n of lastStagingNames) {
         const opt = document.createElement("option");
@@ -592,8 +602,12 @@
         opt.textContent = n;
         sel.appendChild(opt);
       }
-      if (prev && lastStagingNames.includes(prev)) sel.value = prev;
-      if (sel.value) setSelectedStaging(sel.value);
+      if (prev && lastStagingNames.includes(prev)) {
+        sel.value = "";
+      } else {
+        sel.value = "";
+      }
+      setSelectedStaging("");
     }
 
     renderStagingList();
@@ -605,7 +619,7 @@
     if (!list) return;
 
     if (!lastStagingNames.length) {
-      list.innerHTML = "<div style='color:#64748b;'>No staging found in Redis.</div>";
+      list.innerHTML = "<div style='color:#64748b;'>No staging found.</div>";
       return;
     }
 
@@ -639,11 +653,7 @@
           <div data-stg-body="1" style="display:none; margin-top:8px;"></div>
         </div>
 
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <button type="button" class="btn btn-sm btn-azure-outline" onclick="viewStagingMeta('${escapeHtml(n)}'); event.stopPropagation();">
-            <i class="fas fa-code"></i> Meta
-          </button>
-          <button type="button" class="btn btn-sm btn-danger-outline" onclick="deleteStaging('${escapeHtml(n)}'); event.stopPropagation();">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">          <button type="button" class="btn btn-sm btn-danger-outline" onclick="deleteStaging('${escapeHtml(n)}'); event.stopPropagation();">
             <i class="fas fa-trash"></i> Delete
           </button>
         </div>
@@ -691,6 +701,7 @@
   let selectedPipeName = "";
   let selectedPipeEnabled = false;
   let lastPipeItems = [];
+  let lastPipesStagingLoaded = "";
 
   function setPipeButtonsVisible(visible) {
     const pill = document.getElementById("pipeEnabledPill");
@@ -727,6 +738,7 @@
     if (!stg) {
       list.innerHTML = "<div style='color:#64748b;'>Please select a staging area first.</div>";
       lastPipeItems = [];
+      lastPipesStagingLoaded = "";
       return;
     }
 
@@ -734,6 +746,7 @@
     const data = await getJSON(`/reflection/ingestion/pipes?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}`);
     const items = (data && data.items) ? data.items : [];
     lastPipeItems = Array.isArray(items) ? items : [];
+    lastPipesStagingLoaded = stg;
     renderPipeList();
   }
 
@@ -757,7 +770,7 @@
     }
 
     if (!items.length) {
-      list.innerHTML = "<div style='color:#64748b;'>No pipes found in Redis.</div>";
+      list.innerHTML = "<div style='color:#64748b;'>No pipes found.</div>";
       return;
     }
 
@@ -797,6 +810,15 @@
 
     const data = await getJSON(`/reflection/ingestion/pipe/meta?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}&pipe_name=${enc(pipeName)}`);
     const meta = (data && data.meta) ? data.meta : {};
+    // Ensure required routing fields exist even if legacy Redis entries are partial.
+    const cur = currentOrgSup();
+    if (meta && typeof meta === "object") {
+      meta.organization = String(meta.organization || meta.org || cur.org || "");
+      meta.super_name = String(meta.super_name || meta.sup || cur.sup || "");
+      meta.staging_name = String(meta.staging_name || stagingName || "");
+      meta.pipe_name = String(meta.pipe_name || pipeName || "");
+      meta.user_hash = String(meta.user_hash || cur.userHash || "");
+    }
     selectedPipeName = String(meta.pipe_name || pipeName || "");
     selectedPipeEnabled = !!meta.enabled;
     editor.value = JSON.stringify(meta || {}, null, 2);
@@ -824,6 +846,12 @@
     stgSel.addEventListener("change", async () => {
       setSelectedStaging(stgSel.value || "");
       await refreshPipes();
+    });
+    stgSel.addEventListener("click", async () => {
+      const v = String(stgSel.value || "").trim();
+      if (v && v !== lastPipesStagingLoaded) {
+        try { await refreshPipes(); } catch (e) {}
+      }
     });
   }
 
@@ -891,6 +919,21 @@
       let obj = null;
       try { obj = JSON.parse(editor.value || "{}"); } catch (e) { alert("Invalid JSON: " + e.message); return; }
       if (!obj || typeof obj !== "object") { alert("Pipe definition must be a JSON object."); return; }
+
+      // Fill required identity fields from current selection (helps when editing legacy/partial entries).
+      const cur = currentOrgSup();
+      const stg = (stgSel && stgSel.value) ? String(stgSel.value).trim() : "";
+      obj.organization = String(obj.organization || obj.org || cur.org || "");
+      obj.super_name = String(obj.super_name || obj.sup || cur.sup || "");
+      obj.staging_name = String(obj.staging_name || stg || "");
+      obj.pipe_name = String(obj.pipe_name || selectedPipeName || "").trim();
+      obj.user_hash = String(obj.user_hash || cur.userHash || "");
+
+      if (!obj.organization || !obj.super_name || !obj.staging_name || !obj.pipe_name) {
+        alert("Missing required fields: organization, super_name, staging_name, pipe_name.");
+        return;
+      }
+
       await postJSON("/reflection/pipes/save", obj);
       await refreshPipes();
       alert("Saved.");
