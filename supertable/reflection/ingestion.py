@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 
@@ -88,7 +89,7 @@ def attach_ingestion_routes(
         _: Any = Depends(logged_in_guard_api),
     ):
         names = redis_list_stagings(org, sup)
-        return {"staging_names": names}
+        return {"staging_names": names, "items": names}
 
     @router.get("/reflection/ingestion/staging/meta")
     def api_ingestion_get_staging_meta(
@@ -552,3 +553,277 @@ def attach_ingestion_routes(
             meta["enabled"] = False
         redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
         return {"ok": True}
+
+    # ----------------------------- Load Data APIs ----------------------------
+
+    @router.get("/reflection/ingestion/tables")
+    def api_ingestion_list_tables(
+        org: str = Query(...),
+        sup: str = Query(...),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """Best-effort list of existing table names for UI suggestions."""
+        try:
+            from supertable.super_table import SuperTable  # noqa: WPS433
+        except Exception as e:  # pragma: no cover
+            return {"tables": [], "warning": f"SuperTable import failed: {e}"}
+
+        try:
+            st = SuperTable(super_name=sup, organization=org)
+        except Exception as e:
+            return {"tables": [], "warning": f"SuperTable init failed: {e}"}
+
+        out: List[str] = []
+
+        # Try a handful of common APIs across versions, but never fail hard.
+        for attr in (
+            "list_tables",
+            "list_table_names",
+            "get_table_names",
+            "list_simple_names",
+            "tables",
+        ):
+            if not hasattr(st, attr):
+                continue
+
+            try:
+                val = getattr(st, attr)
+                res = val() if callable(val) else val
+            except Exception:
+                continue
+
+            if isinstance(res, dict) and "tables" in res:
+                res = res["tables"]
+
+            if isinstance(res, (list, tuple, set)):
+                out = [str(x).strip() for x in res if str(x).strip()]
+                break
+
+        out = sorted(set(out))
+        return {"tables": out}
+    def _validate_simple_name(val: str) -> str:
+        v = (val or "").strip()
+        # conservative: letters, numbers, underscore; must start with letter; 1..64 chars
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", v):
+            raise HTTPException(status_code=400, detail="Invalid table name")
+        return v
+
+    def _convert_upload_to_arrow(file_name: str, file_bytes: bytes, table_name: str):
+        """Convert upload to a PyArrow table and attach system columns."""
+        try:
+            import uuid  # noqa: WPS433
+            import pandas as pd  # noqa: WPS433
+            import pyarrow as pa  # noqa: WPS433
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Missing conversion deps (pandas/pyarrow): {e}")
+
+        raw_name = (file_name or "").lower()
+        suffix = os.path.splitext(raw_name)[1]
+
+        # Read bytes once (already buffered)
+        data = file_bytes
+
+        # Heuristics by extension
+        if suffix in {".csv", ".tsv", ".txt"}:
+            sep = "\t" if suffix == ".tsv" else ","
+            df = pd.read_csv(pa.BufferReader(data), sep=sep, low_memory=False)
+            file_type = suffix.lstrip(".") or "csv"
+        elif suffix in {".json", ".jsonl", ".ndjson"}:
+            # Try jsonl first if looks line-based
+            text_head = data[:2048].lstrip()
+            if text_head.startswith(b"{") and b"\n" in text_head and suffix in {".jsonl", ".ndjson"}:
+                df = pd.read_json(pa.BufferReader(data), lines=True)
+            else:
+                try:
+                    df = pd.read_json(pa.BufferReader(data), lines=True)
+                except Exception:
+                    df = pd.read_json(pa.BufferReader(data))
+            file_type = "json"
+        elif suffix in {".parquet"}:
+            import pyarrow.parquet as pq  # noqa: WPS433
+
+            t = pq.read_table(pa.BufferReader(data))
+            file_type = "parquet"
+            df = None
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type (use csv/tsv/json/jsonl/parquet)")
+
+        job_uuid = str(uuid.uuid4())
+
+        if df is not None:
+            t = pa.Table.from_pandas(df, preserve_index=False)
+
+        # Attach system columns
+        row_ids = pa.array([str(uuid.uuid4()) for _ in range(t.num_rows)])
+        job_uuids = pa.array([job_uuid] * t.num_rows)
+        table_names = pa.array([table_name] * t.num_rows)
+
+        t = t.append_column("_sys_row_id", row_ids)
+        t = t.append_column("_sys_job_uuid", job_uuids)
+        t = t.append_column("_sys_table_name", table_names)
+
+        return t, job_uuid, file_type
+
+    @router.post("/reflection/ingestion/load/upload")
+    async def api_ingestion_load_upload(
+        org: str = Form(...),
+        sup: str = Form(...),
+        user_hash: str = Form(...),
+        mode: str = Form(...),
+        table_name: Optional[str] = Form(None),
+        staging_name: Optional[str] = Form(None),
+        overwrite_columns: Optional[str] = Form(None),
+        file: UploadFile = File(...),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """Upload a file and load to a table or stage it."""
+        t0 = time.perf_counter()
+
+        uhash = (user_hash or "").strip()
+        if not uhash:
+            raise HTTPException(status_code=400, detail="Missing user_hash")
+
+        m = (mode or "").strip().lower()
+        if m not in {"table", "staging"}:
+            raise HTTPException(status_code=400, detail="Invalid mode")
+
+        if m == "table":
+            if not table_name:
+                raise HTTPException(status_code=400, detail="Missing table_name")
+            simple_name = _validate_simple_name(table_name)
+        else:
+            if not staging_name:
+                raise HTTPException(status_code=400, detail="Missing staging_name")
+            if not STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+                raise HTTPException(status_code=400, detail="Invalid staging_name")
+            simple_name = _validate_simple_name(table_name or "data")
+
+        # Convert file
+        file_bytes = await file.read()
+        arrow_table, job_uuid, file_type = _convert_upload_to_arrow(file.filename or "", file_bytes, simple_name)
+
+        # Execute target
+        storage = get_storage()
+        written_at_ns = time.time_ns()
+
+        if m == "staging":
+            # Ensure staging folder exists via canonical interface
+            from supertable.staging_area import Staging  # noqa: WPS433
+
+            try:
+                Staging(organization=org, super_name=sup, staging_name=staging_name.strip())  # side effects
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Create staging failed: {e}")
+
+            # Save parquet via StagingArea if available; otherwise fall back to storage write
+            stage_file = None
+            try:
+                from supertable.super_table import SuperTable  # noqa: WPS433
+                from supertable.staging_area import StagingArea  # noqa: WPS433
+                import pyarrow.parquet as pq  # noqa: WPS433
+                import pyarrow as pa  # noqa: WPS433
+
+                st = SuperTable(super_name=sup, organization=org)
+                stg = StagingArea(super_table=st, organization=org)
+                # save_as_parquet returns a path like ".../staging/<file>"
+                stage_path = stg.save_as_parquet(
+                    arrow_table=arrow_table,
+                    table_name=simple_name,
+                    file_name=file.filename or "upload",
+                )
+                stage_file = str(stage_path).split("staging/")[-1]
+            except Exception:
+                # Fallback: write parquet directly via storage into staging folder
+                try:
+                    import pyarrow.parquet as pq  # noqa: WPS433
+                    import pyarrow as pa  # noqa: WPS433
+                    import io  # noqa: WPS433
+
+                    buf = io.BytesIO()
+                    pq.write_table(arrow_table, buf)
+                    buf.seek(0)
+                    stage_file = f"{simple_name}_{job_uuid}.parquet"
+                    base_dir = os.path.join(org, sup, "staging")
+                    p = os.path.join(base_dir, staging_name.strip(), stage_file)
+                    if hasattr(storage, "write_bytes"):
+                        storage.write_bytes(p, buf.read())
+                    elif hasattr(storage, "write"):
+                        storage.write(p, buf.read())
+                    else:
+                        raise RuntimeError("Storage backend does not support byte writes")
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Stage write failed: {e}")
+
+            # Update staging index (used by /staging/files)
+            base_dir = os.path.join(org, sup, "staging")
+            index_path = os.path.join(base_dir, f"{staging_name.strip()}_files.json")
+            items = storage.read_json(index_path) if storage.exists(index_path) else []
+            if not isinstance(items, list):
+                items = []
+
+            items.append(
+                {
+                    "file": stage_file,
+                    "rows": int(getattr(arrow_table, "num_rows", 0) or 0),
+                    "written_at_ns": str(written_at_ns),
+                    "job_uuid": job_uuid,
+                    "file_type": file_type,
+                    "table": simple_name,
+                }
+            )
+            write_json_atomic(storage, index_path, items)
+
+            inserted = int(getattr(arrow_table, "num_rows", 0) or 0)
+            deleted = 0
+        else:
+            try:
+                from supertable.data_writer import DataWriter  # noqa: WPS433
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"DataWriter import failed: {e}")
+
+            overwrite_cols: List[str] = []
+            raw_overwrite = (overwrite_columns or "").strip()
+            if raw_overwrite:
+                parts = re.split(r"[\s,]+", raw_overwrite)
+                for p in parts:
+                    col = (p or "").strip()
+                    if not col:
+                        continue
+                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", col):
+                        raise HTTPException(status_code=400, detail=f"Invalid overwrite column: {col}")
+                    overwrite_cols.append(col)
+                # de-duplicate preserving order
+                overwrite_cols = list(dict.fromkeys(overwrite_cols))
+
+            try:
+                writer = DataWriter(super_name=sup, organization=org)
+                cols, rows, inserted, deleted = writer.write(
+                    user_hash=uhash,
+                    simple_name=simple_name,
+                    data=arrow_table,
+                    overwrite_columns=overwrite_cols,
+                    compression_level=2,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        t1 = time.perf_counter()
+        server_ms = (t1 - t0) * 1000.0
+
+        return {
+            "ok": True,
+            "mode": m,
+            "org": org,
+            "sup": sup,
+            "table_name": simple_name,
+            "staging_name": staging_name.strip() if staging_name else None,
+            "file_name": file.filename,
+            "file_type": file_type,
+            "rows": int(getattr(arrow_table, "num_rows", 0) or 0),
+            "job_uuid": job_uuid,
+            "inserted": int(inserted),
+            "deleted": int(deleted),
+            "written_at_ns": str(written_at_ns),
+            "server_duration_ms": round(server_ms, 3),
+            "server_duration_s": round(server_ms / 1000.0, 3),
+        }

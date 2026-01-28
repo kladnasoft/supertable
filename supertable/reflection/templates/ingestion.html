@@ -113,6 +113,196 @@
     background: #1c96ca;
     color: #ffffff;
   }
+
+  /* ---- Load Data (modern step cards) ---- */
+  .load-steps {
+    display: grid;
+    gap: 14px;
+    margin-top: 12px;
+  }
+  .stepcard {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 8px 24px rgba(15,23,42,.06);
+    padding: 14px 16px;
+  }
+  .stephead {
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .stephead .kicker {
+    font-size: 12px;
+    color: #64748b;
+    letter-spacing: .02em;
+    font-weight: 700;
+  }
+  .stephead .title {
+    font-size: 14px;
+    font-weight: 900;
+    color:#0f172a;
+    margin-top: 2px;
+  }
+  .load-row {
+    display:flex;
+    align-items:center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .file-pill {
+    display:inline-flex;
+    align-items:center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(15,23,42,.12);
+    background: rgba(248,250,252,.9);
+    font-size: 12px;
+    color:#0f172a;
+    max-width: 100%;
+  }
+  .file-pill .name { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; word-break: break-all; }
+  .segmented {
+    display:inline-flex;
+    border: 1px solid rgba(15,23,42,.12);
+    border-radius: 999px;
+    overflow:hidden;
+    background: rgba(248,250,252,.8);
+  }
+  .segmented button {
+    border: 0;
+    background: transparent;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 800;
+    color: #334155;
+    cursor: pointer;
+    display:inline-flex;
+    align-items:center;
+    gap: 7px;
+  }
+  .segmented button.active {
+    background: #1c96ca;
+    color: #ffffff;
+  }
+  .segmented button.active i { color: #ffffff; }
+  .segmented button:hover { background: rgba(28,150,202,.10); }
+  .segmented button.active:hover { background: #1787b6; }
+  .segmented button i { color: #1c96ca; }
+  .field {
+    display:flex;
+    flex-direction:column;
+    gap: 6px;
+    min-width: 260px;
+    flex: 1;
+  }
+  .field label {
+    font-size: 12px;
+    color: #64748b;
+    font-weight: 800;
+  }
+  .field input, .field select, .field textarea {
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.14);
+    padding: 10px 12px;
+    font-size: 13px;
+    background: rgba(248,250,252,.9);
+    outline: none;
+  }
+  .field textarea {
+    resize: vertical;
+    min-height: 92px;
+  }
+  .field input.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+  .previewbox {
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.10);
+    background: rgba(248,250,252,.7);
+    overflow: hidden;
+  }
+  .previewhead {
+    padding: 10px 12px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    border-bottom: 1px solid rgba(15,23,42,.08);
+  }
+  .previewhead .h {
+    font-size: 12px;
+    font-weight: 900;
+    color:#0f172a;
+  }
+  .previewbody {
+    max-height: 220px;
+    overflow:auto;
+  }
+  .previewtable {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .previewtable th {
+    position: sticky;
+    top: 0;
+    background: #ffffff;
+    text-align:left;
+    padding: 8px 8px;
+    border-bottom: 1px solid rgba(15,23,42,.10);
+    font-weight: 900;
+    color:#0f172a;
+    white-space: nowrap;
+  }
+  .previewtable td {
+    padding: 7px 8px;
+    border-top: 1px solid rgba(15,23,42,.06);
+    vertical-align: top;
+    max-width: 280px;
+    overflow:hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .load-footer {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .timer {
+    font-size: 12px;
+    color:#334155;
+    display:inline-flex;
+    align-items:center;
+    gap: 8px;
+  }
+  .spinner {
+    width: 14px; height: 14px;
+    border-radius: 999px;
+    border: 2px solid rgba(28,150,202,.25);
+    border-top-color: #1c96ca;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .muted { color:#64748b; font-size: 12px; }
+  .alert {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.10);
+    background: rgba(248,250,252,.9);
+    font-size: 12px;
+    color:#0f172a;
+  }
+  .alert.ok { border-left: 4px solid rgba(16,185,129,.9); }
+  .alert.err { border-left: 4px solid rgba(239,68,68,.9); }
+
 </style>
 {% endblock %}
 
@@ -219,7 +409,146 @@
 
   <!-- -------------------- LOAD DATA TAB -------------------- -->
   <div class="tabpane hidden" id="pane-load">
-    <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Load data</div>
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
+      <div>
+        <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Load Data</div>
+        <div class="muted" style="margin-top:4px;">Upload a file and load into a table, or stage it for later.</div>
+      </div>
+    </div>
+
+    {% if not has_tenant %}
+      <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
+    {% else %}
+      <div class="load-steps">
+
+        <!-- Step 1 -->
+        <div class="stepcard">
+          <div class="stephead">
+            <div>
+              <div class="kicker">1) CHOOSE A FILE</div>
+              <div class="title">Pick a file and preview it instantly</div>
+            </div>
+          </div>
+
+          <div class="load-row">
+            <input id="loadFileInput" type="file" style="display:none;" />
+            <label for="loadFileInput" class="btn btn-sm btn-azure-outline" style="margin:0;">
+              <i class="fas fa-file-arrow-up"></i> Choose file
+            </label>
+
+            <div id="loadFilePill" class="file-pill" style="display:none;">
+              <i class="fas fa-paperclip" style="color:#1c96ca;"></i>
+              <span class="name" id="loadFileName">—</span>
+              <span class="muted" id="loadFileMeta" style="margin-left:8px;">—</span>
+            </div>
+
+            <div class="muted">Supported: csv, tsv, json/jsonl, parquet</div>
+          </div>
+
+          <div id="loadPreview" style="margin-top: 12px; display:none;">
+            <div class="previewbox">
+              <div class="previewhead">
+                <div class="h"><i class="fas fa-table" style="color:#1c96ca; margin-right:6px;"></i> Snake peek</div>
+                <div class="muted" id="loadPreviewInfo">—</div>
+              </div>
+              <div class="previewbody">
+                <table class="previewtable">
+                  <thead id="loadPreviewThead"></thead>
+                  <tbody id="loadPreviewTbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 2 -->
+        <div class="stepcard">
+          <div class="stephead">
+            <div>
+              <div class="kicker">2) TARGET</div>
+              <div class="title">Choose where to load</div>
+            </div>
+            <div class="segmented" role="tablist" aria-label="Load target">
+              <button type="button" id="modeTableBtn" class="active" aria-selected="true">
+                <i class="fas fa-database"></i> Table
+              </button>
+              <button type="button" id="modeStagingBtn" aria-selected="false">
+                <i class="fas fa-folder-open"></i> Staging
+              </button>
+            </div>
+          </div>
+
+          <div class="load-row" style="margin-top:4px;">
+            <div id="targetTablePanel" class="field">
+              <label for="loadTableName">Table name (autocomplete + create new)</label>
+              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <input id="loadTableName" class="mono" placeholder="e.g. table_1" list="loadTableSuggestions" />
+                <datalist id="loadTableSuggestions"></datalist>
+                <button type="button" id="btnRefreshTables" class="btn btn-sm btn-azure-outline">
+                  <i class="fas fa-rotate"></i> Refresh
+                </button>
+              </div>
+              <div class="muted">Tip: start typing to see existing tables. You can also type a new one.</div>
+            </div>
+
+            <div id="targetStagingPanel" class="field" style="display:none;">
+              <label for="loadStagingName">Staging name</label>
+              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <select id="loadStagingName">
+                  <option value="">Select staging…</option>
+                </select>
+                <button type="button" id="btnRefreshStagings" class="btn btn-sm btn-azure-outline">
+                  <i class="fas fa-rotate"></i> Refresh
+                </button>
+              </div>
+              <div class="muted">Your file will be stored in the selected staging and listed under the Staging tab.</div>
+            </div>
+          </div>
+        </div>
+
+        
+        <!-- Step 3 -->
+        <div class="stepcard" id="overwriteStepCard">
+          <div class="stephead">
+            <div>
+              <div class="kicker">3) OVERWRITE</div>
+              <div class="title">Optional: overwrite matching rows</div>
+              <div class="muted">Add column names (comma or newline separated). Leave empty to append.</div>
+            </div>
+          </div>
+
+          <div class="field" style="min-width: 320px;">
+            <label for="loadOverwriteCols">Overwrite columns</label>
+            <textarea id="loadOverwriteCols" rows="4" placeholder="e.g. id&#10;email"></textarea>
+          </div>
+        </div>
+
+<!-- Step 4 -->
+        <div class="stepcard">
+          <div class="stephead">
+            <div>
+              <div class="kicker">4) LOAD</div>
+              <div class="title">Upload & load the file</div>
+            </div>
+          </div>
+
+          <div class="load-footer">
+            <div class="timer" id="loadTimer" style="display:none;">
+              <span class="spinner"></span>
+              <span>Loading:</span>
+              <span class="mono" id="loadTimerVal">0.000s</span>
+            </div>
+
+            <button type="button" id="loadStartBtn" class="btn btn-sm btn-azure-outline" disabled>
+              <i class="fas fa-upload"></i> Upload & Load
+            </button>
+          </div>
+
+          <div id="loadResult" style="display:none;"></div>
+        </div>
+
+      </div>
+    {% endif %}
   </div>
 
 </div>
@@ -372,6 +701,9 @@
           try { await refreshPipes(); } catch (e) {}
         }
       }, 0);
+    }
+    if (name === "load") {
+      setTimeout(() => { try { initLoadTab(); } catch (e) {} }, 0);
     }
   };
 
@@ -1032,6 +1364,420 @@
 
   window.refreshStagings = refreshStagings;
   window.refreshPipes = refreshPipes;
+
+  // -------------------- Load Data (modern) --------------------
+
+  let loadMode = "table"; // "table" | "staging"
+  let loadSelectedFile = null;
+  let loadTimerHandle = null;
+  let loadTimerStart = 0;
+
+  function _fmtBytes(n) {
+    const v = Number(n || 0);
+    if (!Number.isFinite(v) || v <= 0) return "0 B";
+    const units = ["B","KB","MB","GB"];
+    let u = 0;
+    let x = v;
+    while (x >= 1024 && u < units.length - 1) { x /= 1024; u += 1; }
+    return `${x.toFixed(u === 0 ? 0 : 2)} ${units[u]}`;
+  }
+
+  function _setMode(m) {
+    loadMode = m;
+    const ow = document.getElementById("overwriteStepCard");
+    if (ow) ow.style.display = (m === "table") ? "" : "none";
+
+    const b1 = document.getElementById("modeTableBtn");
+    const b2 = document.getElementById("modeStagingBtn");
+    const p1 = document.getElementById("targetTablePanel");
+    const p2 = document.getElementById("targetStagingPanel");
+    if (b1) b1.classList.toggle("active", m === "table");
+    if (b2) b2.classList.toggle("active", m === "staging");
+    if (b1) b1.setAttribute("aria-selected", m === "table" ? "true" : "false");
+    if (b2) b2.setAttribute("aria-selected", m === "staging" ? "true" : "false");
+    if (p1) p1.style.display = (m === "table") ? "" : "none";
+    if (p2) p2.style.display = (m === "staging") ? "" : "none";
+    _updateLoadStartEnabled();
+  }
+
+  function _updateLoadStartEnabled() {
+    const btn = document.getElementById("loadStartBtn");
+    if (!btn) return;
+    const fileOk = !!loadSelectedFile;
+    let targetOk = false;
+    if (loadMode === "table") {
+      const t = document.getElementById("loadTableName");
+      targetOk = !!(t && String(t.value || "").trim());
+    } else {
+      const s = document.getElementById("loadStagingName");
+      targetOk = !!(s && String(s.value || "").trim());
+    }
+    btn.disabled = !(fileOk && targetOk);
+  }
+
+  function _clearPreview() {
+    const box = document.getElementById("loadPreview");
+    if (box) box.style.display = "none";
+    const thead = document.getElementById("loadPreviewThead");
+    const tbody = document.getElementById("loadPreviewTbody");
+    const info = document.getElementById("loadPreviewInfo");
+    if (thead) thead.innerHTML = "";
+    if (tbody) tbody.innerHTML = "";
+    if (info) info.textContent = "—";
+  }
+
+  function _renderPreview(headers, rows, infoText) {
+    const box = document.getElementById("loadPreview");
+    const thead = document.getElementById("loadPreviewThead");
+    const tbody = document.getElementById("loadPreviewTbody");
+    const info = document.getElementById("loadPreviewInfo");
+    if (!box || !thead || !tbody) return;
+
+    const h = (headers || []).slice(0, 30);
+    thead.innerHTML = `<tr>${h.map(x => `<th>${escapeHtml(x)}</th>`).join("")}</tr>`;
+    tbody.innerHTML = (rows || []).slice(0, 20).map(r => {
+      const cells = h.map((_, i) => {
+        const v = (r && r[i] !== undefined && r[i] !== null) ? String(r[i]) : "";
+        return `<td title="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
+      });
+      return `<tr>${cells.join("")}</tr>`;
+    }).join("");
+
+    if (info) info.textContent = infoText || "";
+    box.style.display = "";
+  }
+
+  async function _snakePeekFile(file) {
+    _clearPreview();
+    if (!file) return;
+
+    const name = (file.name || "").toLowerCase();
+    const ext = name.includes(".") ? name.split(".").pop() : "";
+    const maxBytes = 512 * 1024;
+
+    // Parquet preview client-side is not supported without heavier deps
+    if (ext === "parquet") {
+      _renderPreview(["Preview not available"], [["Parquet preview is shown after upload/load."]], "Parquet");
+      return;
+    }
+
+    const blob = file.slice(0, maxBytes);
+    const text = await blob.text();
+
+    try {
+      if (ext === "json" || ext === "jsonl" || ext === "ndjson") {
+        const trimmed = text.trim();
+        let arr = null;
+
+        // Try JSONL first
+        const lines = trimmed.split(/\r?\n/).filter(x => x.trim());
+        if ((ext === "jsonl" || ext === "ndjson") && lines.length) {
+          arr = lines.slice(0, 50).map(l => JSON.parse(l));
+        } else {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) arr = parsed.slice(0, 50);
+          else if (parsed && Array.isArray(parsed.data)) arr = parsed.data.slice(0, 50);
+          else arr = [parsed];
+        }
+
+        const keys = [];
+        for (const o of (arr || [])) {
+          if (o && typeof o === "object" && !Array.isArray(o)) {
+            for (const k of Object.keys(o)) if (!keys.includes(k)) keys.push(k);
+          }
+        }
+        const headers = keys.length ? keys : ["value"];
+        const rows = (arr || []).slice(0, 20).map(o => headers.map(k => (keys.length ? o?.[k] : o)));
+        _renderPreview(headers, rows, `JSON preview (first ${rows.length} rows)`);
+        return;
+      }
+
+      // CSV/TSV-ish
+      const sep = ext === "tsv" ? "\t" : ",";
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (!lines.length) {
+        _renderPreview(["Empty file"], [["No rows detected."]], "Empty");
+        return;
+      }
+      const head = lines[0].split(sep).map(x => x.trim());
+      const rows = lines.slice(1, 21).map(l => l.split(sep));
+      _renderPreview(head, rows, `Preview (first ${rows.length} rows)`);
+    } catch (e) {
+      _renderPreview(["Preview failed"], [[String(e || "Unable to preview file")]], "Preview error");
+    }
+  }
+
+  async function _refreshStagingNames() {
+    const { org, sup } = currentOrgSup();
+    const sel = document.getElementById("loadStagingName");
+    if (!sel) return;
+    sel.innerHTML = `<option value="">Select staging…</option>`;
+    if (!org || !sup) return;
+
+    try {
+      const data = await getJSON(`/reflection/ingestion/stagings?org=${enc(org)}&sup=${enc(sup)}`);
+      const names = (data && data.items) ? data.items : ((data && data.staging_names) ? data.staging_names : (Array.isArray(data) ? data : []));
+      for (const n of (names || [])) {
+        const opt = document.createElement("option");
+        opt.value = String(n);
+        opt.textContent = String(n);
+        sel.appendChild(opt);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function _refreshTableSuggestions() {
+    const { org, sup } = currentOrgSup();
+    const dl = document.getElementById("loadTableSuggestions");
+    if (!dl) return;
+    dl.innerHTML = "";
+    if (!org || !sup) return;
+
+    try {
+      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}`);
+      const tables = (data && data.tables) ? data.tables : [];
+      for (const t of (tables || [])) {
+        const opt = document.createElement("option");
+        opt.value = String(t);
+        dl.appendChild(opt);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function _startLoadTimer() {
+    loadTimerStart = performance.now();
+    const el = document.getElementById("loadTimer");
+    const val = document.getElementById("loadTimerVal");
+    if (el) el.style.display = "";
+    if (val) val.textContent = "0.000s";
+
+    if (loadTimerHandle) clearInterval(loadTimerHandle);
+    loadTimerHandle = setInterval(() => {
+      const ms = performance.now() - loadTimerStart;
+      if (val) val.textContent = `${(ms / 1000).toFixed(3)}s`;
+    }, 50);
+  }
+
+  function _stopLoadTimer() {
+    if (loadTimerHandle) clearInterval(loadTimerHandle);
+    loadTimerHandle = null;
+    const el = document.getElementById("loadTimer");
+    if (el) el.style.display = "none";
+  }
+
+  function _setLoadResult(ok, html) {
+    const box = document.getElementById("loadResult");
+    if (!box) return;
+    box.className = "alert " + (ok ? "ok" : "err");
+    box.innerHTML = html;
+    box.style.display = "";
+  }
+
+  function _setLoadBusy(busy) {
+    const btn = document.getElementById("loadStartBtn");
+    const fi = document.getElementById("loadFileInput");
+    const t = document.getElementById("loadTableName");
+    const s = document.getElementById("loadStagingName");
+    const b1 = document.getElementById("modeTableBtn");
+    const b2 = document.getElementById("modeStagingBtn");
+    const r1 = document.getElementById("btnRefreshTables");
+    const r2 = document.getElementById("btnRefreshStagings");
+
+    if (btn) btn.disabled = busy || btn.disabled;
+    if (fi) fi.disabled = !!busy;
+    if (t) t.disabled = !!busy;
+    if (s) s.disabled = !!busy;
+    if (b1) b1.disabled = !!busy;
+    if (b2) b2.disabled = !!busy;
+    if (r1) r1.disabled = !!busy;
+    if (r2) r2.disabled = !!busy;
+
+    if (btn && busy) btn.innerHTML = `<i class="fas fa-upload"></i> Uploading…`;
+    if (btn && !busy) btn.innerHTML = `<i class="fas fa-upload"></i> Upload & Load`;
+  }
+
+  async function _doUploadAndLoad() {
+    const { org, sup, userHash } = currentOrgSup();
+    const btn = document.getElementById("loadStartBtn");
+    if (!btn || !loadSelectedFile) return;
+
+    const tableNameEl = document.getElementById("loadTableName");
+    const stagingEl = document.getElementById("loadStagingName");
+
+    const tableName = tableNameEl ? String(tableNameEl.value || "").trim() : "";
+    const stagingName = stagingEl ? String(stagingEl.value || "").trim() : "";
+
+    if (!org || !sup) {
+      _setLoadResult(false, "Missing tenant selection (org/super).");
+      return;
+    }
+    if (!userHash) {
+      _setLoadResult(false, "Missing user hash (session). Please re-login.");
+      return;
+    }
+    if (loadMode === "table" && !tableName) {
+      _setLoadResult(false, "Please enter a table name.");
+      return;
+    }
+    if (loadMode === "staging" && !stagingName) {
+      _setLoadResult(false, "Please select a staging name.");
+      return;
+    }
+
+    const clientStart = performance.now();
+    _setLoadBusy(true);
+    _startLoadTimer();
+
+    try {
+      const fd = new FormData();
+      fd.append("org", org);
+      fd.append("sup", sup);
+      fd.append("user_hash", userHash);
+      fd.append("mode", loadMode);
+      if (tableName) fd.append("table_name", tableName);
+      const overwriteEl2 = document.getElementById("loadOverwriteCols");
+      const overwriteRaw = overwriteEl2 ? String(overwriteEl2.value || "").trim() : "";
+      if (loadMode === "table" && overwriteRaw) fd.append("overwrite_columns", overwriteRaw);
+      if (stagingName) fd.append("staging_name", stagingName);
+      fd.append("file", loadSelectedFile, loadSelectedFile.name || "upload");
+
+      const resp = await fetch("/reflection/ingestion/load/upload", {
+        method: "POST",
+        body: fd,
+        credentials: "same-origin",
+      });
+
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) { data = null; }
+
+      if (!resp.ok) {
+        const msg = (data && (data.detail || data.error)) || text || ("Upload failed: " + resp.status);
+        throw new Error(msg);
+      }
+
+      const clientMs = performance.now() - clientStart;
+      const serverMs = data && data.server_duration_ms !== undefined ? Number(data.server_duration_ms) : null;
+
+      const modeTxt = (data && data.mode) ? String(data.mode) : loadMode;
+      const rows = (data && data.rows !== undefined) ? String(data.rows) : "";
+      const fileType = (data && data.file_type) ? String(data.file_type) : "";
+      const job = (data && data.job_uuid) ? String(data.job_uuid) : "";
+
+      const targetTxt = modeTxt === "staging"
+        ? `staging <b>${escapeHtml(String(data.staging_name || stagingName))}</b>`
+        : `table <b>${escapeHtml(String(data.table_name || tableName))}</b>`;
+
+      const sMsHtml = (serverMs !== null && Number.isFinite(serverMs))
+        ? `${serverMs.toFixed(3)} ms`
+        : "—";
+
+      _setLoadResult(true, `
+        <div style="font-weight:900;">Loaded successfully</div>
+        <div class="muted" style="margin-top:6px;">Target: ${targetTxt}</div>
+        <div class="muted">Rows: ${escapeHtml(rows)} | Type: ${escapeHtml(fileType)} | Job: <span class="mono">${escapeHtml(job)}</span></div>
+        <div style="margin-top:8px; display:flex; gap:14px; flex-wrap:wrap;">
+          <div><span class="muted">Server:</span> <span class="mono">${escapeHtml(sMsHtml)}</span></div>
+          <div><span class="muted">Client roundtrip:</span> <span class="mono">${(clientMs).toFixed(1)} ms</span></div>
+        </div>
+      `);
+
+      // If staging, refresh staging list quickly so it appears immediately
+      if (modeTxt === "staging") {
+        try { await _refreshStagingNames(); } catch (e) {}
+      }
+
+    } catch (e) {
+      _setLoadResult(false, `<div style="font-weight:900;">Error</div><div class="mono" style="margin-top:6px; white-space:pre-wrap;">${escapeHtml(String(e || "Upload failed"))}</div>`);
+    } finally {
+      _stopLoadTimer();
+      _setLoadBusy(false);
+      _updateLoadStartEnabled();
+    }
+  }
+
+  function initLoadTab() {
+    const fileInput = document.getElementById("loadFileInput");
+    const filePill = document.getElementById("loadFilePill");
+    const fileName = document.getElementById("loadFileName");
+    const fileMeta = document.getElementById("loadFileMeta");
+
+    const bTable = document.getElementById("modeTableBtn");
+    const bStg = document.getElementById("modeStagingBtn");
+    const startBtn = document.getElementById("loadStartBtn");
+    const refreshTables = document.getElementById("btnRefreshTables");
+    const refreshStagings = document.getElementById("btnRefreshStagings");
+    const tableName = document.getElementById("loadTableName");
+    const stagingName = document.getElementById("loadStagingName");
+    const overwriteEl = document.getElementById("loadOverwriteCols");
+    const overwriteCard = document.getElementById("overwriteStepCard");
+
+    if (fileInput && fileInput.dataset.bound !== "1") {
+      fileInput.dataset.bound = "1";
+      fileInput.addEventListener("change", async () => {
+        const f = (fileInput.files && fileInput.files[0]) ? fileInput.files[0] : null;
+        loadSelectedFile = f;
+        if (f && filePill && fileName && fileMeta) {
+          fileName.textContent = f.name || "upload";
+          fileMeta.textContent = `${_fmtBytes(f.size)} · ${String((f.type || "").toLowerCase() || "file")}`;
+          filePill.style.display = "";
+        } else if (filePill) {
+          filePill.style.display = "none";
+        }
+
+        await _snakePeekFile(f);
+        _updateLoadStartEnabled();
+      });
+    }
+
+    if (bTable && bTable.dataset.bound !== "1") {
+      bTable.dataset.bound = "1";
+      bTable.addEventListener("click", () => _setMode("table"));
+    }
+    if (bStg && bStg.dataset.bound !== "1") {
+      bStg.dataset.bound = "1";
+      bStg.addEventListener("click", () => _setMode("staging"));
+    }
+
+    if (refreshTables && refreshTables.dataset.bound !== "1") {
+      refreshTables.dataset.bound = "1";
+      refreshTables.addEventListener("click", async () => { await _refreshTableSuggestions(); });
+    }
+    if (refreshStagings && refreshStagings.dataset.bound !== "1") {
+      refreshStagings.dataset.bound = "1";
+      refreshStagings.addEventListener("click", async () => { await _refreshStagingNames(); });
+    }
+
+    if (tableName && tableName.dataset.bound !== "1") {
+      tableName.dataset.bound = "1";
+      tableName.addEventListener("input", _updateLoadStartEnabled);
+    }
+    if (overwriteEl && overwriteEl.dataset.bound !== "1") {
+      overwriteEl.dataset.bound = "1";
+      overwriteEl.addEventListener("input", _updateLoadStartEnabled);
+    }
+
+    if (stagingName && stagingName.dataset.bound !== "1") {
+      stagingName.dataset.bound = "1";
+      stagingName.addEventListener("change", _updateLoadStartEnabled);
+    }
+
+    if (startBtn && startBtn.dataset.bound !== "1") {
+      startBtn.dataset.bound = "1";
+      startBtn.addEventListener("click", _doUploadAndLoad);
+    }
+
+    // initial refresh
+    _setMode(loadMode || "table");
+    _refreshTableSuggestions();
+    _refreshStagingNames();
+    _updateLoadStartEnabled();
+  }
+
 })();
 </script>
 {% endblock %}
