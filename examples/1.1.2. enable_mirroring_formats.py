@@ -10,10 +10,13 @@ st = SuperTable(super_name=super_name, organization=organization)
 MirrorFormats.set_with_lock(st, [FormatMirror.DELTA, FormatMirror.ICEBERG])
 
 # Or enable one:
-MirrorFormats.enable_with_lock(st, "DELTA")
+MirrorFormats.disable_with_lock(st, "DELTA")
 
 # Disable one:
 MirrorFormats.disable_with_lock(st, "ICEBERG")
+# Disable one:
+MirrorFormats.disable_with_lock(st, "PARQUET")
+
 
 # Check:
 logger.info(f"Mirror formats: {MirrorFormats.get_enabled(st)}")

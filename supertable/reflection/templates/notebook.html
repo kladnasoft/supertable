@@ -1,0 +1,706 @@
+{% extends "base.html" %}
+
+{% block title %}Notebooks{% endblock %}
+
+{% block head_extra %}
+<style>
+  .muted { color:#64748b; font-size: 12px; }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  .nb-root {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    padding: 24px 28px;
+    border: 1px solid rgba(0,0,0,0.05);
+    border-left: 5px solid #1c96ca;
+  }
+
+  .nb-topbar {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .nb-title {
+    font-size: 18px;
+    font-weight: 900;
+    color:#0f172a;
+  }
+
+  .nb-layout {
+    display:flex;
+    gap: 14px;
+    margin-top: 16px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .nb-main {
+    flex: 3;
+    min-width: 520px;
+  }
+
+  .nb-side {
+    flex: 1;
+    min-width: 280px;
+  }
+
+  .panel {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    background: #fff;
+    padding: 14px 14px;
+  }
+
+  .panel + .panel { margin-top: 12px; }
+
+  .panel-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+  }
+
+  .panel-title {
+    font-weight: 900;
+    color:#0f172a;
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  /* Cells */
+  .cell {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    background: #fff;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+
+  .cell-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    background: rgba(248,250,252,.9);
+    border-bottom: 1px solid rgba(15,23,42,.08);
+  }
+
+  .cell-left {
+    display:flex;
+    align-items:center;
+    gap: 10px;
+    font-weight: 900;
+    color:#334155;
+    font-size: 12px;
+  }
+
+  .cell-actions {
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .cell-body {
+    padding: 10px 12px;
+  }
+
+  .editor {
+    width: 100%;
+    min-height: 130px;
+    resize: vertical;
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.14);
+    padding: 12px 12px;
+    background: #ffffff;
+    font-size: 13px;
+    line-height: 1.35;
+  }
+
+  .output {
+    margin-top: 10px;
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.10);
+    background: rgba(248,250,252,.9);
+    padding: 10px 12px;
+    font-size: 12px;
+    color:#0f172a;
+    display:none;
+  }
+  .output.err { border-left: 4px solid rgba(239,68,68,0.7); }
+  .output.ok { border-left: 4px solid rgba(16,185,129,0.7); }
+  .output pre { margin:0; white-space: pre-wrap; }
+
+  .timer {
+    font-size: 12px;
+    color:#334155;
+    display:inline-flex;
+    align-items:center;
+    gap: 8px;
+  }
+  .spinner {
+    width: 14px; height: 14px;
+    border-radius: 999px;
+    border: 2px solid rgba(28,150,202,25);
+    border-top-color: #1c96ca;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Snippets */
+  .snippet {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 14px;
+    padding: 10px 10px;
+    background: #fff;
+    cursor: pointer;
+    transition: transform .08s ease, border-color .12s ease, box-shadow .12s ease;
+  }
+  .snippet:hover {
+    transform: translateY(-1px);
+    border-color: rgba(28,150,202,.55);
+    box-shadow: 0 10px 14px rgba(0,0,0,0.04);
+  }
+  .snippet .h {
+    font-weight: 900;
+    color:#0f172a;
+    font-size: 12px;
+    display:flex;
+    align-items:center;
+    gap: 8px;
+  }
+  .snippet .d {
+    margin-top: 6px;
+    color:#64748b;
+    font-size: 12px;
+  }
+
+  /* Button style reuse (matches ingestion/admin) */
+  .btn-azure-outline {
+    border: 1px solid #1c96ca;
+    background: transparent;
+    color: #1c96ca;
+    font-weight: 600;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-azure-outline:hover { background: #1c96ca; color: #ffffff; }
+
+  .btn-danger-outline {
+    border: 1px solid rgba(239,68,68,0.75);
+    background: transparent;
+    color: rgba(239,68,68,0.9);
+    font-weight: 700;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-danger-outline:hover { background: rgba(239,68,68,0.9); color:#fff; }
+
+  @media (max-width: 980px) {
+    .nb-main { min-width: 100%; }
+    .nb-side { min-width: 100%; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+
+{% include "selection.html" %}
+
+<div style="height: 18px;"></div>
+
+<div id="nbRoot"
+     class="nb-root"
+     data-org="{{ sel_org }}"
+     data-sup="{{ sel_sup }}"
+     data-user-hash="{{ session_user_hash }}"
+>
+  <div class="nb-topbar">
+    <div>
+      <div class="nb-title">Notebooks</div>
+      <div class="muted" style="margin-top:4px;">Synapse-style cells with persistent state per session. Click a snippet to insert it into the active cell.</div>
+    </div>
+
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <div class="timer" id="nbGlobalTimer" style="display:none;">
+        <span class="spinner"></span>
+        <span>Running:</span>
+        <span class="mono" id="nbGlobalTimerVal">0.000s</span>
+      </div>
+
+      <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCell">
+        <i class="fas fa-plus"></i> Add cell
+      </button>
+      <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
+        <i class="fas fa-play"></i> Run all
+      </button>
+      <button type="button" class="btn btn-sm btn-danger-outline" id="btnResetKernel">
+        <i class="fas fa-broom"></i> Reset
+      </button>
+    </div>
+  </div>
+
+  {% if not has_tenant %}
+    <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
+  {% else %}
+    <div class="nb-layout">
+      <div class="nb-main">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title"><i class="fas fa-code" style="color:#1c96ca;"></i> Notebook</div>
+            <div class="muted">Autosaves locally • Ctrl/⌘ + Enter to run</div>
+          </div>
+          <div style="height:10px;"></div>
+          <div id="cells"></div>
+        </div>
+      </div>
+
+      <div class="nb-side">
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title"><i class="fas fa-wand-magic-sparkles" style="color:#1c96ca;"></i> Snippets</div>
+            <div class="muted">Click to insert</div>
+          </div>
+
+          <div style="margin-top:10px; display:flex; flex-direction:column; gap:10px;">
+            <div class="snippet" data-snippet="print('Hello from SuperTable Notebooks 🚀')">
+              <div class="h"><i class="fas fa-rocket" style="color:#1c96ca;"></i> Hello world</div>
+              <div class="d">Sanity check your notebook execution.</div>
+            </div>
+
+            <div class="snippet" data-snippet="# Read top rows from a table\n# returns: (df, status, message)\nres = st_read_table('table_1', limit=10)\nres[0].head()">
+              <div class="h"><i class="fas fa-database" style="color:#1c96ca;"></i> Read from table</div>
+              <div class="d">Quickly preview data from an existing SuperTable table.</div>
+            </div>
+
+            <div class="snippet" data-snippet="# Query with SQL (DuckDB engine)\nq = \"\"\"select * from table_1 limit 5\"\"\"\nst_sql(q)[0]">
+              <div class="h"><i class="fas fa-terminal" style="color:#1c96ca;"></i> SQL query</div>
+              <div class="d">Execute SQL against your SuperTable data.</div>
+            </div>
+
+            <div class="snippet" data-snippet="# Transform + write into a new table\nimport pandas as pd\n\ndf = st_read_table('table_1', limit=50)[0]\n# example transform\ndf['new_col'] = 1\n\n# overwrite_columns optional: pass [] to append\nst_write_table('table_out', df, overwrite_columns=[])">
+              <div class="h"><i class="fas fa-shuffle" style="color:#1c96ca;"></i> Transform + write</div>
+              <div class="d">Read data, transform it, then save into a different table.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title"><i class="fas fa-circle-info" style="color:#1c96ca;"></i> Context</div>
+          </div>
+          <div class="muted" style="margin-top:10px;">
+            Variables provided:
+            <div class="mono" style="margin-top:6px;">ORG, SUPER, USER_HASH</div>
+            <div class="muted" style="margin-top:10px;">Built-in connectors:</div>
+            <div class="mono" style="margin-top:6px;">st_sql(query)</div>
+            <div class="mono">st_read_table(table, limit=50)</div>
+            <div class="mono">st_write_table(table, rows, overwrite_columns=[])</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+</div>
+
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+(function () {
+  // Highlight sidebar item (if present)
+  const ln = document.getElementById("link-notebooks");
+  if (ln) ln.classList.add("active");
+
+  function enc(v) { return encodeURIComponent(v || ""); }
+  function root() { return document.getElementById("nbRoot"); }
+  function currentCtx() {
+    const el = root();
+    return {
+      org: el ? (el.dataset.org || "") : "",
+      sup: el ? (el.dataset.sup || "") : "",
+      userHash: el ? (el.dataset.userHash || "") : "",
+    };
+  }
+
+  function escapeHtml(str) {
+    return String(str || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  async function postJSON(url, obj) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(obj || {}),
+      credentials: "same-origin",
+    });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  async function getJSON(url) {
+    const resp = await fetch(url, { credentials: "same-origin" });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  // Notebook persistence (local)
+  function storeKey() {
+    const { org, sup, userHash } = currentCtx();
+    return `nb:${org}:${sup}:${userHash}:cells`;
+  }
+  function sessionKey() {
+    const { org, sup, userHash } = currentCtx();
+    return `nb:${org}:${sup}:${userHash}:session`;
+  }
+
+  function getOrCreateSessionId() {
+    const k = sessionKey();
+    let v = localStorage.getItem(k) || "";
+    if (!v) {
+      v = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
+      localStorage.setItem(k, v);
+    }
+    return v;
+  }
+
+  function loadCells() {
+    try {
+      const raw = localStorage.getItem(storeKey());
+      const arr = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(arr) && arr.length) return arr;
+    } catch (e) {}
+    return [{
+      id: (crypto && crypto.randomUUID) ? crypto.randomUUID() : "c1",
+      code: "print('Ready. Try a snippet →')",
+    }];
+  }
+
+  function saveCells(arr) {
+    try { localStorage.setItem(storeKey(), JSON.stringify(arr || [])); } catch (e) {}
+  }
+
+  // UI state
+  let cells = [];
+  let activeCellId = "";
+  let globalTimerHandle = null;
+  let globalTimerStart = 0;
+
+  function startGlobalTimer() {
+    const box = document.getElementById("nbGlobalTimer");
+    const val = document.getElementById("nbGlobalTimerVal");
+    if (!box || !val) return;
+    if (globalTimerHandle) clearInterval(globalTimerHandle);
+    globalTimerStart = performance.now();
+    box.style.display = "";
+    globalTimerHandle = setInterval(() => {
+      const ms = performance.now() - globalTimerStart;
+      val.textContent = `${(ms / 1000).toFixed(3)}s`;
+    }, 50);
+  }
+  function stopGlobalTimer() {
+    const box = document.getElementById("nbGlobalTimer");
+    if (globalTimerHandle) clearInterval(globalTimerHandle);
+    globalTimerHandle = null;
+    if (box) box.style.display = "none";
+  }
+
+  function createCellEl(cell, idx) {
+    const el = document.createElement("div");
+    el.className = "cell";
+    el.dataset.id = cell.id;
+
+    el.innerHTML = `
+      <div class="cell-head">
+        <div class="cell-left">
+          <span class="mono">In [${idx + 1}]</span>
+          <span class="muted" id="status-${cell.id}"></span>
+        </div>
+        <div class="cell-actions">
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run">
+            <i class="fas fa-play"></i> Run
+          </button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="add-below">
+            <i class="fas fa-plus"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-danger-outline" data-action="delete">
+            <i class="fas fa-trash"></i>
+          </button>
+        </div>
+      </div>
+      <div class="cell-body">
+        <textarea class="editor mono" spellcheck="false"></textarea>
+        <div class="output mono" id="out-${cell.id}"></div>
+      </div>
+    `;
+
+    const ta = el.querySelector("textarea");
+    if (ta) {
+      ta.value = cell.code || "";
+      ta.addEventListener("focus", () => { activeCellId = cell.id; });
+      ta.addEventListener("input", () => {
+        const found = cells.find(c => c.id === cell.id);
+        if (found) found.code = ta.value;
+        saveCells(cells);
+      });
+      ta.addEventListener("keydown", async (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+          e.preventDefault();
+          await runCell(cell.id);
+        }
+      });
+    }
+
+    el.addEventListener("click", () => { activeCellId = cell.id; });
+
+    el.querySelectorAll("button[data-action]").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        const action = btn.getAttribute("data-action");
+        if (action === "run") await runCell(cell.id);
+        if (action === "add-below") addCellBelow(cell.id);
+        if (action === "delete") deleteCell(cell.id);
+      });
+    });
+
+    return el;
+  }
+
+  function render() {
+    const wrap = document.getElementById("cells");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    cells.forEach((c, i) => wrap.appendChild(createCellEl(c, i)));
+    saveCells(cells);
+    if (!activeCellId && cells.length) activeCellId = cells[0].id;
+  }
+
+  function addCellBelow(id) {
+    const i = cells.findIndex(c => c.id === id);
+    const n = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
+    const item = { id: n, code: "" };
+    if (i >= 0) cells.splice(i + 1, 0, item);
+    else cells.push(item);
+    activeCellId = item.id;
+    render();
+    // focus after render
+    setTimeout(() => {
+      const el = document.querySelector(`.cell[data-id="${CSS.escape(item.id)}"] textarea`);
+      if (el) el.focus();
+    }, 30);
+  }
+
+  function deleteCell(id) {
+    if (cells.length <= 1) return;
+    cells = cells.filter(c => c.id !== id);
+    if (activeCellId === id) activeCellId = cells[0].id;
+    render();
+  }
+
+  function addCellEnd() {
+    const n = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
+    cells.push({ id: n, code: "" });
+    activeCellId = n;
+    render();
+    setTimeout(() => {
+      const el = document.querySelector(`.cell[data-id="${CSS.escape(n)}"] textarea`);
+      if (el) el.focus();
+    }, 30);
+  }
+
+  function insertSnippet(code) {
+    const id = activeCellId || (cells[0] && cells[0].id) || "";
+    if (!id) return;
+    const cell = cells.find(c => c.id === id);
+    if (!cell) return;
+    const el = document.querySelector(`.cell[data-id="${CSS.escape(id)}"] textarea`);
+    const snippet = String(code || "");
+    if (el) {
+      const start = el.selectionStart || 0;
+      const end = el.selectionEnd || 0;
+      const before = el.value.slice(0, start);
+      const after = el.value.slice(end);
+      const join = (before && !before.endsWith("\n")) ? "\n" : "";
+      el.value = before + join + snippet + "\n" + after;
+      el.selectionStart = el.selectionEnd = (before + join + snippet + "\n").length;
+      el.focus();
+    } else {
+      cell.code = (cell.code || "") + "\n" + snippet + "\n";
+    }
+    cell.code = el ? el.value : cell.code;
+    saveCells(cells);
+  }
+
+  function setOutput(cellId, ok, stdout, stderr, meta) {
+    const box = document.getElementById(`out-${cellId}`);
+    if (!box) return;
+    const o = String(stdout || "");
+    const e = String(stderr || "");
+    const m = meta ? String(meta) : "";
+    const has = (o.trim() || e.trim() || m.trim());
+    box.style.display = has ? "" : "none";
+    box.className = "output mono " + (ok ? "ok" : "err");
+    box.innerHTML = `
+      ${m ? `<div class="muted" style="margin-bottom:8px;">${m}</div>` : ""}
+      ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><pre>${escapeHtml(o)}</pre></div>` : ""}
+      ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><pre>${escapeHtml(e)}</pre></div>` : ""}
+    `;
+  }
+
+  function setStatus(cellId, txt) {
+    const el = document.getElementById(`status-${cellId}`);
+    if (el) el.textContent = txt || "";
+  }
+
+  async function runCell(cellId) {
+    const { org, sup, userHash } = currentCtx();
+    if (!org || !sup) { alert("Select a tenant first."); return; }
+    if (!userHash) { alert("Missing user hash (session). Please re-login."); return; }
+
+    const cell = cells.find(c => c.id === cellId);
+    if (!cell) return;
+
+    const code = String(cell.code || "").trim();
+    if (!code) return;
+
+    const sessionId = getOrCreateSessionId();
+    const start = performance.now();
+    setStatus(cellId, "running…");
+    setOutput(cellId, true, "", "", "");
+    startGlobalTimer();
+
+    const metaTick = setInterval(() => {
+      const ms = performance.now() - start;
+      setStatus(cellId, `running • ${(ms/1000).toFixed(3)}s`);
+    }, 60);
+
+    try {
+      const created = await postJSON("/reflection/notebooks/jobs", {
+        org, sup, user_hash: userHash,
+        code,
+        session_id: sessionId,
+      });
+      const jobId = created && created.job_id ? String(created.job_id) : "";
+      if (!jobId) throw new Error("Missing job_id");
+
+      while (true) {
+        const js = await getJSON(`/reflection/notebooks/jobs/${enc(jobId)}`);
+        const job = js && js.job ? js.job : null;
+        if (!job) throw new Error("Job not found");
+        const st = String(job.status || "");
+        if (st === "queued" || st === "running") {
+          await new Promise(r => setTimeout(r, 250));
+          continue;
+        }
+
+        const dur = (job.duration_ms !== undefined && job.duration_ms !== null) ? Number(job.duration_ms) : null;
+        const meta = (dur !== null && Number.isFinite(dur))
+          ? `Server: ${dur.toFixed(3)} ms • Client: ${(performance.now()-start).toFixed(1)} ms`
+          : `Client: ${(performance.now()-start).toFixed(1)} ms`;
+
+        if (st === "done") {
+          setStatus(cellId, "done");
+          setOutput(cellId, true, job.stdout || "", job.stderr || "", meta);
+          break;
+        }
+        if (st === "error") {
+          setStatus(cellId, "error");
+          const msg = job.error ? String(job.error) : "Execution failed";
+          const stderr = (job.stderr ? String(job.stderr) : "");
+          setOutput(cellId, false, job.stdout || "", stderr || msg, meta);
+          break;
+        }
+        // unknown status
+        setStatus(cellId, st);
+        break;
+      }
+    } catch (e) {
+      setStatus(cellId, "error");
+      setOutput(cellId, false, "", String(e && e.message ? e.message : e), "");
+    } finally {
+      clearInterval(metaTick);
+      stopGlobalTimer();
+    }
+  }
+
+  async function runAll() {
+    for (const c of cells) {
+      const code = String(c.code || "").trim();
+      if (code) await runCell(c.id);
+    }
+  }
+
+  async function resetKernel() {
+    const { org, sup, userHash } = currentCtx();
+    if (!org || !sup || !userHash) return;
+    const sessionId = getOrCreateSessionId();
+    try {
+      await postJSON("/reflection/notebooks/kernel/reset", { org, sup, user_hash: userHash, session_id: sessionId });
+      // Clear outputs
+      cells.forEach(c => {
+        setStatus(c.id, "");
+        setOutput(c.id, true, "", "", "");
+      });
+    } catch (e) {
+      alert(String(e && e.message ? e.message : e));
+    }
+  }
+
+  function wireSnippets() {
+    document.querySelectorAll(".snippet[data-snippet]").forEach(s => {
+      s.addEventListener("click", () => insertSnippet(s.getAttribute("data-snippet")));
+    });
+  }
+
+  const btnAdd = document.getElementById("btnAddCell");
+  if (btnAdd) btnAdd.addEventListener("click", addCellEnd);
+
+  const btnRunAll = document.getElementById("btnRunAll");
+  if (btnRunAll) btnRunAll.addEventListener("click", runAll);
+
+  const btnReset = document.getElementById("btnResetKernel");
+  if (btnReset) btnReset.addEventListener("click", resetKernel);
+
+  // Cross-page tenant change (match ingestion pattern)
+  window.addEventListener("supertable-changed", function(e) {
+    const detail = (e && e.detail) ? e.detail : {};
+    const org = detail.org || "";
+    const sup = detail.sup || "";
+    const u = new URL(window.location.href);
+    u.pathname = "/reflection/notebooks";
+    u.searchParams.set("org", org);
+    u.searchParams.set("sup", sup);
+    window.location.href = u.toString();
+  });
+
+  // Init
+  cells = loadCells();
+  render();
+  wireSnippets();
+})();
+</script>
+{% endblock %}

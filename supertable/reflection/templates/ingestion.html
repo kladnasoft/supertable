@@ -1529,14 +1529,14 @@
   }
 
   async function _refreshTableSuggestions() {
-    const { org, sup } = currentOrgSup();
+    const { org, sup, userHash } = currentOrgSup();
     const dl = document.getElementById("loadTableSuggestions");
     if (!dl) return;
     dl.innerHTML = "";
     if (!org || !sup) return;
 
     try {
-      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}`);
+      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}&user_hash=${enc(userHash)}`);
       const tables = (data && data.tables) ? data.tables : [];
       for (const t of (tables || [])) {
         const opt = document.createElement("option");

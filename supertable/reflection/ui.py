@@ -23,6 +23,7 @@ import redis
 from fastapi import APIRouter, Query, HTTPException, Request, Response, Depends, Form, Body
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from redis import Sentinel
 
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
@@ -56,6 +57,13 @@ class Settings:
         self.SUPERTABLE_REDIS_DB: int = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
         self.SUPERTABLE_REDIS_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_PASSWORD")
         self.SUPERTABLE_REDIS_USERNAME: Optional[str] = os.getenv("SUPERTABLE_REDIS_USERNAME")
+
+        # SENTINEL
+        self.SUPERTABLE_REDIS_SENTINEL: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL")
+        self.SUPERTABLE_REDIS_SENTINELS: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINELS")
+        self.SUPERTABLE_REDIS_SENTINEL_MASTER: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_MASTER")
+        self.SUPERTABLE_REDIS_SENTINEL_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_PASSWORD")
+        self.SUPERTABLE_REDIS_SENTINEL_STRICT: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_STRICT")
 
         self.SUPERTABLE_ADMIN_TOKEN: Optional[str] = os.getenv("SUPERTABLE_ADMIN_TOKEN")
 
@@ -360,10 +368,16 @@ def _coerce_password(pw: Optional[str]) -> Optional[str]:
 def _build_redis_client() -> redis.Redis:
     """
     Build a Redis client from SUPERTABLE_* envs.
+
     Precedence:
       1) SUPERTABLE_REDIS_URL (parsed)
       2) SUPERTABLE_REDIS_HOST/PORT/DB/PASSWORD (overrides URL parts if provided)
+
+    Sentinel:
+      If SUPERTABLE_REDIS_SENTINEL is enabled and SUPERTABLE_REDIS_SENTINELS is set,
+      use the same Sentinel connection behavior as RedisCatalog (ping-probe + optional fallback).
     """
+    settings = Settings()
     url = (settings.SUPERTABLE_REDIS_URL or "").strip() or None
 
     host = settings.SUPERTABLE_REDIS_HOST
@@ -371,6 +385,8 @@ def _build_redis_client() -> redis.Redis:
     db = settings.SUPERTABLE_REDIS_DB
     username = (settings.SUPERTABLE_REDIS_USERNAME or "").strip() or None
     password = _coerce_password(settings.SUPERTABLE_REDIS_PASSWORD)
+
+    use_ssl = url.startswith("rediss://") if url else False
 
     if url:
         u = urlparse(url)
@@ -393,10 +409,107 @@ def _build_redis_client() -> redis.Redis:
         if u.password:
             password = _coerce_password(u.password)
 
+    # Sentinel detection + options
+    sentinel_enabled = (settings.SUPERTABLE_REDIS_SENTINEL or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    sentinel_strict = (settings.SUPERTABLE_REDIS_SENTINEL_STRICT or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    sentinel_master = (settings.SUPERTABLE_REDIS_SENTINEL_MASTER or "").strip() or "mymaster"
+
+    sentinel_password = _coerce_password(settings.SUPERTABLE_REDIS_SENTINEL_PASSWORD) or password
+
+    # Single-password setup: if Sentinel is enabled and Redis password is not set, reuse Sentinel password.
+    if sentinel_enabled and password is None and sentinel_password:
+        password = sentinel_password
+
     # If username is set but password is None, drop username (ACL requires both)
     if username and not password:
         username = None
 
+    sentinel_hosts: List[Tuple[str, int]] = []
+    sentinel_raw = (settings.SUPERTABLE_REDIS_SENTINELS or "").strip()
+    if sentinel_raw:
+        for part in sentinel_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                h, p = part.split(":")
+                sentinel_hosts.append((h.strip(), int(p)))
+            except ValueError:
+                # Keep behavior non-fatal; invalid entries are ignored.
+                continue
+
+    if sentinel_enabled and sentinel_hosts:
+        sentinel_kwargs: dict = {
+            "socket_timeout": 0.5,
+            "decode_responses": True,
+            "ssl": use_ssl,
+        }
+        if sentinel_password:
+            sentinel_kwargs["password"] = sentinel_password
+        if username:
+            sentinel_kwargs["username"] = username
+
+        sentinel = Sentinel(
+            sentinel_hosts,
+            sentinel_kwargs=sentinel_kwargs,
+            socket_timeout=0.5,
+            decode_responses=True,
+            ssl=use_ssl,
+            username=username,
+            password=password,
+        )
+
+        sentinel_client: redis.Redis = sentinel.master_for(
+            sentinel_master,
+            db=db,
+            decode_responses=True,
+            ssl=use_ssl,
+            username=username,
+            password=password,
+        )
+
+        # Fail-fast probe (matches RedisCatalog behavior).
+        sentinel_err: Optional[BaseException] = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            try:
+                sentinel_client.ping()
+                sentinel_err = None
+                break
+            except (MasterNotFoundError, redis.RedisError, OSError) as e:
+                sentinel_err = e
+                time.sleep(0.2)
+
+        if sentinel_err is None:
+            return sentinel_client
+
+        if sentinel_strict:
+            raise sentinel_err
+
+        # Non-strict fallback to standard Redis
+        return redis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=password,
+            username=username,
+            decode_responses=True,
+            ssl=use_ssl,
+        )
+
+    # Standard Redis mode
     return redis.Redis(
         host=host,
         port=port,
@@ -404,9 +517,8 @@ def _build_redis_client() -> redis.Redis:
         password=password,
         username=username,
         decode_responses=True,
-        ssl=url.startswith("rediss://") if url else False,
+        ssl=use_ssl,
     )
-
 
 def _build_catalog() -> Tuple[object, redis.Redis]:
     r = _build_redis_client()
@@ -2506,5 +2618,65 @@ attach_ingestion_routes(
     redis_upsert_pipe_meta=_redis_upsert_pipe_meta,
     redis_delete_pipe_meta=_redis_delete_pipe_meta,
     get_storage=get_storage,
+)
+
+
+# ---------------------------------------------------------------------------
+# Notebooks UI + API routes
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+
+attach_notebook_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+)
+
+
+# ---------------------------------------------------------------------------
+# Notebooks UI + API routes
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+
+attach_notebook_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+)
+
+
+# ---------------------------------------------------------------------------
+# Notebooks UI + API routes
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+
+attach_notebook_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
 )
 
