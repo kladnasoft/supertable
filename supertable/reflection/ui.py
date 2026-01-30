@@ -24,6 +24,7 @@ from fastapi import APIRouter, Query, HTTPException, Request, Response, Depends,
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from redis import Sentinel
+from redis.sentinel import MasterNotFoundError
 
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
