@@ -332,19 +332,19 @@
   </div>
 
   <div id="tab-navigation" style="margin-top: 16px;">
-    <div id="tab-staging" class="tab active" onclick="switchTab('staging')">
+    <div id="tab-load" class="tab active" onclick="switchTab('load')">
+      <i class="fas fa-upload"></i><span>Load Data</span>
+    </div>
+  <div id="tab-staging" class="tab" onclick="switchTab('staging')">
       <i class="fas fa-folder-open"></i><span>Staging</span>
     </div>
     <div id="tab-pipe" class="tab" onclick="switchTab('pipe')">
       <i class="fas fa-diagram-project"></i><span>Pipe</span>
     </div>
-    <div id="tab-load" class="tab" onclick="switchTab('load')">
-      <i class="fas fa-upload"></i><span>Load Data</span>
     </div>
-  </div>
 
   <!-- -------------------- STAGING TAB -------------------- -->
-  <div class="tabpane" id="pane-staging">
+  <div class="tabpane hidden" id="pane-staging">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
       <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Staging</div>
       <button type="button" id="btnCreateStaging" class="btn btn-sm btn-azure-outline">
@@ -408,7 +408,7 @@
   </div>
 
   <!-- -------------------- LOAD DATA TAB -------------------- -->
-  <div class="tabpane hidden" id="pane-load">
+  <div class="tabpane" id="pane-load">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
       <div>
         <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Load Data</div>
@@ -1338,10 +1338,77 @@
 
   // -------------------- Cross-page tenant change --------------------
 
+
+  window.onPairChange = async function onPairChange() {
+    const el = root();
+    if (!el) return;
+
+    const sel = document.getElementById("pairSel");
+    const nextSup = sel ? String(sel.value || "").trim() : "";
+    const nextOrg = (typeof ORG_NAME !== "undefined" && ORG_NAME) ? String(ORG_NAME || "").trim() : (el.dataset.org || "");
+    if (!nextOrg || !nextSup) return;
+
+    // Update the root dataset so all API calls use the new tenant.
+    el.dataset.org = nextOrg;
+    el.dataset.sup = nextSup;
+
+    // Reset state/caches so the page renders the new tenant cleanly.
+    selectedStagingName = "";
+    expandedStagingName = "";
+    try { collapseExpandedIfAny(); } catch (_) {}
+
+    try { lastStagingNames = []; } catch (_) {}
+    try { lastPipeItems = []; } catch (_) {}
+    try { lastPipesStagingLoaded = ""; } catch (_) {}
+    try { for (const k in stagingFilesState) { delete stagingFilesState[k]; } } catch (_) {}
+
+    const list = document.getElementById("stagingList");
+    if (list) list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
+    const pipeList = document.getElementById("pipeList");
+    if (pipeList) pipeList.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
+    const editor = document.getElementById("pipeEditor");
+    if (editor) editor.value = "";
+
+    try { await refreshStagings(); } catch (e) { console.error("refreshStagings failed:", e); }
+
+    // If Pipe tab is currently open, refresh its list as well.
+    try {
+      const pipeTab = document.getElementById("tab-pipe");
+      if (pipeTab && pipeTab.classList.contains("active")) {
+        await refreshPipes();
+      }
+    } catch (e) {
+      console.error("refreshPipes failed:", e);
+    }
+
+    // If Load tab is open, refresh the suggestions/names there too.
+    try {
+      const loadTab = document.getElementById("tab-load");
+      if (loadTab && loadTab.classList.contains("active")) {
+        if (typeof _refreshTableSuggestions === "function") await _refreshTableSuggestions();
+        const modeStg = document.getElementById("modeStagingBtn");
+        if (modeStg && modeStg.classList.contains("active") && typeof _refreshStagingNames === "function") {
+          await _refreshStagingNames();
+        }
+      }
+    } catch (_) {}
+  };
+
+
+
   window.addEventListener("supertable-changed", function(e) {
     const detail = (e && e.detail) ? e.detail : {};
     const org = detail.org || "";
     const sup = detail.sup || "";
+    if (!org || !sup) return;
+    
+
+    // If the page can refresh in-place, prefer that and prevent the selection fallback reload.
+    if (typeof window.onPairChange === "function") {
+      try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } catch (_) {}
+      return;
+    }
+try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } catch (_) {}
     const u = new URL(window.location.href);
     u.pathname = "/reflection/ingestion";
     u.searchParams.set("org", org);
@@ -1354,9 +1421,11 @@
   const h = (window.location.hash || "").replace("#", "");
   if (h === "pipe" || h === "load" || h === "staging") {
     window.switchTab(h);
+  } else {
+    window.switchTab("load");
   }
 
-  // Initial load
+// Initial load
   refreshStagings().then(async () => {
     const stgSel2 = document.getElementById("pipeStagingSelect");
     if (stgSel2 && stgSel2.value) await refreshPipes();

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
+import tempfile
+import uuid
+from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 
@@ -593,3 +598,219 @@ def attach_ingestion_routes(
             meta["enabled"] = False
         redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
         return {"ok": True}
+    # ----------------------------- Load (file upload) -----------------------------
+
+    @router.post("/reflection/ingestion/load/upload")
+    async def api_ingestion_load_upload(
+        request: Request,
+        org: str = Form(...),
+        sup: str = Form(...),
+        user_hash: str = Form(...),
+        mode: str = Form(...),  # "table" | "staging"
+        table_name: Optional[str] = Form(None),
+        staging_name: Optional[str] = Form(None),
+        overwrite_columns: Optional[str] = Form(None),
+        file: UploadFile = File(...),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """Upload a file and load it either into a table or into a staging area.
+
+        The UI always posts to this endpoint; behavior is selected by `mode`:
+          - mode="staging": use `supertable.staging_area.Staging.save_as_parquet`
+          - mode="table": use `supertable.data_writer.DataWriter.write`
+        """
+        t0 = time.perf_counter()
+
+        org_eff = (org or "").strip()
+        sup_eff = (sup or "").strip()
+        if not org_eff or not sup_eff:
+            raise HTTPException(status_code=400, detail="Missing org or sup")
+
+        # Security: always bind writes to the logged-in user session.
+        sess = None
+        try:
+            from supertable.reflection.ui import get_session as _get_session  # noqa: WPS433
+            sess = _get_session(request) or {}
+        except Exception:
+            sess = None
+
+        sess_org = str((sess or {}).get("org") or "")
+        sess_user_hash = str((sess or {}).get("user_hash") or "")
+        if sess_org and sess_org != org_eff:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if sess_user_hash and sess_user_hash != (user_hash or "").strip():
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        user_hash_eff = sess_user_hash or (user_hash or "").strip()
+        if not user_hash_eff:
+            raise HTTPException(status_code=400, detail="Missing user_hash")
+
+        mode_eff = (mode or "").strip().lower()
+        if mode_eff not in ("table", "staging"):
+            raise HTTPException(status_code=400, detail="Invalid mode (expected 'table' or 'staging')")
+
+        if mode_eff == "table":
+            table_eff = (table_name or "").strip()
+            if not table_eff:
+                raise HTTPException(status_code=400, detail="Missing table_name")
+            # Avoid path traversal / weird separators in table names.
+            if any(x in table_eff for x in ("/", "\\", "\x00")) or ".." in table_eff:
+                raise HTTPException(status_code=400, detail="Invalid table_name")
+        else:
+            stg_eff = (staging_name or "").strip()
+            if not stg_eff:
+                raise HTTPException(status_code=400, detail="Missing staging_name")
+            if not STAGING_NAME_RE.match(stg_eff):
+                raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+        filename = (file.filename or "upload").strip()
+        ext = Path(filename).suffix.lower().lstrip(".")
+        if ext in ("", None):
+            ext = ""
+
+        # Save upload to a temp file (avoid large in-memory buffers).
+        def _persist_upload_to_temp(upload: UploadFile) -> str:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=(".%s" % ext) if ext else "")
+            tmp_path = tmp.name
+            try:
+                with tmp:
+                    while True:
+                        chunk = upload.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
+            finally:
+                try:
+                    upload.file.close()
+                except Exception:
+                    pass
+            return tmp_path
+
+        tmp_path = await asyncio.to_thread(_persist_upload_to_temp, file)
+
+        def _read_arrow_table(path: str, file_ext: str) -> Any:
+            try:
+                import pyarrow as pa  # noqa: WPS433
+                import pyarrow.csv as pa_csv  # noqa: WPS433
+                import pyarrow.json as pa_json  # noqa: WPS433
+                import pyarrow.parquet as pa_parquet  # noqa: WPS433
+            except Exception as e:
+                raise RuntimeError(f"pyarrow import failed: {e}")
+
+            e = (file_ext or "").lower()
+            if e in ("csv", "tsv"):
+                delimiter = "\t" if e == "tsv" else ","
+                read_opts = pa_csv.ReadOptions(autogenerate_column_names=False)
+                parse_opts = pa_csv.ParseOptions(delimiter=delimiter)
+                convert_opts = pa_csv.ConvertOptions(strings_can_be_null=True)
+                return pa_csv.read_csv(path, read_options=read_opts, parse_options=parse_opts, convert_options=convert_opts)
+
+            if e in ("parquet", "pq"):
+                return pa_parquet.read_table(path)
+
+            if e in ("jsonl", "ndjson"):
+                return pa_json.read_json(path)
+
+            if e == "json":
+                # Try pyarrow JSON first (works for JSON-lines).
+                try:
+                    return pa_json.read_json(path)
+                except Exception:
+                    # Fallback: attempt to load a JSON array of objects.
+                    import json  # noqa: WPS433
+                    with open(path, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if isinstance(data, list):
+                        return pa.Table.from_pylist(data)
+                    raise
+
+            raise RuntimeError("Unsupported file type. Supported: csv, tsv, json/jsonl, parquet")
+
+        try:
+            arrow_table = await asyncio.to_thread(_read_arrow_table, tmp_path, ext)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse file: {e}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        job_uuid = str(uuid.uuid4())
+
+        if mode_eff == "staging":
+            stg_eff = (staging_name or "").strip()
+            base_name = Path(filename).stem or "upload"
+            base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("._-") or "upload"
+
+            try:
+                from supertable.staging_area import Staging  # noqa: WPS433
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Staging import failed: {e}")
+
+            def _do_stage() -> str:
+                stg = Staging(organization=org_eff, super_name=sup_eff, staging_name=stg_eff)
+                return stg.save_as_parquet(arrow_table=arrow_table, base_file_name=base_name)
+
+            try:
+                saved = await asyncio.to_thread(_do_stage)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Staging save failed: {e}")
+
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            rows = getattr(arrow_table, "num_rows", None)
+            return {
+                "ok": True,
+                "mode": "staging",
+                "organization": org_eff,
+                "super_name": sup_eff,
+                "staging_name": stg_eff,
+                "saved_file_name": saved,
+                "rows": rows if rows is not None else 0,
+                "file_type": ext or "unknown",
+                "job_uuid": job_uuid,
+                "server_duration_ms": dt_ms,
+            }
+
+        # mode == "table"
+        table_eff = (table_name or "").strip()
+        overwrite_cols: List[str] = []
+        if overwrite_columns:
+            raw = str(overwrite_columns)
+            overwrite_cols = [c.strip() for c in re.split(r"[\n,]+", raw) if c.strip()]
+
+        try:
+            from supertable.data_writer import DataWriter  # noqa: WPS433
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"DataWriter import failed: {e}")
+
+        def _do_write() -> Any:
+            dw = DataWriter(super_name=sup_eff, organization=org_eff)
+            return dw.write(
+                user_hash=user_hash_eff,
+                simple_name=table_eff,
+                data=arrow_table,
+                overwrite_columns=overwrite_cols,
+            )
+
+        try:
+            cols, rows, inserted, deleted = await asyncio.to_thread(_do_write)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Write failed: {e}")
+
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "ok": True,
+            "mode": "table",
+            "organization": org_eff,
+            "super_name": sup_eff,
+            "table_name": table_eff,
+            "rows": rows,
+            "inserted": inserted,
+            "deleted": deleted,
+            "file_type": ext or "unknown",
+            "job_uuid": job_uuid,
+            "server_duration_ms": dt_ms,
+        }

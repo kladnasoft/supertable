@@ -79,7 +79,7 @@
                     onmouseover="this.style.background='rgba(239,68,68,.08)'"
                     onmouseout="this.style.background='transparent'">−</button>
 
-                  <select id="pairSel" onchange="onPairChange()" style="
+                  <select id="pairSel" onchange="__st_onPairChange()" style="
                         width: 100%;
                         padding: 10px 12px;
                         border: 1px solid #d0d7e7;
@@ -289,6 +289,7 @@
     const ORG_NAME = {{ session_org|default(sel_org|default("", true), true)|tojson }};
     const USER_HASH = {{ session_user_hash|default(default_user_hash|default("", true), true)|tojson }};
     const IS_SUPERUSER = {{ session_is_superuser|default(false, true)|tojson }};
+    const PRESELECT_SUP = {{ sel_sup|default("", true)|tojson }};
 
     const pairSel = document.getElementById("pairSel");
     let lastSupers = [];
@@ -378,7 +379,24 @@ const filesEl = document.getElementById("tenantFilesValue");
                 pairSel.appendChild(opt);
             });
 
-            // Auto-load first SuperTable
+            // Prefer URL (?sup=) or server-selected sup when available.
+            let initialSup = "";
+            try {
+                const params0 = new URLSearchParams(window.location.search || "");
+                initialSup = (params0.get("sup") || "").trim();
+            } catch (e) {
+                // ignore
+            }
+            if (!initialSup) {
+                initialSup = (PRESELECT_SUP || "").trim();
+            }
+
+            if (initialSup) {
+                const found = Array.from(pairSel.options || []).some(o => o && o.value === initialSup);
+                if (found) pairSel.value = initialSup;
+            }
+
+            // Auto-load selected SuperTable
             if (pairSel.value) {
                 await loadSuperMeta(pairSel.value);
             } else {
@@ -417,16 +435,65 @@ const filesEl = document.getElementById("tenantFilesValue");
         }
     }
 
-    // Expose for onchange="onPairChange()"
-    window.onPairChange = function onPairChange() {
+    // Primary handler for the SuperTable selector.
+    // - Updates the selection metrics block (this template)
+    // - Notifies the host page (CustomEvent)
+    // - Delegates to a page-provided onPairChange() if one exists
+    // - Falls back to a full page reload for pages that are server-rendered (admin/notebooks/etc.)
+    window.__st_onPairChange = function __st_onPairChange() {
         const superName = pairSel.value;
+
+        // Always refresh selection metrics immediately.
         loadSuperMeta(superName);
+
+        // Keep URL in sync so refresh / deep links preserve the selection.
+        let nextHref = "";
         try {
-            window.dispatchEvent(new CustomEvent('supertable-changed', { detail: { super_name: superName } }));
+            const u = new URL(window.location.href);
+            if (ORG_NAME) u.searchParams.set("org", ORG_NAME);
+            if (superName) u.searchParams.set("sup", superName);
+            nextHref = u.toString();
+            history.replaceState(null, "", nextHref);
         } catch (e) {
             // ignore
         }
+
+        // Notify any page-level listeners (ingestion, etc.)
+        let allowFallbackReload = true;
+        try {
+            const ev = new CustomEvent("supertable-changed", {
+                cancelable: true,
+                detail: { org: ORG_NAME, sup: superName, super_name: superName }
+            });
+            allowFallbackReload = window.dispatchEvent(ev);
+        } catch (e) {
+            // ignore
+        }
+
+        // If the host page defines its own onPairChange(), call it too (do not recurse).
+        try {
+            if (typeof window.onPairChange === "function" && window.onPairChange !== window.__st_onPairChange) {
+                window.onPairChange(ORG_NAME, superName);
+                return;
+            }
+        } catch (e) {
+            console.error("Page onPairChange failed:", e);
+        }
+
+        // No page handler => reload so server-rendered sections change with the tenant.
+        if (allowFallbackReload) {
+            if (nextHref) {
+                window.location.href = nextHref;
+            } else {
+                window.location.reload();
+            }
+        }
     };
+
+    // Backwards-compat: keep onPairChange() available if the page doesn't define one.
+    if (typeof window.onPairChange !== "function") {
+        window.onPairChange = window.__st_onPairChange;
+    }
 
     if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", loadSupers);
