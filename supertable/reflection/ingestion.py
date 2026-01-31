@@ -48,7 +48,7 @@ def attach_ingestion_routes(
 ) -> None:
     """Register Ingestion UI + API routes onto an existing router.
 
-    This keeps `ui.py` smaller without changing runtime behavior or paths.
+    This keeps `common.py` smaller without changing runtime behavior or paths.
     """
 
     # ---------------------------- Ingestion page ----------------------------
@@ -629,7 +629,7 @@ def attach_ingestion_routes(
         # Security: always bind writes to the logged-in user session.
         sess = None
         try:
-            from supertable.reflection.ui import get_session as _get_session  # noqa: WPS433
+            from supertable.reflection.common import get_session as _get_session  # noqa: WPS433
             sess = _get_session(request) or {}
         except Exception:
             sess = None

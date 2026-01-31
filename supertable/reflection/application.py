@@ -13,7 +13,7 @@ STATIC_DIR = str(Path(__file__).resolve().parent / "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # include the two modules' routers (no circular imports)
-from supertable.reflection.ui import router as admin_router
+from supertable.reflection.common import router as admin_router
 
 app.include_router(admin_router)
 

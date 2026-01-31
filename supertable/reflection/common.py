@@ -591,71 +591,6 @@ def _escape(s: str) -> str:
 # ------------------------------ Auth helpers ------------------------------
 
 
-def _get_org_from_env_fallback() -> str:
-    return (os.getenv("SUPERTABLE_ORGANIZATION") or "").strip()
-
-
-def _catalog_list_tokens(org: str) -> List[Dict[str, Any]]:
-    if not org:
-        return []
-    try:
-        return catalog.list_auth_tokens(org)  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            raw = redis_client.hgetall(f"supertable:{org}:auth:tokens") or {}
-            out: List[Dict[str, Any]] = []
-            for token_id, meta_raw in raw.items():
-                try:
-                    meta = json.loads(meta_raw) if meta_raw else {}
-                except Exception:
-                    meta = {"value": meta_raw}
-                if isinstance(meta, dict):
-                    meta = dict(meta)
-                else:
-                    meta = {"value": meta}
-                meta.setdefault("token_id", token_id)
-                out.append(meta)
-            out.sort(key=lambda x: int(x.get("created_ms") or 0), reverse=True)
-            return out
-        except Exception:
-            return []
-
-
-def _catalog_create_token(org: str, created_by: str, label: Optional[str]) -> Dict[str, Any]:
-    if not org:
-        raise HTTPException(status_code=400, detail="Missing organization")
-    try:
-        return catalog.create_auth_token(org=org, created_by=created_by, label=label)  # type: ignore[attr-defined]
-    except Exception:
-        token = secrets.token_urlsafe(24)
-        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        meta = {
-            "token_id": token_id,
-            "created_ms": int(time.time() * 1000),
-            "created_by": str(created_by or ""),
-            "label": (str(label).strip() if label is not None else ""),
-            "enabled": True,
-        }
-        try:
-            redis_client.hset(f"supertable:{org}:auth:tokens", token_id, json.dumps(meta))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Token creation failed: {e}")
-        return {"token": token, **meta}
-
-
-def _catalog_delete_token(org: str, token_id: str) -> bool:
-    if not org or not token_id:
-        return False
-    try:
-        return bool(catalog.delete_auth_token(org=org, token_id=token_id))  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            return bool(redis_client.hdel(f"supertable:{org}:auth:tokens", token_id))
-        except Exception:
-            return False
-
-
-
 def _get_provided_token(request: Request) -> Optional[str]:
     cookie = request.cookies.get(_ADMIN_COOKIE_NAME)
     return cookie.strip() if isinstance(cookie, str) else None
@@ -776,55 +711,6 @@ def list_users(org: str, sup: str) -> List[Dict]:
     return out
 
 
-def list_roles(org: str, sup: str) -> List[Dict]:
-    out: List[Dict] = []
-    pattern = f"supertable:{org}:{sup}:meta:roles:*"
-    cursor = 0
-    while True:
-        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=500)
-        for key in keys:
-            k = key if isinstance(key, str) else key.decode("utf-8")
-            if ":type_to_hash:" in k:
-                continue
-            tail = k.rsplit(":", 1)[-1]
-            if tail == "meta":
-                continue
-            t = _r_type(k)
-            doc = None
-            if t == "string":
-                doc = _read_string_json(k)
-            elif t == "hash":
-                doc = _read_hash(k)
-            else:
-                continue
-            if doc is None:
-                continue
-            out.append({"hash": tail, **doc})
-        if cursor == 0:
-            break
-    return out
-
-
-def read_user(org: str, sup: str, user_hash: str) -> Optional[Dict]:
-    k = f"supertable:{org}:{sup}:meta:users:{user_hash}"
-    t = _r_type(k)
-    if t == "string":
-        return _read_string_json(k)
-    if t == "hash":
-        return _read_hash(k)
-    return None
-
-
-def read_role(org: str, sup: str, role_hash: str) -> Optional[Dict]:
-    k = f"supertable:{org}:{sup}:meta:roles:{role_hash}"
-    t = _r_type(k)
-    if t == "string":
-        return _read_string_json(k)
-    if t == "hash":
-        return _read_hash(k)
-    return None
-
-
 # Prefer installed package; fallback to local modules for dev
 try:
     from supertable.meta_reader import MetaReader  # type: ignore
@@ -866,14 +752,12 @@ def healthz():
 
 # -------- JSON API (read-only) --------
 
-@router.get("/reflection/tenants")
 def api_tenants(_: Any = Depends(logged_in_guard_api)):
     pairs = discover_pairs()
     return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
 
 
 
-@router.get("/reflection/mirrors")
 def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -950,7 +834,6 @@ def _list_leaves(
     return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
 
 
-@router.get("/reflection/users")
 def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -958,7 +841,6 @@ def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"users": list_users(org, sup)}
 
 
-@router.get("/reflection/roles")
 def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
     if not org or not sup:
@@ -966,7 +848,6 @@ def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None)
     return {"roles": list_roles(org, sup)}
 
 
-@router.get("/reflection/user/{user_hash}")
 def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -978,7 +859,6 @@ def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Opti
     return {"hash": user_hash, "data": obj}
 
 
-@router.get("/reflection/role/{role_hash}")
 def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
                      _=Depends(admin_guard_api)):
     org, sup = resolve_pair(org, sup)
@@ -988,147 +868,6 @@ def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Opti
     if not obj:
         raise HTTPException(status_code=404, detail="Role not found")
     return {"hash": role_hash, "data": obj}
-
-
-# ------------------------------ .env helpers + /admin/env endpoints ------------------------------
-
-_SENSITIVE_KEY_PARTS = (
-    "PASSWORD",
-    "PASS",
-    "SECRET",
-    "TOKEN",
-    "KEY",
-    "ACCESS_KEY",
-    "CONNECTION_STRING",
-    "API_KEY",
-    "CLIENT_SECRET",
-)
-
-
-def _env_file_path() -> Path:
-    """
-    Resolve the project .env path relative to this file.
-
-    Given the layout:
-
-      /home/.../dev/supertable/.env
-      /home/.../dev/supertable/supertable/reflection/ui.py
-
-    This returns /home/.../dev/supertable/.env
-    """
-    here = Path(__file__).resolve()
-    reflection_dir = here.parent              # .../supertable/supertable/reflection
-    pkg_dir = reflection_dir.parent           # .../supertable/supertable
-    repo_root = pkg_dir.parent                # .../supertable (project root)
-
-    dotenv_path = settings.DOTENV_PATH or ".env"
-    p = Path(dotenv_path)
-    if not p.is_absolute():
-        p = (repo_root / dotenv_path).resolve()
-    return p
-
-
-def _is_sensitive_env_key(key: str) -> bool:
-    up = (key or "").upper()
-    return any(part in up for part in _SENSITIVE_KEY_PARTS)
-
-
-_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
-
-
-def _mask_secret(value: str) -> str:
-    v = str(value or "")
-    if not v:
-        return ""
-    if len(v) <= 4:
-        return "****"
-    return "****" + v[-4:]
-
-
-@router.get("/reflection/env")
-def admin_env_get(_=Depends(admin_guard_api)):
-    """
-    Return the current .env values from the project root.
-
-    Response:
-    {
-      "found": bool,
-      "path": str,
-      "items": [
-        {"key": "...", "value": "...", "is_sensitive": bool}
-      ]
-    }
-    """
-    if dotenv_values is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    found = env_path.exists() and env_path.is_file()
-    items: List[Dict[str, Any]] = []
-
-    if found:
-        values = dotenv_values(str(env_path)) or {}
-        for k, v in values.items():
-            # dotenv_values may return None for some entries
-            val = "" if v is None else str(v)
-            is_sensitive = _is_sensitive_env_key(k)
-            items.append(
-                {
-                    "key": k,
-                    "value": _mask_secret(val) if is_sensitive else val,
-                    "is_sensitive": is_sensitive,
-                }
-            )
-
-    return {
-        "found": found,
-        "path": str(env_path),
-        "items": items,
-    }
-
-
-@router.post("/reflection/env")
-def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
-    """
-    Update the project .env with provided items.
-
-    Request body:
-    {
-      "items": [
-        {"key": "NAME", "value": "VAL"},
-        ...
-      ]
-    }
-    """
-    if set_key is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    env_path.touch(exist_ok=True)
-
-    items = payload.get("items") or []
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="items must be a list")
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "").strip()
-        if not key or not _ENV_KEY_RE.fullmatch(key):
-            continue
-        if not key:
-            continue
-        value = item.get("value", "")
-        # Prevent newline injection / file corruption.
-        value_str = str(value)
-        if "\n" in value_str or "\r" in value_str:
-            raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
-        if len(value_str) > 8192:
-            raise HTTPException(status_code=400, detail=f"Value too long for {key}")
-        # Cast to str and avoid auto-quoting to preserve readability
-        set_key(str(env_path), key, value_str, quote_mode="never")
-
-    return {"ok": True, "path": str(env_path)}
 
 
 # ------------------------------ Admin page & auth routes ------------------------------
@@ -1259,7 +998,6 @@ def _effective_settings() -> Dict[str, str]:
 
 
 
-@router.get("/reflection/tokens")
 def api_list_tokens(
     request: Request,
     org: str = Query(None),
@@ -1272,7 +1010,6 @@ def api_list_tokens(
     return {"ok": True, "organization": org_eff, "tokens": tokens}
 
 
-@router.post("/reflection/tokens")
 def api_create_token(
     request: Request,
     org: str = Query(None),
@@ -1286,7 +1023,6 @@ def api_create_token(
     return {"ok": True, "organization": org_eff, **created}
 
 
-@router.delete("/reflection/tokens/{token_id}")
 def api_delete_token(
     request: Request,
     token_id: str,
@@ -1303,7 +1039,6 @@ def api_delete_token(
 
 
 
-@router.get("/reflection/admin", response_class=HTMLResponse)
 def admin_page(
         request: Request,
         org: Optional[str] = Query(None),
@@ -1377,6 +1112,42 @@ def admin_page(
     resp = templates.TemplateResponse("admin.html", ctx)
     _no_store(resp)
     return resp
+
+
+
+
+# ---------------------------------------------------------------------------
+# Admin UI + API routes (extracted to admin.py)
+# ---------------------------------------------------------------------------
+
+try:
+    from .admin import attach_admin_routes  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from supertable.reflection.admin import attach_admin_routes  # type: ignore
+    except Exception:
+        from admin import attach_admin_routes  # type: ignore
+
+attach_admin_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    catalog=catalog,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    list_users=list_users,
+    fmt_ts=_fmt_ts,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+    dotenv_values=dotenv_values,
+    set_key=set_key,
+)
 
 # ------------------------------ Tables tab (moved to tables.py) ------------------------------
 
