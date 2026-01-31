@@ -1228,6 +1228,75 @@
         });
     }
 
+
+
+    // Refresh only the Tables section (no full page reload)
+    function refreshTablesSection() {
+      const btn = document.getElementById('tablesRefreshBtn');
+      const originalHtml = btn ? btn.innerHTML : null;
+
+      // Preserve DataTables UI state (search/order/page/pageSize)
+      let dtState = null;
+      try {
+        if ($.fn.DataTable.isDataTable('#tablesTable')) {
+          const dt = $('#tablesTable').DataTable();
+          dtState = {
+            search: dt.search(),
+            order: dt.order(),
+            page: dt.page(),
+            len: dt.page.len()
+          };
+        }
+      } catch (e) {
+        dtState = null;
+      }
+
+      if (!currentSuper) {
+        renderTables(null, []);
+        return;
+      }
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      }
+
+      api(
+        META_BASE + '/reflection/super?organization=' +
+        encodeURIComponent(ORGANIZATION) +
+        '&super_name=' + encodeURIComponent(currentSuper) +
+        '&user_hash=' + encodeURIComponent(USER_HASH)
+      )
+        .then(data => {
+          const s = data && data.meta && data.meta.super ? data.meta.super : null;
+          const tables = (s && Array.isArray(s.tables)) ? s.tables : [];
+          renderTables(currentSuper, tables);
+
+          // Reapply DataTables state after refresh
+          try {
+            if (dtState && $.fn.DataTable.isDataTable('#tablesTable')) {
+              const dt2 = $('#tablesTable').DataTable();
+              if (dtState.len) dt2.page.len(dtState.len);
+              if (dtState.order) dt2.order(dtState.order);
+              if (dtState.search != null) dt2.search(dtState.search);
+              if (typeof dtState.page === 'number') dt2.page(dtState.page);
+              dt2.draw(false);
+            }
+          } catch (e) {
+            // ignore
+          }
+        })
+        .catch(err => {
+          console.error('Failed to refresh tables', err);
+        })
+        .finally(() => {
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = originalHtml || '⟳ Refresh';
+          }
+        });
+    }
+
     function loadTenants() {
       const labelEl = document.getElementById('tenantLabel');
       const selEl = document.getElementById('pairSel');
@@ -1968,6 +2037,18 @@ function deleteTable(simple) {
               <span id="tablesShownCount" style="font-weight:600;margin-left:4px;">0</span>
               <span class="muted">tables</span>
             </div>
+
+            <!-- Refresh tables (AJAX) -->
+            <button id="tablesRefreshBtn"
+                    class="btn btn-light btn-sm"
+                    type="button"
+                    onclick="refreshTablesSection()"
+                    title="Refresh tables"
+                    aria-label="Refresh tables"
+                    style="border:1px solid #e5e7eb;border-radius:999px;padding:4px 10px;min-width:90px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:6px;">
+              <span aria-hidden="true" style="font-size:14px;line-height:1;">⟳</span>
+              <span class="text-xs" style="font-weight:600;">Refresh</span>
+            </button>
 
           </div>
         </div>

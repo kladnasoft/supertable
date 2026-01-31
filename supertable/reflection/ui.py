@@ -1378,86 +1378,33 @@ def admin_page(
     _no_store(resp)
     return resp
 
+# ------------------------------ Tables tab (moved to tables.py) ------------------------------
 
-@router.get("/reflection/tables")
-def admin_tables_page(
-        request: Request,
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-        page: int = Query(1, ge=1),
-        page_size: int = Query(25, ge=5, le=200),
-):
-    """
-    Tables (Leaves) listing page, rendered with tables.html.
-    All table-related UI has been moved here from admin.html.
-    """
-    if not _is_authorized(request):
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
-
-    provided = _get_provided_token(request) or ""
-
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
-
-    # If no tenant, just render with the selection UI
-    if not sel_org or not sel_sup:
-        ctx = {
-            "request": request,
-            "authorized": True,
-            "token": provided,
-            "tenants": tenants,
-            "sel_org": sel_org,
-            "sel_sup": sel_sup,
-            "has_tenant": False,
-        }
-        inject_session_into_ctx(ctx, request)
-        resp = templates.TemplateResponse("tables.html", ctx)
-        _no_store(resp)
-        return resp
-
+try:
+    from .tables import attach_tables_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        root = catalog.get_root(sel_org, sel_sup) or {}
+        from supertable.reflection.tables import attach_tables_routes  # type: ignore
     except Exception:
-        root = {}
+        from tables import attach_tables_routes  # type: ignore
 
-    # Reuse the existing leaves API logic for listing
-    listing = _list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
-    raw_items = listing.get("items", [])
+attach_tables_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    list_users=list_users,
+    fmt_ts=_fmt_ts,
+    list_leaves=_list_leaves,
+    catalog=catalog,
+    admin_guard_api=admin_guard_api,
+)
 
-    items: List[Dict[str, Any]] = []
-    for it in raw_items:
-        obj = dict(it)
-        try:
-            obj["ts_iso"] = _fmt_ts(int(obj.get("ts", 0)))
-        except Exception:
-            obj["ts_iso"] = str(obj.get("ts", ""))
-        items.append(obj)
 
-    total = int(listing.get("total", 0))
-    pages = (total + page_size - 1) // page_size if total else 1
-
-    ctx = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": True,
-        "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
-        "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
-        "page": page,
-        "pages": pages if pages else 1,
-        "total": total,
-        "items": items,
-    }
-    inject_session_into_ctx(ctx, request)
-    resp = templates.TemplateResponse("tables.html", ctx)
-    _no_store(resp)
-    return resp
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -1748,70 +1695,6 @@ def admin_schema_api(
         return JSONResponse({"status": "error", "message": f"Get schema failed: {e}"}, status_code=500)
 
 
-def _get_redis_items(pattern) -> List[str]:
-    """
-    Get all tables for this super table by scanning Redis keys.
-    """
-    catalog = RedisCatalog()
-    try:
-        items = []
-        cursor = 0
-        while True:
-            cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
-            for key in keys:
-                # Handle both bytes and string keys
-                if isinstance(key, bytes):
-                    key_str = key.decode('utf-8')
-                else:
-                    key_str = str(key)
-
-                items.append(key_str)
-            if cursor == 0:
-                break
-        return items
-    except Exception as e:
-        logger.error(f"Error getting tables from Redis: {e}")
-        return []
-
-def list_supers(organization: str) -> List[str]:
-    """
-    Searches the organization's directory for subdirectories that contain a
-    "super" folder and a "_super.json" file. Uses the storage interface's
-    get_directory_structure() for portability.
-    """
-    result = []
-    pattern = f"supertable:{organization}:*:meta:root"
-
-    items = _get_redis_items(pattern)
-    for item in items:
-        super_name = item.split(':')[2]
-        result.append(super_name)
-
-    return sorted(result)
-
-
-
-@router.get("/reflection/supers")
-def api_list_supers(
-        request: Request,
-        organization: str = Query(..., description="Organization identifier"),
-        _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-      resp = RedirectResponse("/reflection/login", status_code=302)
-      _no_store(resp)
-      return resp
-
-    try:
-        return {
-            "ok": True,
-            "organization": organization,
-            "supers": list_supers(organization=organization),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
-
-
 @router.delete("/reflection/super")
 def api_delete_super(
     request: Request,
@@ -1844,155 +1727,6 @@ def api_delete_super(
         raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
 
     return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
-
-
-@router.delete("/reflection/table")
-def api_delete_table(
-    request: Request,
-    organization: str = Query(..., description="Organization identifier"),
-    super_name: str = Query(..., description="SuperTable name"),
-    table: Optional[str] = Query(None, description="Simple table name (preferred query param: table)"),
-    table_name: Optional[str] = Query(None, description="Simple table name (compat)"),
-    _: Any = Depends(admin_guard_api),
-):
-    """Delete a simple table (leaf) from Redis and its folder from storage (destructive)."""
-    simple = (table or table_name or "").strip()
-    if not organization or not super_name or not simple:
-        raise HTTPException(status_code=400, detail="organization, super_name and table are required")
-
-    storage = get_storage()
-    catalog = RedisCatalog()
-
-    simple_folder = os.path.join(organization, super_name, "tables", simple)
-
-    try:
-        if storage.exists(simple_folder):
-            storage.delete(simple_folder)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
-
-    try:
-        catalog.delete_simple_table(organization, super_name, simple)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
-
-    return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
-
-
-@router.get("/reflection/tables", response_class=HTMLResponse)
-def tables_page(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=5, le=500),
-):
-    """
-    Tables view: shows Redis leaves as logical tables.
-    """
-    if not _is_authorized(request):
-      resp = RedirectResponse("/reflection/login", status_code=302)
-      _no_store(resp)
-      return resp
-
-    provided = _get_provided_token(request) or ""
-
-    # same tenant selection UX as /admin
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-    tenants = [
-        {"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)}
-        for o, s in pairs
-    ]
-
-    has_tenant = bool(sel_org and sel_sup)
-    total = 0
-    items: List[Dict[str, Any]] = []
-    root_version = None
-    root_ts = None
-    pages = 1
-
-    if has_tenant:
-        listing = _list_leaves(
-            org=sel_org,
-            sup=sel_sup,
-            q=None,
-            page=page,
-            page_size=page_size,
-        )
-
-        total = listing.get("total", 0)
-        page = listing.get("page", page)
-        page_size = listing.get("page_size", page_size)
-        raw_items = listing.get("items") or []
-
-        for it in raw_items:
-            ts_val = it.get("ts")
-            if isinstance(ts_val, (int, float)):
-                ts_iso = _fmt_ts(int(ts_val))
-            else:
-                ts_iso = str(ts_val) if ts_val is not None else ""
-            new_it = dict(it)
-            new_it["ts_iso"] = ts_iso
-            items.append(new_it)
-
-        pages = max(1, (total + page_size - 1) // page_size)
-
-        try:
-            root = catalog.get_root(sel_org, sel_sup)
-            if root:
-                root_version = root.get("version")
-                root_ts = _fmt_ts(root.get("ts", 0))
-        except Exception:
-            root_version = None
-            root_ts = None
-
-    # Users are needed for a default user hash on stats/meta calls
-    users = list_users(sel_org, sel_sup) if has_tenant else []
-    default_user_hash = users[0]["hash"] if users else ""
-    ctx = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": has_tenant,
-        "total": total,
-        "page": page,
-        "pages": pages,
-        "items": items,
-        "root_version": root_version,
-        "root_ts": root_ts,
-        "default_user_hash": default_user_hash,
-    }
-    inject_session_into_ctx(ctx, request)
-    resp = templates.TemplateResponse("tables.html", ctx)
-    _no_store(resp)
-    return resp
-
-
-@router.get("/reflection/super")
-def api_get_super_meta(
-    request: Request,
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    user_hash: str = Query(...),
-    _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-      resp = RedirectResponse("/reflection/login", status_code=302)
-      _no_store(resp)
-      return resp
-
-    try:
-        mr = MetaReader(organization=organization, super_name=super_name)
-        return {"ok": True, "meta": mr.get_super_meta(user_hash)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
-
 
 
 @router.post("/reflection/super")
@@ -2038,40 +1772,6 @@ def api_get_super_meta(
         raise HTTPException(status_code=500, detail=f"SuperTable deletion failed: {e}")
 
 
-@router.get("/reflection/schema")
-def api_get_table_schema(
-        organization: str = Query(...),
-        super_name: str = Query(...),
-        table: str = Query(..., description="Table simple name"),
-        user_hash: str = Query(...),
-        _: Any = Depends(admin_guard_api),
-):
-    """Correct usage: pass the table (simple) name — NOT the super_name."""
-    try:
-        mr = MetaReader(organization=organization, super_name=super_name)
-        schema = mr.get_table_schema(table, user_hash)
-        logger.debug(f"table.schema.result: {schema}")
-        return {"ok": True, "schema": schema}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
-
-
-@router.get("/reflection/stats")
-def api_get_table_stats(
-        organization: str = Query(...),
-        super_name: str = Query(...),
-        table: str = Query(..., description="Table simple name"),
-        user_hash: str = Query(...),
-        _: Any = Depends(admin_guard_api),
-):
-    """Correct usage: pass the table (simple) name — NOT the super_name."""
-    try:
-        mr = MetaReader(organization=organization, super_name=super_name)
-        stats = mr.get_table_stats(table, user_hash)
-        logger.debug(f"table.stats.result: {stats}")
-        return {"ok": True, "stats": stats}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
 # ------------------------------ Route aliases: /admin -> /reflection, /api -> /reflection ------------------------------
 
 def _add_reflection_alias_routes(_router: APIRouter) -> None:
