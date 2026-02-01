@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Spark Web Terminal</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f0f2f5; }
+        .notebook { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        textarea { width: 100%; height: 150px; font-family: monospace; padding: 10px; margin: 10px 0; border: 1px solid #ccc; }
+        #output { background: #1e1e1e; color: #00ff00; padding: 15px; min-height: 100px; white-space: pre-wrap; border-radius: 4px; }
+        .btn { padding: 10px 20px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; }
+        .start-btn { background: #28a745; color: white; }
+        .run-btn { background: #007bff; color: white; }
+    </style>
+</head>
+<body>
+    <div class="notebook">
+        <h2>Supertable Spark Cluster Interface</h2>
+        <button class="btn start-btn" onclick="startCluster()">1. Start/Connect Cluster</button>
+        <p id="status">Status: Disconnected</p>
+
+        <textarea id="codeBlock">
+data = [("Alice", 34), ("Bob", 45), ("Charlie", 23)]
+df = spark.createDataFrame(data, ["Name", "Age"])
+df.filter(df.Age > 30).show()
+        </textarea>
+
+        <button class="btn run-btn" onclick="runCommand()">2. Run Spark Command</button>
+        <h3>Output:</h3>
+        <div id="output">Console ready...</div>
+    </div>
+
+    <script>
+        const ws = new WebSocket("ws://localhost:8000/ws/spark");
+        const status = document.getElementById("status");
+        const output = document.getElementById("output");
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.status === "ready") {
+                status.innerText = "Status: " + msg.message;
+            } else if (msg.status === "running") {
+                output.innerText = "Executing on cluster...";
+            } else if (msg.status === "result") {
+                output.innerText = msg.data.output || msg.data.message;
+            }
+        };
+
+        function startCluster() {
+            ws.send(JSON.stringify({ action: "START" }));
+        }
+
+        function runCommand() {
+            const code = document.getElementById("codeBlock").value;
+            ws.send(JSON.stringify({ action: "EXECUTE", code: code }));
+        }
+    </script>
+</body>
+</html>

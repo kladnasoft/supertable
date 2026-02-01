@@ -1,5 +1,4 @@
 import io
-import sys
 from pyspark.sql import SparkSession
 from contextlib import redirect_stdout
 
@@ -10,13 +9,14 @@ class SparkClusterManager:
 
     def start_cluster(self):
         try:
-            # Connect to the Master running in Docker via the forwarded port
+            # Persistent session connected to your Docker cluster
             self.spark = SparkSession.builder \
                 .appName("SupertableSparkNotebook") \
                 .master("spark://localhost:7077") \
                 .config("spark.driver.host", "localhost") \
+                .config("spark.driver.bindAddress", "0.0.0.0") \
                 .getOrCreate()
-            return "Spark Session Connected to Docker Cluster"
+            return "Spark Session Ready"
         except Exception as e:
             return f"Failed to connect: {str(e)}"
 
@@ -25,16 +25,14 @@ class SparkClusterManager:
             return {"status": "error", "message": "Spark session not started"}
 
         output = io.StringIO()
-        # Provide the 'spark' object to the executed code
+        # Passing the session into the exec context allows multi-line code to use 'spark'
         exec_globals = {"spark": self.spark}
 
         try:
             with redirect_stdout(output):
+                # Using exec for dynamic execution of multiple lines
                 exec(code_str, exec_globals)
             return {"status": "success", "output": output.getvalue()}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    def stop_cluster(self):
-        if self.spark:
-            self.spark.stop()
+            import traceback
+            return {"status": "error", "message": traceback.format_exc()}
