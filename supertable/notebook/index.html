@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Supertable Notebook</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; background: #f4f4f9; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        textarea { width: 100%; height: 200px; font-family: 'Courier New', monospace; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 10px; }
+        #console { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; height: 300px; overflow-y: auto; font-family: 'Consolas', monospace; white-space: pre-wrap; }
+        .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        button { background: #0078d4; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #ccc; }
+        #status { font-size: 0.9em; color: #666; }
+        .progress-line { color: #4ec9b0; } /* Highlight for 'progress' logs */
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Supertable Python Notebook</h2>
+
+    <div class="controls">
+        <div id="status">Status: Disconnected</div>
+        <button id="runBtn" onclick="runCode()" disabled>Run Cell</button>
+    </div>
+
+    <textarea id="codeEditor" spellcheck="false">
+import time
+import requests
+
+print("Checking external API connection...")
+for i in range(1, 6):
+    print(f"Progress: {i*20}% completed...")
+    time.sleep(1) # Simulated complex work
+
+try:
+    r = requests.get('https://api.github.com')
+    print(f"Final Result: GitHub API returned {r.status_code}")
+except Exception as e:
+    print(f"Error: {e}")
+    </textarea>
+
+    <div id="console">Console output will appear here...</div>
+</div>
+
+<script>
+    const consoleDiv = document.getElementById('console');
+    const statusDiv = document.getElementById('status');
+    const runBtn = document.getElementById('runBtn');
+    const codeEditor = document.getElementById('codeEditor');
+
+    // 1. Establish WebSocket connection
+    const socket = new WebSocket('ws://localhost:8000/ws/execute');
+
+    socket.onopen = () => {
+        statusDiv.innerText = "Status: Connected (Ready)";
+        runBtn.disabled = false;
+    };
+
+    socket.onmessage = (event) => {
+        const response = JSON.parse(event.data);
+
+        if (response.status === "start") {
+            consoleDiv.innerHTML = ""; // Clear console for new run
+            statusDiv.innerText = "Status: Running...";
+            runBtn.disabled = true;
+        }
+        else if (response.status === "output") {
+            // Check if line looks like progress to style it
+            const line = response.data;
+            const span = document.createElement('span');
+            if (line.includes("Progress")) span.className = "progress-line";
+            span.innerText = line;
+
+            consoleDiv.appendChild(span);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight; // Auto-scroll
+        }
+        else if (response.status === "complete") {
+            statusDiv.innerText = "Status: Finished";
+            runBtn.disabled = false;
+        }
+    };
+
+    socket.onclose = () => {
+        statusDiv.innerText = "Status: Disconnected (Server Offline)";
+        runBtn.disabled = true;
+    };
+
+    function runCode() {
+        const code = codeEditor.value;
+        socket.send(JSON.stringify({ code: code }));
+    }
+</script>
+
+</body>
+</html>

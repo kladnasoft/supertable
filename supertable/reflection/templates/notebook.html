@@ -20,7 +20,7 @@
 
   .nb-topbar {
     display:flex;
-    align-items:center;
+    align-items:flex-start;
     justify-content:space-between;
     gap: 12px;
     flex-wrap: wrap;
@@ -32,23 +32,89 @@
     color:#0f172a;
   }
 
-  .nb-layout {
-    display:flex;
-    gap: 14px;
+  /* Admin-like tab bar (matches admin.html) */
+  #tab-navigation {
+    display: flex;
+    gap: 24px;
     margin-top: 16px;
-    align-items: flex-start;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 0 2px;
     flex-wrap: wrap;
+    align-items: center;
   }
 
-  .nb-main {
-    flex: 3;
-    min-width: 520px;
+  .tab {
+    padding: 8px 0;
+    margin-bottom: -1px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    font-size: 13px;
+    color: #64748b;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
   }
 
-  .nb-side {
-    flex: 1;
-    min-width: 280px;
+  .tab.active {
+    color: #1c96ca;
+    border-bottom-color: #1c96ca;
+    font-weight: 500;
   }
+
+  .tab-sep {
+    color:#94a3b8;
+    margin: 0 6px;
+    font-size: 13px;
+    user-select:none;
+  }
+
+  .tab-add {
+    min-width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    cursor: pointer;
+    color: #0f172a;
+    padding: 0;
+    margin-bottom: 4px;
+  }
+  .tab-add:hover { background: #e2e8f0; }
+
+  .tab-close {
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    border: 1px solid rgba(148,163,184,.8);
+    background: #fff;
+    display: inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-size: 11px;
+    color: #64748b;
+    cursor:pointer;
+    padding: 0;
+  }
+  .tab-close:hover {
+    background: rgba(239,68,68,0.12);
+    border-color: rgba(239,68,68,0.55);
+    color: rgba(239,68,68,0.9);
+  }
+
+  .tab-doc {
+    display:inline-flex;
+    align-items:center;
+    gap: 8px;
+  }
+
+  .hidden { display:none; }
 
   .panel {
     border: 1px solid rgba(15,23,42,.10);
@@ -64,6 +130,7 @@
     align-items:center;
     justify-content:space-between;
     gap: 10px;
+    flex-wrap: wrap;
   }
 
   .panel-title {
@@ -75,13 +142,81 @@
     font-size: 13px;
   }
 
+  /* Buttons match admin style */
+  .btn-azure-outline {
+    border: 1px solid #1c96ca;
+    background: transparent;
+    color: #1c96ca;
+    font-weight: 600;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-azure-outline:hover { background: #1c96ca; color: #ffffff; }
+
+  .btn-danger-outline {
+    border: 1px solid rgba(239,68,68,0.75);
+    background: transparent;
+    color: rgba(239,68,68,0.9);
+    font-weight: 700;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-danger-outline:hover { background: rgba(239,68,68,0.9); color:#fff; }
+
+  /* Notebook list */
+  .toolbar {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+  }
+
+  .searchbox {
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .searchbox input { min-width: 320px; }
+  @media (max-width: 680px) { .searchbox input { min-width: 100%; } }
+
+  /* Editor */
+  .editor-top {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+  }
+  .editor-top .left,
+  .editor-top .right {
+    display:flex;
+    align-items:center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .editor-subbar {
+    display:flex;
+    align-items:center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+  }
+
+  .nb-name-input {
+    min-width: 260px;
+    font-weight: 700;
+  }
+
   /* Cells */
   .cell {
     border: 1px solid rgba(15,23,42,.10);
     border-radius: 16px;
     background: #fff;
     overflow: hidden;
-    margin-bottom: 12px;
+    margin-top: 12px;
   }
 
   .cell-head {
@@ -110,11 +245,9 @@
     flex-wrap: wrap;
   }
 
-  .cell-body {
-    padding: 10px 12px;
-  }
+  .cell-body { padding: 10px 12px; }
 
-  .editor {
+  .codebox {
     width: 100%;
     min-height: 130px;
     resize: vertical;
@@ -140,72 +273,102 @@
   .output.ok { border-left: 4px solid rgba(16,185,129,0.7); }
   .output pre { margin:0; white-space: pre-wrap; }
 
-  .timer {
-    font-size: 12px;
-    color:#334155;
-    display:inline-flex;
-    align-items:center;
-    gap: 8px;
-  }
-  .spinner {
-    width: 14px; height: 14px;
-    border-radius: 999px;
-    border: 2px solid rgba(28,150,202,25);
-    border-top-color: #1c96ca;
-    animation: spin 0.9s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* Snippets */
-  .snippet {
-    border: 1px solid rgba(15,23,42,.10);
+  /* Tiny toast */
+  .toast {
+    position: fixed;
+    right: 18px;
+    top: 16px;
+    z-index: 5000;
+    background: rgba(15,23,42,0.92);
+    color: #fff;
     border-radius: 14px;
-    padding: 10px 10px;
-    background: #fff;
-    cursor: pointer;
-    transition: transform .08s ease, border-color .12s ease, box-shadow .12s ease;
+    padding: 10px 12px;
+    font-size: 12px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.22);
+    display:none;
+    max-width: min(520px, calc(100vw - 36px));
   }
-  .snippet:hover {
-    transform: translateY(-1px);
-    border-color: rgba(28,150,202,.55);
-    box-shadow: 0 10px 14px rgba(0,0,0,0.04);
+
+  /* Modal */
+  .nb-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.55);
+    display:none;
+    align-items:center;
+    justify-content:center;
+    padding: 18px;
+    z-index: 4000;
   }
-  .snippet .h {
+  .nb-modal .card {
+    background:#fff;
+    border-radius: 16px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.25);
+    border: 1px solid rgba(0,0,0,0.08);
+    max-width: 980px;
+    width: 100%;
+    padding: 14px;
+  }
+  .nb-modal .head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+  }
+  .nb-modal .title {
     font-weight: 900;
     color:#0f172a;
-    font-size: 12px;
+    font-size: 14px;
     display:flex;
     align-items:center;
     gap: 8px;
   }
-  .snippet .d {
-    margin-top: 6px;
-    color:#64748b;
+  .nb-modal .body { margin-top: 10px; }
+  .nb-modal .actions {
+    margin-top: 12px;
+    display:flex;
+    justify-content:flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  /* Snippets list */
+  .sn-grid {
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 12px;
+  }
+  @media (max-width: 980px) { .sn-grid { grid-template-columns: 1fr; } }
+
+  .sn-card {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    padding: 12px 12px;
+    background:#fff;
+  }
+  .sn-card .top {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap: 10px;
+  }
+  .sn-card .name { font-weight: 900; color:#0f172a; font-size: 13px; }
+  .sn-card pre {
+    margin: 10px 0 0 0;
+    padding: 10px 10px;
+    border-radius: 14px;
+    background: rgba(248,250,252,.9);
+    border: 1px solid rgba(15,23,42,.10);
     font-size: 12px;
+    white-space: pre-wrap;
   }
-
-  /* Button style reuse (matches ingestion/admin) */
-  .btn-azure-outline {
-    border: 1px solid #1c96ca;
-    background: transparent;
-    color: #1c96ca;
-    font-weight: 600;
-    transition: background-color 0.2s ease, color 0.2s ease;
-  }
-  .btn-azure-outline:hover { background: #1c96ca; color: #ffffff; }
-
-  .btn-danger-outline {
-    border: 1px solid rgba(239,68,68,0.75);
-    background: transparent;
-    color: rgba(239,68,68,0.9);
-    font-weight: 700;
-    transition: background-color 0.2s ease, color 0.2s ease;
-  }
-  .btn-danger-outline:hover { background: rgba(239,68,68,0.9); color:#fff; }
-
-  @media (max-width: 980px) {
-    .nb-main { min-width: 100%; }
-    .nb-side { min-width: 100%; }
+  .sn-actions {
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
   }
 </style>
 {% endblock %}
@@ -225,89 +388,170 @@
   <div class="nb-topbar">
     <div>
       <div class="nb-title">Notebooks</div>
-      <div class="muted" style="margin-top:4px;">Synapse-style cells with persistent state per session. Click a snippet to insert it into the active cell.</div>
-    </div>
-
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <div class="timer" id="nbGlobalTimer" style="display:none;">
-        <span class="spinner"></span>
-        <span>Running:</span>
-        <span class="mono" id="nbGlobalTimerVal">0.000s</span>
+      <div class="muted" style="margin-top:4px;">
+        Manage notebooks and snippets. Open notebooks in editor tabs (Synapse-style).
       </div>
-
-      <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCell">
-        <i class="fas fa-plus"></i> Add cell
-      </button>
-      <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
-        <i class="fas fa-play"></i> Run all
-      </button>
-      <button type="button" class="btn btn-sm btn-danger-outline" id="btnResetKernel">
-        <i class="fas fa-broom"></i> Reset
-      </button>
     </div>
+  </div>
+
+  <div id="tab-navigation">
+    <button type="button" class="tab active" data-pane="list">
+      <i class="fas fa-list"></i> Notebooks
+    </button>
+    <button type="button" class="tab" data-pane="snippets">
+      <i class="fas fa-wand-magic-sparkles"></i> Snippets
+    </button>
+
+    <span class="tab-sep">|</span>
+
+    <button type="button" class="tab-add" id="btnNewNotebook" title="New notebook">+</button>
+
+    <div id="openTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
   </div>
 
   {% if not has_tenant %}
     <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
   {% else %}
-    <div class="nb-layout">
-      <div class="nb-main">
-        <div class="panel">
-          <div class="panel-head">
-            <div class="panel-title"><i class="fas fa-code" style="color:#1c96ca;"></i> Notebook</div>
-            <div class="muted">Autosaves locally • Ctrl/⌘ + Enter to run</div>
-          </div>
-          <div style="height:10px;"></div>
-          <div id="cells"></div>
+    <!-- Notebooks list pane -->
+    <div id="pane-list" style="margin-top:14px;">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><i class="fas fa-book" style="color:#1c96ca;"></i> Notebooks</div>
+          <div class="muted">Stored locally for now. Creator = your session user hash.</div>
         </div>
-      </div>
 
-      <div class="nb-side">
-        <div class="panel">
-          <div class="panel-head">
-            <div class="panel-title"><i class="fas fa-wand-magic-sparkles" style="color:#1c96ca;"></i> Snippets</div>
-            <div class="muted">Click to insert</div>
+        <div class="toolbar">
+          <div class="searchbox">
+            <i class="fas fa-magnifying-glass" style="color:#94a3b8;"></i>
+            <input class="form-control form-control-sm" id="nbSearch" placeholder="Search notebooks by name / creator..." />
           </div>
 
-          <div style="margin-top:10px; display:flex; flex-direction:column; gap:10px;">
-            <div class="snippet" data-snippet="print('Hello from SuperTable Notebooks 🚀')">
-              <div class="h"><i class="fas fa-rocket" style="color:#1c96ca;"></i> Hello world</div>
-              <div class="d">Sanity check your notebook execution.</div>
-            </div>
-
-            <div class="snippet" data-snippet="# Read top rows from a table\n# returns: (df, status, message)\nres = st_read_table('table_1', limit=10)\nres[0].head()">
-              <div class="h"><i class="fas fa-database" style="color:#1c96ca;"></i> Read from table</div>
-              <div class="d">Quickly preview data from an existing SuperTable table.</div>
-            </div>
-
-            <div class="snippet" data-snippet="# Query with SQL (DuckDB engine)\nq = \"\"\"select * from table_1 limit 5\"\"\"\nst_sql(q)[0]">
-              <div class="h"><i class="fas fa-terminal" style="color:#1c96ca;"></i> SQL query</div>
-              <div class="d">Execute SQL against your SuperTable data.</div>
-            </div>
-
-            <div class="snippet" data-snippet="# Transform + write into a new table\nimport pandas as pd\n\ndf = st_read_table('table_1', limit=50)[0]\n# example transform\ndf['new_col'] = 1\n\n# overwrite_columns optional: pass [] to append\nst_write_table('table_out', df, overwrite_columns=[])">
-              <div class="h"><i class="fas fa-shuffle" style="color:#1c96ca;"></i> Transform + write</div>
-              <div class="d">Read data, transform it, then save into a different table.</div>
-            </div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshList">
+              <i class="fas fa-rotate"></i> Refresh
+            </button>
           </div>
         </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <div class="panel-title"><i class="fas fa-circle-info" style="color:#1c96ca;"></i> Context</div>
-          </div>
-          <div class="muted" style="margin-top:10px;">
-            Variables provided:
-            <div class="mono" style="margin-top:6px;">ORG, SUPER, USER_HASH</div>
-            <div class="muted" style="margin-top:10px;">Built-in connectors:</div>
-            <div class="mono" style="margin-top:6px;">st_sql(query)</div>
-            <div class="mono">st_read_table(table, limit=50)</div>
-            <div class="mono">st_write_table(table, rows, overwrite_columns=[])</div>
-          </div>
+        <div style="height:10px;"></div>
+
+        <div class="table-responsive">
+          <table class="table table-sm" style="margin-bottom:0;">
+            <thead>
+              <tr>
+                <th style="min-width:240px;">Name</th>
+                <th style="min-width:180px;">Creator</th>
+                <th style="min-width:190px;">Created</th>
+                <th style="min-width:190px;">Updated</th>
+                <th style="min-width:240px;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="nbListBody"></tbody>
+          </table>
+        </div>
+
+        <div id="nbEmpty" class="muted" style="margin-top:12px; display:none;">
+          No notebooks yet. Click <b>+</b> to create one.
         </div>
       </div>
     </div>
+
+    <!-- Snippets pane -->
+    <div id="pane-snippets" class="hidden" style="margin-top:14px;">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><i class="fas fa-wand-magic-sparkles" style="color:#1c96ca;"></i> Snippets</div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnNewSnippet">
+              <i class="fas fa-plus"></i> New snippet
+            </button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="searchbox">
+            <i class="fas fa-magnifying-glass" style="color:#94a3b8;"></i>
+            <input class="form-control form-control-sm" id="snSearch" placeholder="Search snippets by name or content..." />
+          </div>
+        </div>
+
+        <div id="snGrid" class="sn-grid"></div>
+
+        <div id="snEmpty" class="muted" style="margin-top:12px; display:none;">
+          No snippets yet. Click <b>New snippet</b> to create one.
+        </div>
+      </div>
+    </div>
+
+    <!-- Editor pane (shown when an editor tab is active) -->
+    <div id="pane-editor" class="hidden" style="margin-top:14px;">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><i class="fas fa-code" style="color:#1c96ca;"></i> Notebook editor</div>
+          <div class="muted" id="editorStatus"></div>
+        </div>
+
+        <!-- Row 1: Run all / Stop -->
+        <div class="editor-top">
+          <div class="left">
+            <input class="form-control form-control-sm nb-name-input" id="nbEditorName" placeholder="Untitled notebook" />
+            <span class="muted" id="nbEditorMeta"></span>
+          </div>
+          <div class="right">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
+              <i class="fas fa-play"></i> Run All
+            </button>
+            <button type="button" class="btn btn-sm btn-danger-outline" id="btnStop">
+              <i class="fas fa-stop"></i> Stop
+            </button>
+          </div>
+        </div>
+
+        <!-- Row 2: + / delete / search snippets / run -->
+        <div class="editor-subbar">
+          <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCellTop" title="Add cell">
+            <i class="fas fa-plus"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-danger-outline" id="btnDeleteActiveCell" title="Delete active cell">
+            <i class="fas fa-trash"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
+            <i class="fas fa-magnifying-glass"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunActive" title="Run active cell">
+            <i class="fas fa-play"></i>
+          </button>
+
+          <div style="flex:1;"></div>
+
+          <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
+            <i class="fas fa-save"></i> Save
+          </button>
+          <button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab">
+            <i class="fas fa-xmark"></i> Close
+          </button>
+        </div>
+
+        <div id="cells"></div>
+      </div>
+    </div>
   {% endif %}
+</div>
+
+<div class="toast" id="nbToast"></div>
+
+<!-- Modal -->
+<div class="nb-modal" id="nbModal">
+  <div class="card">
+    <div class="head">
+      <div class="title" id="nbModalTitle"><i class="fas fa-pen"></i> Modal</div>
+      <button type="button" class="btn btn-sm btn-danger-outline" id="nbModalClose"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="body" id="nbModalBody"></div>
+    <div class="actions">
+      <button type="button" class="btn btn-sm btn-azure-outline" id="nbModalConfirm"><i class="fas fa-check"></i> Save</button>
+    </div>
+  </div>
 </div>
 
 {% endblock %}
@@ -315,12 +559,20 @@
 {% block body_scripts %}
 <script>
 (function () {
-  // Highlight sidebar item (if present)
   const ln = document.getElementById("link-notebooks");
   if (ln) ln.classList.add("active");
 
-  function enc(v) { return encodeURIComponent(v || ""); }
   function root() { return document.getElementById("nbRoot"); }
+  function enc(v) { return encodeURIComponent(v || ""); }
+  function cssEsc(v) {
+    try { return (window.CSS && CSS.escape) ? CSS.escape(String(v)) : String(v).replace(/[^a-zA-Z0-9_-]/g, '\\$&'); }
+    catch (e) { return String(v || ""); }
+  }
+  function nowISO() { return new Date().toISOString(); }
+  function fmt(ts) {
+    try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts || ""); }
+  }
+
   function currentCtx() {
     const el = root();
     return {
@@ -339,12 +591,22 @@
       .replaceAll("'", "&#039;");
   }
 
-  async function postJSON(url, obj) {
+  function toast(msg) {
+    const el = document.getElementById('nbToast');
+    if (!el) return;
+    el.textContent = String(msg || '');
+    el.style.display = 'block';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { el.style.display = 'none'; }, 1800);
+  }
+
+  async function postJSON(url, obj, signal) {
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(obj || {}),
       credentials: "same-origin",
+      signal,
     });
     const text = await resp.text();
     let js = null;
@@ -356,8 +618,8 @@
     return js;
   }
 
-  async function getJSON(url) {
-    const resp = await fetch(url, { credentials: "same-origin" });
+  async function getJSON(url, signal) {
+    const resp = await fetch(url, { credentials: "same-origin", signal });
     const text = await resp.text();
     let js = null;
     try { js = JSON.parse(text); } catch (e) { js = null; }
@@ -368,230 +630,735 @@
     return js;
   }
 
-  // Notebook persistence (local)
-  function storeKey() {
+  function k(prefix) {
     const { org, sup, userHash } = currentCtx();
-    return `nb:${org}:${sup}:${userHash}:cells`;
-  }
-  function sessionKey() {
-    const { org, sup, userHash } = currentCtx();
-    return `nb:${org}:${sup}:${userHash}:session`;
+    return `nb:${org}:${sup}:${userHash}:${prefix}`;
   }
 
-  function getOrCreateSessionId() {
-    const k = sessionKey();
-    let v = localStorage.getItem(k) || "";
+  function lsGet(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      return JSON.parse(raw);
+    } catch (e) {
+      return fallback;
+    }
+  }
+  function lsSet(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+  }
+
+  function genId(prefix) {
+    const rnd = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (String(Math.random()).slice(2) + Date.now());
+    return `${prefix}_${rnd}`;
+  }
+
+  // -----------------------------
+  // Storage models
+  // -----------------------------
+  function loadNotebooks() {
+    let arr = lsGet(k('notebooks'), null);
+    if (!Array.isArray(arr)) arr = [];
+    return arr;
+  }
+  function saveNotebooks(arr) { lsSet(k('notebooks'), arr || []); }
+
+  function loadSnippets() {
+    let arr = lsGet(k('snippets'), null);
+    if (!Array.isArray(arr) || !arr.length) {
+      arr = [
+        { id:'s_hello', name:'Hello world', code:"print('Hello from SuperTable Notebooks 🚀')", created_at: nowISO(), updated_at: nowISO() },
+        { id:'s_read', name:'Read from table', code:"# returns: (df, status, message)\nres = st_read_table('table_1', limit=10)\nres[0].head()", created_at: nowISO(), updated_at: nowISO() },
+        { id:'s_sql', name:'SQL query', code:"q = \"\"\"select * from table_1 limit 5\"\"\"\nst_sql(q)[0]", created_at: nowISO(), updated_at: nowISO() },
+      ];
+      lsSet(k('snippets'), arr);
+    }
+    return arr;
+  }
+  function saveSnippets(arr) { lsSet(k('snippets'), arr || []); }
+
+  function kernelSessionKey(scopeId) { return k(`kernel_session:${scopeId}`); }
+  function getOrCreateKernelSessionId(scopeId) {
+    const kk = kernelSessionKey(scopeId);
+    let v = String(lsGet(kk, '') || '');
     if (!v) {
       v = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
-      localStorage.setItem(k, v);
+      lsSet(kk, v);
     }
     return v;
   }
 
-  function loadCells() {
-    try {
-      const raw = localStorage.getItem(storeKey());
-      const arr = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(arr) && arr.length) return arr;
-    } catch (e) {}
-    return [{
-      id: (crypto && crypto.randomUUID) ? crypto.randomUUID() : "c1",
-      code: "print('Ready. Try a snippet →')",
-    }];
-  }
-
-  function saveCells(arr) {
-    try { localStorage.setItem(storeKey(), JSON.stringify(arr || [])); } catch (e) {}
-  }
-
+  // -----------------------------
   // UI state
-  let cells = [];
+  // -----------------------------
+  let notebooks = [];
+  let snippets = [];
+  let openDocs = []; // editor tabs: { tab_id, notebook_id|null, name, cells, creator, created_at, updated_at, dirty }
+  let activePane = "list"; // list | snippets | editor
+  let activeTabId = ""; // for editor tabs
   let activeCellId = "";
-  let globalTimerHandle = null;
-  let globalTimerStart = 0;
 
-  function startGlobalTimer() {
-    const box = document.getElementById("nbGlobalTimer");
-    const val = document.getElementById("nbGlobalTimerVal");
-    if (!box || !val) return;
-    if (globalTimerHandle) clearInterval(globalTimerHandle);
-    globalTimerStart = performance.now();
-    box.style.display = "";
-    globalTimerHandle = setInterval(() => {
-      const ms = performance.now() - globalTimerStart;
-      val.textContent = `${(ms / 1000).toFixed(3)}s`;
-    }, 50);
-  }
-  function stopGlobalTimer() {
-    const box = document.getElementById("nbGlobalTimer");
-    if (globalTimerHandle) clearInterval(globalTimerHandle);
-    globalTimerHandle = null;
-    if (box) box.style.display = "none";
+  // run control
+  let stopRequested = false;
+  let activeControllers = [];
+
+  function setPane(pane) {
+    activePane = pane;
+    const listEl = document.getElementById('pane-list');
+    const snEl = document.getElementById('pane-snippets');
+    const edEl = document.getElementById('pane-editor');
+
+    if (listEl) listEl.classList.toggle('hidden', pane !== 'list');
+    if (snEl) snEl.classList.toggle('hidden', pane !== 'snippets');
+    if (edEl) edEl.classList.toggle('hidden', pane !== 'editor');
+
+    // highlight base tabs only when in those panes
+    document.querySelectorAll('#tab-navigation .tab[data-pane]').forEach(t => {
+      const p = t.getAttribute('data-pane');
+      t.classList.toggle('active', (p === pane));
+    });
+    if (pane === 'editor') {
+      // base tabs not active
+      document.querySelectorAll('#tab-navigation .tab[data-pane]').forEach(t => t.classList.remove('active'));
+    }
   }
 
+  function renderOpenTabs() {
+    const wrap = document.getElementById('openTabs');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    openDocs.forEach(doc => {
+      const box = document.createElement('div');
+      box.className = 'tab-doc';
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tab' + (doc.tab_id === activeTabId ? ' active' : '');
+      const dot = doc.dirty ? ' •' : '';
+      btn.innerHTML = `<i class="fas fa-book"></i><span>${escapeHtml(doc.name || 'Untitled')}${dot}</span>`;
+      btn.addEventListener('click', () => activateEditorTab(doc.tab_id));
+
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'tab-close';
+      close.title = 'Close';
+      close.innerHTML = '<i class="fas fa-xmark"></i>';
+      close.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeEditorTab(doc.tab_id);
+      });
+
+      box.appendChild(btn);
+      box.appendChild(close);
+      wrap.appendChild(box);
+    });
+  }
+
+  function renderNotebookList() {
+    const body = document.getElementById('nbListBody');
+    const empty = document.getElementById('nbEmpty');
+    if (!body) return;
+
+    const q = String((document.getElementById('nbSearch') || {}).value || '').trim().toLowerCase();
+    const rows = notebooks.filter(n => {
+      const hay = `${n.name||''} ${n.creator||''}`.toLowerCase();
+      return !q || hay.includes(q);
+    });
+
+    body.innerHTML = '';
+    rows.forEach(n => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><b>${escapeHtml(n.name || 'Untitled')}</b></td>
+        <td class="mono">${escapeHtml(String(n.creator || '').slice(0, 18))}</td>
+        <td>${escapeHtml(fmt(n.created_at))}</td>
+        <td>${escapeHtml(fmt(n.updated_at || n.created_at))}</td>
+        <td>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-act="open"><i class="fas fa-up-right-from-square"></i> Open</button>
+          <button type="button" class="btn btn-sm btn-danger-outline" data-act="delete"><i class="fas fa-trash"></i> Delete</button>
+        </td>
+      `;
+      tr.querySelector('button[data-act="open"]').addEventListener('click', () => openNotebookInTab(n.id));
+      tr.querySelector('button[data-act="delete"]').addEventListener('click', () => deleteNotebook(n.id));
+      body.appendChild(tr);
+    });
+
+    if (empty) empty.style.display = rows.length ? 'none' : '';
+  }
+
+  function deleteNotebook(id) {
+    const nb = notebooks.find(x => x.id === id);
+    const name = nb ? nb.name : 'this notebook';
+    if (!confirm(`Delete ${name}?`)) return;
+
+    notebooks = notebooks.filter(x => x.id !== id);
+    saveNotebooks(notebooks);
+
+    // also close any open tabs for it
+    const toClose = openDocs.filter(d => d.notebook_id === id).map(d => d.tab_id);
+    toClose.forEach(tid => closeEditorTab(tid, { skipConfirm: true }));
+
+    renderNotebookList();
+    toast('Notebook deleted');
+  }
+
+  function openNotebookInTab(id) {
+    const nb = notebooks.find(x => x.id === id);
+    if (!nb) return;
+
+    const existing = openDocs.find(d => d.notebook_id === id);
+    if (existing) {
+      activateEditorTab(existing.tab_id);
+      return;
+    }
+
+    const tab = {
+      tab_id: genId('tab'),
+      notebook_id: nb.id,
+      name: nb.name || 'Untitled',
+      cells: Array.isArray(nb.cells) && nb.cells.length ? nb.cells.map(c => ({ id: c.id || genId('c'), code: c.code || '' })) : [{ id: genId('c'), code: '' }],
+      creator: nb.creator || '',
+      created_at: nb.created_at,
+      updated_at: nb.updated_at || nb.created_at,
+      dirty: false,
+    };
+    openDocs.push(tab);
+    activateEditorTab(tab.tab_id);
+    renderOpenTabs();
+  }
+
+  function activateEditorTab(tabId) {
+    const doc = openDocs.find(d => d.tab_id === tabId);
+    if (!doc) return;
+
+    activeTabId = tabId;
+    activeCellId = (doc.cells && doc.cells[0]) ? doc.cells[0].id : '';
+
+    // show editor and populate fields
+    const name = document.getElementById('nbEditorName');
+    const meta = document.getElementById('nbEditorMeta');
+    if (name) name.value = doc.name || '';
+    if (meta) {
+      const who = doc.creator ? String(doc.creator).slice(0, 18) : '';
+      meta.textContent = `creator: ${who} • created: ${fmt(doc.created_at)}${doc.notebook_id ? '' : ' • (unsaved)'}`;
+    }
+
+    setPane('editor');
+    renderOpenTabs();
+    renderCells();
+  }
+
+  function closeEditorTab(tabId, opts) {
+    const o = opts || {};
+    const doc = openDocs.find(d => d.tab_id === tabId);
+    if (!doc) return;
+
+    if (!o.skipConfirm && doc.dirty) {
+      if (!confirm('This notebook has unsaved changes. Close anyway?')) return;
+    }
+
+    openDocs = openDocs.filter(d => d.tab_id !== tabId);
+
+    if (activeTabId === tabId) {
+      activeTabId = openDocs.length ? openDocs[openDocs.length - 1].tab_id : '';
+      if (activeTabId) activateEditorTab(activeTabId);
+      else setPane('list');
+    }
+
+    renderOpenTabs();
+    toast('Tab closed');
+  }
+
+  function createNewNotebookTab() {
+    const { userHash } = currentCtx();
+    const tab = {
+      tab_id: genId('tab'),
+      notebook_id: null,
+      name: `Untitled ${openDocs.length + 1}`,
+      cells: [{ id: genId('c'), code: "print('Ready. Add a cell or insert a snippet →')" }],
+      creator: userHash || '',
+      created_at: nowISO(),
+      updated_at: nowISO(),
+      dirty: true,
+    };
+    openDocs.push(tab);
+    activateEditorTab(tab.tab_id);
+    renderOpenTabs();
+    toast('New notebook tab opened');
+  }
+
+  function getActiveDoc() {
+    return openDocs.find(d => d.tab_id === activeTabId) || null;
+  }
+
+  // -----------------------------
+  // Editor: cells
+  // -----------------------------
   function createCellEl(cell, idx) {
-    const el = document.createElement("div");
-    el.className = "cell";
+    const el = document.createElement('div');
+    el.className = 'cell';
     el.dataset.id = cell.id;
 
     el.innerHTML = `
       <div class="cell-head">
         <div class="cell-left">
           <span class="mono">In [${idx + 1}]</span>
-          <span class="muted" id="status-${cell.id}"></span>
+          <span class="muted" id="status-${escapeHtml(cell.id)}"></span>
         </div>
         <div class="cell-actions">
-          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run">
-            <i class="fas fa-play"></i> Run
-          </button>
-          <button type="button" class="btn btn-sm btn-azure-outline" data-action="add-below">
-            <i class="fas fa-plus"></i>
-          </button>
-          <button type="button" class="btn btn-sm btn-danger-outline" data-action="delete">
-            <i class="fas fa-trash"></i>
-          </button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run"><i class="fas fa-play"></i> Run</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="add-below" title="Add cell below"><i class="fas fa-plus"></i></button>
+          <button type="button" class="btn btn-sm btn-danger-outline" data-action="delete" title="Delete cell"><i class="fas fa-trash"></i></button>
         </div>
       </div>
       <div class="cell-body">
-        <textarea class="editor mono" spellcheck="false"></textarea>
-        <div class="output mono" id="out-${cell.id}"></div>
+        <textarea class="codebox mono" spellcheck="false"></textarea>
+        <div class="output mono" id="out-${escapeHtml(cell.id)}"></div>
       </div>
     `;
 
-    const ta = el.querySelector("textarea");
+    const ta = el.querySelector('textarea');
     if (ta) {
-      ta.value = cell.code || "";
-      ta.addEventListener("focus", () => { activeCellId = cell.id; });
-      ta.addEventListener("input", () => {
-        const found = cells.find(c => c.id === cell.id);
+      ta.value = cell.code || '';
+      ta.addEventListener('focus', () => { activeCellId = cell.id; });
+      ta.addEventListener('input', () => {
+        const doc = getActiveDoc();
+        if (!doc) return;
+        const found = doc.cells.find(c => c.id === cell.id);
         if (found) found.code = ta.value;
-        saveCells(cells);
+        markDirty(doc);
       });
-      ta.addEventListener("keydown", async (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      ta.addEventListener('keydown', async (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
           e.preventDefault();
           await runCell(cell.id);
         }
       });
     }
 
-    el.addEventListener("click", () => { activeCellId = cell.id; });
+    el.addEventListener('click', () => { activeCellId = cell.id; });
 
-    el.querySelectorAll("button[data-action]").forEach(btn => {
-      btn.addEventListener("click", async (e) => {
+    el.querySelectorAll('button[data-action]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
         e.preventDefault();
-        const action = btn.getAttribute("data-action");
-        if (action === "run") await runCell(cell.id);
-        if (action === "add-below") addCellBelow(cell.id);
-        if (action === "delete") deleteCell(cell.id);
+        const action = btn.getAttribute('data-action');
+        if (action === 'run') await runCell(cell.id);
+        if (action === 'add-below') addCellBelow(cell.id);
+        if (action === 'delete') deleteCell(cell.id);
       });
     });
 
     return el;
   }
 
-  function render() {
-    const wrap = document.getElementById("cells");
-    if (!wrap) return;
-    wrap.innerHTML = "";
-    cells.forEach((c, i) => wrap.appendChild(createCellEl(c, i)));
-    saveCells(cells);
-    if (!activeCellId && cells.length) activeCellId = cells[0].id;
+  function renderCells() {
+    const wrap = document.getElementById('cells');
+    const doc = getActiveDoc();
+    if (!wrap || !doc) return;
+
+    wrap.innerHTML = '';
+    doc.cells.forEach((c, i) => wrap.appendChild(createCellEl(c, i)));
+    if (!activeCellId && doc.cells.length) activeCellId = doc.cells[0].id;
   }
 
   function addCellBelow(id) {
-    const i = cells.findIndex(c => c.id === id);
-    const n = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
-    const item = { id: n, code: "" };
-    if (i >= 0) cells.splice(i + 1, 0, item);
-    else cells.push(item);
+    const doc = getActiveDoc();
+    if (!doc) return;
+    const i = doc.cells.findIndex(c => c.id === id);
+    const item = { id: genId('c'), code: '' };
+    if (i >= 0) doc.cells.splice(i + 1, 0, item);
+    else doc.cells.push(item);
     activeCellId = item.id;
-    render();
-    // focus after render
+    markDirty(doc);
+    renderCells();
     setTimeout(() => {
-      const el = document.querySelector(`.cell[data-id="${CSS.escape(item.id)}"] textarea`);
+      const el = document.querySelector(`.cell[data-id="${cssEsc(item.id)}"] textarea`);
+      if (el) el.focus();
+    }, 30);
+  }
+
+  function addCellEnd() {
+    const doc = getActiveDoc();
+    if (!doc) return;
+    const item = { id: genId('c'), code: '' };
+    doc.cells.push(item);
+    activeCellId = item.id;
+    markDirty(doc);
+    renderCells();
+    setTimeout(() => {
+      const el = document.querySelector(`.cell[data-id="${cssEsc(item.id)}"] textarea`);
       if (el) el.focus();
     }, 30);
   }
 
   function deleteCell(id) {
-    if (cells.length <= 1) return;
-    cells = cells.filter(c => c.id !== id);
-    if (activeCellId === id) activeCellId = cells[0].id;
-    render();
+    const doc = getActiveDoc();
+    if (!doc) return;
+    if (doc.cells.length <= 1) return;
+
+    doc.cells = doc.cells.filter(c => c.id !== id);
+    if (activeCellId === id) activeCellId = doc.cells[0].id;
+    markDirty(doc);
+    renderCells();
   }
 
-  function addCellEnd() {
-    const n = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Math.random()).slice(2);
-    cells.push({ id: n, code: "" });
-    activeCellId = n;
-    render();
-    setTimeout(() => {
-      const el = document.querySelector(`.cell[data-id="${CSS.escape(n)}"] textarea`);
-      if (el) el.focus();
-    }, 30);
+  function deleteActiveCell() {
+    const doc = getActiveDoc();
+    if (!doc) return;
+    if (!activeCellId) return;
+    deleteCell(activeCellId);
   }
 
+  // -----------------------------
+  // Snippet picker / insert
+  // -----------------------------
   function insertSnippet(code) {
-    const id = activeCellId || (cells[0] && cells[0].id) || "";
+    const doc = getActiveDoc();
+    if (!doc) return;
+
+    const id = activeCellId || (doc.cells[0] && doc.cells[0].id) || '';
     if (!id) return;
-    const cell = cells.find(c => c.id === id);
+    const cell = doc.cells.find(c => c.id === id);
     if (!cell) return;
-    const el = document.querySelector(`.cell[data-id="${CSS.escape(id)}"] textarea`);
-    const snippet = String(code || "");
+
+    const el = document.querySelector(`.cell[data-id="${cssEsc(id)}"] textarea`);
+    const snippet = String(code || '');
     if (el) {
       const start = el.selectionStart || 0;
       const end = el.selectionEnd || 0;
       const before = el.value.slice(0, start);
       const after = el.value.slice(end);
-      const join = (before && !before.endsWith("\n")) ? "\n" : "";
-      el.value = before + join + snippet + "\n" + after;
-      el.selectionStart = el.selectionEnd = (before + join + snippet + "\n").length;
+      const join = (before && !before.endsWith('\n')) ? '\n' : '';
+      el.value = before + join + snippet + '\n' + after;
+      el.selectionStart = el.selectionEnd = (before + join + snippet + '\n').length;
       el.focus();
+      cell.code = el.value;
     } else {
-      cell.code = (cell.code || "") + "\n" + snippet + "\n";
+      cell.code = (cell.code || '') + '\n' + snippet + '\n';
     }
-    cell.code = el ? el.value : cell.code;
-    saveCells(cells);
+    markDirty(doc);
   }
 
+  function showModal(title, bodyHtml, onConfirm) {
+    const wrap = document.getElementById('nbModal');
+    const t = document.getElementById('nbModalTitle');
+    const b = document.getElementById('nbModalBody');
+    const c = document.getElementById('nbModalConfirm');
+    const x = document.getElementById('nbModalClose');
+
+    if (!wrap || !t || !b || !c || !x) return;
+
+    t.innerHTML = title || 'Modal';
+    b.innerHTML = bodyHtml || '';
+    wrap.style.display = 'flex';
+
+    const close = () => {
+      wrap.style.display = 'none';
+      c.onclick = null;
+    };
+    x.onclick = close;
+    wrap.onclick = (e) => { if (e.target === wrap) close(); };
+
+    c.onclick = async (e) => {
+      e.preventDefault();
+      try {
+        if (onConfirm) await onConfirm();
+        close();
+      } catch (err) {
+        toast(String(err && err.message ? err.message : err));
+      }
+    };
+  }
+
+  function openSnippetPicker() {
+    const q = `
+      <div class="muted" style="margin-bottom:8px;">Search snippets and click one to insert into the active cell.</div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <input id="pickQ" class="form-control form-control-sm" placeholder="Search..." />
+        <button type="button" class="btn btn-sm btn-azure-outline" id="btnPickNew"><i class="fas fa-plus"></i> New</button>
+      </div>
+      <div style="height:10px;"></div>
+      <div id="pickList" style="display:flex; flex-direction:column; gap:10px;"></div>
+    `;
+    showModal('<i class="fas fa-magnifying-glass"></i> Snippets', q, null);
+
+    const input = document.getElementById('pickQ');
+    const list = document.getElementById('pickList');
+    const btnNew = document.getElementById('btnPickNew');
+
+    function renderPick() {
+      if (!list) return;
+      const qq = String((input || {}).value || '').trim().toLowerCase();
+      const rows = snippets.filter(s => {
+        const hay = `${s.name||''}\n${s.code||''}`.toLowerCase();
+        return !qq || hay.includes(qq);
+      });
+
+      list.innerHTML = '';
+      if (!rows.length) {
+        list.innerHTML = '<div class="muted">No matches.</div>';
+        return;
+      }
+
+      rows.slice(0, 50).forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'sn-card';
+        div.style.cursor = 'pointer';
+        div.innerHTML = `
+          <div class="top">
+            <div>
+              <div class="name"><i class="fas fa-wand-magic-sparkles" style="color:#1c96ca; margin-right:6px;"></i>${escapeHtml(s.name||'Snippet')}</div>
+              <div class="muted" style="margin-top:4px;">${escapeHtml((s.code||'').slice(0, 140))}${(s.code||'').length>140?'…':''}</div>
+            </div>
+            <div>
+              <button type="button" class="btn btn-sm btn-azure-outline" data-act="copy"><i class="fas fa-copy"></i></button>
+            </div>
+          </div>
+        `;
+        div.addEventListener('click', (e) => {
+          // ignore copy button click
+          if (e && e.target && (e.target.closest && e.target.closest('button[data-act="copy"]'))) return;
+          insertSnippet(s.code || '');
+          toast('Inserted snippet');
+        });
+        div.querySelector('button[data-act="copy"]').addEventListener('click', async (e) => {
+          e.preventDefault();
+          await copyToClipboard(String(s.code||''));
+          toast('Copied');
+        });
+        list.appendChild(div);
+      });
+    }
+
+    if (input) input.addEventListener('input', renderPick);
+    if (btnNew) btnNew.addEventListener('click', (e) => { e.preventDefault(); openSnippetModal(); });
+    renderPick();
+    setTimeout(() => { if (input) input.focus(); }, 50);
+  }
+
+  async function copyToClipboard(text) {
+    const t = String(text || '');
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(t);
+        return true;
+      }
+    } catch (e) {}
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    return true;
+  }
+
+  // -----------------------------
+  // Snippets CRUD
+  // -----------------------------
+  function renderSnippets() {
+    const grid = document.getElementById('snGrid');
+    const empty = document.getElementById('snEmpty');
+    if (!grid) return;
+
+    const q = String((document.getElementById('snSearch') || {}).value || '').trim().toLowerCase();
+    const rows = snippets.filter(s => {
+      const hay = `${s.name||''}\n${s.code||''}`.toLowerCase();
+      return !q || hay.includes(q);
+    });
+
+    grid.innerHTML = '';
+    rows.forEach(s => {
+      const card = document.createElement('div');
+      card.className = 'sn-card';
+      card.innerHTML = `
+        <div class="top">
+          <div>
+            <div class="name">${escapeHtml(s.name || 'Snippet')}</div>
+            <div class="muted" style="margin-top:4px;">updated: ${escapeHtml(fmt(s.updated_at || s.created_at))}</div>
+          </div>
+        </div>
+        <pre class="mono">${escapeHtml((s.code || '').slice(0, 900))}${(s.code||'').length>900 ? '\n…' : ''}</pre>
+        <div class="sn-actions">
+          <button type="button" class="btn btn-sm btn-azure-outline" data-act="copy"><i class="fas fa-copy"></i> Copy</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
+          <button type="button" class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
+        </div>
+      `;
+      card.querySelector('button[data-act="copy"]').addEventListener('click', async () => {
+        await copyToClipboard(String(s.code || ''));
+        toast('Copied');
+      });
+      card.querySelector('button[data-act="edit"]').addEventListener('click', () => openSnippetModal(s));
+      card.querySelector('button[data-act="del"]').addEventListener('click', () => deleteSnippet(s.id));
+      grid.appendChild(card);
+    });
+
+    if (empty) empty.style.display = rows.length ? 'none' : '';
+  }
+
+  function deleteSnippet(id) {
+    if (!confirm('Delete this snippet?')) return;
+    snippets = snippets.filter(s => s.id !== id);
+    saveSnippets(snippets);
+    renderSnippets();
+    toast('Snippet deleted');
+  }
+
+  function openSnippetModal(existing) {
+    const s = existing || null;
+    const title = s ? '<i class="fas fa-pen"></i> Edit snippet' : '<i class="fas fa-plus"></i> New snippet';
+    const body = `
+      <div class="form-group" style="margin-bottom:10px;">
+        <label class="muted" style="font-size:12px;">Name</label>
+        <input id="snName" class="form-control form-control-sm" value="${escapeHtml(s ? (s.name||'') : '')}" placeholder="My snippet" />
+      </div>
+      <div class="form-group" style="margin-bottom:10px;">
+        <label class="muted" style="font-size:12px;">Code</label>
+        <textarea id="snCode" class="form-control form-control-sm mono" rows="12" placeholder="print('hello')">${escapeHtml(s ? (s.code||'') : '')}</textarea>
+      </div>
+    `;
+    showModal(title, body, async () => {
+      const name = String((document.getElementById('snName')||{}).value || '').trim();
+      const code = String((document.getElementById('snCode')||{}).value || '').trim();
+      if (!name) throw new Error('Name is required');
+      if (!code) throw new Error('Code is required');
+
+      if (s) {
+        s.name = name;
+        s.code = code;
+        s.updated_at = nowISO();
+        snippets = snippets.map(x => x.id === s.id ? s : x);
+      } else {
+        snippets.unshift({ id: genId('sn'), name, code, created_at: nowISO(), updated_at: nowISO() });
+      }
+      saveSnippets(snippets);
+      renderSnippets();
+      toast('Snippet saved');
+    });
+  }
+
+  // -----------------------------
+  // Save notebook
+  // -----------------------------
+  function markDirty(doc) {
+    doc.dirty = true;
+    doc.updated_at = nowISO();
+    renderOpenTabs();
+  }
+
+  function saveActiveNotebook() {
+    const { userHash } = currentCtx();
+    const doc = getActiveDoc();
+    if (!doc) return;
+
+    const nameVal = String((document.getElementById('nbEditorName')||{}).value || '').trim() || 'Untitled';
+    doc.name = nameVal;
+
+    if (!doc.notebook_id) {
+      // first save: create a new notebook entry
+      const id = genId('nb');
+      const nb = {
+        id,
+        name: doc.name,
+        creator: userHash || doc.creator || '',
+        created_at: doc.created_at || nowISO(),
+        updated_at: nowISO(),
+        cells: doc.cells.map(c => ({ id: c.id, code: c.code })),
+      };
+      notebooks.unshift(nb);
+      saveNotebooks(notebooks);
+
+      doc.notebook_id = id;
+      doc.creator = nb.creator;
+      doc.created_at = nb.created_at;
+      doc.updated_at = nb.updated_at;
+      doc.dirty = false;
+
+      renderNotebookList();
+      activateEditorTab(doc.tab_id);
+      toast('Notebook saved');
+      return;
+    }
+
+    // update existing
+    notebooks = notebooks.map(n => {
+      if (n.id !== doc.notebook_id) return n;
+      return {
+        ...n,
+        name: doc.name,
+        updated_at: nowISO(),
+        cells: doc.cells.map(c => ({ id: c.id, code: c.code })),
+      };
+    });
+    saveNotebooks(notebooks);
+
+    doc.dirty = false;
+    doc.updated_at = nowISO();
+    renderNotebookList();
+    renderOpenTabs();
+    toast('Notebook updated');
+  }
+
+  // -----------------------------
+  // Run cells
+  // -----------------------------
   function setOutput(cellId, ok, stdout, stderr, meta) {
     const box = document.getElementById(`out-${cellId}`);
     if (!box) return;
-    const o = String(stdout || "");
-    const e = String(stderr || "");
-    const m = meta ? String(meta) : "";
+    const o = String(stdout || '');
+    const e = String(stderr || '');
+    const m = meta ? String(meta) : '';
     const has = (o.trim() || e.trim() || m.trim());
-    box.style.display = has ? "" : "none";
-    box.className = "output mono " + (ok ? "ok" : "err");
+    box.style.display = has ? '' : 'none';
+    box.className = 'output mono ' + (ok ? 'ok' : 'err');
     box.innerHTML = `
-      ${m ? `<div class="muted" style="margin-bottom:8px;">${m}</div>` : ""}
-      ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><pre>${escapeHtml(o)}</pre></div>` : ""}
-      ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><pre>${escapeHtml(e)}</pre></div>` : ""}
+      ${m ? `<div class="muted" style="margin-bottom:8px;">${escapeHtml(m)}</div>` : ``}
+      ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><pre>${escapeHtml(o)}</pre></div>` : ``}
+      ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><pre>${escapeHtml(e)}</pre></div>` : ``}
     `;
   }
 
   function setStatus(cellId, txt) {
     const el = document.getElementById(`status-${cellId}`);
-    if (el) el.textContent = txt || "";
+    if (el) el.textContent = txt || '';
+  }
+
+  function stopAllRuns() {
+    stopRequested = true;
+    activeControllers.forEach(c => { try { c.abort(); } catch (e) {} });
+    activeControllers = [];
+    toast('Stopped (client-side)');
+    // allow new runs
+    setTimeout(() => { stopRequested = false; }, 200);
   }
 
   async function runCell(cellId) {
     const { org, sup, userHash } = currentCtx();
-    if (!org || !sup) { alert("Select a tenant first."); return; }
-    if (!userHash) { alert("Missing user hash (session). Please re-login."); return; }
+    if (!org || !sup) { alert('Select a tenant first.'); return; }
+    if (!userHash) { alert('Missing user hash (session). Please re-login.'); return; }
 
-    const cell = cells.find(c => c.id === cellId);
+    const doc = getActiveDoc();
+    if (!doc) return;
+    const cell = doc.cells.find(c => c.id === cellId);
     if (!cell) return;
 
-    const code = String(cell.code || "").trim();
+    const code = String(cell.code || '').trim();
     if (!code) return;
 
-    const sessionId = getOrCreateSessionId();
+    const controller = new AbortController();
+    activeControllers.push(controller);
+
+    const sessionScope = doc.notebook_id || doc.tab_id;
+    const sessionId = getOrCreateKernelSessionId(sessionScope);
+
     const start = performance.now();
-    setStatus(cellId, "running…");
-    setOutput(cellId, true, "", "", "");
-    startGlobalTimer();
+    setStatus(cellId, 'running…');
+    setOutput(cellId, true, '', '', '');
 
     const metaTick = setInterval(() => {
       const ms = performance.now() - start;
@@ -599,20 +1366,24 @@
     }, 60);
 
     try {
-      const created = await postJSON("/reflection/notebooks/jobs", {
+      if (stopRequested) return;
+
+      const created = await postJSON('/reflection/notebooks/jobs', {
         org, sup, user_hash: userHash,
         code,
         session_id: sessionId,
-      });
-      const jobId = created && created.job_id ? String(created.job_id) : "";
-      if (!jobId) throw new Error("Missing job_id");
+      }, controller.signal);
+
+      const jobId = created && created.job_id ? String(created.job_id) : '';
+      if (!jobId) throw new Error('Missing job_id');
 
       while (true) {
-        const js = await getJSON(`/reflection/notebooks/jobs/${enc(jobId)}`);
+        if (stopRequested) return;
+        const js = await getJSON(`/reflection/notebooks/jobs/${enc(jobId)}`, controller.signal);
         const job = js && js.job ? js.job : null;
-        if (!job) throw new Error("Job not found");
-        const st = String(job.status || "");
-        if (st === "queued" || st === "running") {
+        if (!job) throw new Error('Job not found');
+        const st = String(job.status || '');
+        if (st === 'queued' || st === 'running') {
           await new Promise(r => setTimeout(r, 250));
           continue;
         }
@@ -622,70 +1393,116 @@
           ? `Server: ${dur.toFixed(3)} ms • Client: ${(performance.now()-start).toFixed(1)} ms`
           : `Client: ${(performance.now()-start).toFixed(1)} ms`;
 
-        if (st === "done") {
-          setStatus(cellId, "done");
-          setOutput(cellId, true, job.stdout || "", job.stderr || "", meta);
+        if (st === 'done') {
+          setStatus(cellId, 'done');
+          setOutput(cellId, true, job.stdout || '', job.stderr || '', meta);
           break;
         }
-        if (st === "error") {
-          setStatus(cellId, "error");
-          const msg = job.error ? String(job.error) : "Execution failed";
-          const stderr = (job.stderr ? String(job.stderr) : "");
-          setOutput(cellId, false, job.stdout || "", stderr || msg, meta);
+        if (st === 'error') {
+          setStatus(cellId, 'error');
+          const msg = job.error ? String(job.error) : 'Execution failed';
+          const stderr = (job.stderr ? String(job.stderr) : '');
+          setOutput(cellId, false, job.stdout || '', stderr || msg, meta);
           break;
         }
-        // unknown status
         setStatus(cellId, st);
         break;
       }
     } catch (e) {
-      setStatus(cellId, "error");
-      setOutput(cellId, false, "", String(e && e.message ? e.message : e), "");
+      if (String(e && e.name) === 'AbortError') {
+        setStatus(cellId, 'stopped');
+        setOutput(cellId, false, '', 'Stopped (client-side)', '');
+      } else {
+        setStatus(cellId, 'error');
+        setOutput(cellId, false, '', String(e && e.message ? e.message : e), '');
+      }
     } finally {
       clearInterval(metaTick);
-      stopGlobalTimer();
+      activeControllers = activeControllers.filter(x => x !== controller);
     }
   }
 
+  async function runActiveCell() {
+    const doc = getActiveDoc();
+    if (!doc) return;
+    const id = activeCellId || (doc.cells[0] && doc.cells[0].id) || '';
+    if (!id) return;
+    await runCell(id);
+  }
+
   async function runAll() {
-    for (const c of cells) {
-      const code = String(c.code || "").trim();
+    const doc = getActiveDoc();
+    if (!doc) return;
+    for (const c of doc.cells) {
+      if (stopRequested) return;
+      const code = String(c.code || '').trim();
       if (code) await runCell(c.id);
     }
   }
 
-  async function resetKernel() {
-    const { org, sup, userHash } = currentCtx();
-    if (!org || !sup || !userHash) return;
-    const sessionId = getOrCreateSessionId();
-    try {
-      await postJSON("/reflection/notebooks/kernel/reset", { org, sup, user_hash: userHash, session_id: sessionId });
-      // Clear outputs
-      cells.forEach(c => {
-        setStatus(c.id, "");
-        setOutput(c.id, true, "", "", "");
+  // -----------------------------
+  // Wire UI
+  // -----------------------------
+  function wireBaseTabs() {
+    document.querySelectorAll('#tab-navigation .tab[data-pane]').forEach(t => {
+      t.addEventListener('click', () => {
+        const p = t.getAttribute('data-pane');
+        if (!p) return;
+        setPane(p);
       });
-    } catch (e) {
-      alert(String(e && e.message ? e.message : e));
+    });
+
+    const btnNew = document.getElementById('btnNewNotebook');
+    if (btnNew) btnNew.addEventListener('click', createNewNotebookTab);
+
+    const btnRefresh = document.getElementById('btnRefreshList');
+    if (btnRefresh) btnRefresh.addEventListener('click', () => { notebooks = loadNotebooks(); renderNotebookList(); });
+
+    const nbSearch = document.getElementById('nbSearch');
+    if (nbSearch) nbSearch.addEventListener('input', renderNotebookList);
+
+    const snSearch = document.getElementById('snSearch');
+    if (snSearch) snSearch.addEventListener('input', renderSnippets);
+
+    const btnNewSnippet = document.getElementById('btnNewSnippet');
+    if (btnNewSnippet) btnNewSnippet.addEventListener('click', () => openSnippetModal(null));
+
+    const btnAddCellTop = document.getElementById('btnAddCellTop');
+    if (btnAddCellTop) btnAddCellTop.addEventListener('click', addCellEnd);
+
+    const btnDelActive = document.getElementById('btnDeleteActiveCell');
+    if (btnDelActive) btnDelActive.addEventListener('click', deleteActiveCell);
+
+    const btnPick = document.getElementById('btnSnippetPicker');
+    if (btnPick) btnPick.addEventListener('click', openSnippetPicker);
+
+    const btnRunA = document.getElementById('btnRunActive');
+    if (btnRunA) btnRunA.addEventListener('click', runActiveCell);
+
+    const btnRunAll = document.getElementById('btnRunAll');
+    if (btnRunAll) btnRunAll.addEventListener('click', runAll);
+
+    const btnStop = document.getElementById('btnStop');
+    if (btnStop) btnStop.addEventListener('click', stopAllRuns);
+
+    const btnSave = document.getElementById('btnSaveNotebook');
+    if (btnSave) btnSave.addEventListener('click', saveActiveNotebook);
+
+    const btnClose = document.getElementById('btnCloseTab');
+    if (btnClose) btnClose.addEventListener('click', () => closeEditorTab(activeTabId));
+
+    const nameInput = document.getElementById('nbEditorName');
+    if (nameInput) {
+      nameInput.addEventListener('input', () => {
+        const doc = getActiveDoc();
+        if (!doc) return;
+        doc.name = String(nameInput.value || '');
+        markDirty(doc);
+      });
     }
   }
 
-  function wireSnippets() {
-    document.querySelectorAll(".snippet[data-snippet]").forEach(s => {
-      s.addEventListener("click", () => insertSnippet(s.getAttribute("data-snippet")));
-    });
-  }
-
-  const btnAdd = document.getElementById("btnAddCell");
-  if (btnAdd) btnAdd.addEventListener("click", addCellEnd);
-
-  const btnRunAll = document.getElementById("btnRunAll");
-  if (btnRunAll) btnRunAll.addEventListener("click", runAll);
-
-  const btnReset = document.getElementById("btnResetKernel");
-  if (btnReset) btnReset.addEventListener("click", resetKernel);
-
-  // Cross-page tenant change (match ingestion pattern)
+  // Tenant change: redirect and keep on notebooks page
   window.addEventListener("supertable-changed", function(e) {
     const detail = (e && e.detail) ? e.detail : {};
     const org = detail.org || "";
@@ -698,9 +1515,15 @@
   });
 
   // Init
-  cells = loadCells();
-  render();
-  wireSnippets();
+  notebooks = loadNotebooks();
+  snippets = loadSnippets();
+
+  wireBaseTabs();
+  renderOpenTabs();
+  renderNotebookList();
+  renderSnippets();
+  setPane('list');
+
 })();
 </script>
 {% endblock %}

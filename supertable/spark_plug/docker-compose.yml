@@ -1,0 +1,19 @@
+services:
+  spark-master:
+    image: docker.io/bitnamilegacy/spark:3.5.1
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    ports:
+      - "8080:8080" # Master Web UI
+      - "7077:7077" # Master Port (This is what your Python code connects to)
+
+  spark-worker:
+    image: docker.io/bitnamilegacy/spark:3.5.1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=1
+      - SPARK_WORKER_MEMORY=1G
+    depends_on:
+      - spark-master

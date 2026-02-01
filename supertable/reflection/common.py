@@ -730,10 +730,66 @@ router = APIRouter()
 # --- Reflection root redirect (NEW) ---
 @router.get("/reflection", include_in_schema=False)
 async def reflection_root_redirect() -> RedirectResponse:
-    # Keep /reflection landing stable and explicit
-    return RedirectResponse(url="/reflection/admin", status_code=302)
+    # Default landing page
+    return RedirectResponse(url="/reflection/home", status_code=302)
 
 templates = Jinja2Templates(directory=settings.TEMPLATES_DIR)
+@router.get("/reflection/home", response_class=HTMLResponse)
+def home_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    if not _is_authorized(request):
+        resp = RedirectResponse("/reflection/login", status_code=302)
+        _no_store(resp)
+        return resp
+
+    provided = _get_provided_token(request) or ""
+    pairs = discover_pairs()
+    sel_org, sel_sup = resolve_pair(org, sup)
+    tenants = [{"org": o, "sup": s, "selected": bool(o == sel_org and s == sel_sup)} for o, s in pairs]
+
+    # Lightweight stats (best-effort)
+    try:
+        supertables = len({s for o, s in pairs if o})
+    except Exception:
+        supertables = None
+
+    tables = None  # intentionally not computed here (may be expensive)
+
+    connectors = None
+    pools = None
+    try:
+        state_dir = Path(os.getenv("SUPERTABLE_REFLECTION_STATE_DIR", "/tmp/supertable_reflection"))
+        c_dir = state_dir / "connectors"
+        p_dir = state_dir / "compute_pools"
+        connectors = len(list(c_dir.glob("*.json"))) if c_dir.exists() else 0
+        pools = len(list(p_dir.glob("*.json"))) if p_dir.exists() else 0
+    except Exception:
+        pass
+
+    ctx: Dict[str, Any] = {
+        "request": request,
+        "authorized": True,
+        "token": provided,
+        "tenants": tenants,
+        "sel_org": sel_org,
+        "sel_sup": sel_sup,
+        "has_tenant": bool(sel_org and sel_sup),
+        "stats": {
+            "supertables": supertables,
+            "tables": tables,
+            "connectors": connectors,
+            "pools": pools,
+        },
+    }
+    inject_session_into_ctx(ctx, request)
+
+    resp = templates.TemplateResponse("home.html", ctx)
+    _no_store(resp)
+    return resp
+
 
 
 @router.get("/favicon.ico", include_in_schema=False)
@@ -903,7 +959,7 @@ def admin_login(
         username_eff = "superuser"
         user_hash = settings.SUPERTABLE_SUPERHASH
 
-        resp = RedirectResponse(url="/reflection/admin", status_code=302)
+        resp = RedirectResponse(url="/reflection/home", status_code=302)
         resp.set_cookie(
             _ADMIN_COOKIE_NAME,
             provided,
@@ -934,7 +990,7 @@ def admin_login(
         return _render_login(request, message="Invalid token.", clear_cookie=True)
 
     user_hash = _user_hash(org, username)
-    resp = RedirectResponse(url="/reflection/admin", status_code=302)
+    resp = RedirectResponse(url="/reflection/home", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _set_session_cookie(resp, {"org": org, "username": username, "user_hash": user_hash, "is_superuser": False})
@@ -2151,4 +2207,41 @@ attach_notebook_routes(
     logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
 )
+# ---------------------------------------------------------------------------
+# Connectors UI + API routes
+# ---------------------------------------------------------------------------
 
+from supertable.reflection.connectors import attach_connectors_routes  # noqa: E402
+
+attach_connectors_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+)
+
+
+# ---------------------------------------------------------------------------
+# Compute Pools UI + API routes
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.compute_pools import attach_compute_pools_routes  # noqa: E402
+
+attach_compute_pools_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+)

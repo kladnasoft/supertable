@@ -1,0 +1,507 @@
+{% extends "base.html" %}
+
+{% block title %}Connectors{% endblock %}
+
+{% block head_extra %}
+<style>
+  .muted { color:#64748b; font-size: 12px; }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  .root {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    padding: 24px 28px;
+    border: 1px solid rgba(0,0,0,0.05);
+    border-left: 5px solid #1c96ca;
+  }
+
+  .title { font-size: 18px; font-weight: 900; color:#0f172a; }
+
+  .panel {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    background: #fff;
+    padding: 14px 14px;
+  }
+  .panel + .panel { margin-top: 12px; }
+  .panel-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .panel-title {
+    font-weight: 900;
+    color:#0f172a;
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .btn-azure-outline {
+    border: 1px solid #1c96ca;
+    background: transparent;
+    color: #1c96ca;
+    font-weight: 600;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-azure-outline:hover { background: #1c96ca; color: #ffffff; }
+
+  .btn-danger-outline {
+    border: 1px solid rgba(239,68,68,0.75);
+    background: transparent;
+    color: rgba(239,68,68,0.9);
+    font-weight: 700;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+  .btn-danger-outline:hover { background: rgba(239,68,68,0.9); color:#fff; }
+
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+  @media (max-width: 980px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .card {
+    border: 1px solid rgba(15,23,42,.10);
+    border-radius: 16px;
+    background:#fff;
+    padding: 12px;
+  }
+
+  pre {
+    margin: 10px 0 0 0;
+    padding: 10px 10px;
+    border-radius: 14px;
+    background: rgba(248,250,252,.9);
+    border: 1px solid rgba(15,23,42,.10);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+
+  .toast {
+    position: fixed;
+    right: 18px;
+    top: 16px;
+    z-index: 5000;
+    background: rgba(15,23,42,0.92);
+    color: #fff;
+    border-radius: 14px;
+    padding: 10px 12px;
+    font-size: 12px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.22);
+    display:none;
+    max-width: min(520px, calc(100vw - 36px));
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% include "selection.html" %}
+<div style="height: 18px;"></div>
+
+<div id="root" class="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" data-user-hash="{{ session_user_hash }}">
+  <div>
+    <div class="title">Connectors</div>
+    <div class="muted" style="margin-top:4px;">
+      Airbyte connector discovery + creation helper. This page proxies Airbyte API calls server-side to avoid CORS.
+    </div>
+  </div>
+
+  {% if not has_tenant %}
+    <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
+  {% else %}
+    <div class="panel" style="margin-top:14px;">
+      <div class="panel-head">
+        <div class="panel-title"><i class="fas fa-plug" style="color:#1c96ca;"></i> Airbyte connection</div>
+        <div class="muted" id="pyairbyteStatus"></div>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <div class="muted" style="margin-bottom:6px;">Airbyte base URL</div>
+          <input class="form-control form-control-sm" id="abBaseUrl" placeholder="http://airbyte:8000" />
+          <div class="muted" style="margin-top:8px;">
+            Expected endpoints: <span class="mono">/api/v1/workspaces/list</span>, <span class="mono">/api/v1/source_definitions/list</span> …
+          </div>
+        </div>
+        <div>
+          <div class="muted" style="margin-bottom:6px;">Workspace</div>
+          <select class="form-control form-control-sm" id="abWorkspace"></select>
+          <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-azure-outline" id="btnLoadWorkspaces"><i class="fas fa-rotate"></i> Load workspaces</button>
+            <button class="btn btn-sm btn-azure-outline" id="btnLoadDefs"><i class="fas fa-list"></i> Load connector defs</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid2" style="margin-top:12px;">
+        <div class="card">
+          <div class="panel-title"><i class="fas fa-arrow-right-to-bracket" style="color:#1c96ca;"></i> Create Source</div>
+          <div class="muted" style="margin-top:6px;">Pick a source definition and paste its config JSON.</div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Source definition</div>
+            <select class="form-control form-control-sm" id="srcDef"></select>
+          </div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Name</div>
+            <input class="form-control form-control-sm" id="srcName" placeholder="my-source" />
+          </div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Connection configuration (JSON)</div>
+            <textarea class="form-control form-control-sm mono" id="srcCfg" rows="10" placeholder='{"host":"...","port":5432,"database":"..."}'></textarea>
+          </div>
+
+          <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-azure-outline" id="btnCreateSource"><i class="fas fa-plus"></i> Create in Airbyte</button>
+            <button class="btn btn-sm btn-azure-outline" id="btnSaveSource"><i class="fas fa-save"></i> Save (SuperTable)</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="panel-title"><i class="fas fa-arrow-right-from-bracket" style="color:#1c96ca;"></i> Create Destination</div>
+          <div class="muted" style="margin-top:6px;">Pick a destination definition and paste its config JSON.</div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Destination definition</div>
+            <select class="form-control form-control-sm" id="dstDef"></select>
+          </div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Name</div>
+            <input class="form-control form-control-sm" id="dstName" placeholder="my-destination" />
+          </div>
+
+          <div style="margin-top:10px;">
+            <div class="muted" style="margin-bottom:6px;">Connection configuration (JSON)</div>
+            <textarea class="form-control form-control-sm mono" id="dstCfg" rows="10" placeholder='{"destination_path":"..."}'></textarea>
+          </div>
+
+          <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-azure-outline" id="btnCreateDest"><i class="fas fa-plus"></i> Create in Airbyte</button>
+            <button class="btn btn-sm btn-azure-outline" id="btnSaveDest"><i class="fas fa-save"></i> Save (SuperTable)</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top:12px;">
+        Quick templates (paste into JSON config fields):
+      </div>
+
+      <div class="grid2" style="margin-top:10px;">
+        <div class="card">
+          <div class="panel-title"><i class="fas fa-database" style="color:#1c96ca;"></i> Postgres (source)</div>
+          <pre class="mono">{
+  "host": "postgres",
+  "port": 5432,
+  "database": "db",
+  "username": "user",
+  "password": "pass",
+  "ssl_mode": { "mode": "disable" }
+}</pre>
+        </div>
+
+        <div class="card">
+          <div class="panel-title"><i class="fas fa-cloud" style="color:#1c96ca;"></i> S3 / MinIO (destination)</div>
+          <pre class="mono">{
+  "s3_bucket_name": "bucket",
+  "s3_bucket_path": "path/prefix",
+  "s3_region": "us-east-1",
+  "s3_endpoint": "http://minio:9000",
+  "access_key_id": "minio",
+  "secret_access_key": "minio123",
+  "s3_path_style_access": true
+}</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title"><i class="fas fa-floppy-disk" style="color:#1c96ca;"></i> Saved connectors (SuperTable)</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button class="btn btn-sm btn-azure-outline" id="btnLoadSaved"><i class="fas fa-rotate"></i> Refresh</button>
+        </div>
+      </div>
+      <div id="savedList" style="margin-top:10px; display:flex; flex-direction:column; gap:10px;"></div>
+      <div id="savedEmpty" class="muted" style="display:none; margin-top:10px;">No saved connectors yet.</div>
+    </div>
+  {% endif %}
+</div>
+
+<div class="toast" id="toast"></div>
+
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+(function () {
+  const ln = document.getElementById("link-connectors");
+  if (ln) ln.classList.add("active");
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = String(msg || '');
+    el.style.display = 'block';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { el.style.display = 'none'; }, 1800);
+  }
+
+  function root() { return document.getElementById('root'); }
+  function ctx() {
+    const r = root();
+    return {
+      org: r ? (r.dataset.org || '') : '',
+      sup: r ? (r.dataset.sup || '') : '',
+      userHash: r ? (r.dataset.userHash || '') : '',
+    };
+  }
+
+  async function postJSON(url, obj) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(obj || {}),
+      credentials: "same-origin",
+    });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  async function getJSON(url) {
+    const resp = await fetch(url, { credentials: "same-origin" });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  function baseUrl() { return String((document.getElementById('abBaseUrl')||{}).value || '').trim(); }
+
+  function parseJsonOrThrow(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return {};
+    try { return JSON.parse(s); } catch (e) { throw new Error('Invalid JSON: ' + e.message); }
+  }
+
+  function fillSelect(sel, items, labelFn, valueFn) {
+    if (!sel) return;
+    sel.innerHTML = '';
+    (items || []).forEach(it => {
+      const opt = document.createElement('option');
+      opt.value = valueFn(it);
+      opt.textContent = labelFn(it);
+      sel.appendChild(opt);
+    });
+  }
+
+  async function loadPyAirbyteStatus() {
+    try {
+      const js = await getJSON('/reflection/connectors/pyairbyte/status');
+      const el = document.getElementById('pyairbyteStatus');
+      if (!el) return;
+      if (js && js.installed) el.textContent = 'PyAirbyte: installed';
+      else el.textContent = 'PyAirbyte: not installed (optional) • pip install pyairbyte';
+    } catch (e) {}
+  }
+
+  async function loadWorkspaces() {
+    const url = baseUrl();
+    if (!url) return toast('Set Airbyte base URL first');
+    const js = await postJSON('/reflection/connectors/airbyte/workspaces/list', { base_url: url });
+    const wss = (js && (js.workspaces || js.data || js.items)) ? (js.workspaces || js.data || js.items) : (js.workspaces || []);
+    const sel = document.getElementById('abWorkspace');
+    fillSelect(sel, wss, (w) => (w.name ? w.name : (w.workspaceId || w.workspace_id || 'workspace')), (w) => (w.workspaceId || w.workspace_id || w.id || ''));
+    toast('Workspaces loaded');
+  }
+
+  async function loadDefs() {
+    const url = baseUrl();
+    if (!url) return toast('Set Airbyte base URL first');
+
+    const src = await postJSON('/reflection/connectors/airbyte/source_definitions/list', { base_url: url });
+    const dst = await postJSON('/reflection/connectors/airbyte/destination_definitions/list', { base_url: url });
+
+    const srcDefs = (src && (src.sourceDefinitions || src.source_definitions || src.data)) ? (src.sourceDefinitions || src.source_definitions || src.data) : [];
+    const dstDefs = (dst && (dst.destinationDefinitions || dst.destination_definitions || dst.data)) ? (dst.destinationDefinitions || dst.destination_definitions || dst.data) : [];
+
+    const ssel = document.getElementById('srcDef');
+    const dsel = document.getElementById('dstDef');
+
+    fillSelect(ssel, srcDefs,
+      (d) => `${d.name || 'source'} (${(d.sourceDefinitionId || d.source_definition_id || '').slice(0,8)})`,
+      (d) => (d.sourceDefinitionId || d.source_definition_id || '')
+    );
+    fillSelect(dsel, dstDefs,
+      (d) => `${d.name || 'destination'} (${(d.destinationDefinitionId || d.destination_definition_id || '').slice(0,8)})`,
+      (d) => (d.destinationDefinitionId || d.destination_definition_id || '')
+    );
+    toast('Connector definitions loaded');
+  }
+
+  async function createSourceInAirbyte() {
+    const url = baseUrl();
+    if (!url) return toast('Set Airbyte base URL first');
+    const ws = String((document.getElementById('abWorkspace')||{}).value || '').trim();
+    const def = String((document.getElementById('srcDef')||{}).value || '').trim();
+    const name = String((document.getElementById('srcName')||{}).value || '').trim() || 'source';
+    const cfg = parseJsonOrThrow((document.getElementById('srcCfg')||{}).value || '');
+
+    const js = await postJSON('/reflection/connectors/airbyte/sources/create', {
+      base_url: url,
+      workspaceId: ws,
+      sourceDefinitionId: def,
+      name,
+      connectionConfiguration: cfg,
+    });
+    toast('Source created in Airbyte');
+    console.log(js);
+  }
+
+  async function createDestInAirbyte() {
+    const url = baseUrl();
+    if (!url) return toast('Set Airbyte base URL first');
+    const ws = String((document.getElementById('abWorkspace')||{}).value || '').trim();
+    const def = String((document.getElementById('dstDef')||{}).value || '').trim();
+    const name = String((document.getElementById('dstName')||{}).value || '').trim() || 'destination';
+    const cfg = parseJsonOrThrow((document.getElementById('dstCfg')||{}).value || '');
+
+    const js = await postJSON('/reflection/connectors/airbyte/destinations/create', {
+      base_url: url,
+      workspaceId: ws,
+      destinationDefinitionId: def,
+      name,
+      connectionConfiguration: cfg,
+    });
+    toast('Destination created in Airbyte');
+    console.log(js);
+  }
+
+  async function saveConnector(kind) {
+    const { org, sup, userHash } = ctx();
+    const url = baseUrl();
+
+    const ws = String((document.getElementById('abWorkspace')||{}).value || '').trim();
+    if (!ws) return toast('Select workspace first');
+
+    let name = '';
+    let defId = '';
+    let cfg = {};
+    if (kind === 'source') {
+      name = String((document.getElementById('srcName')||{}).value || '').trim() || 'source';
+      defId = String((document.getElementById('srcDef')||{}).value || '').trim();
+      cfg = parseJsonOrThrow((document.getElementById('srcCfg')||{}).value || '');
+    } else {
+      name = String((document.getElementById('dstName')||{}).value || '').trim() || 'destination';
+      defId = String((document.getElementById('dstDef')||{}).value || '').trim();
+      cfg = parseJsonOrThrow((document.getElementById('dstCfg')||{}).value || '');
+    }
+
+    const item = {
+      id: `${kind}_${Date.now()}`,
+      kind,
+      name,
+      base_url: url,
+      workspaceId: ws,
+      definitionId: defId,
+      connectionConfiguration: cfg,
+      created_at: new Date().toISOString(),
+      creator: userHash || '',
+    };
+
+    await postJSON('/reflection/connectors/saved/upsert', { org, sup, item });
+    toast('Saved in SuperTable');
+    await loadSaved();
+  }
+
+  function esc(s) {
+    return String(s||'')
+      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
+  async function loadSaved() {
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/connectors/saved?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    const items = js && js.data && Array.isArray(js.data.items) ? js.data.items : [];
+    const wrap = document.getElementById('savedList');
+    const empty = document.getElementById('savedEmpty');
+    if (!wrap) return;
+
+    wrap.innerHTML = '';
+    items.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'card';
+      div.innerHTML = `
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+          <div>
+            <div style="font-weight:900; color:#0f172a;">${esc(it.name || 'connector')} <span class="muted">(${esc(it.kind || '')})</span></div>
+            <div class="muted" style="margin-top:4px;">workspace: <span class="mono">${esc(it.workspaceId || '')}</span> • def: <span class="mono">${esc((it.definitionId||'').slice(0,10))}</span></div>
+          </div>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-azure-outline" data-act="copy"><i class="fas fa-copy"></i> Copy JSON</button>
+            <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
+          </div>
+        </div>
+        <pre class="mono">${esc(JSON.stringify(it.connectionConfiguration || {}, null, 2))}</pre>
+      `;
+
+      div.querySelector('button[data-act="copy"]').addEventListener('click', async () => {
+        await navigator.clipboard.writeText(JSON.stringify(it, null, 2));
+        toast('Copied');
+      });
+      div.querySelector('button[data-act="del"]').addEventListener('click', async () => {
+        if (!confirm('Delete saved connector?')) return;
+        await fetch(`/reflection/connectors/saved/${encodeURIComponent(it.id)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`, { method:'DELETE', credentials:'same-origin' });
+        toast('Deleted');
+        await loadSaved();
+      });
+
+      wrap.appendChild(div);
+    });
+
+    if (empty) empty.style.display = items.length ? 'none' : '';
+  }
+
+  const btnWs = document.getElementById('btnLoadWorkspaces');
+  if (btnWs) btnWs.addEventListener('click', (e) => { e.preventDefault(); loadWorkspaces().catch(err => toast(err.message)); });
+
+  const btnDefs = document.getElementById('btnLoadDefs');
+  if (btnDefs) btnDefs.addEventListener('click', (e) => { e.preventDefault(); loadDefs().catch(err => toast(err.message)); });
+
+  const btnCS = document.getElementById('btnCreateSource');
+  if (btnCS) btnCS.addEventListener('click', (e) => { e.preventDefault(); createSourceInAirbyte().catch(err => toast(err.message)); });
+
+  const btnCD = document.getElementById('btnCreateDest');
+  if (btnCD) btnCD.addEventListener('click', (e) => { e.preventDefault(); createDestInAirbyte().catch(err => toast(err.message)); });
+
+  const btnSS = document.getElementById('btnSaveSource');
+  if (btnSS) btnSS.addEventListener('click', (e) => { e.preventDefault(); saveConnector('source').catch(err => toast(err.message)); });
+
+  const btnSD = document.getElementById('btnSaveDest');
+  if (btnSD) btnSD.addEventListener('click', (e) => { e.preventDefault(); saveConnector('destination').catch(err => toast(err.message)); });
+
+  const btnSaved = document.getElementById('btnLoadSaved');
+  if (btnSaved) btnSaved.addEventListener('click', (e) => { e.preventDefault(); loadSaved().catch(err => toast(err.message)); });
+
+  loadPyAirbyteStatus();
+  loadSaved().catch(() => {});
+})();
+</script>
+{% endblock %}
