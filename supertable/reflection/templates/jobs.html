@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+
+{% block title %}Jobs{% endblock %}
+
+{% block head_extra %}
+<style>
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+    }
+
+    .jobs-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #e5e7eb;
+      padding-bottom: 12px;
+      margin-bottom: 20px;
+    }
+
+    .jobs-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-color);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .metric-card {
+      display: flex;
+      align-items: center;
+      padding: 16px;
+      border-radius: 12px;
+      background: #fff;
+      border: 1px solid var(--panel-border);
+      transition: box-shadow 0.2s;
+    }
+
+    .metric-icon {
+      width: 40px; height: 40px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--primary-light);
+      color: var(--primary-color);
+      margin-right: 12px;
+    }
+
+    .job-status-pill {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+    }
+    .status-running { background: #dcfce7; color: #166534; }
+    .status-idle { background: #f3f4f6; color: #374151; }
+
+    .schedule-form {
+        background: #f8fafc;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        padding: 20px;
+        margin-top: 20px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+{% include "selection.html" %}
+
+<div class="card" style="margin-top:20px;">
+    <div class="section">
+        <div class="jobs-header">
+            <div class="jobs-title">
+                <i class="fas fa-clock" style="color:var(--primary-color);"></i>
+                <span>Notebook Scheduler</span>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnNewJob">
+                <i class="fas fa-plus"></i> New Scheduled Job
+            </button>
+        </div>
+
+        <div class="row mb-4">
+            <div class="col-md-4">
+                <div class="metric-card">
+                    <div class="metric-icon"><i class="fas fa-play"></i></div>
+                    <div>
+                        <div class="text-xs muted">Active Jobs</div>
+                        <div class="font-weight-bold">0</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="metric-card">
+                    <div class="metric-icon"><i class="fas fa-history"></i></div>
+                    <div>
+                        <div class="text-xs muted">Last 24h Runs</div>
+                        <div class="font-weight-bold">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="table-responsive">
+            <table class="table table-sm" id="jobsTable">
+                <thead>
+                    <tr>
+                        <th>Job Name</th>
+                        <th>Notebook</th>
+                        <th>Schedule</th>
+                        <th>Last Run</th>
+                        <th>Status</th>
+                        <th class="text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="jobsBody">
+                    <tr>
+                        <td colspan="6" class="text-center muted py-4">No scheduled jobs found.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Scheduler Modal -->
+<div class="modal fade" id="jobModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Schedule Notebook</h5>
+        <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+            <label class="text-xs font-weight-bold">Job Name</label>
+            <input type="text" class="form-control form-control-sm" placeholder="Nightly Cleanup">
+        </div>
+        <div class="form-group">
+            <label class="text-xs font-weight-bold">Select Notebook</label>
+            <select class="form-control form-control-sm" id="notebookSelect">
+                <option>Loading notebooks...</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label class="text-xs font-weight-bold">Schedule (Cron Expression)</label>
+            <input type="text" class="form-control form-control-sm" placeholder="0 0 * * *">
+            <small class="text-muted">Example: 0 0 * * * (Every day at midnight)</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary btn-sm" data-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary btn-sm">Save Job</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+    $(document).ready(function() {
+        $("#link-jobs").addClass("active");
+
+        $("#btnNewJob").on("click", function() {
+            $('#jobModal').modal('show');
+            loadNotebookOptions();
+        });
+
+        function loadNotebookOptions() {
+            // Logic to fetch notebooks from LocalStorage as per lab.html pattern
+            const org = "{{ sel_org }}";
+            const sup = "{{ sel_sup }}";
+            const userHash = "{{ session_user_hash }}";
+            const key = `nb:${org}:${sup}:${userHash}:notebooks`;
+            
+            let notebooks = [];
+            try {
+                notebooks = JSON.parse(localStorage.getItem(key)) || [];
+            } catch(e) {}
+
+            const select = $("#notebookSelect");
+            select.empty();
+            if (notebooks.length === 0) {
+                select.append('<option disabled>No notebooks found in Studio</option>');
+            } else {
+                notebooks.forEach(nb => {
+                    select.append(`<option value="${nb.id}">${nb.name}</option>`);
+                });
+            }
+        }
+    });
+</script>
+{% endblock %}

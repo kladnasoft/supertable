@@ -143,6 +143,25 @@
     outline: none;
     box-shadow: 0 0 0 2px rgba(28,150,202,0.1);
   }
+
+  /* Tabs (Source / Destination / Vault) */
+  .tabs-bar {
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 10px 0 16px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(15,23,42,.08);
+  }
+  .pill.tab-btn { cursor:pointer; user-select:none; }
+  .pill.tab-btn.active {
+    background: rgba(28,150,202,0.10);
+    border-color: #1c96ca;
+    color: #1c96ca;
+    font-weight: 700;
+  }
+
 </style>
 {% endblock %}
 
@@ -159,6 +178,14 @@
       </div>
     </div>
   </div>
+  <div class="tabs-bar" id="connectorsTabs">
+    <span class="pill tab-btn active" data-tab="source"><i class="fas fa-sign-in-alt" style="margin-right:6px;"></i>Source</span>
+    <span class="pill tab-btn" data-tab="destination"><i class="fas fa-sign-out-alt" style="margin-right:6px;"></i>Destination</span>
+    <span class="pill tab-btn" data-tab="vault"><i class="fas fa-lock" style="margin-right:6px;"></i>Vault</span>
+    <span style="flex:1;"></span>
+    <span class="muted" id="connectorsTabHint"></span>
+  </div>
+
 
   {% if not has_tenant %}
     <div class="card" style="text-align: center; padding: 40px;">
@@ -166,6 +193,7 @@
       <div style="color:#64748b; font-weight: 500;">Select a tenant to manage connectors.</div>
     </div>
   {% else %}
+    <div id="connectorsMain">
     <div class="panel">
       <div class="panel-head">
         <div class="panel-title"><i class="fas fa-terminal" style="color:#1c96ca;"></i> PyAirbyte (Notebook Ready)</div>
@@ -259,7 +287,7 @@
         </div>
 
         <div class="grid2" style="margin-top:16px;">
-          <div class="card">
+          <div class="card" id="abSourceCard">
             <div class="panel-title" style="margin-bottom:12px;"><i class="fas fa-sign-in-alt"></i> New Source</div>
             <select class="form-control form-control-sm mb-2" id="srcDef"></select>
             <input class="form-control form-control-sm mb-2" id="srcName" placeholder="Source Name" />
@@ -269,7 +297,7 @@
                 <button class="btn btn-sm btn-azure-outline" id="btnSaveSource">Save Draft</button>
             </div>
           </div>
-          <div class="card">
+          <div class="card" id="abDestCard">
             <div class="panel-title" style="margin-bottom:12px;"><i class="fas fa-sign-out-alt"></i> New Destination</div>
             <select class="form-control form-control-sm mb-2" id="dstDef"></select>
             <input class="form-control form-control-sm mb-2" id="dstName" placeholder="Destination Name" />
@@ -291,6 +319,62 @@
       <div id="savedList" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:12px;"></div>
       <div id="savedEmpty" class="muted" style="display:none; text-align:center; padding: 20px;">No saved connectors found.</div>
     </div>
+    </div>
+
+    <div id="vaultPanel" style="display:none;">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title"><i class="fas fa-lock" style="color:#1c96ca;"></i> Vault</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button class="btn btn-sm btn-azure-outline" id="btnVaultRefresh"><i class="fas fa-sync"></i> Refresh</button>
+          </div>
+        </div>
+
+        <div class="grid2" style="gap: 12px;">
+          <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <div style="font-weight:900; font-size:13px; color:#0f172a;"><i class="fas fa-list" style="margin-right:8px;"></i>Secrets</div>
+              <div class="muted" id="vaultCount"></div>
+            </div>
+            <input class="form-control form-control-sm" id="vaultSearch" placeholder="Search secrets..." />
+            <div style="height: 10px;"></div>
+            <div id="vaultList" style="max-height: 360px; overflow:auto;"></div>
+            <div id="vaultEmpty" class="muted" style="display:none; padding:10px;">No secrets yet.</div>
+          </div>
+
+          <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <div style="font-weight:900; font-size:13px; color:#0f172a;"><i class="fas fa-pen" style="margin-right:8px;"></i>Editor</div>
+              <div class="muted mono" id="vaultRedisKey" style="font-size:10px;"></div>
+            </div>
+
+            <input class="form-control form-control-sm mono" id="vaultName" placeholder="Key (e.g. synapse_password)" />
+            <div style="height: 10px;"></div>
+
+            <div style="display:flex; gap:8px; align-items:flex-start;">
+              <input class="form-control form-control-sm mono" id="vaultValue" type="password" placeholder="Value (encrypted in Redis)" style="flex:1;" />
+              <button class="btn btn-sm btn-azure-outline" id="btnVaultToggle" title="Show/Hide"><i class="fas fa-eye"></i></button>
+            </div>
+
+            <div style="height: 10px;"></div>
+            <textarea class="form-control form-control-sm mono" id="vaultNote" rows="4" placeholder="Notes (optional)"></textarea>
+
+            <div class="muted" style="margin-top:10px; font-size:11px;">
+              Redis key: <span class="mono" id="vaultKeyPreview"></span>
+            </div>
+
+            <div style="display:flex; gap:8px; margin-top:12px; flex-wrap: wrap;">
+              <button class="btn btn-sm btn-azure-outline" id="btnVaultSave"><i class="fas fa-save"></i> Save</button>
+              <button class="btn btn-sm btn-azure-outline" id="btnVaultReveal"><i class="fas fa-unlock"></i> Reveal</button>
+              <button class="btn btn-sm btn-danger-outline" id="btnVaultDelete"><i class="fas fa-trash"></i> Delete</button>
+            </div>
+
+            <pre class="mono" id="vaultMetaOut" style="display:none; max-height: 160px; overflow:auto;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
   {% endif %}
 </div>
 
@@ -347,6 +431,58 @@
   }
 
   const paState = { loaded:false, connectors:[], popular:{sources:[],destinations:[]}, selected:null, code:'' };
+
+  // Tabs: Source / Destination / Vault
+  const tabState = { active: 'source' };
+
+  function setActiveTab(tab) {
+    tabState.active = tab;
+
+    document.querySelectorAll('#connectorsTabs .tab-btn').forEach(el => {
+      el.classList.toggle('active', el.dataset.tab === tab);
+    });
+
+    const hint = document.getElementById('connectorsTabHint');
+    if (hint) {
+      hint.textContent = (tab === 'source') ? 'Configure source connectors'
+        : (tab === 'destination') ? 'Configure destination connectors'
+        : 'Encrypted secrets per SuperTable';
+    }
+
+    const main = document.getElementById('connectorsMain');
+    const vault = document.getElementById('vaultPanel');
+    if (main) main.style.display = (tab === 'vault') ? 'none' : 'block';
+    if (vault) vault.style.display = (tab === 'vault') ? 'block' : 'none';
+
+    const srcCard = document.getElementById('abSourceCard');
+    const dstCard = document.getElementById('abDestCard');
+    if (srcCard) srcCard.style.display = (tab === 'destination') ? 'none' : 'block';
+    if (dstCard) dstCard.style.display = (tab === 'source') ? 'none' : 'block';
+
+    const kindSel = document.getElementById('paKind');
+    if (kindSel) {
+      if (tab === 'source' || tab === 'destination') {
+        kindSel.value = tab;
+        kindSel.style.display = 'none';
+      } else {
+        kindSel.style.display = 'inline-block';
+      }
+    }
+
+    // refresh lists for the selected tab
+    if (tab === 'vault') {
+      vaultLoad().catch(e => toast(e.message));
+    } else {
+      loadSaved().catch(e => toast(e.message));
+      try { loadPyAirbyteConnectors(); } catch (e) {}
+      try { paRenderList(); } catch (e) {}
+    }
+  }
+
+  document.querySelectorAll('#connectorsTabs .tab-btn').forEach(el => {
+    el.addEventListener('click', () => setActiveTab(el.dataset.tab));
+  });
+
 
   function paRenderList() {
     const list = document.getElementById('paList');
@@ -464,9 +600,15 @@
     wrap.innerHTML = '';
     const items = js.data?.items || [];
 
-    document.getElementById('savedEmpty').style.display = items.length ? 'none' : 'block';
+    const active = (typeof tabState !== 'undefined' && tabState.active) ? tabState.active : '';
+    const filteredItems = (active === 'source' || active === 'destination')
+      ? items.filter(it => (it && it.kind) ? String(it.kind) === active : true)
+      : items;
 
-    items.forEach(it => {
+
+    document.getElementById('savedEmpty').style.display = filteredItems.length ? 'none' : 'block';
+
+    filteredItems.forEach(it => {
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `
@@ -486,6 +628,113 @@
       wrap.appendChild(card);
     });
   }
+
+  
+
+  // ---------------------------------------------------------------------------
+  // Vault (encrypted secrets in Redis per SuperTable)
+  // ---------------------------------------------------------------------------
+  const vaultState = { loaded:false, items:[], selected:null, metaKey:'' };
+
+  function vaultKeyPreview(name) {
+    const { org, sup } = ctx();
+    if (!org || !sup) return '';
+    const safe = String(name || '').trim().replace(/[^a-zA-Z0-9_.-]/g, '_');
+    if (!safe) return '';
+    return `supertable:${org}:${sup}:meta:vault:${safe}`;
+  }
+
+  function vaultRenderList() {
+    const wrap = document.getElementById('vaultList');
+    const empty = document.getElementById('vaultEmpty');
+    const cnt = document.getElementById('vaultCount');
+    if (!wrap) return;
+
+    const term = (document.getElementById('vaultSearch')?.value || '').toLowerCase();
+    const filtered = (vaultState.items || []).filter(it => (it.name || '').toLowerCase().includes(term));
+
+    if (cnt) cnt.textContent = `${filtered.length} secret(s)`;
+
+    wrap.innerHTML = '';
+    if (empty) empty.style.display = filtered.length ? 'none' : 'block';
+
+    filtered.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'list-item' + (vaultState.selected === it.name ? ' active' : '');
+      div.innerHTML = `<span class="mono" style="font-size:12px;">${it.name}</span>`;
+      div.onclick = () => vaultSelect(it);
+      wrap.appendChild(div);
+    });
+  }
+
+  function vaultSelect(it) {
+    vaultState.selected = it.name;
+    document.getElementById('vaultName').value = it.name || '';
+    document.getElementById('vaultNote').value = it.note || '';
+    document.getElementById('vaultValue').value = '';
+    const key = it.redis_key || vaultKeyPreview(it.name || '');
+    document.getElementById('vaultRedisKey').textContent = key;
+    document.getElementById('vaultKeyPreview').textContent = key;
+
+    const metaOut = document.getElementById('vaultMetaOut');
+    if (metaOut) {
+      metaOut.style.display = 'block';
+      metaOut.textContent = JSON.stringify(it || {}, null, 2);
+    }
+    vaultRenderList();
+  }
+
+  async function vaultLoad() {
+    const { org, sup } = ctx();
+    if (!org || !sup) return;
+    const js = await getJSON(`/reflection/connectors/vault/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    vaultState.items = js.items || [];
+    vaultState.metaKey = js.meta_key || '';
+    vaultRenderList();
+  }
+
+  async function vaultSave() {
+    const { org, sup, userHash } = ctx();
+    const name = (document.getElementById('vaultName')?.value || '').trim();
+    const value = (document.getElementById('vaultValue')?.value || '');
+    const note = (document.getElementById('vaultNote')?.value || '');
+
+    if (!name) { toast('Vault key required'); return; }
+    if (!value) { toast('Vault value required'); return; }
+
+    await postJSON('/reflection/connectors/vault/upsert', { org, sup, name, value, note, user_hash: userHash });
+    toast('Saved (encrypted)');
+    await vaultLoad();
+    const found = (vaultState.items || []).find(x => x.name === name);
+    if (found) vaultSelect(found);
+  }
+
+  async function vaultReveal() {
+    const { org, sup } = ctx();
+    const name = (document.getElementById('vaultName')?.value || '').trim();
+    if (!name) { toast('Select a secret'); return; }
+    const js = await postJSON('/reflection/connectors/vault/reveal', { org, sup, name });
+    document.getElementById('vaultValue').value = js.value || '';
+    toast('Revealed');
+  }
+
+  async function vaultDelete() {
+    const { org, sup } = ctx();
+    const name = (document.getElementById('vaultName')?.value || '').trim();
+    if (!name) { toast('Select a secret'); return; }
+    if (!confirm(`Delete secret "${name}"?`)) return;
+
+    await fetch(`/reflection/connectors/vault/${encodeURIComponent(name)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`, {
+      method: 'DELETE',
+      credentials: 'same-origin'
+    });
+    toast('Deleted');
+    document.getElementById('vaultName').value = '';
+    document.getElementById('vaultValue').value = '';
+    document.getElementById('vaultNote').value = '';
+    await vaultLoad();
+  }
+
 
   // Event Listeners
   document.getElementById('btnPaLoad')?.addEventListener('click', loadPyAirbyteConnectors);
@@ -516,7 +765,28 @@
       loadSaved();
   });
 
+
+  // Vault listeners
+  document.getElementById('btnVaultRefresh')?.addEventListener('click', () => vaultLoad().catch(e => toast(e.message)));
+  document.getElementById('vaultSearch')?.addEventListener('input', vaultRenderList);
+  document.getElementById('btnVaultSave')?.addEventListener('click', () => vaultSave().catch(e => toast(e.message)));
+  document.getElementById('btnVaultReveal')?.addEventListener('click', () => vaultReveal().catch(e => toast(e.message)));
+  document.getElementById('btnVaultDelete')?.addEventListener('click', () => vaultDelete().catch(e => toast(e.message)));
+  document.getElementById('btnVaultToggle')?.addEventListener('click', () => {
+    const v = document.getElementById('vaultValue');
+    if (!v) return;
+    v.type = (v.type === 'password') ? 'text' : 'password';
+  });
+  document.getElementById('vaultName')?.addEventListener('input', () => {
+    const nm = (document.getElementById('vaultName')?.value || '').trim();
+    const key = vaultKeyPreview(nm);
+    document.getElementById('vaultKeyPreview').textContent = key;
+    document.getElementById('vaultRedisKey').textContent = key;
+  });
+
+
   // Init
+  setActiveTab('source');
   loadPyAirbyteConnectors();
   loadSaved();
   getJSON('/reflection/connectors/pyairbyte/status').then(js => {

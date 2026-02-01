@@ -2150,12 +2150,12 @@ attach_ingestion_routes(
 
 
 # ---------------------------------------------------------------------------
-# Notebooks UI + API routes
+# Studio (formerly Lab/Notebooks) UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
+from supertable.reflection.studio import attach_studio_routes  # noqa: E402
 
-attach_notebook_routes(
+attach_studio_routes(
     router,
     templates=templates,
     is_authorized=_is_authorized,
@@ -2168,14 +2168,13 @@ attach_notebook_routes(
     admin_guard_api=admin_guard_api,
 )
 
-
 # ---------------------------------------------------------------------------
-# Notebooks UI + API routes
+# Jobs UI routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
+from supertable.reflection.jobs import attach_jobs_routes  # noqa: E402
 
-attach_notebook_routes(
+attach_jobs_routes(
     router,
     templates=templates,
     is_authorized=_is_authorized,
@@ -2188,25 +2187,6 @@ attach_notebook_routes(
     admin_guard_api=admin_guard_api,
 )
 
-
-# ---------------------------------------------------------------------------
-# Notebooks UI + API routes
-# ---------------------------------------------------------------------------
-
-from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
-
-attach_notebook_routes(
-    router,
-    templates=templates,
-    is_authorized=_is_authorized,
-    no_store=_no_store,
-    get_provided_token=_get_provided_token,
-    discover_pairs=discover_pairs,
-    resolve_pair=resolve_pair,
-    inject_session_into_ctx=inject_session_into_ctx,
-    logged_in_guard_api=logged_in_guard_api,
-    admin_guard_api=admin_guard_api,
-)
 # ---------------------------------------------------------------------------
 # Connectors UI + API routes
 # ---------------------------------------------------------------------------
