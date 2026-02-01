@@ -7,30 +7,32 @@ class SparkClusterManager:
     def __init__(self):
         self.spark = None
 
-    def start_cluster(self):
+    def start_cluster_generator(self):
+        """Yields progress messages during Spark initialization."""
         try:
-            # Persistent session connected to your Docker cluster
+            yield "Initializing Spark Session..."
+            # Connect to the Master running in Docker
             self.spark = SparkSession.builder \
                 .appName("SupertableSparkNotebook") \
                 .master("spark://localhost:7077") \
                 .config("spark.driver.host", "localhost") \
                 .config("spark.driver.bindAddress", "0.0.0.0") \
                 .getOrCreate()
-            return "Spark Session Ready"
+
+            yield "Connected to Master at spark://localhost:7077"
+            yield "Spark Session Ready"
         except Exception as e:
-            return f"Failed to connect: {str(e)}"
+            yield f"Connection Failed: {str(e)}"
 
     def execute_pyspark(self, code_str):
         if not self.spark:
             return {"status": "error", "message": "Spark session not started"}
 
         output = io.StringIO()
-        # Passing the session into the exec context allows multi-line code to use 'spark'
         exec_globals = {"spark": self.spark}
 
         try:
             with redirect_stdout(output):
-                # Using exec for dynamic execution of multiple lines
                 exec(code_str, exec_globals)
             return {"status": "success", "output": output.getvalue()}
         except Exception as e:

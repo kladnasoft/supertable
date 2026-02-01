@@ -29,30 +29,40 @@ df.filter(df.Age > 30).show()
         <div id="output">Console ready...</div>
     </div>
 
-    <script>
-        const ws = new WebSocket("ws://localhost:8000/ws/spark");
-        const status = document.getElementById("status");
-        const output = document.getElementById("output");
+<script>
+    const ws = new WebSocket("ws://localhost:8000/ws/spark");
+    const status = document.getElementById("status");
+    const output = document.getElementById("output");
 
-        ws.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-            if (msg.status === "ready") {
-                status.innerText = "Status: " + msg.message;
-            } else if (msg.status === "running") {
-                output.innerText = "Executing on cluster...";
-            } else if (msg.status === "result") {
-                output.innerText = msg.data.output || msg.data.message;
-            }
-        };
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
 
-        function startCluster() {
-            ws.send(JSON.stringify({ action: "START" }));
+        if (msg.status === "progress") {
+            // Append connection steps to the console output
+            output.innerText += "\n[System]: " + msg.message;
+            status.innerText = "Status: Connecting...";
         }
-
-        function runCommand() {
-            const code = document.getElementById("codeBlock").value;
-            ws.send(JSON.stringify({ action: "EXECUTE", code: code }));
+        else if (msg.status === "ready") {
+            status.innerText = "Status: Connected and Ready";
+            output.innerText += "\n[System]: Initialization Complete.\n";
         }
-    </script>
+        else if (msg.status === "running") {
+            output.innerText = "Executing on cluster...\n";
+        }
+        else if (msg.status === "result") {
+            output.innerText = msg.data.output || msg.data.message;
+        }
+    };
+
+    function startCluster() {
+        output.innerText = "Initiating Connection...";
+        ws.send(JSON.stringify({ action: "START" }));
+    }
+
+    function runCommand() {
+        const code = document.getElementById("codeBlock").value;
+        ws.send(JSON.stringify({ action: "EXECUTE", code: code }));
+    }
+</script>
 </body>
 </html>
