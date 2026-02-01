@@ -132,7 +132,7 @@ def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
     # If SUPERTABLE_REDIS_DECODE_RESPONSES=true, redis-py returns str instead of bytes.
     # Some older call sites may assume bytes; callers should handle both bytes and str.
     if opts.decode_responses:
-        logger.info("[redis-connector] SUPERTABLE_REDIS_DECODE_RESPONSES=true; redis responses will be decoded to str")
+        logger.debug("[redis-connector] SUPERTABLE_REDIS_DECODE_RESPONSES=true; redis responses will be decoded to str")
     decode_responses = bool(opts.decode_responses)
 
     # Decide between standard Redis and Sentinel-based Redis

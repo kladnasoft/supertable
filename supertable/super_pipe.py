@@ -37,8 +37,11 @@ class SuperPipe:
         finally:
             # Simple release
             current_val = self.catalog.r.get(lock_key)
-            if current_val and current_val.decode() == token:
-                self.catalog.r.delete(lock_key)
+            if current_val:
+                # Handle both str (decoded) and bytes based on Redis connection options
+                val_str = current_val.decode() if isinstance(current_val, bytes) else current_val
+                if val_str == token:
+                    self.catalog.r.delete(lock_key)
 
     def create(self, *, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
                enabled: bool = True) -> str:
