@@ -2153,7 +2153,7 @@ attach_ingestion_routes(
 # Notebooks UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
 
 attach_notebook_routes(
     router,
@@ -2173,7 +2173,7 @@ attach_notebook_routes(
 # Notebooks UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
 
 attach_notebook_routes(
     router,
@@ -2193,7 +2193,7 @@ attach_notebook_routes(
 # Notebooks UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.notebook import attach_notebook_routes  # noqa: E402
+from supertable.reflection.lab import attach_notebook_routes  # noqa: E402
 
 attach_notebook_routes(
     router,

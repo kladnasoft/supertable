@@ -4,12 +4,13 @@
     <title>Spark Web Terminal</title>
     <style>
         body { font-family: sans-serif; padding: 20px; background: #f0f2f5; }
-        .notebook { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .notebook { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         textarea { width: 100%; height: 150px; font-family: monospace; padding: 10px; margin: 10px 0; border: 1px solid #ccc; }
-        #output { background: #1e1e1e; color: #00ff00; padding: 15px; min-height: 100px; white-space: pre-wrap; border-radius: 4px; }
+        #output { background: #1e1e1e; color: #00ff00; padding: 15px; min-height: 200px; white-space: pre-wrap; border-radius: 4px; overflow-y: auto; }
         .btn { padding: 10px 20px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; }
         .start-btn { background: #28a745; color: white; }
         .run-btn { background: #007bff; color: white; }
+        .sys-msg { color: #888; font-style: italic; }
     </style>
 </head>
 <body>
@@ -29,40 +30,40 @@ df.filter(df.Age > 30).show()
         <div id="output">Console ready...</div>
     </div>
 
-<script>
-    const ws = new WebSocket("ws://localhost:8000/ws/spark");
-    const status = document.getElementById("status");
-    const output = document.getElementById("output");
+    <script>
+        const ws = new WebSocket("ws://localhost:8000/ws/spark");
+        const status = document.getElementById("status");
+        const output = document.getElementById("output");
 
-    ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
 
-        if (msg.status === "progress") {
-            // Append connection steps to the console output
-            output.innerText += "\n[System]: " + msg.message;
-            status.innerText = "Status: Connecting...";
-        }
-        else if (msg.status === "ready") {
-            status.innerText = "Status: Connected and Ready";
-            output.innerText += "\n[System]: Initialization Complete.\n";
-        }
-        else if (msg.status === "running") {
-            output.innerText = "Executing on cluster...\n";
-        }
-        else if (msg.status === "result") {
-            output.innerText = msg.data.output || msg.data.message;
-        }
-    };
+            if (msg.status === "progress") {
+                // Update console with progress steps
+                output.innerHTML += `<div class="sys-msg">[System]: ${msg.message}</div>`;
+                status.innerText = "Status: Connecting...";
+            }
+            else if (msg.status === "ready") {
+                status.innerText = "Status: Connected and Ready";
+                output.innerHTML += `<div>[System]: Spark Session successfully initialized.</div><hr>`;
+            }
+            else if (msg.status === "running") {
+                output.innerText += "\nExecuting on cluster...\n";
+            }
+            else if (msg.status === "result") {
+                output.innerText += (msg.data.output || msg.data.message);
+            }
+        };
 
-    function startCluster() {
-        output.innerText = "Initiating Connection...";
-        ws.send(JSON.stringify({ action: "START" }));
-    }
+        function startCluster() {
+            output.innerHTML = "<div>[System]: Initiating connection request...</div>";
+            ws.send(JSON.stringify({ action: "START" }));
+        }
 
-    function runCommand() {
-        const code = document.getElementById("codeBlock").value;
-        ws.send(JSON.stringify({ action: "EXECUTE", code: code }));
-    }
-</script>
+        function runCommand() {
+            const code = document.getElementById("codeBlock").value;
+            ws.send(JSON.stringify({ action: "EXECUTE", code: code }));
+        }
+    </script>
 </body>
 </html>

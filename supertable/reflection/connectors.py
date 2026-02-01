@@ -76,7 +76,7 @@ def _airbyte_post(base_url: str, path: str, payload: Dict[str, Any]) -> Any:
     except requests.HTTPError as e:
         detail = ""
         try:
-            detail = r.text  # type: ignore[name-defined]
+            detail = r.text
         except Exception:
             detail = str(e)
         raise HTTPException(status_code=502, detail=f"Airbyte error: {detail}") from e
@@ -85,23 +85,23 @@ def _airbyte_post(base_url: str, path: str, payload: Dict[str, Any]) -> Any:
 
 
 def attach_connectors_routes(
-    router: APIRouter,
-    *,
-    templates: Any,
-    is_authorized: Callable[[Request], bool],
-    no_store: Callable[[Any], None],
-    get_provided_token: Callable[[Request], Optional[str]],
-    discover_pairs: Callable[[], Sequence[Tuple[str, str]]],
-    resolve_pair: Callable[[Optional[str], Optional[str]], Tuple[Optional[str], Optional[str]]],
-    inject_session_into_ctx: Callable[[Dict[str, Any], Request], None],
-    logged_in_guard_api: Any,
-    admin_guard_api: Any,
+        router: APIRouter,
+        *,
+        templates: Any,
+        is_authorized: Callable[[Request], bool],
+        no_store: Callable[[Any], None],
+        get_provided_token: Callable[[Request], Optional[str]],
+        discover_pairs: Callable[[], Sequence[Tuple[str, str]]],
+        resolve_pair: Callable[[Optional[str], Optional[str]], Tuple[Optional[str], Optional[str]]],
+        inject_session_into_ctx: Callable[[Dict[str, Any], Request], None],
+        logged_in_guard_api: Any,
+        admin_guard_api: Any,
 ) -> None:
     @router.get("/reflection/connectors", response_class=HTMLResponse)
     def connectors_page(
-        request: Request,
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
+            request: Request,
+            org: Optional[str] = Query(None),
+            sup: Optional[str] = Query(None),
     ):
         if not is_authorized(request):
             resp = RedirectResponse("/reflection/login", status_code=302)
@@ -127,7 +127,7 @@ def attach_connectors_routes(
         no_store(resp)
         return resp
 
-    # --- Airbyte discovery endpoints (server-side proxy to avoid CORS) ---
+    # --- Airbyte discovery endpoints ---
 
     @router.post("/reflection/connectors/airbyte/workspaces/list")
     def airbyte_list_workspaces(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
@@ -166,7 +166,7 @@ def attach_connectors_routes(
         }
         return _airbyte_post(base_url, "/api/v1/destinations/create", body)
 
-    # --- Saved connectors (our app state) ---
+    # --- Saved connectors ---
 
     @router.get("/reflection/connectors/saved")
     def saved_list(org: str, sup: str, _: Any = Depends(logged_in_guard_api)):
@@ -181,18 +181,12 @@ def attach_connectors_routes(
         item = payload.get("item") or {}
         if not org or not sup:
             raise HTTPException(status_code=400, detail="org/sup required")
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=400, detail="item must be an object")
 
         data = _load_saved(org, sup)
         items = data.get("items") or []
-        if not isinstance(items, list):
-            items = []
-
         item_id = str(item.get("id") or "").strip() or os.urandom(8).hex()
         item["id"] = item_id
 
-        # replace or insert
         out = []
         replaced = False
         for it in items:
@@ -209,124 +203,117 @@ def attach_connectors_routes(
 
     @router.delete("/reflection/connectors/saved/{item_id}")
     def saved_delete(item_id: str, org: str, sup: str, _: Any = Depends(logged_in_guard_api)):
-        if not org or not sup:
-            raise HTTPException(status_code=400, detail="org/sup required")
         data = _load_saved(org, sup)
         items = data.get("items") or []
-        if not isinstance(items, list):
-            items = []
         data["items"] = [it for it in items if not (isinstance(it, dict) and str(it.get("id")) == item_id)]
         _save_saved(org, sup, data)
         return {"ok": True}
 
+    # --- PyAirbyte Utils ---
 
+    def _import_pyairbyte_like() -> Tuple[Optional[str], Optional[Any]]:
+        try:
+            import airbyte as ab
+            return "airbyte", ab
+        except Exception:
+            try:
+                import pyairbyte as ab
+                return "pyairbyte", ab
+            except Exception:
+                return None, None
 
-    # --- PyAirbyte helpers (best-effort; APIs may vary by version) ---
+    def _popular_connectors(all_names: Sequence[str]) -> Dict[str, list[str]]:
+        sources = ["source-postgres", "source-mysql", "source-s3", "source-google-sheets", "source-github"]
+        dests = ["destination-postgres", "destination-s3", "destination-bigquery"]
+        sset = set(all_names)
+        return {
+            "sources": [n for n in sources if n in sset],
+            "destinations": [n for n in dests if n in sset],
+        }
 
     @router.get("/reflection/connectors/pyairbyte/connectors")
     def pyairbyte_connectors(_: Any = Depends(logged_in_guard_api)):
-        """Best-effort listing of connectors from PyAirbyte (if installed).
+        modname, ab = _import_pyairbyte_like()
+        if ab is None:
+            return {"ok": True, "installed": False, "connectors": []}
 
-        PyAirbyte's public API has changed across versions, so we try a few known entry-points.
-        """
+        names = []
         try:
-            import pyairbyte  # type: ignore
+            # Current PyAirbyte API
+            names = list(ab.get_available_connectors())
         except Exception:
-            return {"ok": True, "installed": False, "connectors": [], "hint": "pip install pyairbyte"}
-
-        # Try common entrypoints
-        candidates = [
-            "get_available_sources",
-            "get_available_connectors",
-            "available_connectors",
-            "list_connectors",
-            "sources",
-            "connectors",
-        ]
-        for name in candidates:
-            fn = getattr(pyairbyte, name, None)
             try:
-                if callable(fn):
-                    res = fn()
-                    # normalize list of names
-                    if isinstance(res, dict):
-                        keys = list(res.keys())
-                        return {"ok": True, "installed": True, "api": name, "connectors": keys}
-                    if isinstance(res, (list, tuple, set)):
-                        out = []
-                        for it in res:
-                            if isinstance(it, str):
-                                out.append(it)
-                            elif isinstance(it, dict) and "name" in it:
-                                out.append(it["name"])
-                            else:
-                                out.append(str(it))
-                        return {"ok": True, "installed": True, "api": name, "connectors": out}
-                    return {"ok": True, "installed": True, "api": name, "connectors": [str(res)]}
+                # Legacy or variant API
+                names = list(ab.get_available_sources()) + list(ab.get_available_destinations())
             except Exception:
-                continue
+                pass
 
         return {
             "ok": True,
             "installed": True,
-            "api": "unknown",
-            "connectors": [],
-            "hint": "PyAirbyte is installed but no known list API found. Upgrade/downgrade PyAirbyte or rely on Airbyte API listing on this page.",
-            "module_attrs": [a for a in dir(pyairbyte) if not a.startswith('_')][:60],
+            "module": modname,
+            "connectors": sorted(list(set(names))),
+            "popular": _popular_connectors(names)
         }
 
-    @router.post("/reflection/connectors/pyairbyte/create")
-    def pyairbyte_create(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
-        """Best-effort creation of a connector object via PyAirbyte (if installed).
+    @router.post("/reflection/connectors/pyairbyte/spec")
+    def pyairbyte_spec(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
+        modname, ab = _import_pyairbyte_like()
+        kind = str(payload.get("kind") or "source")
+        connector = str(payload.get("connector") or "")
 
-        This does NOT start a sync by itself; it primarily validates config and returns a normalized payload
-        that you can save in SuperTable (and/or later bind to an Airbyte server).
-        """
+        factory = getattr(ab, "get_source" if kind == "source" else "get_destination", None)
+        if not factory:
+            raise HTTPException(400, "API not found")
+
         try:
-            import pyairbyte  # type: ignore
+            # We pass empty config just to get the spec object
+            obj = factory(connector, config={})
+            spec = getattr(obj, "config_spec", {})
+            if callable(spec): spec = spec()
+            return {"ok": True, "spec": spec}
         except Exception as e:
-            raise HTTPException(status_code=400, detail="PyAirbyte not installed. pip install pyairbyte") from e
+            return {"ok": False, "error": str(e)}
 
-        kind = str(payload.get("kind") or "source").strip().lower()
-        connector = str(payload.get("connector") or "").strip()
+    @router.post("/reflection/connectors/pyairbyte/check")
+    def pyairbyte_check(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
+        _, ab = _import_pyairbyte_like()
+        kind = payload.get("kind")
+        connector = payload.get("connector")
         config = payload.get("config") or {}
 
-        if not connector:
-            raise HTTPException(status_code=400, detail="connector is required")
-        if not isinstance(config, dict):
-            raise HTTPException(status_code=400, detail="config must be an object")
+        factory = getattr(ab, "get_source" if kind == "source" else "get_destination")
+        try:
+            obj = factory(connector, config=config)
+            res = obj.check()
+            return {"ok": True, "status": str(res)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
-        # Try common factories
-        factories = []
-        if kind == "source":
-            factories = ["get_source", "source", "Source", "get_connector"]
-        else:
-            factories = ["get_destination", "destination", "Destination", "get_connector"]
+    @router.post("/reflection/connectors/pyairbyte/codegen")
+    def pyairbyte_codegen(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
+        kind = payload.get("kind")
+        connector = payload.get("connector")
+        config = payload.get("config") or {}
+        name = _safe_slug(payload.get("name") or "conn").replace("-", "_")
 
-        last_err: Optional[str] = None
-        for name in factories:
-            fn = getattr(pyairbyte, name, None)
-            if not callable(fn):
-                continue
-            try:
-                obj = fn(connector, config)  # type: ignore[misc]
-                # We don't serialize the object; we return validated payload.
-                return {"ok": True, "kind": kind, "connector": connector, "config": config, "pyairbyte_factory": name}
-            except Exception as e:
-                last_err = str(e)
-                continue
+        cfg_str = json.dumps(config, indent=2)
+        method = "get_source" if kind == "source" else "get_destination"
 
-        raise HTTPException(
-            status_code=400,
-            detail=f"PyAirbyte installed, but could not create connector via known factories. Last error: {last_err}",
+        code = (
+            "import airbyte as ab\n\n"
+            f"config = {cfg_str}\n\n"
+            f"{name} = ab.{method}(\n"
+            f"    {connector!r},\n"
+            "    config=config,\n"
+            "    install_if_missing=True\n"
+            ")\n\n"
+            f"verify = {name}.check()\n"
+            "print(verify)"
         )
+        return {"ok": True, "code": code}
 
-
-    # --- Optional PyAirbyte hint endpoint (non-fatal if missing) ---
     @router.get("/reflection/connectors/pyairbyte/status")
     def pyairbyte_status(_: Any = Depends(logged_in_guard_api)):
-        try:
-            import pyairbyte  # type: ignore  # noqa: F401
-            return {"ok": True, "installed": True}
-        except Exception:
-            return {"ok": True, "installed": False, "hint": "pip install pyairbyte"}
+        modname, ab = _import_pyairbyte_like()
+        return {"ok": True, "installed": ab is not None, "module": modname}

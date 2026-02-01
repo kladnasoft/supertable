@@ -128,13 +128,12 @@ class RedisOptions:
 
 def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
     opts = options or RedisOptions()
-
-    # The wider codebase (e.g. SuperPipe locks) expects Redis GET to return bytes.
-    # If decode_responses=True, redis-py returns str and callers that do current_val.decode() crash.
-    # We therefore force byte responses for the shared client, and decode within higher-level APIs as needed.
+    # Response decoding:
+    # If SUPERTABLE_REDIS_DECODE_RESPONSES=true, redis-py returns str instead of bytes.
+    # Some older call sites may assume bytes; callers should handle both bytes and str.
     if opts.decode_responses:
-        logger.warning("[redis-connector] SUPERTABLE_REDIS_DECODE_RESPONSES=true is not supported; forcing false")
-    decode_responses = False
+        logger.info("[redis-connector] SUPERTABLE_REDIS_DECODE_RESPONSES=true; redis responses will be decoded to str")
+    decode_responses = bool(opts.decode_responses)
 
     # Decide between standard Redis and Sentinel-based Redis
     if opts.is_sentinel and opts.sentinel_hosts:
@@ -147,7 +146,7 @@ def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
             sentinel_kwargs={
                 "socket_timeout": 0.5,
                 "password": opts.sentinel_password,
-                "decode_responses": opts.decode_responses,
+                "decode_responses": decode_responses,
             },
             socket_timeout=0.5,
             password=opts.password,

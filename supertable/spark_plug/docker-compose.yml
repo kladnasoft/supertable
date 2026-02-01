@@ -1,19 +1,42 @@
 services:
   spark-master:
-    image: docker.io/bitnamilegacy/spark:3.5.1
+    image: apache/spark:3.5.2
+    container_name: spark-master
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
     ports:
-      - "8080:8080" # Master Web UI
-      - "7077:7077" # Master Port (This is what your Python code connects to)
+      - "8080:8080" # Web UI
+      - "7077:7077" # RPC
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host 0.0.0.0 --port 7077 --webui-port 8080
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep org.apache.spark.deploy.master.Master | grep -v grep"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spark-network
+    restart: unless-stopped
 
   spark-worker:
-    image: docker.io/bitnamilegacy/spark:3.5.1
+    image: apache/spark:3.5.2
+    container_name: spark-worker
     environment:
       - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_CORES=1
       - SPARK_WORKER_MEMORY=1G
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
+    networks:
+      - spark-network
+    restart: unless-stopped
+
+networks:
+  spark-network:
+    driver: bridge
