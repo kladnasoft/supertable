@@ -1,0 +1,723 @@
+{% extends "base.html" %}
+
+{% block title %}Compute{% endblock %}
+
+{% block head_extra %}
+<style>
+  :root {
+    --azure: #1c96ca;
+    --slate-900: #0f172a;
+    --slate-700: #334155;
+    --slate-500: #64748b;
+    --border: rgba(15,23,42,.10);
+    --border-strong: rgba(15,23,42,.14);
+    --shadow: 0 18px 40px rgba(0,0,0,0.18);
+    --ring: 0 0 0 3px rgba(28,150,202,.14);
+  }
+
+  .muted { color: var(--slate-500); font-size: 12px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+  .root {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    padding: 24px 28px;
+    border: 1px solid rgba(0,0,0,0.05);
+    border-left: 5px solid var(--azure);
+  }
+  .title { font-size: 18px; font-weight: 900; color: var(--slate-900); }
+
+  .panel {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: #fff;
+    padding: 14px 14px;
+  }
+  .panel + .panel { margin-top: 12px; }
+  .panel-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .panel-title {
+    font-weight: 900;
+    color: var(--slate-900);
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .btn-azure-outline {
+    border: 1px solid var(--azure);
+    background: transparent;
+    color: var(--azure);
+    font-weight: 700;
+    transition: background-color 0.2s ease, color 0.2s ease, transform .05s ease;
+    border-radius: 10px;
+  }
+  .btn-azure-outline:hover { background: var(--azure); color: #ffffff; }
+  .btn-azure-outline:active { transform: translateY(1px); }
+
+  .btn-danger-outline {
+    border: 1px solid rgba(239,68,68,0.75);
+    background: transparent;
+    color: rgba(239,68,68,0.95);
+    font-weight: 800;
+    transition: background-color 0.2s ease, color 0.2s ease, transform .05s ease;
+    border-radius: 10px;
+  }
+  .btn-danger-outline:hover { background: rgba(239,68,68,0.92); color:#fff; }
+  .btn-danger-outline:active { transform: translateY(1px); }
+
+  .rowcard {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background:#fff;
+    padding: 12px;
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .rowcard + .rowcard { margin-top: 10px; }
+
+  .rowcard .name { font-weight: 900; color: var(--slate-900); font-size: 13px; }
+  .rowcard .sub { margin-top: 4px; color: var(--slate-500); font-size: 12px; }
+
+  .search {
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    padding: 9px 12px;
+    outline: none;
+    width: min(420px, 100%);
+    font-size: 13px;
+    background: #fff;
+  }
+  .search:focus { border-color: var(--azure); box-shadow: var(--ring); }
+
+  .badge {
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:4px 10px;
+    border-radius:999px;
+    font-size:11px;
+    font-weight:900;
+    border:1px solid var(--border);
+    background:#fff;
+    color: var(--slate-500);
+  }
+
+  .toast {
+    position: fixed;
+    right: 18px;
+    top: 16px;
+    z-index: 5000;
+    background: rgba(15,23,42,0.92);
+    color: #fff;
+    border-radius: 14px;
+    padding: 10px 12px;
+    font-size: 12px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.22);
+    display:none;
+    max-width: min(520px, calc(100vw - 36px));
+  }
+
+  /* Modal */
+  .modal-backdrop {
+    position:fixed;
+    inset:0;
+    background:rgba(15,23,42,.55);
+    display:none;
+    align-items:center;
+    justify-content:center;
+    z-index:4500;
+    padding:18px;
+    backdrop-filter: blur(3px);
+  }
+  .modal-card {
+    width:680px;
+    max-width:95vw;
+    background:#fff;
+    border-radius:18px;
+    border:1px solid var(--border);
+    border-left:5px solid var(--azure);
+    padding:18px 18px 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .modal-head {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:12px;
+    margin-bottom:12px;
+  }
+  .modal-title-wrap { display:flex; align-items:flex-start; gap:10px; }
+  .modal-icon {
+    width:34px; height:34px;
+    border-radius:12px;
+    background: rgba(28,150,202,.12);
+    border: 1px solid rgba(28,150,202,.22);
+    display:flex; align-items:center; justify-content:center;
+    color: var(--azure);
+  }
+  .modal-title { font-size:15px; font-weight: 950; color: var(--slate-900); line-height: 1.1; }
+  .modal-sub { margin-top:3px; color: var(--slate-500); font-size: 12px; }
+
+  .btn-ghost {
+    padding: 6px 10px;
+    border-radius: 10px;
+    border: 1px solid #d0d7e7;
+    background: transparent;
+    color: #475569;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .btn-ghost:hover { background:#e2e8f0; }
+
+  .grid {
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap:12px;
+  }
+  @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+
+  .field {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 10px 10px;
+    background: #fff;
+  }
+  .form-label {
+    font-size: 12px;
+    font-weight: 950;
+    color: var(--slate-900);
+    margin-bottom: 6px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 8px;
+  }
+  .form-help { font-weight: 800; font-size: 11px; color: var(--slate-500); }
+
+  /* make the Bootstrap inputs match our card style */
+  .field .form-control,
+  .field .form-select {
+    border-radius: 12px;
+    border: 1px solid rgba(15,23,42,.12);
+    box-shadow: none !important;
+  }
+  .field .form-control:focus,
+  .field .form-select:focus {
+    border-color: var(--azure);
+    box-shadow: var(--ring) !important;
+    outline: none;
+  }
+
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    vertical-align: middle;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background-color: #e2e8f0;
+    border: 1px solid rgba(15,23,42,.12);
+    transition: .2s;
+    border-radius: 999px;
+  }
+  .slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    top: 50%;
+    transform: translateY(-50%);
+    background-color: white;
+    transition: .2s;
+    border-radius: 999px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  }
+  .switch input:checked + .slider {
+    background-color: rgba(28,150,202,.25);
+    border-color: rgba(28,150,202,.45);
+  }
+  .switch input:checked + .slider:before {
+    transform: translate(20px, -50%);
+  }
+
+  .modal-actions {
+    display:flex;
+    justify-content:space-between;
+    gap:8px;
+    margin-top:14px;
+    flex-wrap:wrap;
+    align-items:center;
+  }
+  .modal-actions .left {
+    display:flex;
+    gap:10px;
+    flex-wrap:wrap;
+    align-items:center;
+  }
+  .error {
+    color: rgba(239,68,68,0.95);
+    font-weight: 800;
+    font-size: 12px;
+  }
+
+
+  /* ---- admin.html tab bar style ---- */
+  #tab-navigation {
+    display: flex;
+    gap: 24px;
+    margin-top: 16px;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 0 2px;
+    flex-wrap: wrap;
+  }
+
+  .tab {
+    padding: 8px 0;
+    margin-bottom: -1px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    font-size: 13px;
+    color: #64748b;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab i { font-size: 13px; }
+
+  .tab.active {
+    color: var(--azure);
+    border-bottom-color: var(--azure);
+    font-weight: 500;
+  }
+
+  .tab-sep {
+    width: 1px;
+    height: 22px;
+    background: rgba(15, 23, 42, 0.12);
+    margin: 0 10px;
+    align-self: center;
+    border-radius: 1px;
+  }
+
+  .hidden { display:none; }
+
+
+  /* ---- Compute Pools toolbar alignment ---- */
+  .panel-head { flex-wrap: nowrap; }
+  .panel-actions {
+    display:flex;
+    align-items:center;
+    justify-content:flex-end;
+    gap:10px;
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+  .panel-actions .search {
+    flex: 1 1 340px;
+    width: 340px;
+    max-width: 420px;
+    min-width: 260px;
+  }
+  .panel-actions .badge { flex: 0 0 auto; }
+  .panel-actions .btn { flex: 0 0 auto; }
+
+  /* Responsive: allow wrap on smaller screens */
+  @media (max-width: 980px) {
+    .panel-head { flex-wrap: wrap; }
+    .panel-actions {
+      width: 100%;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+    }
+    .panel-actions .search {
+      flex: 1 1 100%;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+    }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% include "selection.html" %}
+<div style="height: 18px;"></div>
+
+<!-- admin-style in-page tab bar (separate from the card) -->
+<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
+  <button class="tab active" type="button" aria-selected="true">
+    <i class="fas fa-microchip"></i>
+    <span>Compute</span>
+  </button>
+</div>
+
+<div style="height: 10px;"></div>
+
+<div id="root" class="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}">
+
+
+  {% if not has_tenant %}
+    <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
+  {% else %}
+<div class="panel" style="margin-top:14px;">
+      <div class="panel-head">
+        <div class="panel-title"><i class="fas fa-microchip" style="color:#1c96ca;"></i> Pools</div>
+
+        <div class="panel-actions">
+          <input id="poolSearch" class="search" placeholder="Search pools..." />
+          <span class="badge" id="countBadge"><i class="fas fa-list"></i> <span id="countValue">0</span></span>
+          <button class="btn btn-sm btn-azure-outline" id="btnNew"><i class="fas fa-plus"></i> New pool</button>
+          <button class="btn btn-sm btn-azure-outline" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+        </div>
+      </div>
+
+      <div id="list" style="margin-top:12px;"></div>
+      <div id="empty" class="muted" style="display:none; margin-top:10px;">No pools yet.</div>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Modal: Create/Edit pool -->
+<div class="modal-backdrop" id="modalPool" aria-hidden="true">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <div class="modal-title-wrap">
+        <div class="modal-icon"><i class="fas fa-microchip"></i></div>
+        <div>
+          <div class="modal-title" id="modalTitle">New pool</div>
+          <div class="modal-sub">Choose backend, size and concurrency. You can change this later.</div>
+        </div>
+      </div>
+      <button class="btn-ghost" id="btnModalClose" aria-label="Close"><i class="fas fa-times"></i></button>
+    </div>
+
+    <div class="grid">
+      <div class="field">
+        <div class="form-label">
+          <span>Name</span>
+          <span class="form-help">Human-friendly</span>
+        </div>
+        <input class="form-control form-control-sm" id="poolName" placeholder="e.g. Spark – Medium" />
+        <div class="muted" style="margin-top:6px;">Shown in routing UI and job payloads later.</div>
+      </div>
+
+      <div class="field">
+        <div class="form-label">
+          <span>Max concurrency</span>
+          <span class="form-help mono">integer</span>
+        </div>
+        <input class="form-control form-control-sm mono" id="poolMax" type="number" min="1" step="1" value="1" />
+        <div class="muted" style="margin-top:6px;">How many jobs can run concurrently in this pool.</div>
+      </div>
+
+      <div class="field">
+        <div class="form-label">
+          <span>Kind</span>
+          <span class="form-help">backend</span>
+        </div>
+        <select class="form-select form-select-sm mono" id="poolKind">
+          <option value="in-process">in-process</option>
+          <option value="spark">spark</option>
+          <option value="kubernetes">kubernetes</option>
+        </select>
+        <div class="muted" style="margin-top:6px;">Execution backend for notebook jobs.</div>
+      </div>
+
+      <div class="field">
+        <div class="form-label">
+          <span>Size</span>
+          <span class="form-help">profile</span>
+        </div>
+        <select class="form-select form-select-sm mono" id="poolSize">
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="large">large</option>
+        </select>
+        <div class="muted" style="margin-top:6px;">Resource profile (used for routing/scheduling later).</div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+      <div style="display:flex; align-items:center; gap:10px;">
+        <label style="display:flex; align-items:center; gap:10px; margin:0;">
+          <span class="muted" style="font-weight:900;">Default</span>
+          <span class="switch">
+            <input type="checkbox" id="poolDefault" />
+            <span class="slider"></span>
+          </span>
+        </label>
+        <span class="muted">Default pool is used when no pool is specified.</span>
+      </div>
+      <div class="muted" id="modalHint"></div>
+    </div>
+
+    <div class="modal-actions">
+      <div class="left">
+        <span class="error" id="modalError" style="display:none;"></span>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-sm btn-azure-outline" id="btnModalCancel">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnModalSave"><i class="fas fa-save"></i> Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+(function () {
+  const ln = document.getElementById("link-compute") || document.getElementById("link-compute-pools");
+  if (ln) ln.classList.add("active");
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = String(msg || '');
+    el.style.display = 'block';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { el.style.display = 'none'; }, 1800);
+  }
+
+  function root() { return document.getElementById('root'); }
+  function ctx() {
+    const r = root();
+    return {
+      org: r ? (r.dataset.org || '') : '',
+      sup: r ? (r.dataset.sup || '') : '',
+    };
+  }
+
+  async function getJSON(url) {
+    const resp = await fetch(url, { credentials: "same-origin" });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  async function postJSON(url, obj) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(obj || {}),
+      credentials: "same-origin",
+    });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  async function del(url) {
+    const resp = await fetch(url, { method:'DELETE', credentials:'same-origin' });
+    const text = await resp.text();
+    let js = null;
+    try { js = JSON.parse(text); } catch (e) { js = null; }
+    if (!resp.ok) {
+      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
+      throw new Error(msg);
+    }
+    return js;
+  }
+
+  function esc(s) {
+    return String(s||'')
+      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
+  let pools = [];
+  let search = '';
+
+  function filteredPools() {
+    const q = (search || '').trim().toLowerCase();
+    if (!q) return pools;
+    return (pools || []).filter(p => {
+      const name = String(p.name || '').toLowerCase();
+      const kind = String(p.kind || '').toLowerCase();
+      const size = String(p.size || '').toLowerCase();
+      return name.includes(q) || kind.includes(q) || size.includes(q);
+    });
+  }
+
+  async function loadPools() {
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/compute/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    pools = js && js.data && Array.isArray(js.data.items) ? js.data.items : [];
+    render();
+  }
+
+  function render() {
+    const wrap = document.getElementById('list');
+    const empty = document.getElementById('empty');
+    const count = document.getElementById('countValue');
+    if (!wrap) return;
+
+    const items = filteredPools();
+    if (count) count.textContent = String(items.length);
+
+    wrap.innerHTML = '';
+    items.forEach(p => {
+      const div = document.createElement('div');
+      div.className = 'rowcard';
+      div.innerHTML = `
+        <div>
+          <div class="name">${esc(p.name || 'Pool')}${p.is_default ? ' <span class="muted">(default)</span>' : ''}</div>
+          <div class="sub">kind: <span class="mono">${esc(p.kind || '')}</span> • size: <span class="mono">${esc(p.size || '')}</span> • max: <span class="mono">${esc(String(p.max_concurrency || 1))}</span></div>
+        </div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
+          <button class="btn btn-sm btn-azure-outline" data-act="default"><i class="fas fa-star"></i> Default</button>
+          <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
+        </div>
+      `;
+
+      div.querySelector('button[data-act="edit"]').addEventListener('click', () => openModal(p));
+      div.querySelector('button[data-act="default"]').addEventListener('click', () => setDefault(p));
+      div.querySelector('button[data-act="del"]').addEventListener('click', () => deletePool(p));
+      wrap.appendChild(div);
+    });
+
+    if (empty) empty.style.display = items.length ? 'none' : '';
+  }
+
+  async function upsertPool(pool) {
+    const { org, sup } = ctx();
+    await postJSON('/reflection/compute/upsert', { org, sup, item: pool });
+    await loadPools();
+  }
+
+  async function deletePool(pool) {
+    const { org, sup } = ctx();
+    if (!confirm('Delete this pool?')) return;
+    await del(`/reflection/compute/${encodeURIComponent(pool.id)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    await loadPools();
+    toast('Deleted');
+  }
+
+  async function setDefault(pool) {
+    const p = { ...pool, is_default: true };
+    await upsertPool(p);
+    toast('Default updated');
+  }
+
+  // ---- Modal ----
+  let editingId = null;
+
+  function modalEl() { return document.getElementById('modalPool'); }
+  function modalShow() {
+    const el = modalEl();
+    if (!el) return;
+    el.style.display = 'flex';
+    setTimeout(() => { try { document.getElementById('poolName').focus(); } catch (e) {} }, 0);
+  }
+  function modalHide() {
+    const el = modalEl();
+    if (el) el.style.display = 'none';
+    const me = document.getElementById('modalError'); if (me) { me.style.display = 'none'; me.textContent = ''; }
+    editingId = null;
+  }
+
+  function openModal(existing) {
+    const isEdit = Boolean(existing && existing.id);
+    editingId = isEdit ? existing.id : null;
+
+    const me = document.getElementById('modalError'); if (me) { me.style.display = 'none'; me.textContent = ''; }
+
+    document.getElementById('modalTitle').textContent = isEdit ? 'Edit pool' : 'New pool';
+    document.getElementById('modalHint').textContent = isEdit ? `Editing: ${existing.name || ''}` : '';
+
+    document.getElementById('poolName').value = (existing && existing.name) ? existing.name : '';
+    document.getElementById('poolKind').value = (existing && existing.kind) ? existing.kind : 'in-process';
+    document.getElementById('poolSize').value = (existing && existing.size) ? existing.size : 'small';
+    document.getElementById('poolMax').value = String((existing && existing.max_concurrency) ? existing.max_concurrency : 1);
+    document.getElementById('poolDefault').checked = Boolean(existing && existing.is_default);
+
+    modalShow();
+  }
+
+  function collectModal() {
+    const name = (document.getElementById('poolName').value || '').trim();
+    if (!name) throw new Error('Name is required');
+
+    const kind = (document.getElementById('poolKind').value || 'in-process').trim();
+    const size = (document.getElementById('poolSize').value || 'small').trim();
+    const max = parseInt(document.getElementById('poolMax').value || '1', 10);
+    const isDefault = Boolean(document.getElementById('poolDefault').checked);
+
+    const p = {
+      id: editingId || '',
+      name,
+      kind,
+      size,
+      max_concurrency: Number.isFinite(max) && max > 0 ? max : 1,
+      is_default: isDefault,
+    };
+    return p;
+  }
+
+  // Wire modal buttons
+  document.getElementById('btnModalClose').addEventListener('click', (e) => { e.preventDefault(); modalHide(); });
+  document.getElementById('btnModalCancel').addEventListener('click', (e) => { e.preventDefault(); modalHide(); });
+  document.getElementById('btnModalSave').addEventListener('click', (e) => {
+    e.preventDefault();
+    try {
+      const p = collectModal();
+      upsertPool(p).then(() => {
+        modalHide();
+        toast(editingId ? 'Saved' : 'Created');
+      }).catch(err => toast(err.message));
+    } catch (err) {
+      toast(err.message || String(err));
+    }
+  });
+
+  // close modal on backdrop click / Esc
+  modalEl().addEventListener('click', (ev) => { if (ev.target === modalEl()) modalHide(); });
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && modalEl().style.display === 'flex') modalHide(); });
+
+  // ---- main buttons ----
+  const btnNew = document.getElementById('btnNew');
+  if (btnNew) btnNew.addEventListener('click', (e) => { e.preventDefault(); openModal(null); });
+
+  const btnRefresh = document.getElementById('btnRefresh');
+  if (btnRefresh) btnRefresh.addEventListener('click', (e) => { e.preventDefault(); loadPools().catch(err => toast(err.message)); });
+
+  const poolSearch = document.getElementById('poolSearch');
+  if (poolSearch) poolSearch.addEventListener('input', (ev) => { search = ev.target.value || ''; render(); });
+
+  loadPools().catch(err => toast(err.message));
+})();
+</script>
+{% endblock %}

@@ -12,7 +12,7 @@
     margin-top: 16px;
     border-bottom: 1px solid #e2e8f0;
     padding: 0 2px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
   }
 
   .tab {
@@ -31,12 +31,22 @@
 
   .tab i { font-size: 13px; }
 
-  .tab:hover { color: #0f172a; }
+  /* Admin tabs do not change text color on hover */
+  .tab:hover { color: #64748b; }
 
   .tab.active {
     color: #1c96ca;
     border-bottom-color: #1c96ca;
     font-weight: 500;
+  }
+
+  .tab-sep {
+    width: 1px;
+    height: 22px;
+    background: rgba(15, 23, 42, 0.12);
+    margin: 0 10px;
+    align-self: center;
+    border-radius: 1px;
   }
 
   .tabpane { margin-top: 16px; }
@@ -335,13 +345,15 @@
     <div id="tab-load" class="tab active" onclick="switchTab('load')">
       <i class="fas fa-upload"></i><span>Load Data</span>
     </div>
+    <div class="tab-sep" aria-hidden="true"></div>
   <div id="tab-staging" class="tab" onclick="switchTab('staging')">
       <i class="fas fa-folder-open"></i><span>Staging</span>
     </div>
+    <div class="tab-sep" aria-hidden="true"></div>
     <div id="tab-pipe" class="tab" onclick="switchTab('pipe')">
       <i class="fas fa-diagram-project"></i><span>Pipe</span>
     </div>
-    </div>
+  </div>
 
   <!-- -------------------- STAGING TAB -------------------- -->
   <div class="tabpane hidden" id="pane-staging">

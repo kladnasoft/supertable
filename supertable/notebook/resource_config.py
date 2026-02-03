@@ -7,6 +7,7 @@ class ResourceConfig:
     cpu_quota: int = 50000  # 50% of one CPU
     network_disabled: bool = True
     timeout: int = 10
+    max_output_len: int = 100_000  # 100KB limit for safety
 
 # Pre-defined profiles
 LOW_TIER = ResourceConfig(mem_limit="128m", cpu_quota=20000) # 20% CPU

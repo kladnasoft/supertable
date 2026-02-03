@@ -763,7 +763,9 @@ def home_page(
     try:
         state_dir = Path(os.getenv("SUPERTABLE_REFLECTION_STATE_DIR", "/tmp/supertable_reflection"))
         c_dir = state_dir / "connectors"
-        p_dir = state_dir / "compute_pools"
+        p_dir = state_dir / "compute"
+        if not p_dir.exists():
+            p_dir = state_dir / "compute_pools"  # legacy
         connectors = len(list(c_dir.glob("*.json"))) if c_dir.exists() else 0
         pools = len(list(p_dir.glob("*.json"))) if p_dir.exists() else 0
     except Exception:
@@ -2191,9 +2193,9 @@ attach_jobs_routes(
 # Connectors UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.connectors import attach_connectors_routes  # noqa: E402
+from supertable.reflection.vault import attach_vault_routes  # noqa: E402
 
-attach_connectors_routes(
+attach_vault_routes(
     router,
     templates=templates,
     is_authorized=_is_authorized,
@@ -2208,12 +2210,12 @@ attach_connectors_routes(
 
 
 # ---------------------------------------------------------------------------
-# Compute Pools UI + API routes
+# Compute UI + API routes
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.compute_pools import attach_compute_pools_routes  # noqa: E402
+from supertable.reflection.compute import attach_compute_routes  # noqa: E402
 
-attach_compute_pools_routes(
+attach_compute_routes(
     router,
     templates=templates,
     is_authorized=_is_authorized,

@@ -1,0 +1,548 @@
+{% extends "base.html" %}
+
+{% block title %}Environments{% endblock %}
+
+{% block head_extra %}
+<style>
+  .muted { color:#64748b; font-size: 12px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+  .root { background:#fff; border-radius:16px; box-shadow:0 4px 15px rgba(0,0,0,0.08);
+          padding:24px 28px; border:1px solid rgba(0,0,0,0.05); border-left:5px solid #1c96ca; }
+  .title { font-size:20px; font-weight:900; color:#0f172a; margin-bottom:4px; }
+
+  .panel { border:1px solid rgba(15,23,42,.10); border-radius:16px; background:#fff; padding:16px; }
+  .panel + .panel { margin-top:16px; }
+  .panel-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+  .panel-title { font-weight:900; color:#0f172a; display:flex; align-items:center; gap:8px; font-size:14px; }
+
+  .btn-azure-outline { border:1px solid #1c96ca; background:transparent; color:#1c96ca; font-weight:600; transition:all .2s ease; }
+  .btn-azure-outline:hover { background:#1c96ca; color:#fff; }
+  .btn-danger-outline { border:1px solid rgba(239,68,68,.75); background:transparent; color:rgba(239,68,68,.9); font-weight:700; transition:all .2s ease; }
+  .btn-danger-outline:hover { background:rgba(239,68,68,.9); color:#fff; }
+
+  .card { border:1px solid rgba(15,23,42,.10); border-radius:12px; background:#fff; padding:16px; height:100%; }
+
+  .toast { position:fixed; right:18px; top:16px; z-index:5000; background:#0f172a; color:#fff; border-radius:8px;
+           padding:12px 16px; font-size:13px; box-shadow:0 10px 25px rgba(0,0,0,.2); display:none; }
+
+  .list-item { padding:10px 12px; border-radius:8px; border:1px solid transparent; cursor:pointer; margin-bottom:4px; transition:background .2s; }
+  .list-item:hover { background:#f1f5f9; }
+  .list-item.active { background:rgba(28,150,202,.08); border-color:#1c96ca; font-weight:600; }
+
+  .pill { display:inline-flex; align-items:center; padding:4px 10px; border-radius:999px; border:1px solid #e2e8f0; background:#fff;
+          font-size:11px; font-weight:500; color:#64748b; transition:all .2s; }
+  .pill-btn { cursor:pointer; }
+  .pill-btn:hover { border-color:#1c96ca; color:#1c96ca; background:#f0f9ff; }
+  .stage-pill.active { background:#1c96ca; color:#fff; border-color:#1c96ca; }
+
+  textarea.mono { resize:vertical; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:12px; }
+  textarea.mono:focus { border-color:#1c96ca; outline:none; box-shadow:0 0 0 2px rgba(28,150,202,.1); }
+
+  /* Modal */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.55); display:none; align-items:center; justify-content:center;
+                    z-index:4500; padding:18px; }
+  .modal-card { width:540px; max-width:95vw; background:#fff; border-radius:16px; border:1px solid rgba(15,23,42,.10);
+                padding:16px; box-shadow:0 20px 45px rgba(0,0,0,.25); }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+  .modal-title { font-size:14px; font-weight:900; color:#0f172a; }
+  .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; flex-wrap:wrap; }
+</style>
+{% endblock %}
+
+{% block content %}
+{% include "selection.html" %}
+<div style="height: 18px;"></div>
+
+<div id="root" class="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" data-user-hash="{{ session_user_hash }}">
+  <div class="panel-head" style="margin-bottom: 20px;">
+    <div>
+      <div class="title">Environments</div>
+      <div class="muted">Store encrypted <span class="mono">.env</span> blobs per stage and export them safely for notebooks.</div>
+    </div>
+  </div>
+
+  {% if not has_tenant %}
+    <div class="card" style="text-align:center; padding:40px;">
+      <i class="fas fa-building-user fa-3x" style="color:#cbd5e1; margin-bottom:16px;"></i>
+      <div style="color:#64748b; font-weight:500;">Select a tenant to manage environments.</div>
+    </div>
+  {% else %}
+
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title"><i class="fas fa-sliders-h" style="color:#1c96ca;"></i> Environments</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-sm btn-azure-outline" id="btnEnvRefresh"><i class="fas fa-sync"></i> Refresh</button>
+        <button class="btn btn-sm btn-azure-outline" id="btnEnvCopyValues"><i class="fas fa-copy"></i> Copy values</button>
+        <button class="btn btn-sm btn-azure-outline" id="btnEnvCopyUrl" disabled><i class="fas fa-link"></i> Copy URL</button>
+        <button class="btn btn-sm btn-azure" id="btnEnvCreate"><i class="fas fa-plus"></i> Create environment</button>
+        <button class="btn btn-sm btn-danger-outline" id="btnEnvDelete" disabled><i class="fas fa-trash"></i> Delete</button>
+      </div>
+    </div>
+
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+      <div class="muted" style="font-weight:800;">Stage:</div>
+      <div id="envStagePills" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+      <span style="flex:1;"></span>
+      <button class="btn btn-sm btn-danger-outline" id="btnStageDelete" disabled><i class="fas fa-trash"></i> Delete</button>
+      <button class="btn btn-sm btn-azure" id="btnStageAdd"><i class="fas fa-plus"></i> + Add</button>
+    </div>
+
+    <div class="muted" id="envHint" style="margin-bottom:12px;">
+      Select an environment and a stage to view and edit values. Use <b>Copy URL</b> to mint a signed export link for notebooks.
+    </div>
+
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+      <div style="flex:0 0 320px; min-width:280px;">
+        <div class="panel" style="padding:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+            <div class="panel-title" style="font-size:12px;">Saved environments</div>
+            <div class="muted" id="envCount" style="font-size:12px;"></div>
+          </div>
+          <div id="envList" style="margin-top:10px;"></div>
+          <div id="envEmpty" class="muted" style="display:none; padding:10px;">No environments found.</div>
+        </div>
+      </div>
+
+      <div style="flex:1; min-width:340px;">
+        <div class="panel" style="padding:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+            <div>
+              <div class="panel-title" style="font-size:12px;">Editor</div>
+              <div class="muted mono" id="envEditorMeta" style="font-size:10px;"></div>
+            </div>
+            <div><button class="btn btn-sm btn-azure" id="btnEnvSave" disabled><i class="fas fa-save"></i> Save</button></div>
+          </div>
+
+          <textarea class="form-control mono" id="envEditor" placeholder="# KEY=VALUE" style="margin-top:10px; min-height:280px; font-size:12px;"></textarea>
+          <div class="muted" id="envValidateMsg" style="margin-top:8px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal-backdrop" id="modalStageAdd">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Add stage</div>
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalStageAdd"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="muted">Create a new stage (e.g. <span class="mono">qa</span>).</div>
+      <div style="height:10px;"></div>
+      <input class="form-control form-control-sm mono" id="stageAddName" placeholder="stage name" />
+      <div class="modal-actions">
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalStageAdd">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnStageAddConfirm">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modalStageDelete">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Delete stage</div>
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalStageDelete"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="muted">Type <span class="mono" id="stageDeleteTarget"></span> to confirm deletion.</div>
+      <div style="height:10px;"></div>
+      <input class="form-control form-control-sm mono" id="stageDeleteConfirm" placeholder="type stage name to confirm" />
+      <div class="modal-actions">
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalStageDelete">Cancel</button>
+        <button class="btn btn-sm btn-danger" id="btnStageDeleteConfirm">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modalEnvCreate">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Create environment</div>
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalEnvCreate"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="muted">Environment name (e.g. <span class="mono">app</span>). Values must follow <span class="mono">.env</span> format.</div>
+      <div style="height:10px;"></div>
+      <input class="form-control form-control-sm mono" id="envCreateName" placeholder="environment name" />
+      <div style="height:10px;"></div>
+      <textarea class="form-control mono" id="envCreateContent" placeholder="LOG_LEVEL=INFO" style="min-height:200px; font-size:12px;"></textarea>
+      <div class="muted" id="envCreateValidate" style="margin-top:8px;"></div>
+      <div class="modal-actions">
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalEnvCreate">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnEnvCreateConfirm">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modalEnvDelete">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Delete environment</div>
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalEnvDelete"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="muted">By default this deletes the environment across <b>all stages</b>. Type <span class="mono" id="envDeleteTarget"></span> to confirm.</div>
+      <div style="height:10px;"></div>
+      <input class="form-control form-control-sm mono" id="envDeleteConfirm" placeholder="type environment name to confirm" />
+      <div id="envDeleteStageRow" style="display:none; margin-top:10px;">
+        <label class="muted" style="display:flex; gap:8px; align-items:center; margin:0;">
+          <input type="checkbox" id="envDeleteOnlyStage" />
+          Only delete value for stage <span class="mono" id="envDeleteStageName"></span>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-sm btn-azure-outline" data-modal-close="modalEnvDelete">Cancel</button>
+        <button class="btn btn-sm btn-danger" id="btnEnvDeleteConfirm">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  {% endif %}
+</div>
+
+<div class="toast" id="toast"></div>
+{% endblock %}
+
+{% block body_scripts %}
+<script>
+(function () {
+  const lnEnv = document.getElementById("link-environments");
+  if (lnEnv) lnEnv.classList.add("active");
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = String(msg || '');
+    el.style.display = 'block';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { el.style.display = 'none'; }, 2500);
+  }
+
+  function root() { return document.getElementById('root'); }
+  function ctx() {
+    const r = root();
+    return { org: r ? (r.dataset.org || '') : '', sup: r ? (r.dataset.sup || '') : '', userHash: r ? (r.dataset.userHash || '') : '' };
+  }
+
+  async function postJSON(url, obj) {
+    const resp = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(obj||{}), credentials:"same-origin" });
+    const text = await resp.text();
+    let js = null; try { js = JSON.parse(text); } catch(e) {}
+    if (!resp.ok) throw new Error((js && (js.detail || js.error)) ? (js.detail || js.error) : (text || resp.statusText));
+    return js;
+  }
+  async function getJSON(url) {
+    const resp = await fetch(url, { credentials:"same-origin" });
+    const text = await resp.text();
+    let js = null; try { js = JSON.parse(text); } catch(e) {}
+    if (!resp.ok) throw new Error((js && (js.detail || js.error)) ? (js.detail || js.error) : (text || resp.statusText));
+    return js;
+  }
+
+  const envsState = { inited:false, stages:[], selectedStage:'', envs:[], selectedEnv:'', loadedContent:'' };
+
+  function modalShow(id) { const el = document.getElementById(id); if (!el) return; el.style.display='flex'; const f = el.querySelector('input, textarea, button'); if (f) setTimeout(()=>{try{f.focus();}catch(e){}},0); }
+  function modalHide(id) { const el = document.getElementById(id); if (el) el.style.display='none'; }
+
+  function bindModalCloseHandlers() {
+    document.querySelectorAll('[data-modal-close]').forEach(btn => btn.addEventListener('click', (ev) => { ev.preventDefault(); const id = btn.getAttribute('data-modal-close'); if (id) modalHide(id); }));
+    ['modalStageAdd','modalStageDelete','modalEnvCreate','modalEnvDelete'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('click', (ev) => { if (ev.target === el) modalHide(id); });
+    });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Escape') return;
+      ['modalStageAdd','modalStageDelete','modalEnvCreate','modalEnvDelete'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.style.display === 'flex') modalHide(id);
+      });
+    });
+  }
+
+  function validateDotenvText(text) {
+    const lines = String(text || '').split('\n');
+    for (let i=0;i<lines.length;i++) {
+      const raw = lines[i];
+      let line = (raw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      if (line.toLowerCase().startsWith('export ')) line = line.slice(7).trim();
+      const eq = line.indexOf('=');
+      if (eq < 1) return `line ${i+1}: expected KEY=VALUE`;
+      const key = line.slice(0,eq).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return `line ${i+1}: invalid key "${key}"`;
+    }
+    return null;
+  }
+
+  function envsUpdateButtons() {
+    document.getElementById('btnEnvDelete').disabled = !envsState.selectedEnv;
+    document.getElementById('btnEnvCopyUrl').disabled = !(envsState.selectedEnv && envsState.selectedStage);
+    document.getElementById('btnStageDelete').disabled = !envsState.selectedStage;
+  }
+
+  function envsRenderStages() {
+    const wrap = document.getElementById('envStagePills');
+    wrap.innerHTML = '';
+    (envsState.stages || []).forEach(st => {
+      const sp = document.createElement('span');
+      sp.className = 'pill pill-btn stage-pill' + (envsState.selectedStage === st ? ' active' : '');
+      sp.textContent = st;
+      sp.onclick = () => envsSelectStage(st);
+      wrap.appendChild(sp);
+    });
+    envsUpdateButtons();
+  }
+
+  function envsRenderList() {
+    const wrap = document.getElementById('envList');
+    const empty = document.getElementById('envEmpty');
+    const cnt = document.getElementById('envCount');
+
+    const items = envsState.envs || [];
+    cnt.textContent = `${items.length} environment(s)`;
+
+    wrap.innerHTML = '';
+    empty.style.display = items.length ? 'none' : 'block';
+
+    items.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'list-item' + (envsState.selectedEnv === it.name ? ' active' : '');
+      const at = it.last_updated_at ? new Date(it.last_updated_at * 1000).toLocaleString() : '';
+      const by = it.last_updated_by || '';
+      div.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+          <div style="font-weight:800; color:#0f172a;">${it.name}</div>
+          <div class="muted mono" style="font-size:10px;">${at}</div>
+        </div>
+        <div class="muted mono" style="font-size:10px; margin-top:2px;">${by ? ('by ' + by) : ''}</div>
+      `;
+      div.onclick = () => envsSelectEnv(it.name);
+      wrap.appendChild(div);
+    });
+
+    envsUpdateButtons();
+  }
+
+  function envsSetEditorMeta(meta) { document.getElementById('envEditorMeta').textContent = meta || ''; }
+
+  function envsComputeSaveState() {
+    const ed = document.getElementById('envEditor');
+    const btn = document.getElementById('btnEnvSave');
+    const msg = document.getElementById('envValidateMsg');
+
+    if (!envsState.selectedEnv || !envsState.selectedStage) {
+      btn.disabled = true; msg.textContent = ''; envsUpdateButtons(); return;
+    }
+    const text = ed.value || '';
+    const err = validateDotenvText(text);
+    msg.textContent = err ? err : '';
+    if (err) { btn.disabled = true; envsUpdateButtons(); return; }
+    btn.disabled = (text === envsState.loadedContent);
+    envsUpdateButtons();
+  }
+
+  async function envsLoadStages() {
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/environments/envs/stages?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    envsState.stages = js.stages || [];
+    if (!envsState.selectedStage && envsState.stages.length) envsState.selectedStage = envsState.stages[0];
+    envsRenderStages();
+  }
+
+  async function envsLoadList() {
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/environments/envs/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    envsState.envs = js.items || [];
+    envsRenderList();
+  }
+
+  async function envsLoadSelected() {
+    const { org, sup } = ctx();
+    const ed = document.getElementById('envEditor');
+
+    if (!org || !sup || !envsState.selectedEnv || !envsState.selectedStage) {
+      ed.value = ''; envsState.loadedContent=''; envsSetEditorMeta(''); envsComputeSaveState(); return;
+    }
+
+    const js = await postJSON('/reflection/environments/envs/get', { org, sup, name: envsState.selectedEnv, stage: envsState.selectedStage });
+    ed.value = (js && js.content) ? js.content : '';
+    envsState.loadedContent = ed.value;
+
+    const at = js.updated_at ? new Date(js.updated_at * 1000).toLocaleString() : '';
+    const by = js.updated_by || '';
+    envsSetEditorMeta(`${envsState.selectedEnv} • ${envsState.selectedStage}${by ? (' • by ' + by) : ''}${at ? (' • ' + at) : ''}`);
+    envsComputeSaveState();
+  }
+
+  function envsSelectStage(stage) { envsState.selectedStage = stage || ''; envsRenderStages(); envsLoadSelected().catch(e => toast(e.message || String(e))); }
+  function envsSelectEnv(name) { envsState.selectedEnv = name || ''; envsRenderList(); envsLoadSelected().catch(e => toast(e.message || String(e))); }
+
+  async function envsSave() {
+    const { org, sup, userHash } = ctx();
+    const ed = document.getElementById('envEditor');
+    const err = validateDotenvText(ed.value || '');
+    if (err) { toast(err); return; }
+    await postJSON('/reflection/environments/envs/update', { org, sup, name: envsState.selectedEnv, stage: envsState.selectedStage, content: ed.value || '', user_hash: userHash || '' });
+    toast('Saved');
+    await envsLoadList();
+    await envsLoadSelected();
+  }
+
+  async function envsCreate(name, content) {
+    const { org, sup, userHash } = ctx();
+    const err = validateDotenvText(content || '');
+    if (err) throw new Error(err);
+    await postJSON('/reflection/environments/envs/create', { org, sup, name, stage: envsState.selectedStage, content, user_hash: userHash || '' });
+    toast('Created');
+    await envsLoadList();
+  }
+
+  async function envsDeleteSelected(stage) {
+    const { org, sup } = ctx();
+    const nm = envsState.selectedEnv;
+    const st = (stage || '').trim();
+    const extra = st ? `&stage=${encodeURIComponent(st)}` : '';
+    const resp = await fetch(`/reflection/environments/envs/${encodeURIComponent(nm)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}${extra}`, { method:'DELETE', credentials:'same-origin' });
+    if (!resp.ok) throw new Error(await resp.text());
+    toast(stage ? 'Deleted for stage' : 'Deleted');
+    document.getElementById('envEditor').value = '';
+    envsState.loadedContent = '';
+    envsSetEditorMeta('');
+    if (!stage) envsState.selectedEnv = '';
+    await envsLoadList();
+    envsRenderList();
+    await envsLoadSelected();
+    envsComputeSaveState();
+  }
+
+  async function envsStageAdd(stage) {
+    const { org, sup, userHash } = ctx();
+    await postJSON('/reflection/environments/envs/stages/add', { org, sup, stage, user_hash: userHash || '' });
+    toast('Stage added');
+    await envsLoadStages();
+  }
+
+  async function envsStageDelete(stage) {
+    const { org, sup, userHash } = ctx();
+    await postJSON('/reflection/environments/envs/stages/delete', { org, sup, stage, user_hash: userHash || '' });
+    toast('Stage deleted');
+    envsState.selectedStage = '';
+    await envsLoadStages();
+    await envsLoadSelected();
+  }
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(String(text || '')); return true; } catch (e) {}
+    return false;
+  }
+
+  async function envsCopyValues() {
+    const ed = document.getElementById('envEditor');
+    const text = ed ? (ed.value || '') : '';
+    if (await copyText(text)) { toast('Copied'); return; }
+    try { ed.select(); document.execCommand('copy'); toast('Copied'); } catch (e) { toast('Copy failed'); }
+  }
+
+  async function envsCopyUrl() {
+    const { org, sup } = ctx();
+    if (!org || !sup || !envsState.selectedEnv || !envsState.selectedStage) { toast('Select an environment and stage first'); return; }
+    const js = await postJSON('/reflection/environments/envs/export_url', { org, sup, name: envsState.selectedEnv, stage: envsState.selectedStage, ttl_seconds: 365*24*3600 });
+    const rel = (js && js.relative_url) ? js.relative_url : '';
+    if (!rel) { toast('Could not mint URL'); return; }
+    if (await copyText(rel)) { toast('Export URL copied'); return; }
+    toast('Copy failed');
+  }
+
+  function envsBindUI() {
+    document.getElementById('btnEnvRefresh').addEventListener('click', () => envsRefresh().catch(e => toast(e.message || String(e))));
+    document.getElementById('btnEnvCopyValues').addEventListener('click', () => envsCopyValues().catch(e => toast(e.message || String(e))));
+    document.getElementById('btnEnvCopyUrl').addEventListener('click', () => envsCopyUrl().catch(e => toast(e.message || String(e))));
+    document.getElementById('btnEnvSave').addEventListener('click', () => envsSave().catch(e => toast(e.message || String(e))));
+    document.getElementById('envEditor').addEventListener('input', () => envsComputeSaveState());
+
+    document.getElementById('btnStageAdd').addEventListener('click', () => { document.getElementById('stageAddName').value=''; modalShow('modalStageAdd'); });
+    document.getElementById('btnStageDelete').addEventListener('click', () => {
+      if (!envsState.selectedStage) return;
+      document.getElementById('stageDeleteTarget').textContent = envsState.selectedStage;
+      document.getElementById('stageDeleteConfirm').value = '';
+      modalShow('modalStageDelete');
+    });
+
+    document.getElementById('btnStageAddConfirm').addEventListener('click', () => {
+      const stage = (document.getElementById('stageAddName').value || '').trim();
+      if (!stage) { toast('Stage is required'); return; }
+      envsStageAdd(stage).then(() => modalHide('modalStageAdd')).catch(e => toast(e.message || String(e)));
+    });
+
+    document.getElementById('btnStageDeleteConfirm').addEventListener('click', () => {
+      const want = envsState.selectedStage;
+      const typed = (document.getElementById('stageDeleteConfirm').value || '').trim();
+      if (typed !== want) { toast('Confirmation does not match'); return; }
+      envsStageDelete(want).then(() => modalHide('modalStageDelete')).catch(e => toast(e.message || String(e)));
+    });
+
+    document.getElementById('btnEnvCreate').addEventListener('click', () => {
+      if (!envsState.selectedStage) { toast('Select a stage first'); return; }
+      document.getElementById('envCreateName').value='';
+      document.getElementById('envCreateContent').value='';
+      document.getElementById('envCreateValidate').textContent='';
+      modalShow('modalEnvCreate');
+    });
+
+    document.getElementById('envCreateContent').addEventListener('input', () => {
+      const err = validateDotenvText(document.getElementById('envCreateContent').value || '');
+      document.getElementById('envCreateValidate').textContent = err ? err : '';
+    });
+
+    document.getElementById('btnEnvCreateConfirm').addEventListener('click', () => {
+      const name = (document.getElementById('envCreateName').value || '').trim();
+      const content = document.getElementById('envCreateContent').value || '';
+      if (!name) { toast('Name is required'); return; }
+      const err = validateDotenvText(content);
+      document.getElementById('envCreateValidate').textContent = err ? err : '';
+      if (err) { toast(err); return; }
+      envsCreate(name, content).then(() => { modalHide('modalEnvCreate'); envsSelectEnv(name); }).catch(e => toast(e.message || String(e)));
+    });
+
+    document.getElementById('btnEnvDelete').addEventListener('click', () => {
+      if (!envsState.selectedEnv) return;
+      document.getElementById('envDeleteTarget').textContent = envsState.selectedEnv;
+      document.getElementById('envDeleteConfirm').value = '';
+      document.getElementById('envDeleteOnlyStage').checked = false;
+      if (envsState.selectedStage) {
+        document.getElementById('envDeleteStageRow').style.display = 'block';
+        document.getElementById('envDeleteStageName').textContent = envsState.selectedStage;
+      } else {
+        document.getElementById('envDeleteStageRow').style.display = 'none';
+      }
+      modalShow('modalEnvDelete');
+    });
+
+    document.getElementById('btnEnvDeleteConfirm').addEventListener('click', () => {
+      const want = envsState.selectedEnv;
+      const typed = (document.getElementById('envDeleteConfirm').value || '').trim();
+      if (typed !== want) { toast('Confirmation does not match'); return; }
+      const delStage = (document.getElementById('envDeleteOnlyStage').checked) ? envsState.selectedStage : '';
+      envsDeleteSelected(delStage).then(() => modalHide('modalEnvDelete')).catch(e => toast(e.message || String(e)));
+    });
+  }
+
+  async function envsRefresh() {
+    await envsLoadStages();
+    await envsLoadList();
+    await envsLoadSelected();
+    envsComputeSaveState();
+  }
+
+  function envsInit() {
+    if (envsState.inited) return;
+    envsState.inited = true;
+    bindModalCloseHandlers();
+    envsBindUI();
+    envsRefresh().catch(e => toast(e.message || String(e)));
+  }
+
+  envsInit();
+})();
+</script>
+{% endblock %}
