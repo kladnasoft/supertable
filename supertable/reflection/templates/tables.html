@@ -926,7 +926,7 @@
       });
     }
 
-    const META_BASE = 'http://0.0.0.0:8080';
+    const META_BASE = '';
     // Organization + user_hash must be per-login (session cookie). No hardcoded tenants.
     const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
     const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};

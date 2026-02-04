@@ -82,7 +82,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
     allow_imports_raw = (
         os.getenv("SUPERTABLE_LAB_ALLOWED_IMPORTS")
         or os.getenv("SUPERTABLE_NOTEBOOK_ALLOWED_IMPORTS")
-        or "math,re,json,datetime,statistics,random,decimal,collections,itertools,functools,typing,pandas,pyarrow,numpy,supertable"
+        or "math,re,json,datetime,statistics,random,decimal,collections,itertools,functools,typing,pandas,pyarrow,numpy,supertable,requests,airbyte"
     )
     allow_imports = allow_imports_raw.split(",")
 
@@ -414,6 +414,55 @@ def attach_studio_routes(
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return {"ok": True, "job": job.model_dump()}
+
+    
+
+    @router.get("/reflection/studio/connectors")
+    async def api_connectors(_: Any = Depends(logged_in_guard_api)):
+        try:
+            import airbyte as ab  # type: ignore
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="airbyte package not available") from e
+
+        try:
+            items = ab.get_available_connectors()
+            if not isinstance(items, (list, tuple)):
+                items = list(items) if items else []
+            return {"ok": True, "items": list(items)}
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to list connectors: {e}"
+            ) from e
+
+    @router.get("/reflection/studio/connectors/spec")
+    async def api_connector_spec(
+        name: str = Query(..., min_length=1, max_length=200),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        try:
+            import airbyte as ab  # type: ignore
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="airbyte package not available") from e
+
+        try:
+            spec: Any
+            try:
+                src = ab.get_source(name, config=None, no_executor=True)
+                spec = src.config_spec
+            except Exception:
+                # Fallback to a local executor-based spec fetch if needed
+                src = ab.get_source(name, config=None, install_if_missing=True)
+                spec = src.config_spec
+
+            if not isinstance(spec, dict):
+                raise HTTPException(status_code=500, detail="Invalid connector spec")
+            return {"ok": True, "name": name, "spec": spec}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to fetch connector spec: {e}"
+            ) from e
 
     @router.post("/reflection/notebooks/kernel/reset")
     @router.post("/reflection/lab/kernel/reset")

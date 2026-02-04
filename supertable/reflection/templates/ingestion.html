@@ -12,7 +12,7 @@
     margin-top: 16px;
     border-bottom: 1px solid #e2e8f0;
     padding: 0 2px;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
   }
 
   .tab {
@@ -322,26 +322,7 @@
 
 <div style="height: 18px;"></div>
 
-<div id="stagingRoot"
-     data-org="{{ sel_org }}"
-     data-sup="{{ sel_sup }}"
-     data-user-hash="{{ session_user_hash }}"
-     style="
-        background: #ffffff;
-        border-radius: 16px;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-        padding: 24px 28px;
-        border: 1px solid rgba(0, 0, 0, 0.05);
-        border-left: 5px solid #1c96ca;
-     ">
-
-  <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-    <div>
-      <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Ingestion</div>
-    </div>
-  </div>
-
-  <div id="tab-navigation" style="margin-top: 16px;">
+<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
     <div id="tab-load" class="tab active" onclick="switchTab('load')">
       <i class="fas fa-upload"></i><span>Load Data</span>
     </div>
@@ -355,10 +336,33 @@
     </div>
   </div>
 
+<div style="height: 10px;"></div>
+
+<div id="stagingRoot"
+     data-org="{{ sel_org }}"
+     data-sup="{{ sel_sup }}"
+     data-user-hash="{{ session_user_hash }}"
+     style="
+        background: #ffffff;
+        border-radius: 16px;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+        padding: 24px 28px;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        border-left: 5px solid #1c96ca;
+     ">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; display:none;">
+    <div>
+      <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Ingestion</div>
+    </div>
+  </div>
+
+  
+
   <!-- -------------------- STAGING TAB -------------------- -->
   <div class="tabpane hidden" id="pane-staging">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Staging</div>
+      <div class="muted">Staging</div>
       <button type="button" id="btnCreateStaging" class="btn btn-sm btn-azure-outline">
         <i class="fas fa-plus"></i> Create staging
       </button>
@@ -375,7 +379,7 @@
   <!-- -------------------- PIPE TAB -------------------- -->
   <div class="tabpane hidden" id="pane-pipe">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div style="font-size: 14px; font-weight: 900; color:#0f172a;">Pipe</div>
+      <div class="muted">Pipe</div>
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
         <select id="pipeStagingSelect" class="input" style="min-width: 240px; border-radius: 12px; padding: 8px 10px; border: 1px solid rgba(15,23,42,.14);">
           <option value="">Select staging…</option>
@@ -423,7 +427,7 @@
   <div class="tabpane" id="pane-load">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
       <div>
-        <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Load Data</div>
+        <div class="muted">Load Data</div>
         <div class="muted" style="margin-top:4px;">Upload a file and load into a table, or stage it for later.</div>
       </div>
     </div>

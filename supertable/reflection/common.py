@@ -2114,6 +2114,61 @@ def staging_page(
 # ---------------------------------------------------------------------------
 # Ingestion UI + API routes (moved out for clarity)
 # ---------------------------------------------------------------------------
+@router.get("/reflection/ingestion/tables")
+def ingestion_tables_list(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    organization: Optional[str] = Query(None),
+    super_name: Optional[str] = Query(None),
+    user_hash: str = Query(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Return table names for ingestion UI autocomplete.
+
+    Accepts both (org, sup) and (organization, super_name) query params for compatibility.
+    """
+    org_val = (org or organization or "").strip()
+    sup_val = (sup or super_name or "").strip()
+    uhash = (user_hash or "").strip()
+
+    if not org_val or not sup_val or not uhash:
+        return {"ok": True, "tables": []}
+
+    # Prevent using another user's hash unless the requester is a superuser.
+    sess = get_session(request) or {}
+    sess_hash = (sess.get("user_hash") or "").strip()
+    if sess_hash and sess_hash != uhash and not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        mr = MetaReader(organization=org_val, super_name=sup_val)
+        meta = mr.get_super_meta(uhash) or {}
+    except Exception as e:
+        logger.warning("Failed to fetch super meta for ingestion tables (%s/%s): %s", org_val, sup_val, e)
+        return {"ok": True, "tables": []}
+
+    super_meta = meta.get("super", {}) if isinstance(meta, dict) else {}
+    raw_tables = []
+    try:
+        raw_tables = super_meta.get("tables") if isinstance(super_meta, dict) else None
+    except Exception:
+        raw_tables = None
+
+    names: List[str] = []
+    if isinstance(raw_tables, list):
+        for t in raw_tables:
+            if isinstance(t, str):
+                name = t.strip()
+            elif isinstance(t, dict):
+                name = str(t.get("name") or "").strip()
+            else:
+                name = str(t or "").strip()
+            if name and name not in names:
+                names.append(name)
+
+    return {"ok": True, "tables": names}
+
 
 from supertable.reflection.ingestion import attach_ingestion_routes  # noqa: E402
 

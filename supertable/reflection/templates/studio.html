@@ -4,6 +4,7 @@
 
 {% block head_extra %}
 <style>
+  :root { --azure: #1c96ca; }
   .muted { color:#64748b; font-size: 12px; }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -32,15 +33,14 @@
     color:#0f172a;
   }
 
-  /* Admin-like tab bar (matches admin.html) */
+  /* Vault/Compute-style tab bar (matches vault.html / compute.html) */
   #tab-navigation {
     display: flex;
+    align-items: center;
     gap: 24px;
-    margin-top: 16px;
-    border-bottom: 1px solid #e2e8f0;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.12);
     padding: 0 2px;
     flex-wrap: wrap;
-    align-items: center;
   }
 
   .tab {
@@ -51,27 +51,30 @@
     background: transparent;
     cursor: pointer;
     font-size: 13px;
-    color: #64748b;
+    color: #0f172a;
     display: inline-flex;
     align-items: center;
     gap: 6px;
     user-select: none;
   }
 
+  .tab i { font-size: 13px; color: inherit; }
+
   .tab.active {
-    color: #1c96ca;
-    border-bottom-color: #1c96ca;
+    color: var(--azure, #1c96ca);
+    border-bottom-color: var(--azure, #1c96ca);
     font-weight: 500;
   }
 
   .tab-sep {
-    color:#94a3b8;
-    margin: 0 6px;
-    font-size: 13px;
-    user-select:none;
+    width: 1px;
+    height: 22px;
+    margin: 0 10px;
+    background: rgba(15, 23, 42, 0.12);
+    user-select: none;
   }
 
-  .tab-add {
+.tab-add {
     min-width: 22px;
     height: 22px;
     border-radius: 999px;
@@ -121,6 +124,11 @@
     border-radius: 16px;
     background: #fff;
     padding: 14px 14px;
+  }
+
+  .panel-inset {
+    background: rgba(248,250,252,.65);
+    border-color: rgba(15,23,42,.08);
   }
 
   .panel + .panel { margin-top: 12px; }
@@ -273,6 +281,22 @@
   .output.ok { border-left: 4px solid rgba(16,185,129,0.7); }
   .output pre { margin:0; white-space: pre-wrap; }
 
+  .md-preview {
+    margin-top: 10px;
+    border-radius: 14px;
+    border: 1px solid rgba(15,23,42,.10);
+    background: rgba(255,255,255,.92);
+    padding: 10px 12px;
+    font-size: 13px;
+    color:#0f172a;
+    display:none;
+  }
+  .md-preview h1, .md-preview h2, .md-preview h3 { margin: 0 0 8px 0; }
+  .md-preview p { margin: 0 0 8px 0; }
+  .md-preview code { background: rgba(15,23,42,.06); padding: 1px 4px; border-radius: 6px; }
+  .md-preview pre { background: rgba(15,23,42,.06); padding: 10px; border-radius: 12px; overflow:auto; }
+
+
   /* Tiny toast */
   .toast {
     position: fixed;
@@ -379,11 +403,33 @@
 
 <div style="height: 18px;"></div>
 
+
+<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
+  <button id="tab-list" type="button" class="tab active" data-pane="list" onclick="switchTab('list')" aria-selected="true">
+    <i class="fas fa-list"></i><span>Studio</span>
+  </button>
+
+  <div class="tab-sep" aria-hidden="true"></div>
+
+  <button id="tab-snippets" type="button" class="tab" data-pane="snippets" onclick="switchTab('snippets')" aria-selected="false">
+    <i class="fas fa-wand-magic-sparkles"></i><span>Snippets</span>
+  </button>
+
+  <div class="tab-sep" aria-hidden="true"></div>
+
+  <button type="button" class="tab-add" id="btnNewNotebook" title="New lab">+</button>
+
+  <div id="openTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
+</div>
+
+<div style="height: 10px;"></div>
+
 <div id="nbRoot"
      class="nb-root"
      data-org="{{ sel_org }}"
      data-sup="{{ sel_sup }}"
      data-user-hash="{{ session_user_hash }}"
+     data-user-name="{{ session_username }}"
 >
   <div class="nb-topbar">
     <div>
@@ -394,20 +440,7 @@
     </div>
   </div>
 
-  <div id="tab-navigation">
-    <button type="button" class="tab active" data-pane="list">
-      <i class="fas fa-list"></i> Studio
-    </button>
-    <button type="button" class="tab" data-pane="snippets">
-      <i class="fas fa-wand-magic-sparkles"></i> Snippets
-    </button>
 
-    <span class="tab-sep">|</span>
-
-    <button type="button" class="tab-add" id="btnNewNotebook" title="New lab">+</button>
-
-    <div id="openTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
-  </div>
 
   {% if not has_tenant %}
     <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
@@ -417,7 +450,7 @@
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title"><i class="fas fa-flask" style="color:#1c96ca;"></i> Studio</div>
-          <div class="muted">Stored locally for now. Creator = your session user hash.</div>
+          <div class="muted">Stored locally for now. Creator = your username.</div>
         </div>
 
         <div class="toolbar">
@@ -504,35 +537,49 @@
             <button type="button" class="btn btn-sm btn-danger-outline" id="btnStop">
               <i class="fas fa-stop"></i> Stop
             </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
+              <i class="fas fa-save"></i> Save
+            </button>
+                        <button type="button" class="btn btn-sm btn-azure-outline" id="btnDownloadNotebook">
+              <i class="fas fa-download"></i> Download
+            </button>
+<button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab" style="display:none;">
+              <i class="fas fa-xmark"></i> Close
+            </button>
           </div>
         </div>
 
-        <!-- Row 2: + / delete / search snippets / run -->
-        <div class="editor-subbar">
-          <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCellTop" title="Add cell">
-            <i class="fas fa-plus"></i>
-          </button>
-          <button type="button" class="btn btn-sm btn-danger-outline" id="btnDeleteActiveCell" title="Delete active cell">
-            <i class="fas fa-trash"></i>
-          </button>
-          <button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
-            <i class="fas fa-magnifying-glass"></i>
-          </button>
-          <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunActive" title="Run active cell">
-            <i class="fas fa-play"></i>
-          </button>
+        <!-- Cells -->
+        <div class="panel panel-inset" style="padding:12px; margin-top:12px;">
+          <div class="panel-title" style="font-size:12px; margin-bottom:8px;">
+            <i class="fas fa-table-cells" style="color:var(--azure, #1c96ca);"></i> Cells
+          </div>
 
-          <div style="flex:1;"></div>
+          <div class="editor-subbar" style="margin-top:0;">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCellTop" title="Add cell">
+              <i class="fas fa-plus"></i>
+            </button>
+            <button type="button" class="btn btn-sm btn-danger-outline" id="btnDeleteActiveCell" title="Delete active cell">
+              <i class="fas fa-trash"></i>
+            </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunActive" title="Run active cell">
+              <i class="fas fa-play"></i>
+            </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
+              <i class="fas fa-magnifying-glass"></i> Snippets
+            </button>
 
-          <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
-            <i class="fas fa-save"></i> Save
-          </button>
-          <button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab">
-            <i class="fas fa-xmark"></i> Close
-          </button>
+                        <button type="button" class="btn btn-sm btn-azure-outline" id="btnVaultPicker" title="Search vault envs">
+              <i class="fas fa-lock"></i> Vault
+            </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnConnectorPicker" title="Search Airbyte connectors">
+              <i class="fas fa-plug"></i> Connectors
+            </button>
+<div style="flex:1;"></div>
+          </div>
+
+          <div id="cells"></div>
         </div>
-
-        <div id="cells"></div>
       </div>
     </div>
   {% endif %}
@@ -579,8 +626,18 @@
       org: el ? (el.dataset.org || "") : "",
       sup: el ? (el.dataset.sup || "") : "",
       userHash: el ? (el.dataset.userHash || "") : "",
+      userName: el ? (el.dataset.userName || "") : "",
     };
   }
+
+  function displayCreator(val) {
+    const { userHash, userName } = currentCtx();
+    const v = String(val || '');
+    // Stored docs are per-user-hash; show username for legacy hash values.
+    if (userName && (v === userHash || !v || /^[0-9a-f]{12,}$/i.test(v))) return userName;
+    return v;
+  }
+
 
   function escapeHtml(str) {
     return String(str || "")
@@ -653,6 +710,19 @@
     return `${prefix}_${rnd}`;
   }
 
+  function normalizeCell(c) {
+    const obj = c || {};
+    const out = obj.output || null;
+    const hasOut = out && (String(out.stdout||'').trim() || String(out.stderr||'').trim() || String(out.meta||'').trim());
+    return {
+      id: obj.id ? String(obj.id) : genId('c'),
+      type: (obj.type === 'markdown') ? 'markdown' : 'code',
+      code: (typeof obj.code === 'string') ? obj.code : String(obj.code || ''),
+      output: hasOut ? { ok: !!out.ok, stdout: String(out.stdout||''), stderr: String(out.stderr||''), meta: String(out.meta||'') } : null,
+    };
+  }
+
+
   // -----------------------------
   // Storage models
   // -----------------------------
@@ -715,13 +785,19 @@
     // highlight base tabs only when in those panes
     document.querySelectorAll('#tab-navigation .tab[data-pane]').forEach(t => {
       const p = t.getAttribute('data-pane');
-      t.classList.toggle('active', (p === pane));
+      const isActive = (p === pane);
+      t.classList.toggle('active', isActive);
+      t.setAttribute('aria-selected', isActive ? 'true' : 'false');
     });
     if (pane === 'editor') {
       // base tabs not active
       document.querySelectorAll('#tab-navigation .tab[data-pane]').forEach(t => t.classList.remove('active'));
     }
   }
+
+  window.switchTab = function (name) {
+    setPane(String(name || ''));
+  };
 
   function renderOpenTabs() {
     const wrap = document.getElementById('openTabs');
@@ -771,15 +847,17 @@
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td><b>${escapeHtml(n.name || 'Untitled')}</b></td>
-        <td class="mono">${escapeHtml(String(n.creator || '').slice(0, 18))}</td>
+        <td class="mono">${escapeHtml(displayCreator(n.creator || ''))}</td>
         <td>${escapeHtml(fmt(n.created_at))}</td>
         <td>${escapeHtml(fmt(n.updated_at || n.created_at))}</td>
         <td>
           <button type="button" class="btn btn-sm btn-azure-outline" data-act="open"><i class="fas fa-up-right-from-square"></i> Open</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-act="download"><i class="fas fa-download"></i> Download</button>
           <button type="button" class="btn btn-sm btn-danger-outline" data-act="delete"><i class="fas fa-trash"></i> Delete</button>
         </td>
       `;
       tr.querySelector('button[data-act="open"]').addEventListener('click', () => openNotebookInTab(n.id));
+      tr.querySelector('button[data-act="download"]').addEventListener('click', () => downloadNotebookIpynb(n));
       tr.querySelector('button[data-act="delete"]').addEventListener('click', () => deleteNotebook(n.id));
       body.appendChild(tr);
     });
@@ -817,7 +895,7 @@
       tab_id: genId('tab'),
       notebook_id: nb.id,
       name: nb.name || 'Untitled',
-      cells: Array.isArray(nb.cells) && nb.cells.length ? nb.cells.map(c => ({ id: c.id || genId('c'), code: c.code || '' })) : [{ id: genId('c'), code: '' }],
+      cells: Array.isArray(nb.cells) && nb.cells.length ? nb.cells.map(normalizeCell) : [normalizeCell({})],
       creator: nb.creator || '',
       created_at: nb.created_at,
       updated_at: nb.updated_at || nb.created_at,
@@ -840,7 +918,7 @@
     const meta = document.getElementById('nbEditorMeta');
     if (name) name.value = doc.name || '';
     if (meta) {
-      const who = doc.creator ? String(doc.creator).slice(0, 18) : '';
+      const who = doc.creator ? displayCreator(doc.creator) : '';
       meta.textContent = `creator: ${who} • created: ${fmt(doc.created_at)}${doc.notebook_id ? '' : ' • (unsaved)'}`;
     }
 
@@ -871,13 +949,13 @@
   }
 
   function createNewNotebookTab() {
-    const { userHash } = currentCtx();
+    const { userHash, userName } = currentCtx();
     const tab = {
       tab_id: genId('tab'),
       notebook_id: null,
       name: `Untitled ${openDocs.length + 1}`,
-      cells: [{ id: genId('c'), code: "print('Ready. Add a cell or insert a snippet →')" }],
-      creator: userHash || '',
+      cells: [normalizeCell({ code: "print('Ready. Add a cell or insert a snippet →')" })],
+      creator: userName || userHash || '',
       created_at: nowISO(),
       updated_at: nowISO(),
       dirty: true,
@@ -904,16 +982,20 @@
       <div class="cell-head">
         <div class="cell-left">
           <span class="mono">In [${idx + 1}]</span>
+          <span class="muted" id="kind-${escapeHtml(cell.id)}" style="margin-left:8px;">${cell.type === 'markdown' ? 'Markdown' : 'Code'}</span>
           <span class="muted" id="status-${escapeHtml(cell.id)}"></span>
         </div>
         <div class="cell-actions">
-          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run"><i class="fas fa-play"></i> Run</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run"><i class="fas fa-play"></i> ${cell.type === 'markdown' ? 'Render' : 'Run'}</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="toggle-type" title="Toggle markdown/code">${cell.type === 'markdown' ? 'Code' : 'MD'}</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="clear-output" title="Clear output"><i class="fas fa-eraser"></i></button>
           <button type="button" class="btn btn-sm btn-azure-outline" data-action="add-below" title="Add cell below"><i class="fas fa-plus"></i></button>
           <button type="button" class="btn btn-sm btn-danger-outline" data-action="delete" title="Delete cell"><i class="fas fa-trash"></i></button>
         </div>
       </div>
       <div class="cell-body">
         <textarea class="codebox mono" spellcheck="false"></textarea>
+        <div class="md-preview" id="md-${escapeHtml(cell.id)}"></div>
         <div class="output mono" id="out-${escapeHtml(cell.id)}"></div>
       </div>
     `;
@@ -926,7 +1008,10 @@
         const doc = getActiveDoc();
         if (!doc) return;
         const found = doc.cells.find(c => c.id === cell.id);
-        if (found) found.code = ta.value;
+        if (found) {
+          found.code = ta.value;
+          if (found.type === 'markdown') renderMarkdownInto(cell.id, found.code);
+        }
         markDirty(doc);
       });
       ta.addEventListener('keydown', async (e) => {
@@ -944,13 +1029,131 @@
         e.preventDefault();
         const action = btn.getAttribute('data-action');
         if (action === 'run') await runCell(cell.id);
+        if (action === 'toggle-type') toggleCellType(cell.id);
+        if (action === 'clear-output') clearCellOutput(cell.id);
         if (action === 'add-below') addCellBelow(cell.id);
         if (action === 'delete') deleteCell(cell.id);
       });
     });
 
+    // apply current state
+    syncCellTypeDom(cell.id);
+    if (cell.type === 'markdown') renderMarkdownInto(cell.id, cell.code || '');
+    if (cell.output) setOutput(cell.id, !!cell.output.ok, cell.output.stdout || '', cell.output.stderr || '', cell.output.meta || '', false);
+
     return el;
   }
+
+  function syncCellTypeDom(cellId) {
+    const doc = getActiveDoc();
+    const cell = doc ? doc.cells.find(c => c.id === cellId) : null;
+    const typ = (cell && cell.type === 'markdown') ? 'markdown' : 'code';
+    const kind = document.getElementById(`kind-${cellId}`);
+    if (kind) kind.textContent = (typ === 'markdown') ? 'Markdown' : 'Code';
+    const cellWrap = document.querySelector(`.cell[data-id="${cssEsc(cellId)}"]`);
+    if (!cellWrap) return;
+    const runBtn = cellWrap.querySelector('button[data-action="run"]');
+    if (runBtn) runBtn.innerHTML = `<i class="fas fa-play"></i> ${typ === 'markdown' ? 'Render' : 'Run'}`;
+    const toggleBtn = cellWrap.querySelector('button[data-action="toggle-type"]');
+    if (toggleBtn) toggleBtn.textContent = (typ === 'markdown') ? 'Code' : 'MD';
+    const md = document.getElementById(`md-${cellId}`);
+    const out = document.getElementById(`out-${cellId}`);
+    if (md) md.style.display = (typ === 'markdown') ? '' : 'none';
+    if (out) {
+      if (typ === 'markdown') out.style.display = 'none';
+      // for code cells, setOutput controls display
+    }
+  }
+
+  function clearCellOutput(cellId) {
+    const doc = getActiveDoc();
+    if (doc) {
+      const cell = doc.cells.find(c => c.id === cellId);
+      if (cell) { cell.output = null; markDirty(doc); }
+    }
+    const out = document.getElementById(`out-${cellId}`);
+    if (out) { out.innerHTML = ''; out.style.display = 'none'; }
+  }
+
+  function renderMarkdownSafe(raw) {
+    const src = String(raw || '');
+    const parts = [];
+    const reFence = /```([\s\S]*?)```/g;
+    let last = 0;
+    let m;
+    while ((m = reFence.exec(src)) !== null) {
+      if (m.index > last) parts.push({ t: 'text', v: src.slice(last, m.index) });
+      parts.push({ t: 'code', v: m[1] });
+      last = m.index + m[0].length;
+    }
+    if (last < src.length) parts.push({ t: 'text', v: src.slice(last) });
+
+    function inline(escaped) {
+      let s = String(escaped || '');
+      s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+      s = s.replace(/\*([^*]+)\*/g, '<i>$1</i>');
+      s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (full, txt, href) => {
+        const h = String(href || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').trim();
+        if (!/^https?:\/\//i.test(h) && !/^mailto:/i.test(h)) return full;
+        const safeHref = escapeHtml(h);
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+      });
+      return s;
+    }
+
+    let html = '';
+    parts.forEach(p => {
+      if (p.t === 'code') {
+        html += `<pre><code>${escapeHtml(p.v || '').replace(/^\n+/, '')}</code></pre>`;
+        return;
+      }
+      const blocks = String(p.v || '').split(/\n\s*\n/);
+      blocks.forEach(b => {
+        const lines = String(b || '').split('\n');
+        if (!lines.length) return;
+        const first = lines[0];
+        if (/^###\s+/.test(first)) {
+          html += `<h3>${inline(escapeHtml(first.replace(/^###\s+/, '')))}</h3>`;
+          lines.slice(1).forEach(ln => { if (String(ln||'').trim()) html += `<p>${inline(escapeHtml(ln))}</p>`; });
+          return;
+        }
+        if (/^##\s+/.test(first)) {
+          html += `<h2>${inline(escapeHtml(first.replace(/^##\s+/, '')))}</h2>`;
+          lines.slice(1).forEach(ln => { if (String(ln||'').trim()) html += `<p>${inline(escapeHtml(ln))}</p>`; });
+          return;
+        }
+        if (/^#\s+/.test(first)) {
+          html += `<h1>${inline(escapeHtml(first.replace(/^#\s+/, '')))}</h1>`;
+          lines.slice(1).forEach(ln => { if (String(ln||'').trim()) html += `<p>${inline(escapeHtml(ln))}</p>`; });
+          return;
+        }
+        const joined = lines.map(ln => inline(escapeHtml(ln))).join('<br>');
+        html += `<p>${joined}</p>`;
+      });
+    });
+    return html || '<div class="muted">(empty)</div>';
+  }
+
+  function renderMarkdownInto(cellId, raw) {
+    const md = document.getElementById(`md-${cellId}`);
+    if (!md) return;
+    md.innerHTML = renderMarkdownSafe(raw);
+    syncCellTypeDom(cellId);
+  }
+
+  function toggleCellType(cellId) {
+    const doc = getActiveDoc();
+    if (!doc) return;
+    const cell = doc.cells.find(c => c.id === cellId);
+    if (!cell) return;
+    cell.type = (cell.type === 'markdown') ? 'code' : 'markdown';
+    // switching to markdown means output is hidden
+    syncCellTypeDom(cellId);
+    if (cell.type === 'markdown') renderMarkdownInto(cellId, cell.code || '');
+    markDirty(doc);
+  }
+
 
   function renderCells() {
     const wrap = document.getElementById('cells');
@@ -966,7 +1169,7 @@
     const doc = getActiveDoc();
     if (!doc) return;
     const i = doc.cells.findIndex(c => c.id === id);
-    const item = { id: genId('c'), code: '' };
+    const item = normalizeCell({});
     if (i >= 0) doc.cells.splice(i + 1, 0, item);
     else doc.cells.push(item);
     activeCellId = item.id;
@@ -981,7 +1184,7 @@
   function addCellEnd() {
     const doc = getActiveDoc();
     if (!doc) return;
-    const item = { id: genId('c'), code: '' };
+    const item = normalizeCell({});
     doc.cells.push(item);
     activeCellId = item.id;
     markDirty(doc);
@@ -1052,6 +1255,10 @@
     t.innerHTML = title || 'Modal';
     b.innerHTML = bodyHtml || '';
     wrap.style.display = 'flex';
+
+    // Reset confirm button each time
+    c.innerHTML = '<i class="fas fa-check"></i> Save';
+    c.style.display = onConfirm ? '' : 'none';
 
     const close = () => {
       wrap.style.display = 'none';
@@ -1136,6 +1343,323 @@
     renderPick();
     setTimeout(() => { if (input) input.focus(); }, 50);
   }
+
+
+  let _vaultCache = { stages: [], items: [] };
+  let _connectorCache = null;
+
+  async function openVaultPicker() {
+    const { org, sup } = currentCtx();
+    if (!org || !sup) { alert('Select a tenant first.'); return; }
+
+    const body = `
+      <div class="muted" style="margin-bottom:8px;">Search vault envs and click one to view links/keys.</div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <input id="vaultQ" class="form-control form-control-sm" placeholder="Search envs..." />
+        <select id="vaultStage" class="form-control form-control-sm" style="max-width:180px;"></select>
+        <button type="button" class="btn btn-sm btn-azure-outline" id="vaultRefresh"><i class="fas fa-rotate"></i></button>
+      </div>
+      <div style="height:10px;"></div>
+      <div id="vaultList" style="display:flex; flex-direction:column; gap:10px;"></div>
+    `;
+    showModal('<i class="fas fa-lock"></i> Vault', body, null);
+
+    const input = document.getElementById('vaultQ');
+    const sel = document.getElementById('vaultStage');
+    const list = document.getElementById('vaultList');
+    const btnRef = document.getElementById('vaultRefresh');
+
+    async function refresh() {
+      try {
+        const res = await getJSON(`/reflection/vault/envs/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+        if (res && res.ok) _vaultCache = { stages: res.stages || [], items: res.items || [] };
+      } catch (e) {
+        toast('Vault list failed');
+      }
+      render();
+    }
+
+    function render() {
+      if (!list || !sel) return;
+      const qq = String((input || {}).value || '').trim().toLowerCase();
+      const stage = String((sel || {}).value || '');
+      const items = Array.isArray(_vaultCache.items) ? _vaultCache.items : [];
+
+      // stage options
+      sel.innerHTML = '';
+      const stages = Array.isArray(_vaultCache.stages) ? _vaultCache.stages : [];
+      stages.forEach((s, i) => {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s;
+        sel.appendChild(opt);
+        if (!stage && i === 0) sel.value = s;
+      });
+
+      const st = String((sel || {}).value || '');
+      const rows = items.filter(x => {
+        const hay = `${x.name||''} ${x.last_updated_by||''}`.toLowerCase();
+        return (!qq || hay.includes(qq));
+      }).slice(0, 50);
+
+      list.innerHTML = '';
+      if (!rows.length) {
+        list.innerHTML = '<div class="muted">No matches.</div>';
+        return;
+      }
+      rows.forEach(x => {
+        const div = document.createElement('div');
+        div.className = 'sn-card';
+        div.style.cursor = 'pointer';
+        div.innerHTML = `
+          <div class="top">
+            <div>
+              <div class="name"><i class="fas fa-file-shield" style="color:#1c96ca; margin-right:6px;"></i>${escapeHtml(x.name||'')}</div>
+              <div class="muted" style="margin-top:4px;">Last by ${escapeHtml(displayCreator(x.last_updated_by||''))}</div>
+            </div>
+            <div class="muted mono">${escapeHtml(st||'')}</div>
+          </div>
+        `;
+        div.addEventListener('click', () => openVaultEnvDetail(x.name, st));
+        list.appendChild(div);
+      });
+    }
+
+    if (btnRef) btnRef.addEventListener('click', (e) => { e.preventDefault(); refresh(); });
+    if (input) input.addEventListener('input', render);
+    if (sel) sel.addEventListener('change', render);
+
+    if (!_vaultCache.items.length) await refresh(); else render();
+    setTimeout(() => { if (input) input.focus(); }, 50);
+  }
+
+  function _parseDotenvKeys(content) {
+    const keys = [];
+    String(content || '').split(/\r?\n/).forEach(line => {
+      const s = String(line || '').trim();
+      if (!s || s.startsWith('#')) return;
+      const idx = s.indexOf('=');
+      if (idx <= 0) return;
+      const k = s.slice(0, idx).trim();
+      if (k) keys.push(k);
+    });
+    return keys;
+  }
+
+  async function openVaultEnvDetail(name, stage) {
+    const { org, sup } = currentCtx();
+    if (!org || !sup) return;
+    const qName = String(name||'');
+    const qStage = String(stage||'');
+    const res = await postJSON('/reflection/vault/envs/get', { org, sup, name: qName, stage: qStage });
+    const links = (res && res.links) ? res.links : {};
+    const primary = (links.primary && links.primary.url) ? links.primary.url : '';
+    const secondary = (links.secondary && links.secondary.url) ? links.secondary.url : '';
+    const raw = (links.raw && links.raw.url) ? links.raw.url : '';
+    const keys = _parseDotenvKeys((res && res.content) ? res.content : '');
+    const body = `
+      <div class="muted" style="margin-bottom:8px;">Select a link to insert the Vault loader, or click a key to insert <span class="mono">vault_vars.get("KEY")</span>.</div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        ${primary ? `<button type="button" class="btn btn-sm btn-azure-outline" id="vaultInsPrimary"><i class="fas fa-link"></i> Insert primary</button>` : ``}
+        ${secondary ? `<button type="button" class="btn btn-sm btn-azure-outline" id="vaultInsSecondary"><i class="fas fa-link"></i> Insert secondary</button>` : ``}
+        ${raw ? `<button type="button" class="btn btn-sm btn-azure-outline" id="vaultInsRaw"><i class="fas fa-link"></i> Insert raw</button>` : ``}
+      </div>
+      <div style="height:10px;"></div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <input id="vaultKeyQ" class="form-control form-control-sm" placeholder="Search keys..." />
+      </div>
+      <div style="height:10px;"></div>
+      <div id="vaultKeys" style="display:flex; flex-direction:column; gap:6px; max-height:320px; overflow:auto;"></div>
+    `;
+    showModal('<i class="fas fa-lock"></i> Vault: ' + escapeHtml(name||''), body, null);
+
+    const origin = window.location.origin || '';
+    function ins(urlPath) {
+      const full = (urlPath && urlPath.startsWith('/')) ? (origin + urlPath) : String(urlPath||'');
+      const snippet = [
+        'import requests',
+        '',
+        `url = "${full}"`,
+        'vault_data = requests.get(url, timeout=30).json()',
+        '',
+        'vault_vars = vault_data.get("vars", {})',
+        ''
+      ].join('\n');
+      insertSnippet(snippet);
+      toast('Inserted Vault loader');
+    }
+
+    const btnP = document.getElementById('vaultInsPrimary');
+    const btnS = document.getElementById('vaultInsSecondary');
+    const btnR = document.getElementById('vaultInsRaw');
+    if (btnP) btnP.addEventListener('click', (e) => { e.preventDefault(); ins(primary); });
+    if (btnS) btnS.addEventListener('click', (e) => { e.preventDefault(); ins(secondary); });
+    if (btnR) btnR.addEventListener('click', (e) => { e.preventDefault(); ins(raw); });
+
+    const keyInput = document.getElementById('vaultKeyQ');
+    const wrap = document.getElementById('vaultKeys');
+
+    function renderKeys() {
+      if (!wrap) return;
+      const qq = String((keyInput||{}).value || '').trim().toLowerCase();
+      const rows = keys.filter(k => !qq || String(k||'').toLowerCase().includes(qq)).slice(0, 200);
+      wrap.innerHTML = '';
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="muted">No keys.</div>';
+        return;
+      }
+      rows.forEach(k => {
+        const div = document.createElement('div');
+        div.className = 'sn-card';
+        div.style.cursor = 'pointer';
+        div.style.padding = '8px 10px';
+        div.innerHTML = `<div class="mono">${escapeHtml(k)}</div>`;
+        div.addEventListener('click', () => { insertSnippet(`vault_vars.get("${String(k).replaceAll('"','\\\"')}")`); toast('Inserted key'); });
+        wrap.appendChild(div);
+      });
+    }
+
+    if (keyInput) keyInput.addEventListener('input', renderKeys);
+    renderKeys();
+    setTimeout(() => { if (keyInput) keyInput.focus(); }, 50);
+  }
+
+  async function openConnectorPicker() {
+    const body = `
+      <div class="muted" style="margin-bottom:8px;">Search Airbyte connectors and click one to insert an auto-mapped setup (requires <span class="mono">vault_vars</span>).</div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <input id="conQ" class="form-control form-control-sm" placeholder="Search connectors..." />
+        <button type="button" class="btn btn-sm btn-azure-outline" id="conInsDiscovery"><i class="fas fa-wand-magic-sparkles"></i> Insert discovery snippet</button>
+      </div>
+      <div style="height:10px;"></div>
+      <div id="conList" style="display:flex; flex-direction:column; gap:10px; max-height:360px; overflow:auto;"></div>
+    `;
+    showModal('<i class="fas fa-plug"></i> Connectors', body, null);
+
+    const input = document.getElementById('conQ');
+    const list = document.getElementById('conList');
+    const btnDisc = document.getElementById('conInsDiscovery');
+
+    if (btnDisc) btnDisc.addEventListener('click', (e) => {
+      e.preventDefault();
+      const snippet = [
+        'import airbyte as ab',
+        '',
+        '# Get a list of all available source connectors',
+        'sources = ab.get_available_connectors()',
+        '',
+        '# Print the first 10 connectors to see their names',
+        'for source in sources[:10]:',
+        '    print(source)',
+        '',
+        '# To find a specific one, like MSSQL:',
+        'mssql_connectors = [s for s in sources if "mssql" in s.lower()]',
+        'print(f"Found MSSQL connectors: {mssql_connectors}")',
+        ''
+      ].join('\n');
+      insertSnippet(snippet);
+      toast('Inserted discovery snippet');
+    });
+
+    async function ensureList() {
+      if (_connectorCache) return _connectorCache;
+      const res = await getJSON('/reflection/studio/connectors');
+      _connectorCache = (res && res.ok && Array.isArray(res.items)) ? res.items : [];
+      return _connectorCache;
+    }
+
+    function buildConnectorSnippet(connectorName) {
+      const cn = String(connectorName || '').trim();
+      const snippet = [
+        'import airbyte as ab',
+        '',
+        '# Requires `vault_vars` from the Vault loader (see Vault button).',
+        `connector_name = "${cn}"`,
+        '',
+        '# Fetch the connector config schema (JSON Schema) and auto-map required keys from vault_vars.',
+        'spec = ab.get_source(connector_name, config=None, no_executor=True).config_spec',
+        'required = list(spec.get("required", []) or [])',
+        'properties = dict(spec.get("properties", {}) or {})',
+        '',
+        'def _norm_key(s: str) -> str:',
+        '    return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())',
+        '',
+        'def _score(cfg_key: str, prop: dict, vault_key: str) -> int:',
+        '    # strictly derived from the connector spec key/title/description (no hardcoded mappings)',
+        '    vk = _norm_key(vault_key)',
+        '    hint = " ".join([str(cfg_key or ""), str(prop.get("title") or ""), str(prop.get("description") or "")]).lower()',
+        '    best = 0',
+        '',
+        '    ck = _norm_key(cfg_key)',
+        '    if ck and (ck in vk or vk in ck):',
+        '        best = max(best, 50)',
+        '',
+        '    for tok in [t for t in re.split(r"[^a-z0-9]+", hint) if t]:',
+        '        if tok and tok in vk:',
+        '            best = max(best, 60)',
+        '',
+        '    best = max(best, len(set(_norm_key(hint)) & set(vk)))',
+        '    return best',
+        '',
+        'import re',
+        '',
+        'vault_keys = list(vault_vars.keys())',
+        'auto_mapping = {}  # Vault Key -> Airbyte Config Key',
+        'for cfg_key in required:',
+        '    prop = properties.get(cfg_key, {}) if isinstance(properties, dict) else {}',
+        '    best_key = None',
+        '    best_score = -1',
+        '    for vk in vault_keys:',
+        '        sc = _score(cfg_key, prop if isinstance(prop, dict) else {}, vk)',
+        '        if sc > best_score:',
+        '            best_score = sc',
+        '            best_key = vk',
+        '    if best_key and best_score >= 10:',
+        '        auto_mapping[best_key] = cfg_key',
+        '',
+        'source_config = {cfg_key: vault_vars.get(vault_key) for vault_key, cfg_key in auto_mapping.items()}',
+        '',
+        '# Apply schema defaults where available',
+        'for k, p in properties.items():',
+        '    if k not in source_config and isinstance(p, dict) and "default" in p:',
+        '        source_config[k] = p["default"]',
+        '',
+        'missing = [k for k in required if k not in source_config]',
+        'if missing:',
+        '    print(f"Missing required config keys (not found in vault_vars): {missing}")',
+        '',
+        '# Initialize the source',
+        'source = ab.get_source(connector_name, config=source_config)',
+        ''
+      ].join('\n');
+      return snippet;
+    }
+
+    async function render() {
+      if (!list) return;
+      const items = await ensureList();
+      const qq = String((input||{}).value || '').trim().toLowerCase();
+      const rows = items.filter(x => !qq || String(x||'').toLowerCase().includes(qq)).slice(0, 80);
+      list.innerHTML = '';
+      if (!rows.length) {
+        list.innerHTML = '<div class="muted">No matches.</div>';
+        return;
+      }
+      rows.forEach(name => {
+        const div = document.createElement('div');
+        div.className = 'sn-card';
+        div.style.cursor = 'pointer';
+        div.innerHTML = `<div class="top"><div class="name"><i class="fas fa-plug" style="color:#1c96ca; margin-right:6px;"></i>${escapeHtml(name)}</div></div>`;
+        div.addEventListener('click', () => { insertSnippet(buildConnectorSnippet(name)); toast('Inserted connector'); });
+        list.appendChild(div);
+      });
+    }
+
+    if (input) input.addEventListener('input', render);
+    await render();
+    setTimeout(() => { if (input) input.focus(); }, 50);
+  }
+
 
   async function copyToClipboard(text) {
     const t = String(text || '');
@@ -1265,10 +1789,10 @@
       const nb = {
         id,
         name: doc.name,
-        creator: userHash || doc.creator || '',
+        creator: userName || userHash || doc.creator || '',
         created_at: doc.created_at || nowISO(),
         updated_at: nowISO(),
-        cells: doc.cells.map(c => ({ id: c.id, code: c.code })),
+        cells: doc.cells.map(c => ({ id: c.id, type: c.type || 'code', code: c.code, output: c.output || null })),
       };
       notebooks.unshift(nb);
       saveNotebooks(notebooks);
@@ -1292,7 +1816,7 @@
         ...n,
         name: doc.name,
         updated_at: nowISO(),
-        cells: doc.cells.map(c => ({ id: c.id, code: c.code })),
+        cells: doc.cells.map(c => ({ id: c.id, type: c.type || 'code', code: c.code, output: c.output || null })),
       };
     });
     saveNotebooks(notebooks);
@@ -1304,23 +1828,99 @@
     toast('Studio updated');
   }
 
+  function _toSourceLines(txt) {
+    const s = String(txt || '');
+    if (!s) return [];
+    // Jupyter uses a list of strings; preserve newlines.
+    return s.split(/\n/).map((line, i, arr) => (i < arr.length - 1 ? line + '\n' : line));
+  }
+
+  function buildIpynbPayload(nbLike) {
+    const cells = (nbLike && Array.isArray(nbLike.cells)) ? nbLike.cells : [];
+    const ipCells = [];
+    cells.forEach(c => {
+      const typ = (c && c.type === 'markdown') ? 'markdown' : 'code';
+      if (typ === 'markdown') {
+        ipCells.push({
+          cell_type: 'markdown',
+          metadata: {},
+          source: _toSourceLines(c.code || ''),
+        });
+        return;
+      }
+      const outs = [];
+      const out = c && c.output ? c.output : null;
+      if (out && (String(out.stdout||'').trim() || String(out.stderr||'').trim())) {
+        if (String(out.stdout||'')) outs.push({ output_type: 'stream', name: 'stdout', text: _toSourceLines(out.stdout) });
+        if (String(out.stderr||'')) outs.push({ output_type: 'stream', name: 'stderr', text: _toSourceLines(out.stderr) });
+      }
+      ipCells.push({
+        cell_type: 'code',
+        metadata: {},
+        execution_count: null,
+        source: _toSourceLines(c.code || ''),
+        outputs: outs,
+      });
+    });
+    return {
+      cells: ipCells,
+      metadata: {
+        kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+        language_info: { name: 'python' },
+      },
+      nbformat: 4,
+      nbformat_minor: 5,
+    };
+  }
+
+  function downloadNotebookIpynb(nbLike) {
+    const name = String((nbLike && nbLike.name) ? nbLike.name : 'notebook').trim() || 'notebook';
+    const safe = name.replace(/[^a-z0-9\-_. ]/gi, '_').slice(0, 60).trim() || 'notebook';
+    const payload = buildIpynbPayload(nbLike);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/x-ipynb+json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safe}.ipynb`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 500);
+  }
+
+
+
   // -----------------------------
   // Run cells
   // -----------------------------
-  function setOutput(cellId, ok, stdout, stderr, meta) {
-    const box = document.getElementById(`out-${cellId}`);
-    if (!box) return;
+  function setOutput(cellId, ok, stdout, stderr, meta, persist = true) {
     const o = String(stdout || '');
     const e = String(stderr || '');
-    const m = meta ? String(meta) : '';
-    const has = (o.trim() || e.trim() || m.trim());
+    const mm = meta ? String(meta) : '';
+    const has = (o.trim() || e.trim() || mm.trim());
+
+    if (persist) {
+      const doc = getActiveDoc();
+      if (doc) {
+        const cell = doc.cells.find(c => c.id === cellId);
+        if (cell && cell.type !== 'markdown') {
+          cell.output = has ? { ok: !!ok, stdout: o, stderr: e, meta: mm } : null;
+          markDirty(doc);
+        }
+      }
+    }
+
+    const box = document.getElementById(`out-${cellId}`);
+    if (!box) return;
+
     box.style.display = has ? '' : 'none';
     box.className = 'output mono ' + (ok ? 'ok' : 'err');
     box.innerHTML = `
-      ${m ? `<div class="muted" style="margin-bottom:8px;">${escapeHtml(m)}</div>` : ``}
+      ${mm ? `<div class="muted" style="margin-bottom:8px;">${escapeHtml(mm)}</div>` : ``}
       ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><pre>${escapeHtml(o)}</pre></div>` : ``}
       ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><pre>${escapeHtml(e)}</pre></div>` : ``}
     `;
+    syncCellTypeDom(cellId);
   }
 
   function setStatus(cellId, txt) {
@@ -1346,6 +1946,12 @@
     if (!doc) return;
     const cell = doc.cells.find(c => c.id === cellId);
     if (!cell) return;
+
+    if (cell.type === 'markdown') {
+      renderMarkdownInto(cellId, cell.code || '');
+      setStatus(cellId, 'rendered');
+      return;
+    }
 
     const code = String(cell.code || '').trim();
     if (!code) return;
@@ -1476,6 +2082,12 @@
     const btnPick = document.getElementById('btnSnippetPicker');
     if (btnPick) btnPick.addEventListener('click', openSnippetPicker);
 
+    const btnVault = document.getElementById('btnVaultPicker');
+    if (btnVault) btnVault.addEventListener('click', openVaultPicker);
+
+    const btnConn = document.getElementById('btnConnectorPicker');
+    if (btnConn) btnConn.addEventListener('click', openConnectorPicker);
+
     const btnRunA = document.getElementById('btnRunActive');
     if (btnRunA) btnRunA.addEventListener('click', runActiveCell);
 
@@ -1487,6 +2099,12 @@
 
     const btnSave = document.getElementById('btnSaveNotebook');
     if (btnSave) btnSave.addEventListener('click', saveActiveNotebook);
+
+    const btnDl = document.getElementById('btnDownloadNotebook');
+    if (btnDl) btnDl.addEventListener('click', () => {
+      const doc = getActiveDoc();
+      if (doc) downloadNotebookIpynb(doc);
+    });
 
     const btnClose = document.getElementById('btnCloseTab');
     if (btnClose) btnClose.addEventListener('click', () => closeEditorTab(activeTabId));

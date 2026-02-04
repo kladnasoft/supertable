@@ -59,6 +59,12 @@
   .title { font-size:20px; font-weight:900; color:#0f172a; margin-bottom:4px; }
   .panel { border:1px solid rgba(15,23,42,.10); border-radius:16px; background:#fff; padding:16px; }
   .panel + .panel { margin-top:16px; }
+  /* Reduce nested-panel "double border" look (e.g., Access links box) */
+  .panel-inset {
+    border-color: rgba(15, 23, 42, .06);
+    background: #f8fafc;
+  }
+
   .panel-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
   .panel-title { font-weight:900; color:#0f172a; display:flex; align-items:center; gap:8px; font-size:14px; }
 
@@ -114,7 +120,7 @@
 <div style="height: 18px;"></div>
 
 {% if has_tenant %}
-<div id="tab-navigation" style="margin-bottom: 10px;">
+<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
   <button id="tab-vault" class="tab active" type="button" onclick="switchTab('vault')" aria-selected="true">
     <i class="fas fa-lock"></i><span>Environments</span>
   </button>
@@ -123,6 +129,8 @@
     <i class="fas fa-layer-group"></i><span>Stages</span>
   </button>
 </div>
+
+<div style="height: 10px;"></div>
 {% endif %}
 <div id="root" class="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" data-user-hash="{{ session_user_hash }}" data-user-name="{{ session_username }}">
 {% if not has_tenant %}
@@ -189,7 +197,7 @@
 
             <div style="height:12px;"></div>
 
-            <div class="panel" style="padding:12px;">
+            <div class="panel panel-inset" style="padding:12px;">
               <div class="panel-title" style="font-size:12px; margin-bottom:8px;"><i class="fas fa-link" style="color:#1c96ca;"></i> Access links</div>
 
               <div class="muted" style="margin-bottom:10px;">
