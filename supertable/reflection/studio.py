@@ -16,6 +16,15 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 
+# Content Security Policy (CSP) for Studio UI pages.
+# Note: connect-src must allow ws:/wss: for browser WebSocket connections to compute backends.
+_STUDIO_CSP = (
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https:; "
+    "script-src 'self' 'unsafe-inline' https:; connect-src 'self' https: ws: wss:; "
+    "font-src 'self' data: https:; base-uri 'self'; frame-ancestors 'none'"
+)
+
+
 # ---------------------------------------------------------------------------
 # In-memory job queue (per-process). This mimics a "central queue" pattern
 # without adding external infrastructure.
@@ -312,6 +321,7 @@ def attach_studio_routes(
         inject_session_into_ctx(ctx, request)
 
         resp = templates.TemplateResponse("studio.html", ctx)
+        resp.headers["Content-Security-Policy"] = _STUDIO_CSP
         no_store(resp)
         return resp
 

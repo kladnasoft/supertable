@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from dotenv import load_dotenv
 import json
 from contextlib import asynccontextmanager
 
@@ -9,6 +9,7 @@ from fastapi.concurrency import iterate_in_threadpool
 from supertable.notebook.resource_config import HIGH_TIER, LOW_TIER
 from supertable.notebook.warm_pool_manager import WarmPoolManager
 
+load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

@@ -657,6 +657,11 @@
       .replaceAll("'", "&#039;");
   }
 
+  function escapeHtmlNl(str) {
+    // Escape HTML and render newlines like a console (index.html-style).
+    return escapeHtml(String(str || '')).replace(/\n/g, '<br>');
+  }
+
   function toast(msg) {
     const el = document.getElementById('nbToast');
     if (!el) return;
@@ -854,6 +859,8 @@
     if (!ok) return;
     selectedComputePoolId = id;
     setSavedComputePoolId(id);
+    // Switching compute invalidates any existing notebook WS session.
+    try { closeAllNotebookWsSessions('compute changed'); } catch (e) {}
   }
 
   // -----------------------------
@@ -869,6 +876,10 @@
   // run control
   let stopRequested = false;
   let activeControllers = [];
+  let activeSockets = [];
+
+  // notebook ws sessions (per editor tab; preserves kernel state like index.html)
+  let notebookWsSessions = {};
 
   // compute pools
   let computePools = [];
@@ -1037,6 +1048,8 @@
     if (!o.skipConfirm && doc.dirty) {
       if (!confirm('This lab has unsaved changes. Close anyway?')) return;
     }
+
+    try { closeNotebookWsSession(tabId, 'tab closed'); } catch (e) {}
 
     openDocs = openDocs.filter(d => d.tab_id !== tabId);
 
@@ -2015,12 +2028,12 @@
     const box = document.getElementById(`out-${cellId}`);
     if (!box) return;
 
-    box.style.display = has ? '' : 'none';
+    box.style.display = has ? 'block' : 'none';
     box.className = 'output mono ' + (ok ? 'ok' : 'err');
     box.innerHTML = `
       ${mm ? `<div class="muted" style="margin-bottom:8px;">${escapeHtml(mm)}</div>` : ``}
-      ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><pre>${escapeHtml(o)}</pre></div>` : ``}
-      ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><pre>${escapeHtml(e)}</pre></div>` : ``}
+      ${o ? `<div><div class="muted" style="margin-bottom:4px;">stdout</div><div class="cell-console" style="white-space:pre-wrap; overflow-wrap:anywhere;">${escapeHtmlNl(o)}</div></div>` : ``}
+      ${e ? `<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">stderr</div><div class="cell-console" style="white-space:pre-wrap; overflow-wrap:anywhere;">${escapeHtmlNl(e)}</div></div>` : ``}
     `;
     syncCellTypeDom(cellId);
   }
@@ -2034,10 +2047,413 @@
     stopRequested = true;
     activeControllers.forEach(c => { try { c.abort(); } catch (e) {} });
     activeControllers = [];
+    activeSockets.forEach(s => { try { s.close(); } catch (e) {} });
+    activeSockets = [];
+    notebookWsSessions = {};
     toast('Stopped (client-side)');
     // allow new runs
     setTimeout(() => { stopRequested = false; }, 200);
   }
+
+
+  function normalizeNotebookWsUrl(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    let u = s;
+
+    // Convert http(s) to ws(s) for convenience.
+    u = u.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+
+    // If user saved "host:port/path", prefix with current ws scheme.
+    if (!/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(u)) {
+      const proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+      u = proto + u.replace(/^\/+/, '');
+    }
+
+    try {
+      const url = new URL(u);
+
+      // "0.0.0.0" is not a routable browser hostname; map it to a usable host.
+      if (url.hostname === '0.0.0.0') {
+        const h = String(location.hostname || 'localhost');
+        url.hostname = (h && h !== '0.0.0.0') ? h : 'localhost';
+      }
+
+      // Mirror index.html behavior: if Studio is served over HTTPS, use wss:// (CSP typically blocks ws://).
+      if (location.protocol === 'https:' && String(url.protocol || '').toLowerCase() === 'ws:') {
+        url.protocol = 'wss:';
+      }
+
+      // Match the simple notebook runner (index.html): if no path is provided, default to /ws/execute.
+      const p = String(url.pathname || '');
+      if (!p || p === '/') url.pathname = '/ws/execute';
+
+      return url.toString();
+    } catch (e) {
+      return u;
+    }
+  }
+
+
+function streamOutputInit(cellId, meta) {
+    const doc = getActiveDoc();
+    if (doc) {
+      const cell = doc.cells.find(c => c.id === cellId);
+      if (cell && cell.type !== 'markdown') {
+        cell.output = { ok: true, stdout: '', stderr: '', meta: String(meta || '') };
+        markDirty(doc);
+      }
+    }
+
+    const box = document.getElementById(`out-${cellId}`);
+    if (!box) return;
+    box.style.display = 'block';
+    box.className = 'output mono ok';
+    box.innerHTML = `
+      ${meta ? `<div class="muted" style="margin-bottom:8px;">${escapeHtml(String(meta))}</div>` : ``}
+      <div>
+        <div class="muted" style="margin-bottom:4px;">stdout</div>
+        <div id="console-${cellId}" style="white-space:pre-wrap; overflow-wrap:anywhere;"></div>
+      </div>
+    `;
+  }
+
+  function streamOutputAppend(cellId, chunk) {
+    const t = String(chunk || '');
+    const consoleDiv = document.getElementById(`console-${cellId}`);
+    if (consoleDiv) {
+      // Match index.html: append spans for each streamed chunk.
+      const span = document.createElement('span');
+      if (t.includes('Progress')) span.className = 'progress-line';
+      span.innerText = t;
+      consoleDiv.appendChild(span);
+
+      const box = document.getElementById(`out-${cellId}`);
+      if (box) box.scrollTop = box.scrollHeight;
+    }
+
+    const doc = getActiveDoc();
+    if (doc) {
+      const cell = doc.cells.find(c => c.id === cellId);
+      if (cell && cell.output && cell.type !== 'markdown') {
+        cell.output.stdout = String(cell.output.stdout || '') + t;
+        markDirty(doc);
+      }
+    }
+  }
+
+  // -----------------------------
+  // Notebook WebSocket execution (index.html-style)
+  // -----------------------------
+  function closeNotebookWsSession(tabId, reason) {
+    const tid = String(tabId || '').trim();
+    if (!tid) return;
+    const sess = notebookWsSessions[tid];
+    if (!sess) return;
+    try { if (sess.sock) sess.sock.close(); } catch (e) {}
+    if (sess.sock) activeSockets = activeSockets.filter(s => s !== sess.sock);
+    delete notebookWsSessions[tid];
+  }
+
+  function closeAllNotebookWsSessions(reason) {
+    Object.keys(notebookWsSessions || {}).forEach(tid => closeNotebookWsSession(tid, reason));
+  }
+
+  async function getOrCreateNotebookWsSession(tabId, pool) {
+    const tid = String(tabId || '').trim();
+    if (!tid) throw new Error('Missing notebook tab');
+
+    const wsUrl = normalizeNotebookWsUrl(pool && pool.ws_url ? pool.ws_url : '');
+    if (!wsUrl) throw new Error('Selected compute has no ws_url');
+
+    const profile = (pool && pool.has_internet) ? 'internet' : 'no-internet';
+
+    let sess = notebookWsSessions[tid] || null;
+    const cmpWs = (u) => String(u || '').replace(/^wss:/i, 'ws:');
+    if (sess && (cmpWs(sess.wsUrl) !== cmpWs(wsUrl) || sess.profile !== profile)) {
+      closeNotebookWsSession(tid, 'compute/profile changed');
+      sess = null;
+    }
+
+    if (sess && sess.sock && sess.sock.readyState === WebSocket.OPEN) return sess;
+    if (sess && sess.sock && sess.sock.readyState === WebSocket.CONNECTING && sess.openPromise) {
+      await sess.openPromise;
+      return sess;
+    }
+
+    let wsUrlUsed = wsUrl;
+    let sock = null;
+
+    try {
+      sock = new WebSocket(wsUrlUsed);
+    } catch (e) {
+      // Some deployments ship a stricter CSP (e.g. connect-src 'self' https:) which blocks ws://.
+      // In that case, retry with wss://.
+      const name = String(e && e.name ? e.name : '');
+      const msg = String(e && e.message ? e.message : e);
+      const looksCsp = (name === 'SecurityError') || /content security policy|connect-src/i.test(msg);
+      const alt = wsUrlUsed.replace(/^ws:/i, 'wss:');
+      if (looksCsp && alt !== wsUrlUsed) {
+        try {
+          sock = new WebSocket(alt);
+          wsUrlUsed = alt;
+        } catch (e2) {
+          const msg2 = String(e2 && e2.message ? e2.message : e2);
+          throw new Error(`WebSocket blocked by CSP (ws:// not allowed) and wss:// retry failed: ${msg2}`);
+        }
+      } else {
+        throw new Error(`Failed to create WebSocket: ${msg}`);
+      }
+    }
+
+    sess = { wsUrl: wsUrlUsed, profile, sock, busy: false, openPromise: null };
+    notebookWsSessions[tid] = sess;
+    activeSockets.push(sock);
+
+    sess.openPromise = new Promise((resolve, reject) => {
+      const timeoutMs = 15000;
+      const timer = setTimeout(() => {
+        try { sock.close(); } catch (e) {}
+        reject(new Error('Notebook connection timeout'));
+      }, timeoutMs);
+
+      const onOpen = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const onError = () => {
+        clearTimeout(timer);
+        reject(new Error('WebSocket error (check DevTools Console)'));
+      };
+      const onClose = () => {
+        clearTimeout(timer);
+        reject(new Error('Notebook connection closed'));
+      };
+
+      sock.addEventListener('open', onOpen, { once: true });
+      sock.addEventListener('error', onError, { once: true });
+      sock.addEventListener('close', onClose, { once: true });
+    });
+
+    try {
+      await sess.openPromise;
+      sess.openPromise = null;
+      return sess;
+    } catch (e) {
+      closeNotebookWsSession(tid, 'connect failed');
+      throw e;
+    }
+  }
+
+  async function runCellOnNotebookWs(cellId, code, pool, startTs, tabIdOverride) {
+    const tid = String(tabIdOverride || activeTabId || '').trim();
+    const sess = await getOrCreateNotebookWsSession(tid, pool);
+
+    if (sess.busy) throw new Error('Notebook is busy (another cell is running)');
+    sess.busy = true;
+
+    const wsUrl = String(sess.wsUrl || '');
+    const profile = String(sess.profile || 'no-internet');
+    const poolMeta = pool ? `Compute: ${computePoolLabel(pool)}` : '';
+    const metaBase = `${poolMeta}${poolMeta ? ' • ' : ''}Notebook: ${profile} • ${wsUrl}`;
+
+    return await new Promise((resolve) => {
+      let done = false;
+      let started = false;
+      let stdout = '';
+      let stderr = '';
+
+      const sock = sess.sock;
+
+      let onMessage = null;
+      let onError = null;
+      let onClose = null;
+
+      const cleanup = () => {
+        sess.busy = false;
+        if (onMessage) { try { sock.removeEventListener('message', onMessage); } catch (e) {} }
+        if (onError) { try { sock.removeEventListener('error', onError); } catch (e) {} }
+        if (onClose) { try { sock.removeEventListener('close', onClose); } catch (e) {} }
+      };
+
+      const finish = (ok, errMsg) => {
+        if (done) return;
+        done = true;
+        cleanup();
+
+        const baseMeta = `Client: ${(performance.now()-startTs).toFixed(1)} ms`;
+        const meta = `${poolMeta}${poolMeta ? ' • ' : ''}Notebook: ${profile} • ${baseMeta}`;
+
+        if (ok) {
+          setStatus(cellId, 'done');
+          setOutput(cellId, true, stdout, stderr, meta);
+          resolve(true);
+          return;
+        }
+
+        const m = String(errMsg || 'Execution failed');
+        setStatus(cellId, (m.toLowerCase().includes('stopped') ? 'stopped' : 'error'));
+        setOutput(cellId, false, stdout, (stderr || m), meta);
+
+        // If the connection is unhealthy, drop the session so the next run reconnects.
+        if (sess && sess.sock && sess.sock.readyState !== WebSocket.OPEN) {
+          closeNotebookWsSession(tid, 'socket unhealthy');
+        }
+        resolve(false);
+      };
+
+      onMessage = (event) => {
+        if (stopRequested) { finish(false, 'Stopped (client-side)'); return; }
+        let msg = null;
+        try { msg = JSON.parse(event.data); } catch (e) { msg = null; }
+        const st = msg && msg.status ? String(msg.status) : '';
+        if (st === 'start') {
+          started = true;
+          stdout = '';
+          stderr = '';
+          streamOutputInit(cellId, metaBase);
+          return;
+        }
+        if (st === 'output') {
+          const chunk = msg && msg.data !== undefined ? msg.data : '';
+          stdout += String(chunk || '');
+          streamOutputAppend(cellId, chunk);
+          return;
+        }
+        if (st === 'stderr') {
+          const chunk = msg && msg.data !== undefined ? msg.data : '';
+          stderr += String(chunk || '');
+          streamOutputAppend(cellId, chunk);
+          return;
+        }
+        if (st === 'error') {
+          const em = (msg && (msg.error || msg.data)) ? (msg.error || msg.data) : 'Execution failed';
+          finish(false, String(em || 'Execution failed'));
+          return;
+        }
+        if (st === 'complete') {
+          finish(true, '');
+          return;
+        }
+      };
+
+      onError = () => {
+        if (!started) finish(false, 'WebSocket error (check DevTools Console)');
+        else finish(false, 'Notebook disconnected (WebSocket error)');
+      };
+
+      onClose = () => {
+        if (done) return;
+        if (stopRequested) { finish(false, 'Stopped (client-side)'); return; }
+        finish(false, 'Notebook connection closed');
+      };
+
+      sock.addEventListener('message', onMessage);
+      sock.addEventListener('error', onError);
+      sock.addEventListener('close', onClose);
+
+      // Prepare streaming output area and send code (like index.html)
+      streamOutputInit(cellId, metaBase);
+      setStatus(cellId, 'running…');
+      try {
+        sock.send(JSON.stringify({ code: String(code || ''), profile }));
+      } catch (e) {
+        finish(false, 'Failed to send code to notebook');
+      }
+    });
+  }
+
+  // Legacy one-shot runner (kept for backward compatibility)
+  async function runCellOnNotebookWsOneShot(cellId, code, pool, startTs) {
+    const wsUrl = normalizeNotebookWsUrl(pool && pool.ws_url ? pool.ws_url : '');
+    if (!wsUrl) throw new Error('Selected compute has no ws_url');
+
+    const profile = (pool && pool.has_internet) ? 'internet' : 'no-internet';
+    const poolMeta = pool ? `Compute: ${computePoolLabel(pool)}` : '';
+    const metaBase = `${poolMeta}${poolMeta ? ' • ' : ''}Notebook: ${profile} • ${wsUrl}`;
+
+    return await new Promise((resolve, reject) => {
+      let done = false;
+      let started = false;
+      let stdout = '';
+
+      const sock = new WebSocket(wsUrl);
+      activeSockets.push(sock);
+
+      const finish = (ok, errMsg) => {
+        if (done) return;
+        done = true;
+        try { sock.close(); } catch (e) {}
+        activeSockets = activeSockets.filter(s => s !== sock);
+
+        const baseMeta = `Client: ${(performance.now()-startTs).toFixed(1)} ms`;
+        const meta = `${poolMeta}${poolMeta ? ' • ' : ''}Notebook: ${profile} • ${baseMeta}`;
+
+        if (ok) {
+          setStatus(cellId, 'done');
+          setOutput(cellId, true, stdout, '', meta);
+          resolve(true);
+        } else {
+          const m = String(errMsg || 'Execution failed');
+          setStatus(cellId, (m.toLowerCase().includes('stopped') ? 'stopped' : 'error'));
+          setOutput(cellId, false, stdout, m, meta);
+          resolve(false);
+        }
+      };
+
+      sock.onopen = () => {
+        if (stopRequested) { finish(false, 'Stopped (client-side)'); return; }
+        // Prepare streaming output area
+        streamOutputInit(cellId, metaBase);
+        setStatus(cellId, 'running…');
+        try {
+          sock.send(JSON.stringify({ code: String(code || ''), profile }));
+        } catch (e) {
+          finish(false, 'Failed to send code to notebook');
+        }
+      };
+
+      sock.onmessage = (event) => {
+        if (stopRequested) { finish(false, 'Stopped (client-side)'); return; }
+        let msg = null;
+        try { msg = JSON.parse(event.data); } catch (e) { msg = null; }
+        const st = msg && msg.status ? String(msg.status) : '';
+        if (st === 'start') {
+          started = true;
+          stdout = '';
+          streamOutputInit(cellId, metaBase);
+          return;
+        }
+        if (st === 'output') {
+          const chunk = msg && msg.data !== undefined ? msg.data : '';
+          stdout += String(chunk || '');
+          streamOutputAppend(cellId, chunk);
+          return;
+        }
+        if (st === 'complete') {
+          finish(true, '');
+        }
+      };
+
+      sock.onerror = () => {
+        if (!started) finish(false, 'WebSocket error (check DevTools Console)');
+        else finish(false, 'Notebook disconnected (WebSocket error)');
+      };
+
+      sock.onclose = () => {
+        if (done) return;
+        if (stopRequested) { finish(false, 'Stopped (client-side)'); return; }
+        finish(false, 'Notebook connection closed');
+      };
+    });
+  }
+
+  function isLikelyCspWebSocketBlock(err) {
+    const name = String(err && err.name ? err.name : '');
+    const msg = String((err && err.message) ? err.message : (err || ''));
+    return (name === 'SecurityError') || /content security policy|connect-src/i.test(msg);
+  }
+
 
   async function runCell(cellId) {
     const { org, sup, userHash } = currentCtx();
@@ -2078,6 +2494,29 @@
 
       if (!computePools.length) { try { await loadComputePools(); } catch (e) {} }
       const computeId = String(selectedComputePoolId || '').trim();
+
+      const pool = getSelectedComputePool();
+      const allowLocalFallback = (new URLSearchParams(location.search)).get('local_fallback') === '1';
+
+      const wsRaw = pool && pool.ws_url ? String(pool.ws_url) : '';
+      if (pool && wsRaw && wsRaw.trim()) {
+        try {
+          const ok = await runCellOnNotebookWs(cellId, code, pool, start, doc.tab_id);
+          // Avoid double-execution: only fall back if the websocket was blocked before the run started.
+          if (ok) return;
+          return;
+        } catch (e) {
+          if (isLikelyCspWebSocketBlock(e)) {
+            toast('WebSocket blocked by CSP; falling back to server runner');
+            // fall through to the server job runner below
+          } else {
+            throw e;
+          }
+        }
+      }
+      if (pool && !allowLocalFallback) {
+        throw new Error('Selected compute has no ws_url');
+      }
 
       const created = await postJSON('/reflection/studio/jobs', {
         org, sup, user_hash: userHash,

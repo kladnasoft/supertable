@@ -394,6 +394,93 @@
       <div id="list" style="margin-top:12px;"></div>
       <div id="empty" class="muted" style="display:none; margin-top:10px;">No pools yet.</div>
     </div>
+
+<div class="panel" style="margin-top:14px; display:none;" data-disabled="true">
+  <!-- Disabled: Notebook management is handled in Studio -->
+  <div class="panel-head">
+    <div class="muted"> Notebook</div>
+
+    <div class="panel-actions">
+      <span class="badge" id="nbStatus"><i class="fas fa-book"></i> <span id="nbStatusText">—</span></span>
+      <button class="btn btn-sm btn-azure-outline" id="btnNotebookOpen"><i class="fas fa-up-right-from-square"></i> Open</button>
+      <button class="btn btn-sm btn-azure-outline" id="btnNotebookRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:12px;">
+    <div class="field">
+      <div class="form-label">
+        <span>Notebook port</span>
+        <span class="form-help mono">SUPERTABLE_NOTEBOOK_PORT</span>
+      </div>
+      <input class="form-control form-control-sm mono" id="notebookPort" type="number" min="1" max="65535" step="1" value="8010" />
+      <div class="muted" style="margin-top:6px;">Port used by the notebook WebSocket server (e.g. <span class="mono">/ws/execute</span>).</div>
+    </div>
+
+    <div class="field">
+      <div class="form-label">
+        <span>Default profile</span>
+        <span class="form-help">execution</span>
+      </div>
+      <select class="form-select form-select-sm mono" id="notebookProfile">
+        <option value="no-internet">no-internet</option>
+        <option value="internet">internet</option>
+      </select>
+      <div class="muted" style="margin-top:6px;">Default execution profile for new notebooks.</div>
+    </div>
+
+    <div class="field">
+      <div class="form-label">
+        <span>Persist notebooks</span>
+        <span class="form-help">server-side</span>
+      </div>
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <label style="display:flex; align-items:center; gap:10px; margin:0;">
+          <span class="muted" style="font-weight:900;">Enabled</span>
+          <span class="switch">
+            <input type="checkbox" id="notebookPersist" checked />
+            <span class="slider"></span>
+          </span>
+        </label>
+        <span class="muted" id="nbStorageDir" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:320px;"></span>
+      </div>
+      <div class="muted" style="margin-top:6px;">Notebooks are stored per-tenant on the server so you can use them later.</div>
+    </div>
+
+    <div class="field">
+      <div class="form-label">
+        <span>WebSocket URL</span>
+        <span class="form-help">derived</span>
+      </div>
+      <input class="form-control form-control-sm mono" id="notebookWsUrl" readonly />
+      <div class="muted" style="margin-top:6px;">Used by the notebook UI to execute code.</div>
+    </div>
+  </div>
+
+  <div class="modal-actions">
+    <div class="left">
+      <span class="error" id="nbError" style="display:none;"></span>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-sm btn-azure-outline" id="btnNotebookSave"><i class="fas fa-save"></i> Save</button>
+    </div>
+  </div>
+
+  <div style="height: 8px;"></div>
+
+  <div class="panel" style="padding: 12px; border-radius: 14px; border: 1px solid var(--border);">
+    <div class="panel-head" style="padding: 0; border: none;">
+      <div class="muted"> Saved notebooks</div>
+      <div class="panel-actions">
+        <input id="nbUpload" type="file" class="search" style="padding: 7px 10px;" accept=".json,.ipynb,application/json" />
+        <button class="btn btn-sm btn-azure-outline" id="btnNbUpload"><i class="fas fa-upload"></i> Upload</button>
+      </div>
+    </div>
+
+    <div id="nbList" style="margin-top:12px;"></div>
+    <div id="nbEmpty" class="muted" style="display:none; margin-top:10px;">No notebooks saved yet.</div>
+  </div>
+</div>
   {% endif %}
 </div>
 
@@ -454,6 +541,29 @@
           <option value="large">large</option>
         </select>
         <div class="muted" style="margin-top:6px;">Resource profile (used for routing/scheduling later).</div>
+      <div class="field">
+        <div class="form-label">
+          <span>Internet access</span>
+          <span class="form-help">profile</span>
+        </div>
+        <label style="display:flex; align-items:center; gap:10px; margin:0;">
+          <span class="switch">
+            <input type="checkbox" id="poolInternet" />
+            <span class="slider"></span>
+          </span>
+          <span class="muted">Enable internet profile for this pool.</span>
+        </label>
+      </div>
+
+      <div class="field" style="grid-column: 1 / -1;">
+        <div class="form-label">
+          <span>WebSocket endpoint</span>
+          <span class="form-help mono">ws://…/ws/execute</span>
+        </div>
+        <input class="form-control form-control-sm mono" id="poolWsUrl" placeholder="e.g. ws://localhost:8010/ws/execute" />
+        <div class="muted" style="margin-top:6px;">Studio uses this to execute cells on the selected notebook server.</div>
+      </div>
+
       </div>
     </div>
 
@@ -557,6 +667,12 @@
       .replaceAll('"',"&quot;").replaceAll("'","&#039;");
   }
 
+  function wsUrlForPort(port) {
+    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+    const host = location.hostname || 'localhost';
+    return `${proto}//${host}:${port}/ws/execute`;
+  }
+
   let pools = [];
   let search = '';
 
@@ -594,7 +710,7 @@
       div.innerHTML = `
         <div>
           <div class="name">${esc(p.name || 'Pool')}${p.is_default ? ' <span class="muted">(default)</span>' : ''}</div>
-          <div class="sub">kind: <span class="mono">${esc(p.kind || '')}</span> • size: <span class="mono">${esc(p.size || '')}</span> • max: <span class="mono">${esc(String(p.max_concurrency || 1))}</span></div>
+          <div class="sub">kind: <span class="mono">${esc(p.kind || '')}</span> • size: <span class="mono">${esc(p.size || '')}</span> • max: <span class="mono">${esc(String(p.max_concurrency || 1))}</span> • internet: <span class="mono">${p.has_internet ? 'on' : 'off'}</span> • ws: <span class="mono">${esc(String(p.ws_url||'').slice(0, 90))}${String(p.ws_url||'').length>90 ? '…' : ''}</span></div>
         </div>
         <div style="display:flex; gap:10px; flex-wrap:wrap;">
           <button class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
@@ -663,6 +779,11 @@
     document.getElementById('poolSize').value = (existing && existing.size) ? existing.size : 'small';
     document.getElementById('poolMax').value = String((existing && existing.max_concurrency) ? existing.max_concurrency : 1);
     document.getElementById('poolDefault').checked = Boolean(existing && existing.is_default);
+    document.getElementById('poolInternet').checked = Boolean(existing && existing.has_internet);
+
+    const port = parseInt((document.getElementById('notebookPort') || {}).value || '8010', 10);
+    const defWs = wsUrlForPort(Number.isFinite(port) && port > 0 ? port : 8010);
+    document.getElementById('poolWsUrl').value = (existing && existing.ws_url) ? String(existing.ws_url) : defWs;
 
     modalShow();
   }
@@ -675,6 +796,8 @@
     const size = (document.getElementById('poolSize').value || 'small').trim();
     const max = parseInt(document.getElementById('poolMax').value || '1', 10);
     const isDefault = Boolean(document.getElementById('poolDefault').checked);
+    const hasInternet = Boolean(document.getElementById('poolInternet').checked);
+    const wsUrl = String((document.getElementById('poolWsUrl').value || '')).trim();
 
     const p = {
       id: editingId || '',
@@ -683,6 +806,8 @@
       size,
       max_concurrency: Number.isFinite(max) && max > 0 ? max : 1,
       is_default: isDefault,
+      has_internet: hasInternet,
+      ws_url: wsUrl,
     };
     return p;
   }
@@ -717,7 +842,219 @@
   const poolSearch = document.getElementById('poolSearch');
   if (poolSearch) poolSearch.addEventListener('input', (ev) => { search = ev.target.value || ''; render(); });
 
+
+  // initial load
+  const _ctx = ctx();
+  if (_ctx.org && _ctx.sup) {
+    loadPools().catch(err => toast(err.message));
+  }
+
+    const ENABLE_NOTEBOOK_SECTION = false;
+
+// ---- Notebook config / saved notebooks ----
+  if (!ENABLE_NOTEBOOK_SECTION) { return; }
+
+  let nbConfig = null;
+  let notebooks = [];
+
+  function wsUrlForPort(port) {
+    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+    const host = location.hostname || 'localhost';
+    return `${proto}//${host}:${port}/ws/execute`;
+  }
+
+  function httpUrlForPort(port) {
+    const proto = (location.protocol === 'https:') ? 'https:' : 'http:';
+    const host = location.hostname || 'localhost';
+    return `${proto}//${host}:${port}/`;
+  }
+
+  function setNbStatus(msg) {
+    const el = document.getElementById('nbStatusText');
+    if (el) el.textContent = String(msg || '—');
+  }
+
+  function nbCtxOk() {
+    const { org, sup } = ctx();
+    return Boolean(org && sup);
+  }
+
+  async function loadNotebookConfig() {
+    if (!nbCtxOk()) return;
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/compute/notebook/config?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    const data = js && js.data ? js.data : {};
+    nbConfig = data.notebook || null;
+
+    const portEl = document.getElementById('notebookPort');
+    const profEl = document.getElementById('notebookProfile');
+    const persistEl = document.getElementById('notebookPersist');
+    const wsEl = document.getElementById('notebookWsUrl');
+    const dirEl = document.getElementById('nbStorageDir');
+
+    const port = (nbConfig && nbConfig.port) ? parseInt(nbConfig.port, 10) : 8010;
+    if (portEl) portEl.value = String(Number.isFinite(port) ? port : 8010);
+    if (profEl) profEl.value = (nbConfig && nbConfig.default_profile) ? nbConfig.default_profile : 'no-internet';
+    if (persistEl) persistEl.checked = Boolean(nbConfig && nbConfig.persist);
+
+    const wsUrl = wsUrlForPort(Number.isFinite(port) ? port : 8010);
+    if (wsEl) wsEl.value = wsUrl;
+
+    if (dirEl && data.storage_dir) dirEl.textContent = String(data.storage_dir);
+    setNbStatus(`ws: ${wsUrl}`);
+  }
+
+  async function saveNotebookConfig() {
+    if (!nbCtxOk()) return;
+    const { org, sup } = ctx();
+
+    const port = parseInt((document.getElementById('notebookPort').value || '8010'), 10);
+    const profile = (document.getElementById('notebookProfile').value || 'no-internet').trim();
+    const persist = Boolean(document.getElementById('notebookPersist').checked);
+
+    const payload = {
+      org,
+      sup,
+      notebook: {
+        port: Number.isFinite(port) ? port : 8010,
+        default_profile: profile,
+        persist,
+      },
+    };
+
+    await postJSON('/reflection/compute/notebook/config', payload);
+    await loadNotebookConfig();
+    toast('Notebook config saved');
+  }
+
+  async function loadNotebooks() {
+    if (!nbCtxOk()) return;
+    const { org, sup } = ctx();
+    const js = await getJSON(`/reflection/compute/notebook/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    notebooks = js && Array.isArray(js.items) ? js.items : [];
+    renderNotebooks();
+  }
+
+  function renderNotebooks() {
+    const wrap = document.getElementById('nbList');
+    const empty = document.getElementById('nbEmpty');
+    if (!wrap) return;
+
+    wrap.innerHTML = '';
+    (notebooks || []).forEach(n => {
+      const div = document.createElement('div');
+      div.className = 'rowcard';
+      div.innerHTML = `
+        <div>
+          <div class="name">${esc(n.name || 'notebook.json')}</div>
+          <div class="sub">updated: <span class="mono">${esc(n.updated || '')}</span> • size: <span class="mono">${esc(String(n.size || 0))}</span> bytes</div>
+        </div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button class="btn btn-sm btn-azure-outline" data-act="dl"><i class="fas fa-download"></i> Download</button>
+          <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
+        </div>
+      `;
+
+      div.querySelector('button[data-act="dl"]').addEventListener('click', () => downloadNotebook(n));
+      div.querySelector('button[data-act="del"]').addEventListener('click', () => deleteNotebook(n));
+      wrap.appendChild(div);
+    });
+
+    if (empty) empty.style.display = notebooks.length ? 'none' : '';
+  }
+
+  async function downloadNotebook(n) {
+    const { org, sup } = ctx();
+    const name = n && n.name ? String(n.name) : '';
+    if (!name) return;
+    const js = await getJSON(`/reflection/compute/notebook/get?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}&name=${encodeURIComponent(name)}`);
+    const nb = js && js.notebook ? js.notebook : {};
+    const blob = new Blob([JSON.stringify(nb, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  async function deleteNotebook(n) {
+    const { org, sup } = ctx();
+    const name = n && n.name ? String(n.name) : '';
+    if (!name) return;
+    if (!confirm('Delete this notebook?')) return;
+    await del(`/reflection/compute/notebook/${encodeURIComponent(name)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    await loadNotebooks();
+    toast('Deleted');
+  }
+
+  async function uploadNotebook() {
+    if (!nbCtxOk()) return;
+    const { org, sup } = ctx();
+    const fileEl = document.getElementById('nbUpload');
+    if (!fileEl || !fileEl.files || !fileEl.files.length) {
+      toast('Choose a notebook file first');
+      return;
+    }
+    const f = fileEl.files[0];
+    const name = (f && f.name) ? String(f.name) : 'notebook.json';
+    const txt = await f.text();
+    let nb = null;
+    try {
+      nb = JSON.parse(txt);
+    } catch (e) {
+      toast('Invalid JSON');
+      return;
+    }
+
+    await postJSON('/reflection/compute/notebook/save', { org, sup, name, notebook: nb });
+    fileEl.value = '';
+    await loadNotebooks();
+    toast('Uploaded');
+  }
+
+  const btnNotebookSave = document.getElementById('btnNotebookSave');
+  if (btnNotebookSave) btnNotebookSave.addEventListener('click', (e) => {
+    e.preventDefault();
+    saveNotebookConfig().catch(err => toast(err.message));
+  });
+
+  const btnNotebookRefresh = document.getElementById('btnNotebookRefresh');
+  if (btnNotebookRefresh) btnNotebookRefresh.addEventListener('click', (e) => {
+    e.preventDefault();
+    Promise.all([loadNotebookConfig(), loadNotebooks()]).catch(err => toast(err.message));
+  });
+
+  const btnNotebookOpen = document.getElementById('btnNotebookOpen');
+  if (btnNotebookOpen) btnNotebookOpen.addEventListener('click', (e) => {
+    e.preventDefault();
+    const port = parseInt((document.getElementById('notebookPort').value || '8010'), 10);
+    window.open(httpUrlForPort(Number.isFinite(port) ? port : 8010), '_blank', 'noopener');
+  });
+
+  const btnNbUpload = document.getElementById('btnNbUpload');
+  if (btnNbUpload) btnNbUpload.addEventListener('click', (e) => {
+    e.preventDefault();
+    uploadNotebook().catch(err => toast(err.message));
+  });
+
+  const nbPortEl = document.getElementById('notebookPort');
+  if (nbPortEl) nbPortEl.addEventListener('input', (ev) => {
+    const v = parseInt(ev.target.value || '8010', 10);
+    const wsEl = document.getElementById('notebookWsUrl');
+    const wsUrl = wsUrlForPort(Number.isFinite(v) ? v : 8010);
+    if (wsEl) wsEl.value = wsUrl;
+    setNbStatus(`ws: ${wsUrl}`);
+  });
+
+
   loadPools().catch(err => toast(err.message));
+
+  if (document.getElementById('notebookPort')) {
+    Promise.all([loadNotebookConfig(), loadNotebooks()]).catch(err => toast(err.message));
+  }
 })();
 </script>
 {% endblock %}
