@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import io
 import os
+import re
 import time
 import traceback
 import uuid
@@ -28,6 +29,7 @@ class _JobKey:
 
 class _Job(BaseModel):
     job_id: str
+    compute_pool_id: Optional[str] = None
     status: str = "queued"  # queued | running | done | error
     created_at_ns: int
     started_at_ns: Optional[int] = None
@@ -54,6 +56,7 @@ class LabJobCreate(BaseModel):
     user_hash: str = Field(..., min_length=1, max_length=512)
     code: str = Field(..., min_length=1, max_length=200_000)
     session_id: str = Field(..., min_length=1, max_length=128)
+    compute_pool_id: Optional[str] = Field(default=None, max_length=128)
 
 
 def _now_ns() -> int:
@@ -382,7 +385,11 @@ def attach_studio_routes(
             raise HTTPException(status_code=400, detail="Missing session_id")
 
         job_id = str(uuid.uuid4())
-        job = _Job(job_id=job_id, created_at_ns=_now_ns())
+        compute_pool_id = (payload.compute_pool_id or '').strip() or None
+        if compute_pool_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", compute_pool_id):
+            raise HTTPException(status_code=400, detail="Invalid compute_pool_id")
+
+        job = _Job(job_id=job_id, created_at_ns=_now_ns(), compute_pool_id=compute_pool_id)
 
         session_key = f"{payload.org}:{payload.sup}:{payload.user_hash}:{payload.session_id}"
 
@@ -397,6 +404,7 @@ def attach_studio_routes(
                 "sup": payload.sup,
                 "user_hash": payload.user_hash,
                 "code": payload.code,
+                "compute_pool_id": compute_pool_id,
             }
         )
 

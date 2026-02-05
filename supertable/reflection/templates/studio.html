@@ -531,6 +531,15 @@
             <span class="muted" id="nbEditorMeta"></span>
           </div>
           <div class="right">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span class="muted" style="font-weight:900;">Compute</span>
+              <select class="form-select form-select-sm mono" id="computeSelect" style="min-width:220px;">
+                <option value="">Loading…</option>
+              </select>
+              <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshCompute" title="Refresh compute pools">
+                <i class="fas fa-rotate"></i>
+              </button>
+            </div>
             <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
               <i class="fas fa-play"></i> Run All
             </button>
@@ -758,6 +767,95 @@
     return v;
   }
 
+  function computePoolKey() { return k('compute_pool'); }
+  function getSavedComputePoolId() { return String(lsGet(computePoolKey(), '') || ''); }
+  function setSavedComputePoolId(v) { lsSet(computePoolKey(), String(v || '')); }
+
+  function computePoolLabel(p) {
+    const name = String((p && p.name) ? p.name : 'Pool').trim() || 'Pool';
+    const kind = String((p && p.kind) ? p.kind : '').trim();
+    const size = String((p && p.size) ? p.size : '').trim();
+    const extra = (kind || size) ? ` (${kind || '?'} / ${size || '?'})` : '';
+    return name + extra;
+  }
+
+  function getSelectedComputePool() {
+    const id = String(selectedComputePoolId || '').trim();
+    if (!id) return null;
+    return (computePools || []).find(p => String((p && p.id) ? p.id : '') === id) || null;
+  }
+
+  function renderComputeSelect() {
+    const sel = document.getElementById('computeSelect');
+    if (!sel) return;
+
+    sel.innerHTML = '';
+    const items = Array.isArray(computePools) ? computePools.slice() : [];
+
+    if (!items.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No pools';
+      sel.appendChild(opt);
+      sel.disabled = true;
+      return;
+    }
+
+    // default first
+    items.sort((a, b) => (b && b.is_default ? 1 : 0) - (a && a.is_default ? 1 : 0));
+
+    items.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = String((p && p.id) ? p.id : '');
+      opt.textContent = computePoolLabel(p) + ((p && p.is_default) ? ' (default)' : '');
+      sel.appendChild(opt);
+    });
+
+    sel.disabled = false;
+    const want = String(selectedComputePoolId || '').trim();
+    if (want) sel.value = want;
+  }
+
+  async function loadComputePools() {
+    const sel = document.getElementById('computeSelect');
+    if (sel) {
+      sel.disabled = true;
+      sel.innerHTML = '<option value="">Loading…</option>';
+    }
+
+    const { org, sup } = currentCtx();
+    if (!org || !sup) {
+      computePools = [];
+      selectedComputePoolId = '';
+      renderComputeSelect();
+      return;
+    }
+
+    try {
+      const js = await getJSON(`/reflection/compute/list?org=${enc(org)}&sup=${enc(sup)}`);
+      computePools = (js && js.data && Array.isArray(js.data.items)) ? js.data.items : [];
+    } catch (e) {
+      computePools = [];
+    }
+
+    const saved = getSavedComputePoolId();
+    const hasSaved = saved && (computePools || []).some(p => String((p && p.id) ? p.id : '') === saved);
+    const def = (computePools || []).find(p => p && p.is_default) || (computePools[0] || null);
+    selectedComputePoolId = hasSaved ? String(saved) : (def ? String(def.id || '') : '');
+    if (selectedComputePoolId) setSavedComputePoolId(selectedComputePoolId);
+
+    renderComputeSelect();
+  }
+
+  function selectComputePool(idRaw) {
+    const id = String(idRaw || '').trim();
+    if (!id) return;
+    const ok = (computePools || []).some(p => String((p && p.id) ? p.id : '') === id);
+    if (!ok) return;
+    selectedComputePoolId = id;
+    setSavedComputePoolId(id);
+  }
+
   // -----------------------------
   // UI state
   // -----------------------------
@@ -771,6 +869,10 @@
   // run control
   let stopRequested = false;
   let activeControllers = [];
+
+  // compute pools
+  let computePools = [];
+  let selectedComputePoolId = '';
 
   function setPane(pane) {
     activePane = pane;
@@ -1974,10 +2076,14 @@
     try {
       if (stopRequested) return;
 
+      if (!computePools.length) { try { await loadComputePools(); } catch (e) {} }
+      const computeId = String(selectedComputePoolId || '').trim();
+
       const created = await postJSON('/reflection/studio/jobs', {
         org, sup, user_hash: userHash,
         code,
         session_id: sessionId,
+        compute_pool_id: computeId,
       }, controller.signal);
 
       const jobId = created && created.job_id ? String(created.job_id) : '';
@@ -1995,9 +2101,13 @@
         }
 
         const dur = (job.duration_ms !== undefined && job.duration_ms !== null) ? Number(job.duration_ms) : null;
-        const meta = (dur !== null && Number.isFinite(dur))
+        const baseMeta = (dur !== null && Number.isFinite(dur))
           ? `Server: ${dur.toFixed(3)} ms • Client: ${(performance.now()-start).toFixed(1)} ms`
           : `Client: ${(performance.now()-start).toFixed(1)} ms`;
+
+        const pool = getSelectedComputePool();
+        const poolMeta = pool ? `Compute: ${computePoolLabel(pool)}` : '';
+        const meta = poolMeta ? (poolMeta + ' • ' + baseMeta) : baseMeta;
 
         if (st === 'done') {
           setStatus(cellId, 'done');
@@ -2088,6 +2198,18 @@
     const btnConn = document.getElementById('btnConnectorPicker');
     if (btnConn) btnConn.addEventListener('click', openConnectorPicker);
 
+    const computeSel = document.getElementById('computeSelect');
+    if (computeSel) computeSel.addEventListener('change', () => selectComputePool(computeSel.value));
+
+    const btnRefreshCompute = document.getElementById('btnRefreshCompute');
+    if (btnRefreshCompute) btnRefreshCompute.addEventListener('click', () => {
+      loadComputePools().then(() => {
+        toast((computePools && computePools.length) ? 'Compute refreshed' : 'No compute pools');
+      }).catch((e) => {
+        toast(String(e && e.message ? e.message : e));
+      });
+    });
+
     const btnRunA = document.getElementById('btnRunActive');
     if (btnRunA) btnRunA.addEventListener('click', runActiveCell);
 
@@ -2137,6 +2259,7 @@
   snippets = loadSnippets();
 
   wireBaseTabs();
+  loadComputePools().catch(() => {});
   renderOpenTabs();
   renderNotebookList();
   renderSnippets();

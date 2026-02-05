@@ -1,7 +1,14 @@
 # execute_v20260201_2045_fix-script.py
-from supertable.notebook.worker import ExecutionWorker
-from supertable.notebook.resource_config import ResourceConfig
-from supertable.notebook.warm_pool_manager import WarmPoolManager
+try:
+    from supertable.notebook.worker import ExecutionWorker
+    from supertable.notebook.resource_config import ResourceConfig
+    from supertable.notebook.warm_pool_manager import WarmPoolManager
+except ModuleNotFoundError:
+    # Local/dev layout support (running from this folder)
+    from worker import ExecutionWorker
+    from resource_config import ResourceConfig
+    from warm_pool_manager import WarmPoolManager
+
 
 worker = ExecutionWorker()
 

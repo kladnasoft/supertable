@@ -1,6 +1,10 @@
 # worker_v20260201_2045_add-dns.py
 import docker
-from supertable.notebook.resource_config import ResourceConfig
+try:
+    from supertable.notebook.resource_config import ResourceConfig
+except ModuleNotFoundError:
+    from resource_config import ResourceConfig
+
 
 
 class ExecutionWorker:

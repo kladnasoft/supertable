@@ -21,7 +21,16 @@
     <h2>Supertable Python Notebook</h2>
 
     <div class="controls">
-        <div id="status">Status: Disconnected</div>
+        <div>
+            <div id="status">Status: Disconnected</div>
+            <div style="margin-top:6px;">
+                <label for="profileSelect">Internet:</label>
+                <select id="profileSelect">
+                    <option value="no-internet">Off</option>
+                    <option value="internet">On</option>
+                </select>
+            </div>
+        </div>
         <button id="runBtn" onclick="runCode()" disabled>Run Cell</button>
     </div>
 
@@ -49,12 +58,26 @@ except Exception as e:
     const statusDiv = document.getElementById('status');
     const runBtn = document.getElementById('runBtn');
     const codeEditor = document.getElementById('codeEditor');
+    const profileSelect = document.getElementById('profileSelect');
 
     // 1. Establish WebSocket connection
-    const socket = new WebSocket('ws://localhost:8000/ws/execute');
+    // WebSocket URL notes:
+    // - If you open this page from a different machine than the server, "localhost" will point to *your browser machine*.
+    // - If the page is served over HTTPS, the browser will block ws:// and you must use wss://.
+    // You can override the backend host:port via ?backend=HOST:PORT (e.g. ?backend=192.168.1.10:8000)
+    const params = new URLSearchParams(window.location.search);
+    const initialProfile = params.get('profile') || 'no-internet';
+    profileSelect.value = initialProfile;
+    const notebookPort = '8010';
+    const defaultBackend = (window.location.port === notebookPort && window.location.host)
+        ? window.location.host
+        : `${window.location.hostname || 'localhost'}:${notebookPort}`;
+    const backend = params.get('backend') || defaultBackend;
+    const wsProto = (window.location.protocol === 'https:') ? 'wss' : 'ws';
+    const socket = new WebSocket(`${wsProto}://${backend}/ws/execute`);
 
     socket.onopen = () => {
-        statusDiv.innerText = "Status: Connected (Ready)";
+        statusDiv.innerText = `Status: Connected (Ready) [${profileSelect.value}]`;
         runBtn.disabled = false;
     };
 
@@ -82,6 +105,12 @@ except Exception as e:
         }
     };
 
+    socket.onerror = (event) => {
+        // Most useful details are in the browser DevTools Console.
+        statusDiv.innerText = "Status: Disconnected (WebSocket error - check DevTools Console)";
+        runBtn.disabled = true;
+    };
+
     socket.onclose = () => {
         statusDiv.innerText = "Status: Disconnected (Server Offline)";
         runBtn.disabled = true;
@@ -89,7 +118,7 @@ except Exception as e:
 
     function runCode() {
         const code = codeEditor.value;
-        socket.send(JSON.stringify({ code: code }));
+        socket.send(JSON.stringify({ code: code, profile: profileSelect.value }));
     }
 </script>
 
