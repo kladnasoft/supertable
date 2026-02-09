@@ -230,7 +230,102 @@
         box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
     }
 
-    /* --- CodeMirror styling (INCREASED HEIGHT to 500px) --- */
+
+    /* --- Execution sessions (+) tabs --- */
+#exec-navigation {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    border-bottom: 2px solid var(--panel-border);
+    margin-top: 16px;
+    margin-bottom: 14px;
+    padding-left: 8px;
+    flex-wrap: wrap;
+}
+
+#openExecTabs {
+    display: flex !important;
+    align-items: flex-end !important;
+    gap: 8px !important;
+    flex-wrap: wrap;
+}
+
+/* + button aligned with tabs */
+.tab-add {
+    border: 1px dashed var(--panel-border);
+    background: rgba(28, 150, 202, 0.08);
+    color: var(--primary-color);
+    padding: 9px 12px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: var(--transition);
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: -2px; /* visually sits on the same baseline as the tabs */
+}
+
+.tab-add:hover {
+    border-color: var(--primary-color);
+    background: rgba(28, 150, 202, 0.14);
+}
+
+.exec-tab-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: flex-end;
+}
+
+/* Dedicated styling so exec tabs don't reuse inner .tab styles */
+.exec-tab-btn {
+    appearance: none;
+    border: 1px solid var(--panel-border);
+    border-bottom: none;
+    background: #f8fafc;
+    color: var(--text-light);
+    padding: 10px 38px 10px 16px; /* extra right padding for the close button */
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    cursor: pointer;
+    transition: var(--transition);
+    font-size: 14px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: -2px; /* overlap container border-bottom */
+}
+
+.exec-tab-btn:hover {
+    color: var(--primary-color);
+}
+
+.exec-tab-btn.active {
+    background: #ffffff;
+    color: var(--primary-color);
+}
+
+.exec-tab-close {
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    border: none;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+    padding: 6px 8px;
+    border-radius: 8px;
+    transition: var(--transition);
+}
+
+.exec-tab-close:hover {
+    background: rgba(15, 23, 42, 0.06);
+    color: #334155;
+}
+
+#inner-tab-mount {
+    margin: 0 0 14px 0;
+}
+/* --- CodeMirror styling (INCREASED HEIGHT to 500px) --- */
     .CodeMirror {
       border-radius: 8px; /* Match form elements */
       border: 1px solid #d0d7e7;
@@ -551,6 +646,273 @@
     window.__curHeaders = []; // Keep track of current headers
     window.__hintTables = {}; // Global schema map for IntelliSense
 
+
+    // --- Multi-execution sessions (tabs with +) ---
+    const __execSessions = [];
+    let __activeExecSessionId = null;
+    let __execSessionSeq = 0;
+    window.__activeInnerTabName = 'execute';
+
+    function __getActiveExecSession() {
+      if (!__activeExecSessionId) return null;
+      return __execSessions.find(s => s.id === __activeExecSessionId) || null;
+    }
+
+    function __buildDefaultExecutionQuery() {
+      const leaf = getURLParameter('leaf');
+      // defaultSuperName is defined later in this script; safe because we call this after page init
+      const sup = (typeof defaultSuperName !== 'undefined' && defaultSuperName) ? defaultSuperName : '';
+      if (!sup) {
+        return window.editor ? window.editor.getValue() : '';
+      }
+      return leaf ? `SELECT * FROM ${sup}.${leaf} LIMIT 1000` : `SELECT * FROM ${sup} LIMIT 100`;
+    }
+
+    function __createExecSession(opts) {
+      __execSessionSeq += 1;
+      const name = (opts && opts.name) ? opts.name : `Execution ${__execSessionSeq}`;
+      const query = (opts && typeof opts.query === 'string') ? opts.query : __buildDefaultExecutionQuery();
+      return {
+        id: 'exec-' + __execSessionSeq,
+        name,
+        query,
+        innerTab: 'execute',
+        statusText: 'Ready',
+        statusCls: '',
+        rows: [],
+        timings: null,
+        errorVisible: false,
+        errorTitle: '',
+        errorMessage: '',
+        abortController: null,
+        isExecuting: false
+      };
+    }
+
+    function __renderExecTabs() {
+      const host = document.getElementById('openExecTabs');
+      if (!host) return;
+
+      host.innerHTML = '';
+
+      __execSessions.forEach(s => {
+        const wrap = document.createElement('div');
+        wrap.className = 'exec-tab-wrap';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'exec-tab-btn' + (s.id === __activeExecSessionId ? ' active' : '');
+        btn.setAttribute('aria-selected', s.id === __activeExecSessionId ? 'true' : 'false');
+
+        const icon = document.createElement('i');
+        icon.className = 'fas fa-bolt';
+        const label = document.createElement('span');
+        label.textContent = s.name;
+
+        btn.appendChild(icon);
+        btn.appendChild(label);
+        btn.addEventListener('click', () => __activateExecSession(s.id));
+
+        wrap.appendChild(btn);
+
+        if (__execSessions.length > 1) {
+          const closeBtn = document.createElement('button');
+          closeBtn.type = 'button';
+          closeBtn.className = 'exec-tab-close';
+          closeBtn.title = 'Close';
+          closeBtn.innerHTML = '<i class="fas fa-times"></i>';
+          closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            __closeExecSession(s.id);
+          });
+          wrap.appendChild(closeBtn);
+        }
+
+        host.appendChild(wrap);
+      });
+    }
+
+    function __mountInnerTabs() {
+      const mount = document.getElementById('inner-tab-mount');
+      const nav = document.getElementById('tab-navigation');
+      if (!mount || !nav) return;
+      if (nav.parentElement !== mount) {
+        mount.appendChild(nav);
+      }
+    }
+
+    function __cancelSessionExecution(session) {
+      if (!session) return;
+
+      session.isExecuting = false;
+
+      if (session.abortController) {
+        try { session.abortController.abort(); } catch (e) {}
+      }
+      session.abortController = null;
+
+      if (execTimerId) {
+        clearInterval(execTimerId);
+        execTimerId = null;
+      }
+      execStartTime = null;
+    }
+
+    function __saveActiveExecSessionState() {
+      const s = __getActiveExecSession();
+      if (!s) return;
+      if (window.editor) s.query = window.editor.getValue();
+      s.innerTab = window.__activeInnerTabName || s.innerTab || 'execute';
+    }
+
+    function __resetUIForNewSession(session) {
+      const errorDisplay = document.getElementById('query-error-display');
+      const timingCard = document.getElementById('timings-visualization-card');
+      const resultDiv = document.getElementById('result');
+
+      if (errorDisplay) errorDisplay.style.display = 'none';
+      if (timingCard) timingCard.style.display = 'none';
+      if (resultDiv) {
+        resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">No results</div>';
+      }
+
+      if (window.timingsChartInstance) {
+        try { window.timingsChartInstance.destroy(); } catch (e) {}
+        window.timingsChartInstance = null;
+      }
+
+      window.__curRows = [];
+      window.__curHeaders = [];
+
+      session.rows = [];
+      session.timings = null;
+      session.errorVisible = false;
+      session.errorTitle = '';
+      session.errorMessage = '';
+      session.statusText = 'Ready';
+      session.statusCls = '';
+      session.innerTab = 'execute';
+
+      if (window.editor) window.editor.setValue(session.query || __buildDefaultExecutionQuery());
+      setStatus('Ready');
+      switchTab('execute');
+    }
+
+    function __applyExecSessionState(session) {
+      if (!session) return;
+
+      if (window.editor && typeof session.query === 'string') {
+        window.editor.setValue(session.query);
+      }
+
+      const errorDisplay = document.getElementById('query-error-display');
+      const timingCard = document.getElementById('timings-visualization-card');
+      const resultDiv = document.getElementById('result');
+
+      if (errorDisplay) errorDisplay.style.display = 'none';
+      if (timingCard) timingCard.style.display = 'none';
+
+      if (window.timingsChartInstance) {
+        try { window.timingsChartInstance.destroy(); } catch (e) {}
+        window.timingsChartInstance = null;
+      }
+
+      if (session.errorVisible) {
+        displayError(session.errorTitle || 'Query Error', session.errorMessage || 'Unknown error');
+      } else {
+        setStatus(session.statusText || 'Ready', session.statusCls || '');
+
+        if (Array.isArray(session.rows) && session.rows.length) {
+          renderTable(session.rows, session.rows.length, 1, 1000, (p) => executeSQL(p));
+        } else if (resultDiv) {
+          resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">No results</div>';
+          window.__curRows = [];
+          window.__curHeaders = [];
+        }
+
+        if (Array.isArray(session.timings) && session.timings.length) {
+          renderTimingsChart(session.timings);
+        }
+      }
+
+      switchTab(session.innerTab || 'execute');
+
+      if (window.editor) {
+        setTimeout(() => { try { window.editor.refresh(); } catch (e) {} }, 0);
+      }
+    }
+
+    function __activateExecSession(id) {
+      if (id === __activeExecSessionId) return;
+
+      const cur = __getActiveExecSession();
+      if (cur && cur.isExecuting) {
+        __cancelSessionExecution(cur);
+        cur.statusText = 'Cancelled';
+        cur.statusCls = '';
+      }
+
+      __saveActiveExecSessionState();
+
+      __activeExecSessionId = id;
+      __renderExecTabs();
+      __applyExecSessionState(__getActiveExecSession());
+    }
+
+    function __addExecSession() {
+      __saveActiveExecSessionState();
+
+      const s = __createExecSession();
+      __execSessions.push(s);
+      __activeExecSessionId = s.id;
+
+      __renderExecTabs();
+      __resetUIForNewSession(s);
+    }
+
+    function __closeExecSession(id) {
+      const idx = __execSessions.findIndex(s => s.id === id);
+      if (idx < 0) return;
+
+      const s = __execSessions[idx];
+      if (s && s.isExecuting) __cancelSessionExecution(s);
+
+      __execSessions.splice(idx, 1);
+
+      if (!__execSessions.length) {
+        const fresh = __createExecSession({ name: 'Execution 1' });
+        __execSessions.push(fresh);
+      }
+
+      if (__activeExecSessionId === id) {
+        const next = __execSessions[Math.max(0, idx - 1)] || __execSessions[0];
+        __activeExecSessionId = next.id;
+      }
+
+      __renderExecTabs();
+      __applyExecSessionState(__getActiveExecSession());
+    }
+
+    function __initExecSessions() {
+      const addBtn = document.getElementById('btnNewExecution');
+      const host = document.getElementById('openExecTabs');
+      if (!addBtn || !host) return;
+
+      if (__execSessions.length) return;
+
+      addBtn.addEventListener('click', () => __addExecSession());
+
+      const first = __createExecSession({
+        name: 'Execution 1',
+        query: window.editor ? window.editor.getValue() : __buildDefaultExecutionQuery()
+      });
+
+      __execSessions.push(first);
+      __activeExecSessionId = first.id;
+
+      __renderExecTabs();
+    }
+
     function updateTenantSummary(superMeta) {
       const filesEl = document.getElementById('tenantFilesValue');
       const rowsEl = document.getElementById('tenantRowsValue');
@@ -711,6 +1073,12 @@
       const el = document.getElementById('status');
       el.className = 'text-sm muted ' + (cls || '');
       el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
+
+      const s = __getActiveExecSession ? __getActiveExecSession() : null;
+      if (s) {
+        s.statusText = text;
+        s.statusCls = cls || '';
+      }
     }
 
     // NEW: Function to switch tabs
@@ -740,11 +1108,28 @@
                 window.editor.refresh();
             }, 0);
         }
-    }
+    
+
+        window.__activeInnerTabName = tabName;
+        const __s = __getActiveExecSession ? __getActiveExecSession() : null;
+        if (__s) __s.innerTab = tabName;
+}
 
 
     // NEW: Centralized error display function
     function displayError(title, message) {
+        const __s = __getActiveExecSession ? __getActiveExecSession() : null;
+        if (__s) {
+            __s.errorVisible = true;
+            __s.errorTitle = title;
+            __s.errorMessage = message;
+            __s.rows = [];
+            __s.timings = null;
+            __s.statusText = 'Failed';
+            __s.statusCls = 'error';
+            __s.innerTab = 'result';
+        }
+
         const statusEl = document.getElementById('status');
         const errorDisplay = document.getElementById('query-error-display');
         const resultDiv = document.getElementById('result');
@@ -1053,7 +1438,8 @@
     let execStartTime = null;
     let execTimerId = null;
 
-    async function executeSQL(page) {
+        async function executeSQL(page) {
+      const session = __getActiveExecSession ? __getActiveExecSession() : null;
       const userHash = USER_HASH;
       const pageSize = 1000;
       const query = window.editor.getValue().trim();
@@ -1063,7 +1449,7 @@
       const timingCard = document.getElementById('timings-visualization-card');
       const resultDiv = document.getElementById('result');
 
-      // Reset error and timing display
+      // Reset error and timing display (active session UI)
       errorDisplay.style.display = 'none';
       timingCard.style.display = 'none';
       resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Loading results...</div>';
@@ -1072,13 +1458,36 @@
             window.timingsChartInstance = null;
         }
 
+      if (session) {
+        session.errorVisible = false;
+        session.errorTitle = '';
+        session.errorMessage = '';
+        session.rows = [];
+        session.timings = null;
+        session.innerTab = 'result';
+      }
+
       switchTab('result');
 
       if (!organization || !superName || !userHash) {
+        if (session) {
+          session.errorVisible = true;
+          session.errorTitle = 'Input Error';
+          session.errorMessage = 'Please select a SuperTable.';
+          session.statusText = 'Failed';
+          session.statusCls = 'error';
+        }
         displayError('Input Error', 'Please select a SuperTable.');
         return;
       }
       if (!/^\s*(select|with)\b/i.test(query)) {
+        if (session) {
+          session.errorVisible = true;
+          session.errorTitle = 'Input Error';
+          session.errorMessage = 'Only SELECT/WITH queries are allowed.';
+          session.statusText = 'Failed';
+          session.statusCls = 'error';
+        }
         displayError('Input Error', 'Only SELECT/WITH queries are allowed.');
         return;
       }
@@ -1100,10 +1509,25 @@
 
       setStatus('Executing…', 'executing');
 
+      // Per-session cancellation
+      let abortController = null;
+      if (session) {
+        if (session.abortController) {
+          try { session.abortController.abort(); } catch (e) {}
+        }
+        abortController = new AbortController();
+        session.abortController = abortController;
+        session.isExecuting = true;
+        session.query = query;
+      } else {
+        abortController = new AbortController();
+      }
+
       try {
         const data = await api('/reflection/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: abortController.signal,
           body: JSON.stringify({
             organization,
             super_name: superName,
@@ -1123,18 +1547,12 @@
           execTimerId = null;
         }
 
-        if (data.status === 'ok') {
-          renderTable(
-            data.result || [],
-            data.total_count || 0,
-            1,
-            pageSize,
-            (p) => executeSQL(p)
-          );
+        const activeNow = __getActiveExecSession ? __getActiveExecSession() : null;
+        const isActive = session && activeNow && session.id === activeNow.id;
 
-          if (data.meta && data.meta.timings) {
-              renderTimingsChart(data.meta.timings);
-          }
+        if (data.status === 'ok') {
+          const rows = data.result || [];
+          const timings = (data.meta && data.meta.timings) ? data.meta.timings : null;
 
           let durationMs = null;
           if (typeof data.duration_ms === 'number') {
@@ -1146,21 +1564,74 @@
           }
 
           const durationStr = (durationMs / 1000).toFixed(3) + 's';
-          const rowsLen = (data.result || []).length;
+          const rowsLen = rows.length;
           const total = data.total_count || 0;
 
           const statusText =
             `Success — ${rowsLen} rows (total ${total}) in ${durationStr}`;
 
-          setStatus(statusText);
+          if (session) {
+            session.rows = rows;
+            session.timings = timings || null;
+            session.errorVisible = false;
+            session.errorTitle = '';
+            session.errorMessage = '';
+            session.statusText = statusText;
+            session.statusCls = '';
+            session.innerTab = window.__activeInnerTabName || session.innerTab || 'result';
+          }
+
+          if (isActive) {
+            renderTable(
+              rows,
+              total,
+              1,
+              pageSize,
+              (p) => executeSQL(p)
+            );
+
+            if (timings) {
+              renderTimingsChart(timings);
+            }
+
+            setStatus(statusText);
+          }
         } else {
           const finishedAtError = Date.now();
           const elapsedErrorSec = ((finishedAtError - startedAt) / 1000).toFixed(3);
 
-          setStatus(`Error executing query after ${elapsedErrorSec}s`, 'error');
-          displayError('Query Error', data.message || 'Unknown error');
+          const msg = data.message || 'Unknown error';
+
+          if (session) {
+            session.errorVisible = true;
+            session.errorTitle = 'Query Error';
+            session.errorMessage = msg;
+            session.rows = [];
+            session.timings = null;
+            session.statusText = `Error executing query after ${elapsedErrorSec}s`;
+            session.statusCls = 'error';
+            session.innerTab = 'result';
+          }
+
+          if (isActive) {
+            setStatus(`Error executing query after ${elapsedErrorSec}s`, 'error');
+            displayError('Query Error', msg);
+          }
         }
       } catch (e) {
+        if (e && e.name === 'AbortError') {
+          if (session) {
+            session.statusText = 'Cancelled';
+            session.statusCls = '';
+            session.isExecuting = false;
+            session.abortController = null;
+          }
+          const activeNow = __getActiveExecSession ? __getActiveExecSession() : null;
+          const isActive = session && activeNow && session.id === activeNow.id;
+          if (isActive) setStatus('Cancelled');
+          return;
+        }
+
         const finishedAt = Date.now();
         const elapsedSec = ((finishedAt - startedAt) / 1000).toFixed(3);
 
@@ -1170,8 +1641,28 @@
           execTimerId = null;
         }
 
-        setStatus(`Error executing query after ${elapsedSec}s`, 'error');
-        displayError('Network Error', e.message || String(e));
+        if (session) {
+          session.errorVisible = true;
+          session.errorTitle = 'Network Error';
+          session.errorMessage = e.message || String(e);
+          session.rows = [];
+          session.timings = null;
+          session.statusText = `Error executing query after ${elapsedSec}s`;
+          session.statusCls = 'error';
+          session.innerTab = 'result';
+        }
+
+        const activeNow = __getActiveExecSession ? __getActiveExecSession() : null;
+        const isActive = session && activeNow && session.id === activeNow.id;
+        if (isActive) {
+          setStatus(`Error executing query after ${elapsedSec}s`, 'error');
+          displayError('Network Error', e.message || String(e));
+        }
+      } finally {
+        if (session && session.abortController === abortController) {
+          session.abortController = null;
+          session.isExecuting = false;
+        }
       }
     }
 
@@ -1318,6 +1809,9 @@
 
       loadTenants();
 
+      __mountInnerTabs();
+      __initExecSessions();
+
       switchTab('execute');
     });
   </script>
@@ -1332,6 +1826,11 @@
 
       {% if has_tenant %}
 
+      <div id="exec-navigation" style="margin: 0 6px 14px 6px;">
+        <button type="button" class="tab-add" id="btnNewExecution" title="New execution">+</button>
+        <div id="openExecTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
+      </div>
+
       <div id="tab-navigation">
           <div id="tab-execute" class="tab active" onclick="switchTab('execute')">
               <i class="fas fa-terminal"></i>&nbsp;Execute
@@ -1345,6 +1844,8 @@
       </div>
 
       <div id="tab-content-container">
+
+          <div id="inner-tab-mount"></div>
 
           <div id="tab-content-execute" class="tab-content active">
               <div class="card sql-editor-card">
