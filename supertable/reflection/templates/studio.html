@@ -197,6 +197,35 @@
     flex-wrap: wrap;
     margin-top: 12px;
   }
+
+/* Keep notebook name + Save/Download on the same row */
+.editor-top .left{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 320px;
+}
+.editor-top .left .nb-name-input{
+  width: 320px; /* override bootstrap width:100% */
+  max-width: 100%;
+  flex: 0 0 auto;
+  order: 1;
+}
+.name-actions{
+  display:flex;
+  align-items:center;
+  gap: 8px;
+  flex: 0 0 auto;
+  order: 2;
+}
+.editor-top .left #nbEditorMeta{
+  flex: 1 1 auto;
+  order: 3;
+  min-width: 220px;
+    flex-basis: 100%;
+  }
   .editor-top .left,
   .editor-top .right {
     display:flex;
@@ -257,7 +286,7 @@
 
   .codebox {
     width: 100%;
-    min-height: 130px;
+    min-height: 190px;
     resize: vertical;
     border-radius: 14px;
     border: 1px solid rgba(15,23,42,.14);
@@ -394,7 +423,82 @@
     flex-wrap: wrap;
     margin-top: 10px;
   }
+
+/* --- Studio editor UX tweaks (2026-02-09) --- */
+.name-actions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-left:10px;
+  flex-wrap:wrap;
+}
+.compute-select{
+  border-radius: 14px;
+  border: 1px solid rgba(15,23,42,.14);
+  background: rgba(248,250,252,.9);
+  padding-left: 10px;
+}
+
+.compute-bar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.compute-left{
+  display:flex;
+  align-items:center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 260px;
+}
+.compute-right{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-left: auto;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
+/* Keep Run All / Stop on the right when there's enough room */
+@media (min-width: 820px){
+  .compute-bar{ flex-wrap: nowrap; }
+  .compute-left{ flex-wrap: nowrap; }
+  .compute-right{ flex-wrap: nowrap; }
+}
+
+
+/* CodeMirror (optional) matches the existing textarea look */
+.CodeMirror{
+  border-radius: 14px;
+  border: 1px solid rgba(15,23,42,.14);
+  background: #ffffff;
+  font-size: 13px;
+  line-height: 1.35;
+  height: 190px; /* taller by default */
+}
+.CodeMirror-gutters{
+  border-right: 1px solid rgba(15,23,42,.10);
+  background: rgba(248,250,252,.95);
+}
+.CodeMirror-linenumber{
+  padding: 0 10px 0 10px;
+  min-width: 42px;
+  text-align: right;
+  color:#94a3b8;
+}
+.CodeMirror-lines{ padding: 10px 12px; } /* padding for code, not over the gutter */
+.CodeMirror-scroll{ padding: 0 !important; }
+
 </style>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" referrerpolicy="no-referrer" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css" referrerpolicy="no-referrer" />
 {% endblock %}
 
 {% block content %}
@@ -524,35 +628,41 @@
           <div class="muted" id="editorStatus"></div>
         </div>
 
-        <!-- Row 1: Run all / Stop -->
+        <!-- Row 1: Notebook name + actions -->
         <div class="editor-top">
           <div class="left">
             <input class="form-control form-control-sm nb-name-input" id="nbEditorName" placeholder="Untitled lab" />
-            <span class="muted" id="nbEditorMeta"></span>
-          </div>
-          <div class="right">
-            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-              <span class="muted" style="font-weight:900;">Compute</span>
-              <select class="form-select form-select-sm mono" id="computeSelect" style="min-width:220px;">
-                <option value="">Loading…</option>
-              </select>
-              <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshCompute" title="Refresh compute pools">
-                <i class="fas fa-rotate"></i>
+            <div class="name-actions" aria-label="Notebook actions">
+              <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
+                <i class="fas fa-save"></i> Save
+              </button>
+              <button type="button" class="btn btn-sm btn-azure-outline" id="btnDownloadNotebook">
+                <i class="fas fa-download"></i> Download
               </button>
             </div>
+            <span class="muted" id="nbEditorMeta"></span>
+          </div>
+        </div>
+
+        <!-- Row 2: Compute (below editor) -->
+        <div class="compute-bar" aria-label="Compute controls">
+          <div class="compute-left">
+            <span class="muted" style="font-weight:900;">Compute</span>
+            <select class="form-select form-select-sm mono compute-select" id="computeSelect" style="min-width:240px;">
+              <option value="">Loading…</option>
+            </select>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshCompute" title="Refresh compute pools">
+              <i class="fas fa-rotate"></i>
+            </button>
+          </div>
+          <div class="compute-right">
             <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
               <i class="fas fa-play"></i> Run All
             </button>
             <button type="button" class="btn btn-sm btn-danger-outline" id="btnStop">
               <i class="fas fa-stop"></i> Stop
             </button>
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
-              <i class="fas fa-save"></i> Save
-            </button>
-                        <button type="button" class="btn btn-sm btn-azure-outline" id="btnDownloadNotebook">
-              <i class="fas fa-download"></i> Download
-            </button>
-<button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab" style="display:none;">
+            <button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab" style="display:none;">
               <i class="fas fa-xmark"></i> Close
             </button>
           </div>
@@ -565,16 +675,7 @@
           </div>
 
           <div class="editor-subbar" style="margin-top:0;">
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnAddCellTop" title="Add cell">
-              <i class="fas fa-plus"></i>
-            </button>
-            <button type="button" class="btn btn-sm btn-danger-outline" id="btnDeleteActiveCell" title="Delete active cell">
-              <i class="fas fa-trash"></i>
-            </button>
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunActive" title="Run active cell">
-              <i class="fas fa-play"></i>
-            </button>
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
+<button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
               <i class="fas fa-magnifying-glass"></i> Snippets
             </button>
 
@@ -613,6 +714,15 @@
 {% endblock %}
 
 {% block body_scripts %}
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/anyword-hint.min.js" referrerpolicy="no-referrer"></script>
+
 <script>
 (function () {
   const ln = document.getElementById("link-studio");
@@ -1088,6 +1198,81 @@
   // -----------------------------
   // Editor: cells
   // -----------------------------
+
+// CodeMirror (optional): syntax highlight + basic autocomplete
+const cmByCellId = new Map();
+
+function cmModeFor(cellType) {
+  return (cellType === 'markdown') ? 'markdown' : 'python';
+}
+
+function focusCellEditor(cellId) {
+  const cm = cmByCellId.get(cellId);
+  if (cm && typeof cm.focus === 'function') { cm.focus(); return true; }
+  const ta = document.querySelector(`.cell[data-id="${cssEsc(cellId)}"] textarea`);
+  if (ta) { ta.focus(); return true; }
+  return false;
+}
+
+function attachCodeMirror(cell, textarea) {
+  if (!textarea) return null;
+  if (!window.CodeMirror) return null;
+  try {
+    const cm = window.CodeMirror.fromTextArea(textarea, {
+      mode: cmModeFor(cell.type),
+      lineNumbers: true,
+      indentUnit: 4,
+      tabSize: 4,
+      indentWithTabs: false,
+      electricChars: true,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      viewportMargin: 50,
+      extraKeys: {
+        'Tab': (cmx) => cmx.execCommand('insertSoftTab'),
+        'Shift-Tab': (cmx) => cmx.execCommand('indentLess'),
+        'Ctrl-Space': 'autocomplete',
+        'Cmd-Space': 'autocomplete',
+        'Ctrl-Enter': async () => { if (cell.type !== 'markdown') await runCell(cell.id); },
+        'Cmd-Enter': async () => { if (cell.type !== 'markdown') await runCell(cell.id); },
+      },
+      hintOptions: (window.CodeMirror && window.CodeMirror.hint && window.CodeMirror.hint.anyword)
+        ? { hint: window.CodeMirror.hint.anyword }
+        : undefined
+    });
+
+    cm.on('focus', () => { activeCellId = cell.id; });
+
+    cm.on('change', () => {
+      const doc = getActiveDoc();
+      if (!doc) return;
+      const found = doc.cells.find(c => c.id === cell.id);
+      if (found) {
+        found.code = cm.getValue();
+        if (found.type === 'markdown') renderMarkdownInto(cell.id, found.code);
+      }
+      markDirty(doc);
+    });
+
+    // Ensure the editor paints correctly even if the cell was created off-DOM
+    try {
+      const initial = textarea.value || (cell.code || '');
+      if (cm.getValue() !== initial) cm.setValue(initial);
+      cm.clearHistory();
+    } catch (e) {}
+
+    const _refresh = () => { try { cm.refresh(); } catch (e) {} };
+    if (window.requestAnimationFrame) window.requestAnimationFrame(_refresh);
+    setTimeout(_refresh, 0);
+    setTimeout(_refresh, 60);
+
+    cmByCellId.set(cell.id, cm);
+    return cm;
+  } catch (e) {
+    console.warn('CodeMirror init failed', e);
+    return null;
+  }
+}
   function createCellEl(cell, idx) {
     const el = document.createElement('div');
     el.className = 'cell';
@@ -1101,7 +1286,7 @@
           <span class="muted" id="status-${escapeHtml(cell.id)}"></span>
         </div>
         <div class="cell-actions">
-          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run"><i class="fas fa-play"></i> ${cell.type === 'markdown' ? 'Render' : 'Run'}</button>
+          <button type="button" class="btn btn-sm btn-azure-outline" data-action="run"><i class="fas fa-play"></i> Run</button>
           <button type="button" class="btn btn-sm btn-azure-outline" data-action="toggle-type" title="Toggle markdown/code">${cell.type === 'markdown' ? 'Code' : 'MD'}</button>
           <button type="button" class="btn btn-sm btn-azure-outline" data-action="clear-output" title="Clear output"><i class="fas fa-eraser"></i></button>
           <button type="button" class="btn btn-sm btn-azure-outline" data-action="add-below" title="Add cell below"><i class="fas fa-plus"></i></button>
@@ -1132,9 +1317,10 @@
       ta.addEventListener('keydown', async (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
           e.preventDefault();
-          await runCell(cell.id);
+          if (cell.type !== 'markdown') await runCell(cell.id);
         }
       });
+      attachCodeMirror(cell, ta);
     }
 
     el.addEventListener('click', () => { activeCellId = cell.id; });
@@ -1168,7 +1354,10 @@
     const cellWrap = document.querySelector(`.cell[data-id="${cssEsc(cellId)}"]`);
     if (!cellWrap) return;
     const runBtn = cellWrap.querySelector('button[data-action="run"]');
-    if (runBtn) runBtn.innerHTML = `<i class="fas fa-play"></i> ${typ === 'markdown' ? 'Render' : 'Run'}`;
+    if (runBtn) {
+      runBtn.innerHTML = `<i class="fas fa-play"></i> Run`;
+      runBtn.style.display = (typ === 'markdown') ? 'none' : '';
+    }
     const toggleBtn = cellWrap.querySelector('button[data-action="toggle-type"]');
     if (toggleBtn) toggleBtn.textContent = (typ === 'markdown') ? 'Code' : 'MD';
     const md = document.getElementById(`md-${cellId}`);
@@ -1178,6 +1367,9 @@
       if (typ === 'markdown') out.style.display = 'none';
       // for code cells, setOutput controls display
     }
+    // update CodeMirror mode if present
+    const cm = cmByCellId.get(cellId);
+    if (cm && typeof cm.setOption === 'function') cm.setOption('mode', cmModeFor(typ));
   }
 
   function clearCellOutput(cellId) {
@@ -1276,8 +1468,18 @@
     if (!wrap || !doc) return;
 
     wrap.innerHTML = '';
+    cmByCellId.clear();
     doc.cells.forEach((c, i) => wrap.appendChild(createCellEl(c, i)));
     if (!activeCellId && doc.cells.length) activeCellId = doc.cells[0].id;
+
+    // After DOM is painted, refresh CodeMirror so content/line-numbers render correctly
+    if (window.requestAnimationFrame) {
+      window.requestAnimationFrame(() => {
+        cmByCellId.forEach((cm) => { try { cm.refresh(); } catch (e) {} });
+      });
+    } else {
+      setTimeout(() => { cmByCellId.forEach((cm) => { try { cm.refresh(); } catch (e) {} }); }, 0);
+    }
   }
 
   function addCellBelow(id) {
@@ -1290,11 +1492,8 @@
     activeCellId = item.id;
     markDirty(doc);
     renderCells();
-    setTimeout(() => {
-      const el = document.querySelector(`.cell[data-id="${cssEsc(item.id)}"] textarea`);
-      if (el) el.focus();
-    }, 30);
-  }
+    setTimeout(() => { focusCellEditor(item.id); }, 30);
+    }
 
   function addCellEnd() {
     const doc = getActiveDoc();
@@ -1304,11 +1503,8 @@
     activeCellId = item.id;
     markDirty(doc);
     renderCells();
-    setTimeout(() => {
-      const el = document.querySelector(`.cell[data-id="${cssEsc(item.id)}"] textarea`);
-      if (el) el.focus();
-    }, 30);
-  }
+    setTimeout(() => { focusCellEditor(item.id); }, 30);
+    }
 
   function deleteCell(id) {
     const doc = getActiveDoc();
@@ -2489,8 +2685,9 @@ function streamOutputInit(cellId, meta) {
     if (!cell) return;
 
     if (cell.type === 'markdown') {
+      // Markdown cells are not executed. Rendering happens automatically on edit/toggle.
       renderMarkdownInto(cellId, cell.code || '');
-      setStatus(cellId, 'rendered');
+      setStatus(cellId, '');
       return;
     }
 
@@ -2613,6 +2810,7 @@ function streamOutputInit(cellId, meta) {
     if (!doc) return;
     for (const c of doc.cells) {
       if (stopRequested) return;
+      if (c && c.type === 'markdown') continue;
       const code = String(c.code || '').trim();
       if (code) await runCell(c.id);
     }
