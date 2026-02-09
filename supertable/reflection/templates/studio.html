@@ -2047,9 +2047,26 @@
     stopRequested = true;
     activeControllers.forEach(c => { try { c.abort(); } catch (e) {} });
     activeControllers = [];
+
+    // Ask server-side notebook kernels to reset before closing sockets
+    try {
+      Object.keys(notebookWsSessions || {}).forEach(tid => {
+        const sess = notebookWsSessions[tid];
+        try {
+          if (sess && sess.sock && sess.sock.readyState === WebSocket.OPEN && sess.sessionId) {
+            sess.sock.send(JSON.stringify({ op: 'reset', session_id: String(sess.sessionId) }));
+          }
+        } catch (e) {}
+      });
+    } catch (e) {}
+
+    // Properly reset stateful notebook sessions (closes sockets and clears map)
+    try { closeAllNotebookWsSessions('stop'); } catch (e) {}
+
+    // Close any remaining sockets (safety net)
     activeSockets.forEach(s => { try { s.close(); } catch (e) {} });
     activeSockets = [];
-    notebookWsSessions = {};
+
     toast('Stopped (client-side)');
     // allow new runs
     setTimeout(() => { stopRequested = false; }, 200);
@@ -2150,6 +2167,11 @@ function streamOutputInit(cellId, meta) {
     if (!tid) return;
     const sess = notebookWsSessions[tid];
     if (!sess) return;
+    try {
+      if (sess && sess.sock && sess.sock.readyState === WebSocket.OPEN && sess.sessionId) {
+        sess.sock.send(JSON.stringify({ op: 'reset', session_id: String(sess.sessionId) }));
+      }
+    } catch (e) {}
     try { if (sess.sock) sess.sock.close(); } catch (e) {}
     if (sess.sock) activeSockets = activeSockets.filter(s => s !== sess.sock);
     delete notebookWsSessions[tid];
@@ -2245,12 +2267,13 @@ function streamOutputInit(cellId, meta) {
     }
   }
 
-  async function runCellOnNotebookWs(cellId, code, pool, startTs, tabIdOverride) {
+  async function runCellOnNotebookWs(cellId, code, pool, startTs, tabIdOverride, sessionId) {
     const tid = String(tabIdOverride || activeTabId || '').trim();
     const sess = await getOrCreateNotebookWsSession(tid, pool);
 
     if (sess.busy) throw new Error('Notebook is busy (another cell is running)');
     sess.busy = true;
+    sess.sessionId = String(sessionId || '');
 
     const wsUrl = String(sess.wsUrl || '');
     const profile = String(sess.profile || 'no-internet');
@@ -2356,7 +2379,7 @@ function streamOutputInit(cellId, meta) {
       streamOutputInit(cellId, metaBase);
       setStatus(cellId, 'running…');
       try {
-        sock.send(JSON.stringify({ code: String(code || ''), profile }));
+        sock.send(JSON.stringify({ code: String(code || ''), profile, session_id: String(sessionId || '') }));
       } catch (e) {
         finish(false, 'Failed to send code to notebook');
       }
@@ -2407,7 +2430,7 @@ function streamOutputInit(cellId, meta) {
         streamOutputInit(cellId, metaBase);
         setStatus(cellId, 'running…');
         try {
-          sock.send(JSON.stringify({ code: String(code || ''), profile }));
+          sock.send(JSON.stringify({ code: String(code || ''), profile, session_id: String(sessionId || '') }));
         } catch (e) {
           finish(false, 'Failed to send code to notebook');
         }
@@ -2501,7 +2524,7 @@ function streamOutputInit(cellId, meta) {
       const wsRaw = pool && pool.ws_url ? String(pool.ws_url) : '';
       if (pool && wsRaw && wsRaw.trim()) {
         try {
-          const ok = await runCellOnNotebookWs(cellId, code, pool, start, doc.tab_id);
+          const ok = await runCellOnNotebookWs(cellId, code, pool, start, doc.tab_id, sessionId);
           // Avoid double-execution: only fall back if the websocket was blocked before the run started.
           if (ok) return;
           return;
