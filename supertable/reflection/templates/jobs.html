@@ -67,6 +67,24 @@
         padding: 20px;
         margin-top: 20px;
     }
+    /* Studio-like buttons */
+    .btn-azure-outline {
+      border: 1px solid #1c96ca;
+      background: transparent;
+      color: #1c96ca;
+      font-weight: 600;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+    .btn-azure-outline:hover { background: #1c96ca; color: #ffffff; }
+
+    .btn-danger-outline {
+      border: 1px solid rgba(239,68,68,0.75);
+      background: transparent;
+      color: rgba(239,68,68,0.9);
+      font-weight: 600;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+    .btn-danger-outline:hover { background: rgba(239,68,68,0.12); }
 </style>
 {% endblock %}
 
@@ -80,7 +98,7 @@
                 <i class="fas fa-clock" style="color:var(--primary-color);"></i>
                 <span>Notebook Scheduler</span>
             </div>
-            <button class="btn btn-primary btn-sm" id="btnNewJob">
+            <button class="btn btn-azure-outline btn-sm" id="btnNewJob">
                 <i class="fas fa-plus"></i> New Scheduled Job
             </button>
         </div>
@@ -139,7 +157,7 @@
       <div class="modal-body">
         <div class="form-group">
             <label class="text-xs font-weight-bold">Job Name</label>
-            <input type="text" class="form-control form-control-sm" placeholder="Nightly Cleanup">
+             <input type="text" class="form-control form-control-sm" id="jobNameInput" placeholder="Nightly Cleanup">
         </div>
         <div class="form-group">
             <label class="text-xs font-weight-bold">Select Notebook</label>
@@ -147,15 +165,48 @@
                 <option>Loading notebooks...</option>
             </select>
         </div>
+        
         <div class="form-group">
+            <label class="text-xs font-weight-bold">Schedule</label>
+            <select class="form-control form-control-sm" id="scheduleTypeSelect">
+                <option value="every">Every (N minutes)</option>
+                <option value="minute">Minute (minutes in hour)</option>
+                <option value="day" selected>Day (times)</option>
+                <option value="week">Week</option>
+                <option value="second_week">Second week</option>
+                <option value="month">Month</option>
+                <option value="year">Year</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label class="text-xs font-weight-bold">Value(s)</label>
+            <input type="text" class="form-control form-control-sm" id="scheduleValuesInput" placeholder="13:00,15:00">
+            <small class="text-muted" id="scheduleHelp"></small>
+        </div>
+
+        <!-- Advanced (kept for backward compatibility) -->
+        <div class="form-group" id="cronAdvancedGroup" style="display:none;">
             <label class="text-xs font-weight-bold">Schedule (Cron Expression)</label>
-            <input type="text" class="form-control form-control-sm" placeholder="0 0 * * *">
+            <input type="text" class="form-control form-control-sm" id="cronInput" placeholder="0 0 * * *">
             <small class="text-muted">Example: 0 0 * * * (Every day at midnight)</small>
+        </div>
+
+         <div class="form-group">
+             <label class="text-xs font-weight-bold">Timezone</label>
+             <input type="text" class="form-control form-control-sm" id="tzInput" placeholder="UTC">
+             <small class="text-muted">IANA timezone name (e.g. Europe/Budapest). Defaults to your browser timezone.</small>
+         </div>
+         <div class="form-group">
+             <label class="text-xs font-weight-bold">Compute Pool</label>
+             <select class="form-control form-control-sm" id="computeSelect">
+                 <option value="">Default</option>
+             </select>
+         </div>
         </div>
       </div>
       <div class="modal-footer">
-        <button type="button" class="btn btn-secondary btn-sm" data-dismiss="modal">Cancel</button>
-        <button type="button" class="btn btn-primary btn-sm">Save Job</button>
+         <button type="button" class="btn btn-azure-outline btn-sm" data-dismiss="modal" id="btnCancelJob">Cancel</button>
+         <button type="button" class="btn btn-azure-outline btn-sm" id="btnSaveJob">Save Job</button>
       </div>
     </div>
   </div>
@@ -164,36 +215,388 @@
 
 {% block body_scripts %}
 <script>
-    $(document).ready(function() {
-        $("#link-jobs").addClass("active");
+  (function() {
+    function qs(sel) { return document.querySelector(sel); }
+    function qsa(sel) { return Array.from(document.querySelectorAll(sel)); }
 
-        $("#btnNewJob").on("click", function() {
-            $('#jobModal').modal('show');
-            loadNotebookOptions();
-        });
+    function currentCtx() {
+      return {
+        org: "{{ sel_org }}",
+        sup: "{{ sel_sup }}",
+        userHash: "{{ session_user_hash }}",
+      };
+    }
 
-        function loadNotebookOptions() {
+    function k(prefix) {
+      const c = currentCtx();
+      return `nb:${c.org}:${c.sup}:${c.userHash}:${prefix}`;
+    }
 
-            const org = "{{ sel_org }}";
-            const sup = "{{ sel_sup }}";
-            const userHash = "{{ session_user_hash }}";
-            const key = `nb:${org}:${sup}:${userHash}:notebooks`;
-            
-            let notebooks = [];
-            try {
-                notebooks = JSON.parse(localStorage.getItem(key)) || [];
-            } catch(e) {}
+    function lsGet(key, fallback) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return fallback;
+        return JSON.parse(raw);
+      } catch (e) {
+        return fallback;
+      }
+    }
 
-            const select = $("#notebookSelect");
-            select.empty();
-            if (notebooks.length === 0) {
-                select.append('<option disabled>No notebooks found in Studio</option>');
-            } else {
-                notebooks.forEach(nb => {
-                    select.append(`<option value="${nb.id}">${nb.name}</option>`);
-                });
-            }
+    function compileNotebook(nb) {
+      const cells = (nb && Array.isArray(nb.cells)) ? nb.cells : [];
+      const chunks = [];
+      for (const c of cells) {
+        const typ = String(c.type || 'code');
+        const code = String(c.code || '');
+        if (typ === 'markdown') continue;
+        if (!code.trim()) continue;
+        chunks.push(code.trim());
+      }
+      return chunks.join("\n\n");
+    }
+
+    async function getJSON(url) {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      const text = await resp.text();
+      let js = null;
+      try { js = JSON.parse(text); } catch (e) { js = null; }
+      if (!resp.ok) {
+        const msg = (js && (js.detail || js.error)) || text || ('Request failed: ' + resp.status);
+        throw new Error(msg);
+      }
+      return js;
+    }
+
+    async function postJSON(url, obj, method) {
+      const resp = await fetch(url, {
+        method: method || 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(obj || {}),
+        credentials: 'same-origin',
+      });
+      const text = await resp.text();
+      let js = null;
+      try { js = JSON.parse(text); } catch (e) { js = null; }
+      if (!resp.ok) {
+        const msg = (js && (js.detail || js.error)) || text || ('Request failed: ' + resp.status);
+        throw new Error(msg);
+      }
+      return js;
+    }
+
+    function showModal(el) {
+      if (!el) return;
+      if (window.bootstrap && window.bootstrap.Modal) {
+        const m = window.bootstrap.Modal.getOrCreateInstance(el);
+        m.show();
+        return;
+      }
+      // Fallback (no Bootstrap JS): toggle classes + backdrop
+      el.style.display = 'block';
+      el.classList.add('show');
+      el.setAttribute('aria-modal', 'true');
+      el.removeAttribute('aria-hidden');
+      document.body.classList.add('modal-open');
+      let bd = qs('.modal-backdrop');
+      if (!bd) {
+        bd = document.createElement('div');
+        bd.className = 'modal-backdrop fade show';
+        document.body.appendChild(bd);
+      }
+    }
+
+    function hideModal(el) {
+      if (!el) return;
+      if (window.bootstrap && window.bootstrap.Modal) {
+        const m = window.bootstrap.Modal.getOrCreateInstance(el);
+        m.hide();
+        return;
+      }
+      el.classList.remove('show');
+      el.style.display = 'none';
+      el.setAttribute('aria-hidden', 'true');
+      el.removeAttribute('aria-modal');
+      document.body.classList.remove('modal-open');
+      const bd = qs('.modal-backdrop');
+      if (bd) bd.remove();
+    }
+
+    function fillNotebooks() {
+      const sel = qs('#notebookSelect');
+      if (!sel) return;
+      const notebooks = lsGet(k('notebooks'), []);
+      sel.innerHTML = '';
+      if (!Array.isArray(notebooks) || notebooks.length === 0) {
+        const opt = document.createElement('option');
+        opt.disabled = true;
+        opt.textContent = 'No notebooks found in Studio';
+        sel.appendChild(opt);
+        return;
+      }
+      for (const nb of notebooks) {
+        const opt = document.createElement('option');
+        opt.value = String(nb.id || '');
+        opt.textContent = String(nb.name || nb.id || 'Notebook');
+        sel.appendChild(opt);
+      }
+    }
+
+    async function fillComputePools() {
+      const sel = qs('#computeSelect');
+      if (!sel) return;
+      // keep first option (Default)
+      while (sel.options.length > 1) sel.remove(1);
+      try {
+        const js = await getJSON('/reflection/compute/list');
+        const items = (js && (js.items || js.pools || js.compute || js.data)) || [];
+        if (!Array.isArray(items)) return;
+        for (const it of items) {
+          const id = String(it.id || it.compute_pool_id || it.pool_id || '');
+          if (!id) continue;
+          const label = String(it.label || it.name || id);
+          const opt = document.createElement('option');
+          opt.value = id;
+          opt.textContent = label;
+          sel.appendChild(opt);
         }
+      } catch (e) {
+        // compute list is optional; ignore
+      }
+    }
+
+    async function refreshSchedules() {
+      const tbody = qs('#jobsBody');
+      if (!tbody) return;
+      const c = currentCtx();
+      if (!c.org || !c.sup || !c.userHash) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center muted py-4">Select a tenant to view schedules.</td></tr>';
+        return;
+      }
+      try {
+        const url = `/reflection/jobs/scheduled?org=${encodeURIComponent(c.org)}&sup=${encodeURIComponent(c.sup)}&user_hash=${encodeURIComponent(c.userHash)}`;
+        const js = await getJSON(url);
+        const items = (js && js.items) || [];
+        if (!Array.isArray(items) || items.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="text-center muted py-4">No scheduled jobs found.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = '';
+        for (const it of items) {
+          const tr = document.createElement('tr');
+          const lastRun = it.last_run_iso ? String(it.last_run_iso) : '-';
+          const status = it.last_status ? String(it.last_status) : 'idle';
+          const pillClass = (status === 'running') ? 'status-running' : 'status-idle';
+          tr.innerHTML = `
+            <td>${escapeHtml(String(it.name || ''))}</td>
+            <td>${escapeHtml(String(it.notebook_name || it.notebook_id || ''))}</td>
+            <td>${escapeHtml(scheduleSummary(it))}</td>
+            <td class="mono" style="font-size:12px;">${escapeHtml(lastRun)}</td>
+            <td><span class="job-status-pill ${pillClass}">${escapeHtml(status)}</span></td>
+            <td class="text-right">
+              <button class="btn btn-azure-outline btn-sm" data-action="run" data-id="${escapeHtml(String(it.schedule_id))}">Run now</button>
+              <button class="btn btn-danger-outline btn-sm" data-action="del" data-id="${escapeHtml(String(it.schedule_id))}">Delete</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="6" class="text-center muted py-4">${escapeHtml(String(e.message || e))}</td></tr>`;
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, function(c) {
+        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] || c;
+      });
+    }
+
+
+    function scheduleSummary(it) {
+      const tz = String((it && it.timezone) || 'UTC');
+      const st = String((it && it.schedule_type) || '').trim();
+      const sv = String((it && it.schedule_values) || '').trim();
+
+      const labels = {
+        'every': 'Every',
+        'minute': 'Minute',
+        'day': 'Day',
+        'week': 'Week',
+        'second_week': 'Second week',
+        'month': 'Month',
+        'year': 'Year',
+        'cron': 'Cron',
+      };
+      if (st && st !== 'cron') {
+        const label = labels[st] || st;
+        if (st === 'every') {
+          const n = sv || '-';
+          return `${label} ${n} min (${tz})`;
+        }
+        if (!sv) return `${label} (${tz})`;
+        return `${label}: ${sv} (${tz})`;
+      }
+      const cron = String((it && it.cron) || '').trim();
+      if (cron) return `${cron} (${tz})`;
+      return `- (${tz})`;
+    }
+
+
+    function updateScheduleHelp() {
+      const sel = qs('#scheduleTypeSelect');
+      const input = qs('#scheduleValuesInput');
+      const help = qs('#scheduleHelp');
+      if (!sel || !input || !help) return;
+      const t = String(sel.value || '').trim();
+
+      let placeholder = '';
+      let msg = '';
+      if (t === 'every') {
+        placeholder = '5';
+        msg = 'Run every N minutes. Example: 5';
+      } else if (t === 'minute') {
+        placeholder = '0,15,30,45';
+        msg = 'Run at these minutes each hour (0-59). Leave empty for every minute.';
+      } else if (t === 'day') {
+        placeholder = '13:00,15:00';
+        msg = 'Run daily at these times (HH:MM). You can also use hours like "13,15" (=13:00 and 15:00).';
+      } else if (t === 'week') {
+        placeholder = 'Mon@13:00,Wed@15:00';
+        msg = 'Run weekly. Use "Day@HH:MM" (Day can be Mon..Sun or 1..7 for Mon..Sun).';
+      } else if (t === 'second_week') {
+        placeholder = 'Mon@13:00';
+        msg = 'Run every 2 weeks (anchored to creation week). Use "Day@HH:MM".';
+      } else if (t === 'month') {
+        placeholder = '1@09:00,15@13:00';
+        msg = 'Run monthly. Use "DayOfMonth@HH:MM" (1-31).';
+      } else if (t === 'year') {
+        placeholder = '03-15@13:00';
+        msg = 'Run yearly. Use "MM-DD@HH:MM" (e.g. 03-15@13:00).';
+      }
+      input.placeholder = placeholder;
+      help.textContent = msg;
+    }
+
+    async function createSchedule() {
+      const c = currentCtx();
+      const name = String((qs('#jobNameInput') && qs('#jobNameInput').value) || '').trim();
+      const nbId = String((qs('#notebookSelect') && qs('#notebookSelect').value) || '').trim();
+      const scheduleType = String((qs('#scheduleTypeSelect') && qs('#scheduleTypeSelect').value) || '').trim();
+      const scheduleValues = String((qs('#scheduleValuesInput') && qs('#scheduleValuesInput').value) || '').trim();
+      const cron = String((qs('#cronInput') && qs('#cronInput').value) || '').trim(); // advanced (optional)
+      const tz = String((qs('#tzInput') && qs('#tzInput').value) || '').trim();
+      const compute = String((qs('#computeSelect') && qs('#computeSelect').value) || '').trim();
+
+      if (!c.org || !c.sup || !c.userHash) throw new Error('Select a tenant first.');
+      if (!name) throw new Error('Job name is required.');
+      if (!nbId) throw new Error('Select a notebook.');
+      if (!scheduleType) throw new Error('Schedule type is required.');
+      if (['week','second_week','month','year'].includes(scheduleType) && !scheduleValues) throw new Error('Value(s) are required for this schedule type.');
+      if (scheduleType === 'every' && (!scheduleValues || !/^[0-9]+$/.test(scheduleValues))) throw new Error('For "Every", enter an integer number of minutes.');
+const notebooks = lsGet(k('notebooks'), []);
+      const nb = (Array.isArray(notebooks) ? notebooks : []).find(x => String(x.id || '') === nbId);
+      if (!nb) throw new Error('Notebook not found in Studio storage.');
+      const code = compileNotebook(nb);
+      if (!code.trim()) throw new Error('Notebook has no code cells to run.');
+
+      const payload = {
+        org: c.org,
+        sup: c.sup,
+        user_hash: c.userHash,
+        name: name,
+        notebook_id: String(nb.id || ''),
+        notebook_name: String(nb.name || nb.id || ''),
+        notebook: nb,
+        code: code,
+        cron: cron || null,
+        schedule_type: scheduleType,
+        schedule_values: scheduleValues,
+timezone: tz || (Intl && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'UTC') || 'UTC',
+        compute_pool_id: compute || null,
+      };
+      await postJSON('/reflection/jobs/scheduled', payload, 'POST');
+    }
+
+    async function runNow(scheduleId) {
+      const c = currentCtx();
+      const url = `/reflection/jobs/scheduled/${encodeURIComponent(scheduleId)}/run_now?org=${encodeURIComponent(c.org)}&sup=${encodeURIComponent(c.sup)}&user_hash=${encodeURIComponent(c.userHash)}`;
+      await postJSON(url, {}, 'POST');
+    }
+
+    async function deleteSchedule(scheduleId) {
+      const c = currentCtx();
+      const url = `/reflection/jobs/scheduled/${encodeURIComponent(scheduleId)}?org=${encodeURIComponent(c.org)}&sup=${encodeURIComponent(c.sup)}&user_hash=${encodeURIComponent(c.userHash)}`;
+      await postJSON(url, {}, 'DELETE');
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+      const link = qs('#link-jobs');
+      if (link) link.classList.add('active');
+
+      const modal = qs('#jobModal');
+      const btnNew = qs('#btnNewJob');
+      const btnSave = qs('#btnSaveJob');
+      const scheduleSel = qs('#scheduleTypeSelect');
+      if (scheduleSel) {
+        scheduleSel.addEventListener('change', updateScheduleHelp);
+      }
+
+
+      if (btnNew) {
+        btnNew.addEventListener('click', async function() {
+          fillNotebooks();
+          await fillComputePools();
+          const tzEl = qs('#tzInput');
+          if (tzEl && !String(tzEl.value || '').trim()) {
+            try { tzEl.value = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) { tzEl.value = 'UTC'; }
+          }
+          updateScheduleHelp();
+          showModal(modal);
+        });
+      }
+
+      if (btnSave) {
+        btnSave.addEventListener('click', async function() {
+          try {
+            await createSchedule();
+            hideModal(modal);
+            await refreshSchedules();
+          } catch (e) {
+            alert(String(e.message || e));
+          }
+        });
+      }
+
+      // modal dismiss buttons fallback
+      qsa('[data-dismiss="modal"]').forEach(function(el) {
+        el.addEventListener('click', function() { hideModal(modal); });
+      });
+
+      const tbody = qs('#jobsBody');
+      if (tbody) {
+        tbody.addEventListener('click', async function(ev) {
+          const t = ev.target;
+          if (!(t instanceof HTMLElement)) return;
+          const action = t.getAttribute('data-action');
+          const id = t.getAttribute('data-id');
+          if (!action || !id) return;
+          try {
+            if (action === 'run') {
+              await runNow(id);
+              await refreshSchedules();
+            } else if (action === 'del') {
+              if (!confirm('Delete this schedule?')) return;
+              await deleteSchedule(id);
+              await refreshSchedules();
+            }
+          } catch (e) {
+            alert(String(e.message || e));
+          }
+        });
+      }
+
+      // initial load
+      refreshSchedules();
     });
+  })();
 </script>
 {% endblock %}
