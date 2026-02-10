@@ -1,5 +1,5 @@
 import abc
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pyarrow as pa
 
 class StorageInterface(abc.ABC):
@@ -103,3 +103,22 @@ class StorageInterface(abc.ABC):
         Raises FileNotFoundError, ValueError, etc. on error.
         """
         pass
+
+    # -------------------------
+    # Optional parity helpers (object stores)
+    # -------------------------
+    def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
+        """
+        Return a path usable by DuckDB readers.
+
+        Implementations may return either:
+        - s3://bucket/key
+        - http(s)://... URLs (when prefer_httpfs=True)
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement to_duckdb_path()")
+
+    def presign(self, key: str, expiry_seconds: int = 3600) -> str:
+        """
+        Return a presigned GET URL for the object.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement presign()")

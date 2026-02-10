@@ -637,8 +637,8 @@
 
     // --- SuperTable metadata (same pattern as tables.html) ---
     const META_BASE = ''; // same-origin (avoids CSP connect-src violations)
-    const ORGANIZATION = 'kladna-soft';
-    const USER_HASH = '0b85b786b16d195439c0da18fd4478df';
+    const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
+    const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
 
     let currentSuper = null;
     let timingsChart = null; // NEW: Global variable for Chart.js instance

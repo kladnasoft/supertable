@@ -52,7 +52,10 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     if storage_type == "S3":
         _require("boto3", "s3")
         mod = importlib.import_module("supertable.storage.s3_storage")
-        return getattr(mod, "S3Storage")(**kwargs)
+        S3Storage = getattr(mod, "S3Storage")
+        if kwargs:
+            return S3Storage(**kwargs)
+        return S3Storage.from_env()
 
     if storage_type == "MINIO":
         _require("minio", "minio")

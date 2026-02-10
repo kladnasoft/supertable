@@ -73,7 +73,7 @@ class RoleManager:
                             "filters": ["*"]  # No row filters
                         }
                         sysadmin_hash = self.create_role(sysadmin_data)
-                        logger.info(f"Default sysadmin role created with hash: {sysadmin_hash}")
+                        logger.info(f"Default superadmin role created with hash: {sysadmin_hash}")
             finally:
                 if lock_token:
                     self.redis_catalog.release_simple_lock(
