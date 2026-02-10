@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from supertable.redis_catalog import RedisCatalog
 from supertable.storage.storage_factory import get_storage
@@ -221,9 +222,39 @@ def attach_tables_routes(
             no_store(resp)
             return resp
 
+        debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS") or "").strip() == "1"
+        t0 = time.perf_counter()
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
-            return {"ok": True, "meta": mr.get_super_meta(user_hash)}
+            t1 = time.perf_counter()
+            meta = mr.get_super_meta(user_hash)
+            t2 = time.perf_counter()
+
+            payload = {"ok": True, "meta": meta}
+            if not debug_timings:
+                return payload
+
+            mr_ms = (t1 - t0) * 1000.0
+            get_ms = (t2 - t1) * 1000.0
+            total_ms = (t2 - t0) * 1000.0
+
+            client_host = getattr(getattr(request, "client", None), "host", None) or "-"
+            logger.info(
+                "[timing][reflection/super] total_ms=%.2f mr_ms=%.2f get_super_meta_ms=%.2f org=%s super=%s user_hash=%s client=%s",
+                total_ms,
+                mr_ms,
+                get_ms,
+                organization,
+                super_name,
+                (user_hash or "")[:12],
+                client_host,
+            )
+
+            resp = JSONResponse(payload)
+            resp.headers["Server-Timing"] = (
+                f"meta_reader;dur={mr_ms:.2f},get_super_meta;dur={get_ms:.2f},total;dur={total_ms:.2f}"
+            )
+            return resp
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
 

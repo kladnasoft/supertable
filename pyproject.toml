@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.5.6"
+version = "1.6.2"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
 readme = "README.md"
 requires-python = ">=3.10"

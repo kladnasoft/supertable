@@ -1,5 +1,8 @@
 import os
 import logging
+import json
+import time
+import threading
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
@@ -10,6 +13,22 @@ from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 
 logger = logging.getLogger(__name__)
+
+
+# Small in-process cache to de-duplicate bursty reflection calls.
+# Keyed by org/super/user_hash and guarded by root version.
+_SUPER_META_CACHE: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
+_SUPER_META_CACHE_LOCK = threading.Lock()
+
+def _super_meta_cache_ttl_s() -> float:
+    val = (os.getenv("SUPERTABLE_SUPER_META_CACHE_TTL_S", "") or "").strip()
+    if not val:
+        return 1.0
+    try:
+        ttl = float(val)
+    except Exception:
+        return 1.0
+    return max(0.0, ttl)
 
 
 def _prune_dict(d: Dict[str, Any], keys_to_remove: Set[str]) -> Dict[str, Any]:
@@ -43,6 +62,44 @@ def _get_redis_items(pattern) -> List[str]:
 
 
 
+
+def _try_parse_leaf_meta(raw: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort JSON decode for Redis leaf values (bytes/str)."""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw_s = raw.decode("utf-8")
+        else:
+            raw_s = str(raw)
+        raw_s = raw_s.strip()
+        if not raw_s:
+            return None
+        # Most leaf values are JSON payloads.
+        return json.loads(raw_s)
+    except Exception:
+        return None
+
+
+def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Return a dict that looks like SimpleTable snapshot data if the Redis leaf already stores it.
+    This is an optimization to avoid hitting object storage for reflection endpoints.
+    """
+    if not isinstance(meta, dict):
+        return None
+    if isinstance(meta.get("resources"), list):
+        return meta
+    data = meta.get("data")
+    if isinstance(data, dict) and isinstance(data.get("resources"), list):
+        return data
+    snapshot = meta.get("snapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("resources"), list):
+        return snapshot
+    return None
+
+
+
 class MetaReader:
     """
     Read-only metadata helper for SuperTable & SimpleTable.
@@ -64,6 +121,7 @@ class MetaReader:
             pattern = f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:*"
 
             tables = []
+            seen = set()
             cursor = 0
             while True:
                 cursor, keys = self.catalog.r.scan(cursor=cursor, match=pattern, count=1000)
@@ -76,7 +134,8 @@ class MetaReader:
 
                     # Extract table name from key: supertable:org:super:meta:leaf:table_name
                     table_name = key_str.split(':')[-1]
-                    if table_name not in tables:
+                    if table_name and table_name not in seen:
+                        seen.add(table_name)
                         tables.append(table_name)
                 if cursor == 0:
                     break
@@ -118,7 +177,25 @@ class MetaReader:
             if table_name == self.super_table.super_name:
                 # Aggregate schema across all simple tables
                 tables = self._get_all_tables()
-                for table in tables:
+
+                leaf_keys = [
+                    f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{t}"
+                    for t in tables
+                ]
+                try:
+                    raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
+                    leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
+                except Exception:
+                    leaf_payloads = [None for _ in tables]
+
+                for i, table in enumerate(tables):
+                    leaf_meta = leaf_payloads[i] if i < len(leaf_payloads) else None
+                    schema = (leaf_meta or {}).get("schema") if isinstance(leaf_meta, dict) else None
+                    if isinstance(schema, dict):
+                        for key, value in schema.items():
+                            schema_items.add((key, value))
+                        continue
+
                     try:
                         simple_table = SimpleTable(self.super_table, table)
                         simple_table_data, _ = simple_table.get_simple_table_snapshot()
@@ -130,15 +207,21 @@ class MetaReader:
                         continue
             else:
                 # Single table
-                try:
-                    simple_table = SimpleTable(self.super_table, table_name)
-                    simple_table_data, _ = simple_table.get_simple_table_snapshot()
-                    schema = simple_table_data.get("schema", {}) or {}
+                leaf_meta = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, table_name)
+                schema = (leaf_meta or {}).get("schema") if isinstance(leaf_meta, dict) else None
+                if isinstance(schema, dict):
                     for key, value in schema.items():
                         schema_items.add((key, value))
-                except (FileNotFoundError, KeyError) as e:
-                    logger.debug("Failed to read schema for table %s: %s", table_name, e)
-                    return [{}]
+                else:
+                    try:
+                        simple_table = SimpleTable(self.super_table, table_name)
+                        simple_table_data, _ = simple_table.get_simple_table_snapshot()
+                        schema = simple_table_data.get("schema", {}) or {}
+                        for key, value in schema.items():
+                            schema_items.add((key, value))
+                    except (FileNotFoundError, KeyError) as e:
+                        logger.debug("Failed to read schema for table %s: %s", table_name, e)
+                        return [{}]
 
             distinct_schema = dict(sorted(schema_items))
             return [distinct_schema]
@@ -211,6 +294,10 @@ class MetaReader:
         return stats
 
     def get_super_meta(self, user_hash: str) -> Optional[Dict[str, Any]]:
+
+        debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS", "") or "").lower() in ("1", "true", "yes", "on")
+        t0 = time.perf_counter()
+
         try:
             # Checking meta access for the super table itself
             check_meta_access(
@@ -226,32 +313,118 @@ class MetaReader:
             )
             return None
 
+        t_access = time.perf_counter()
+
         root = self.catalog.get_root(org=self.super_table.organization, sup=self.super_table.super_name)
+        t_root = time.perf_counter()
+
+        ttl_s = _super_meta_cache_ttl_s()
+        root_version = (root or {}).get("version", 0) if isinstance(root, dict) else 0
+        cache_key = f"{self.super_table.organization}:{self.super_table.super_name}:{user_hash}"
+        if ttl_s > 0:
+            now = time.monotonic()
+            with _SUPER_META_CACHE_LOCK:
+                cached = _SUPER_META_CACHE.get(cache_key)
+            if cached is not None:
+                cached_version, expires_at, cached_result = cached
+                if cached_version == root_version and now < expires_at:
+                    t_end = time.perf_counter()
+                    if debug_timings:
+                        logger.info(
+                            "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s user_hash=%s cache_hit=1",
+                            (t_end - t0) * 1000.0,
+                            (t_access - t0) * 1000.0,
+                            (t_root - t_access) * 1000.0,
+                            0.0,
+                            0.0,
+                            0,
+                            0,
+                            0.0,
+                            0.0,
+                            "",
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            user_hash[:12],
+                        )
+                    return cached_result
+
         # Get all tables from Redis
         tables = self._get_all_tables()
+        t_scan = time.perf_counter()
+
+        # Best-effort bulk fetch leaf metadata in one Redis roundtrip.
+        leaf_payloads: List[Optional[Dict[str, Any]]] = []
+        leaf_keys: List[str] = [
+            f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{t}"
+            for t in tables
+        ]
+        t_mget0 = time.perf_counter()
+        try:
+            raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
+            leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
+        except Exception:
+            leaf_payloads = [None for _ in tables]
+        t_mget1 = time.perf_counter()
 
         simple_table_info = []
         total_files = 0
         total_rows = 0
         total_size = 0
 
-        for table in tables:
+        snapshot_calls = 0
+        snapshot_ms_total = 0.0
+        max_snapshot_ms = 0.0
+        max_snapshot_table = ""
+
+        for idx, table in enumerate(tables):
             try:
-                st = SimpleTable(self.super_table, table)
-                st_data, _ = st.get_simple_table_snapshot()
+                leaf_meta = leaf_payloads[idx] if idx < len(leaf_payloads) else None
+                leaf_stats = leaf_meta.get("stats") if isinstance(leaf_meta, dict) else None
+                if isinstance(leaf_stats, dict):
+                    table_files = int(leaf_stats.get("files") or 0)
+                    table_rows = int(leaf_stats.get("rows") or 0)
+                    table_size = int(leaf_stats.get("size") or 0)
+                    updated_ms = leaf_stats.get("updated_utc")
+                    simple_table_info.append({
+                        "name": table,
+                        "files": table_files,
+                        "rows": table_rows,
+                        "size": table_size,
+                        "updated_utc": int(updated_ms) if updated_ms is not None else 0,
+                    })
+                    total_files += table_files
+                    total_rows += table_rows
+                    total_size += table_size
+                    continue
+
+                st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
+
+                if st_data is None:
+                    # Fallback: read the current snapshot from storage via SimpleTable.
+                    t_st0 = time.perf_counter()
+                    st = SimpleTable(self.super_table, table)
+                    st_data, _ = st.get_simple_table_snapshot()
+                    t_st1 = time.perf_counter()
+
+                    snapshot_calls += 1
+                    dt_ms = (t_st1 - t_st0) * 1000.0
+                    snapshot_ms_total += dt_ms
+                    if dt_ms > max_snapshot_ms:
+                        max_snapshot_ms = dt_ms
+                        max_snapshot_table = table
 
                 # Calculate table stats
-                resources = st_data.get("resources", [])
-                table_files = len(resources)
-                table_rows = sum(res.get("rows", 0) for res in resources)
-                table_size = sum(res.get("file_size", 0) for res in resources)
+                resources = st_data.get("resources", []) if isinstance(st_data, dict) else []
+                table_files = len(resources) if isinstance(resources, list) else 0
+                table_rows = sum(res.get("rows", 0) for res in resources if isinstance(res, dict))
+                table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 
                 simple_table_info.append({
                     "name": table,
                     "files": table_files,
                     "rows": table_rows,
                     "size": table_size,
-                    "updated_utc": st_data.get("last_updated_ms", 0),
+                    "updated_utc": (st_data or {}).get("last_updated_ms", 0) if isinstance(st_data, dict) else 0,
                 })
 
                 total_files += table_files
@@ -268,13 +441,40 @@ class MetaReader:
                 "files": total_files,
                 "rows": total_rows,
                 "size": total_size,
-                "version": root.get("version", 0),
-                "updated_utc": root.get("ts", int(datetime.now().timestamp() * 1000)),
+                "version": (root or {}).get("version", 0) if isinstance(root, dict) else 0,
+                "updated_utc": (root or {}).get("ts", int(datetime.now().timestamp() * 1000)) if isinstance(root, dict) else int(datetime.now().timestamp() * 1000),
                 "tables": simple_table_info,
                 "meta_path": f"redis://{self.super_table.organization}/{self.super_table.super_name}",
             }
         }
+
+        # Store in burst cache keyed by root version.
+        if ttl_s > 0:
+            expires_at = time.monotonic() + ttl_s
+            with _SUPER_META_CACHE_LOCK:
+                _SUPER_META_CACHE[cache_key] = (root_version, expires_at, result)
+
+        t_end = time.perf_counter()
+        if debug_timings:
+            logger.info(
+                "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s user_hash=%s cache_hit=0",
+                (t_end - t0) * 1000.0,
+                (t_access - t0) * 1000.0,
+                (t_root - t_access) * 1000.0,
+                (t_scan - t_root) * 1000.0,
+                (t_mget1 - t_mget0) * 1000.0,
+                len(tables),
+                snapshot_calls,
+                snapshot_ms_total,
+                max_snapshot_ms,
+                max_snapshot_table,
+                self.super_table.organization,
+                self.super_table.super_name,
+                user_hash[:12],
+            )
+
         return result
+
 
 
 
