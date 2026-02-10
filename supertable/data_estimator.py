@@ -121,7 +121,21 @@ class DataEstimator:
         self.plan_stats: Optional[PlanStats] = None
         self.catalog = RedisCatalog()
 
-    # ----------------------- storage helpers (matching original) -----------------------
+    
+    def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
+        """Normalize schema representations into a {name: type} dict."""
+        if isinstance(schema_obj, dict):
+            return schema_obj
+        if isinstance(schema_obj, list):
+            out: Dict[str, str] = {}
+            for item in schema_obj:
+                if isinstance(item, dict):
+                    name = item.get("name")
+                    if name is not None:
+                        out[str(name)] = str(item.get("type", ""))
+            return out
+        return {}
+# ----------------------- storage helpers (matching original) -----------------------
 
     def _get_env(self, *names: str) -> Optional[str]:
         for n in names:
@@ -261,7 +275,8 @@ class DataEstimator:
                     "table_name": it["simple"],
                     "last_updated_ms": int(it.get("ts", 0)),
                     "path": it["path"],
-                    "version": it['version']
+                    "version": it['version'],
+                    "payload": it.get("payload"),
                 }
             )
         return snapshots
@@ -309,10 +324,12 @@ class DataEstimator:
 
                 for snapshot in snapshots:
                     current_snapshot_path = snapshot["path"]
-                    current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
+                    current_snapshot_data = snapshot.get("payload")
+                    if not (isinstance(current_snapshot_data, dict) and isinstance(current_snapshot_data.get("resources"), list)):
+                        current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
 
                     current_version = current_snapshot_data.get("snapshot_version", 0)
-                    current_schema = current_snapshot_data.get("schema", {})
+                    current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
                     schema.update(dict_keys_to_lowercase(current_schema).keys())
 
                     resources = current_snapshot_data.get("resources", []) or []

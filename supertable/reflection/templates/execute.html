@@ -641,6 +641,34 @@
     const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
 
     let currentSuper = null;
+    // Selection component will call this after /reflection/super is loaded.
+    // We cache the meta to avoid duplicate /reflection/super calls from this page (e.g. loadSchema()).
+    window.onSuperMetaLoaded = function (org, superName, superMeta) {
+      try {
+        if (superName) currentSuper = superName;
+        window.__st_lastSuperMeta = superMeta || null;
+
+        // Update the CodeMirror content when the SuperTable changes (initial load included)
+        if (window.editor) {
+          const leaf = getURLParameter('leaf');
+          const defaultQuery = leaf
+            ? `SELECT * FROM ${superName}.${leaf} LIMIT 1000`
+            : `SELECT * FROM ${superName} LIMIT 100`;
+
+          window.editor.setValue(defaultQuery);
+        }
+      } catch (e) {
+        console.error('onSuperMetaLoaded failed', e);
+      }
+
+      // Load schema hints once we have the latest meta.
+      try {
+        loadSchema();
+      } catch (e) {
+        console.error('loadSchema failed', e);
+      }
+    };
+
     let timingsChart = null; // NEW: Global variable for Chart.js instance
     window.__curRows = []; // Keep track of current rows
     window.__curHeaders = []; // Keep track of current headers
@@ -823,7 +851,7 @@
         setStatus(session.statusText || 'Ready', session.statusCls || '');
 
         if (Array.isArray(session.rows) && session.rows.length) {
-          renderTable(session.rows, session.rows.length, 1, 1000, (p) => executeSQL(p));
+          renderTable(session.rows, session.rows.length, 1, 1000, (p) => executeSQL(p), session.statusText);
         } else if (resultDiv) {
           resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">No results</div>';
           window.__curRows = [];
@@ -1042,8 +1070,7 @@
       const sup = sel.value;
       if (!sup) return;
       currentSuper = sup;
-      loadTenantSuper(sup);
-      loadSchema();
+      // Selection.html already fetches /reflection/super; avoid duplicate calls here.
 
       // Update the CodeMirror content when the SuperTable changes
       if (window.editor) {
@@ -1068,6 +1095,21 @@
     function getTenant() {
       return { organization: ORGANIZATION, superName: currentSuper };
     }
+
+    function extractExecuteError(payload) {
+      if (!payload || typeof payload !== 'object') return null;
+      const meta = payload.meta || {};
+      const result1 = typeof meta.result_1 === 'string' ? meta.result_1 : '';
+      if (result1 && result1.toUpperCase() === 'ERROR') {
+        const msg = (typeof meta.result_2 === 'string' && meta.result_2) ? meta.result_2 : (payload.message || 'Unknown error');
+        let summary = 'Error';
+        const m = /:\s*(\d{3})\s*\(([^)]+)\)/.exec(msg);
+        if (m) summary = `HTTP ${m[1]} (${m[2]})`;
+        return { title: 'Query Error', message: msg, summary };
+      }
+      return null;
+    }
+
 
     function setStatus(text, cls) {
       const el = document.getElementById('status');
@@ -1117,7 +1159,7 @@
 
 
     // NEW: Centralized error display function
-    function displayError(title, message) {
+    function displayError(title, message, statusTextOverride) {
         const __s = __getActiveExecSession ? __getActiveExecSession() : null;
         if (__s) {
             __s.errorVisible = true;
@@ -1125,18 +1167,19 @@
             __s.errorMessage = message;
             __s.rows = [];
             __s.timings = null;
-            __s.statusText = 'Failed';
+            __s.statusText = statusTextOverride || 'Failed';
             __s.statusCls = 'error';
             __s.innerTab = 'result';
         }
 
         const statusEl = document.getElementById('status');
+        const statusText = statusTextOverride || 'Failed';
         const errorDisplay = document.getElementById('query-error-display');
         const resultDiv = document.getElementById('result');
         const timingCard = document.getElementById('timings-visualization-card');
 
         statusEl.className = 'text-sm muted error';
-        statusEl.innerHTML = '<i class="fas fa-times-circle"></i>&nbsp;Failed';
+        statusEl.innerHTML = `<i class="fas fa-times-circle"></i>&nbsp;${statusText}`;
 
         // Show the error on the Result tab
         errorDisplay.style.display = 'block';
@@ -1161,18 +1204,36 @@
     // OLD function replaced/redirected to new one
     function renderError(msg) {
         // Intercept old calls to renderError and use the new displayError structure
-        displayError('Query Error', msg);
+        displayError('Query Error', msg, `Error executing query after ${elapsedErrorSec}s`);
     }
 
-    function renderTable(rows, total, page, pageSize, onPage) {
+    function renderTable(rows, total, page, pageSize, onPage, statusText) {
+      // Optional status summary shown above the result table (matches Execute header)
+      const __esc = (v) => String(v === undefined || v === null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
+      const statusLine = statusText || (__getActiveExecSession && __getActiveExecSession() ? __getActiveExecSession().statusText : '') || '';
+
       if (!rows || !rows.length) {
-        document.getElementById('result').innerHTML =
-          '<div class="muted text-sm" style="padding: 15px;">No results</div>';
+        let html = '';
+        if (statusLine) {
+          html += `<div class="text-sm muted" style="padding: 10px 0 8px 2px;">${__esc(statusLine)}</div>`;
+        }
+        html += '<div class="muted text-sm" style="padding: 15px;">No results</div>';
+        document.getElementById('result').innerHTML = html;
         window.__curRows = []; window.__curHeaders = [];
         return;
       }
       const headers = Object.keys(rows[0]);
-      let html =
+let html = '';
+      if (statusLine) {
+        html += `<div class="text-sm muted" style="padding: 10px 0 8px 2px;">${__esc(statusLine)}</div>`;
+      }
+      html +=
         '<div style="overflow:auto; max-height:60vh;">' +
         '<table><thead><tr><th>#</th>';
       headers.forEach(h => { html += `<th>${h}</th>`; });
@@ -1388,40 +1449,45 @@
       const { organization, superName } = getTenant();
       if (!organization || !superName || !userHash) return;
 
-      try {
-        // 1) list tables in the selected SuperTable (use /reflection/super meta; do NOT use /meta/tables)
-        const superResp = await api(
-          META_BASE +
-          '/reflection/super?organization=' + encodeURIComponent(organization) +
-          '&super_name=' + encodeURIComponent(superName) +
-          '&user_hash=' + encodeURIComponent(userHash)
-        );
-        const superMeta = superResp && superResp.meta && superResp.meta.super ? superResp.meta.super : null;
+      try {        // 1) list tables in the selected SuperTable (use /reflection/super meta; do NOT use /meta/tables)
+        let superMeta = null;
+        try {
+          const cached = window.__st_lastSuperMeta;
+          if (cached && cached.name === superName && Array.isArray(cached.tables)) {
+            superMeta = cached;
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        if (!superMeta) {
+          const superResp = await api(
+            META_BASE +
+            '/reflection/super?organization=' + encodeURIComponent(organization) +
+            '&super_name=' + encodeURIComponent(superName) +
+            '&user_hash=' + encodeURIComponent(userHash)
+          );
+          superMeta = superResp && superResp.meta && superResp.meta.super ? superResp.meta.super : null;
+        }
+
         const tables = (superMeta && Array.isArray(superMeta.tables))
           ? superMeta.tables.map(t => (t && t.name) ? String(t.name) : '').filter(Boolean)
           : [];
 
+        // Disabled broken per-table schema fetch (incomplete block caused SyntaxError during parsing).
+        // Original fragment kept here for context:
+        // if (schemaResp && schemaResp.ok && Array.isArray(schemaResp.schema) && schemaResp.schema.length > 0) {
+        //   const firstRow = schemaResp.schema[0];
+        //   const cols = Object.keys(firstRow || {});
+        //   hint[tableName] = { columns: cols };
+        // }
+        // } catch (e) {
+        //   console.error('Failed to load schema for table', tableName, e);
+        // }
+        // }
         const hint = {};
-
-        // 2) for each table, get its schema and derive column names
         for (const tableName of tables) {
-          try {
-            const schemaResp = await api(
-              META_BASE +
-              '/reflection/schema?organization=' + encodeURIComponent(organization) +
-              '&super_name=' + encodeURIComponent(superName) +
-              '&table=' + encodeURIComponent(tableName) +
-              '&user_hash=' + encodeURIComponent(userHash)
-            );
-
-            if (schemaResp && schemaResp.ok && Array.isArray(schemaResp.schema) && schemaResp.schema.length > 0) {
-              const firstRow = schemaResp.schema[0];
-              const cols = Object.keys(firstRow || {});
-              hint[tableName] = { columns: cols };
-            }
-          } catch (e) {
-            console.error('Failed to load schema for table', tableName, e);
-          }
+          hint[tableName] = { columns: [] };
         }
 
         window.__hintTables = hint;
@@ -1551,7 +1617,6 @@
         const isActive = session && activeNow && session.id === activeNow.id;
 
         if (data.status === 'ok') {
-          const rows = data.result || [];
           const timings = (data.meta && data.meta.timings) ? data.meta.timings : null;
 
           let durationMs = null;
@@ -1564,6 +1629,33 @@
           }
 
           const durationStr = (durationMs / 1000).toFixed(3) + 's';
+
+          const metaErr = extractExecuteError(data);
+          if (metaErr) {
+            const errStatusText = `${metaErr.summary} — in ${durationStr}`;
+
+            if (session) {
+              session.errorVisible = true;
+              session.errorTitle = metaErr.title;
+              session.errorMessage = metaErr.message;
+              session.rows = [];
+              session.timings = timings || null;
+              session.statusText = errStatusText;
+              session.statusCls = 'error';
+              session.innerTab = 'result';
+            }
+
+            if (isActive) {
+              setStatus(errStatusText, 'error');
+              displayError(metaErr.title, metaErr.message, errStatusText);
+              if (timings) {
+                renderTimingsChart(timings);
+              }
+            }
+            return;
+          }
+
+          const rows = data.result || [];
           const rowsLen = rows.length;
           const total = data.total_count || 0;
 
@@ -1587,7 +1679,8 @@
               total,
               1,
               pageSize,
-              (p) => executeSQL(p)
+              (p) => executeSQL(p),
+              statusText
             );
 
             if (timings) {
@@ -1656,7 +1749,7 @@
         const isActive = session && activeNow && session.id === activeNow.id;
         if (isActive) {
           setStatus(`Error executing query after ${elapsedSec}s`, 'error');
-          displayError('Network Error', e.message || String(e));
+          displayError('Network Error', e.message || String(e), `Error executing query after ${elapsedSec}s`);
         }
       } finally {
         if (session && session.abortController === abortController) {
@@ -1807,7 +1900,9 @@
 
       $("#link-execute").addClass("active");
 
-      loadTenants();
+      if (!window.__st_selection_component) {
+        loadTenants();
+      }
 
       __mountInnerTabs();
       __initExecSessions();

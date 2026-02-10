@@ -120,6 +120,34 @@ redis.call('SET', key, new_val)
 return new_version
 """
 
+
+    _LUA_LEAF_PAYLOAD_CAS_SET = """
+local key = KEYS[1]
+local payload_json = ARGV[1]
+local new_path = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+
+local cur = redis.call('GET', key)
+local old_version = -1
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if ok and obj and obj['version'] then
+    old_version = tonumber(obj['version'])
+  end
+end
+local new_version = old_version + 1
+
+local payload = {}
+local okp, pobj = pcall(cjson.decode, payload_json)
+if okp and pobj then
+  payload = pobj
+end
+
+local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path, payload=payload})
+redis.call('SET', key, new_val)
+return new_version
+"""
+
     _LUA_ROOT_BUMP = """
 local key = KEYS[1]
 local now_ms = tonumber(ARGV[1])
@@ -166,6 +194,7 @@ return 0
 
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
+        self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
         self._lock_release_if_token = self.r.register_script(self._LUA_LOCK_RELEASE_IF_TOKEN)
         self._lock_extend_if_token = self.r.register_script(self._LUA_LOCK_EXTEND_IF_TOKEN)
@@ -336,7 +365,38 @@ return 0
             logger.error(f"[redis-catalog] leaf_cas_set error: {e}")
             raise
 
-    # ------------- Mirror formats (Redis-backed) -------------
+    
+
+    def set_leaf_payload_cas(
+        self,
+        org: str,
+        sup: str,
+        simple: str,
+        payload: Dict[str, Any],
+        path: str,
+        now_ms: Optional[int] = None,
+    ) -> int:
+        """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
+        try:
+            payload_json = json.dumps(payload or {})
+        except Exception:
+            payload_json = "{}"
+
+        try:
+            return int(
+                self._leaf_payload_cas_set(
+                    keys=[_leaf_key(org, sup, simple)],
+                    args=[payload_json, path, int(now_ms or _now_ms())],
+                )
+                or 0
+            )
+        except AttributeError:
+            # Backward compatible fallback if script isn't registered for some reason.
+            return self.set_leaf_path_cas(org, sup, simple, path, now_ms=now_ms)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
+            raise
+# ------------- Mirror formats (Redis-backed) -------------
 
     def get_mirrors(self, org: str, sup: str) -> List[str]:
         """Read enabled mirror formats from Redis key."""
@@ -605,6 +665,7 @@ return 0
                     "version": int(obj.get("version", -1)),
                     "ts": int(obj.get("ts", 0)),
                     "path": obj.get("path", ""),
+                    "payload": obj.get("payload"),
                 }
             except Exception:
                 continue

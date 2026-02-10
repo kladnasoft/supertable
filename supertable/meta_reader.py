@@ -90,6 +90,14 @@ def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     if isinstance(meta.get("resources"), list):
         return meta
+
+    payload = meta.get("payload")
+    if isinstance(payload, dict):
+        if isinstance(payload.get("resources"), list):
+            return payload
+        snapshot = payload.get("snapshot")
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("resources"), list):
+            return snapshot
     data = meta.get("data")
     if isinstance(data, dict) and isinstance(data.get("resources"), list):
         return data
@@ -97,6 +105,27 @@ def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if isinstance(snapshot, dict) and isinstance(snapshot.get("resources"), list):
         return snapshot
     return None
+
+
+def _schema_to_dict(schema_obj: Any) -> Dict[str, Any]:
+    """Normalize schema representations into a {name: type} dict."""
+    if isinstance(schema_obj, dict):
+        return schema_obj
+    if isinstance(schema_obj, list):
+        out: Dict[str, Any] = {}
+        for item in schema_obj:
+            if isinstance(item, dict):
+                # Common form: [{name,type}, ...]
+                name = item.get("name")
+                if name is not None:
+                    out[str(name)] = item.get("type")
+                    continue
+                # Fallback: single-key dict
+                if len(item) == 1:
+                    k = next(iter(item.keys()))
+                    out[str(k)] = item.get(k)
+        return out
+    return {}
 
 
 
@@ -175,53 +204,50 @@ class MetaReader:
             schema_items: Set[Tuple[str, Any]] = set()
 
             if table_name == self.super_table.super_name:
-                # Aggregate schema across all simple tables
+                # Aggregate schema across all simple tables (prefer Redis leaf payload; fallback to storage).
                 tables = self._get_all_tables()
-
-                leaf_keys = [
+                leaf_keys: List[str] = [
                     f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{t}"
                     for t in tables
                 ]
                 try:
                     raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
-                    leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
                 except Exception:
-                    leaf_payloads = [None for _ in tables]
+                    raws = []
 
-                for i, table in enumerate(tables):
-                    leaf_meta = leaf_payloads[i] if i < len(leaf_payloads) else None
-                    schema = (leaf_meta or {}).get("schema") if isinstance(leaf_meta, dict) else None
-                    if isinstance(schema, dict):
-                        for key, value in schema.items():
-                            schema_items.add((key, value))
-                        continue
-
+                for t, raw in zip(tables, raws):
                     try:
-                        simple_table = SimpleTable(self.super_table, table)
-                        simple_table_data, _ = simple_table.get_simple_table_snapshot()
-                        schema = simple_table_data.get("schema", {}) or {}
+                        leaf_meta = _try_parse_leaf_meta(raw)
+                        st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
+                        if st_data is None:
+                            simple_table = SimpleTable(self.super_table, t)
+                            st_data, _ = simple_table.get_simple_table_snapshot()
+
+                        schema = _schema_to_dict((st_data or {}).get("schema", {}))
                         for key, value in schema.items():
                             schema_items.add((key, value))
                     except (FileNotFoundError, KeyError) as e:
-                        logger.debug("Failed to read schema for table %s: %s", table, e)
+                        logger.debug("Failed to read schema for table %s: %s", t, e)
                         continue
             else:
-                # Single table
-                leaf_meta = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, table_name)
-                schema = (leaf_meta or {}).get("schema") if isinstance(leaf_meta, dict) else None
-                if isinstance(schema, dict):
+                # Single table (prefer Redis leaf payload; fallback to storage).
+                try:
+                    raw = self.catalog.r.get(
+                        f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{table_name}"
+                    )
+                    leaf_meta = _try_parse_leaf_meta(raw)
+                    st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
+
+                    if st_data is None:
+                        simple_table = SimpleTable(self.super_table, table_name)
+                        st_data, _ = simple_table.get_simple_table_snapshot()
+
+                    schema = _schema_to_dict((st_data or {}).get("schema", {}))
                     for key, value in schema.items():
                         schema_items.add((key, value))
-                else:
-                    try:
-                        simple_table = SimpleTable(self.super_table, table_name)
-                        simple_table_data, _ = simple_table.get_simple_table_snapshot()
-                        schema = simple_table_data.get("schema", {}) or {}
-                        for key, value in schema.items():
-                            schema_items.add((key, value))
-                    except (FileNotFoundError, KeyError) as e:
-                        logger.debug("Failed to read schema for table %s: %s", table_name, e)
-                        return [{}]
+                except (FileNotFoundError, KeyError) as e:
+                    logger.debug("Failed to read schema for table %s: %s", table_name, e)
+                    return [{}]
 
             distinct_schema = dict(sorted(schema_items))
             return [distinct_schema]
@@ -379,24 +405,6 @@ class MetaReader:
         for idx, table in enumerate(tables):
             try:
                 leaf_meta = leaf_payloads[idx] if idx < len(leaf_payloads) else None
-                leaf_stats = leaf_meta.get("stats") if isinstance(leaf_meta, dict) else None
-                if isinstance(leaf_stats, dict):
-                    table_files = int(leaf_stats.get("files") or 0)
-                    table_rows = int(leaf_stats.get("rows") or 0)
-                    table_size = int(leaf_stats.get("size") or 0)
-                    updated_ms = leaf_stats.get("updated_utc")
-                    simple_table_info.append({
-                        "name": table,
-                        "files": table_files,
-                        "rows": table_rows,
-                        "size": table_size,
-                        "updated_utc": int(updated_ms) if updated_ms is not None else 0,
-                    })
-                    total_files += table_files
-                    total_rows += table_rows
-                    total_size += table_size
-                    continue
-
                 st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
 
                 if st_data is None:

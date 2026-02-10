@@ -156,13 +156,26 @@ class SimpleTable:
         self.storage.write_json(new_simple_path, snapshot_data)
 
         # CAS set leaf to that path (version becomes 0)
-        self.catalog.set_leaf_path_cas(
-            self.super_table.organization,
-            self.super_table.super_name,
-            self.simple_name,
-            new_simple_path,
-            now_ms=int(datetime.now().timestamp() * 1000),
-        )
+        now_ms = int(datetime.now().timestamp() * 1000)
+        try:
+            # Prefer storing snapshot payload in Redis so readers can avoid storage reads.
+            self.catalog.set_leaf_payload_cas(
+                self.super_table.organization,
+                self.super_table.super_name,
+                self.simple_name,
+                snapshot_data,
+                new_simple_path,
+                now_ms=now_ms,
+            )
+        except Exception:
+            # Backward compatible fallback.
+            self.catalog.set_leaf_path_cas(
+                self.super_table.organization,
+                self.super_table.super_name,
+                self.simple_name,
+                new_simple_path,
+                now_ms=now_ms,
+            )
 
     def delete(self, user_hash: str) -> None:
         check_write_access(
@@ -194,11 +207,24 @@ class SimpleTable:
     def get_simple_table_snapshot(self):
         """
         Read the current heavy snapshot via the Redis leaf pointer.
+
+        If the Redis leaf stores a snapshot payload, use it to avoid storage reads.
         """
         ptr = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
         if not ptr or not ptr.get("path"):
             raise FileNotFoundError("No path found in simple table leaf pointer.")
         path = ptr["path"]
+
+        payload = ptr.get("payload") if isinstance(ptr, dict) else None
+        if isinstance(payload, dict):
+            # Common: payload is the snapshot dict itself.
+            if isinstance(payload.get("resources"), list):
+                return payload, path
+            # Also support nested snapshot shapes.
+            snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
+            if isinstance(snap, dict) and isinstance(snap.get("resources"), list):
+                return snap, path
+
         data = self.storage.read_json(path)
         return data, path
 

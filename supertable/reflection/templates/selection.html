@@ -284,6 +284,8 @@
 
 <script>
 (function () {
+    window.__st_selection_component = true;
+
     // Organization and user hash are injected server-side from the current tenant / selected user.
     // sel_org comes from the backend tenant resolution; default_user_hash is derived from the first admin user.
     const ORG_NAME = {{ session_org|default(sel_org|default("", true), true)|tojson }};
@@ -429,6 +431,13 @@ const filesEl = document.getElementById("tenantFilesValue");
             const data = await resp.json();
             const superMeta = data && data.meta && data.meta.super;
             applySuperMeta(superMeta || null);
+try {
+    if (typeof window.onSuperMetaLoaded === "function") {
+        window.onSuperMetaLoaded(ORG_NAME, superName, superMeta || null);
+    }
+} catch (e) {
+    console.error("onSuperMetaLoaded failed:", e);
+}
         } catch (err) {
             console.error("Error loading super meta:", err);
             applySuperMeta(null);

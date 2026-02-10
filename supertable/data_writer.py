@@ -110,14 +110,29 @@ class DataWriter:
             mark("update_simple")
 
             # --- CAS set leaf pointer + atomic root bump ----------------------
-            self.catalog.set_leaf_path_cas(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
-                new_snapshot_path,
-                now_ms=int(datetime.now().timestamp() * 1000),
-            )
-            self.catalog.bump_root(self.super_table.organization, self.super_table.super_name)
+            now_ms = int(datetime.now().timestamp() * 1000)
+            payload = new_snapshot_dict
+
+            try:
+                self.catalog.set_leaf_payload_cas(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    payload,
+                    new_snapshot_path,
+                    now_ms=now_ms,
+                )
+            except Exception:
+                # Backward compatible fallback.
+                self.catalog.set_leaf_path_cas(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    new_snapshot_path,
+                    now_ms=now_ms,
+                )
+
+            self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
             mark("bump_root")
 
             # --- Optional mirroring -------------------------------------------

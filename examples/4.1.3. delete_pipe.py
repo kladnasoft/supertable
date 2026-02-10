@@ -9,8 +9,9 @@ pipe = SuperPipe(
     staging_name=staging_name,
 )
 
-# Minimal delete: removes the JSON definition from storage
-pipe_path = pipe._pipe_path(pipe_name)  # noqa: SLF001
-pipe.storage.delete(pipe_path)
+deleted = pipe.delete(pipe_name)
 
-print(pipe_path)
+if deleted:
+    print(f"Deleted pipe '{pipe_name}' from Redis.")
+else:
+    print(f"Pipe '{pipe_name}' was not found (nothing deleted).")

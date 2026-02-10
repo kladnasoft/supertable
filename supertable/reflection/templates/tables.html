@@ -947,8 +947,20 @@
         label.textContent = 'SuperTable: ' + sup;
       }
       renderTables(sup, []);
-      loadTenantSuper(sup);
+      if (typeof window.__st_onPairChange !== 'function') {
+        loadTenantSuper(sup);
+      }
     }
+    // selection.html fetches /reflection/super; reuse that payload to render the tables without a second request.
+    window.onSuperMetaLoaded = function (org, superName, superMeta) {
+      try {
+    currentSuper = superName || null;
+    const tables = (superMeta && Array.isArray(superMeta.tables)) ? superMeta.tables : [];
+    renderTables(currentSuper, tables);
+      } catch (e) {
+    console.error('onSuperMetaLoaded failed:', e);
+      }
+    };
 
     function showModal(title, body) {
       document.getElementById('m-title').textContent = title;
@@ -1962,7 +1974,9 @@ function deleteTable(simple) {
 
       $("#link-tables").addClass("active");
 
-      loadTenants();
+      if (typeof window.__st_onPairChange !== 'function') {
+        loadTenants();
+      }
 
       document.addEventListener('keydown', function (ev) {
         if (ev.key === 'Escape') {
