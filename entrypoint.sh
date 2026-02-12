@@ -1,6 +1,22 @@
 #!/usr/bin/env sh
 set -eu
 
+# Default HOME for anonymous/non-root runtimes (e.g. random UID)
+: "${HOME:=/home/supertable}"
+
+# Expand "~/" in DUCKDB_EXTENSION_DIRECTORY (docker-compose env often uses this form).
+if [ "${DUCKDB_EXTENSION_DIRECTORY:-}" != "" ]; then
+  case "$DUCKDB_EXTENSION_DIRECTORY" in
+    "~/"*) DUCKDB_EXTENSION_DIRECTORY="${HOME}/${DUCKDB_EXTENSION_DIRECTORY#~/}" ;;
+  esac
+fi
+
+: "${DUCKDB_EXTENSION_DIRECTORY:=${HOME}/.duckdb/extensions}"
+export DUCKDB_EXTENSION_DIRECTORY
+
+# Ensure baked runtime dirs exist even if HOME changes or a volume is mounted.
+mkdir -p "${DUCKDB_EXTENSION_DIRECTORY}" "${HOME}/supertable"
+
 SERVICE="${SERVICE:-admin}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"

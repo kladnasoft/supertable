@@ -32,6 +32,7 @@ services:
     env_file:
       - .env
     environment:
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
       SERVICE: admin
       HOST: 0.0.0.0
       PORT: 8000
@@ -70,6 +71,7 @@ services:
     env_file:
       - .env
     environment:
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
       SERVICE: mcp
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 

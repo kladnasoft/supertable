@@ -1233,6 +1233,32 @@ attach_tables_routes(
     admin_guard_api=admin_guard_api,
 )
 
+# ------------------------------ RBAC Views tab (NEW, extracted to rbac.py) ------------------------------
+
+try:
+    from .rbac import attach_rbac_routes  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from supertable.reflection.rbac import attach_rbac_routes  # type: ignore
+    except Exception:
+        from rbac import attach_rbac_routes  # type: ignore
+
+attach_rbac_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    admin_guard_api=admin_guard_api,
+)
+
+
 
 
 

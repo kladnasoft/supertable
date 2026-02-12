@@ -1,0 +1,480 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – RBAC Views</title>
+
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+
+  <!-- Fonts & Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"/>
+
+  <!-- Bootstrap -->
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+
+  <!-- CodeMirror -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
+
+  <style>
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --secondary-color: #147ba3;
+      --dark-color: #1a1a2e;
+      --light-color: #f8f9fa;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+      --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f3f6fb;
+      color: var(--text-color);
+    }
+
+    .muted { color: var(--text-light); }
+
+    .rbac-grid {
+      display: grid;
+      grid-template-columns: 420px 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+
+    @media (max-width: 1100px) {
+      .rbac-grid { grid-template-columns: 1fr; }
+    }
+
+    .rbac-card-h {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(15,23,42,.08);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: linear-gradient(180deg, rgba(28,150,202,.06), rgba(28,150,202,.02));
+      border-top-left-radius: 12px;
+      border-top-right-radius: 12px;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--text-light);
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--panel-border);
+      border-radius: 999px;
+      background: #ffffff;
+      font-size: 12px;
+      color: #334155;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03);
+    }
+
+    .pill strong {
+      font-weight: 800;
+      color: #0f172a;
+    }
+
+    .views-table thead th {
+      border-top: none;
+      color: var(--text-light);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 10px 12px;
+      background: #f8fafc;
+    }
+
+    .views-table tbody tr {
+      cursor: pointer;
+    }
+
+    .views-table tbody tr:hover {
+      background: #f8fafc;
+    }
+
+    .views-table tbody tr.selected {
+      background: rgba(28,150,202,0.10);
+    }
+
+    .views-table tbody td {
+      padding: 10px 12px;
+      vertical-align: middle;
+    }
+
+    .CodeMirror {
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      height: 360px;
+      font-size: 13px;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  {% include "sidebar.html" %}
+
+  <div class="content-container">
+    <div class="wrap">
+
+      {% include "selection.html" %}
+
+      <div class="card" style="margin-top:20px;">
+        <div class="section" style="padding-bottom:16px; border-bottom:1px solid rgba(15,23,42,.08);">
+          <div class="d-flex align-items-start justify-content-between" style="gap:12px;">
+            <div>
+              <div style="font-weight:800; font-size:18px; color:#0f172a;">RBAC Views</div>
+              <div class="muted" style="font-size:13px; margin-top:4px;">
+                Save read-only SQL queries as reusable “views”. Next step will be assigning these views to roles/users.
+              </div>
+            </div>
+            <div class="d-flex align-items-center" style="gap:10px;">
+              <div class="pill" title="Number of saved views for the selected SuperTable">
+                <i class="fa-solid fa-database" style="color:#1c96ca;"></i>
+                <span class="muted">Views</span>
+                <strong id="viewsCount">0</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section" style="padding-top:16px;">
+          {% if not has_tenant %}
+            <div class="alert alert-info mb-0">
+              Select a SuperTable above to manage views.
+            </div>
+          {% else %}
+
+            <div class="rbac-grid">
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div style="font-weight:800; color:#0f172a;">Saved views</div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <input id="search" class="form-control form-control-sm" placeholder="Search…" style="width: 210px;"/>
+                    <button id="refreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                  </div>
+                </div>
+                <div style="padding:0;">
+                  <table class="table table-sm mb-0 views-table">
+                    <thead>
+                      <tr>
+                        <th style="width: 40%;">Name</th>
+                        <th style="width: 35%;">Updated</th>
+                        <th style="width: 25%;">Creator</th>
+                      </tr>
+                    </thead>
+                    <tbody id="viewsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div>
+                    <div style="font-weight:800; color:#0f172a;">Editor</div>
+                    <div class="hint">Only SELECT / WITH queries are allowed.</div>
+                  </div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <button id="newBtn" class="btn btn-sm btn-outline-secondary">New</button>
+                    <button id="deleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
+                    <button id="saveBtn" class="btn btn-sm btn-primary">Save</button>
+                  </div>
+                </div>
+
+                <div class="section" style="padding-top:14px;">
+                  <div class="form-row">
+                    <div class="form-group col-md-8">
+                      <label class="text-sm muted" style="font-weight:700;">Name</label>
+                      <input id="name" class="form-control" placeholder="e.g. Active customers"/>
+                    </div>
+                    <div class="form-group col-md-4">
+                      <label class="text-sm muted" style="font-weight:700;">Enabled</label>
+                      <select id="enabled" class="form-control">
+                        <option value="1">Enabled</option>
+                        <option value="0">Disabled</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Description</label>
+                    <input id="description" class="form-control" placeholder="Optional"/>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Query</label>
+                    <textarea id="query" class="form-control" rows="10"></textarea>
+                  </div>
+
+                  <div class="status" id="status"></div>
+
+                  <div class="hint" style="margin-top:10px;">
+                    Tip: later we’ll attach role hashes to a view (field already stored as <code>roles</code> in Redis).
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          {% endif %}
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- JS deps -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
+
+  <script>
+    const DEFAULT_ORG = {{ sel_org|default('', true)|tojson }};
+    const DEFAULT_SUP = {{ sel_sup|default('', true)|tojson }};
+
+    let selectedViewId = null;
+    let allViews = [];
+
+    function el(id){ return document.getElementById(id); }
+
+    function setStatus(msg, kind='info'){
+      const node = el('status');
+      if (!node) return;
+      const cls = kind === 'error' ? 'text-danger' : (kind === 'ok' ? 'text-success' : 'muted');
+      node.className = 'status ' + cls;
+      node.textContent = msg || '';
+    }
+
+    async function api(url, opts={}){
+      const res = await fetch(url, {
+        method: opts.method || 'GET',
+        headers: Object.assign({'Content-Type':'application/json'}, opts.headers || {}),
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+        credentials: 'same-origin'
+      });
+
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch(e) {}
+
+      if (!res.ok) {
+        const detail = (data && (data.detail || data.message)) ? (data.detail || data.message) : (text || res.statusText);
+        throw new Error(detail);
+      }
+      return data;
+    }
+
+    function currentTenant(){
+      const p = new URLSearchParams(window.location.search);
+      const org = (p.get('org') || DEFAULT_ORG || '').trim();
+      const sup = (p.get('sup') || DEFAULT_SUP || '').trim();
+      return {org, sup};
+    }
+
+    function updateCount(){
+      const c = document.getElementById('viewsCount');
+      if (c) c.textContent = String(allViews.length || 0);
+    }
+
+    function renderViews(){
+      const body = el('viewsBody');
+      if (!body) return;
+
+      const q = (el('search')?.value || '').trim().toLowerCase();
+      const items = q
+        ? allViews.filter(v => (v.name || '').toLowerCase().includes(q) || (v.description || '').toLowerCase().includes(q))
+        : allViews;
+
+      body.innerHTML = '';
+      for (const v of items) {
+        const tr = document.createElement('tr');
+        tr.dataset.id = v.id;
+        if (v.id === selectedViewId) tr.classList.add('selected');
+
+        const name = document.createElement('td');
+        name.textContent = v.name || '';
+
+        const upd = document.createElement('td');
+        upd.textContent = v.updated_at || '';
+
+        const cr = document.createElement('td');
+        cr.textContent = v.created_by || v.created_by_hash || '';
+
+        tr.appendChild(name);
+        tr.appendChild(upd);
+        tr.appendChild(cr);
+
+        tr.addEventListener('click', () => {
+          selectView(v);
+        });
+
+        body.appendChild(tr);
+      }
+
+      if (!items.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 3;
+        td.className = 'muted';
+        td.style.padding = '14px';
+        td.textContent = 'No saved views.';
+        tr.appendChild(td);
+        body.appendChild(tr);
+      }
+
+      updateCount();
+    }
+
+    function clearEditor(){
+      selectedViewId = null;
+      el('name').value = '';
+      el('description').value = '';
+      el('enabled').value = '1';
+      if (cm) cm.setValue('');
+      el('deleteBtn').disabled = true;
+      renderViews();
+      setStatus('');
+    }
+
+    function selectView(v){
+      selectedViewId = v.id;
+      el('name').value = v.name || '';
+      el('description').value = v.description || '';
+      el('enabled').value = String(v.enabled || '1');
+      if (cm) cm.setValue(v.query || '');
+      el('deleteBtn').disabled = false;
+      renderViews();
+      setStatus(`Selected: ${v.name}`, 'info');
+    }
+
+    async function loadViews(){
+      const {org, sup} = currentTenant();
+      if (!org || !sup) return;
+
+      setStatus('Loading…');
+      try {
+        const data = await api(`/reflection/rbac/views?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`);
+        allViews = (data && data.data && data.data.items) ? data.data.items : [];
+        renderViews();
+        setStatus(`Loaded ${allViews.length} view(s).`, 'ok');
+      } catch (e) {
+        allViews = [];
+        renderViews();
+        setStatus(e.message || 'Failed to load views', 'error');
+      }
+    }
+
+    async function saveCurrent(){
+      const {org, sup} = currentTenant();
+      const name = el('name').value || '';
+      const description = el('description').value || '';
+      const enabled = el('enabled').value === '1';
+      const query = cm ? cm.getValue() : (el('query').value || '');
+
+      setStatus('Saving…');
+      try {
+        if (!selectedViewId) {
+          const data = await api('/reflection/rbac/views', {
+            method: 'POST',
+            body: { organization: org, super_name: sup, name, description, query }
+          });
+          const doc = data && data.data ? data.data : null;
+          await loadViews();
+          if (doc && doc.id) {
+            const found = allViews.find(x => x.id === doc.id);
+            if (found) selectView(found);
+          }
+          setStatus('Created.', 'ok');
+        } else {
+          const data = await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}`, {
+            method: 'PUT',
+            body: { organization: org, super_name: sup, name, description, query, enabled }
+          });
+          const doc = data && data.data ? data.data : null;
+          await loadViews();
+          if (doc && doc.id) {
+            const found = allViews.find(x => x.id === doc.id);
+            if (found) selectView(found);
+          }
+          setStatus('Updated.', 'ok');
+        }
+      } catch (e) {
+        setStatus(e.message || 'Save failed', 'error');
+      }
+    }
+
+    async function deleteCurrent(){
+      if (!selectedViewId) return;
+      if (!confirm('Delete this view?')) return;
+
+      const {org, sup} = currentTenant();
+      setStatus('Deleting…');
+      try {
+        await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`, {
+          method: 'DELETE'
+        });
+        clearEditor();
+        await loadViews();
+        setStatus('Deleted.', 'ok');
+      } catch (e) {
+        setStatus(e.message || 'Delete failed', 'error');
+      }
+    }
+
+    let cm = null;
+    document.addEventListener('DOMContentLoaded', () => {
+      const q = el('query');
+      if (q) {
+        cm = CodeMirror.fromTextArea(q, {
+          mode: 'text/x-sql',
+          lineNumbers: true,
+          lineWrapping: true
+        });
+      }
+
+      el('refreshBtn')?.addEventListener('click', loadViews);
+      el('search')?.addEventListener('input', renderViews);
+      el('newBtn')?.addEventListener('click', clearEditor);
+      el('saveBtn')?.addEventListener('click', saveCurrent);
+      el('deleteBtn')?.addEventListener('click', deleteCurrent);
+
+      loadViews();
+    });
+
+    // Sidebar UX (same behavior as other pages)
+    $(document).ready(function() {
+      const isCollapsed = localStorage.getItem('sidebar-collapsed') === 'true';
+      if (isCollapsed) {
+        $('.sidebar').addClass('sidebar-collapsed');
+      }
+      $('#toggleSidebar').on('click', function() {
+        $('.sidebar').toggleClass('sidebar-collapsed');
+        localStorage.setItem('sidebar-collapsed', $('.sidebar').hasClass('sidebar-collapsed'));
+      });
+      $('#link-rbac').addClass('active');
+    });
+  </script>
+</body>
+</html>

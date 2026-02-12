@@ -1885,7 +1885,121 @@ let html = '';
         URL.revokeObjectURL(link.href);
     }
 
-    $(document).ready(function(){
+    
+
+    // --- Save as RBAC View (stored in Redis; managed on /reflection/rbac) ---
+    function __setSaveViewStatus(text, isError) {
+      const el = document.getElementById('saveViewStatus');
+      if (!el) return;
+      el.style.display = 'block';
+      el.style.color = isError ? '#b91c1c' : '#0f766e';
+      el.textContent = text;
+    }
+
+    function openSaveViewModal() {
+      const { organization, superName } = getTenant();
+      const q = window.editor ? String(window.editor.getValue() || '').trim() : '';
+
+      if (!organization || !superName) {
+        alert('Please select a SuperTable first.');
+        return;
+      }
+      if (!/^\s*(select|with)\b/i.test(q)) {
+        alert('Only SELECT/WITH queries can be saved as a view.');
+        return;
+      }
+
+      const orgEl = document.getElementById('saveViewOrg');
+      const supEl = document.getElementById('saveViewSup');
+      const nameEl = document.getElementById('saveViewName');
+      const descEl = document.getElementById('saveViewDesc');
+      const qEl = document.getElementById('saveViewQueryPreview');
+      const stEl = document.getElementById('saveViewStatus');
+      const manage = document.getElementById('saveViewManageLink');
+
+      if (orgEl) orgEl.textContent = organization;
+      if (supEl) supEl.textContent = superName;
+      if (qEl) qEl.value = q;
+      if (stEl) stEl.style.display = 'none';
+
+      // Default name suggestion (non-destructive)
+      if (nameEl && !nameEl.value) {
+        const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        nameEl.value = `View (${superName}) ${ts}`;
+      }
+      if (descEl && !descEl.value) descEl.value = '';
+
+      if (manage) {
+        const url = new URL('/reflection/rbac', window.location.origin);
+        url.searchParams.set('org', organization);
+        url.searchParams.set('sup', superName);
+        manage.href = url.toString();
+      }
+
+      $('#saveViewModal').modal('show');
+      try { if (nameEl) nameEl.focus(); } catch (e) {}
+    }
+
+    async function saveViewNow() {
+      const { organization, superName } = getTenant();
+      const q = window.editor ? String(window.editor.getValue() || '').trim() : '';
+
+      const nameEl = document.getElementById('saveViewName');
+      const descEl = document.getElementById('saveViewDesc');
+      const btn = document.getElementById('btnSaveViewConfirm');
+
+      const name = nameEl ? String(nameEl.value || '').trim() : '';
+      const description = descEl ? String(descEl.value || '').trim() : '';
+
+      if (!organization || !superName) {
+        __setSaveViewStatus('Missing organization/super_name.', true);
+        return;
+      }
+      if (!name) {
+        __setSaveViewStatus('View name is required.', true);
+        return;
+      }
+      if (!/^\s*(select|with)\b/i.test(q)) {
+        __setSaveViewStatus('Only SELECT/WITH queries can be saved as a view.', true);
+        return;
+      }
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>&nbsp;Saving…';
+      }
+
+      try {
+        const resp = await api('/reflection/rbac/views', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            organization,
+            super_name: superName,
+            name,
+            description,
+            query: q
+          })
+        });
+
+        __setSaveViewStatus('Saved successfully.', false);
+
+        // Close after a short moment so the user sees success feedback.
+        setTimeout(() => {
+          try { $('#saveViewModal').modal('hide'); } catch (e) {}
+        }, 350);
+
+        console.log('Saved view:', resp);
+      } catch (e) {
+        __setSaveViewStatus(e && e.message ? e.message : String(e), true);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '<i class="fas fa-check"></i>&nbsp;Save';
+        }
+      }
+    }
+$(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
       $("#toggleSidebar").on("click", function() {
@@ -1906,6 +2020,11 @@ let html = '';
 
       __mountInnerTabs();
       __initExecSessions();
+
+      const __sv = document.getElementById('btnSaveView');
+      if (__sv) __sv.addEventListener('click', () => openSaveViewModal());
+      const __sv2 = document.getElementById('btnSaveViewConfirm');
+      if (__sv2) __sv2.addEventListener('click', () => saveViewNow());
 
       switchTab('execute');
     });
@@ -1955,6 +2074,10 @@ let html = '';
                           <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
                         </div>
                         <div style="display:flex; gap:8px;">
+                          <button id="btnSaveView" type="button" class="btn">
+  <i class="fas fa-save"></i>&nbsp;Save View
+</button>
+
                           <button id="btnExec" class="btn-exec">
                             <i class="fas fa-play"></i>&nbsp;Execute
                           </button>
@@ -1999,7 +2122,52 @@ let html = '';
               </div>
           </div>
 
-      </div> {% endif %}
+      
+
+      <!-- Save as RBAC View Modal -->
+      <div class="modal fade" id="saveViewModal" tabindex="-1" role="dialog" aria-hidden="true">
+        <div class="modal-dialog modal-lg" role="document">
+          <div class="modal-content" style="border-radius: 12px;">
+            <div class="modal-header" style="background: var(--header-bg); border-bottom: 1px solid var(--panel-border);">
+              <h5 class="modal-title" style="margin:0; font-weight:700;">Save as RBAC View</h5>
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>
+            <div class="modal-body">
+              <div class="text-sm muted" style="margin-bottom: 10px;">
+                Organization: <strong id="saveViewOrg"></strong> &nbsp;•&nbsp; SuperTable: <strong id="saveViewSup"></strong>
+              </div>
+
+              <div class="form-group">
+                <label class="text-sm muted" for="saveViewName">View name</label>
+                <input id="saveViewName" type="text" class="form-control" placeholder="e.g. Active customers (EU)" maxlength="120" />
+              </div>
+
+              <div class="form-group">
+                <label class="text-sm muted" for="saveViewDesc">Description (optional)</label>
+                <textarea id="saveViewDesc" class="form-control" rows="3" placeholder="Short description" maxlength="2000"></textarea>
+              </div>
+
+              <div class="form-group" style="margin-bottom: 0;">
+                <label class="text-sm muted" for="saveViewQueryPreview">Query</label>
+                <textarea id="saveViewQueryPreview" class="form-control" rows="6" readonly></textarea>
+              </div>
+
+              <div id="saveViewStatus" class="text-sm" style="margin-top: 10px; display:none;"></div>
+            </div>
+            <div class="modal-footer" style="border-top: 1px solid var(--panel-border);">
+              <a id="saveViewManageLink" class="text-sm" href="#" style="margin-right:auto;">Manage saved views</a>
+              <button type="button" class="btn" data-dismiss="modal">Cancel</button>
+              <button type="button" class="btn-exec" id="btnSaveViewConfirm">
+                <i class="fas fa-check"></i>&nbsp;Save
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+</div> {% endif %}
     </div>
   </div>
 
