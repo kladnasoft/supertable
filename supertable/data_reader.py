@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
 
@@ -149,6 +151,26 @@ class DataReader:
         self.timer.capture_duration(event="TOTAL_EXECUTE")
         return result_df, status, message
 
+def _ensure_sql_limit(sql: str, default_limit: int) -> str:
+    """
+    If the outermost query has no LIMIT clause, append one.
+
+    Only appends when the SQL does not already end with a LIMIT (ignoring
+    trailing whitespace/semicolons).  This avoids breaking queries that
+    already specify their own LIMIT, subqueries that contain LIMIT internally,
+    or CTEs.
+    """
+    # Strip trailing whitespace and optional semicolons for inspection
+    stripped = sql.rstrip().rstrip(";").rstrip()
+
+    # Check if the query already ends with LIMIT <number> (possibly with OFFSET)
+    # Pattern: LIMIT <digits> [OFFSET <digits>] at the very end
+    if re.search(r'\bLIMIT\s+\d+\s*(?:OFFSET\s+\d+\s*)?$', stripped, re.IGNORECASE):
+        return sql
+
+    return f"{sql}\nLIMIT {int(default_limit)}"
+
+
 def query_sql(
         organization: str,
         super_name: str,
@@ -161,6 +183,10 @@ def query_sql(
     Execute SQL query and return results in the format expected by MCP server.
     Returns: (columns, rows, columns_meta)
     """
+    # Safety guard: ensure a LIMIT is present so unbounded queries don't
+    # overwhelm the MCP response payload.
+    sql = _ensure_sql_limit(sql, default_limit=limit)
+
     reader = DataReader(organization=organization, super_name=super_name, query=sql)
 
     # Execute the query
@@ -175,7 +201,19 @@ def query_sql(
 
     # Convert DataFrame to the expected format
     columns = list(result_df.columns)
+
+    # Sanitize pandas NA variants (pd.NA, pd.NaT, np.nan) to Python None
+    # so downstream JSON serialization does not choke on NAType.
+    # Note: DataFrame.where() + .values.tolist() does NOT fully sanitize
+    # nullable dtypes (Int64, string) or np.nan in float columns.
+    # We must sanitize the final Python objects after .tolist().
     rows = result_df.values.tolist()
+    for row in rows:
+        for i, val in enumerate(row):
+            if val is pd.NA or val is pd.NaT:
+                row[i] = None
+            elif isinstance(val, float) and math.isnan(val):
+                row[i] = None
 
     # Create basic column metadata
     columns_meta = [
