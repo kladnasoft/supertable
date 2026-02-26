@@ -511,6 +511,100 @@ def process_files_without_overlap(
 
 
 # =========================
+# Delete-only processing (per-file in-place rewrite)
+# =========================
+
+def process_delete_only(
+        df: polars.DataFrame,
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        data_dir: str,
+        compression_level: int,
+):
+    """
+    Delete-only path: for each overlapping file, remove rows matching the
+    overwrite_columns keys present in *df*, then rewrite the remainder as a
+    standalone file.
+
+    Semantics:
+      - Only has_overlap=True files are touched.
+      - has_overlap=False files are ignored (no compaction during delete).
+      - Each file is rewritten independently — no union/merge across files.
+      - If all rows are deleted from a file, only sunset occurs (no new file).
+      - If no rows match, the file is left untouched.
+
+    Returns the same 6-tuple as process_overlapping_files:
+        (inserted, deleted, total_rows, total_columns, new_resources, sunset_files)
+    where inserted is always 0.
+    """
+    deleted = 0
+    total_rows = 0
+    total_columns = 0
+
+    new_resources: List[Dict] = []
+    sunset_files: Set[str] = set()
+
+    # Pre-compute unique key values for efficient is_in() filtering
+    unique_values_map: Dict[str, polars.Series] = {}
+    for col in overwrite_columns:
+        if col in df.columns:
+            unique_values_map[col] = df[col].unique(maintain_order=False)
+
+    for file, has_overlap, file_size in overlapping_files:
+        if not has_overlap:
+            continue
+
+        existing_df = _read_parquet_safe(file)
+        if existing_df is None:
+            continue
+
+        # Build the match condition (rows to DELETE)
+        cond = polars.lit(False)
+        any_pred = False
+        for col in overwrite_columns:
+            if col in existing_df.columns and col in unique_values_map:
+                any_pred = True
+                cond = cond | polars.col(col).is_in(unique_values_map[col])
+
+        if not any_pred:
+            # No key columns overlap with this file — skip
+            continue
+
+        kept_df = existing_df.filter(~cond)
+        difference = existing_df.shape[0] - kept_df.shape[0]
+
+        if difference == 0:
+            # Nothing deleted from this file — leave it untouched
+            continue
+
+        deleted += difference
+
+        # Sunset the original file
+        sunset_files.add(file)
+
+        # Track total_columns from existing files (they have the full schema)
+        if total_columns == 0:
+            total_columns = existing_df.shape[1]
+
+        # If there are remaining rows, write them as a standalone file
+        if kept_df.shape[0] > 0:
+            total_rows += kept_df.shape[0]
+            write_parquet_and_collect_resources(
+                write_df=kept_df,
+                overwrite_columns=overwrite_columns,
+                data_dir=data_dir,
+                new_resources=new_resources,
+                compression_level=compression_level,
+            )
+
+    # Fallback: if no files were touched, derive total_columns from the delete df
+    if total_columns == 0:
+        total_columns = df.shape[1]
+
+    return 0, deleted, total_rows, total_columns, new_resources, sunset_files
+
+
+# =========================
 # Write helpers
 # =========================
 

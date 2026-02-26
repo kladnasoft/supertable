@@ -16,6 +16,7 @@ from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
 from supertable.processing import (
     process_overlapping_files,
+    process_delete_only,
     find_and_lock_overlapping_files,
     filter_stale_incoming_rows,
 )
@@ -31,7 +32,7 @@ class DataWriter:
 
     timer = Timer()
 
-    def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1, newer_than=None):
+    def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False):
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
@@ -55,7 +56,7 @@ class DataWriter:
         stats_payload = None
 
         try:
-            logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than})"))
+            logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
 
             # --- Access control ------------------------------------------------
             check_write_access(
@@ -71,7 +72,7 @@ class DataWriter:
             mark("convert")
 
             # --- Validate ------------------------------------------------------
-            self.validation(dataframe, simple_name, overwrite_columns, newer_than)
+            self.validation(dataframe, simple_name, overwrite_columns, newer_than, delete_only)
             mark("validate")
 
             # --- Per-simple Redis lock ----------------------------------------
@@ -115,13 +116,22 @@ class DataWriter:
                 mark("newer_than")
 
             # --- Process & write data -----------------------------------------
-            inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
-                dataframe,
-                overlapping_files,
-                overwrite_columns,
-                simple_table.data_dir,
-                compression_level,
-            )
+            if delete_only:
+                inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_delete_only(
+                    dataframe,
+                    overlapping_files,
+                    overwrite_columns,
+                    simple_table.data_dir,
+                    compression_level,
+                )
+            else:
+                inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
+                    dataframe,
+                    overlapping_files,
+                    overwrite_columns,
+                    simple_table.data_dir,
+                    compression_level,
+                )
             mark("process")
 
             # --- Update snapshot on storage -----------------------------------
@@ -175,6 +185,7 @@ class DataWriter:
                 "table_name": simple_name,               # partitioning by table_name in monitor
                 "overwrite_columns": overwrite_columns,
                 "newer_than": newer_than,
+                "delete_only": delete_only,
                 "inserted": inserted,
                 "deleted": deleted,
                 "total_rows": total_rows,
@@ -231,7 +242,7 @@ class DataWriter:
 
         return result_tuple
 
-    def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None):
+    def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):
         if len(simple_name) == 0 or len(simple_name) > 128:
             raise ValueError("SimpleTable name can't be empty or longer than 128")
         if simple_name == self.super_table.super_name:
@@ -246,6 +257,8 @@ class DataWriter:
             raise ValueError("Some overwrite columns are not present in the dataset")
         if isinstance(overwrite_columns, str):
             raise ValueError("overwrite columns must be list")
+        if delete_only and not overwrite_columns:
+            raise ValueError("delete_only requires overwrite_columns to identify rows to delete")
         if newer_than is not None:
             if not isinstance(newer_than, str):
                 raise ValueError("newer_than must be a column name string")
