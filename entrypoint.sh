@@ -21,20 +21,67 @@ SERVICE="${SERVICE:-admin}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
+_run_web() {
+  # Prefer dedicated web_server.py if present; fall back to the existing FastAPI app.
+  if [ -f "/app/web_server.py" ]; then
+    exec python -u /app/web_server.py
+  fi
+  if [ -f "/app/supertable/web_server.py" ]; then
+    exec python -u /app/supertable/web_server.py
+  fi
+  if [ -f "/app/supertable/reflection/web_server.py" ]; then
+    exec python -u /app/supertable/reflection/web_server.py
+  fi
+  exec uvicorn supertable.reflection.application:app --host "$HOST" --port "$PORT"
+}
+
+_start_web_bg() {
+  if [ -f "/app/web_server.py" ]; then
+    python -u /app/web_server.py &
+    return
+  fi
+  if [ -f "/app/supertable/web_server.py" ]; then
+    python -u /app/supertable/web_server.py &
+    return
+  fi
+  if [ -f "/app/supertable/reflection/web_server.py" ]; then
+    python -u /app/supertable/reflection/web_server.py &
+    return
+  fi
+  uvicorn supertable.reflection.application:app --host "$HOST" --port "$PORT" &
+}
+
+_run_mcp() {
+  # Prefer dedicated mcp_server.py if present; fall back to the packaged server.
+  if [ -f "/app/mcp_server.py" ]; then
+    exec python -u /app/mcp_server.py
+  fi
+  if [ -f "/app/supertable/mcp_server.py" ]; then
+    exec python -u /app/supertable/mcp_server.py
+  fi
+  if [ -f "/app/supertable/mcp/mcp_server.py" ]; then
+    exec python -u /app/supertable/mcp/mcp_server.py
+  fi
+  exec python -u supertable/mcp/mcp_server.py
+}
+
 case "$SERVICE" in
   admin)
     # App is inside the package: supertable/reflection/application.py -> supertable.reflection.application:app
     exec uvicorn supertable.reflection.application:app --host "$HOST" --port "$PORT"
     ;;
+  web)
+    _run_web
+    ;;
   mcp)
-    exec python -u supertable/mcp/mcp_server.py
+    _run_mcp
     ;;
   both)
-    uvicorn supertable.reflection.application:app --host "$HOST" --port "$PORT" &
-    exec python -u supertable/mcp/mcp_server.py
+    _start_web_bg
+    _run_mcp
     ;;
   *)
-    echo "Unknown SERVICE=$SERVICE (use: admin|mcp|both)" >&2
+    echo "Unknown SERVICE=$SERVICE (use: admin|web|mcp|both)" >&2
     exit 64
     ;;
 esac

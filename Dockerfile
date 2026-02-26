@@ -33,6 +33,7 @@ ENV DUCKDB_EXTENSION_DIRECTORY=/home/supertable/.duckdb/extensions
 # Copy the codebase (includes supertable/reflection)
 COPY supertable/ ./supertable/
 
+
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

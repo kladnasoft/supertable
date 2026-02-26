@@ -62,6 +62,41 @@ services:
     ports:
       - "8000:8000"
 
+  supertable-web:
+    build: .
+    profiles: ["mcp"]
+    init: true
+    env_file:
+      - .env
+    environment:
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+      SERVICE: web
+      HOST: 0.0.0.0
+      PORT: 8000
+      # must be set (in .env or env); prevents default "change-me-now" in prod
+      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?set_a_token}
+
+      # ---- Defaults point to HOST services (your already-running Redis & MinIO) ----
+      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB:   ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+      # Misc you already use
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+
   supertable-mcp:
     build: .
     profiles: ["mcp"]

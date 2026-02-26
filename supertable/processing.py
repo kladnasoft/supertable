@@ -109,6 +109,79 @@ def _read_parquet_safe(path: str) -> Optional[polars.DataFrame]:
 
 
 # =========================
+# Idempotency: filter stale incoming rows
+# =========================
+
+
+def filter_stale_incoming_rows(
+        incoming_df: polars.DataFrame,
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        idempotent_check_col: str,
+) -> polars.DataFrame:
+    """
+    Remove incoming rows whose key already exists in storage with an equal or
+    newer value in the ``idempotent_check_col`` column.
+
+    Only files marked ``has_overlap=True`` are inspected (they are the only ones
+    that can contain matching keys).
+
+    Rules:
+      - existing >= incoming  →  drop the incoming row  (stale / replay)
+      - existing < incoming   →  keep the incoming row   (genuine update)
+      - key not found         →  keep the incoming row   (new data)
+      - idempotent_check_col missing in existing file →  keep the incoming row
+    """
+    # Collect existing rows from overlapping files, only the columns we need
+    needed_cols = overwrite_columns + [idempotent_check_col]
+    existing_parts: List[polars.DataFrame] = []
+
+    for file, has_overlap, _ in overlapping_files:
+        if not has_overlap:
+            continue
+        df_existing = _read_parquet_safe(file)
+        if df_existing is None:
+            continue
+        # If the idempotent check column is missing from this file, skip it
+        # (rule: missing column → allow incoming rows through)
+        if idempotent_check_col not in df_existing.columns:
+            continue
+        # Select only columns we need that exist in the file
+        select_cols = [c for c in needed_cols if c in df_existing.columns]
+        existing_parts.append(df_existing.select(select_cols))
+
+    if not existing_parts:
+        # No existing data with the idempotent column → everything is new
+        return incoming_df
+
+    existing_keys_df = polars.concat(existing_parts, how="vertical_relaxed")
+
+    # For each key combination, find the max idempotent_check value in existing data
+    existing_max = (
+        existing_keys_df
+        .group_by(overwrite_columns)
+        .agg(polars.col(idempotent_check_col).max().alias("__existing_max__"))
+    )
+
+    # Left join incoming against existing max values
+    incoming_with_max = incoming_df.join(
+        existing_max,
+        on=overwrite_columns,
+        how="left",
+    )
+
+    # Keep rows where:
+    #   - no existing max found (new key) → __existing_max__ is null
+    #   - incoming value > existing max   (genuine update)
+    filtered = incoming_with_max.filter(
+        polars.col("__existing_max__").is_null()
+        | (polars.col(idempotent_check_col) > polars.col("__existing_max__"))
+    ).drop("__existing_max__")
+
+    return filtered
+
+
+# =========================
 # Original-style merge threshold logic
 # =========================
 
@@ -560,3 +633,79 @@ def collect_column_statistics(write_df, overwrite_columns: List[str]):
         stats[c] = {"min": min_val, "max": max_val}
 
     return stats
+
+
+# =========================
+# Newer-than filtering (idempotency / conflict resolution)
+# =========================
+
+def filter_stale_incoming_rows(
+        incoming_df: polars.DataFrame,
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        newer_than_col: str,
+) -> polars.DataFrame:
+    """
+    Remove rows from *incoming_df* that are stale or already present in existing data.
+
+    For each incoming row (keyed by *overwrite_columns*), we find the maximum value of
+    *newer_than_col* across all overlapping existing files.  If the existing max is >=
+    the incoming value, the incoming row is dropped (it is either a replay or out-of-order).
+
+    Edge cases:
+      - Key not found in existing data            → keep incoming row (new key).
+      - Existing file lacks the newer_than column → keep incoming row (legacy data).
+      - incoming newer_than > existing max        → keep incoming row (genuine update).
+
+    Returns the filtered incoming DataFrame (potentially empty).
+    """
+    if not overwrite_columns or not newer_than_col:
+        return incoming_df
+
+    # Collect only has_overlap=True files — those are the ones sharing keys with incoming data
+    overlap_true_files = [f for f, has_overlap, _ in overlapping_files if has_overlap]
+    if not overlap_true_files:
+        # No overlapping files → all incoming rows are new
+        return incoming_df
+
+    # Columns we need from existing files: overwrite keys + the newer_than column
+    needed_cols = list(dict.fromkeys(overwrite_columns + [newer_than_col]))
+
+    # Read and collect relevant rows from overlapping files
+    existing_parts: List[polars.DataFrame] = []
+    for file_path in overlap_true_files:
+        part = _read_parquet_safe(file_path)
+        if part is None:
+            continue
+        # If the file doesn't have the newer_than column, skip it (legacy data → allow overwrite)
+        if newer_than_col not in part.columns:
+            continue
+        # Select only the columns we need, filtering to matching keys
+        available_cols = [c for c in needed_cols if c in part.columns]
+        if not all(c in available_cols for c in overwrite_columns):
+            continue
+        existing_parts.append(part.select(available_cols))
+
+    if not existing_parts:
+        # No existing data with the newer_than column → all incoming rows proceed
+        return incoming_df
+
+    existing_combined = polars.concat(existing_parts, how="vertical_relaxed")
+
+    # Get max(newer_than_col) per key group from existing data
+    existing_max = existing_combined.group_by(overwrite_columns).agg(
+        polars.col(newer_than_col).max().alias("__existing_max__")
+    )
+
+    # Left join incoming against existing max
+    joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
+
+    # Keep rows where:
+    #   - no existing data for this key (null max → new key)
+    #   - incoming value > existing max   (genuine update)
+    filtered = joined.filter(
+        polars.col("__existing_max__").is_null()
+        | (polars.col(newer_than_col) > polars.col("__existing_max__"))
+    ).drop("__existing_max__")
+
+    return filtered

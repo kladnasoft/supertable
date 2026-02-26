@@ -17,6 +17,7 @@ from supertable.utils.timer import Timer
 from supertable.processing import (
     process_overlapping_files,
     find_and_lock_overlapping_files,
+    filter_stale_incoming_rows,
 )
 from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
@@ -30,7 +31,7 @@ class DataWriter:
 
     timer = Timer()
 
-    def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1):
+    def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1, newer_than=None):
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
@@ -54,7 +55,7 @@ class DataWriter:
         stats_payload = None
 
         try:
-            logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level})"))
+            logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than})"))
 
             # --- Access control ------------------------------------------------
             check_write_access(
@@ -70,7 +71,7 @@ class DataWriter:
             mark("convert")
 
             # --- Validate ------------------------------------------------------
-            self.validation(dataframe, simple_name, overwrite_columns)
+            self.validation(dataframe, simple_name, overwrite_columns, newer_than)
             mark("validate")
 
             # --- Per-simple Redis lock ----------------------------------------
@@ -92,6 +93,26 @@ class DataWriter:
                 last_simple_table, dataframe, overwrite_columns, locking=None
             )
             mark("overlap")
+
+            # --- Newer-than filtering (skip stale/replayed rows) ---------------
+            if newer_than and overwrite_columns:
+                pre_filter_count = dataframe.height
+                dataframe = filter_stale_incoming_rows(
+                    incoming_df=dataframe,
+                    overlapping_files=overlapping_files,
+                    overwrite_columns=overwrite_columns,
+                    newer_than_col=newer_than,
+                )
+                skipped = pre_filter_count - dataframe.height
+                if skipped > 0:
+                    logger.info(lp(f"newer_than={newer_than}: skipped {skipped}/{pre_filter_count} stale rows"))
+                if dataframe.height == 0:
+                    logger.info(lp("newer_than: all incoming rows are stale — skipping write"))
+                    mark("newer_than")
+                    total_columns = dataframe.width
+                    result_tuple = (total_columns, 0, 0, 0)
+                    return result_tuple
+                mark("newer_than")
 
             # --- Process & write data -----------------------------------------
             inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
@@ -153,6 +174,7 @@ class DataWriter:
                 "super_name": self.super_table.super_name,
                 "table_name": simple_name,               # partitioning by table_name in monitor
                 "overwrite_columns": overwrite_columns,
+                "newer_than": newer_than,
                 "inserted": inserted,
                 "deleted": deleted,
                 "total_rows": total_rows,
@@ -170,7 +192,8 @@ class DataWriter:
                     f"total={total_duration:.3f} | "
                     f"convert={timings.get('convert', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
                     f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
-                    f"overlap={timings.get('overlap', 0):.3f} | process={timings.get('process', 0):.3f} | "
+                    f"overlap={timings.get('overlap', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
+                    f"process={timings.get('process', 0):.3f} | "
                     f"update_simple={timings.get('update_simple', 0):.3f} | bump_root={timings.get('bump_root', 0):.3f} | "
                     f"mirror={timings.get('mirror', 0):.3f} | prepare_monitor={timings.get('prepare_monitor', 0):.3f}"
                 )
@@ -208,7 +231,7 @@ class DataWriter:
 
         return result_tuple
 
-    def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list):
+    def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None):
         if len(simple_name) == 0 or len(simple_name) > 128:
             raise ValueError("SimpleTable name can't be empty or longer than 128")
         if simple_name == self.super_table.super_name:
@@ -223,3 +246,10 @@ class DataWriter:
             raise ValueError("Some overwrite columns are not present in the dataset")
         if isinstance(overwrite_columns, str):
             raise ValueError("overwrite columns must be list")
+        if newer_than is not None:
+            if not isinstance(newer_than, str):
+                raise ValueError("newer_than must be a column name string")
+            if newer_than not in dataframe.columns:
+                raise ValueError(f"newer_than column '{newer_than}' is not present in the dataset")
+            if not overwrite_columns:
+                raise ValueError("newer_than requires overwrite_columns to be set")
