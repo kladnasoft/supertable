@@ -1,6 +1,6 @@
 # supertable/rbac/access_control.py
 
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from supertable.config.defaults import logger
 from supertable.data_classes import TableDefinition
@@ -58,52 +58,95 @@ def restrict_read_access(
         organization: str,
         role_name: str,
         tables: List[TableDefinition],
-):
+) -> Dict[str, "RbacViewDef"]:
     """
-    Checks whether the given *role_name* can read the requested tables/columns.
+    Check whether *role_name* can read the requested tables/columns.
 
-    Currently disabled — returns immediately.
+    Returns a dict of ``{alias: RbacViewDef}`` for each table that needs
+    RBAC filtering.  An empty dict means the role is unrestricted
+    (superadmin/admin or wildcard columns+filters).
+
+    Raises ``PermissionError`` if the role lacks READ access entirely
+    or if a requested table is not in the role's allowed table list.
     """
-    return
-    # --- Disabled code below (preserved for future implementation) ---
+    from supertable.data_classes import RbacViewDef
+
     role_manager = RoleManager(super_name=super_name, organization=organization)
-    role_info_data = _resolve_role(role_manager, role_name)
+    role_info = _resolve_role(role_manager, role_name)
 
-    role_type_str = role_info_data.get("role")
+    role_type_str = role_info.get("role")
     if not role_type_str:
         raise PermissionError("You don't have permission to read the table.")
 
     role_type = RoleType(role_type_str)
 
     if not has_permission(role_type, Permission.READ):
-        logger.error("You don't have permission to read the table")
         raise PermissionError("You don't have permission to read the table.")
 
-    role_tables = role_info_data.get("tables", [])
-    if "*" not in role_tables and table_name not in role_tables:
-        logger.error("You don't have permission to read the table")
-        raise PermissionError("You don't have permission to read the table.")
+    # Superadmin/admin: no filtering needed
+    if role_type in (RoleType.SUPERADMIN, RoleType.ADMIN):
+        return {}
 
-    role_columns = role_info_data.get("columns", [])
+    role_tables = role_info.get("tables", [])
+    role_columns = role_info.get("columns", [])
+    role_filters = role_info.get("filters", ["*"])
+
     columns_unrestricted = role_columns == ["*"]
+    filters_unrestricted = role_filters == ["*"]
 
-    if not columns_unrestricted:
-        allowed_columns = set(role_columns)
-        if not allowed_columns:
-            logger.error("You don't have permission to read the table")
-            raise PermissionError("You don't have permission to read the table.")
+    # If everything is wildcard, no views needed
+    if columns_unrestricted and filters_unrestricted and "*" in role_tables:
+        return {}
 
-        missing = table_schema - allowed_columns
-        if missing:
-            logger.error(f"You don't have permission to columns: {missing}")
-            raise PermissionError(f"You don't have permission to columns {missing}.")
+    rbac_views: Dict[str, RbacViewDef] = {}
 
-    fb = FilterBuilder(table_name=table_name,
-                       columns=parsed_columns,
-                       role_info=role_info_data)
-    parser.view_definition = fb.filter_query
+    for td in tables:
+        # Table-level access check
+        if "*" not in role_tables and td.simple_name not in role_tables:
+            raise PermissionError(
+                f"You don't have permission to read table '{td.simple_name}'."
+            )
 
-    return
+        # Column-level filtering
+        allowed_columns = ["*"]
+        if not columns_unrestricted:
+            if not role_columns:
+                raise PermissionError(
+                    f"You don't have permission to read any columns in '{td.simple_name}'."
+                )
+            # If query requests specific columns, validate they're all allowed
+            if td.columns:
+                requested_lower = {c.lower() for c in td.columns}
+                allowed_lower = {c.lower() for c in role_columns}
+                denied = requested_lower - allowed_lower
+                if denied:
+                    raise PermissionError(
+                        f"You don't have permission to columns: {denied}"
+                    )
+            allowed_columns = list(role_columns)
+
+        # Row-level filtering
+        where_clause = ""
+        if not filters_unrestricted:
+            fb = FilterBuilder(
+                table_name="__PLACEHOLDER__",  # table name is substituted by executor
+                columns=["*"],  # column filtering is separate
+                role_info=role_info,
+            )
+            # Extract just the WHERE clause from the generated query
+            generated = fb.filter_query
+            where_idx = generated.upper().find("WHERE ")
+            if where_idx >= 0:
+                where_clause = generated[where_idx + 6:]  # everything after "WHERE "
+
+        # Only add an entry if there's actual filtering to apply
+        if allowed_columns != ["*"] or where_clause:
+            rbac_views[td.alias] = RbacViewDef(
+                allowed_columns=allowed_columns,
+                where_clause=where_clause,
+            )
+
+    return rbac_views
 
 
 def check_meta_access(

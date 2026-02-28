@@ -114,6 +114,20 @@ def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Spark cluster key helpers
+# --------------------------------------------------------------------------- #
+
+def _spark_clusters_key() -> str:
+    """HASH: cluster_id → JSON cluster config (global, not org-scoped)."""
+    return "supertable:spark:clusters"
+
+
+def _spark_cluster_doc_key(cluster_id: str) -> str:
+    """HASH fields for a single cluster document."""
+    return f"supertable:spark:cluster:{cluster_id}"
+
+
+# --------------------------------------------------------------------------- #
 # Staging / Pipe meta keys (Redis-backed UI listing)
 # --------------------------------------------------------------------------- #
 
@@ -1344,3 +1358,124 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_pipe_meta del error: {e}")
             return 0
+
+    # ========================================================================= #
+    # Spark cluster management
+    # ========================================================================= #
+
+    def register_spark_cluster(self, cluster_id: str, config: Dict[str, Any]) -> None:
+        """
+        Register or update a Spark Thrift cluster.
+
+        config should include:
+            thrift_host: str       — hostname of the Thrift Server
+            thrift_port: int       — port (default 10000)
+            name: str              — human-readable name
+            min_bytes: int         — minimum job size for this cluster (default 0)
+            max_bytes: int         — maximum job size (default unlimited)
+            status: str            — "active" | "draining" | "offline"
+            s3_enabled: bool       — can read from S3/MinIO directly
+        """
+        try:
+            doc = dict(config)
+            doc["cluster_id"] = cluster_id
+            doc.setdefault("status", "active")
+            doc.setdefault("thrift_port", 10000)
+            doc.setdefault("min_bytes", 0)
+            doc.setdefault("max_bytes", 0)
+            doc.setdefault("s3_enabled", True)
+            doc["modified_ms"] = _now_ms()
+            self.r.hset(
+                _spark_clusters_key(),
+                cluster_id,
+                json.dumps(doc, default=str),
+            )
+            logger.info(f"[redis-catalog] spark cluster registered: {cluster_id}")
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] register_spark_cluster error: {e}")
+
+    def deregister_spark_cluster(self, cluster_id: str) -> bool:
+        """Remove a Spark cluster from the registry."""
+        try:
+            return bool(self.r.hdel(_spark_clusters_key(), cluster_id))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] deregister_spark_cluster error: {e}")
+            return False
+
+    def get_spark_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        """Return config for a specific cluster."""
+        try:
+            raw = self.r.hget(_spark_clusters_key(), cluster_id)
+            if raw:
+                return json.loads(raw)
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] get_spark_cluster error: {e}")
+        return None
+
+    def list_spark_clusters(self) -> List[Dict[str, Any]]:
+        """Return all registered Spark clusters."""
+        try:
+            raw = self.r.hgetall(_spark_clusters_key())
+            clusters = []
+            for _cid, data in raw.items():
+                try:
+                    clusters.append(json.loads(data))
+                except json.JSONDecodeError:
+                    pass
+            return clusters
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_spark_clusters error: {e}")
+            return []
+
+    def update_spark_cluster_status(self, cluster_id: str, status: str) -> bool:
+        """Update only the status of a cluster (active/draining/offline)."""
+        try:
+            raw = self.r.hget(_spark_clusters_key(), cluster_id)
+            if not raw:
+                return False
+            doc = json.loads(raw)
+            doc["status"] = status
+            doc["modified_ms"] = _now_ms()
+            self.r.hset(_spark_clusters_key(), cluster_id, json.dumps(doc, default=str))
+            return True
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] update_spark_cluster_status error: {e}")
+            return False
+
+    def select_spark_cluster(self, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Select the best active Spark cluster for a job of the given size.
+
+        Selection logic:
+        1. Filter clusters where status == "active"
+        2. If force=False: filter where min_bytes <= job_bytes AND (max_bytes >= job_bytes OR max_bytes == 0)
+        3. If force=True: skip size filtering (user explicitly requested Spark)
+        4. Among matches, prefer the cluster with the tightest max_bytes
+           (most specialized for this job size), breaking ties by name.
+        """
+        clusters = self.list_spark_clusters()
+        candidates = []
+
+        for c in clusters:
+            if c.get("status") != "active":
+                continue
+            if not force:
+                min_b = int(c.get("min_bytes", 0))
+                max_b = int(c.get("max_bytes", 0))
+                if job_bytes < min_b:
+                    continue
+                if max_b > 0 and job_bytes > max_b:
+                    continue
+            candidates.append(c)
+
+        if not candidates:
+            return None
+
+        # Prefer tightest fit: smallest max_bytes > 0, then by name
+        def sort_key(c):
+            max_b = int(c.get("max_bytes", 0))
+            # 0 means unlimited — sort last
+            return (0 if max_b > 0 else 1, max_b, c.get("name", ""))
+
+        candidates.sort(key=sort_key)
+        return candidates[0]

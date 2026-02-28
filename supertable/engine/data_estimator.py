@@ -1,4 +1,4 @@
-# supertable/data_estimator.py
+# supertable/engine/data_estimator.py
 
 from __future__ import annotations
 
@@ -11,12 +11,13 @@ from supertable.config.defaults import logger
 from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
-from supertable.plan_stats import PlanStats
+from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
 from supertable.rbac.access_control import restrict_read_access
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
 from supertable.utils.sql_parser import TableDefinition
+
 
 def _lower_set(items: Iterable[str]) -> Set[str]:
     return {str(x).lower() for x in items}
@@ -26,8 +27,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 def get_missing_columns(
-    tables: List[TableDefinition],
-    selected: List[SuperSnapshot],
+        tables: List[TableDefinition],
+        selected: List[SuperSnapshot],
 ) -> List[Tuple[str, str, Set[str]]]:
     """
     Returns list of (super_name, simple_name, missing_columns),
@@ -101,7 +102,6 @@ def get_missing_columns(
     return results
 
 
-
 class DataEstimator:
     """
     Estimates which files will be read for a query and validates read access.
@@ -121,7 +121,6 @@ class DataEstimator:
         self.plan_stats: Optional[PlanStats] = None
         self.catalog = RedisCatalog()
 
-    
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
         """Normalize schema representations into a {name: type} dict."""
         if isinstance(schema_obj, dict):
@@ -135,9 +134,11 @@ class DataEstimator:
                         out[str(name)] = str(item.get("type", ""))
             return out
         return {}
-# ----------------------- storage helpers (matching original) -----------------------
+
+    # ----------------------- storage helpers (matching original) -----------------------
 
     def _get_env(self, *names: str) -> Optional[str]:
+        """Deprecated: retained for backward compatibility. Prefer os.getenv('STORAGE_*') directly."""
         for n in names:
             v = os.getenv(n)
             if v:
@@ -161,6 +162,7 @@ class DataEstimator:
         return f"{host}{port}"
 
     def _detect_endpoint(self) -> Optional[str]:
+        # 1) storage object attributes (e.g. endpoint_url, endpoint)
         candidates = [
             "endpoint_url", "endpoint", "url", "api_url", "base_url",
             "s3_endpoint", "minio_endpoint", "public_endpoint",
@@ -177,21 +179,10 @@ class DataEstimator:
             composed = f"{host}{':' + port if port else ''}"
             return self._normalize_endpoint_for_s3(composed)
 
-        env_single = self._get_env(
-            "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL",
-            "MINIO_ENDPOINT", "MINIO_URL", "MINIO_SERVER", "MINIO_ADDRESS",
-            "MINIO_API_URL", "MINIO_PUBLIC_URL",
-            "S3_ENDPOINT", "S3_ENDPOINT_URL", "S3_URL",
-            "AWS_S3_ENDPOINT", "AWS_S3_URL",
-        )
+        # 2) Environment variable
+        env_single = os.getenv("STORAGE_ENDPOINT_URL")
         if env_single:
             return self._normalize_endpoint_for_s3(env_single)
-
-        host_env = self._get_env("MINIO_HOST", "S3_HOST", "AWS_S3_HOST")
-        port_env = self._get_env("MINIO_PORT", "S3_PORT", "AWS_S3_PORT")
-        if host_env:
-            composed = f"{host_env}{':' + port_env if port_env else ''}"
-            return self._normalize_endpoint_for_s3(composed)
 
         return None
 
@@ -200,12 +191,12 @@ class DataEstimator:
             v = self._storage_attr(name)
             if v:
                 return v
-        return self._get_env("SUPERTABLE_BUCKET", "MINIO_BUCKET", "S3_BUCKET", "AWS_S3_BUCKET", "AWS_BUCKET", "BUCKET")
+        return os.getenv("STORAGE_BUCKET")
 
     def _detect_ssl(self) -> bool:
         val = (
                 (str(getattr(self.storage, "secure", "")).lower() if hasattr(self.storage, "secure") else "")
-                or (self._get_env("MINIO_SECURE", "S3_USE_SSL") or "")
+                or (os.getenv("STORAGE_USE_SSL", "") or "")
         ).lower()
         return val in ("1", "true", "yes", "on")
 
@@ -314,9 +305,11 @@ class DataEstimator:
 
         # Discover snapshots
         for super_name, tables in super_map:
+            # Collect snapshots ONCE per super_name (avoid redundant SCAN per simple table)
+            all_snapshots = self._collect_snapshots_from_redis(organization=self.organization, super_name=super_name)
+
             for simple_name in tables:
-                snapshots = self._collect_snapshots_from_redis(organization=self.organization, super_name=super_name)
-                snapshots = self._filter_snapshots(super_name, simple_name, snapshots)
+                snapshots = self._filter_snapshots(super_name, simple_name, all_snapshots)
                 super_table = SuperTable(super_name, self.organization)
 
                 parquet_files: List[str] = []
@@ -325,7 +318,8 @@ class DataEstimator:
                 for snapshot in snapshots:
                     current_snapshot_path = snapshot["path"]
                     current_snapshot_data = snapshot.get("payload")
-                    if not (isinstance(current_snapshot_data, dict) and isinstance(current_snapshot_data.get("resources"), list)):
+                    if not (isinstance(current_snapshot_data, dict) and isinstance(
+                            current_snapshot_data.get("resources"), list)):
                         current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
 
                     current_version = current_snapshot_data.get("snapshot_version", 0)
@@ -341,7 +335,8 @@ class DataEstimator:
                         parquet_files.append(resolved)
                         reflection_file_size += int(resource.get("file_size", 0))
 
-                    super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name, simple_version=current_version, files=parquet_files, columns=schema)
+                    super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
+                                                   simple_version=current_version, files=parquet_files, columns=schema)
                     supers.append(super_snapshot)
 
         # Validate requested columns

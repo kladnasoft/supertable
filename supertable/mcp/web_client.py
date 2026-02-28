@@ -19,6 +19,7 @@ _AUTH_TOOLS = {
     "get_table_stats",
     "get_super_meta",
     "query_sql",
+    "sample_data",
 }
 
 def _default_server_path() -> str:
@@ -46,7 +47,7 @@ class MCPWebClient:
     ) -> None:
         self.server_path = os.path.abspath(server_path or os.getenv("MCP_SERVER_PATH", _default_server_path()))
         self.python_exe = python_exe or sys.executable
-        self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", ""))).strip()
+        self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", "")).strip()
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task[None]] = None

@@ -1,3 +1,5 @@
+# supertable/engine/plan_stats.py
+
 class PlanStats:
     def __init__(self):
         self.stats = []

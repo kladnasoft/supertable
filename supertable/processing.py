@@ -15,8 +15,15 @@ from supertable.utils.helper import generate_filename, collect_schema
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
 
-# Single storage instance
-_storage = get_storage()
+# Lazy storage accessor to avoid import-time initialization failures
+_storage = None
+
+
+def _get_storage():
+    global _storage
+    if _storage is None:
+        _storage = get_storage()
+    return _storage
 
 # =========================
 # Schema helpers (robust, minimal)
@@ -88,7 +95,7 @@ def concat_with_union(a: polars.DataFrame, b: polars.DataFrame) -> polars.DataFr
 
 def _safe_exists(path: str) -> bool:
     try:
-        return _storage.exists(path)
+        return _get_storage().exists(path)
     except Exception:
         return False
 
@@ -98,7 +105,7 @@ def _read_parquet_safe(path: str) -> Optional[polars.DataFrame]:
         logging.info(f"[race] file already sunset by another writer: {path}")
         return None
     try:
-        tbl = _storage.read_parquet(path)  # -> pyarrow.Table
+        tbl = _get_storage().read_parquet(path)  # -> pyarrow.Table
         return polars.from_arrow(tbl)
     except FileNotFoundError:
         logging.info(f"[race] file vanished before read: {path}")
@@ -337,6 +344,7 @@ def process_overlapping_files(
         overwrite_columns: List[str],
         data_dir: str,
         compression_level: int,
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
 ):
     """
     Merge implementation:
@@ -384,6 +392,7 @@ def process_overlapping_files(
         sunset_files=sunset_files,
         total_rows=total_rows,
         compression_level=compression_level,
+        file_cache=file_cache,
     )
 
     # Final flush if anything remains
@@ -412,6 +421,7 @@ def process_files_with_overlap(
         sunset_files,
         total_rows,
         compression_level,
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
 ):
     # Pre-compute unique values for overwrite columns (ORIGINAL FAST APPROACH)
     unique_values_map = {}
@@ -422,24 +432,26 @@ def process_files_with_overlap(
 
     # Iterate only files where has_overlap is True
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if has_overlap):
-        existing_df = _read_parquet_safe(file)
+        # Use cached read if available (populated by filter_stale_incoming_rows)
+        if file_cache is not None and file in file_cache:
+            existing_df = file_cache.pop(file)
+        else:
+            existing_df = _read_parquet_safe(file)
         if existing_df is None:
             continue
 
         filtered_df = empty_df.clone()
 
         if overwrite_columns:
-            # ORIGINAL EFFICIENT APPROACH - multiple is_in() calls
-            cond = polars.lit(False)  # Start with False, OR with each column
-            any_pred = False
-            for col in overwrite_columns:
-                if col in existing_df.columns and col in unique_values_map:
-                    any_pred = True
-                    unique_vals = unique_values_map[col]
-                    cond = cond | polars.col(col).is_in(unique_vals)
+            # Use anti-join on composite key to correctly match all columns (AND),
+            # not OR'd is_in per column which over-deletes on partial key matches.
+            key_cols_in_existing = [c for c in overwrite_columns if c in existing_df.columns]
+            key_cols_in_incoming = [c for c in overwrite_columns if c in unique_values_map]
 
-            if any_pred:
-                kept = existing_df.filter(~cond)
+            if key_cols_in_existing == list(overwrite_columns) and key_cols_in_incoming == list(overwrite_columns):
+                # Build a DataFrame of unique incoming key tuples for the join
+                incoming_keys = df.select(overwrite_columns).unique()
+                kept = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
                 difference = existing_df.shape[0] - kept.shape[0]
                 deleted += difference
                 filtered_df = kept
@@ -520,6 +532,7 @@ def process_delete_only(
         overwrite_columns: List[str],
         data_dir: str,
         compression_level: int,
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
 ):
     """
     Delete-only path: for each overlapping file, remove rows matching the
@@ -554,23 +567,25 @@ def process_delete_only(
         if not has_overlap:
             continue
 
-        existing_df = _read_parquet_safe(file)
+        # Use cached read if available (populated by filter_stale_incoming_rows)
+        if file_cache is not None and file in file_cache:
+            existing_df = file_cache.pop(file)
+        else:
+            existing_df = _read_parquet_safe(file)
         if existing_df is None:
             continue
 
-        # Build the match condition (rows to DELETE)
-        cond = polars.lit(False)
-        any_pred = False
-        for col in overwrite_columns:
-            if col in existing_df.columns and col in unique_values_map:
-                any_pred = True
-                cond = cond | polars.col(col).is_in(unique_values_map[col])
+        # Build the match condition: anti-join on composite key (AND semantics)
+        key_cols_in_existing = [c for c in overwrite_columns if c in existing_df.columns]
+        key_cols_in_incoming = [c for c in overwrite_columns if c in unique_values_map]
 
-        if not any_pred:
+        if key_cols_in_existing != list(overwrite_columns) or key_cols_in_incoming != list(overwrite_columns):
             # No key columns overlap with this file — skip
             continue
 
-        kept_df = existing_df.filter(~cond)
+        # Build a DataFrame of unique incoming key tuples for the join
+        incoming_keys = df.select(overwrite_columns).unique()
+        kept_df = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
         difference = existing_df.shape[0] - kept_df.shape[0]
 
         if difference == 0:
@@ -619,8 +634,8 @@ def write_parquet_and_collect_resources(
 
     # Ensure target "directory" exists in the active storage (creates a marker or no-op)
     try:
-        if not _storage.exists(data_dir):
-            _storage.makedirs(data_dir)
+        if not _get_storage().exists(data_dir):
+            _get_storage().makedirs(data_dir)
     except Exception:
         # Best-effort: some backends may not require explicit directory creation
         pass
@@ -645,12 +660,12 @@ def write_parquet_and_collect_resources(
         )
         data = buf.getvalue()
 
-        if hasattr(_storage, "write_bytes"):
-            _storage.write_bytes(new_parquet_path, data)
-        elif hasattr(_storage, "write_parquet"):
+        if hasattr(_get_storage(), "write_bytes"):
+            _get_storage().write_bytes(new_parquet_path, data)
+        elif hasattr(_get_storage(), "write_parquet"):
             # Fallback: some storage backends may only expose write_parquet(table, path)
             # (may ignore compression level); we prefer bytes path above to preserve behavior.
-            _storage.write_parquet(arrow_tbl, new_parquet_path)
+            _get_storage().write_parquet(arrow_tbl, new_parquet_path)
         else:
             # Last-resort local write identical to original behavior
             write_df.write_parquet(
@@ -670,7 +685,7 @@ def write_parquet_and_collect_resources(
 
     # size via storage if available
     try:
-        file_size = _storage.size(new_parquet_path)
+        file_size = _get_storage().size(new_parquet_path)
     except Exception:
         try:
             file_size = os.path.getsize(new_parquet_path)
@@ -738,6 +753,7 @@ def filter_stale_incoming_rows(
         overlapping_files: Set[Tuple[str, bool, int]],
         overwrite_columns: List[str],
         newer_than_col: str,
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -750,6 +766,9 @@ def filter_stale_incoming_rows(
       - Key not found in existing data            → keep incoming row (new key).
       - Existing file lacks the newer_than column → keep incoming row (legacy data).
       - incoming newer_than > existing max        → keep incoming row (genuine update).
+
+    If file_cache dict is provided, read DataFrames are stored in it keyed by file path
+    so downstream processing can reuse them without re-reading from storage.
 
     Returns the filtered incoming DataFrame (potentially empty).
     """
@@ -771,6 +790,9 @@ def filter_stale_incoming_rows(
         part = _read_parquet_safe(file_path)
         if part is None:
             continue
+        # Cache the full DataFrame for downstream reuse (avoids double-read)
+        if file_cache is not None:
+            file_cache[file_path] = part
         # If the file doesn't have the newer_than column, skip it (legacy data → allow overwrite)
         if newer_than_col not in part.columns:
             continue

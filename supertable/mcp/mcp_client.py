@@ -138,19 +138,7 @@ def load_config(server_path: str, verbose: bool) -> Dict[str, Any]:
     cfg["wire"] = os.getenv("MCP_WIRE", json_cfg.get("wire", "ndjson"))
     cfg["org"] = os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", json_cfg.get("org", "")))
     cfg["super"] = os.getenv("SUPERTABLE_TEST_SUPER", json_cfg.get("super", ""))
-    cfg["user_hash"] = os.getenv(
-        "SUPERTABLE_TEST_USER_HASH",
-        os.getenv(
-            "SUPERTABLE_SYSADMIN_USER_HASH",
-            os.getenv(
-                "SUPERTABLE_SUPERUSER_HASH",
-                os.getenv(
-                    "SUPERTABLE_SUPER_USER_HASH",
-                    os.getenv("SUPERTABLE_ADMIN_USER_HASH", json_cfg.get("user_hash", "")),
-                ),
-            ),
-        ),
-    )
+    cfg["user_hash"] = os.getenv("SUPERTABLE_ROLE", json_cfg.get("role", ""))
     # Default SQL now empty; if env provides something, we use it (and may fallback)
     cfg["sql"] = os.getenv("SUPERTABLE_TEST_QUERY", json_cfg.get("sql", ""))
     cfg["hash_files"] = paths["hash_files"]
@@ -291,6 +279,7 @@ AUTH_TOOLS = {
     "get_table_stats",
     "get_super_meta",
     "query_sql",
+    "sample_data",
 }
 
 def call_tool(
@@ -433,7 +422,7 @@ def _looks_tableless(sql: str) -> bool:
 def _get_first_table(wire: Wire, ids: RpcIds, org: str, super_name: str, user_hash: str, auth_token: str) -> Optional[str]:
     lt = call_tool(
         wire, ids, "list_tables",
-        {"super_name": super_name, "organization": org, "user_hash": user_hash},
+        {"super_name": super_name, "organization": org, "role": user_hash},
         auth_token=auth_token,
     )
     pretty("tools/call list_tables (fallback)", lt)
@@ -479,7 +468,7 @@ def safe_query_with_fallback(
             "organization": org,
             "sql": sql.strip(),
             "limit": 10,
-            "user_hash": user_hash,
+            "role": user_hash,
         }
         if engine:
             q_args["engine"] = engine
@@ -507,7 +496,7 @@ def safe_query_with_fallback(
         "organization": org,
         "sql": sample_sql,
         "limit": 10,
-        "user_hash": user_hash,
+        "role": user_hash,
     }
     if engine:
         q_args["engine"] = engine
@@ -530,23 +519,11 @@ def main() -> None:
     parser.add_argument("--org", dest="org", default=os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", "")))
     parser.add_argument("--super", dest="super_name", default=os.getenv("SUPERTABLE_TEST_SUPER", ""))
     parser.add_argument(
-        "--hash",
-        dest="user_hash",
-        default=os.getenv(
-            "SUPERTABLE_TEST_USER_HASH",
-            os.getenv(
-                "SUPERTABLE_SYSADMIN_USER_HASH",
-                os.getenv(
-                    "SUPERTABLE_SUPERUSER_HASH",
-                    os.getenv(
-                        "SUPERTABLE_SUPER_USER_HASH",
-                        os.getenv("SUPERTABLE_ADMIN_USER_HASH", ""),
-                    ),
-                ),
-            ),
-        ),
+        "--role",
+        dest="role",
+        default=os.getenv("SUPERTABLE_ROLE", ""),
     )
-    parser.add_argument("--token", dest="auth_token", default=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", "")))
+    parser.add_argument("--token", dest="auth_token", default=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", ""))
     # Default SQL may be empty; if env gives SELECT 1, we will show it and then fallback
     parser.add_argument("--sql", dest="sql", default=os.getenv("SUPERTABLE_TEST_QUERY", ""))
     parser.add_argument("--engine", dest="engine", default=os.getenv("SUPERTABLE_TEST_ENGINE", ""))
@@ -569,7 +546,7 @@ def main() -> None:
     # CLI overrides
     org = (args.org or cfg["org"]).strip()
     super_name = (args.super_name or cfg["super"]).strip()
-    user_hash_seed = (args.user_hash or cfg["user_hash"]).strip()
+    role_seed = (args.role or cfg["user_hash"]).strip()
     wire_mode = args.wire or cfg["wire"]
     sql = (args.sql or cfg["sql"]).strip()  # may be empty or table-less
     engine = (args.engine or "").strip()
@@ -622,13 +599,13 @@ def main() -> None:
     # Some servers return nested structuredContent: {"result": { ... }}
     if isinstance(info_payload, dict) and isinstance(info_payload.get("result"), dict):
         info_payload = info_payload["result"]
-    require_hash = bool(info_payload.get("require_explicit_user_hash", False)) if isinstance(info_payload, dict) else False
+    require_hash = bool(info_payload.get("require_explicit_role", info_payload.get("require_explicit_user_hash", False))) if isinstance(info_payload, dict) else False
 
-    # Resolve user_hash
-    user_hash = resolve_user_hash(user_hash_seed, cfg["hash_files"], require_hash, verbose=args.verbose)
+    # Resolve role (accepts legacy user_hash files too)
+    user_hash = resolve_user_hash(role_seed, cfg["hash_files"], require_hash, verbose=args.verbose)
 
     # whoami
-    whoami_resp = call_tool(wire, ids, "whoami", {"user_hash": user_hash}, auth_token=auth_token)
+    whoami_resp = call_tool(wire, ids, "whoami", {"role": user_hash}, auth_token=auth_token)
     pretty("tools/call whoami", whoami_resp)
 
     # organization
@@ -658,7 +635,7 @@ def main() -> None:
             wire,
             ids,
             "list_tables",
-            {"super_name": super_name, "organization": org, "user_hash": user_hash},
+            {"super_name": super_name, "organization": org, "role": user_hash},
             auth_token=auth_token,
         )
         pretty("tools/call list_tables", lt_resp)
@@ -668,7 +645,7 @@ def main() -> None:
             wire,
             ids,
             "describe_table",
-            {"super_name": super_name, "organization": org, "table": args.describe_table, "user_hash": user_hash},
+            {"super_name": super_name, "organization": org, "table": args.describe_table, "role": user_hash},
             auth_token=auth_token,
         )
         pretty("tools/call describe_table", dt_resp)
@@ -678,7 +655,7 @@ def main() -> None:
             wire,
             ids,
             "get_table_stats",
-            {"super_name": super_name, "organization": org, "table": args.stats_table, "user_hash": user_hash},
+            {"super_name": super_name, "organization": org, "table": args.stats_table, "role": user_hash},
             auth_token=auth_token,
         )
         pretty("tools/call get_table_stats", st_resp)
@@ -688,7 +665,7 @@ def main() -> None:
             wire,
             ids,
             "get_super_meta",
-            {"super_name": super_name, "organization": org, "user_hash": user_hash},
+            {"super_name": super_name, "organization": org, "role": user_hash},
             auth_token=auth_token,
         )
         pretty("tools/call get_super_meta", gm_resp)

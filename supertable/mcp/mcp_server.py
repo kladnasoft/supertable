@@ -3,13 +3,17 @@
 mcp/mcp_server.py — Supertable MCP server (simple, robust, production-ready)
 
 Key points:
-- Strict input validation (org/super/table/user_hash).
+- Strict input validation (org/super/table/role).
 - Read-only SQL enforcement.
 - Clear, consistent envelopes for all tools (errors included).
 - Concurrency limiting + per-request timeout with AnyIO.
 - Minimal but structured INFO logs for observability.
 - Correct integration with MetaReader (get_tables, get_table_schema, get_table_stats, get_super_meta)
   and module-level list_supers/list_tables + DataReader.query_sql.
+
+The external MCP parameter is ``role`` (RBAC role name or role ID).
+Internally the codebase passes this as ``role_name`` to restrict_read_access /
+check_write_access / DataReader.execute.
 """
 
 from __future__ import annotations
@@ -106,7 +110,7 @@ def _ensure_imports():
 
 # ---------- Helpers ----------
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-USER_HASH_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
+ROLE_RE = SAFE_ID_RE
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -182,11 +186,12 @@ def _serve_streamable_http_via_uvicorn(*, mcp: FastMCP, host: str, port: int, pa
 def _env_transport(name: str, default: str = "stdio") -> str:
     return _normalize_transport_value(os.getenv(name), default=default)
 
-def _env_hashes(name: str) -> Optional[Set[str]]:
+def _env_set(name: str) -> Optional[Set[str]]:
+    """Parse a comma-separated env var into a set of stripped strings."""
     v = (os.getenv(name) or "").strip()
     if not v:
         return None
-    return {s.strip().lower() for s in v.split(",") if s.strip()}
+    return {s.strip() for s in v.split(",") if s.strip()}
 
 def _safe_id(x: str, field: str) -> str:
     if (
@@ -199,10 +204,14 @@ def _safe_id(x: str, field: str) -> str:
         raise ValueError(f"Invalid {field}: {x!r}")
     return x
 
-def _validate_user_hash(u: str) -> str:
-    if not isinstance(u, str) or not USER_HASH_RE.match(u):
-        raise ValueError("Invalid user_hash format (expect 32/64 hex).")
-    return u.lower()
+def _validate_role(r: str) -> str:
+    """Validate a role identifier (role name or role ID)."""
+    if not isinstance(r, str) or not r.strip():
+        raise ValueError("Invalid role: must be a non-empty string.")
+    r = r.strip()
+    if not ROLE_RE.match(r):
+        raise ValueError(f"Invalid role format: {r!r} (allowed: alphanumeric, underscore, dot, dash; max 128 chars).")
+    return r
 
 _FORBIDDEN_SQL_RE = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b",
@@ -231,17 +240,17 @@ def _summarize_rows(rows: List[List[Any]], head_n: int = 3) -> str:
 @dataclass(frozen=True)
 class Config:
     name: str = "supertable-mcp"
-    version: str = "1.2.0"
+    version: str = "1.3.0"
     default_engine: str = os.getenv("SUPERTABLE_DEFAULT_ENGINE", "AUTO")
     default_limit: int = int(os.getenv("SUPERTABLE_DEFAULT_LIMIT", "200"))
     max_limit: int = int(os.getenv("SUPERTABLE_MAX_LIMIT", "5000"))
     default_query_timeout_sec: float = float(os.getenv("SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC", "60"))
     max_concurrency: int = int(os.getenv("SUPERTABLE_MAX_CONCURRENCY", "6"))
-    require_explicit_user_hash: bool = _env_bool("SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH", True)
-    allowed_user_hashes: Optional[Set[str]] = field(default_factory=lambda: _env_hashes("SUPERTABLE_ALLOWED_USER_HASHES"))
+    require_explicit_role: bool = _env_bool("SUPERTABLE_REQUIRE_EXPLICIT_ROLE", True)
+    allowed_roles: Optional[Set[str]] = field(default_factory=lambda: _env_set("SUPERTABLE_ALLOWED_ROLES"))
     allow_sysadmin_default: bool = _env_bool("SUPERTABLE_ALLOW_SYSADMIN_DEFAULT", False)
     require_token: bool = _env_bool("SUPERTABLE_REQUIRE_TOKEN", True)
-    shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", ""))
+    shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", "")
     transport: str = _env_transport("SUPERTABLE_MCP_TRANSPORT", "stdio")
     http_host: str = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
     http_port: int = int(os.getenv("SUPERTABLE_MCP_PORT", "8000"))
@@ -281,21 +290,24 @@ def _check_token(auth_token: Optional[str]) -> None:
     if not hmac.compare_digest(token, CFG.shared_token):
         raise PermissionError("auth_token invalid.")
 
-def _allowed_user_hash(u: str) -> bool:
-    return CFG.allowed_user_hashes is None or u.lower() in CFG.allowed_user_hashes
+def _allowed_role(r: str) -> bool:
+    return CFG.allowed_roles is None or r in CFG.allowed_roles
 
-def _resolve_user(user_hash: Optional[str]) -> str:
-    if CFG.require_explicit_user_hash:
-        if not user_hash:
-            raise PermissionError("user_hash is required by server policy.")
-        u = _validate_user_hash(user_hash)
-        if not _allowed_user_hash(u):
-            raise PermissionError("user_hash not permitted by server policy.")
-        return u
-    u = user_hash or os.getenv("SUPERTABLE_SUPERHASH") or os.getenv("SUPERTABLE_TEST_USER_HASH") or ""
-    if not u:
-        raise PermissionError("user_hash missing and no default configured.")
-    return _validate_user_hash(u)
+def _resolve_role(role: Optional[str]) -> str:
+    """Resolve and validate a role identifier."""
+    r = (role or "").strip()
+    if CFG.require_explicit_role:
+        if not r:
+            raise PermissionError("role is required by server policy.")
+        r = _validate_role(r)
+        if not _allowed_role(r):
+            raise PermissionError("role not permitted by server policy.")
+        return r
+    if not r:
+        r = (os.getenv("SUPERTABLE_ROLE") or "").strip()
+    if not r:
+        raise PermissionError("role missing and no default configured.")
+    return _validate_role(r)
 
 def _resolve_engine(engine_name: Optional[str]):
     name = (engine_name or CFG.default_engine or "AUTO").upper()
@@ -381,7 +393,7 @@ async def info() -> Dict[str, Any]:
             "default_limit": CFG.default_limit,
             "max_limit": CFG.max_limit,
             "default_query_timeout_sec": CFG.default_query_timeout_sec,
-            "require_explicit_user_hash": CFG.require_explicit_user_hash,
+            "require_explicit_role": CFG.require_explicit_role,
             "allow_sysadmin_default": CFG.allow_sysadmin_default,
             "require_token": CFG.require_token,
         }
@@ -389,17 +401,17 @@ async def info() -> Dict[str, Any]:
 
 @mcp.tool()
 @log_tool
-async def whoami(user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def whoami(role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
-    return {"result": {"user_hash": u}}
+    r = _resolve_role(role)
+    return {"result": {"role": r}}
 
 @mcp.tool()
 @log_tool
-async def list_supers(organization: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def list_supers(organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     _check_token(auth_token)
-    _resolve_user(user_hash)
+    _resolve_role(role)
     _ensure_imports()
 
     def _work():
@@ -415,16 +427,16 @@ async def list_supers(organization: str, user_hash: Optional[str] = None, auth_t
 
 @mcp.tool()
 @log_tool
-async def list_tables(super_name: str, organization: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def list_tables(super_name: str, organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
+    r = _resolve_role(role)
     _ensure_imports()
 
     def _work():
-        reader = MetaReader(super_name=sup, organization=org)  # class helper  :contentReference[oaicite:5]{index=5}
-        return list(reader.get_tables(user_hash=u))            # correct method: get_tables
+        reader = MetaReader(super_name=sup, organization=org)
+        return list(reader.get_tables(user_hash=r))
 
     async with _get_limiter():
         tables = await anyio.to_thread.run_sync(_work)
@@ -432,17 +444,17 @@ async def list_tables(super_name: str, organization: str, user_hash: Optional[st
 
 @mcp.tool()
 @log_tool
-async def describe_table(super_name: str, organization: str, table: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def describe_table(super_name: str, organization: str, table: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
+    r = _resolve_role(role)
     _ensure_imports()
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_table_schema(tbl, user_hash=u)
+        return reader.get_table_schema(tbl, user_hash=r)
 
     async with _get_limiter():
         schema = await anyio.to_thread.run_sync(_work)
@@ -450,17 +462,17 @@ async def describe_table(super_name: str, organization: str, table: str, user_ha
 
 @mcp.tool()
 @log_tool
-async def get_table_stats(super_name: str, organization: str, table: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def get_table_stats(super_name: str, organization: str, table: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
+    r = _resolve_role(role)
     _ensure_imports()
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_table_stats(tbl, user_hash=u)
+        return reader.get_table_stats(tbl, user_hash=r)
 
     async with _get_limiter():
         stats = await anyio.to_thread.run_sync(_work)
@@ -468,25 +480,25 @@ async def get_table_stats(super_name: str, organization: str, table: str, user_h
 
 @mcp.tool()
 @log_tool
-async def get_super_meta(super_name: str, organization: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
+async def get_super_meta(super_name: str, organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
+    r = _resolve_role(role)
     _ensure_imports()
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_super_meta(user_hash=u)
+        return reader.get_super_meta(user_hash=r)
 
     async with _get_limiter():
         meta = await anyio.to_thread.run_sync(_work)
     return {"result": meta}
 
-def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int, eng: Any, user_hash: str) -> Dict[str, Any]:
+def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int, eng: Any, role_name: str) -> Dict[str, Any]:
     """
     Runs the module-level query_sql and enforces `limit` server-side (slice rows)
-    to keep the server robust even if downstream ignores it. :contentReference[oaicite:6]{index=6}
+    to keep the server robust even if downstream ignores it.
     """
     _ensure_imports()
     t0 = time.perf_counter()
@@ -498,7 +510,7 @@ def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int,
         sql=sql,
         limit=limit_n,
         engine=eng,
-        user_hash=user_hash,
+        user_hash=role_name,
     )
 
     # Enforce limit here (in case downstream didn't)
@@ -526,13 +538,13 @@ async def query_sql(
     limit: Optional[int] = None,
     engine: Optional[str] = None,
     query_timeout_sec: Optional[float] = None,
-    user_hash: Optional[str] = None,
+    role: Optional[str] = None,
     auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     _check_token(auth_token)
-    u = _resolve_user(user_hash)
+    r = _resolve_role(role)
     _read_only_sql(sql)
 
     limit_n = _clamp_limit(limit, CFG.default_limit, CFG.max_limit)
@@ -542,7 +554,7 @@ async def query_sql(
     async with _get_limiter():
         try:
             def _work():
-                return _exec_query_sync(sup, org, sql, limit_n, eng, u)
+                return _exec_query_sync(sup, org, sql, limit_n, eng, r)
 
             if hasattr(anyio, "fail_after"):
                 with anyio.fail_after(timeout):
@@ -582,15 +594,60 @@ async def query_sql(
 
     return out
 
+@mcp.tool()
+@log_tool
+async def sample_data(
+    super_name: str,
+    organization: str,
+    table: str,
+    limit: Optional[int] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a small sample from a table.  Equivalent to SELECT * FROM "table" LIMIT N.
+
+    This is a convenience shortcut for LLM agents that need to preview data
+    without constructing SQL.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    tbl = _safe_id(table, "table")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+
+    limit_n = _clamp_limit(limit, 10, CFG.max_limit)
+    eng = _resolve_engine(None)
+    sql = f'SELECT * FROM "{tbl}" LIMIT {limit_n}'
+
+    async with _get_limiter():
+        try:
+            def _work():
+                return _exec_query_sync(sup, org, sql, limit_n, eng, r)
+            out = await anyio.to_thread.run_sync(_work)
+        except Exception as exc:
+            logger.exception("sample_data failed: %s", exc)
+            return {
+                "columns": [],
+                "rows": [],
+                "rowcount": 0,
+                "limit_applied": limit_n,
+                "engine": getattr(eng, "name", str(eng)),
+                "elapsed_ms": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+                "columns_meta": [],
+            }
+    return out
+
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
     try:
         transport = _normalize_transport_value(getattr(CFG, "transport", "stdio"))
         logger.info(
-            "Starting MCP server. transport=%s max_concurrency=%d require_explicit_user_hash=%s require_token=%s",
+            "Starting MCP server. transport=%s max_concurrency=%d require_explicit_role=%s require_token=%s",
             transport,
             CFG.max_concurrency,
-            str(CFG.require_explicit_user_hash),
+            str(CFG.require_explicit_role),
             str(CFG.require_token),
         )
         if CFG.require_token and not (CFG.shared_token or "").strip():

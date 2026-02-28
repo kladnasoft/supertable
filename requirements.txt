@@ -37,7 +37,14 @@ mcp>=1.1.0
 # -------- WebSocket server (notebook + spark_plug) --------
 websockets>=12.0,<14.0
 
+# -------- Spark Thrift Server (PyHive connects to HiveServer2) --------
+pyhive>=0.7,<1.0
+thrift>=0.16,<1.0
+pure-sasl>=0.6,<1.0     # pure-Python SASL (no C dependency)
+
 # NOTE:
 # • Using uvicorn[standard] adds uvloop, httptools, watchfiles for better perf/dev.
 # • Ranges chosen to stay friendly with python:3.11-slim in Docker.
 # • You can drop boto3 if you only use MinIO with the MinIO client.
+# • pyhive + thrift + pure-sasl are only needed if using the Spark engine.
+#   They have no C dependencies (pure-sasl replaces the sasl C library).

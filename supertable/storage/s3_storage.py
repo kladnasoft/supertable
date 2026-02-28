@@ -80,16 +80,11 @@ class S3Storage(StorageInterface):
     @classmethod
     def from_env(cls) -> "S3Storage":
         bucket = os.getenv("STORAGE_BUCKET") or "supertable"
-        region = (
-                os.getenv("STORAGE_REGION")
-                or os.getenv("AWS_DEFAULT_REGION")
-                or os.getenv("AWS_REGION")
-                or None
-        )
+        region = os.getenv("STORAGE_REGION") or None
         endpoint = os.getenv("STORAGE_ENDPOINT_URL") or None
-        access_key = os.getenv("STORAGE_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID") or None
-        secret_key = os.getenv("STORAGE_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY") or None
-        session_token = os.getenv("AWS_SESSION_TOKEN") or None
+        access_key = os.getenv("STORAGE_ACCESS_KEY") or None
+        secret_key = os.getenv("STORAGE_SECRET_KEY") or None
+        session_token = os.getenv("STORAGE_SESSION_TOKEN") or None
 
         force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
         url_style = "path" if force_path_style else "vhost"

@@ -35,13 +35,15 @@ class SuperPipe:
         try:
             return fn()
         finally:
-            # Simple release
-            current_val = self.catalog.r.get(lock_key)
-            if current_val:
-                # Handle both str (decoded) and bytes based on Redis connection options
-                val_str = current_val.decode() if isinstance(current_val, bytes) else current_val
-                if val_str == token:
-                    self.catalog.r.delete(lock_key)
+            # Atomic release via Lua script (compare-and-delete)
+            lua = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+            """
+            self.catalog.r.eval(lua, 1, lock_key, token)
 
     def create(self, *, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
                enabled: bool = True) -> str:

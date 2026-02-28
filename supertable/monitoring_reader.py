@@ -9,8 +9,8 @@ import duckdb
 import pandas as pd
 
 from supertable.storage.storage_factory import get_storage
-from supertable.execute_duckdb import DuckDBExecutor
-from supertable.data_estimator import DataEstimator
+from supertable.engine.duckdb_transient import DuckDBExecutor
+from supertable.engine.data_estimator import DataEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -161,13 +161,9 @@ class MonitoringReader:
                 # If parsing fails, fall back to including.
                 pass
 
-            # Avoid hard failures on stale catalogs
-            try:
-                if not self.storage.exists(key):
-                    logger.warning("[monitoring_reader] parquet missing (skipped): %s", key)
-                    continue
-            except Exception as e:
-                logger.warning("[monitoring_reader] exists check failed (including anyway) for %s: %s", key, e)
+            # Note: we intentionally do NOT check storage.exists() per key here
+            # to avoid N+1 HEAD requests. DuckDB's parquet_scan with union_by_name=TRUE
+            # will skip missing files or raise an error handled by the caller's fallback.
 
             keys.append(key)
 

@@ -90,7 +90,7 @@ async def _startup() -> None:
     if _client is None:
         _client = MCPWebClient(
             server_path=os.getenv("MCP_SERVER_PATH"),
-            auth_token=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", os.getenv("SUPERTABLE_MCP_TOKEN", "")),
+            auth_token=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", ""),
         )
         await _client.start()
 
@@ -146,21 +146,22 @@ async def home(req: Request) -> str:
       <label>super_name</label>
       <input id="super" placeholder="example"/>
 
-      <label>user_hash</label>
-      <input id="hash" placeholder="32/64 hex"/>
+      <label>role <span class="muted">(RBAC role name or ID)</span></label>
+      <input id="role" placeholder="role name or UUID"/>
 
       <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/list_supers', {organization: val('org'), user_hash: val('hash')})">list_supers</button>
-        <button onclick="postJson('/api/list_tables', {organization: val('org'), super_name: val('super'), user_hash: val('hash')})">list_tables</button>
+        <button onclick="postJson('/api/list_supers', {organization: val('org'), role: val('role')})">list_supers</button>
+        <button onclick="postJson('/api/list_tables', {organization: val('org'), super_name: val('super'), role: val('role')})">list_tables</button>
       </div>
 
       <label style="margin-top: 12px;">table</label>
       <input id="table" placeholder="facts"/>
 
       <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/describe_table', {organization: val('org'), super_name: val('super'), table: val('table'), user_hash: val('hash')})">describe_table</button>
-        <button onclick="postJson('/api/get_table_stats', {organization: val('org'), super_name: val('super'), table: val('table'), user_hash: val('hash')})">get_table_stats</button>
-        <button onclick="postJson('/api/get_super_meta', {organization: val('org'), super_name: val('super'), user_hash: val('hash')})">get_super_meta</button>
+        <button onclick="postJson('/api/describe_table', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">describe_table</button>
+        <button onclick="postJson('/api/get_table_stats', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">get_table_stats</button>
+        <button onclick="postJson('/api/get_super_meta', {organization: val('org'), super_name: val('super'), role: val('role')})">get_super_meta</button>
+        <button onclick="postJson('/api/sample_data', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">sample_data</button>
       </div>
 
       <label style="margin-top: 12px;">sql</label>
@@ -177,7 +178,7 @@ async def home(req: Request) -> str:
           organization: val('org'),
           super_name: val('super'),
           sql: val('sql'),
-          user_hash: val('hash'),
+          role: val('role'),
           limit: numOrNull('limit'),
           engine: val('engine'),
           query_timeout_sec: numOrNull('timeout')
@@ -248,7 +249,7 @@ async def mcp_http_gateway_v1(req: Request, payload: Dict[str, Any] = Body(...))
 
     Headers supported:
       - Authorization: Bearer <token>  (optional gateway auth; see env vars)
-      - X-User-Hash: <hash>            (optional convenience injection)
+      - X-Role: <role>                 (optional convenience injection)
 
     Env vars:
       - SUPERTABLE_MCP_HTTP_REQUIRE_TOKEN=true|false (default false)
@@ -270,17 +271,17 @@ async def mcp_http_gateway_v1(req: Request, payload: Dict[str, Any] = Body(...))
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="JSON-RPC params must be an object")
 
-    # Convenience: inject auth_token and user_hash from headers for tools/call requests.
+    # Convenience: inject auth_token and role from headers for tools/call requests.
     # - Authorization: Bearer <token>  -> tool auth_token (if not provided)
-    # - X-User-Hash: <hash>            -> tool user_hash (if not provided)
+    # - X-Role: <value>                 -> tool role (if not provided)
     bearer = _parse_bearer(req.headers.get("authorization", ""))
-    header_user_hash = (req.headers.get("x-user-hash") or "").strip()
+    header_role = (req.headers.get("x-role") or "").strip()
     if method == "tools/call" and isinstance(params.get("arguments"), dict):
         args = params["arguments"]
         if bearer and not args.get("auth_token"):
             args["auth_token"] = bearer
-        if header_user_hash and not args.get("user_hash"):
-            args["user_hash"] = header_user_hash
+        if header_role:
+            args["role"] = header_role
 
     c = _client_or_raise()
     try:
@@ -349,16 +350,16 @@ async def mcp_http_gateway(req: Request, body: Dict[str, Any] = Body(...)) -> JS
 
     # Optional header-based injection so Claude can authenticate without embedding secrets in prompts.
     # - Authorization: Bearer <token>  -> tool auth_token (if not provided)
-    # - X-User-Hash: <hash>            -> tool user_hash (if not provided)
+    # - X-Role: <value>                 -> tool role (if not provided)
     bearer = _parse_bearer(req.headers.get("authorization", ""))
-    header_user_hash = (req.headers.get("x-user-hash") or req.headers.get("x_supertable_user_hash") or "").strip()
+    header_role = (req.headers.get("x-role") or "").strip()
 
     if method == "tools/call" and isinstance(params.get("arguments"), dict):
         args = params["arguments"]
         if bearer and not args.get("auth_token"):
             args["auth_token"] = bearer
-        if header_user_hash and not args.get("user_hash"):
-            args["user_hash"] = header_user_hash
+        if header_role:
+            args["role"] = header_role
 
     c = _client_or_raise()
     # Preserve Claude's ids (may be string) while still using integer ids on the stdio side.
@@ -370,11 +371,11 @@ async def mcp_http_gateway(req: Request, body: Dict[str, Any] = Body(...)) -> JS
 async def api_list_supers(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
     if not org:
         raise HTTPException(status_code=400, detail="organization required")
     c = _client_or_raise()
-    resp = await c.tool("list_supers", {"organization": org, "user_hash": u})
+    resp = await c.tool("list_supers", {"organization": org, "role": r})
     return JSONResponse(resp)
 
 @app.post("/api/list_tables")
@@ -382,11 +383,11 @@ async def api_list_tables(req: Request, payload: Dict[str, Any] = Body(...)) -> 
     _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
     if not org or not sup:
         raise HTTPException(status_code=400, detail="organization and super_name required")
     c = _client_or_raise()
-    resp = await c.tool("list_tables", {"organization": org, "super_name": sup, "user_hash": u})
+    resp = await c.tool("list_tables", {"organization": org, "super_name": sup, "role": r})
     return JSONResponse(resp)
 
 @app.post("/api/describe_table")
@@ -395,11 +396,11 @@ async def api_describe_table(req: Request, payload: Dict[str, Any] = Body(...)) 
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     tbl = (payload.get("table") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
     if not org or not sup or not tbl:
         raise HTTPException(status_code=400, detail="organization, super_name, table required")
     c = _client_or_raise()
-    resp = await c.tool("describe_table", {"organization": org, "super_name": sup, "table": tbl, "user_hash": u})
+    resp = await c.tool("describe_table", {"organization": org, "super_name": sup, "table": tbl, "role": r})
     return JSONResponse(resp)
 
 @app.post("/api/get_table_stats")
@@ -408,11 +409,11 @@ async def api_get_table_stats(req: Request, payload: Dict[str, Any] = Body(...))
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     tbl = (payload.get("table") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
     if not org or not sup or not tbl:
         raise HTTPException(status_code=400, detail="organization, super_name, table required")
     c = _client_or_raise()
-    resp = await c.tool("get_table_stats", {"organization": org, "super_name": sup, "table": tbl, "user_hash": u})
+    resp = await c.tool("get_table_stats", {"organization": org, "super_name": sup, "table": tbl, "role": r})
     return JSONResponse(resp)
 
 @app.post("/api/get_super_meta")
@@ -420,11 +421,27 @@ async def api_get_super_meta(req: Request, payload: Dict[str, Any] = Body(...)) 
     _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
     if not org or not sup:
         raise HTTPException(status_code=400, detail="organization and super_name required")
     c = _client_or_raise()
-    resp = await c.tool("get_super_meta", {"organization": org, "super_name": sup, "user_hash": u})
+    resp = await c.tool("get_super_meta", {"organization": org, "super_name": sup, "role": r})
+    return JSONResponse(resp)
+
+@app.post("/api/sample_data")
+async def api_sample_data(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    _require_gateway_auth(req)
+    org = (payload.get("organization") or "").strip()
+    sup = (payload.get("super_name") or "").strip()
+    tbl = (payload.get("table") or "").strip()
+    r = (payload.get("role") or "").strip()
+    if not org or not sup or not tbl:
+        raise HTTPException(status_code=400, detail="organization, super_name, table required")
+    args: Dict[str, Any] = {"organization": org, "super_name": sup, "table": tbl, "role": r}
+    if payload.get("limit") is not None:
+        args["limit"] = payload["limit"]
+    c = _client_or_raise()
+    resp = await c.tool("sample_data", args)
     return JSONResponse(resp)
 
 @app.post("/api/query_sql")
@@ -433,12 +450,12 @@ async def api_query_sql(req: Request, payload: Dict[str, Any] = Body(...)) -> JS
     org = (payload.get("organization") or "").strip()
     sup = (payload.get("super_name") or "").strip()
     sql = (payload.get("sql") or "").strip()
-    u = (payload.get("user_hash") or "").strip()
+    r = (payload.get("role") or "").strip()
 
     if not org or not sup or not sql:
         raise HTTPException(status_code=400, detail="organization, super_name, sql required")
 
-    args: Dict[str, Any] = {"organization": org, "super_name": sup, "sql": sql, "user_hash": u}
+    args: Dict[str, Any] = {"organization": org, "super_name": sup, "sql": sql, "role": r}
     if payload.get("limit") is not None:
         args["limit"] = payload["limit"]
     if payload.get("engine"):

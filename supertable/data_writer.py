@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 
 import polars
@@ -86,7 +86,7 @@ class DataWriter:
 
             # --- Read last snapshot (via leaf pointer) ------------------------
             simple_table = SimpleTable(self.super_table, simple_name)
-            last_simple_table, _ = simple_table.get_simple_table_snapshot()
+            last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             mark("snapshot")
 
             # --- Detect overlaps ----------------------------------------------
@@ -94,6 +94,10 @@ class DataWriter:
                 last_simple_table, dataframe, overwrite_columns, locking=None
             )
             mark("overlap")
+
+            # File cache: populated by newer-than filtering, reused by process step
+            # to avoid double-reading overlapping parquet files from storage.
+            file_cache = {}
 
             # --- Newer-than filtering (skip stale/replayed rows) ---------------
             if newer_than and overwrite_columns:
@@ -103,6 +107,7 @@ class DataWriter:
                     overlapping_files=overlapping_files,
                     overwrite_columns=overwrite_columns,
                     newer_than_col=newer_than,
+                    file_cache=file_cache,
                 )
                 skipped = pre_filter_count - dataframe.height
                 if skipped > 0:
@@ -112,6 +117,23 @@ class DataWriter:
                     mark("newer_than")
                     total_columns = dataframe.width
                     result_tuple = (total_columns, 0, 0, 0)
+                    stats_payload = {
+                        "query_id": qid,
+                        "recorded_at": datetime.now(timezone.utc).isoformat(),
+                        "super_name": self.super_table.super_name,
+                        "table_name": simple_name,
+                        "overwrite_columns": overwrite_columns,
+                        "newer_than": newer_than,
+                        "delete_only": delete_only,
+                        "inserted": 0,
+                        "deleted": 0,
+                        "total_rows": 0,
+                        "total_columns": total_columns,
+                        "new_resources": 0,
+                        "sunset_files": 0,
+                        "duration": round(time.time() - t0, 6),
+                        "skipped_stale": skipped,
+                    }
                     return result_tuple
                 mark("newer_than")
 
@@ -123,6 +145,7 @@ class DataWriter:
                     overwrite_columns,
                     simple_table.data_dir,
                     compression_level,
+                    file_cache=file_cache,
                 )
             else:
                 inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
@@ -131,17 +154,20 @@ class DataWriter:
                     overwrite_columns,
                     simple_table.data_dir,
                     compression_level,
+                    file_cache=file_cache,
                 )
             mark("process")
 
             # --- Update snapshot on storage -----------------------------------
             new_snapshot_dict, new_snapshot_path = simple_table.update(
-                new_resources, sunset_files, dataframe
+                new_resources, sunset_files, dataframe,
+                last_snapshot=last_simple_table,
+                last_snapshot_path=last_simple_table_path,
             )
             mark("update_simple")
 
             # --- CAS set leaf pointer + atomic root bump ----------------------
-            now_ms = int(datetime.now().timestamp() * 1000)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             payload = new_snapshot_dict
 
             try:
@@ -180,7 +206,7 @@ class DataWriter:
             # Prepare monitoring payload (NOT writing, only enqueue later)
             stats_payload = {
                 "query_id": qid,
-                "recorded_at": datetime.utcnow().isoformat(),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
                 "super_name": self.super_table.super_name,
                 "table_name": simple_name,               # partitioning by table_name in monitor
                 "overwrite_columns": overwrite_columns,
@@ -253,10 +279,10 @@ class DataWriter:
                 f"Invalid table name: '{simple_name}'. "
                 "Table names must start with a letter/underscore and contain only alphanumeric/underscore characters."
             )
-        if overwrite_columns and not all(col in dataframe.columns for col in overwrite_columns):
-            raise ValueError("Some overwrite columns are not present in the dataset")
         if isinstance(overwrite_columns, str):
             raise ValueError("overwrite columns must be list")
+        if overwrite_columns and not all(col in dataframe.columns for col in overwrite_columns):
+            raise ValueError("Some overwrite columns are not present in the dataset")
         if delete_only and not overwrite_columns:
             raise ValueError("delete_only requires overwrite_columns to identify rows to delete")
         if newer_than is not None:

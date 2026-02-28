@@ -16,11 +16,11 @@ from supertable.utils.timer import Timer
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.plan_extender import extend_execution_plan
-from supertable.plan_stats import PlanStats
+from supertable.engine.plan_stats import PlanStats
 from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 
-from supertable.data_estimator import DataEstimator
-from supertable.executor import Executor, Engine as _Engine
+from supertable.engine.data_estimator import DataEstimator
+from supertable.engine.executor import Executor, Engine as _Engine
 from supertable.data_classes import TableDefinition
 
 
@@ -33,6 +33,8 @@ class Status(Enum):
 class engine(Enum):  # noqa: N801
     AUTO = _Engine.AUTO.value
     DUCKDB = _Engine.DUCKDB.value
+    DUCKDB_TRANSIENT = _Engine.DUCKDB_TRANSIENT.value
+    DUCKDB_PINNED = _Engine.DUCKDB_PINNED.value
     SPARK = _Engine.SPARK.value
 
     def to_internal(self) -> _Engine:
@@ -191,7 +193,7 @@ def query_sql(
 
     # Execute the query
     result_df, status, message = reader.execute(
-        user_hash=user_hash,
+        role_name=user_hash,
         engine=engine,
         with_scan=False,
     )

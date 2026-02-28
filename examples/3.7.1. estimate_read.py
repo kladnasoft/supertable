@@ -1,5 +1,5 @@
 from supertable.data_classes import Reflection
-from supertable.data_estimator import DataEstimator
+from supertable.engine.data_estimator import DataEstimator
 from examples.defaults import super_name, user_hash, simple_name, organization
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface

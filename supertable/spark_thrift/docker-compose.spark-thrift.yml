@@ -1,0 +1,93 @@
+# docker-compose.spark-thrift.yml
+
+x-spark-common: &spark-common
+  image: docker.io/bitnamilegacy/spark:3.5
+  environment: &spark-env
+    SPARK_MODE: worker
+    SPARK_MASTER_URL: spark://spark-master:7077
+    SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
+    SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+    SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+    SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+    SPARK_SSL_ENABLED: "no"
+    SPARK_USER: spark
+  networks:
+    - supertable-net
+
+services:
+
+  spark-master:
+    image: docker.io/bitnamilegacy/spark:3.5
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+      SPARK_USER: spark
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT:-8180}:8080"
+      - "7077:7077"
+    networks:
+      - supertable-net
+
+  spark-worker:
+    <<: *spark-common
+    depends_on:
+      - spark-master
+
+  spark-thrift:
+    image: docker.io/bitnamilegacy/spark:3.5
+    container_name: spark-thrift
+    user: root
+    depends_on:
+      - spark-master
+    ports:
+      - "${SPARK_THRIFT_PORT:-10000}:10000"
+      - "${SPARK_THRIFT_WEBUI_PORT:-4040}:4040"
+    volumes:
+      - spark-warehouse:/opt/spark/warehouse
+    networks:
+      - supertable-net
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Wait for master to be ready
+        echo "Waiting for Spark master..."
+        while ! (echo > /dev/tcp/spark-master/7077) 2>/dev/null; do sleep 2; done
+        echo "Spark master is up."
+
+        # Start the Thrift Server directly (foreground via --class)
+        /opt/bitnami/spark/bin/spark-submit \
+          --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 \
+          --name "Thrift JDBC/ODBC Server" \
+          --master spark://spark-master:7077 \
+          --conf "spark.sql.warehouse.dir=/opt/spark/warehouse" \
+          --conf "spark.sql.caseSensitive=false" \
+          --conf "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem" \
+          --conf "spark.hadoop.fs.s3a.endpoint=${STORAGE_ENDPOINT_URL:-http://minio:9000}" \
+          --conf "spark.hadoop.fs.s3a.access.key=${STORAGE_ACCESS_KEY:-minioadmin}" \
+          --conf "spark.hadoop.fs.s3a.secret.key=${STORAGE_SECRET_KEY:-minioadmin}" \
+          --conf "spark.hadoop.fs.s3a.path.style.access=${STORAGE_FORCE_PATH_STYLE:-true}" \
+          --conf "spark.hadoop.fs.s3a.connection.ssl.enabled=${STORAGE_USE_SSL:-false}" \
+          --conf "spark.hadoop.fs.s3a.endpoint.region=${STORAGE_REGION:-us-east-1}" \
+          --conf "spark.driver.memory=${SPARK_THRIFT_DRIVER_MEMORY:-2g}" \
+          --conf "spark.executor.memory=${SPARK_THRIFT_EXECUTOR_MEMORY:-2g}" \
+          --conf "spark.driver.extraJavaOptions=-Dderby.system.home=/opt/spark/warehouse/metastore" \
+          --hiveconf hive.server2.thrift.port=10000 \
+          --hiveconf hive.server2.thrift.bind.host=0.0.0.0
+
+volumes:
+  spark-warehouse:
+    driver: local
+
+networks:
+  supertable-net:
+    name: supertable-net
+    external: true

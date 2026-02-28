@@ -228,13 +228,20 @@ class SimpleTable:
         data = self.storage.read_json(path)
         return data, path
 
-    def update(self, new_resources, sunset_files, model_df):
+    def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None):
         """
         Build and write a new heavy snapshot on storage.
         Returns: (snapshot_dict, snapshot_path)
+
+        If last_snapshot and last_snapshot_path are provided, skips the redundant
+        snapshot read (caller already holds the data under lock).
         """
-        # Read current snapshot
-        last_simple_table, last_simple_table_path = self.get_simple_table_snapshot()
+        if last_snapshot is not None and last_snapshot_path is not None:
+            last_simple_table = last_snapshot
+            last_simple_table_path = last_snapshot_path
+        else:
+            # Fallback: read current snapshot (backward compatible)
+            last_simple_table, last_simple_table_path = self.get_simple_table_snapshot()
 
         current_resources = last_simple_table.get("resources", [])
         updated_resources = [res for res in current_resources if res.get("file") not in set(sunset_files)]
