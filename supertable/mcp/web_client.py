@@ -13,6 +13,7 @@ load_dotenv()
 
 _AUTH_TOOLS = {
     "whoami",
+    "list_supers",
     "list_tables",
     "describe_table",
     "get_table_stats",

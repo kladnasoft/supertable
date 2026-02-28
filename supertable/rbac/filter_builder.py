@@ -13,55 +13,52 @@ class FilterBuilder():
 
     def json_to_sql_clause(self, json_obj):
         if isinstance(json_obj, list):
-            return "".join([self.json_to_sql_clause(item) for item in json_obj])
+            parts = []
+            for item in json_obj:
+                part = self.json_to_sql_clause(item)
+                if part:
+                    parts.append(part)
+            return " AND ".join(parts)
         elif isinstance(json_obj, dict):
             clauses = []
             for key, val in json_obj.items():
-                if key in ["AND", "OR"]:
-                    nested_clauses = f" {key} ".join(
-                        [f"({self.json_to_sql_clause(nested_item)})" for nested_item in val]
-                    )
-                    clauses.append(nested_clauses)
+                if key in ("AND", "OR"):
+                    nested = [f"({self.json_to_sql_clause(item)})" for item in val]
+                    clauses.append(f" {key} ".join(nested))
                 elif key == "NOT":
-                    nested_clause = f"NOT ({self.json_to_sql_clause(val)})"
-                    clauses.append(nested_clause)
+                    clauses.append(f"NOT ({self.json_to_sql_clause(val)})")
                 elif "range" in val:
-                    range_clauses = " AND ".join(
-                        [
-                            (
-                                f"{key} {cond['operation']} '{cond['value']}'"
-                                if cond["type"] == "value"
-                                else f"{key} {cond['operation']} {cond['value']}"
-                            )
-                            for cond in val["range"]
-                        ]
-                    )
-                    clauses.append(range_clauses)
+                    range_parts = []
+                    for cond in val["range"]:
+                        if cond["type"] == "value":
+                            range_parts.append(f"{key} {cond['operation']} '{cond['value']}'")
+                        else:
+                            range_parts.append(f"{key} {cond['operation']} {cond['value']}")
+                    clauses.append(" AND ".join(range_parts))
                 else:
                     operation = val["operation"]
-                    escape_clause = ""
-                    if operation.upper() == "ILIKE" and "escape" in val:
-                        escape_clause = f" ESCAPE '{val['escape'] * 2}'"
-                    value = (
-                        f"'{val['value']}'{escape_clause}"
-                        if val["type"] == "value"
-                        else val["value"]
-                    )
-                    if val["type"] == "null":
+                    val_type = val["type"]
+                    if val_type == "null":
                         value = "NULL"
-                    clause = f"{key} {operation} {value}"
-                    clauses.append(clause)
-            return "".join(clauses)
+                    elif val_type == "value":
+                        escape_clause = ""
+                        if operation.upper() == "ILIKE" and "escape" in val:
+                            escape_clause = f" ESCAPE '{val['escape'] * 2}'"
+                        value = f"'{val['value']}'{escape_clause}"
+                    else:
+                        value = val["value"]
+                    clauses.append(f"{key} {operation} {value}")
+            return " AND ".join(clauses)
         else:
             return ""
 
     def build_filter_query(self, table_name, columns, filters):
         column_list = format_column_list(columns)
-        predicates = self.json_to_sql_clause(filters)
-        where_clause = f"\nWHERE {predicates}" if predicates else ""
 
-        query = f"""SELECT {column_list}
-FROM {table_name}{where_clause}"""
+        if filters == ["*"]:
+            where_clause = ""
+        else:
+            predicates = self.json_to_sql_clause(filters)
+            where_clause = f"\nWHERE {predicates}" if predicates else ""
 
-        return query
-
+        return f"SELECT {column_list}\nFROM {table_name}{where_clause}"

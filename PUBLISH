@@ -1,9 +1,0 @@
-NO_GIT=1 ./publish.sh 1.2.4
-# or, to skip tests explicitly:
-NO_GIT=1 ./publish.sh 1.2.4 --no-tests
-
-./publish.sh                # bumps to 1.2.0, builds, tests, uploads to PyPI
-./publish.sh 1.2.3          # same, but with version 1.2.3
-./publish.sh --testpypi     # uploads to TestPyPI (good for a dry run)
-NO_GIT=1 ./publish.sh       # skip git tag/push if you prefer
-SKIP_TESTS=1 ./publish.sh   # skip local install smoke test

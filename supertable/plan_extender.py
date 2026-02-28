@@ -28,7 +28,7 @@ def _safe_json(obj: Any) -> str:
 
 def extend_execution_plan(
     query_plan_manager: QueryPlanManager,
-    user_hash: str,
+    role_name: str,
     timing: Dict[str, float] | None,
     plan_stats: PlanStats,
     status: str,
@@ -75,7 +75,7 @@ def extend_execution_plan(
         stats = {
             "query_id": getattr(query_plan_manager, "query_id", ""),
             "query_hash": getattr(query_plan_manager, "query_hash", ""),
-            "user_hash": user_hash,
+            "role_name": role_name,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "table_name": getattr(query_plan_manager, "original_table", ""),
             "status": status,

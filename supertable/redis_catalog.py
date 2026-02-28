@@ -15,6 +15,7 @@ try:
 except ImportError:  # pragma: no cover
     from redis_connector import RedisConnector, RedisOptions
 
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -39,28 +40,78 @@ def _stat_lock_key(org: str, sup: str) -> str:
 def _mirrors_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:mirrors"
 
-def _users_key(org: str, sup: str) -> str:
-    return f"supertable:{org}:{sup}:meta:users:meta"
 
-def _roles_key(org: str, sup: str) -> str:
-    return f"supertable:{org}:{sup}:meta:roles:meta"
+# -- RBAC key helpers (UUID-based identity) -------------------------------- #
 
-def _user_hash_key(org: str, sup: str, user_hash: str) -> str:
-    return f"supertable:{org}:{sup}:meta:users:{user_hash}"
+def _rbac_user_meta_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:users:meta"
 
-def _role_hash_key(org: str, sup: str, role_hash: str) -> str:
-    return f"supertable:{org}:{sup}:meta:roles:{role_hash}"
 
-def _user_name_to_hash_key(org: str, sup: str) -> str:
-    return f"supertable:{org}:{sup}:meta:users:name_to_hash"
+def _rbac_user_index_key(org: str, sup: str) -> str:
+    """SET of all user_ids."""
+    return f"supertable:{org}:{sup}:rbac:users:index"
+
+
+def _rbac_user_doc_key(org: str, sup: str, user_id: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:users:doc:{user_id}"
+
+
+def _rbac_username_to_id_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:users:name_to_id"
+
+
+def _rbac_role_meta_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:roles:meta"
+
+
+def _rbac_role_index_key(org: str, sup: str) -> str:
+    """SET of all role_ids."""
+    return f"supertable:{org}:{sup}:rbac:roles:index"
+
+
+def _rbac_role_doc_key(org: str, sup: str, role_id: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:roles:doc:{role_id}"
+
+
+def _rbac_role_type_index_key(org: str, sup: str, role_type: str) -> str:
+    return f"supertable:{org}:{sup}:rbac:roles:type:{role_type}"
+
+
+def _rbac_rolename_to_id_key(org: str, sup: str) -> str:
+    """HASH mapping lowercase role_name → role_id."""
+    return f"supertable:{org}:{sup}:rbac:roles:name_to_id"
 
 
 def _auth_tokens_key(org: str) -> str:
     # Store hashed tokens (sha256) -> JSON metadata in a single Redis hash.
     # Value example: {"created_ms": 123, "created_by": "superuser", "label": "dev", "enabled": true}
     return f"supertable:{org}:auth:tokens"
+
+
+# Deprecated key helpers — kept for reference, no longer used by RBAC code.
+def _users_key(org: str, sup: str) -> str:
+    return _rbac_user_meta_key(org, sup)
+
+
+def _roles_key(org: str, sup: str) -> str:
+    return _rbac_role_meta_key(org, sup)
+
+
+def _user_hash_key(org: str, sup: str, user_hash: str) -> str:
+    return _rbac_user_doc_key(org, sup, user_hash)
+
+
+def _role_hash_key(org: str, sup: str, role_hash: str) -> str:
+    return _rbac_role_doc_key(org, sup, role_hash)
+
+
+def _user_name_to_hash_key(org: str, sup: str) -> str:
+    return _rbac_username_to_id_key(org, sup)
+
+
 def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
-    return f"supertable:{org}:{sup}:meta:roles:type_to_hash:{role_type}"
+    return _rbac_role_type_index_key(org, sup, role_type)
+
 
 # --------------------------------------------------------------------------- #
 # Staging / Pipe meta keys (Redis-backed UI listing)
@@ -82,8 +133,6 @@ def _pipe_key(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
 def _pipes_meta_key(org: str, sup: str, staging_name: str) -> str:
     # Set of pipe names for a staging for fast listing
     return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta"
-
-
 
 
 def _stage_lock_key(org: str, sup: str, stage_name: str) -> str:
@@ -119,7 +168,6 @@ local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path})
 redis.call('SET', key, new_val)
 return new_version
 """
-
 
     _LUA_LEAF_PAYLOAD_CAS_SET = """
 local key = KEYS[1]
@@ -189,6 +237,102 @@ end
 return 0
 """
 
+    # ------------- RBAC Lua scripts ------------- #
+
+    _LUA_RBAC_BUMP_META = """
+local key = KEYS[1]
+local now = ARGV[1]
+local v = redis.call('HINCRBY', key, 'version', 1)
+redis.call('HSET', key, 'last_updated_ms', now)
+return v
+"""
+
+    _LUA_RBAC_DELETE_ROLE = """
+local role_id = ARGV[1]
+local now_ms  = ARGV[2]
+local org     = ARGV[3]
+local sup     = ARGV[4]
+
+local user_ids = redis.call('SMEMBERS', KEYS[5])
+for _, uid in ipairs(user_ids) do
+    local ukey = 'supertable:' .. org .. ':' .. sup .. ':rbac:users:doc:' .. uid
+    local roles_json = redis.call('HGET', ukey, 'roles')
+    if roles_json then
+        local ok, roles = pcall(cjson.decode, roles_json)
+        if ok and type(roles) == 'table' then
+            local new_roles = {}
+            local changed = false
+            for _, r in ipairs(roles) do
+                if r == role_id then
+                    changed = true
+                else
+                    new_roles[#new_roles + 1] = r
+                end
+            end
+            if changed then
+                redis.call('HSET', ukey, 'roles', cjson.encode(new_roles))
+                redis.call('HSET', ukey, 'modified_ms', now_ms)
+            end
+        end
+    end
+end
+
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], role_id)
+redis.call('SREM', KEYS[3], role_id)
+redis.call('HINCRBY', KEYS[4], 'version', 1)
+redis.call('HSET', KEYS[4], 'last_updated_ms', now_ms)
+return 1
+"""
+
+    _LUA_RBAC_REMOVE_ROLE_FROM_USER = """
+local role_id = ARGV[1]
+local now_ms  = ARGV[2]
+local roles_json = redis.call('HGET', KEYS[1], 'roles')
+if not roles_json then return 0 end
+
+local ok, roles = pcall(cjson.decode, roles_json)
+if not ok or type(roles) ~= 'table' then return 0 end
+
+local new_roles = {}
+local changed = false
+for _, r in ipairs(roles) do
+    if r == role_id then
+        changed = true
+    else
+        new_roles[#new_roles + 1] = r
+    end
+end
+if not changed then return 0 end
+
+redis.call('HSET', KEYS[1], 'roles', cjson.encode(new_roles))
+redis.call('HSET', KEYS[1], 'modified_ms', now_ms)
+redis.call('HINCRBY', KEYS[2], 'version', 1)
+redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
+return 1
+"""
+
+    _LUA_RBAC_ADD_ROLE_TO_USER = """
+local role_id = ARGV[1]
+local now_ms  = ARGV[2]
+local roles_json = redis.call('HGET', KEYS[1], 'roles')
+if not roles_json then return 0 end
+
+local ok, roles = pcall(cjson.decode, roles_json)
+if not ok or type(roles) ~= 'table' then return 0 end
+
+for _, r in ipairs(roles) do
+    if r == role_id then return 0 end
+end
+
+roles[#roles + 1] = role_id
+redis.call('HSET', KEYS[1], 'roles', cjson.encode(roles))
+redis.call('HSET', KEYS[1], 'modified_ms', now_ms)
+redis.call('HINCRBY', KEYS[2], 'version', 1)
+redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
+return 1
+"""
+
     def __init__(self, options: Optional[RedisOptions] = None):
         self.r = RedisConnector(options).r
 
@@ -199,9 +343,16 @@ return 0
         self._lock_release_if_token = self.r.register_script(self._LUA_LOCK_RELEASE_IF_TOKEN)
         self._lock_extend_if_token = self.r.register_script(self._LUA_LOCK_EXTEND_IF_TOKEN)
 
+        # RBAC Lua scripts
+        self._rbac_bump_meta = self.r.register_script(self._LUA_RBAC_BUMP_META)
+        self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
+        self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
+        self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
+
     # ------------- Locking -------------
 
-    def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[str]:
+    def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[
+        str]:
         """SET lock key NX EX with retry/backoff <= timeout. Returns token if acquired else None."""
         key = _lock_key(org, sup, simple)
         token = uuid.uuid4().hex
@@ -237,12 +388,12 @@ return 0
     # ---- Stage lock (staging + pipe mutations) ----
 
     def acquire_stage_lock(
-        self,
-        org: str,
-        sup: str,
-        stage_name: str,
-        ttl_s: int = 30,
-        timeout_s: int = 30,
+            self,
+            org: str,
+            sup: str,
+            stage_name: str,
+            ttl_s: int = 30,
+            timeout_s: int = 30,
     ) -> Optional[str]:
         """Acquire lock for staging/pipe operations:
             supertable:{org}:{sup}:lock:stage:{stage_name}
@@ -365,16 +516,14 @@ return 0
             logger.error(f"[redis-catalog] leaf_cas_set error: {e}")
             raise
 
-    
-
     def set_leaf_payload_cas(
-        self,
-        org: str,
-        sup: str,
-        simple: str,
-        payload: Dict[str, Any],
-        path: str,
-        now_ms: Optional[int] = None,
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            payload: Dict[str, Any],
+            path: str,
+            now_ms: Optional[int] = None,
     ) -> int:
         """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
         try:
@@ -396,7 +545,8 @@ return 0
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
             raise
-# ------------- Mirror formats (Redis-backed) -------------
+
+    # ------------- Mirror formats (Redis-backed) -------------
 
     def get_mirrors(self, org: str, sup: str) -> List[str]:
         """Read enabled mirror formats from Redis key."""
@@ -454,90 +604,291 @@ return 0
             return cur
         return self.set_mirrors(org, sup, nxt)
 
-    # ------------- User and Role Management -------------
+    # ------------- User and Role Management (RBAC, UUID-based) ------------- #
+
+    @staticmethod
+    def _decode_member(m) -> str:
+        return m if isinstance(m, str) else m.decode("utf-8")
 
     def get_users(self, org: str, sup: str) -> List[Dict[str, Any]]:
-        """Get all users for organization."""
-        users = []
-        pattern = f"supertable:{org}:{sup}:meta:users:*"
-        cursor = 0
+        """Get all users for organization (reads from SET index, not SCAN)."""
+        users: List[Dict[str, Any]] = []
         try:
-            while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=100)
-                for key in keys:
-                    key_str = key if isinstance(key, str) else key.decode('utf-8')
-                    # Skip name_to_hash and meta keys
-                    if "name_to_hash" in key_str or ("meta" in key_str and "users:meta" not in key_str):
-                        continue
-                    raw = self.r.get(key_str)
-                    if raw:
+            members = self.r.smembers(_rbac_user_index_key(org, sup))
+            for uid_raw in (members or []):
+                uid = self._decode_member(uid_raw)
+                raw = self.r.hgetall(_rbac_user_doc_key(org, sup, uid))
+                if raw:
+                    data: Dict[str, Any] = dict(raw)
+                    if "roles" in data:
                         try:
-                            user_data = json.loads(raw)
-                            if isinstance(user_data, dict):
-                                user_hash = key_str.split(':')[-1]
-                                users.append({
-                                    "hash": user_hash,
-                                    **user_data
-                                })
-                        except Exception:
-                            continue
-                if cursor == 0:
-                    break
+                            data["roles"] = json.loads(data["roles"])
+                        except (json.JSONDecodeError, TypeError):
+                            data["roles"] = []
+                    users.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_users error: {e}")
         return users
 
     def get_roles(self, org: str, sup: str) -> List[Dict[str, Any]]:
-        """Get all roles for organization."""
-        roles = []
-        pattern = f"supertable:{org}:{sup}:meta:roles:*"
-        cursor = 0
+        """Get all roles for organization (reads from SET index, not SCAN)."""
+        roles: List[Dict[str, Any]] = []
         try:
-            while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=100)
-                for key in keys:
-                    key_str = key if isinstance(key, str) else key.decode('utf-8')
-                    # Skip type_to_hash and meta keys
-                    if "type_to_hash" in key_str or ("meta" in key_str and "roles:meta" not in key_str):
-                        continue
-                    raw = self.r.get(key_str)
-                    if raw:
-                        try:
-                            role_data = json.loads(raw)
-                            if isinstance(role_data, dict):
-                                role_hash = key_str.split(':')[-1]
-                                roles.append({
-                                    "hash": role_hash,
-                                    **role_data
-                                })
-                        except Exception:
-                            continue
-                if cursor == 0:
-                    break
+            members = self.r.smembers(_rbac_role_index_key(org, sup))
+            for rid_raw in (members or []):
+                rid = self._decode_member(rid_raw)
+                raw = self.r.hgetall(_rbac_role_doc_key(org, sup, rid))
+                if raw:
+                    data: Dict[str, Any] = dict(raw)
+                    for field in ("tables", "columns", "filters"):
+                        if field in data:
+                            try:
+                                data[field] = json.loads(data[field])
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                    roles.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_roles error: {e}")
         return roles
 
-    def get_role_details(self, org: str, sup: str, role_hash: str) -> Optional[Dict[str, Any]]:
-        """Get detailed role information."""
+    def get_role_details(self, org: str, sup: str, role_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed role information by role_id."""
         try:
-            raw = self.r.get(_role_hash_key(org, sup, role_hash))
-            if raw:
-                return json.loads(raw)
+            raw = self.r.hgetall(_rbac_role_doc_key(org, sup, role_id))
+            if not raw:
+                return None
+            data: Dict[str, Any] = dict(raw)
+            for field in ("tables", "columns", "filters"):
+                if field in data:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return data
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_role_details error: {e}")
         return None
 
-    def get_user_details(self, org: str, sup: str, user_hash: str) -> Optional[Dict[str, Any]]:
-        """Get detailed user information."""
+    def get_user_details(self, org: str, sup: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed user information by user_id."""
         try:
-            raw = self.r.get(_user_hash_key(org, sup, user_hash))
-            if raw:
-                return json.loads(raw)
+            raw = self.r.hgetall(_rbac_user_doc_key(org, sup, user_id))
+            if not raw:
+                return None
+            data: Dict[str, Any] = dict(raw)
+            if "roles" in data:
+                try:
+                    data["roles"] = json.loads(data["roles"])
+                except (json.JSONDecodeError, TypeError):
+                    data["roles"] = []
+            return data
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_user_details error: {e}")
         return None
 
+    # ------------- RBAC write operations ------------- #
+
+    @staticmethod
+    def _rbac_serialize(value: Any) -> str:
+        """Convert a Python value to a Redis-safe string for RBAC storage."""
+        if isinstance(value, (list, dict)):
+            return json.dumps(value)
+        if isinstance(value, bool):
+            return str(value).lower()
+        return str(value)
+
+    def _rbac_bump(self, meta_key: str) -> int:
+        """Atomically increment version and update timestamp on an RBAC meta key."""
+        return int(self._rbac_bump_meta(keys=[meta_key], args=[str(_now_ms())]) or 0)
+
+    # -- Role meta init --
+
+    def rbac_init_role_meta(self, org: str, sup: str) -> None:
+        """Ensure the RBAC role meta HASH exists. Idempotent."""
+        key = _rbac_role_meta_key(org, sup)
+        if not self.r.exists(key):
+            self.r.hset(key, mapping={
+                "version": "0",
+                "last_updated_ms": str(_now_ms()),
+                "initialized": "true",
+            })
+
+    # -- Role CRUD --
+
+    def rbac_create_role(self, org: str, sup: str, role_id: str, role_data: Dict[str, Any]) -> None:
+        """Persist a new role document and update indexes."""
+        key = _rbac_role_doc_key(org, sup, role_id)
+        redis_data = {k: self._rbac_serialize(v) for k, v in role_data.items()}
+        pipe = self.r.pipeline()
+        pipe.hset(key, mapping=redis_data)
+        pipe.sadd(_rbac_role_index_key(org, sup), role_id)
+        role_type = role_data.get("role", "")
+        if role_type:
+            pipe.sadd(_rbac_role_type_index_key(org, sup, role_type), role_id)
+        role_name = role_data.get("role_name", "")
+        if role_name:
+            pipe.hset(_rbac_rolename_to_id_key(org, sup), role_name.lower(), role_id)
+        pipe.execute()
+        self._rbac_bump(_rbac_role_meta_key(org, sup))
+
+    def rbac_update_role(self, org: str, sup: str, role_id: str, fields: Dict[str, Any]) -> None:
+        """Update specific fields of an existing role in-place."""
+        key = _rbac_role_doc_key(org, sup, role_id)
+        if not self.r.exists(key):
+            raise ValueError(f"Role {role_id} does not exist")
+        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
+        redis_data["modified_ms"] = str(_now_ms())
+        self.r.hset(key, mapping=redis_data)
+        self._rbac_bump(_rbac_role_meta_key(org, sup))
+
+    def rbac_delete_role(self, org: str, sup: str, role_id: str) -> bool:
+        """Atomically delete a role and strip it from every user's role list."""
+        key = _rbac_role_doc_key(org, sup, role_id)
+        if not self.r.exists(key):
+            return False
+        role_type = self.r.hget(key, "role") or ""
+        if isinstance(role_type, bytes):
+            role_type = role_type.decode("utf-8")
+        role_name = self.r.hget(key, "role_name") or ""
+        if isinstance(role_name, bytes):
+            role_name = role_name.decode("utf-8")
+        result = self._rbac_delete_role(
+            keys=[
+                key,
+                _rbac_role_index_key(org, sup),
+                _rbac_role_type_index_key(org, sup, role_type),
+                _rbac_role_meta_key(org, sup),
+                _rbac_user_index_key(org, sup),
+            ],
+            args=[role_id, str(_now_ms()), org, sup],
+        )
+        if int(result or 0) == 1:
+            if role_name:
+                self.r.hdel(_rbac_rolename_to_id_key(org, sup), role_name.lower())
+            return True
+        return False
+
+    def rbac_role_exists(self, org: str, sup: str, role_id: str) -> bool:
+        return bool(self.r.exists(_rbac_role_doc_key(org, sup, role_id)))
+
+    def rbac_list_role_ids(self, org: str, sup: str) -> List[str]:
+        """Return all role_ids from the index SET."""
+        members = self.r.smembers(_rbac_role_index_key(org, sup))
+        return [self._decode_member(m) for m in (members or [])]
+
+    def rbac_get_role_ids_by_type(self, org: str, sup: str, role_type: str) -> List[str]:
+        """Return role_ids belonging to a specific role type."""
+        members = self.r.smembers(_rbac_role_type_index_key(org, sup, role_type))
+        return [self._decode_member(m) for m in (members or [])]
+
+    def rbac_get_superadmin_role_id(self, org: str, sup: str) -> Optional[str]:
+        """Return the first superadmin role_id, or None."""
+        ids = self.rbac_get_role_ids_by_type(org, sup, "superadmin")
+        return ids[0] if ids else None
+
+    def rbac_get_role_id_by_name(self, org: str, sup: str, role_name: str) -> Optional[str]:
+        """Look up a role_id from a role_name (case-insensitive)."""
+        val = self.r.hget(_rbac_rolename_to_id_key(org, sup), role_name.lower())
+        if val is None:
+            return None
+        return self._decode_member(val)
+
+    # -- User meta init --
+
+    def rbac_init_user_meta(self, org: str, sup: str) -> None:
+        """Ensure the RBAC user meta HASH exists. Idempotent."""
+        key = _rbac_user_meta_key(org, sup)
+        if not self.r.exists(key):
+            self.r.hset(key, mapping={
+                "version": "0",
+                "last_updated_ms": str(_now_ms()),
+                "initialized": "true",
+            })
+
+    # -- User CRUD --
+
+    def rbac_create_user(self, org: str, sup: str, user_id: str, user_data: Dict[str, Any]) -> None:
+        """Persist a new user document and update indexes."""
+        key = _rbac_user_doc_key(org, sup, user_id)
+        username = user_data["username"]
+        redis_data = {k: self._rbac_serialize(v) for k, v in user_data.items()}
+        pipe = self.r.pipeline()
+        pipe.hset(key, mapping=redis_data)
+        pipe.sadd(_rbac_user_index_key(org, sup), user_id)
+        pipe.hset(_rbac_username_to_id_key(org, sup), username.lower(), user_id)
+        pipe.execute()
+        self._rbac_bump(_rbac_user_meta_key(org, sup))
+
+    def rbac_update_user(self, org: str, sup: str, user_id: str, fields: Dict[str, str]) -> None:
+        """Update specific fields of an existing user in-place."""
+        key = _rbac_user_doc_key(org, sup, user_id)
+        if not self.r.exists(key):
+            raise ValueError(f"User {user_id} does not exist")
+        fields["modified_ms"] = str(_now_ms())
+        self.r.hset(key, mapping=fields)
+        self._rbac_bump(_rbac_user_meta_key(org, sup))
+
+    def rbac_rename_user(self, org: str, sup: str, user_id: str, old_username: str, new_username: str) -> None:
+        """Atomically update the username → user_id mapping."""
+        mapping_key = _rbac_username_to_id_key(org, sup)
+        pipe = self.r.pipeline()
+        pipe.hdel(mapping_key, old_username.lower())
+        pipe.hset(mapping_key, new_username.lower(), user_id)
+        pipe.execute()
+
+    def rbac_delete_user(self, org: str, sup: str, user_id: str) -> None:
+        """Delete a user document and remove from all indexes."""
+        key = _rbac_user_doc_key(org, sup, user_id)
+        raw = self.r.hgetall(key)
+        if not raw:
+            raise ValueError(f"User {user_id} does not exist")
+        username = raw.get("username", "")
+        if isinstance(username, bytes):
+            username = username.decode("utf-8")
+        pipe = self.r.pipeline()
+        pipe.delete(key)
+        pipe.srem(_rbac_user_index_key(org, sup), user_id)
+        if username:
+            pipe.hdel(_rbac_username_to_id_key(org, sup), username.lower())
+        pipe.execute()
+        self._rbac_bump(_rbac_user_meta_key(org, sup))
+
+    def rbac_user_exists(self, org: str, sup: str, user_id: str) -> bool:
+        return bool(self.r.exists(_rbac_user_doc_key(org, sup, user_id)))
+
+    def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
+        """Look up a user_id from a username (case-insensitive)."""
+        val = self.r.hget(_rbac_username_to_id_key(org, sup), username.lower())
+        if val is None:
+            return None
+        return self._decode_member(val)
+
+    def rbac_list_user_ids(self, org: str, sup: str) -> List[str]:
+        """Return all user_ids from the index SET."""
+        members = self.r.smembers(_rbac_user_index_key(org, sup))
+        return [self._decode_member(m) for m in (members or [])]
+
+    # -- Atomic role ↔ user mutations --
+
+    def rbac_add_role_to_user(self, org: str, sup: str, user_id: str, role_id: str) -> bool:
+        """Atomically add a role to a user's role list (no-op if already present)."""
+        return int(self._rbac_add_role_to_user(
+            keys=[
+                _rbac_user_doc_key(org, sup, user_id),
+                _rbac_user_meta_key(org, sup),
+            ],
+            args=[role_id, str(_now_ms())],
+        ) or 0) == 1
+
+    def rbac_remove_role_from_user(self, org: str, sup: str, user_id: str, role_id: str) -> bool:
+        """Atomically remove a role from a user's role list."""
+        return int(self._rbac_remove_role_from_user(
+            keys=[
+                _rbac_user_doc_key(org, sup, user_id),
+                _rbac_user_meta_key(org, sup),
+            ],
+            args=[role_id, str(_now_ms())],
+        ) or 0) == 1
 
     # ------------- Organization auth tokens (login tokens) -------------
 
@@ -568,11 +919,11 @@ return 0
         return out
 
     def create_auth_token(
-        self,
-        org: str,
-        created_by: str,
-        label: Optional[str] = None,
-        enabled: bool = True,
+            self,
+            org: str,
+            created_by: str,
+            label: Optional[str] = None,
+            enabled: bool = True,
     ) -> Dict[str, Any]:
         """Create a new auth token.
 
@@ -615,8 +966,7 @@ return 0
             logger.error(f"[redis-catalog] validate_auth_token error: {e}")
             return False
 
-
-# ------------- Listings via SCAN -------------
+    # ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
         """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:*"""
@@ -670,8 +1020,7 @@ return 0
             except Exception:
                 continue
 
-
-# ------------- Deletions (dangerous) -------------
+    # ------------- Deletions (dangerous) -------------
 
     def delete_simple_table(self, org: str, sup: str, simple: str) -> bool:
         """Delete a simple table's Redis meta (leaf pointer + lock).
@@ -724,10 +1073,9 @@ return 0
             logger.error(f"[redis-catalog] SCAN delete error: {e}")
         return deleted
 
-
-# --------------------------------------------------------------------------- #
-# Staging / Pipe meta (for website UI)
-# --------------------------------------------------------------------------- #
+    # --------------------------------------------------------------------------- #
+    # Staging / Pipe meta (for website UI)
+    # --------------------------------------------------------------------------- #
 
     def upsert_staging_meta(self, org: str, sup: str, staging_name: str, meta: Dict[str, Any]) -> bool:
         """Upsert staging metadata and ensure it is indexed for listing."""
@@ -838,12 +1186,12 @@ return 0
         return deleted
 
     def upsert_pipe_meta(
-        self,
-        org: str,
-        sup: str,
-        staging_name: str,
-        pipe_name: str,
-        meta: Dict[str, Any],
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            pipe_name: str,
+            meta: Dict[str, Any],
     ) -> bool:
         """Upsert pipe metadata and ensure it is indexed for listing under a staging."""
         if not (org and sup and staging_name and pipe_name):
@@ -906,12 +1254,12 @@ return 0
         return []
 
     def upsert_pipe_defs(
-        self,
-        org: str,
-        sup: str,
-        staging_name: str,
-        pipe_name: str,
-        defs: List[Dict[str, Any]],
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            pipe_name: str,
+            defs: List[Dict[str, Any]],
     ) -> bool:
         """Store a pipe definition payload as a JSON **list** and index it for listing."""
         if not (org and sup and staging_name and pipe_name):
@@ -926,7 +1274,6 @@ return 0
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] upsert_pipe_defs error: {e}")
             raise
-
 
     def list_pipe_metas(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> List[Dict[str, Any]]:
         """List pipe metadata objects for a staging (back-compat).

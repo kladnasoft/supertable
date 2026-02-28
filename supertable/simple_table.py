@@ -177,11 +177,11 @@ class SimpleTable:
                 now_ms=now_ms,
             )
 
-    def delete(self, user_hash: str) -> None:
+    def delete(self, role_name: str) -> None:
         check_write_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
-            user_hash=user_hash,
+            role_name=role_name,
             table_name=self.simple_name,
         )
 

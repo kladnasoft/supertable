@@ -119,6 +119,66 @@ class AzureBlobStorage(StorageInterface):
         return cls(container_name=container, blob_service_client=svc, base_prefix=base_prefix)
 
     # -------------------------
+    # Optional: DuckDB path / presign
+    # -------------------------
+    def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
+        """Return an Azure path usable by DuckDB (azure:// or https:// form)."""
+        key = (key or "").lstrip("/")
+        full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
+        prefer_httpfs = (
+            prefer_httpfs if prefer_httpfs is not None
+            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+        )
+        if prefer_httpfs:
+            account_url = self.svc.url.rstrip("/")
+            return f"{account_url}/{self.container_name}/{full_key}"
+        return f"azure://{self.container_name}/{full_key}"
+
+    def presign(self, key: str, expiry_seconds: int = 3600) -> str:
+        """Return a presigned (SAS) GET URL for the blob."""
+        from datetime import datetime, timedelta, timezone
+        from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+
+        full_key = self._with_base(key)
+        blob_client = self.container.get_blob_client(full_key)
+
+        # Attempt to use the account key from the credential for SAS generation.
+        # If using DefaultAzureCredential (AAD), user delegation key is needed instead.
+        credential = self.svc.credential
+        account_name = self.svc.account_name
+
+        if hasattr(credential, "account_key"):
+            account_key = credential.account_key
+        elif isinstance(credential, str):
+            account_key = credential
+        else:
+            # AAD / managed identity: use user delegation key
+            start_time = datetime.now(timezone.utc)
+            expiry_time = start_time + timedelta(seconds=expiry_seconds)
+            delegation_key = self.svc.get_user_delegation_key(start_time, expiry_time)
+            sas_token = generate_blob_sas(
+                account_name=account_name,
+                container_name=self.container_name,
+                blob_name=full_key,
+                user_delegation_key=delegation_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=expiry_time,
+                start=start_time,
+            )
+            return f"{blob_client.url}?{sas_token}"
+
+        expiry_time = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=self.container_name,
+            blob_name=full_key,
+            account_key=account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry_time,
+        )
+        return f"{blob_client.url}?{sas_token}"
+
+    # -------------------------
     # Helpers
     # -------------------------
     def _with_base(self, path: str) -> str:

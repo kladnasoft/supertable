@@ -12,22 +12,22 @@ admin_data = {
     "role": "admin",
     "tables": ["*"]
 }
-admin_hash = role_manager.create_role(admin_data)
-logger.info(f"Admin role created with hash: {admin_hash}")
+admin_id = role_manager.create_role(admin_data)
+logger.info(f"Admin role created with id: {admin_id}")
 
 editor_data = {
     "role": "writer",
     "tables": ["table1", "table2"]
 }
-editor_hash = role_manager.create_role(editor_data)
-logger.info(f"Editor role created with hash: {admin_hash}")
+editor_id = role_manager.create_role(editor_data)
+logger.info(f"Editor role created with id: {editor_id}")
 
 usage_data = {
     "role": "meta",
     "tables": ["table1"]
 }
-usage_hash = role_manager.create_role(usage_data)
-logger.info(f"Usage role created with hash: {usage_hash}")
+usage_id = role_manager.create_role(usage_data)
+logger.info(f"Usage role created with id: {usage_id}")
 
 viewer_data = {
     "role": "reader",
@@ -35,8 +35,8 @@ viewer_data = {
     "columns": ["name", "email", "age"],
     "filters": {"country": "US", "active": True}
 }
-viewer_hash = role_manager.create_role(viewer_data)
-logger.info(f"Viewer role created with hash: {viewer_hash}")
+viewer_id = role_manager.create_role(viewer_data)
+logger.info(f"Viewer role created with id: {viewer_id}")
 
 viewer2_data = {
     "role": "reader",
@@ -44,17 +44,23 @@ viewer2_data = {
     "columns": ["name", "email", "age"],
     "filters": {"country": "EU", "active": False}
 }
-viewer2_hash = role_manager.create_role(viewer2_data)
-logger.info(f"Viewer2 role created with hash: {viewer2_hash}")
+viewer2_id = role_manager.create_role(viewer2_data)
+logger.info(f"Viewer2 role created with id: {viewer2_id}")
 
+# --- Update a role in-place (no new id) ---
+logger.info(f"Updating viewer role {viewer_id} to add 'phone' column...")
+role_manager.update_role(viewer_id, {
+    "columns": ["name", "email", "age", "phone"],
+})
+updated_viewer = role_manager.get_role(viewer_id)
+logger.info(f"Viewer role after update: {updated_viewer}")
 
 # --- List all roles ---
 all_roles = role_manager.list_roles()
-logger.info(f"Listing all roles: {all_roles}")
+logger.info(f"Listing all roles ({len(all_roles)}):")
 for role in all_roles:
     logger.info(role)
 
 # --- Retrieve a specific role's configuration ---
-admin_config = role_manager.get_role(admin_hash)
-logger.info(f"Retrieving Admin role configuration: {admin_config}")
+admin_config = role_manager.get_role(admin_id)
 logger.info(f"Admin config: {admin_config}")

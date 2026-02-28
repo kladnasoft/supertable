@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# measure_lock_speed.py
+#
+# Multi-threaded contention benchmark for file-based locking.
+# Standalone: no supertable dependency required.
+#
+# Usage:  python3 measure_lock_speed.py [--threads 10] [--hold 1.0] [--seed 42]
+
 import os
 import sys
 import gc
@@ -7,18 +14,21 @@ import random
 import argparse
 import threading
 
-import supertable.config.homedir  # ensure env/init
-from supertable.config.defaults import logger, logging
-from supertable.locking import Locking
-from supertable.storage.storage_factory import get_storage
+# ---------------------------------------------------------------------------
+# Standalone import
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-logger.setLevel(logging.INFO)
+from supertable.locking.file_lock import FileLocking
 
 # ---------- Defaults ----------
 NUM_THREADS_DEFAULT = 10
-HOLD_TIME_DEFAULT = 1.0  # seconds each thread holds the lock once acquired
-RES_POOL_SIZE = 50       # resources are named res1..res50
-PICKS_PER_THREAD = 5     # each thread picks 5 distinct resources
+HOLD_TIME_DEFAULT = 1.0      # seconds each thread holds the lock once acquired
+RES_POOL_SIZE = 50            # resources are named res1..res50
+PICKS_PER_THREAD = 5          # each thread picks 5 distinct resources
+LOCK_DURATION_DEFAULT = 30    # TTL per lock in seconds
 
 
 def run_multithreaded_test(
@@ -26,40 +36,38 @@ def run_multithreaded_test(
     num_threads: int = NUM_THREADS_DEFAULT,
     hold_time: float = HOLD_TIME_DEFAULT,
     working_dir: str | None = None,
+    lock_duration: int = LOCK_DURATION_DEFAULT,
 ):
     """
-    Run a multi-threaded contention test using the unified Locking façade.
-    Works with any configured storage backend (File/MinIO/S3 + Redis locking).
+    Run a multi-threaded contention test using FileLocking directly.
+    Each thread picks 5 random resources from a pool of 50 and attempts
+    to acquire them all atomically.
     """
-    storage = get_storage()
-
-    # Default to a persistent, backend-agnostic ".locks" directory in storage
-    workdir = working_dir or ".locks"
-    if not storage.exists(workdir):
-        storage.makedirs(workdir)
+    workdir = working_dir or os.path.join(_HERE, ".locks")
+    os.makedirs(workdir, exist_ok=True)
 
     barrier = threading.Barrier(num_threads)
     acquisitions: list[dict] = []
     acquisitions_lock = threading.Lock()
 
     def worker(idx: int) -> None:
-        # each thread picks 5 distinct resources from 1–50
+        # Each thread picks 5 distinct resources from 1–50
         picks = random.sample(range(1, RES_POOL_SIZE + 1), PICKS_PER_THREAD)
-        # Use storage-path resources so both File and remote backends behave consistently
-        resources = [os.path.join(workdir, f"res{n}") for n in picks]
+        resources = [f"res{n}" for n in picks]
 
         name = f"{label}-T{idx}"
-        lock = Locking(identity=name, working_dir=workdir)
+        lock = FileLocking(identity=name, working_dir=workdir, check_interval=0.02)
 
         print(f"[{name}] attempting lock on {resources}")
         barrier.wait()  # sync start
 
         t0 = time.perf_counter()
-        acquired = lock.lock_resources(resources)
+        acquired = lock.acquire(resources, duration=lock_duration, who=name)
         t1 = time.perf_counter()
 
         if not acquired:
             print(f"[{name}] FAILED to acquire lock on {resources}")
+            lock._stop_heartbeat()
             return
 
         wait_time = t1 - t0
@@ -76,9 +84,10 @@ def run_multithreaded_test(
                 }
             )
 
-        # hold the lock, then release all
+        # Hold the lock, then release all explicitly
         time.sleep(hold_time)
-        lock.release_lock()
+        lock.release(resources)
+        lock._stop_heartbeat()
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
     for t in threads:
@@ -90,7 +99,7 @@ def run_multithreaded_test(
     gc.collect()
     time.sleep(0.2)
 
-    # post-process to determine which thread waited for which
+    # Post-process to determine which thread waited for which
     print(f"\n{label} DETAILED WAIT ANALYSIS:")
     for rec in sorted(acquisitions, key=lambda x: x["acquired"]):
         deps = [
@@ -115,36 +124,32 @@ def run_multithreaded_test(
     print(f"  Avg wait          : {avg:.4f}s")
     print(f"  Min wait          : {mn:.4f}s")
     print(f"  Max wait          : {mx:.4f}s")
-    print(f"  Working dir       : {workdir} (storage)" )
+    print(f"  Working dir       : {workdir}")
     print("-" * 40)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Measure multi-threaded lock timing using storage-backed locking."
+        description="Measure multi-threaded lock timing using file-based locking."
     )
     ap.add_argument(
-        "--threads",
-        type=int,
-        default=NUM_THREADS_DEFAULT,
-        help="Number of threads (default: 10)",
+        "--threads", type=int, default=NUM_THREADS_DEFAULT,
+        help=f"Number of threads (default: {NUM_THREADS_DEFAULT})",
     )
     ap.add_argument(
-        "--hold",
-        type=float,
-        default=HOLD_TIME_DEFAULT,
-        help="Seconds each thread holds the lock (default: 1.0)",
+        "--hold", type=float, default=HOLD_TIME_DEFAULT,
+        help=f"Seconds each thread holds the lock (default: {HOLD_TIME_DEFAULT})",
     )
     ap.add_argument(
-        "--workdir",
-        type=str,
-        default=".locks",
-        help="Logical working directory inside the configured storage (default: .locks)",
+        "--workdir", type=str, default=os.path.join(_HERE, ".locks"),
+        help="Working directory for lock files (default: .locks)",
     )
     ap.add_argument(
-        "--seed",
-        type=int,
-        default=None,
+        "--duration", type=int, default=LOCK_DURATION_DEFAULT,
+        help=f"Lock TTL in seconds (default: {LOCK_DURATION_DEFAULT})",
+    )
+    ap.add_argument(
+        "--seed", type=int, default=None,
         help="Random seed for reproducibility (default: None)",
     )
     args = ap.parse_args()
@@ -152,12 +157,13 @@ def main() -> None:
     if args.seed is not None:
         random.seed(args.seed)
 
-    print("==== STORAGE-BASED LOCKING ====")
+    print("==== FILE-BASED LOCKING SPEED TEST ====")
     run_multithreaded_test(
         "Locking",
         num_threads=args.threads,
         hold_time=args.hold,
         working_dir=args.workdir,
+        lock_duration=args.duration,
     )
 
 

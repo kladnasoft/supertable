@@ -1,57 +1,123 @@
-SUPER TABLE PUBLIC USE LICENSE (STPUL) v1.0
+SUPER TABLE PUBLIC USE LICENSE (STPUL) v1.1
 
 1. Definitions
-   1.1. “Software” refers to the source code, binary code, documentation,
-        and related materials for the project known as “SuperTable.”
-   1.2. “Licensor” refers to kladna Soft kft.
-   1.3. “You” (or “Your”) means the individual or entity exercising the
+   1.1. "Software" refers to the source code, binary code, documentation,
+        and related materials for the project known as "SuperTable."
+   1.2. "Licensor" refers to Kladna Soft Kft.
+   1.3. "You" (or "Your") means the individual or entity exercising the
         rights granted under this License.
+   1.4. "Small Organization" means any company, startup, or organization
+        with ten (10) or fewer total employees, contractors, and agents,
+        regardless of how many individuals access or use the Software.
+   1.5. "Educational Use" means use by accredited educational institutions
+        (schools, colleges, universities), students enrolled in such
+        institutions, or educators for teaching, academic research, or
+        coursework purposes.
+   1.6. "Community Use" means use by registered non-profit organizations,
+        open-source projects, or community groups for non-commercial
+        purposes.
+   1.7. "Enterprise Use" means use by any organization with more than
+        ten (10) total employees, contractors, and agents, regardless
+        of how many individuals access or use the Software, or use
+        within a commercial product or service offered to third parties.
 
 2. Grant of License
-   2.1. Personal, Non-Commercial, and Evaluation Use
-       - You are granted a worldwide, royalty-free, non-exclusive,
-         non-transferable license to download, install, and use the
-         Software solely for personal, non-commercial, or evaluation
-         purposes at no cost.
-       - Evaluation use is limited to internal testing and shall not
-         exceed 30 days unless otherwise authorized in writing by the
-         Licensor.
 
-   2.2. Commercial or Enterprise Use
-       - If You wish to use the Software for commercial purposes,
-         within an enterprise environment, or as part of any product
-         or service provided to a third party, You must obtain a
-         separate commercial license from the Licensor. Fees may apply.
+   2.1. Personal and Non-Commercial Use (FREE)
+        You are granted a worldwide, royalty-free, non-exclusive,
+        non-transferable, perpetual license to download, install, and
+        use the Software for personal, non-commercial purposes at no cost.
 
-3. No Modification
-   3.1. You may not modify, reverse engineer, decompile, disassemble,
-        create derivative works from, or otherwise alter the Software
-        in whole or in part without the prior written consent of the
-        Licensor.
+   2.2. Small Organization Use (FREE)
+        Small Organizations are granted a worldwide, royalty-free,
+        non-exclusive, non-transferable license to use the Software
+        for internal business purposes at no cost, provided that:
+        (a) The organization has ten (10) or fewer total employees,
+            contractors, and agents (regardless of how many use the
+            Software); and
+        (b) The Software is not incorporated into a product or service
+            sold or licensed to third parties.
 
-4. No Redistribution
+        If Your organization grows beyond ten (10) employees, You must
+        obtain an Enterprise License within thirty (30) days.
+
+   2.3. Educational Use (FREE)
+        Educational institutions, students, and educators are granted a
+        worldwide, royalty-free, non-exclusive, non-transferable license
+        to use the Software for Educational Use at no cost. This includes:
+        (a) Classroom instruction and coursework;
+        (b) Academic research and publications;
+        (c) Student projects and thesis work;
+        (d) Educational workshops and training.
+
+        Educational Use does not include commercial training programs
+        offered for profit.
+
+   2.4. Community Use (FREE)
+        Registered non-profit organizations and open-source projects are
+        granted a worldwide, royalty-free, non-exclusive, non-transferable
+        license to use the Software for Community Use at no cost.
+
+   2.5. Evaluation Use (FREE, TIME-LIMITED)
+        Any entity may evaluate the Software for up to thirty (30) days
+        to determine suitability for Enterprise Use. Extended evaluation
+        periods require written authorization from the Licensor.
+
+   2.6. Enterprise Use (PAID LICENSE REQUIRED)
+        If You wish to use the Software:
+        (a) Within an organization with more than ten (10) employees,
+            contractors, or agents; or
+        (b) As part of any commercial product or service provided to
+            third parties; or
+        (c) For commercial training programs offered for profit;
+        You must obtain a separate Enterprise License from the Licensor.
+        Contact the Licensor for pricing and terms.
+
+3. Contributions and Modifications
+   3.1. You may submit bug reports, feature requests, and code
+        contributions to the Licensor. By submitting contributions,
+        You grant the Licensor a perpetual, worldwide, royalty-free
+        license to use, modify, and incorporate Your contributions
+        into the Software.
+   3.2. You may not distribute modified versions of the Software
+        without prior written consent from the Licensor.
+   3.3. You may not reverse engineer, decompile, or disassemble the
+        Software except to the extent permitted by applicable law.
+
+4. Redistribution
    4.1. You may not publish, distribute, sublicense, or otherwise make
-        the Software available to any third party, unless You have
-        obtained explicit written permission from the Licensor.
+        the Software available to any third party, except:
+        (a) You may share the official, unmodified Software with others
+            who agree to this License; and
+        (b) You may include the Software in internal development
+            environments within the scope of Your license grant.
 
 5. Ownership and Reservation of Rights
    5.1. All rights, title, and interest in the Software remain with the
         Licensor. This License does not transfer any ownership rights.
-   5.2. Access to the source code is provided for transparency and
-        evaluation only. It does not constitute a grant of rights
-        beyond those explicitly stated in this License.
+   5.2. Access to the source code is provided for transparency,
+        evaluation, and contribution purposes. It does not constitute
+        a grant of rights beyond those explicitly stated in this License.
    5.3. The Licensor reserves all rights not expressly granted to You
         under this License.
 
-6. Disclaimer of Warranties
-   6.1. THE SOFTWARE IS PROVIDED “AS IS,” WITHOUT WARRANTY OF ANY KIND,
+6. Compliance and Audit
+   6.1. You agree to maintain accurate records of Your organization's
+        size (total employees, contractors, and agents) to verify
+        eligibility for Small Organization Use.
+   6.2. The Licensor may, upon reasonable notice, request verification
+        of Your compliance with this License. You agree to provide
+        such verification within thirty (30) days of request.
+
+7. Disclaimer of Warranties
+   7.1. THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND,
         EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
         OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
         NON-INFRINGEMENT. THE ENTIRE RISK AS TO THE QUALITY AND
         PERFORMANCE OF THE SOFTWARE IS WITH YOU.
 
-7. Limitation of Liability
-   7.1. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT,
+8. Limitation of Liability
+   8.1. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT,
         INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
         (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
         GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
@@ -59,26 +125,54 @@ SUPER TABLE PUBLIC USE LICENSE (STPUL) v1.0
         WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
         NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
         THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   8.2. IN NO EVENT SHALL THE LICENSOR'S TOTAL LIABILITY EXCEED THE
+        AMOUNT PAID BY YOU FOR THE SOFTWARE IN THE TWELVE (12) MONTHS
+        PRECEDING THE CLAIM.
 
-8. Termination
-   8.1. This License and the rights granted hereunder will terminate
+9. Termination
+   9.1. This License and the rights granted hereunder will terminate
         automatically if You fail to comply with any term or condition
-        of this License. Upon termination, You must cease all use of
-        the Software and destroy any copies of the Software in Your
-        possession or control.
-   8.2. The Licensor reserves the right to revoke this License in the
-        event of a violation or at its sole discretion, subject to
-        applicable law.
+        of this License.
+   9.2. Upon termination, You must cease all use of the Software and
+        destroy any copies of the Software in Your possession or control.
+   9.3. The Licensor may, at its sole discretion, provide a thirty (30)
+        day cure period for unintentional violations before termination.
+   9.4. Sections 5, 7, 8, and 9 shall survive termination of this License.
 
-9. Governing Law
-   9.1. This License shall be governed by and construed in accordance
-        with the laws of Hungary, without regard to its conflict of
-        law principles.
+10. Governing Law and Dispute Resolution
+    10.1. This License shall be governed by and construed in accordance
+          with the laws of Hungary, without regard to its conflict of
+          law principles.
+    10.2. Any disputes arising from this License shall first be subject
+          to good-faith negotiation. If unresolved within thirty (30)
+          days, disputes shall be submitted to the courts of Hungary.
 
-10. Contact Information
-   10.1. For inquiries about commercial licensing or any other questions
-         regarding this License, please contact:
-         lkupas@kladnasoft.com
+11. Contact Information
+    11.1. For inquiries about Enterprise licensing, compliance questions,
+          or any other matters regarding this License, please contact:
+
+          Kladna Soft Kft.
+          Email: lkupas@kladnasoft.com
+          Website: https://supertable.dev
+
+12. License Summary (Non-Binding)
+
+    +-------------------------------+------------+------------------+
+    | Use Case                      | License    | Cost             |
+    +-------------------------------+------------+------------------+
+    | Personal / Hobby              | Permitted  | FREE             |
+    | Small Startup (≤10 employees) | Permitted  | FREE             |
+    | Educational / Academic        | Permitted  | FREE             |
+    | Non-Profit / Open Source      | Permitted  | FREE             |
+    | Evaluation (30 days)          | Permitted  | FREE             |
+    | Enterprise (>10 employees)    | Required   | Contact Licensor |
+    | Commercial Product/SaaS       | Required   | Contact Licensor |
+    +-------------------------------+------------+------------------+
+
+    This summary is for convenience only. The full license terms above
+    are legally binding.
 
 BY USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS LICENSE,
 UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
+
+Copyright (c) 2024-2026 Kladna Soft Kft. All rights reserved.

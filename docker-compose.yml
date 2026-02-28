@@ -1,10 +1,13 @@
 services:
-  # ===================== Optional Infra (only when you include --profile infra) =====================
+  # =====================================================================
+  # Optional infrastructure — start with: --profile infra
+  # =====================================================================
+
   redis:
     image: redis:7-alpine
     profiles: ["infra"]
-    command: ["redis-server","--appendonly","yes"]
-    # Map ports only if you want host access to this internal Redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6379:6379"
     volumes:
@@ -13,33 +16,39 @@ services:
   minio:
     image: minio/minio:latest
     profiles: ["infra"]
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:-minioadmin123!}
-    # Use non-default host ports to avoid clashes with your existing MinIO (9000/9001)
     ports:
-      - "9002:9000"   # S3 API will be available at http://localhost:9002
-      - "9003:9001"   # Console at http://localhost:9003
+      - "9002:9000"   # S3 API  → http://localhost:9002
+      - "9003:9001"   # Console → http://localhost:9003
     volumes:
       - minio-data:/data
 
-  # ===================== Apps (choose admin and/or mcp; infra is optional) =====================
-  supertable-admin:
-    build: .
-    profiles: ["admin"]
-    init: true
-    env_file:
-      - .env
-    environment:
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-      SERVICE: admin
-      HOST: 0.0.0.0
-      PORT: 8000
-      # must be set (in .env or env); prevents default "change-me-now" in prod
-      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?set_a_token}
+  # =====================================================================
+  # reflection — Supertable admin UI + reflection REST API
+  # Start with:  docker compose --profile reflection up
+  # URL:         http://localhost:8050
+  # =====================================================================
 
-      # ---- Defaults point to HOST services (your already-running Redis & MinIO) ----
+  supertable-reflection:
+    build: .
+    profiles: ["reflection"]
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE: reflection
+      SUPERTABLE_HOST: 0.0.0.0
+      SUPERTABLE_REFLECTION_PORT: ${SUPERTABLE_REFLECTION_PORT:-8050}
+
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      # Token is mandatory — set it in .env before starting.
+      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?Set SUPERTABLE_ADMIN_TOKEN in .env}
+
       REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB:   ${REDIS_DB:-0}
@@ -52,31 +61,35 @@ services:
       STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
       STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
 
-
-      # Misc you already use
       SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    # lets Linux containers reach host services using host.docker.internal
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8000:8000"
+      - "${SUPERTABLE_REFLECTION_PORT:-8050}:${SUPERTABLE_REFLECTION_PORT:-8050}"
 
-  supertable-web:
+  # =====================================================================
+  # api — Supertable REST API
+  # Start with:  docker compose --profile api up
+  # URL:         http://localhost:8090
+  # =====================================================================
+
+  supertable-api:
     build: .
-    profiles: ["mcp"]
+    profiles: ["api"]
     init: true
-    env_file:
-      - .env
+    restart: unless-stopped
+    env_file: .env
     environment:
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-      SERVICE: web
-      HOST: 0.0.0.0
-      PORT: 8000
-      # must be set (in .env or env); prevents default "change-me-now" in prod
-      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?set_a_token}
+      SERVICE: api
+      SUPERTABLE_HOST: 0.0.0.0
+      SUPERTABLE_API_PORT: ${SUPERTABLE_API_PORT:-8090}
 
-      # ---- Defaults point to HOST services (your already-running Redis & MinIO) ----
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?Set SUPERTABLE_ADMIN_TOKEN in .env}
+
       REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB:   ${REDIS_DB:-0}
@@ -89,28 +102,45 @@ services:
       STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
       STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
 
-      # Misc you already use
       SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8000:8000"
+      - "${SUPERTABLE_API_PORT:-8090}:${SUPERTABLE_API_PORT:-8090}"
+
+  # =====================================================================
+  # mcp — MCP stdio server + web tester UI
+  # Start with:  docker compose --profile mcp up
+  # Web tester:  http://localhost:8099
+  # stdio:       connected via Claude Desktop / MCP client on stdin/stdout
+  # =====================================================================
 
   supertable-mcp:
     build: .
     profiles: ["mcp"]
     init: true
+    restart: unless-stopped
+    # stdin_open + tty required for MCP stdio transport.
+    # Remove both if switching to SERVICE=mcp-http.
     stdin_open: true
     tty: true
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
       SERVICE: mcp
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Explicit transport — guards against future default changes.
+      SUPERTABLE_MCP_TRANSPORT: stdio
 
-      # ---- Defaults point to HOST services ----
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
+      SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
+      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
+      # Optional allowlist — leave empty to allow all valid user hashes.
+      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
+      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH:-}
+
       REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB:   ${REDIS_DB:-1}
@@ -124,11 +154,126 @@ services:
       STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
 
       SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
-      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES}
-      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    ports:
+      - "8099:8099"   # MCP web tester UI
+
+  # =====================================================================
+  # mcp-http — MCP server over streamable-http (for remote HTTP clients)
+  # Start with:  docker compose --profile mcp-http up
+  # Endpoint:    http://localhost:8000/mcp
+  # No tty/stdin required — plain HTTP.
+  # =====================================================================
+
+  supertable-mcp-http:
+    build: .
+    profiles: ["mcp-http"]
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE: mcp-http
+      # Forced to streamable-http by entrypoint; declared here for clarity.
+      SUPERTABLE_MCP_TRANSPORT: streamable-http
+      SUPERTABLE_MCP_HTTP_PATH: ${SUPERTABLE_MCP_HTTP_PATH:-/mcp}
+
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
+      SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
+      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
+      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
+
+      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB:   ${REDIS_DB:-1}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/1}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"   # MCP HTTP endpoint
+
+  # =====================================================================
+  # notebook — Supertable notebook WebSocket server
+  # Start with:  docker compose --profile notebook up
+  # URL:         http://localhost:8000  (or SUPERTABLE_NOTEBOOK_PORT)
+  # =====================================================================
+
+  supertable-notebook:
+    build: .
+    profiles: ["notebook"]
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE: notebook
+      SUPERTABLE_NOTEBOOK_PORT: ${SUPERTABLE_NOTEBOOK_PORT:-8000}
+
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB:   ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${SUPERTABLE_NOTEBOOK_PORT:-8000}:${SUPERTABLE_NOTEBOOK_PORT:-8000}"
+    volumes:
+      # Persist notebooks between container restarts.
+      - ./notebooks:/app/notebooks
+
+  # =====================================================================
+  # spark — Spark plug WebSocket server
+  # Start with:  docker compose --profile spark up
+  # URL:         http://localhost:8010
+  # =====================================================================
+
+  supertable-spark:
+    build: .
+    profiles: ["spark"]
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE: spark
+
+      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+
+      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
+      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8010:8010"   # Spark plug WebSocket server
 
 volumes:
   redis-data:

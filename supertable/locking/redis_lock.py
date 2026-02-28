@@ -12,6 +12,50 @@ import redis
 from supertable.config.defaults import logger
 
 
+# Lua script for atomic release: only delete if current value matches token
+_RELEASE_LUA = """
+local key = KEYS[1]
+local who_key = KEYS[2]
+local expected_token = ARGV[1]
+local current = redis.call('GET', key)
+if current == expected_token then
+    redis.call('DEL', key)
+    redis.call('DEL', who_key)
+    return 1
+end
+return 0
+"""
+
+# Lua script for atomic conditional delete (rollback): delete only if value matches
+_COND_DEL_LUA = """
+local key = KEYS[1]
+local who_key = KEYS[2]
+local expected_token = ARGV[1]
+local current = redis.call('GET', key)
+if current == expected_token then
+    redis.call('DEL', key)
+    redis.call('DEL', who_key)
+end
+return 0
+"""
+
+# Lua script for atomic heartbeat refresh: only extend TTL if token still matches
+_REFRESH_LUA = """
+local key = KEYS[1]
+local who_key = KEYS[2]
+local expected_token = ARGV[1]
+local duration = tonumber(ARGV[2])
+local identity = ARGV[3]
+local current = redis.call('GET', key)
+if current == expected_token then
+    redis.call('EXPIRE', key, duration)
+    redis.call('SET', who_key, identity, 'EX', duration)
+    return 1
+end
+return 0
+"""
+
+
 class RedisLocking:
     """
     Redis-based, multi-process safe lock manager using tokenized keys:
@@ -47,6 +91,9 @@ class RedisLocking:
         self._held: Dict[str, str] = {}  # resource -> token
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
+        self._release_script = self.redis.register_script(_RELEASE_LUA)
+        self._cond_del_script = self.redis.register_script(_COND_DEL_LUA)
+        self._refresh_script = self.redis.register_script(_REFRESH_LUA)
         atexit.register(self._on_exit)
 
     # ---------------- internals ----------------
@@ -56,8 +103,11 @@ class RedisLocking:
         return f"lock:{resource}"
 
     @staticmethod
-    def _who(resource: str) -> str:
+    def _who_key(resource: str) -> str:
         return f"lockwho:{resource}"
+
+    # Keep old name as alias for backward compatibility
+    _who = _who_key
 
     def _start_heartbeat(self, duration: int):
         self._hb_stop.clear()
@@ -75,17 +125,15 @@ class RedisLocking:
         while not self._hb_stop.is_set():
             time.sleep(interval)
             try:
-                # refresh TTL for all held
+                # refresh TTL for all held — atomically via Lua
                 for res, token in list(self._held.items()):
-                    key = self._key(res)
-                    cur = self.redis.get(key)
-                    if cur == token:
-                        # extend key + who
-                        self.redis.expire(key, duration)
-                        try:
-                            self.redis.set(self._who(res), self.identity, ex=duration)
-                        except Exception:
-                            pass
+                    try:
+                        self._refresh_script(
+                            keys=[self._key(res), self._who_key(res)],
+                            args=[token, duration, self.identity],
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug(f"[redis-lock] heartbeat error: {e}")
 
@@ -115,7 +163,7 @@ class RedisLocking:
                     try:
                         p2 = self.redis.pipeline()
                         for r in resources:
-                            p2.set(self._who(r), who or self.identity, ex=max(1, int(duration)))
+                            p2.set(self._who_key(r), who or self.identity, ex=max(1, int(duration)))
                         p2.execute()
                     except Exception:
                         pass
@@ -125,17 +173,15 @@ class RedisLocking:
                         self._start_heartbeat(duration)
                     return True
 
-                # rollback partial acquisitions
-                try:
-                    p3 = self.redis.pipeline()
-                    for r, t in tokens.items():
-                        # delete only if we hold it
-                        if self.redis.get(self._key(r)) == t:
-                            p3.delete(self._key(r))
-                            p3.delete(self._who(r))
-                    p3.execute()
-                except Exception:
-                    pass
+                # rollback partial acquisitions atomically using Lua
+                for r, t in tokens.items():
+                    try:
+                        self._cond_del_script(
+                            keys=[self._key(r), self._who_key(r)],
+                            args=[t],
+                        )
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.debug(f"[redis-lock] acquire error: {e}")
@@ -147,16 +193,18 @@ class RedisLocking:
     def release(self, resources: Iterable[str]) -> None:
         resources = [str(r) for r in resources]
         try:
-            p = self.redis.pipeline()
             for r in resources:
-                key = self._key(r)
                 tok = self._held.get(r)
-                cur = self.redis.get(key)
-                if cur and tok and cur == tok:
-                    p.delete(key)
-                    p.delete(self._who(r))
-                    self._held.pop(r, None)
-            p.execute()
+                if not tok:
+                    continue
+                try:
+                    self._release_script(
+                        keys=[self._key(r), self._who_key(r)],
+                        args=[tok],
+                    )
+                except Exception:
+                    pass
+                self._held.pop(r, None)
         finally:
             if not self._held:
                 self._stop_heartbeat()
@@ -167,7 +215,7 @@ class RedisLocking:
         try:
             p = self.redis.pipeline()
             for r in res:
-                p.get(self._who(r))
+                p.get(self._who_key(r))
             vals = p.execute()
             for r, v in zip(res, vals):
                 if v:

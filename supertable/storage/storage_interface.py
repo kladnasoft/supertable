@@ -99,8 +99,49 @@ class StorageInterface(abc.ABC):
     @abc.abstractmethod
     def read_parquet(self, path: str) -> pa.Table:
         """
-        Reads and returns JSON data from the given path.
+        Reads and returns a PyArrow Table from the given Parquet path.
         Raises FileNotFoundError, ValueError, etc. on error.
+        """
+        pass
+
+    # -------------------------
+    # Byte / text / copy operations
+    # -------------------------
+    @abc.abstractmethod
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """
+        Writes raw bytes to the given path.
+        Creates parent directories/prefixes as needed.
+        """
+        pass
+
+    @abc.abstractmethod
+    def read_bytes(self, path: str) -> bytes:
+        """
+        Reads and returns raw bytes from the given path.
+        Raises FileNotFoundError if the path does not exist.
+        """
+        pass
+
+    @abc.abstractmethod
+    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        """
+        Writes a string to the given path using the specified encoding.
+        """
+        pass
+
+    @abc.abstractmethod
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        """
+        Reads and returns text from the given path using the specified encoding.
+        Raises FileNotFoundError if the path does not exist.
+        """
+        pass
+
+    @abc.abstractmethod
+    def copy(self, src_path: str, dst_path: str) -> None:
+        """
+        Copies an object from src_path to dst_path within the same storage backend.
         """
         pass
 

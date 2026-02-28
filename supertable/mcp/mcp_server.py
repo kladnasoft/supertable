@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
-load_dotenv()
+if "_SUPERTABLE_DOTENV_LOADED" not in os.environ:
+    load_dotenv()
+    os.environ["_SUPERTABLE_DOTENV_LOADED"] = "1"
 
 # ---------- Import path: allow `from supertable.*` ----------
 # This file lives at `supertable/mcp/mcp_server.py`. When executed as a script,
@@ -202,12 +204,16 @@ def _validate_user_hash(u: str) -> str:
         raise ValueError("Invalid user_hash format (expect 32/64 hex).")
     return u.lower()
 
+_FORBIDDEN_SQL_RE = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
 def _read_only_sql(sql: str) -> None:
     s = (sql or "").strip().lower()
     if not (s.startswith("select") or s.startswith("with")):
         raise ValueError("Only SELECT (or WITH … SELECT) statements are allowed.")
-    forbidden = ("insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant", "revoke")
-    if any(tok in s for tok in forbidden):
+    if _FORBIDDEN_SQL_RE.search(s):
         raise ValueError("Statement contains write/DDL keywords. Read-only queries only.")
 
 def _clamp_limit(limit: Optional[int], default_n: int, max_n: int) -> int:
@@ -335,8 +341,9 @@ def log_tool(func):
             return out
         except Exception as exc:
             logger.exception("✖ tool %s error: %s", fn, exc)
+            # Return consistent error envelope for all tools.
+            # query_sql has a richer envelope; other tools use a simpler shape.
             if fn == "query_sql":
-                # Return consistent envelope on query errors
                 return {
                     "columns": [],
                     "rows": [],
@@ -348,7 +355,11 @@ def log_tool(func):
                     "message": f"{exc.__class__.__name__}: {exc}",
                     "columns_meta": [],
                 }
-            raise
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
     wrapper.__name__ = func.__name__
     return wrapper
 
@@ -385,14 +396,21 @@ async def whoami(user_hash: Optional[str] = None, auth_token: Optional[str] = No
 
 @mcp.tool()
 @log_tool
-async def list_supers(organization: str) -> Dict[str, Any]:
+async def list_supers(organization: str, user_hash: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
+    _check_token(auth_token)
+    _resolve_user(user_hash)
     _ensure_imports()
-    try:
-        supers = list_supers_fn(org)  # module-level helper  :contentReference[oaicite:4]{index=4}
-    except Exception as e:
-        logger.exception("list_supers failed: %s", e)
-        supers = []
+
+    def _work():
+        return list_supers_fn(org)
+
+    async with _get_limiter():
+        try:
+            supers = await anyio.to_thread.run_sync(_work)
+        except Exception as e:
+            logger.exception("list_supers failed: %s", e)
+            supers = []
     return {"result": supers}
 
 @mcp.tool()
@@ -523,17 +541,16 @@ async def query_sql(
 
     async with _get_limiter():
         try:
+            def _work():
+                return _exec_query_sync(sup, org, sql, limit_n, eng, u)
+
             if hasattr(anyio, "fail_after"):
                 with anyio.fail_after(timeout):
-                    out = await anyio.to_thread.run_sync(
-                        _exec_query_sync, sup, org, sql, limit_n, eng, u
-                    )
+                    out = await anyio.to_thread.run_sync(_work)
             else:
                 result = None
                 with anyio.move_on_after(timeout) as scope:
-                    result = await anyio.to_thread.run_sync(
-                        _exec_query_sync, sup, org, sql, limit_n, eng, u
-                    )
+                    result = await anyio.to_thread.run_sync(_work)
                 if scope.cancel_called or result is None:
                     raise TimeoutError(f"Query timed out after {timeout} sec")
                 out = result
@@ -625,4 +642,3 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.exception("Fatal error in MCP server: %s", exc)
         sys.exit(1)
-

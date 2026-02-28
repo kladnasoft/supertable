@@ -1,7 +1,9 @@
 import io
 import json
 import fnmatch
+import os
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -50,6 +52,63 @@ class GCSStorage(StorageInterface):
 
         self.bucket_name = bucket
         self.bucket = self.client.bucket(bucket)
+
+    # -------------------------
+    # Factory
+    # -------------------------
+    @classmethod
+    def from_env(cls) -> "GCSStorage":
+        """
+        Build GCSStorage from environment variables.
+
+        Recognized env:
+          - GCS_BUCKET / STORAGE_BUCKET (bucket name, default: 'supertable')
+          - GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
+          - GCP_SA_JSON (raw JSON string, alternative to file path)
+          - GCP_PROJECT (optional project override)
+        """
+        bucket = os.getenv("GCS_BUCKET") or os.getenv("STORAGE_BUCKET") or "supertable"
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        sa_json = os.getenv("GCP_SA_JSON", "")
+        project = os.getenv("GCP_PROJECT", "") or None
+
+        if creds_path and Path(creds_path).is_file():
+            client = storage.Client.from_service_account_json(creds_path, project=project)
+        elif sa_json:
+            import json as _json
+            from google.oauth2 import service_account
+            info = _json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info)
+            client = storage.Client(project=project or creds.project_id, credentials=creds)
+        else:
+            # Application Default Credentials (ADC)
+            client = storage.Client(project=project)
+
+        return cls(bucket=bucket, client=client)
+
+    # -------------------------
+    # Optional: DuckDB path / presign
+    # -------------------------
+    def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
+        """Return a GCS path usable by DuckDB (gcs:// or https:// form)."""
+        key = (key or "").lstrip("/")
+        prefer_httpfs = (
+            prefer_httpfs if prefer_httpfs is not None
+            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+        )
+        if prefer_httpfs:
+            return f"https://storage.googleapis.com/{self.bucket_name}/{key}"
+        return f"gcs://{self.bucket_name}/{key}"
+
+    def presign(self, key: str, expiry_seconds: int = 3600) -> str:
+        """Return a presigned (signed) GET URL for the object."""
+        from datetime import timedelta
+        blob = self.bucket.blob(key.lstrip("/"))
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=expiry_seconds),
+            method="GET",
+        )
 
     # -------------------------
     # Helpers

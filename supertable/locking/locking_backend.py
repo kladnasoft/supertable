@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from enum import Enum
+from typing import Optional
 
 
 class LockingBackend(Enum):
@@ -9,7 +10,7 @@ class LockingBackend(Enum):
     REDIS = "redis"
 
     @classmethod
-    def from_str(cls, value: str | None, default: "LockingBackend" = None) -> "LockingBackend":
+    def from_str(cls, value: str | None, default: Optional["LockingBackend"] = None) -> "LockingBackend":
         if not value:
             return default or cls.REDIS
         v = str(value).strip().lower()

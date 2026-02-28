@@ -71,7 +71,7 @@ class DataReader:
 
     def execute(
         self,
-        user_hash: str,
+        role_name: str,
         with_scan: bool = False,
         engine: engine = engine.AUTO,
     ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
@@ -84,7 +84,7 @@ class DataReader:
         restrict_read_access(
             super_name=self.super_name,
             organization=self.organization,
-            user_hash=user_hash,
+            role_name=role_name,
             tables=self.tables
         )
 
@@ -137,7 +137,7 @@ class DataReader:
         try:
             extend_execution_plan(
                 query_plan_manager=self.query_plan_manager,
-                user_hash=user_hash,
+                role_name=role_name,
                 timing=self.timer.timings,
                 plan_stats=self.plan_stats,
                 status=str(status.value),

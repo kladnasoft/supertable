@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 # Small in-process cache to de-duplicate bursty reflection calls.
-# Keyed by org/super/user_hash and guarded by root version.
 _SUPER_META_CACHE: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
 _SUPER_META_CACHE_LOCK = threading.Lock()
 
@@ -173,31 +172,31 @@ class MetaReader:
             logger.error(f"Error getting tables from Redis: {e}")
             return []
 
-    def get_tables(self, user_hash: str) -> List[str]:
+    def get_tables(self, role_name: str) -> List[str]:
         tables = self._get_all_tables()
         result = []
         for table in tables:
             try:
                 check_meta_access(super_name=self.super_table.super_name, organization=self.super_table.organization,
-                              user_hash=user_hash, table_name=table)
+                              role_name=role_name, table_name=table)
                 result.append(table)
             except Exception as e:
-                logger.warning(f"No permission for the user: {user_hash} to table: {table}")
+                logger.warning(f"No permission for the user: {role_name} to table: {table}")
 
         return result
 
-    def get_table_schema(self, table_name: str, user_hash: str) -> Optional[List[Dict[str, Any]]]:
+    def get_table_schema(self, table_name: str, role_name: str) -> Optional[List[Dict[str, Any]]]:
             try:
                 check_meta_access(
                     super_name=self.super_table.super_name,
                     organization=self.super_table.organization,
-                    user_hash=user_hash,
+                    role_name=role_name,
                     table_name=table_name,
                 )
             except PermissionError as e:
                 logger.warning(
                     "[get_table_schema] Access denied for user '%s' on table '%s': %s",
-                    user_hash, table_name, str(e)
+                    role_name, table_name, str(e)
                 )
                 return None
 
@@ -252,18 +251,18 @@ class MetaReader:
             distinct_schema = dict(sorted(schema_items))
             return [distinct_schema]
 
-    def collect_simple_table_schema(self, schemas: set, table_name: str, user_hash: str) -> None:
+    def collect_simple_table_schema(self, schemas: set, table_name: str, role_name: str) -> None:
         try:
             check_meta_access(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
-                user_hash=user_hash,
+                role_name=role_name,
                 table_name=table_name,
             )
         except PermissionError as e:
             logger.warning(
                 "[collect_simple_table_schema] Access denied for user '%s' on table '%s': %s",
-                user_hash, table_name, str(e)
+                role_name, table_name, str(e)
             )
             return
 
@@ -278,18 +277,18 @@ class MetaReader:
         schema_tuple = tuple(sorted(schema.items()))
         schemas.add(schema_tuple)
 
-    def get_table_stats(self, table_name: str, user_hash: str) -> List[Dict[str, Any]]:
+    def get_table_stats(self, table_name: str, role_name: str) -> List[Dict[str, Any]]:
         try:
             check_meta_access(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
-                user_hash=user_hash,
+                role_name=role_name,
                 table_name=table_name,
             )
         except PermissionError as e:
             logger.warning(
                 "[get_table_stats] Access denied for user '%s' on table '%s': %s",
-                user_hash, table_name, str(e)
+                role_name, table_name, str(e)
             )
             return []
 
@@ -319,7 +318,7 @@ class MetaReader:
 
         return stats
 
-    def get_super_meta(self, user_hash: str) -> Optional[Dict[str, Any]]:
+    def get_super_meta(self, role_name: str) -> Optional[Dict[str, Any]]:
 
         debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS", "") or "").lower() in ("1", "true", "yes", "on")
         t0 = time.perf_counter()
@@ -329,13 +328,13 @@ class MetaReader:
             check_meta_access(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
-                user_hash=user_hash,
+                role_name=role_name,
                 table_name=self.super_table.super_name,
             )
         except PermissionError as e:
             logger.warning(
                 "[get_super_meta] Access denied for user '%s' on super '%s': %s",
-                user_hash, self.super_table.super_name, str(e)
+                role_name, self.super_table.super_name, str(e)
             )
             return None
 
@@ -346,7 +345,7 @@ class MetaReader:
 
         ttl_s = _super_meta_cache_ttl_s()
         root_version = (root or {}).get("version", 0) if isinstance(root, dict) else 0
-        cache_key = f"{self.super_table.organization}:{self.super_table.super_name}:{user_hash}"
+        cache_key = f"{self.super_table.organization}:{self.super_table.super_name}:{role_name}"
         if ttl_s > 0:
             now = time.monotonic()
             with _SUPER_META_CACHE_LOCK:
@@ -357,7 +356,7 @@ class MetaReader:
                     t_end = time.perf_counter()
                     if debug_timings:
                         logger.info(
-                            "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s user_hash=%s cache_hit=1",
+                            "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s role_name=%s cache_hit=1",
                             (t_end - t0) * 1000.0,
                             (t_access - t0) * 1000.0,
                             (t_root - t_access) * 1000.0,
@@ -370,7 +369,7 @@ class MetaReader:
                             "",
                             self.super_table.organization,
                             self.super_table.super_name,
-                            user_hash[:12],
+                            role_name[:12],
                         )
                     return cached_result
 
@@ -465,7 +464,7 @@ class MetaReader:
         t_end = time.perf_counter()
         if debug_timings:
             logger.info(
-                "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s user_hash=%s cache_hit=0",
+                "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s role_name=%s cache_hit=0",
                 (t_end - t0) * 1000.0,
                 (t_access - t0) * 1000.0,
                 (t_root - t_access) * 1000.0,
@@ -478,7 +477,7 @@ class MetaReader:
                 max_snapshot_table,
                 self.super_table.organization,
                 self.super_table.super_name,
-                user_hash[:12],
+                role_name[:12],
             )
 
         return result

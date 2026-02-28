@@ -16,7 +16,13 @@ handler.setFormatter(colorlog.ColoredFormatter(
 logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger(__name__)
 
-@dataclass
+# ---------- .env discovery cache ----------
+_env_loaded: bool = False
+_env_path_cache: str | None = None
+
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+@dataclass(slots=True)
 class Default:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024
     MAX_OVERLAPPING_FILES: int = 100
@@ -42,19 +48,38 @@ def _parse_bool(val: str, default: bool = True) -> bool:
         return default
     return val.strip().lower() in ("1","true","yes","y","on")
 
-def _load_env(env_file: str | None, prefer_system: bool) -> str | None:
+def _load_env(env_file: str | None, prefer_system: bool, force: bool = False) -> str | None:
     """
     Returns the path of the .env that was loaded (or None).
     prefer_system=True  -> .env fills missing keys only (override=False)
     prefer_system=False -> .env can override system env (override=True)
+
+    Caches the result of find_dotenv() to avoid repeated filesystem walks.
+    Pass force=True to bypass the cache (used by refresh_defaults).
     """
-    # If a specific env_file path is not given, try to discover one up the tree
-    path = env_file if env_file else find_dotenv(usecwd=True)
+    global _env_loaded, _env_path_cache
+
+    if _env_loaded and not force:
+        logger.debug(".env already loaded (cached), skipping discovery.")
+        return _env_path_cache
+
+    # Resolve path: explicit > cached > discover via find_dotenv
+    if env_file:
+        path = env_file
+    elif _env_path_cache is not None and not force:
+        path = _env_path_cache
+    else:
+        path = find_dotenv(usecwd=True)
+
     if path and os.path.isfile(path):
         load_dotenv(path, override=not prefer_system)
+        _env_loaded = True
+        _env_path_cache = path
         logger.debug(f".env loaded from: {path} (override={'off' if prefer_system else 'on'})")
         return path
     else:
+        _env_loaded = True
+        _env_path_cache = None
         logger.info(".env not found (skipped). Working dir: %s", os.getcwd())
         return None
 
@@ -62,7 +87,7 @@ def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = Tr
     _load_env(env_file, prefer_system=prefer_system)
 
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    if log_level not in {"DEBUG","INFO","WARNING","ERROR","CRITICAL"}:
+    if log_level not in _VALID_LOG_LEVELS:
         logger.warning(f"Invalid LOG_LEVEL={log_level!r}. Falling back to INFO.")
         log_level = "INFO"
     logging.getLogger().setLevel(log_level)
@@ -82,6 +107,7 @@ default = load_defaults_from_env(prefer_system=True)
 
 def refresh_defaults(env_file: str | None = None, prefer_system: bool = True) -> None:
     global default
+    _load_env(env_file, prefer_system=prefer_system, force=True)
     default = load_defaults_from_env(env_file=env_file, prefer_system=prefer_system)
     logger.info(f"Defaults refreshed. STORAGE_TYPE={default.STORAGE_TYPE}, LOG_LEVEL={default.LOG_LEVEL}")
 
@@ -96,7 +122,7 @@ def print_config() -> None:
     for k in keys:
         v = os.getenv(k)
         if k == "AWS_SECRET_ACCESS_KEY" and v:
-            v = v[:4] + "****" + v[-2:]
+            v = "****" + v[-4:] if len(v) > 4 else "****"
         logger.info(f"{k} = {v}")
     logger.info(
         f"(defaults) STORAGE_TYPE={default.STORAGE_TYPE}, "

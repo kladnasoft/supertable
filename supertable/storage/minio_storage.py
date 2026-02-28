@@ -12,6 +12,8 @@ from datetime import timedelta
 import pyarrow as pa
 import pyarrow.parquet as pq
 from minio import Minio
+from minio.commonconfig import CopySource
+from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
 from supertable.storage.storage_interface import StorageInterface
@@ -30,6 +32,10 @@ class MinioStorage(StorageInterface):
         self.region: Optional[str] = None
         self.url_style: str = "path"  # DuckDB: 'path' | 'vhost'
         self.secure: bool = False     # whether endpoint_url is https
+        # Stored for safe client rebuilds without re-reading env
+        self._endpoint: Optional[str] = None
+        self._access_key: Optional[str] = None
+        self._secret_key: Optional[str] = None
 
     @staticmethod
     def _build_client(endpoint: str, access_key: str, secret_key: str, region: Optional[str]) -> Minio:
@@ -86,13 +92,14 @@ class MinioStorage(StorageInterface):
                     raise
 
     def _rebuild_with_region(self, region: str) -> Minio:
-        endpoint_url = os.getenv("STORAGE_ENDPOINT_URL")
-        access_key = os.getenv("STORAGE_ACCESS_KEY")
-        secret_key = os.getenv("STORAGE_SECRET_KEY")
+        endpoint_url = self._endpoint
+        access_key = self._access_key
+        secret_key = self._secret_key
         if not (endpoint_url and access_key and secret_key):
             raise RuntimeError(
-                "Cannot rebuild MinIO client with region: missing STORAGE_ENDPOINT_URL / STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY"
+                "Cannot rebuild MinIO client with region: credentials were not stored at construction time"
             )
+        self.region = region
         return self._build_client(endpoint_url, access_key, secret_key, region)
 
     @classmethod
@@ -101,10 +108,7 @@ class MinioStorage(StorageInterface):
         endpoint = os.getenv("STORAGE_ENDPOINT_URL")
         access_key = os.getenv("STORAGE_ACCESS_KEY")
         secret_key = os.getenv("STORAGE_SECRET_KEY")
-        region = (
-            os.getenv("STORAGE_REGION")
-            or None
-        )
+        region = os.getenv("STORAGE_REGION") or None
         if not endpoint or not access_key or not secret_key:
             raise RuntimeError(
                 "MinIO environment incomplete. "
@@ -118,8 +122,13 @@ class MinioStorage(StorageInterface):
         storage.endpoint_url = endpoint
         storage.region = region
         storage.secure = parsed.scheme == "https"
+        # Store credentials on instance for safe rebuilds
+        storage._endpoint = endpoint
+        storage._access_key = access_key
+        storage._secret_key = secret_key
+
         force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
-        storage.url_style = "path" if force_path_style else "path"
+        storage.url_style = "path" if force_path_style else "vhost"
 
         storage._ensure_bucket_exists(bucket, region)
         return storage
@@ -149,6 +158,18 @@ class MinioStorage(StorageInterface):
 
     # ---------- low-level helpers ----------
 
+    def _get_object_safe(self, path: str) -> bytes:
+        """
+        Download an object and guarantee the HTTP response is closed/released,
+        even if .read() raises mid-stream (network timeout, corrupt data, etc.).
+        """
+        resp = self.client.get_object(self.bucket_name, path)
+        try:
+            return resp.read()
+        finally:
+            resp.close()
+            resp.release_conn()
+
     def _object_exists(self, key: str) -> bool:
         try:
             self.client.stat_object(self.bucket_name, key)
@@ -164,14 +185,15 @@ class MinioStorage(StorageInterface):
     def _child_names_one_level(self, prefix: str) -> List[str]:
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
-        children, seen = [], set()
+        children: List[str] = []
+        seen: set = set()
         for obj in self._list_objects(prefix, recursive=False):
             key = obj.object_name
             if not key.startswith(prefix):
                 continue
             suffix = key[len(prefix):]
             part = suffix.split("/", 1)[0]
-            if part not in seen:
+            if part and part not in seen:
                 seen.add(part)
                 children.append(part)
         return children
@@ -180,10 +202,7 @@ class MinioStorage(StorageInterface):
 
     def read_json(self, path: str) -> Dict[str, Any]:
         try:
-            resp = self.client.get_object(self.bucket_name, path)
-            data = resp.read()
-            resp.close()
-            resp.release_conn()
+            data = self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
@@ -199,10 +218,11 @@ class MinioStorage(StorageInterface):
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        buf = io.BytesIO(payload)
         self.client.put_object(
             self.bucket_name,
             path,
-            data=io.BytesIO(payload),
+            data=buf,
             length=len(payload),
             content_type="application/json",
         )
@@ -241,16 +261,27 @@ class MinioStorage(StorageInterface):
             self.client.remove_object(self.bucket_name, path)
             return
         prefix = path if path.endswith("/") else f"{path}/"
-        to_delete = [obj.object_name for obj in self._list_objects(prefix, recursive=True)]
-        if not to_delete:
+        # Stream object names into a generator — no full list materialised in memory.
+        # The minio SDK handles batching internally via remove_objects().
+        obj_iter = self._list_objects(prefix, recursive=True)
+        # Peek to check if there is anything to delete
+        first = next(obj_iter, None)
+        if first is None:
             raise FileNotFoundError(f"File or folder not found: {path}")
-        for key in to_delete:
-            self.client.remove_object(self.bucket_name, key)
+
+        import itertools
+        all_objs = itertools.chain([first], obj_iter)
+        delete_stream = (DeleteObject(obj.object_name) for obj in all_objs)
+        errors = list(self.client.remove_objects(self.bucket_name, delete_stream))
+        if errors:
+            raise RuntimeError(
+                f"Failed to delete {len(errors)} object(s) under {path}: {errors[0].message}"
+            )
 
     # ---------- directory structure ----------
 
     def get_directory_structure(self, path: str) -> dict:
-        root = {}
+        root: Dict[str, Any] = {}
         if path and not path.endswith("/"):
             path = path + "/"
         for obj in self._list_objects(path, recursive=True):
@@ -272,21 +303,19 @@ class MinioStorage(StorageInterface):
     def write_parquet(self, table: pa.Table, path: str) -> None:
         buf = io.BytesIO()
         pq.write_table(table, buf)
-        data = buf.getvalue()
+        length = buf.tell()
+        buf.seek(0)
         self.client.put_object(
             self.bucket_name,
             path,
-            data=io.BytesIO(data),
-            length=len(data),
+            data=buf,
+            length=length,
             content_type="application/octet-stream",
         )
 
     def read_parquet(self, path: str) -> pa.Table:
         try:
-            resp = self.client.get_object(self.bucket_name, path)
-            data = resp.read()
-            resp.close()
-            resp.release_conn()
+            data = self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"Parquet file not found: {path}") from e
@@ -299,21 +328,18 @@ class MinioStorage(StorageInterface):
     # ---------- bytes / text / copy ----------
 
     def write_bytes(self, path: str, data: bytes) -> None:
+        buf = io.BytesIO(data)
         self.client.put_object(
             self.bucket_name,
             path,
-            data=io.BytesIO(data),
+            data=buf,
             length=len(data),
             content_type="application/octet-stream",
         )
 
     def read_bytes(self, path: str) -> bytes:
         try:
-            resp = self.client.get_object(self.bucket_name, path)
-            data = resp.read()
-            resp.close()
-            resp.release_conn()
-            return data
+            return self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
@@ -329,5 +355,5 @@ class MinioStorage(StorageInterface):
         self.client.copy_object(
             bucket_name=self.bucket_name,
             object_name=dst_path,
-            source=f"/{self.bucket_name}/{src_path}",
+            source=CopySource(self.bucket_name, src_path),
         )

@@ -150,7 +150,7 @@ async def home(req: Request) -> str:
       <input id="hash" placeholder="32/64 hex"/>
 
       <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/list_supers', {organization: val('org')})">list_supers</button>
+        <button onclick="postJson('/api/list_supers', {organization: val('org'), user_hash: val('hash')})">list_supers</button>
         <button onclick="postJson('/api/list_tables', {organization: val('org'), super_name: val('super'), user_hash: val('hash')})">list_tables</button>
       </div>
 
@@ -270,11 +270,17 @@ async def mcp_http_gateway_v1(req: Request, payload: Dict[str, Any] = Body(...))
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="JSON-RPC params must be an object")
 
-    # Convenience: allow passing user hash via header for tools/call requests.
+    # Convenience: inject auth_token and user_hash from headers for tools/call requests.
+    # - Authorization: Bearer <token>  -> tool auth_token (if not provided)
+    # - X-User-Hash: <hash>            -> tool user_hash (if not provided)
+    bearer = _parse_bearer(req.headers.get("authorization", ""))
     header_user_hash = (req.headers.get("x-user-hash") or "").strip()
-    if header_user_hash and method == "tools/call":
-        if isinstance(params.get("arguments"), dict) and not (params["arguments"].get("user_hash") or "").strip():
-            params["arguments"]["user_hash"] = header_user_hash
+    if method == "tools/call" and isinstance(params.get("arguments"), dict):
+        args = params["arguments"]
+        if bearer and not args.get("auth_token"):
+            args["auth_token"] = bearer
+        if header_user_hash and not args.get("user_hash"):
+            args["user_hash"] = header_user_hash
 
     c = _client_or_raise()
     try:
@@ -364,10 +370,11 @@ async def mcp_http_gateway(req: Request, body: Dict[str, Any] = Body(...)) -> JS
 async def api_list_supers(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     _require_gateway_auth(req)
     org = (payload.get("organization") or "").strip()
+    u = (payload.get("user_hash") or "").strip()
     if not org:
         raise HTTPException(status_code=400, detail="organization required")
     c = _client_or_raise()
-    resp = await c.tool("list_supers", {"organization": org})
+    resp = await c.tool("list_supers", {"organization": org, "user_hash": u})
     return JSONResponse(resp)
 
 @app.post("/api/list_tables")

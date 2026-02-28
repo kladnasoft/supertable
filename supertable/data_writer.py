@@ -32,7 +32,7 @@ class DataWriter:
 
     timer = Timer()
 
-    def write(self, user_hash, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False):
+    def write(self, role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False):
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
@@ -62,7 +62,7 @@ class DataWriter:
             check_write_access(
                  super_name=self.super_table.super_name,
                  organization=self.super_table.organization,
-                 user_hash=user_hash,
+                 role_name=role_name,
                  table_name=simple_name,
             )
             mark("access")

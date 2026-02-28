@@ -87,7 +87,6 @@ class S3Storage(StorageInterface):
                 or None
         )
         endpoint = os.getenv("STORAGE_ENDPOINT_URL") or None
-
         access_key = os.getenv("STORAGE_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID") or None
         secret_key = os.getenv("STORAGE_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY") or None
         session_token = os.getenv("AWS_SESSION_TOKEN") or None
@@ -95,40 +94,12 @@ class S3Storage(StorageInterface):
         force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
         url_style = "path" if force_path_style else "vhost"
 
-        if endpoint and "://" not in endpoint:
-            endpoint = "https://" + endpoint
-
-        if endpoint:
-            # Normalize bucket-prefixed AWS endpoints like https://<bucket>.s3.amazonaws.com
-            try:
-                parsed_ep = urlparse(endpoint)
-                host_ep = parsed_ep.netloc
-                if host_ep.startswith(f"{bucket}."):
-                    endpoint = f"{parsed_ep.scheme}://{host_ep[len(bucket) + 1:]}"
-            except Exception:
-                pass
-
-        config = Config(s3={"addressing_style": "path" if force_path_style else "virtual"})
-        client = boto3.client(
-            "s3",
-            region_name=region or None,
-            endpoint_url=endpoint or None,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            aws_session_token=session_token,
-            config=config,
-        )
-
-        parsed = urlparse(endpoint or getattr(client.meta, "endpoint_url", "") or "")
-        secure = parsed.scheme != "http"
-
+        # Let __init__ handle endpoint normalisation, client creation, and secure detection
         return cls(
             bucket_name=bucket,
-            client=client,
-            endpoint_url=endpoint or getattr(client.meta, "endpoint_url", None),
-            region=region or getattr(client.meta, "region_name", None),
+            endpoint_url=endpoint,
+            region=region,
             url_style=url_style,
-            secure=secure,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             aws_session_token=session_token,
@@ -416,6 +387,18 @@ class S3Storage(StorageInterface):
                 return False
             raise
 
+    def _get_object_safe(self, path: str) -> bytes:
+        """
+        Download an object and guarantee the StreamingBody is closed,
+        even if .read() raises mid-stream (network timeout, corrupt data, etc.).
+        """
+        resp = self._call("get_object", Bucket=self.bucket_name, Key=path)
+        body = resp["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
+
     def _list_common_prefixes_and_objects_one_level(self, prefix: str) -> List[str]:
         """
         Return immediate child names under prefix using Delimiter="/".
@@ -430,8 +413,8 @@ class S3Storage(StorageInterface):
             Bucket=self.bucket_name, Prefix=prefix, Delimiter="/"
         )
 
-        children = []
-        seen = set()
+        children: List[str] = []
+        seen: set = set()
 
         for page in page_it:
             for cp in page.get("CommonPrefixes", []):
@@ -459,21 +442,18 @@ class S3Storage(StorageInterface):
     def read_json(self, path: str) -> Dict[str, Any]:
         self._ensure_bucket_region()
         try:
-            resp = self._call("get_object", Bucket=self.bucket_name, Key=path)
+            data = self._get_object_safe(path)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
-        data = resp["Body"].read()
         if len(data) == 0:
             raise ValueError(f"File is empty: {path}")
         try:
             return json.loads(data)
         except json.JSONDecodeError as je:
             raise ValueError(f"Invalid JSON in {path}") from je
-
-        # unreachable
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         self._ensure_bucket_region()
@@ -530,34 +510,42 @@ class S3Storage(StorageInterface):
             self._call("delete_object", Bucket=self.bucket_name, Key=path)
             return
 
-        # prefix recursive
+        # prefix recursive — stream pages and delete in batches as they arrive;
+        # never accumulate all keys in memory.
         prefix = path if path.endswith("/") else f"{path}/"
 
         self._ensure_bucket_region()
         paginator = self.client.get_paginator("list_objects_v2")
         page_it = paginator.paginate(Bucket=self.bucket_name, Prefix=prefix)
 
-        keys = []
+        found_any = False
+        batch: List[Dict[str, str]] = []
+
         for page in page_it:
             for obj in page.get("Contents", []):
-                keys.append({"Key": obj["Key"]})
+                found_any = True
+                batch.append({"Key": obj["Key"]})
+                if len(batch) >= 1000:
+                    self._call("delete_objects",
+                               Bucket=self.bucket_name,
+                               Delete={"Objects": batch, "Quiet": True},
+                               )
+                    batch = []
 
-        if not keys:
-            raise FileNotFoundError(f"File or folder not found: {path}")
-
-        # Batch delete in chunks of 1000 (S3 limit)
-        for i in range(0, len(keys), 1000):
-            chunk = keys[i:i + 1000]
+        if batch:
             self._call("delete_objects",
                        Bucket=self.bucket_name,
-                       Delete={"Objects": chunk, "Quiet": True},
+                       Delete={"Objects": batch, "Quiet": True},
                        )
+
+        if not found_any:
+            raise FileNotFoundError(f"File or folder not found: {path}")
 
     # -------------------------
     # Directory structure
     # -------------------------
     def get_directory_structure(self, path: str) -> dict:
-        root = {}
+        root: Dict[str, Any] = {}
         if path and not path.endswith("/"):
             path = path + "/"
 
@@ -590,24 +578,23 @@ class S3Storage(StorageInterface):
         self._ensure_bucket_region()
         buf = io.BytesIO()
         pq.write_table(table, buf)
-        data = buf.getvalue()
+        buf.seek(0)
         self._call("put_object",
                    Bucket=self.bucket_name,
                    Key=path,
-                   Body=data,
+                   Body=buf,
                    ContentType="application/octet-stream",
                    )
 
     def read_parquet(self, path: str) -> pa.Table:
         self._ensure_bucket_region()
         try:
-            resp = self._call("get_object", Bucket=self.bucket_name, Key=path)
+            data = self._get_object_safe(path)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
                 raise FileNotFoundError(f"Parquet file not found: {path}") from e
             raise
-        data = resp["Body"].read()
         try:
             return pq.read_table(io.BytesIO(data))
         except Exception as e:
@@ -625,8 +612,7 @@ class S3Storage(StorageInterface):
     def read_bytes(self, path: str) -> bytes:
         self._ensure_bucket_region()
         try:
-            resp = self._call("get_object", Bucket=self.bucket_name, Key=path)
-            return resp["Body"].read()
+            return self._get_object_safe(path)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):

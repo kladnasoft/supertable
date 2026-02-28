@@ -12,7 +12,7 @@ def main():
 
     while True:
         try:
-            history_cleaner.clean(user_hash=user_hash)
+            history_cleaner.clean(role_name=user_hash)
             print("[INFO] History cleaned successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to clean history: {e}")

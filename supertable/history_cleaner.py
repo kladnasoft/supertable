@@ -33,7 +33,7 @@ class HistoryCleaner:
 
     # --------------------------------------------------------------------- main
 
-    def clean(self, user_hash: str) -> None:
+    def clean(self, role_name: str) -> None:
         """
         Perform cleanup for:
           1) Legacy files possibly under the SuperTable folder (if any).
@@ -43,7 +43,7 @@ class HistoryCleaner:
         check_write_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
-            user_hash=user_hash,
+            role_name=role_name,
             table_name=self.super_table.super_name,
         )
 

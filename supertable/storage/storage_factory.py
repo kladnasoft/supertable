@@ -80,6 +80,9 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     if storage_type in ("GCS", "GCP"):
         _require("google.cloud.storage", "gcp")
         mod = importlib.import_module("supertable.storage.gcp_storage")
-        return getattr(mod, "GCSStorage")(**kwargs)
+        GCSStorage = getattr(mod, "GCSStorage")
+        if kwargs:
+            return GCSStorage(**kwargs)
+        return GCSStorage.from_env()
 
     raise ValueError(f"Unknown storage type: {storage_type}")
