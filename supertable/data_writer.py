@@ -29,8 +29,68 @@ class DataWriter:
     def __init__(self, super_name: str, organization: str):
         self.super_table = SuperTable(super_name, organization)
         self.catalog = RedisCatalog()
+        self._table_config_cache: dict = {}
 
     timer = Timer()
+
+    # ---- Table configuration (dedup-on-read) --------------------------------
+
+    def configure_table(
+            self,
+            role_name: str,
+            simple_name: str,
+            primary_keys: list,
+            dedup_on_read: bool = False,
+    ) -> None:
+        """Set table-level configuration for dedup-on-read behaviour.
+
+        This is a one-time (or infrequent) operation.  The configuration is
+        persisted in Redis so the read side can build the dedup view, and
+        cached locally so subsequent ``write()`` calls can inject
+        ``__timestamp__`` without an extra Redis round-trip.
+
+        Args:
+            role_name: RBAC role performing the configuration.
+            simple_name: Name of the SimpleTable to configure.
+            primary_keys: Column names that form the logical primary key.
+            dedup_on_read: When True, the read side wraps queries with a
+                ROW_NUMBER window to return only the latest row per key.
+        """
+        check_write_access(
+            super_name=self.super_table.super_name,
+            organization=self.super_table.organization,
+            role_name=role_name,
+            table_name=simple_name,
+        )
+
+        if not isinstance(primary_keys, list) or not primary_keys:
+            raise ValueError("primary_keys must be a non-empty list of column names")
+
+        config = {
+            "primary_keys": primary_keys,
+            "dedup_on_read": bool(dedup_on_read),
+        }
+
+        self.catalog.set_table_config(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+            config,
+        )
+
+        # Update local cache so the next write() sees it immediately
+        self._table_config_cache[simple_name] = config
+
+    def _get_table_config(self, simple_name: str) -> dict:
+        """Return table config from local cache, falling back to Redis once."""
+        if simple_name not in self._table_config_cache:
+            config = self.catalog.get_table_config(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
+            self._table_config_cache[simple_name] = config or {}
+        return self._table_config_cache[simple_name]
 
     def write(self, role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False):
         """
@@ -70,6 +130,15 @@ class DataWriter:
             # --- Convert input -------------------------------------------------
             dataframe: DataFrame = polars.from_arrow(data)
             mark("convert")
+
+            # --- Dedup-on-read: inject __timestamp__ if needed -----------------
+            table_config = self._get_table_config(simple_name)
+            if table_config.get("dedup_on_read"):
+                if "__timestamp__" not in dataframe.columns:
+                    dataframe = dataframe.with_columns(
+                        polars.lit(datetime.now(timezone.utc)).alias("__timestamp__")
+                    )
+            mark("dedup_ts")
 
             # --- Validate ------------------------------------------------------
             self.validation(dataframe, simple_name, overwrite_columns, newer_than, delete_only)
@@ -227,7 +296,7 @@ class DataWriter:
                 lp(
                     "Timing(s): "
                     f"total={total_duration:.3f} | "
-                    f"convert={timings.get('convert', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
+                    f"convert={timings.get('convert', 0):.3f} | dedup_ts={timings.get('dedup_ts', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
                     f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
                     f"overlap={timings.get('overlap', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
                     f"process={timings.get('process', 0):.3f} | "

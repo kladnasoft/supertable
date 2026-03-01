@@ -153,6 +153,11 @@ def _stage_lock_key(org: str, sup: str, stage_name: str) -> str:
     return f"supertable:{org}:{sup}:lock:stage:{stage_name}"
 
 
+def _table_config_key(org: str, sup: str, simple: str) -> str:
+    """Per-table configuration (dedup mode, primary keys, etc.)."""
+    return f"supertable:{org}:{sup}:meta:table_config:{simple}"
+
+
 class RedisCatalog:
     """
     Redis-backed catalog for SuperTable:
@@ -1479,3 +1484,53 @@ return 1
 
         candidates.sort(key=sort_key)
         return candidates[0]
+
+    # ========================================================================= #
+    # Table configuration (dedup-on-read, primary keys, etc.)
+    # ========================================================================= #
+
+    def set_table_config(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            config: Dict[str, Any],
+    ) -> bool:
+        """Store per-table configuration (primary keys, dedup mode, etc.).
+
+        The config dict is stored as a JSON string under a dedicated key.
+        Existing config is fully replaced (last-write-wins).
+        """
+        if not (org and sup and simple):
+            return False
+        try:
+            doc = dict(config)
+            doc["modified_ms"] = _now_ms()
+            self.r.set(
+                _table_config_key(org, sup, simple),
+                json.dumps(doc, default=str),
+            )
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] set_table_config error: {e}")
+            return False
+
+    def get_table_config(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve per-table configuration.
+
+        Returns None if no config has been set for this table.
+        """
+        if not (org and sup and simple):
+            return None
+        try:
+            raw = self.r.get(_table_config_key(org, sup, simple))
+            if raw:
+                return json.loads(raw)
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] get_table_config error: {e}")
+        return None

@@ -12,7 +12,7 @@ import pandas as pd
 from supertable.config.defaults import logger
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
-from supertable.data_classes import Reflection, RbacViewDef
+from supertable.data_classes import Reflection, RbacViewDef, DedupViewDef
 from supertable.redis_catalog import RedisCatalog
 
 from supertable.engine.engine_common import (
@@ -114,6 +114,54 @@ def _spark_create_rbac_view(
     sql = (
         f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
         f"SELECT {select_cols} FROM {base_table_name}{where_sql}"
+    )
+    cursor.execute(sql)
+
+
+def _spark_create_dedup_view(
+        cursor,
+        source_table: str,
+        view_name: str,
+        dedup_def: DedupViewDef,
+) -> None:
+    """Create a dedup-on-read view on top of a Spark table or RBAC view.
+
+    Uses ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY <ts> DESC) to keep
+    only the latest row per primary key.  Only visible_columns are projected
+    so that internal columns (__timestamp__, extra PKs, __rn__) are hidden.
+    """
+    pk_cols = ", ".join(f"`{c}`" for c in dedup_def.primary_keys)
+    order_col = f"`{dedup_def.order_column}`"
+
+    visible = dedup_def.visible_columns
+    if not visible or visible == ["*"]:
+        # Spark has no EXCLUDE syntax.  Query the source schema to build
+        # an explicit column list that omits __rn__ and __timestamp__.
+        hidden = {"__rn__", dedup_def.order_column}
+        try:
+            cursor.execute(f"DESCRIBE {source_table}")
+            src_cols = [row[0] for row in cursor.fetchall()]
+            keep = [c for c in src_cols if c not in hidden]
+        except Exception:
+            # Fallback: can't introspect — expose everything including __timestamp__.
+            # __rn__ is still filtered via the WHERE clause so it won't appear,
+            # but __timestamp__ will be visible.  Acceptable degraded behaviour.
+            keep = []
+
+        if keep:
+            outer_select = ", ".join(f"sub.`{c}`" for c in keep)
+        else:
+            outer_select = "sub.*"
+    else:
+        outer_select = ", ".join(f"sub.`{c}`" for c in visible)
+
+    sql = (
+        f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
+        f"SELECT {outer_select} FROM ("
+        f"SELECT *, ROW_NUMBER() OVER ("
+        f"PARTITION BY {pk_cols} ORDER BY {order_col} DESC"
+        f") AS __rn__ FROM {source_table}"
+        f") sub WHERE sub.__rn__ = 1"
     )
     cursor.execute(sql)
 
@@ -304,6 +352,20 @@ class SparkThriftExecutor:
                         _spark_create_rbac_view(cursor, table_name, view_name, view_def)
                         created_views.append(view_name)
                         query_alias_to_name[alias] = view_name
+
+            # 5b. Create dedup views if dedup-on-read is configured
+            dedup_views = getattr(reflection, "dedup_views", None) or {}
+            if dedup_views:
+                if not rbac_views:
+                    query_suffix = uuid.uuid4().hex[:8]
+                for alias in list(query_alias_to_name.keys()):
+                    dedup_def = dedup_views.get(alias)
+                    if dedup_def:
+                        source = query_alias_to_name[alias]
+                        dedup_view = f"dedup_{source}_{query_suffix}"
+                        _spark_create_dedup_view(cursor, source, dedup_view, dedup_def)
+                        created_views.append(dedup_view)
+                        query_alias_to_name[alias] = dedup_view
 
             # 6. Rewrite and execute
             executing_query = _spark_rewrite_query(

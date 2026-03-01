@@ -24,6 +24,7 @@ from supertable.engine.engine_common import (
     rewrite_query_with_hashed_tables,
     init_connection,
     create_rbac_view,
+    create_dedup_view,
     rbac_view_name,
 )
 
@@ -314,6 +315,23 @@ class DuckDBPinned:
                         rbac_view_names.append(view)
                         query_alias_to_name[alias] = view
 
+            # Create per-query dedup views if dedup-on-read is configured
+            dedup_views = getattr(reflection, "dedup_views", None) or {}
+            dedup_view_names: List[str] = []
+            if dedup_views:
+                if not rbac_views:
+                    import uuid as _uuid
+                    query_suffix = _uuid.uuid4().hex[:8]
+                for alias in list(query_alias_to_name.keys()):
+                    dedup_def = dedup_views.get(alias)
+                    if dedup_def:
+                        source = query_alias_to_name[alias]
+                        view = f"dedup_{source}_{query_suffix}"
+                        with self._lock:
+                            create_dedup_view(con, source, view, dedup_def)
+                        dedup_view_names.append(view)
+                        query_alias_to_name[alias] = view
+
             executing_query = rewrite_query_with_hashed_tables(
                 parser.original_query, query_alias_to_name,
             )
@@ -331,6 +349,15 @@ class DuckDBPinned:
             if rbac_view_names:
                 with self._lock:
                     for view in rbac_view_names:
+                        try:
+                            con.execute(f"DROP VIEW IF EXISTS {view};")
+                        except Exception:
+                            pass
+
+            # Drop per-query dedup views
+            if dedup_view_names:
+                with self._lock:
+                    for view in dedup_view_names:
                         try:
                             con.execute(f"DROP VIEW IF EXISTS {view};")
                         except Exception:

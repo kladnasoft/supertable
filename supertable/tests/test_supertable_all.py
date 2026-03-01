@@ -540,7 +540,7 @@ class TestProcessFilesWithOverlap:
         new_resources: list = []
         sunset_files: set = set()
 
-        deleted, result_merged, total_rows = process_files_with_overlap(
+        deleted, result_merged, total_rows, _skipped = process_files_with_overlap(
             data_dir="/tmp",
             deleted=0,
             df=df,
@@ -573,7 +573,7 @@ class TestProcessFilesWithOverlap:
         new_resources: list = []
         sunset_files: set = set()
 
-        deleted, result_merged, total_rows = process_files_with_overlap(
+        deleted, result_merged, total_rows, _skipped = process_files_with_overlap(
             data_dir="/tmp",
             deleted=0,
             df=df,

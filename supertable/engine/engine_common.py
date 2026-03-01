@@ -416,3 +416,54 @@ def create_rbac_view(
 def rbac_view_name(base_table_name: str) -> str:
     """Generate the RBAC view name for a given reflection table."""
     return f"rbac_{base_table_name}"
+
+
+# =========================================================
+# Dedup-on-read view creation
+# =========================================================
+
+def create_dedup_view(
+        con: duckdb.DuckDBPyConnection,
+        source_table: str,
+        view_name: str,
+        dedup_def,
+) -> None:
+    """
+    Create a dedup view on top of a reflection table (or RBAC view).
+
+    The view uses ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY <ts> DESC)
+    to keep only the latest row per primary key combination.
+
+    Only ``visible_columns`` are projected in the outer SELECT so that
+    internal columns (__timestamp__, extra PKs, __rn__) are hidden from
+    the user query.  If visible_columns is empty or ["*"], all columns
+    from the source are exposed except __rn__.
+
+    Args:
+        con: DuckDB connection
+        source_table: the underlying table or view to dedup
+        view_name: the view name to create
+        dedup_def: DedupViewDef with primary_keys, order_column, visible_columns
+    """
+    pk_cols = ", ".join(quote_if_needed(c) for c in dedup_def.primary_keys)
+    order_col = quote_if_needed(dedup_def.order_column)
+
+    # Determine which columns to expose
+    visible = dedup_def.visible_columns
+    if not visible or visible == ["*"]:
+        # Expose all source columns except internal dedup columns.
+        # DuckDB EXCLUDE removes them from SELECT *.
+        exclude_cols = "__rn__, " + quote_if_needed(dedup_def.order_column)
+        outer_select = f"* EXCLUDE ({exclude_cols})"
+    else:
+        outer_select = ", ".join(quote_if_needed(c) for c in visible)
+
+    sql = (
+        f"CREATE OR REPLACE VIEW {view_name} AS "
+        f"SELECT {outer_select} FROM ("
+        f"SELECT *, ROW_NUMBER() OVER ("
+        f"PARTITION BY {pk_cols} ORDER BY {order_col} DESC"
+        f") AS __rn__ FROM {source_table}"
+        f") sub WHERE __rn__ = 1;"
+    )
+    con.execute(sql)

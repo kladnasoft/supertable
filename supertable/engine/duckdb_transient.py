@@ -19,6 +19,7 @@ from supertable.engine.engine_common import (
     rewrite_query_with_hashed_tables,
     init_connection,
     create_rbac_view,
+    create_dedup_view,
     rbac_view_name,
 )
 
@@ -64,18 +65,36 @@ class DuckDBTransient:
             alias_to_files = {}
             alias_to_columns = {}
 
+            # Dedup config: may require extra columns in the reflection table
+            dedup_views = getattr(reflection, "dedup_views", None) or {}
+
             for td in table_defs:
                 key = (td.super_name, td.simple_name)
                 sup = snapshots_by_key.get(key)
                 if not sup:
                     continue
 
+                cols = list(td.columns or [])
+
+                # For dedup tables in transient mode, the reflection table must
+                # include the PK columns and __timestamp__ even if the user did
+                # not SELECT them, because the dedup window function needs them.
+                dedup_def = dedup_views.get(td.alias)
+                if dedup_def and cols:
+                    extra = []
+                    for c in dedup_def.primary_keys:
+                        if c.lower() not in {x.lower() for x in cols}:
+                            extra.append(c)
+                    if dedup_def.order_column.lower() not in {x.lower() for x in cols}:
+                        extra.append(dedup_def.order_column)
+                    cols = cols + extra
+
                 name = hashed_table_name(
-                    sup.super_name, sup.simple_name, sup.simple_version, td.columns,
+                    sup.super_name, sup.simple_name, sup.simple_version, cols,
                 )
                 alias_to_table_name[td.alias] = name
                 alias_to_files[td.alias] = list(sup.files)
-                alias_to_columns[td.alias] = list(td.columns or [])
+                alias_to_columns[td.alias] = cols
 
             for alias, table_name in alias_to_table_name.items():
                 files = alias_to_files[alias]
@@ -91,16 +110,27 @@ class DuckDBTransient:
 
             # Create RBAC views if filtering is required
             rbac_views = getattr(reflection, "rbac_views", None) or {}
+            query_alias_to_name = dict(alias_to_table_name)
             if rbac_views:
                 for alias, table_name in alias_to_table_name.items():
                     view_def = rbac_views.get(alias)
                     if view_def:
                         view = rbac_view_name(table_name)
                         create_rbac_view(con, table_name, view, view_def)
-                        alias_to_table_name[alias] = view
+                        query_alias_to_name[alias] = view
+
+            # Create dedup views if dedup-on-read is configured
+            if dedup_views:
+                for alias in list(query_alias_to_name.keys()):
+                    dedup_def = dedup_views.get(alias)
+                    if dedup_def:
+                        source = query_alias_to_name[alias]
+                        view = f"dedup_{source}"
+                        create_dedup_view(con, source, view, dedup_def)
+                        query_alias_to_name[alias] = view
 
             executing_query = rewrite_query_with_hashed_tables(
-                parser.original_query, alias_to_table_name,
+                parser.original_query, query_alias_to_name,
             )
             parser.executing_query = executing_query
 

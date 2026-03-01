@@ -21,7 +21,8 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor, Engine as _Engine
-from supertable.data_classes import TableDefinition
+from supertable.data_classes import TableDefinition, DedupViewDef
+from supertable.redis_catalog import RedisCatalog
 
 
 class Status(Enum):
@@ -113,6 +114,26 @@ class DataReader:
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
 
+            # --- Dedup-on-read: look up table configs and build dedup view defs ---
+            try:
+                catalog = RedisCatalog()
+                for td in self.tables:
+                    tbl_cfg = catalog.get_table_config(
+                        self.organization, td.super_name, td.simple_name,
+                    )
+                    if tbl_cfg and tbl_cfg.get("dedup_on_read"):
+                        pk = tbl_cfg.get("primary_keys", [])
+                        if pk:
+                            # visible_columns: what the user actually asked for.
+                            # Empty list (SELECT *) means "all user columns" — the
+                            # executor will expose everything except __rn__.
+                            reflection.dedup_views[td.alias] = DedupViewDef(
+                                primary_keys=pk,
+                                order_column="__timestamp__",
+                                visible_columns=list(td.columns or []),
+                            )
+            except Exception as e:
+                logger.warning(self._lp(f"[dedup] config lookup failed, skipping dedup: {e}"))
 
             if not reflection.supers:
                 message = "No parquet files found"

@@ -207,7 +207,9 @@ def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, b
       - For has_overlap=False small files, include them only if either:
           total_size_of_all_candidates > MAX_MEMORY_CHUNK_SIZE
           OR count_of_false_items >= MAX_OVERLAPPING_FILES
-        and then add false items until hitting MAX_MEMORY_CHUNK_SIZE
+        When the gate opens, ALL false items are included (the downstream
+        process_files_without_overlap handles chunked flushing at memory
+        boundaries, so we must not drop files here).
     """
     max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
     max_files = int(getattr(default, "MAX_OVERLAPPING_FILES", 100))
@@ -220,14 +222,10 @@ def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, b
 
     # Gate: only pull in False items if thresholds hit
     if total_size > max_mem or total_false >= max_files:
-        running_total = sum(item[2] for item in result)
-        false_items = [item for item in overlapping_files if item[1] is False]
-
-        for item in false_items:
-            if running_total > max_mem:
-                break
-            result.add(item)
-            running_total += item[2]
+        # Include ALL false items — downstream handles chunked flushing
+        for item in overlapping_files:
+            if item[1] is False:
+                result.add(item)
 
     return result
 
@@ -380,7 +378,7 @@ def process_overlapping_files(
     merged_df = concat_with_union(chunk_df, df)
 
     # Phase 2: process overlapping=True files (pull-forward non-overwritten rows)
-    deleted, merged_df, total_rows = process_files_with_overlap(
+    deleted, merged_df, total_rows, skipped_files = process_files_with_overlap(
         data_dir=data_dir,
         deleted=deleted,
         df=df,
@@ -394,6 +392,43 @@ def process_overlapping_files(
         compression_level=compression_level,
         file_cache=file_cache,
     )
+
+    # Phase 3: compact skipped small files when file count exceeds threshold.
+    #
+    # After the OR→AND fix, has_overlap=True files with zero actual composite
+    # key matches are correctly left untouched in Phase 2.  Without compaction
+    # these accumulate as many small files over successive writes.
+    #
+    # Policy: when the number of skipped (untouched) small files reaches
+    # MAX_OVERLAPPING_FILES, merge ALL of them into the output buffer.
+    # process_files_without_overlap already handles this pattern for
+    # has_overlap=False files; this does the same for the skipped True files.
+    max_files = int(getattr(default, "MAX_OVERLAPPING_FILES", 100))
+    max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
+
+    if len(skipped_files) >= max_files:
+        compact_size = 0
+        for file, file_size in skipped_files:
+            existing_df = _read_parquet_safe(file)
+            if existing_df is None:
+                continue
+
+            merged_df = concat_with_union(merged_df, existing_df)
+            sunset_files.add(file)
+            compact_size += int(file_size or 0)
+
+            # Flush if chunk exceeds memory limit
+            if compact_size >= max_mem:
+                total_rows += merged_df.shape[0]
+                write_parquet_and_collect_resources(
+                    write_df=merged_df,
+                    overwrite_columns=overwrite_columns,
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                )
+                merged_df = empty_df.clone()
+                compact_size = 0
 
     # Final flush if anything remains
     if merged_df.shape[0] > 0:
@@ -430,6 +465,11 @@ def process_files_with_overlap(
             if col in df.columns:
                 unique_values_map[col] = df[col].unique(maintain_order=False)
 
+    # Track has_overlap=True files that had zero actual row matches (skipped).
+    # These are candidates for small-file compaction when the total file count
+    # exceeds MAX_OVERLAPPING_FILES.
+    skipped_files: List[Tuple[str, int]] = []
+
     # Iterate only files where has_overlap is True
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if has_overlap):
         # Use cached read if available (populated by filter_stale_incoming_rows)
@@ -462,7 +502,8 @@ def process_files_with_overlap(
 
         # If nothing changed, skip re-writing that file
         if filtered_df.shape[0] == existing_df.shape[0] and overwrite_columns:
-            # No rows deleted → keep original; no need to sunset
+            # No rows deleted → keep original; record for potential compaction
+            skipped_files.append((file, file_size))
             continue
 
         merged_df = concat_with_union(merged_df, filtered_df)
@@ -480,7 +521,7 @@ def process_files_with_overlap(
             )
             merged_df = empty_df.clone()
 
-    return deleted, merged_df, total_rows
+    return deleted, merged_df, total_rows, skipped_files
 
 
 def process_files_without_overlap(

@@ -33,6 +33,26 @@ class RbacViewDef:
 
 
 @dataclass
+class DedupViewDef:
+    """Dedup-on-read view definition for a single table alias.
+
+    Produced by DataReader from table config in Redis, consumed by executors
+    to create a ROW_NUMBER window view that keeps only the latest row per
+    primary key combination.
+
+    - primary_keys: columns that form the composite key for dedup.
+    - order_column: column to ORDER BY DESC (default ``__timestamp__``).
+    - visible_columns: columns to expose in the dedup view.  When empty or
+      ["*"], all columns except ``__rn__`` are exposed.  When set, only
+      these columns are projected (hiding PK / order cols that the user
+      did not request).
+    """
+    primary_keys: List[str] = field(default_factory=list)
+    order_column: str = "__timestamp__"
+    visible_columns: List[str] = field(default_factory=list)
+
+
+@dataclass
 class Reflection:
     storage_type: str
     reflection_bytes: int
@@ -40,3 +60,5 @@ class Reflection:
     supers: List[SuperSnapshot]
     # alias -> RbacViewDef.  Empty dict means no RBAC filtering.
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
+    # alias -> DedupViewDef.  Empty dict means no dedup-on-read.
+    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
