@@ -80,6 +80,7 @@ def mock_catalog():
     cat.bump_root.return_value = 1
     cat.root_exists.return_value = True
     cat.leaf_exists.return_value = True
+    cat.get_table_config.return_value = None
     return cat
 
 
@@ -125,6 +126,7 @@ def _build_writer(mock_super_table_cls, mock_catalog_cls, mock_catalog_inst, moc
     writer = DataWriter.__new__(DataWriter)
     writer.super_table = mock_st_inst
     writer.catalog = mock_catalog_inst
+    writer._table_config_cache = {}
     return writer
 
 
@@ -143,6 +145,7 @@ class TestDataWriterInit:
         mock_st = MagicMock()
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
         dw = DataWriter("super1", "org1")
@@ -177,6 +180,7 @@ class TestValidation:
         w.super_table = MagicMock()
         w.super_table.super_name = "super1"
         w.catalog = MagicMock()
+        w._table_config_cache = {}
         return w
 
     # ---- simple_name length -------------------------------------------
@@ -352,6 +356,7 @@ class TestWriteHappyPath:
         mock_st = MagicMock(super_name="s1", organization="o1")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.release_simple_lock.return_value = True
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -418,6 +423,7 @@ class TestWriteHappyPath:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -465,6 +471,7 @@ class TestWriteDeleteOnly:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -505,6 +512,7 @@ class TestWriteDeleteOnly:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -554,6 +562,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.release_simple_lock.return_value = True
         MockCat.return_value = mock_cat
@@ -600,6 +609,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -646,6 +656,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -689,6 +700,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = None  # Lock not acquired
         MockCat.return_value = mock_cat
 
@@ -718,6 +730,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -757,6 +770,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
 
@@ -795,6 +809,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = None
         MockCat.return_value = mock_cat
 
@@ -827,6 +842,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.release_simple_lock.side_effect = RuntimeError("release boom")
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -874,6 +890,7 @@ class TestWriteCASFallback:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.side_effect = Exception("no payload support")
         mock_cat.set_leaf_path_cas.return_value = 1
@@ -924,6 +941,7 @@ class TestWriteMirroring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -973,6 +991,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1022,6 +1041,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1060,6 +1080,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
 
@@ -1138,6 +1159,7 @@ class TestWriteAccessControl:
         mock_st = MagicMock(super_name="my_s", organization="my_o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1189,6 +1211,7 @@ class TestWriteConversion:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
         mock_from_arrow.side_effect = TypeError("unsupported arrow type")
@@ -1226,6 +1249,7 @@ class TestWriteSnapshotRead:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
 
@@ -1268,6 +1292,7 @@ class TestWriteMonitoringPayload:
         mock_st = MagicMock(super_name="sup", organization="org")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1338,6 +1363,7 @@ class TestWriteMonitoringPayload:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         MockCat.return_value = mock_cat
 
@@ -1383,6 +1409,7 @@ class TestWriteValidationErrors:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
         df = _polars_df({"id": [1]})
@@ -1440,6 +1467,7 @@ class TestWriteUpdateIntegration:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1498,6 +1526,7 @@ class TestWriteBumpRoot:
         mock_st = MagicMock(super_name="mysup", organization="myorg")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1547,6 +1576,7 @@ class TestWriteEmptyDataFrame:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1614,6 +1644,7 @@ class TestWriteReturnValue:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
@@ -1667,6 +1698,7 @@ class TestWriteFileCache:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
