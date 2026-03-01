@@ -403,23 +403,98 @@
         word-break: break-all;
     }
 
-    /* --- Visualization --- */
+    /* --- Timings: Metric Rows visualization --- */
     #timings-visualization-card {
-        /* Set a fixed height for the canvas to ensure Chart.js renders correctly */
-        height: 350px;
-        display: none; /* Hidden by default, JS controls visibility */
+        display: none; /* JS controls visibility */
     }
-    .chart-container {
-        position: relative;
+
+    .timings-header {
+        padding: 20px 24px 14px;
+        border-bottom: 1px solid var(--panel-border);
+    }
+    .timings-header h4 {
+        font-size: 16px;
+        font-weight: 700;
+        color: var(--text-color);
+        margin: 0;
+        display: inline;
+    }
+    .timings-header .timings-total {
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--text-light);
+    }
+    .timings-header .timings-sub {
+        font-size: 12px;
+        color: var(--text-light);
+        margin-top: 4px;
+    }
+
+    .timings-rows {
+        padding: 8px 24px 20px;
+    }
+
+    .timings-row {
+        display: grid;
+        grid-template-columns: 180px 1fr 60px 50px;
+        align-items: center;
+        gap: 14px;
+        padding: 11px 0;
+        border-bottom: 1px solid #f1f5f9;
+        opacity: 0;
+        transform: translateX(-12px);
+    }
+    .timings-row:last-child { border-bottom: none; }
+
+    /* Animated entrance */
+    .timings-row.visible {
+        opacity: 1;
+        transform: translateX(0);
+        transition: opacity 0.35s ease, transform 0.35s ease;
+    }
+
+    .timings-row-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: #475569;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .timings-row-track {
+        height: 8px;
+        border-radius: 4px;
+        background: #f1f5f9;
+        overflow: hidden;
+    }
+
+    .timings-row-bar {
         height: 100%;
-        width: 100%;
-        padding: 20px;
+        border-radius: 4px;
+        width: 0%;
+        transition: width 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
     }
-    /* Ensure canvas is block-level and max size of container for Chart.js responsiveness */
-    .chart-container canvas {
-        height: 100% !important;
-        width: 100% !important;
+
+    .timings-row-value {
+        font-size: 13px;
+        font-weight: 700;
+        color: #0f172a;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
     }
+
+    .timings-row-pct {
+        font-size: 11px;
+        color: #94a3b8;
+        text-align: right;
+        font-weight: 500;
+    }
+
+    /* Hover: subtle highlight */
+    .timings-row:hover .timings-row-label { color: var(--text-color); }
+    .timings-row:hover .timings-row-bar { filter: brightness(1.08); }
 
 
     /* --- Results Table --- */
@@ -638,18 +713,24 @@
     // --- SuperTable metadata (same pattern as tables.html) ---
     const META_BASE = ''; // same-origin (avoids CSP connect-src violations)
     const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
-    const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
+    const ROLE_NAME = {{ session_role_name|default(default_role_name|default('', true), true)|tojson }};
 
     let currentSuper = null;
-    // Selection component will call this after /reflection/super is loaded.
-    // We cache the meta to avoid duplicate /reflection/super calls from this page (e.g. loadSchema()).
+    // Track whether sessions were restored from sessionStorage
+    var __sessionsRestoredFromCache = false;
+
+    // Called by selection.html after /reflection/super meta is loaded.
+    // Single source of truth — no duplicate /reflection/super calls from this page.
     window.onSuperMetaLoaded = function (org, superName, superMeta) {
       try {
         if (superName) currentSuper = superName;
         window.__st_lastSuperMeta = superMeta || null;
 
-        // Update the CodeMirror content when the SuperTable changes (initial load included)
-        if (window.editor) {
+        // Update the summary panel with the loaded meta
+        updateTenantSummary(superMeta || null);
+
+        // Only set default query if sessions were NOT restored from cache
+        if (!__sessionsRestoredFromCache && window.editor) {
           const leaf = getURLParameter('leaf');
           const defaultQuery = leaf
             ? `SELECT * FROM ${superName}.${leaf} LIMIT 1000`
@@ -661,7 +742,7 @@
         console.error('onSuperMetaLoaded failed', e);
       }
 
-      // Load schema hints once we have the latest meta.
+      // Load table schemas for IntelliSense (cached in sessionStorage)
       try {
         loadSchema();
       } catch (e) {
@@ -669,7 +750,7 @@
       }
     };
 
-    let timingsChart = null; // NEW: Global variable for Chart.js instance
+    let timingsChart = null; // no longer Chart.js — kept for compat
     window.__curRows = []; // Keep track of current rows
     window.__curHeaders = []; // Keep track of current headers
     window.__hintTables = {}; // Global schema map for IntelliSense
@@ -680,6 +761,74 @@
     let __activeExecSessionId = null;
     let __execSessionSeq = 0;
     window.__activeInnerTabName = 'execute';
+
+    // --- SessionStorage persistence for execution tabs ---
+    // Uses a separate key so it doesn't touch the main session cookie.
+    function _execStorageKey() {
+      var org = (window.__st_org || '').trim();
+      var sup = (typeof defaultSuperName !== 'undefined' && defaultSuperName) ? defaultSuperName : '';
+      return 'st_exec_sessions:' + org + ':' + sup;
+    }
+
+    function _persistExecSessions() {
+      try {
+        var data = __execSessions.map(function (s) {
+          return {
+            id: s.id,
+            name: s.name,
+            query: s.query,
+            innerTab: s.innerTab,
+            statusText: s.statusText,
+            statusCls: s.statusCls,
+            rows: s.rows,
+            timings: s.timings,
+            errorVisible: s.errorVisible,
+            errorTitle: s.errorTitle,
+            errorMessage: s.errorMessage
+          };
+        });
+        var payload = {
+          sessions: data,
+          activeId: __activeExecSessionId,
+          seq: __execSessionSeq
+        };
+        sessionStorage.setItem(_execStorageKey(), JSON.stringify(payload));
+      } catch (e) {
+        // sessionStorage full or unavailable — silently skip
+      }
+    }
+
+    function _restoreExecSessions() {
+      try {
+        var raw = sessionStorage.getItem(_execStorageKey());
+        if (!raw) return false;
+        var payload = JSON.parse(raw);
+        if (!payload || !Array.isArray(payload.sessions) || !payload.sessions.length) return false;
+
+        payload.sessions.forEach(function (saved) {
+          __execSessions.push({
+            id: saved.id || ('exec-' + (++__execSessionSeq)),
+            name: saved.name || 'Execution',
+            query: saved.query || '',
+            innerTab: saved.innerTab || 'execute',
+            statusText: saved.statusText || 'Ready',
+            statusCls: saved.statusCls || '',
+            rows: saved.rows || [],
+            timings: saved.timings || null,
+            errorVisible: !!saved.errorVisible,
+            errorTitle: saved.errorTitle || '',
+            errorMessage: saved.errorMessage || '',
+            abortController: null,
+            isExecuting: false
+          });
+        });
+        __activeExecSessionId = payload.activeId || __execSessions[0].id;
+        __execSessionSeq = payload.seq || __execSessions.length;
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
 
     function __getActiveExecSession() {
       if (!__activeExecSessionId) return null;
@@ -791,6 +940,7 @@
       if (!s) return;
       if (window.editor) s.query = window.editor.getValue();
       s.innerTab = window.__activeInnerTabName || s.innerTab || 'execute';
+      _persistExecSessions();
     }
 
     function __resetUIForNewSession(session) {
@@ -805,9 +955,10 @@
       }
 
       if (window.timingsChartInstance) {
-        try { window.timingsChartInstance.destroy(); } catch (e) {}
         window.timingsChartInstance = null;
       }
+      var _tr1 = document.getElementById('timingsRows');
+      if (_tr1) _tr1.innerHTML = '';
 
       window.__curRows = [];
       window.__curHeaders = [];
@@ -841,9 +992,10 @@
       if (timingCard) timingCard.style.display = 'none';
 
       if (window.timingsChartInstance) {
-        try { window.timingsChartInstance.destroy(); } catch (e) {}
         window.timingsChartInstance = null;
       }
+      var _tr2 = document.getElementById('timingsRows');
+      if (_tr2) _tr2.innerHTML = '';
 
       if (session.errorVisible) {
         displayError(session.errorTitle || 'Query Error', session.errorMessage || 'Unknown error');
@@ -885,6 +1037,7 @@
       __activeExecSessionId = id;
       __renderExecTabs();
       __applyExecSessionState(__getActiveExecSession());
+      _persistExecSessions();
     }
 
     function __addExecSession() {
@@ -896,6 +1049,7 @@
 
       __renderExecTabs();
       __resetUIForNewSession(s);
+      _persistExecSessions();
     }
 
     function __closeExecSession(id) {
@@ -919,6 +1073,7 @@
 
       __renderExecTabs();
       __applyExecSessionState(__getActiveExecSession());
+      _persistExecSessions();
     }
 
     function __initExecSessions() {
@@ -930,6 +1085,30 @@
 
       addBtn.addEventListener('click', () => __addExecSession());
 
+      // Try to restore sessions from sessionStorage
+      if (_restoreExecSessions()) {
+        __sessionsRestoredFromCache = true;
+        __renderExecTabs();
+        // Apply the active session state once the editor is ready
+        const _applyRestored = function () {
+          __applyExecSessionState(__getActiveExecSession());
+        };
+        if (window.editor) {
+          _applyRestored();
+        } else {
+          // Editor may not be ready yet; wait for it
+          var _waitCount = 0;
+          var _waitInterval = setInterval(function () {
+            _waitCount++;
+            if (window.editor || _waitCount > 50) {
+              clearInterval(_waitInterval);
+              _applyRestored();
+            }
+          }, 50);
+        }
+        return;
+      }
+
       const first = __createExecSession({
         name: 'Execution 1',
         query: window.editor ? window.editor.getValue() : __buildDefaultExecutionQuery()
@@ -939,6 +1118,7 @@
       __activeExecSessionId = first.id;
 
       __renderExecTabs();
+      _persistExecSessions();
     }
 
     function updateTenantSummary(superMeta) {
@@ -1001,87 +1181,12 @@
       if (updEl) updEl.textContent = superMeta.updated_utc != null ? formatDateMsLocal(superMeta.updated_utc) : 'n/a';
     }
 
-    function loadTenantSuper(superName) {
-      if (!superName) {
-        updateTenantSummary(null);
-        return;
-      }
+    // loadTenantSuper removed — selection.html handles meta loading via loadSuperMeta()
+    // and calls onSuperMetaLoaded() which updates the summary panel and schema hints.
 
-      api(
-        META_BASE + '/reflection/super?organization=' +
-        encodeURIComponent(ORGANIZATION) +
-        '&super_name=' + encodeURIComponent(superName) +
-        '&user_hash=' + encodeURIComponent(USER_HASH)
-      )
-        .then(data => {
-          const s = data && data.meta && data.meta.super ? data.meta.super : null;
-          if (!s) {
-            updateTenantSummary(null);
-            return;
-          }
-          updateTenantSummary(s);
-        })
-        .catch(err => {
-          console.error('Failed to load super', err);
-          updateTenantSummary(null);
-        });
-    }
+    // loadTenants removed — selection.html populates the SuperTable dropdown.
 
-    function loadTenants() {
-      const selEl = document.getElementById('pairSel');
-      if (!selEl) return;
-
-      api(META_BASE + '/reflection/supers?organization=' + encodeURIComponent(ORGANIZATION))
-        .then(data => {
-          const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
-          selEl.innerHTML = '';
-
-          if (!supers.length) {
-            const opt = document.createElement('option');
-            opt.value = '';
-            opt.textContent = 'No SuperTables found';
-            selEl.appendChild(opt);
-            updateTenantSummary(null);
-            return;
-          }
-
-          supers.forEach(s => {
-            const opt = document.createElement('option');
-            opt.value = s;
-            opt.textContent = s;
-            selEl.appendChild(opt);
-          });
-
-          currentSuper = supers[0];
-          selEl.value = currentSuper;
-          loadTenantSuper(currentSuper);
-          // initial schema hints once we have a tenant
-          loadSchema();
-        })
-        .catch(err => {
-          console.error('Failed to load supers', err);
-          updateTenantSummary(null);
-        });
-    }
-
-    function onPairChange() {
-      const sel = document.getElementById('pairSel');
-      if (!sel) return;
-      const sup = sel.value;
-      if (!sup) return;
-      currentSuper = sup;
-      // Selection.html already fetches /reflection/super; avoid duplicate calls here.
-
-      // Update the CodeMirror content when the SuperTable changes
-      if (window.editor) {
-          const leaf = getURLParameter('leaf');
-          const defaultQuery = leaf
-            ? `SELECT * FROM ${sup}.${leaf} LIMIT 1000`
-            : `SELECT * FROM ${sup} LIMIT 100`;
-
-          window.editor.setValue(defaultQuery);
-      }
-    }
+    // onPairChange removed — selection.html handles SuperTable changes via __st_onPairChange.
 
     function goBackAdmin() {
       const sel = document.getElementById('pairSel');
@@ -1150,7 +1255,7 @@
                 window.editor.refresh();
             }, 0);
         }
-    
+
 
         window.__activeInnerTabName = tabName;
         const __s = __getActiveExecSession ? __getActiveExecSession() : null;
@@ -1193,9 +1298,10 @@
         timingCard.style.display = 'none';
 
         if (timingsChart) {
-            timingsChart.destroy();
             timingsChart = null;
         }
+        var _trClear = document.getElementById('timingsRows');
+        if (_trClear) _trClear.innerHTML = '';
 
         // Switch to the Result tab to show the error
         switchTab('result');
@@ -1259,244 +1365,185 @@ let html = '';
       window.__curHeaders = headers;
     }
 
-    // Function to render the Chart.js timeline
+    // Render Metric Rows timings visualization (no Chart.js)
     function renderTimingsChart(timings) {
-        const chartContainer = document.getElementById('timings-visualization-card');
-        const canvas = document.getElementById('timingsChart');
-        const ctx = canvas.getContext('2d');
+        var container = document.getElementById('timings-visualization-card');
+        var rowsEl = document.getElementById('timingsRows');
+        var totalLabel = document.getElementById('timingsTotalLabel');
 
         if (!timings || timings.length === 0) {
-            chartContainer.style.display = 'none';
+            container.style.display = 'none';
             return;
         }
 
-        chartContainer.style.display = 'block';
-
-        const rawData = [];
-        const labels = [];
-
-        const pastelColors = [
-            "#6BAED6", // clean blue
-            "#9ECAE1", // light blue
-            "#74C476", // green
-            "#A1D99B", // light green
-            "#FDAE6B", // orange-peach
-            "#FDD0A2", // light peach
-            "#C6DBEF", // blue-gray
-            "#E7CB94"  // sand-gold
+        var pastelColors = [
+            "#6BAED6", "#74C476", "#1c96ca", "#FDAE6B",
+            "#9ECAE1", "#A1D99B", "#C6DBEF", "#E7CB94"
         ];
 
-        timings.forEach(timing => {
-            const key = Object.keys(timing)[0];
+        var rawData = [];
+        var labels = [];
 
-            // Filter out total/duration style keys
-            if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) {
-                return;
-            }
-
-            const value = timing[key];
-            rawData.push(value * 1000); // store as ms
+        timings.forEach(function (timing) {
+            var key = Object.keys(timing)[0];
+            if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) return;
+            rawData.push(timing[key] * 1000);
             labels.push(key.replace(/_/g, ' ').toUpperCase());
         });
 
         if (rawData.length === 0) {
-            chartContainer.style.display = 'none';
+            container.style.display = 'none';
             return;
         }
 
-        const totalTimeMs = rawData.reduce((sum, val) => sum + val, 0);
-        const totalTimeSeconds = (totalTimeMs / 1000).toFixed(4);
+        container.style.display = 'block';
 
-        if (timingsChart) {
-            timingsChart.destroy();
-            timingsChart = null;
-        }
+        var totalMs = rawData.reduce(function (s, v) { return s + v; }, 0);
+        var maxMs = Math.max.apply(null, rawData);
 
-        timingsChart = new Chart(ctx, {
-            type: 'bar',
-            data: {
-                labels: ['QUERY TIMELINE'],
-                datasets: rawData.map((dataPoint, index) => ({
-                    label: labels[index] + ' (' + (dataPoint / 1000).toFixed(4) + ' s)',
-                    data: [dataPoint],
-                    backgroundColor: pastelColors[index % pastelColors.length],
-                    stack: 'timeline',
-                    barPercentage: 0.9,
-                    categoryPercentage: 0.9,
-                    borderRadius: 0,
-                    borderSkipped: false,
-                    borderWidth: 1,
-                    borderColor: 'rgba(15, 23, 42, 0.1)'
-                }))
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                indexAxis: 'y', // horizontal
-                plugins: {
-                    legend: {
-                        display: true,
-                        position: 'bottom',
-                        labels: {
-                            boxWidth: 12,
-                            boxHeight: 12,
-                            padding: 14,
-                            font: {
-                                size: 11,
-                                weight: '500'
-                            }
-                        }
-                    },
-                    title: {
-                        display: true,
-                        text: `Execution Timeline (Total: ${totalTimeSeconds} s)`,
-                        font: {
-                            size: 16,
-                            weight: '600'
-                        },
-                        padding: {
-                            top: 8,
-                            bottom: 16
-                        }
-                    },
-                    tooltip: {
-                        mode: 'index',
-                        intersect: false,
-                        backgroundColor: 'rgba(15,23,42,0.92)',
-                        titleFont: {
-                            size: 13,
-                            weight: '600'
-                        },
-                        bodyFont: {
-                            size: 12
-                        },
-                        padding: 10,
-                        callbacks: {
-                            label: function (context) {
-                                const durationSeconds = (context.raw / 1000).toFixed(4) + ' s';
-                                const name = context.dataset.label.split(' (')[0];
-                                return `${name}: ${durationSeconds}`;
-                            },
-                            title: function () {
-                                return 'Internal Step Duration';
-                            }
-                        }
-                    }
-                },
-                animation: {
-                    easing: 'linear',
-                },
-                animations: {
-                    x: {
-                        type: 'number',
-                        from: 0,
-                        easing: 'easeOutQuad',
-                        duration: function (ctx) {
-                            return 600;
-                        },
-                        delay: function (ctx) {
-                            if (ctx.type === 'data' && ctx.dataIndex === 0) {
-                                return ctx.datasetIndex * 300;
-                            }
-                            return 0;
-                        }
-                    },
-                    y: {
-                        duration: 0
-                    }
-                },
-                scales: {
-                    x: {
-                        stacked: true,
-                        title: {
-                            display: true,
-                            text: 'Time (milliseconds)',
-                            font: { size: 13, weight: '500' }
-                        },
-                        beginAtZero: true,
-                        max: totalTimeMs * 1.05,
-                        grid: {
-                            display: true,
-                            drawBorder: false,
-                            lineWidth: 0.5,
-                            color: 'rgba(148, 163, 184, 0.25)'
-                        },
-                        ticks: {
-                            font: { size: 11 }
-                        }
-                    },
-                    y: {
-                        stacked: true,
-                        grid: { display: false },
-                        ticks: { display: false }
-                    }
-                },
-                layout: {
-                    padding: {
-                        top: 8,
-                        right: 16,
-                        bottom: 8,
-                        left: 8
-                    }
-                }
-            }
+        totalLabel.textContent = '\u2014 Total: ' + (totalMs / 1000).toFixed(3) + 's';
+
+        // Build rows
+        rowsEl.innerHTML = '';
+
+        rawData.forEach(function (ms, i) {
+            var pct = ((ms / totalMs) * 100).toFixed(1);
+            var barWidth = maxMs > 0 ? (ms / maxMs) * 100 : 0;
+            var delay = i * 100;
+
+            var row = document.createElement('div');
+            row.className = 'timings-row';
+            row.style.transitionDelay = delay + 'ms';
+
+            // Label
+            var lbl = document.createElement('span');
+            lbl.className = 'timings-row-label';
+            lbl.textContent = labels[i];
+
+            // Track + bar
+            var track = document.createElement('div');
+            track.className = 'timings-row-track';
+            var bar = document.createElement('div');
+            bar.className = 'timings-row-bar';
+            bar.style.backgroundColor = pastelColors[i % pastelColors.length];
+            track.appendChild(bar);
+
+            // Value
+            var val = document.createElement('span');
+            val.className = 'timings-row-value';
+            val.textContent = ms >= 1 ? Math.round(ms) + 'ms' : ms.toFixed(2) + 'ms';
+
+            // Percentage
+            var pctEl = document.createElement('span');
+            pctEl.className = 'timings-row-pct';
+            pctEl.textContent = pct + '%';
+
+            row.appendChild(lbl);
+            row.appendChild(track);
+            row.appendChild(val);
+            row.appendChild(pctEl);
+            rowsEl.appendChild(row);
+
+            // Trigger animation after a microtask so the transition fires
+            (function (_row, _bar, _barWidth, _delay) {
+                setTimeout(function () {
+                    _row.classList.add('visible');
+                }, 30 + _delay);
+                setTimeout(function () {
+                    _bar.style.width = _barWidth + '%';
+                }, 80 + _delay);
+            })(row, bar, barWidth, delay);
         });
+
+        // Store on active session
+        var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+        if (__s) __s.timings = timings;
     }
 
-    // NEW loadSchema: uses FastAPI meta endpoints to build schema for IntelliSense
-    async function loadSchema() {
-      const userHash = USER_HASH;
+    // --- Schema cache for IntelliSense ---
+    function _schemaCacheKey() {
+      var org = (window.__st_org || '').trim();
+      var sup = currentSuper || '';
+      return 'st_table_schemas:' + org + ':' + sup;
+    }
+
+    function _getCachedSchema() {
+      try {
+        var raw = sessionStorage.getItem(_schemaCacheKey());
+        if (!raw) return null;
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+      } catch (e) {}
+      return null;
+    }
+
+    function _setCachedSchema(schemaMap) {
+      try { sessionStorage.setItem(_schemaCacheKey(), JSON.stringify(schemaMap)); } catch (e) {}
+    }
+
+    function _clearCachedSchema() {
+      try { sessionStorage.removeItem(_schemaCacheKey()); } catch (e) {}
+    }
+
+    // loadSchema: fetches table+column schemas from /reflection/schema
+    // and caches in sessionStorage. Populates window.__hintTables for IntelliSense.
+    async function loadSchema(forceRefresh) {
       const { organization, superName } = getTenant();
-      if (!organization || !superName || !userHash) return;
+      if (!organization || !superName) return;
 
-      try {        // 1) list tables in the selected SuperTable (use /reflection/super meta; do NOT use /meta/tables)
-        let superMeta = null;
-        try {
-          const cached = window.__st_lastSuperMeta;
-          if (cached && cached.name === superName && Array.isArray(cached.tables)) {
-            superMeta = cached;
-          }
-        } catch (e) {
-          // ignore
+      var roleName = (window.__st_active_role || window.__st_role_name || ROLE_NAME || '').trim();
+      if (!roleName) return;
+
+      // Check cache first
+      if (!forceRefresh) {
+        var cached = _getCachedSchema();
+        if (cached) {
+          console.log('[execute] using cached table schemas');
+          _applySchema(cached);
+          return;
         }
+      }
 
-        if (!superMeta) {
-          const superResp = await api(
-            META_BASE +
-            '/reflection/super?organization=' + encodeURIComponent(organization) +
-            '&super_name=' + encodeURIComponent(superName) +
-            '&user_hash=' + encodeURIComponent(userHash)
-          );
-          superMeta = superResp && superResp.meta && superResp.meta.super ? superResp.meta.super : null;
-        }
+      console.log('[execute] fetching /reflection/schema from server');
+      try {
+        var data = await api('/reflection/schema', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            organization: organization,
+            super_name: superName,
+            role_name: roleName
+          })
+        });
 
-        const tables = (superMeta && Array.isArray(superMeta.tables))
-          ? superMeta.tables.map(t => (t && t.name) ? String(t.name) : '').filter(Boolean)
-          : [];
-
-        // Disabled broken per-table schema fetch (incomplete block caused SyntaxError during parsing).
-        // Original fragment kept here for context:
-        // if (schemaResp && schemaResp.ok && Array.isArray(schemaResp.schema) && schemaResp.schema.length > 0) {
-        //   const firstRow = schemaResp.schema[0];
-        //   const cols = Object.keys(firstRow || {});
-        //   hint[tableName] = { columns: cols };
-        // }
-        // } catch (e) {
-        //   console.error('Failed to load schema for table', tableName, e);
-        // }
-        // }
-        const hint = {};
-        for (const tableName of tables) {
-          hint[tableName] = { columns: [] };
-        }
-
-        window.__hintTables = hint;
-
-        if (window.editor) {
-          window.editor.setOption('hintOptions', buildSqlHintOptions());
+        if (data && data.status === 'ok' && Array.isArray(data.schema)) {
+          // Convert [ { tableName: [col, ...] }, ... ] → { tableName: [col, ...], ... }
+          var schemaMap = {};
+          data.schema.forEach(function (entry) {
+            var keys = Object.keys(entry);
+            if (keys.length) {
+              schemaMap[keys[0]] = entry[keys[0]] || [];
+            }
+          });
+          _setCachedSchema(schemaMap);
+          _applySchema(schemaMap);
         }
       } catch (e) {
-        console.error('Schema load failed:', e);
+        console.error('Schema fetch failed:', e);
+      }
+    }
+
+    // Apply a schema map { tableName: [col, ...], ... } to the IntelliSense hints
+    function _applySchema(schemaMap) {
+      var hint = {};
+      for (var tableName in schemaMap) {
+        if (schemaMap.hasOwnProperty(tableName)) {
+          hint[tableName] = { columns: schemaMap[tableName] || [] };
+        }
+      }
+      window.__hintTables = hint;
+      if (window.editor) {
+        window.editor.setOption('hintOptions', buildSqlHintOptions());
       }
     }
 
@@ -1506,7 +1553,7 @@ let html = '';
 
         async function executeSQL(page) {
       const session = __getActiveExecSession ? __getActiveExecSession() : null;
-      const userHash = USER_HASH;
+      const roleName = window.__st_role_name || ROLE_NAME;
       const pageSize = 1000;
       const query = window.editor.getValue().trim();
       const { organization, superName } = getTenant();
@@ -1520,9 +1567,10 @@ let html = '';
       timingCard.style.display = 'none';
       resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Loading results...</div>';
       if (window.timingsChartInstance) {
-            window.timingsChartInstance.destroy();
             window.timingsChartInstance = null;
         }
+      var _tr3 = document.getElementById('timingsRows');
+      if (_tr3) _tr3.innerHTML = '';
 
       if (session) {
         session.errorVisible = false;
@@ -1535,7 +1583,7 @@ let html = '';
 
       switchTab('result');
 
-      if (!organization || !superName || !userHash) {
+      if (!organization || !superName || !roleName) {
         if (session) {
           session.errorVisible = true;
           session.errorTitle = 'Input Error';
@@ -1585,6 +1633,7 @@ let html = '';
         session.abortController = abortController;
         session.isExecuting = true;
         session.query = query;
+        _persistExecSessions();
       } else {
         abortController = new AbortController();
       }
@@ -1597,7 +1646,7 @@ let html = '';
           body: JSON.stringify({
             organization,
             super_name: superName,
-            user_hash: userHash,
+            role_name: roleName,
             query,
             page: 1,
             page_size: pageSize
@@ -1643,6 +1692,9 @@ let html = '';
               session.statusText = errStatusText;
               session.statusCls = 'error';
               session.innerTab = 'result';
+              session.isExecuting = false;
+              session.abortController = null;
+              _persistExecSessions();
             }
 
             if (isActive) {
@@ -1671,6 +1723,9 @@ let html = '';
             session.statusText = statusText;
             session.statusCls = '';
             session.innerTab = window.__activeInnerTabName || session.innerTab || 'result';
+            session.isExecuting = false;
+            session.abortController = null;
+            _persistExecSessions();
           }
 
           if (isActive) {
@@ -1704,6 +1759,9 @@ let html = '';
             session.statusText = `Error executing query after ${elapsedErrorSec}s`;
             session.statusCls = 'error';
             session.innerTab = 'result';
+            session.isExecuting = false;
+            session.abortController = null;
+            _persistExecSessions();
           }
 
           if (isActive) {
@@ -1718,6 +1776,7 @@ let html = '';
             session.statusCls = '';
             session.isExecuting = false;
             session.abortController = null;
+            _persistExecSessions();
           }
           const activeNow = __getActiveExecSession ? __getActiveExecSession() : null;
           const isActive = session && activeNow && session.id === activeNow.id;
@@ -1743,6 +1802,9 @@ let html = '';
           session.statusText = `Error executing query after ${elapsedSec}s`;
           session.statusCls = 'error';
           session.innerTab = 'result';
+          session.isExecuting = false;
+          session.abortController = null;
+          _persistExecSessions();
         }
 
         const activeNow = __getActiveExecSession ? __getActiveExecSession() : null;
@@ -1885,7 +1947,7 @@ let html = '';
         URL.revokeObjectURL(link.href);
     }
 
-    
+
 
     // --- Save as RBAC View (stored in Redis; managed on /reflection/rbac) ---
     function __setSaveViewStatus(text, isError) {
@@ -2002,21 +2064,22 @@ let html = '';
 $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
-      $("#toggleSidebar").on("click", function() {
-        $("#sidebar").toggleClass("sidebar-collapsed");
-        localStorage.setItem('st_sidebar_collapsed',
-          $("#sidebar").hasClass("sidebar-collapsed"));
-      });
+      // Sidebar toggle — skip if sidebar.html already bound it
+      if (!window.__st_sidebar_bound) {
+        $("#toggleSidebar").on("click", function() {
+          $("#sidebar").toggleClass("sidebar-collapsed");
+          localStorage.setItem('st_sidebar_collapsed',
+            $("#sidebar").hasClass("sidebar-collapsed"));
+        });
 
-      if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
-        $("#sidebar").addClass("sidebar-collapsed");
+        if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+          $("#sidebar").addClass("sidebar-collapsed");
+        }
       }
 
       $("#link-execute").addClass("active");
 
-      if (!window.__st_selection_component) {
-        loadTenants();
-      }
+      // selection.html always handles SuperTable loading via __st_selection_component
 
       __mountInnerTabs();
       __initExecSessions();
@@ -2026,7 +2089,28 @@ $(document).ready(function(){
       const __sv2 = document.getElementById('btnSaveViewConfirm');
       if (__sv2) __sv2.addEventListener('click', () => saveViewNow());
 
-      switchTab('execute');
+      const __schemaBtn = document.getElementById('btnRefreshSchema');
+      if (__schemaBtn) {
+        __schemaBtn.addEventListener('click', function () {
+          var icon = __schemaBtn.querySelector('i');
+          if (icon) { icon.style.transition = 'transform 0.5s ease'; icon.style.transform = 'rotate(360deg)'; }
+          _clearCachedSchema();
+          loadSchema(true).then(function () {
+            setTimeout(function () { if (icon) icon.style.transform = ''; }, 600);
+          });
+        });
+      }
+
+      // Only default to execute tab if sessions were NOT restored from storage
+      // (restored sessions apply their own innerTab in __applyExecSessionState)
+      if (!sessionStorage.getItem(_execStorageKey())) {
+        switchTab('execute');
+      }
+
+      // Persist execution tabs before navigating away
+      window.addEventListener('beforeunload', function () {
+        try { __saveActiveExecSessionState(); } catch (e) {}
+      });
     });
   </script>
 </head>
@@ -2074,6 +2158,9 @@ $(document).ready(function(){
                           <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
                         </div>
                         <div style="display:flex; gap:8px;">
+                          <button id="btnRefreshSchema" type="button" class="btn" title="Refresh table schemas for IntelliSense">
+  <i class="fas fa-sync-alt"></i>&nbsp;Schema
+</button>
                           <button id="btnSaveView" type="button" class="btn">
   <i class="fas fa-save"></i>&nbsp;Save View
 </button>
@@ -2110,19 +2197,18 @@ $(document).ready(function(){
 
           <div id="tab-content-timings" class="tab-content">
               <div id="timings-visualization-card" class="card">
-                  <div class="section" style="padding-bottom: 0; border-bottom: 1px solid var(--panel-border);">
-                      <h4>Query Execution Timings</h4>
-                      <div class="text-xs muted" style="margin-bottom: 16px;">
-                          Internal execution steps excluding total query time.
-                      </div>
+                  <div class="timings-header">
+                      <h4>Execution Timeline</h4>
+                      <span class="timings-total" id="timingsTotalLabel"></span>
+                      <div class="timings-sub">Internal execution steps excluding total query time.</div>
                   </div>
-                  <div class="chart-container">
-                      <canvas id="timingsChart"></canvas>
+                  <div class="timings-rows" id="timingsRows">
+                      <!-- rows rendered by renderTimingsChart() -->
                   </div>
               </div>
           </div>
 
-      
+
 
       <!-- Save as RBAC View Modal -->
       <div class="modal fade" id="saveViewModal" tabindex="-1" role="dialog" aria-hidden="true">
@@ -2364,6 +2450,16 @@ $(document).ready(function(){
     });
 
     window.editor.refresh();
+
+    // Auto-persist execution sessions 5 seconds after the last editor change
+    var _editorPersistTimer = null;
+    window.editor.on('change', function () {
+      if (_editorPersistTimer) clearTimeout(_editorPersistTimer);
+      _editorPersistTimer = setTimeout(function () {
+        _editorPersistTimer = null;
+        __saveActiveExecSessionState();
+      }, 5000);
+    });
 
     const execBtn = document.getElementById('btnExec');
     if (execBtn) {

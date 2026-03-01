@@ -24,6 +24,7 @@ class ScheduledNotebookCreate(BaseModel):
     org: str = Field(..., min_length=1, max_length=256)
     sup: str = Field(..., min_length=1, max_length=256)
     user_hash: str = Field(..., min_length=1, max_length=512)
+    role_name: str = Field("", max_length=256)
 
     name: str = Field(..., min_length=1, max_length=256)
     notebook_id: str = Field(..., min_length=1, max_length=256)
@@ -52,6 +53,7 @@ class _ScheduledJob(BaseModel):
     org: str
     sup: str
     user_hash: str
+    role_name: str = ""
 
     name: str
     notebook_id: str
@@ -503,6 +505,7 @@ async def _enqueue_studio_job(
     org: str,
     sup: str,
     user_hash: str,
+    role_name: str = "",
     code: str,
     session_id: str,
     compute_pool_id: Optional[str],
@@ -543,6 +546,7 @@ async def _enqueue_studio_job(
             "org": org,
             "sup": sup,
             "user_hash": user_hash,
+            "role_name": role_name,
             "code": c,
             "compute_pool_id": compute,
         }
@@ -610,6 +614,7 @@ async def _run_schedule(*, schedule_id: str, router: APIRouter, reason: str) -> 
             org=s.org,
             sup=s.sup,
             user_hash=s.user_hash,
+            role_name=s.role_name,
             code=s.code,
             session_id=session_id,
             compute_pool_id=s.compute_pool_id,
@@ -728,6 +733,7 @@ def attach_jobs_routes(
             org=payload.org.strip(),
             sup=payload.sup.strip(),
             user_hash=payload.user_hash.strip(),
+            role_name=(payload.role_name or "").strip(),
             name=payload.name.strip(),
             notebook_id=payload.notebook_id.strip(),
             notebook_name=payload.notebook_name.strip(),

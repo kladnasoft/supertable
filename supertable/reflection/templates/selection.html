@@ -1,265 +1,140 @@
 <div class="super-container" style="
-    /* Using the main content background color from the sidebar CSS */
     background-color: #f3f6fb;
-    font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Inter', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     padding: 0px;
 ">
-    <div class="card-professional-themed" style="
+    <div style="
         background-color: #ffffff;
-        border-radius: 16px;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
-        padding: 24px 50px;
-        border: 1px solid rgba(0, 0, 0, 0.05);
-        border-left: 5px solid #1c96ca; /* Primary Accent Color */
+        border-radius: 14px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+        padding: 14px 20px;
+        border: 1px solid #e0e5f0;
+        display: flex;
+        align-items: stretch;
+        gap: 0;
+        overflow: hidden;
     ">
-        
-        {% if session_username %}
+
+        <!-- LEFT: SuperTable selector -->
         <div style="
-            display:flex;
-            align-items:center;
-            justify-content:space-between;
-            gap:12px;
-            margin-bottom:18px;
-            padding:10px 14px;
-            border:1px solid rgba(15,23,42,.08);
-            border-radius:12px;
-            background: linear-gradient(180deg, rgba(28,150,202,.08), rgba(28,150,202,.03));
-            font-size: 13px;
-            color:#334155;
-        ">
-          <div>
-            <strong style="color:#0f172a;">{{ session_username }}</strong>
-            <span style="color:#94a3b8;">•</span>
-            <span>Org:</span> <strong style="color:#0f172a;">{{ session_org }}</strong>
-          </div>
-          <div style="display:inline-flex;align-items:center;gap:12px;color:#64748b;">
-            {% if session_is_superuser %}
-              <span style="display:inline-flex;align-items:center;gap:6px;">
-                <span style="width:8px;height:8px;border-radius:999px;background:#10b981;display:inline-block;"></span>
-                Superuser
-              </span>
-            {% else %}
-              <span style="display:inline-flex;align-items:center;gap:6px;">
-                <span style="width:8px;height:8px;border-radius:999px;background:#3b82f6;display:inline-block;"></span>
-                User
-              </span>
-            {% endif %}
-          </div>
-
-          <a href="/reflection/logout" title="Logout" style="
-              display:inline-flex;
-              align-items:center;
-              gap:8px;
-              padding:8px 12px;
-              border-radius:999px;
-              border:1px solid rgba(15,23,42,.10);
-              background:#ffffff;
-              color:#334155;
-              text-decoration:none;
-              font-weight:700;
-          ">
-            <i class="fas fa-sign-out-alt" style="color:#1c96ca;"></i>
-            <span style="font-size:12px;">Logout</span>
-          </a>
-
-        </div>
-        {% endif %}
-
-        <div class="grid-professional" style="
             display: flex;
-            gap: 40px;
-            align-items: flex-start;
+            align-items: center;
+            gap: 8px;
+            padding-right: 20px;
+            border-right: 1px solid #e0e5f0;
+            flex-shrink: 0;
         ">
-            <!-- LEFT: SuperTable selector -->
-            <div style="flex-shrink: 0; min-width: 300px;">
+            <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
+                style="width:34px; height:34px; border-radius:8px; border:1px solid rgba(239,68,68,.25); background:transparent; color:#475569; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:16px; line-height:1; transition: all 0.15s ease; flex-shrink:0;"
+                onmouseover="this.style.borderColor='#ef4444'; this.style.color='#ef4444'; this.style.background='rgba(239,68,68,0.06)'"
+                onmouseout="this.style.borderColor='rgba(239,68,68,.25)'; this.style.color='#475569'; this.style.background='transparent'">−</button>
 
-                <div style="display:grid; grid-template-columns:42px 1fr 42px; gap:10px; align-items:center;">
-                  <button type="button" id="btnDeleteSuperInline" title="Delete selected SuperTable"
-                    style="width:42px; height:42px; border-radius:12px; border:1px solid rgba(239,68,68,.35); background:transparent; color:#0f172a; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;"
-                    onmouseover="this.style.background='rgba(239,68,68,.08)'"
-                    onmouseout="this.style.background='transparent'">−</button>
+            <div style="display:flex; flex-direction:column; gap:3px; width:180px;">
+                <span style="font-size:10px; font-weight:700; color:#8d99ae; text-transform:uppercase; letter-spacing:0.06em;"></span>
+                <select id="pairSel" onchange="__st_onPairChange()" style="
+                    width: 100%;
+                    padding: 6px 28px 6px 8px;
+                    border: 1px solid #e0e5f0;
+                    border-radius: 6px;
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: #0f172a;
+                    background-color: #ffffff;
+                    cursor: pointer;
+                    appearance: none;
+                    background-image: url('data:image/svg+xml,%3Csvg width=%2712%27 height=%278%27 viewBox=%270 0 12 8%27 fill=%27none%27 xmlns=%27http://www.w3.org/2000/svg%27%3E%3Cpath d=%27M1 1.5L6 6.5L11 1.5%27 stroke=%27%238d99ae%27 stroke-width=%271.5%27 stroke-linecap=%27round%27/%3E%3C/svg%3E');
+                    background-repeat: no-repeat;
+                    background-position: right 10px center;
+                ">
+                </select>
+            </div>
 
-                  <select id="pairSel" onchange="__st_onPairChange()" style="
-                        width: 100%;
-                        padding: 10px 12px;
-                        border: 1px solid #d0d7e7;
-                        border-radius: 8px;
-                        font-size: 16px;
-                        background-color: #ffffff;
-                        cursor: pointer;
-                        appearance: none;
-                        background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fsvg%3E');
-                        background-repeat: no-repeat;
-                        background-position: right 10px center;
-                    ">
-                  </select>
+            <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
+                style="width:34px; height:34px; border-radius:8px; border:1px solid #b1dbec; background:transparent; color:#1c96ca; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:16px; line-height:1; transition: all 0.15s ease; flex-shrink:0;"
+                onmouseover="this.style.background='rgba(28,150,202,0.08)'"
+                onmouseout="this.style.background='transparent'">+</button>
 
-                  <button type="button" id="btnCreateSuperInline" title="Create SuperTable"
-                    style="width:42px; height:42px; border-radius:12px; border:1px solid #b1dbec; background:transparent; color:#1c96ca; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; line-height:1;"
-                    onmouseover="this.style.background='#b1dbec'"
-                    onmouseout="this.style.background='transparent'">+</button>
+            <button type="button" id="btnRefreshSupers" title="Refresh"
+                style="width:34px; height:34px; border-radius:8px; border:1px solid #e0e5f0; background:transparent; color:#8d99ae; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:13px; transition: all 0.15s ease; flex-shrink:0;"
+                onmouseover="this.style.borderColor='#1c96ca'; this.style.color='#1c96ca'"
+                onmouseout="this.style.borderColor='#e0e5f0'; this.style.color='#8d99ae'">
+                <i class="fas fa-arrows-rotate"></i>
+            </button>
+        </div>
 
-                  <div style="
-                        grid-column: 2;
-                        margin-top: 6px;
-                        text-align: center;
-                        font-size: 13px;
-                        color: #475569;
-                    ">
-                      Last updated:
-                      <span id="tenantUpdatedValue" style="font-weight: 600; color: #34475e;">n/a</span>
-                  </div>
+        <!-- RIGHT: Metric cards -->
+        <div style="
+            flex: 1;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            padding-left: 20px;
+            align-items: center;
+        ">
+            <!-- FILES -->
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="
+                    background:#e6f4fa; width:34px; height:34px; border-radius:8px;
+                    display:flex; align-items:center; justify-content:center; color:#1c96ca; font-size:14px;
+                "><i class="fa-solid fa-file"></i></div>
+                <div>
+                    <div style="font-size:10px; font-weight:600; color:#8d99ae; text-transform:uppercase; letter-spacing:0.04em;">Files</div>
+                    <div id="tenantFilesValue" style="font-size:17px; font-weight:800; color:#0f172a;">n/a</div>
                 </div>
             </div>
 
-            <!-- RIGHT: Metric cards -->
-            <div style="flex-grow: 1;">
-                <div class="summary-grid" style="
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 15px;
-                ">
-
-                    <!-- FILES -->
-                    <div class="metric-card-themed" style="
-                        background-color: #f5faff;
-                        border: 1px solid #e2e8f0;
-                        border-radius: 8px;
-                        padding: 15px;
-                        display: flex;
-                        align-items: center;
-                        gap: 12px;
-                    ">
-                        <div class="metric-icon" style="
-                            background: #e6f4fa;
-                            width: 40px;
-                            height: 40px;
-                            border-radius: 999px;
-                            display: flex;
-                            align-items: center;
-                            justify-content: center;
-                            color: #1c96ca;
-                            font-size: 20px;
-                        "><i class="fa-solid fa-file"></i></div>
-                        <div class="metric-content">
-                            <div class="metric-label" style="
-                                font-size: 12px;
-                                color: #475569;
-                                font-weight: 500;
-                            ">FILES</div>
-                            <div class="metric-value" id="tenantFilesValue" style="
-                                font-size: 20px;
-                                font-weight: 700;
-                                color: #34475e;
-                            ">n/a</div>
-                        </div>
-                    </div>
-
-                    <!-- ROWS -->
-                    <div class="metric-card-themed" style="
-                        background-color: #f5faff;
-                        border: 1px solid #d0d7e7;
-                        border-radius: 8px;
-                        padding: 15px;
-                        display: flex;
-                        align-items: center;
-                        gap: 12px;
-                    ">
-                        <div class="metric-icon" style="
-                            color: #475569;
-                            font-size: 20px;
-                        "><i class="fas fa-bars"></i></div>
-                        <div class="metric-content">
-                            <div class="metric-label" style="
-                                font-size: 12px;
-                                color: #475569;
-                                font-weight: 500;
-                            ">ROWS</div>
-                            <div class="metric-value" id="tenantRowsValue" style="
-                                font-size: 20px;
-                                font-weight: 700;
-                                color: #34475e;
-                            ">n/a</div>
-                        </div>
-                    </div>
-
-                    <!-- VERSION -->
-                    <div class="metric-card-themed" style="
-                        background-color: #f5faff;
-                        border: 1px solid #e2e8f0;
-                        border-radius: 8px;
-                        padding: 15px;
-                        display: flex;
-                        align-items: center;
-                        gap: 12px;
-                    ">
-                        <div class="metric-icon" style="
-                            background: #e6f4fa;
-                            width: 40px;
-                            height: 40px;
-                            border-radius: 999px;
-                            display: flex;
-                            align-items: center;
-                            justify-content: center;
-                            color: #1c96ca;
-                            font-size: 20px;
-                        "><i class="fas fa-code-branch"></i></div>
-                        <div class="metric-content">
-                            <div class="metric-label" style="
-                                font-size: 12px;
-                                color: #475569;
-                                font-weight: 500;
-                            ">VERSION</div>
-                            <div class="metric-value" id="tenantVersionValue" style="
-                                font-size: 20px;
-                                font-weight: 700;
-                                color: #34475e;
-                            ">n/a</div>
-                        </div>
-                    </div>
-
-                    <!-- BYTE SIZE -->
-                    <div class="metric-card-themed" style="
-                        background-color: #f5faff;
-                        border: 1px solid #e2e8f0;
-                        border-radius: 8px;
-                        padding: 15px;
-                        display: flex;
-                        align-items: center;
-                        gap: 12px;
-                    ">
-                        <div class="metric-icon" style="
-                            background: #e6f4fa;
-                            width: 40px;
-                            height: 40px;
-                            border-radius: 999px;
-                            display: flex;
-                            align-items: center;
-                            justify-content: center;
-                            color: #1c96ca;
-                            font-size: 20px;
-                        "><i class="fa-solid fa-database"></i></div>
-                        <div class="metric-content">
-                            <div class="metric-label" style="
-                                font-size: 12px;
-                                color: #475569;
-                                font-weight: 500;
-                            ">BYTE SIZE</div>
-                            <div class="metric-value" id="tenantSizeValue" style="
-                                font-size: 20px;
-                                font-weight: 700;
-                                color: #34475e;
-                            ">n/a</div>
-                        </div>
-                    </div>
+            <!-- ROWS -->
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="
+                    background:#e6f4fa; width:34px; height:34px; border-radius:8px;
+                    display:flex; align-items:center; justify-content:center; color:#1c96ca; font-size:14px;
+                "><i class="fas fa-bars"></i></div>
+                <div>
+                    <div style="font-size:10px; font-weight:600; color:#8d99ae; text-transform:uppercase; letter-spacing:0.04em;">Rows</div>
+                    <div id="tenantRowsValue" style="font-size:17px; font-weight:800; color:#0f172a;">n/a</div>
                 </div>
-</div>
+            </div>
 
+            <!-- VERSION -->
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="
+                    background:#e6f4fa; width:34px; height:34px; border-radius:8px;
+                    display:flex; align-items:center; justify-content:center; color:#1c96ca; font-size:14px;
+                "><i class="fas fa-code-branch"></i></div>
+                <div>
+                    <div style="font-size:10px; font-weight:600; color:#8d99ae; text-transform:uppercase; letter-spacing:0.04em;">Version</div>
+                    <div id="tenantVersionValue" style="font-size:17px; font-weight:800; color:#0f172a;">n/a</div>
+                </div>
+            </div>
+
+            <!-- BYTE SIZE -->
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="
+                    background:#e6f4fa; width:34px; height:34px; border-radius:8px;
+                    display:flex; align-items:center; justify-content:center; color:#1c96ca; font-size:14px;
+                "><i class="fa-solid fa-database"></i></div>
+                <div>
+                    <div style="font-size:10px; font-weight:600; color:#8d99ae; text-transform:uppercase; letter-spacing:0.04em;">Size</div>
+                    <div id="tenantSizeValue" style="font-size:17px; font-weight:800; color:#0f172a;">n/a</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Updated timestamp -->
+        <div style="
+            padding-left: 16px;
+            border-left: 1px solid #e0e5f0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 2px;
+            min-width: 110px;
+        ">
+            <span style="font-size:10px; font-weight:600; color:#8d99ae; text-transform:uppercase; letter-spacing:0.04em;">Updated</span>
+            <span id="tenantUpdatedValue" style="font-size:12px; font-weight:600; color:#0f172a;">n/a</span>
         </div>
     </div>
 </div>
-
-<!-- Selection logic: calls /meta/supers and /meta/super -->
 
 <!-- Create/Delete SuperTable Modal -->
 <div id="superModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:9999; align-items:center; justify-content:center; padding:16px;">
@@ -286,34 +161,61 @@
 (function () {
     window.__st_selection_component = true;
 
-    // Organization and user hash are injected server-side from the current tenant / selected user.
-    // sel_org comes from the backend tenant resolution; default_user_hash is derived from the first admin user.
-    const ORG_NAME = {{ session_org|default(sel_org|default("", true), true)|tojson }};
-    const USER_HASH = {{ session_user_hash|default(default_user_hash|default("", true), true)|tojson }};
-    const IS_SUPERUSER = {{ session_is_superuser|default(false, true)|tojson }};
+    // Read globals set by sidebar.html
+    const ORG_NAME = window.__st_org || {{ session_org|default(sel_org|default("", true), true)|tojson }};
+    const IS_SUPERUSER = window.__st_is_superuser || {{ session_is_superuser|default(false, true)|tojson }};
     const PRESELECT_SUP = {{ sel_sup|default("", true)|tojson }};
 
     const pairSel = document.getElementById("pairSel");
     let lastSupers = [];
     const btnCreateInline = document.getElementById("btnCreateSuperInline");
     const btnDeleteInline = document.getElementById("btnDeleteSuperInline");
-const filesEl = document.getElementById("tenantFilesValue");
+    const btnRefresh = document.getElementById("btnRefreshSupers");
+
+    // --- SessionStorage cache ---
+    const _SUPERS_CACHE_KEY = "st_supers:" + ORG_NAME;
+    const _ROLES_CACHE_PREFIX = "st_user_roles:" + ORG_NAME + ":";
+
+    function _getCached(key) {
+        try {
+            var raw = sessionStorage.getItem(key);
+            if (!raw) return null;
+            var parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) return parsed;
+        } catch (e) {}
+        return null;
+    }
+
+    function _setCache(key, list) {
+        try { sessionStorage.setItem(key, JSON.stringify(list)); } catch (e) {}
+    }
+
+    function _clearAllCaches() {
+        try {
+            sessionStorage.removeItem(_SUPERS_CACHE_KEY);
+            var keys = [];
+            for (var i = 0; i < sessionStorage.length; i++) {
+                var k = sessionStorage.key(i);
+                if (k && (k.indexOf(_ROLES_CACHE_PREFIX) === 0 || k.indexOf("st_exec_sessions:") === 0)) keys.push(k);
+            }
+            for (var j = 0; j < keys.length; j++) sessionStorage.removeItem(keys[j]);
+        } catch (e) {}
+    }
+
+    // Expose for sidebar.html logout handler
+    window.__st_clearAllCaches = _clearAllCaches;
+    const filesEl = document.getElementById("tenantFilesValue");
     const rowsEl = document.getElementById("tenantRowsValue");
     const sizeEl = document.getElementById("tenantSizeValue");
     const versionEl = document.getElementById("tenantVersionValue");
     const updatedEl = document.getElementById("tenantUpdatedValue");
 
     function formatBytes(bytes) {
-        if (bytes === null || bytes === undefined || isNaN(bytes)) {
-            return "n/a";
-        }
+        if (bytes === null || bytes === undefined || isNaN(bytes)) return "n/a";
         let val = Number(bytes);
         const units = ["B", "KB", "MB", "GB", "TB", "PB"];
         let i = 0;
-        while (val >= 1024 && i < units.length - 1) {
-            val /= 1024;
-            i++;
-        }
+        while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
         return val.toFixed(1) + " " + units[i];
     }
 
@@ -335,32 +237,40 @@ const filesEl = document.getElementById("tenantFilesValue");
 
     function applySuperMeta(superMeta) {
         if (!superMeta) {
-            filesEl.textContent = "n/a";
-            rowsEl.textContent = "n/a";
-            sizeEl.textContent = "n/a";
-            versionEl.textContent = "n/a";
-            updatedEl.textContent = "n/a";
+            if (filesEl) filesEl.textContent = "n/a";
+            if (rowsEl) rowsEl.textContent = "n/a";
+            if (sizeEl) sizeEl.textContent = "n/a";
+            if (versionEl) versionEl.textContent = "n/a";
+            if (updatedEl) updatedEl.textContent = "n/a";
             clearEmbeddedTablesIfPresent();
             return;
         }
-
-        filesEl.textContent = superMeta.files != null ? superMeta.files : "0";
-        rowsEl.textContent = superMeta.rows != null ? superMeta.rows : "0";
-        sizeEl.textContent = superMeta.size != null ? formatBytes(superMeta.size) : "n/a";
-        versionEl.textContent = superMeta.version != null ? superMeta.version : "n/a";
-        updatedEl.textContent = formatDate(superMeta.updated_utc);
+        if (filesEl) filesEl.textContent = superMeta.files != null ? superMeta.files : "0";
+        if (rowsEl) rowsEl.textContent = superMeta.rows != null ? superMeta.rows : "0";
+        if (sizeEl) sizeEl.textContent = superMeta.size != null ? formatBytes(superMeta.size) : "n/a";
+        if (versionEl) versionEl.textContent = superMeta.version != null ? superMeta.version : "n/a";
+        if (updatedEl) updatedEl.textContent = formatDate(superMeta.updated_utc);
     }
 
-    async function loadSupers() {
+    async function loadSupers(forceRefresh) {
         try {
-            const resp = await fetch(
-                "/reflection/supers?organization=" + encodeURIComponent(ORG_NAME)
-            );
-            if (!resp.ok) {
-                throw new Error("Failed to load supers: " + resp.status);
+            var supers;
+
+            if (!forceRefresh) {
+                supers = _getCached(_SUPERS_CACHE_KEY);
             }
-            const data = await resp.json();
-            const supers = (data && data.supers) || [];
+
+            if (supers === null || supers === undefined) {
+                console.log("[selection] fetching /reflection/supers from server");
+                const resp = await fetch("/reflection/supers?organization=" + encodeURIComponent(ORG_NAME));
+                if (!resp.ok) throw new Error("Failed to load supers: " + resp.status);
+                const data = await resp.json();
+                supers = (data && data.supers) || [];
+                _setCache(_SUPERS_CACHE_KEY, supers);
+            } else {
+                console.log("[selection] using cached supers list (" + supers.length + " items)");
+            }
+
             lastSupers = supers;
 
             pairSel.innerHTML = "";
@@ -381,24 +291,18 @@ const filesEl = document.getElementById("tenantFilesValue");
                 pairSel.appendChild(opt);
             });
 
-            // Prefer URL (?sup=) or server-selected sup when available.
             let initialSup = "";
             try {
                 const params0 = new URLSearchParams(window.location.search || "");
                 initialSup = (params0.get("sup") || "").trim();
-            } catch (e) {
-                // ignore
-            }
-            if (!initialSup) {
-                initialSup = (PRESELECT_SUP || "").trim();
-            }
+            } catch (e) {}
+            if (!initialSup) initialSup = (PRESELECT_SUP || "").trim();
 
             if (initialSup) {
                 const found = Array.from(pairSel.options || []).some(o => o && o.value === initialSup);
                 if (found) pairSel.value = initialSup;
             }
 
-            // Auto-load selected SuperTable
             if (pairSel.value) {
                 await loadSuperMeta(pairSel.value);
             } else {
@@ -412,62 +316,85 @@ const filesEl = document.getElementById("tenantFilesValue");
 
     async function loadSuperMeta(superName) {
         clearEmbeddedTablesIfPresent();
-        if (!superName) {
-            applySuperMeta(null);
-            return;
-        }
+        if (!superName) { applySuperMeta(null); return; }
 
         try {
+            var roleName = (window.__st_active_role || window.__st_role_name || "").trim();
+
             const params = new URLSearchParams({
                 organization: ORG_NAME,
-                super_name: superName,
-                user_hash: USER_HASH
+                super_name: superName
             });
-
-            const resp = await fetch("/reflection/super?" + params.toString());
-            if (!resp.ok) {
-                throw new Error("Failed to load super meta: " + resp.status);
+            if (roleName) {
+                params.set("role_name", roleName);
             }
+
+            const resp = await fetch("/reflection/super-meta?" + params.toString());
+            if (!resp.ok) throw new Error("Failed to load super meta: " + resp.status);
             const data = await resp.json();
             const superMeta = data && data.meta && data.meta.super;
             applySuperMeta(superMeta || null);
-try {
-    if (typeof window.onSuperMetaLoaded === "function") {
-        window.onSuperMetaLoaded(ORG_NAME, superName, superMeta || null);
-    }
-} catch (e) {
-    console.error("onSuperMetaLoaded failed:", e);
-}
+
+            // Load user role names (cached in sessionStorage)
+            await loadUserRoles(ORG_NAME, superName);
+
+            try {
+                if (typeof window.onSuperMetaLoaded === "function") {
+                    window.onSuperMetaLoaded(ORG_NAME, superName, superMeta || null);
+                }
+            } catch (e) { console.error("onSuperMetaLoaded failed:", e); }
         } catch (err) {
             console.error("Error loading super meta:", err);
             applySuperMeta(null);
         }
     }
 
-    // Primary handler for the SuperTable selector.
-    // - Updates the selection metrics block (this template)
-    // - Notifies the host page (CustomEvent)
-    // - Delegates to a page-provided onPairChange() if one exists
-    // - Falls back to a full page reload for pages that are server-rendered (admin/notebooks/etc.)
-    window.__st_onPairChange = function __st_onPairChange() {
-        const superName = pairSel.value;
+    async function loadUserRoles(orgName, superName, forceRefresh) {
+        var cacheKey = _ROLES_CACHE_PREFIX + superName;
+        var roleNames;
 
-        // Always refresh selection metrics immediately.
-        loadSuperMeta(superName);
-
-        // Keep URL in sync so refresh / deep links preserve the selection.
-        let nextHref = "";
-        try {
-            const u = new URL(window.location.href);
-            if (ORG_NAME) u.searchParams.set("org", ORG_NAME);
-            if (superName) u.searchParams.set("sup", superName);
-            nextHref = u.toString();
-            history.replaceState(null, "", nextHref);
-        } catch (e) {
-            // ignore
+        if (!forceRefresh) {
+            roleNames = _getCached(cacheKey);
         }
 
-        // Notify any page-level listeners (ingestion, etc.)
+        if (roleNames === null || roleNames === undefined) {
+            console.log("[selection] fetching /reflection/user-role-names from server");
+            try {
+                var resp = await fetch(
+                    "/reflection/user-role-names?org=" + encodeURIComponent(orgName) +
+                    "&sup=" + encodeURIComponent(superName)
+                );
+                if (!resp.ok) throw new Error("User roles fetch failed: " + resp.status);
+                var data = await resp.json();
+                roleNames = data.role_names || [];
+                _setCache(cacheKey, roleNames);
+            } catch (err) {
+                console.error("Failed to load user roles:", err);
+                roleNames = [];
+            }
+        } else {
+            console.log("[selection] using cached role names (" + roleNames.length + " items)");
+        }
+
+        // Notify sidebar to apply these role names
+        if (typeof window.__st_applyRoleNames === "function") {
+            window.__st_applyRoleNames(roleNames);
+        }
+    }
+
+    // Primary handler for the SuperTable selector.
+    window.__st_onPairChange = function __st_onPairChange() {
+        const superName = pairSel.value;
+        loadSuperMeta(superName);
+
+        let nextHref = "";
+        try {
+            const params = new URLSearchParams(window.location.search || "");
+            params.set("sup", superName || "");
+            nextHref = window.location.pathname + "?" + params.toString();
+            history.replaceState(null, "", nextHref);
+        } catch (e) {}
+
         let allowFallbackReload = true;
         try {
             const ev = new CustomEvent("supertable-changed", {
@@ -475,33 +402,35 @@ try {
                 detail: { org: ORG_NAME, sup: superName, super_name: superName }
             });
             allowFallbackReload = window.dispatchEvent(ev);
-        } catch (e) {
-            // ignore
-        }
+        } catch (e) {}
 
-        // If the host page defines its own onPairChange(), call it too (do not recurse).
         try {
             if (typeof window.onPairChange === "function" && window.onPairChange !== window.__st_onPairChange) {
                 window.onPairChange(ORG_NAME, superName);
                 return;
             }
-        } catch (e) {
-            console.error("Page onPairChange failed:", e);
-        }
+        } catch (e) { console.error("Page onPairChange failed:", e); }
 
-        // No page handler => reload so server-rendered sections change with the tenant.
         if (allowFallbackReload) {
-            if (nextHref) {
-                window.location.href = nextHref;
-            } else {
-                window.location.reload();
-            }
+            if (nextHref) { window.location.href = nextHref; }
+            else { window.location.reload(); }
         }
     };
 
-    // Backwards-compat: keep onPairChange() available if the page doesn't define one.
     if (typeof window.onPairChange !== "function") {
         window.onPairChange = window.__st_onPairChange;
+    }
+
+    // Refresh button
+    if (btnRefresh) {
+        btnRefresh.addEventListener("click", function () {
+            var icon = btnRefresh.querySelector("i");
+            if (icon) { icon.style.transition = "transform 0.5s ease"; icon.style.transform = "rotate(360deg)"; }
+            _clearAllCaches();
+            loadSupers(true).then(function () {
+                setTimeout(function () { if (icon) icon.style.transform = ""; }, 600);
+            });
+        });
     }
 
     if (document.readyState === "loading") {
@@ -544,23 +473,11 @@ try {
             btnPrimary.textContent = "Delete";
         }
 
-        // datalist for delete autocomplete
         let dl = document.getElementById("superNameDatalist");
-        if (!dl) {
-            dl = document.createElement("datalist");
-            dl.id = "superNameDatalist";
-            document.body.appendChild(dl);
-        }
+        if (!dl) { dl = document.createElement("datalist"); dl.id = "superNameDatalist"; document.body.appendChild(dl); }
         dl.innerHTML = "";
-        (supersList || []).forEach(s => {
-            const opt = document.createElement("option");
-            opt.value = s;
-            dl.appendChild(opt);
-        });
-        // For delete: restrict to selectedName; no datalist.
-        if (mode === "delete") {
-            input.removeAttribute("list");
-        }
+        (supersList || []).forEach(s => { const opt = document.createElement("option"); opt.value = s; dl.appendChild(opt); });
+        if (mode === "delete") { input.removeAttribute("list"); }
 
         function close() {
             modal.style.display = "none";
@@ -576,11 +493,7 @@ try {
             err.style.display = "none";
             ok.style.display = "none";
             const name = (input.value || "").trim();
-            if (!name) {
-                err.textContent = "SuperTable name is required.";
-                err.style.display = "";
-                return;
-            }
+            if (!name) { err.textContent = "SuperTable name is required."; err.style.display = ""; return; }
 
             try {
                 if (mode === "create") {
@@ -592,26 +505,16 @@ try {
                     ok.style.display = "";
                 } else {
                     const selected = (selectedName || "").trim();
-                    if (!selected) {
-                        err.textContent = "Select a SuperTable first.";
-                        err.style.display = "";
-                        return;
-                    }
-                    if (name !== selected) {
-                        err.textContent = "Type the selected SuperTable name exactly to confirm deletion.";
-                        err.style.display = "";
-                        return;
-                    }
-                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(USER_HASH)}`;
+                    if (!selected) { err.textContent = "Select a SuperTable first."; err.style.display = ""; return; }
+                    if (name !== selected) { err.textContent = "Type the selected SuperTable name exactly to confirm deletion."; err.style.display = ""; return; }
+                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(window.__st_user_hash || "")}`;
                     const res = await fetch(url, { method: "DELETE" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Delete failed");
                     ok.textContent = `Deleted: ${js.name || name}`;
                     ok.style.display = "";
                 }
-
-                // refresh list
-                await loadSupers();
+                await loadSupers(true);
                 close();
             } catch (e) {
                 err.textContent = e && e.message ? e.message : "Operation failed.";
@@ -625,8 +528,6 @@ try {
         setTimeout(() => input.focus(), 50);
     }
 
-
-    // Inline create/delete buttons next to SuperTable selector
     function setInlineSuperButtonsVisibility() {
       const show = !!IS_SUPERUSER;
       if (btnCreateInline) btnCreateInline.style.display = show ? "flex" : "none";

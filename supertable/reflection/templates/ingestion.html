@@ -341,7 +341,6 @@
 <div id="stagingRoot"
      data-org="{{ sel_org }}"
      data-sup="{{ sel_sup }}"
-     data-user-hash="{{ session_user_hash }}"
      style="
         background: #ffffff;
         border-radius: 16px;
@@ -357,7 +356,7 @@
     </div>
   </div>
 
-  
+
 
   <!-- -------------------- STAGING TAB -------------------- -->
   <div class="tabpane hidden" id="pane-staging">
@@ -522,7 +521,7 @@
           </div>
         </div>
 
-        
+
         <!-- Step 3 -->
         <div class="stepcard" id="overwriteStepCard">
           <div class="stephead">
@@ -591,13 +590,22 @@
 (function () {
   function enc(v) { return encodeURIComponent(v || ""); }
 
+  // Role resolution — mirrors the pattern in tables.html.
+  // selection.html may set window.__st_active_role when the user picks a role;
+  // fall back to the session role_name baked into the template at render time.
+  const ROLE_NAME = {{ session_role_name|default('', true)|tojson }};
+
+  function getActiveRole() {
+    return (window.__st_active_role || window.__st_role_name || ROLE_NAME || '').trim();
+  }
+
   function root() { return document.getElementById("stagingRoot"); }
   function currentOrgSup() {
     const el = root();
     return {
       org: el ? (el.dataset.org || "") : "",
       sup: el ? (el.dataset.sup || "") : "",
-      userHash: el ? (el.dataset.userHash || "") : "",
+      roleName: getActiveRole(),
     };
   }
 
@@ -1165,7 +1173,7 @@
       meta.super_name = String(meta.super_name || meta.sup || cur.sup || "");
       meta.staging_name = String(meta.staging_name || stagingName || "");
       meta.pipe_name = String(meta.pipe_name || pipeName || "");
-      meta.user_hash = String(meta.user_hash || cur.userHash || "");
+      meta.role_name = String(meta.role_name || cur.roleName || "");
     }
     selectedPipeName = String(meta.pipe_name || pipeName || "");
     selectedPipeEnabled = !!meta.enabled;
@@ -1175,13 +1183,13 @@
   }
 
   function newPipeTemplate(stg) {
-    const { org, sup, userHash } = currentOrgSup();
+    const { org, sup, roleName } = currentOrgSup();
     return {
       pipe_name: "pipe_01",
       organization: org,
       super_name: sup,
       staging_name: stg,
-      user_hash: userHash || "",
+      role_name: roleName || "",
       simple_name: "",
       overwrite_columns: ["day"],
       enabled: true,
@@ -1275,7 +1283,7 @@
       obj.super_name = String(obj.super_name || obj.sup || cur.sup || "");
       obj.staging_name = String(obj.staging_name || stg || "");
       obj.pipe_name = String(obj.pipe_name || selectedPipeName || "").trim();
-      obj.user_hash = String(obj.user_hash || cur.userHash || "");
+      obj.role_name = String(obj.role_name || cur.roleName || "");
 
       if (!obj.organization || !obj.super_name || !obj.staging_name || !obj.pipe_name) {
         alert("Missing required fields: organization, super_name, staging_name, pipe_name.");
@@ -1417,7 +1425,7 @@
     const org = detail.org || "";
     const sup = detail.sup || "";
     if (!org || !sup) return;
-    
+
 
     // If the page can refresh in-place, prefer that and prevent the selection fallback reload.
     if (typeof window.onPairChange === "function") {
@@ -1614,14 +1622,14 @@ try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } cat
   }
 
   async function _refreshTableSuggestions() {
-    const { org, sup, userHash } = currentOrgSup();
+    const { org, sup, roleName } = currentOrgSup();
     const dl = document.getElementById("loadTableSuggestions");
     if (!dl) return;
     dl.innerHTML = "";
     if (!org || !sup) return;
 
     try {
-      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}&user_hash=${enc(userHash)}`);
+      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}&role_name=${enc(roleName)}`);
       const tables = (data && data.tables) ? data.tables : [];
       for (const t of (tables || [])) {
         const opt = document.createElement("option");
@@ -1686,7 +1694,7 @@ try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } cat
   }
 
   async function _doUploadAndLoad() {
-    const { org, sup, userHash } = currentOrgSup();
+    const { org, sup, roleName } = currentOrgSup();
     const btn = document.getElementById("loadStartBtn");
     if (!btn || !loadSelectedFile) return;
 
@@ -1700,8 +1708,8 @@ try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } cat
       _setLoadResult(false, "Missing tenant selection (org/super).");
       return;
     }
-    if (!userHash) {
-      _setLoadResult(false, "Missing user hash (session). Please re-login.");
+    if (!roleName) {
+      _setLoadResult(false, "Missing role name (session). Please re-login.");
       return;
     }
     if (loadMode === "table" && !tableName) {
@@ -1721,7 +1729,7 @@ try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } cat
       const fd = new FormData();
       fd.append("org", org);
       fd.append("sup", sup);
-      fd.append("user_hash", userHash);
+      fd.append("role_name", roleName);
       fd.append("mode", loadMode);
       if (tableName) fd.append("table_name", tableName);
       const overwriteEl2 = document.getElementById("loadOverwriteCols");

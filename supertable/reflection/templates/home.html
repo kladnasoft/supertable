@@ -4,331 +4,498 @@
 
 {% block head_extra %}
 <style>
-  .home-hero {
-    background: linear-gradient(135deg, rgba(28,150,202,0.10), rgba(20,123,163,0.06));
-    border: 1px solid rgba(15,23,42,.08);
-    border-left: 5px solid var(--primary-color);
-    border-radius: 18px;
-    padding: 18px 18px;
-    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
-  }
-  .home-hero h1 {
-    margin: 0;
-    font-weight: 900;
-    font-size: 20px;
-    color: #0f172a;
-  }
-  .home-muted { color:#64748b; font-size: 12px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  /* ── Home Page Styles ─────────────────────────────────────────────── */
 
-  .home-card {
-    border: 1px solid rgba(15,23,42,.10);
-    border-radius: 16px;
-    background: #fff;
-    padding: 14px 14px;
-    height: 100%;
-    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+  :root {
+    --home-primary: #1c96ca;
+    --home-primary-hover: #147ba3;
+    --home-primary-deep: #0a678f;
+    --home-primary-glow: rgba(28, 150, 202, 0.12);
+    --home-primary-faint: rgba(28, 150, 202, 0.06);
+    --home-success: #10b981;
+    --home-text: #0f172a;
+    --home-text-secondary: #475569;
+    --home-text-muted: #64748b;
+    --home-border: #e2e8f0;
+    --home-bg-card: #ffffff;
+    --home-bg-subtle: #f8fafc;
+    --home-radius: 14px;
+    --home-shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.03);
+    --home-shadow-md: 0 4px 16px rgba(15, 23, 42, 0.06);
+    --home-shadow-lg: 0 10px 30px rgba(15, 23, 42, 0.08);
+    --home-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   }
-  .home-card .t {
-    font-weight: 900;
-    color:#0f172a;
-    display:flex;
-    align-items:center;
+
+  /* ── Context Cards (top row) ──────────────────────────────────────── */
+
+  .ctx-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+    margin-bottom: 28px;
+  }
+
+  @media (max-width: 992px) {
+    .ctx-grid { grid-template-columns: 1fr; }
+  }
+
+  .ctx-card {
+    background: var(--home-bg-card);
+    border: 1px solid var(--home-border);
+    border-radius: var(--home-radius);
+    padding: 20px;
+    box-shadow: var(--home-shadow-sm);
+    display: flex;
+    flex-direction: column;
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+  }
+
+  .ctx-card:hover {
+    box-shadow: var(--home-shadow-md);
+    transform: translateY(-1px);
+  }
+
+  .ctx-card-header {
+    display: flex;
+    align-items: center;
     gap: 10px;
-    margin-bottom: 8px;
+    margin-bottom: 12px;
     font-size: 13px;
-  }
-  .home-card .t i { color: var(--primary-color); }
-  .home-card .d { color:#64748b; font-size: 12px; line-height: 1.35; }
-  .home-card .k { margin-top:10px; display:flex; gap:10px; flex-wrap:wrap; }
-
-  .btn-azure-outline {
-    border: 1px solid var(--primary-color);
-    background: transparent;
-    color: var(--primary-color);
     font-weight: 700;
-    transition: background-color .18s ease, color .18s ease;
+    color: var(--home-text);
+    letter-spacing: 0.01em;
   }
-  .btn-azure-outline:hover { background: var(--primary-color); color: #fff; }
 
-  .btn-azure-solid {
-    border: 1px solid var(--primary-color);
-    background: var(--primary-color);
+  .ctx-card-header i {
+    color: var(--home-primary);
+    font-size: 14px;
+    width: 18px;
+    text-align: center;
+  }
+
+  .ctx-card-body {
+    font-size: 13px;
+    color: var(--home-text-secondary);
+    line-height: 1.6;
+    flex: 1;
+  }
+
+  .ctx-card-body .mono {
+    font-family: var(--home-mono);
+    font-size: 12px;
+    color: var(--home-text);
+    background: var(--home-bg-subtle);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .ctx-card-actions {
+    margin-top: 14px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* ── Buttons ──────────────────────────────────────────────────────── */
+
+  .btn-home {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    border: none;
+    line-height: 1.4;
+  }
+
+  .btn-home i { font-size: 11px; }
+
+  .btn-home-solid {
+    background: var(--home-primary);
     color: #fff;
-    font-weight: 800;
-    transition: filter .18s ease;
+    box-shadow: 0 1px 3px rgba(28, 150, 202, 0.25);
   }
-  .btn-azure-solid:hover { filter: brightness(0.95); }
-</style>
+  .btn-home-solid:hover {
+    background: var(--home-primary-hover);
+    color: #fff;
+    text-decoration: none;
+    box-shadow: 0 3px 8px rgba(28, 150, 202, 0.3);
+  }
 
-<style>
-.legacy-home {
-      --primary: #1c96ca;
-      --primary-hover: #147ba3;
-      --primary-light: rgba(28, 150, 202, 0.1);
-      --text: #495057;
-      --text-light: #6b7280;
-      --text-dark: #111827;
-      --bg-white: #ffffff;
-      --bg-light: #f8fafc;
-      --bg-lighter: #f1f5f9;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --error: #ef4444;
-      --border: #e2e8f0;
+  .btn-home-outline {
+    background: transparent;
+    color: var(--home-primary);
+    border: 1px solid var(--home-primary);
   }
-.legacy-home body.sidebar-collapsed @media (max-width: 992px) {
-      }
-/* Hero Section */
-  .hero-section{
-      background: linear-gradient(135deg, rgba(28, 150, 202, 0.05) 0%, rgba(16, 185, 129, 0.05) 100%);
-      border-radius: 16px;
-      padding: 40px;
-      margin-bottom: 30px;
-      text-align: center;
-      border: 1px solid var(--border);
-      position: relative;
-      overflow: hidden;
+  .btn-home-outline:hover {
+    background: var(--home-primary);
+    color: #fff;
+    text-decoration: none;
   }
-.legacy-home .hero-section::before {
-      content: "";
-      position: absolute;
-      top: -50px;
-      right: -50px;
-      width: 200px;
-      height: 200px;
-      background: radial-gradient(circle, rgba(28, 150, 202, 0.1) 0%, rgba(28, 150, 202, 0) 70%);
-      z-index: 0;
+
+  .btn-home-ghost {
+    background: var(--home-primary-glow);
+    color: var(--home-primary);
+    border: 1px solid transparent;
   }
-.legacy-home .hero-section::after {
-      content: "";
-      position: absolute;
-      bottom: -30px;
-      left: -30px;
-      width: 150px;
-      height: 150px;
-      background: radial-gradient(circle, rgba(16, 185, 129, 0.1) 0%, rgba(16, 185, 129, 0) 70%);
-      z-index: 0;
+  .btn-home-ghost:hover {
+    background: var(--home-primary);
+    color: #fff;
+    text-decoration: none;
   }
-.legacy-home .hero-title {
-      font-size: 2.5rem;
-      font-weight: 700;
-      color: var(--primary);
-      margin-bottom: 15px;
-      position: relative;
-      z-index: 1;
+
+  /* ── Hero Section ─────────────────────────────────────────────────── */
+
+  .home-hero {
+    background: linear-gradient(135deg, var(--home-primary-faint) 0%, rgba(16, 185, 129, 0.04) 100%);
+    border: 1px solid var(--home-border);
+    border-radius: var(--home-radius);
+    padding: 40px 36px;
+    margin-bottom: 32px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
   }
-.legacy-home .hero-subtitle {
-      font-size: 1.2rem;
-      color: var(--text);
-      max-width: 800px;
-      margin: 0 auto 25px;
-      position: relative;
-      z-index: 1;
+
+  .home-hero::before {
+    content: "";
+    position: absolute;
+    top: -60px;
+    right: -60px;
+    width: 180px;
+    height: 180px;
+    background: radial-gradient(circle, rgba(28, 150, 202, 0.1) 0%, transparent 70%);
+    pointer-events: none;
   }
-/* Feature Cards */
-  .features-grid{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 25px;
-      margin-bottom: 40px;
+
+  .home-hero::after {
+    content: "";
+    position: absolute;
+    bottom: -40px;
+    left: -40px;
+    width: 140px;
+    height: 140px;
+    background: radial-gradient(circle, rgba(16, 185, 129, 0.08) 0%, transparent 70%);
+    pointer-events: none;
   }
-.legacy-home .feature-card {
-      background: white;
-      border-radius: 12px;
-      padding: 25px;
-      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05), 0 4px 6px -2px rgba(0,0,0,0.02);
-      transition: all 0.3s ease;
-      border: 1px solid var(--border);
-      position: relative;
-      overflow: hidden;
+
+  .home-hero h1 {
+    font-size: 1.85rem;
+    font-weight: 800;
+    color: var(--home-primary);
+    margin: 0 0 10px;
+    position: relative;
+    z-index: 1;
+    letter-spacing: -0.02em;
   }
-.legacy-home .feature-card:hover {
-      transform: translateY(-5px);
-      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.04);
+
+  .home-hero p {
+    font-size: 1rem;
+    color: var(--home-text-secondary);
+    margin: 0 auto 20px;
+    max-width: 640px;
+    position: relative;
+    z-index: 1;
+    line-height: 1.6;
   }
-.legacy-home .feature-card::before {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 4px;
-      height: 100%;
-      background: var(--primary);
+
+  .home-hero .hero-actions {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
   }
-.legacy-home .feature-icon {
-      width: 60px;
-      height: 60px;
-      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
-      border-radius: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: white;
-      font-size: 1.5rem;
-      margin-bottom: 20px;
+
+  .btn-hero {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 26px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s ease;
   }
-.legacy-home .feature-title {
-      font-size: 1.3rem;
-      font-weight: 600;
-      color: var(--text-dark);
-      margin-bottom: 15px;
+
+  .btn-hero-primary {
+    background: linear-gradient(135deg, var(--home-primary) 0%, var(--home-primary-hover) 100%);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(28, 150, 202, 0.3);
   }
-.legacy-home .feature-description {
-      color: var(--text);
-      margin-bottom: 15px;
+
+  .btn-hero-primary:hover {
+    color: #fff;
+    text-decoration: none;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(28, 150, 202, 0.4);
   }
-.legacy-home .feature-link {
-      display: inline-flex;
-      align-items: center;
-      color: var(--primary);
-      font-weight: 500;
-      text-decoration: none;
-      transition: all 0.2s;
+
+  .btn-hero-primary:hover i { transform: translateX(3px); }
+  .btn-hero-primary i { transition: transform 0.2s ease; }
+
+  .btn-hero-secondary {
+    background: var(--home-bg-card);
+    color: var(--home-primary);
+    border: 1px solid var(--home-border);
+    box-shadow: var(--home-shadow-sm);
   }
-.legacy-home .feature-link:hover {
-      color: var(--primary-hover);
-      text-decoration: underline;
+
+  .btn-hero-secondary:hover {
+    color: var(--home-primary-hover);
+    text-decoration: none;
+    background: var(--home-bg-subtle);
+    transform: translateY(-2px);
+    box-shadow: var(--home-shadow-md);
   }
-.legacy-home .feature-link i {
-      margin-left: 5px;
-      transition: transform 0.2s;
+
+  /* ── Quick Start Steps ────────────────────────────────────────────── */
+
+  .qs-section {
+    background: var(--home-bg-card);
+    border: 1px solid var(--home-border);
+    border-radius: var(--home-radius);
+    padding: 28px;
+    margin-bottom: 32px;
+    box-shadow: var(--home-shadow-sm);
   }
-.legacy-home .feature-link:hover i {
-      transform: translateX(3px);
+
+  .section-heading {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--home-text);
+    margin: 0 0 22px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
-/* Quick Start Section */
-  .quick-start{
-      background: white;
-      border-radius: 16px;
-      padding: 30px;
-      margin-bottom: 30px;
-      border: 1px solid var(--border);
+
+  .section-heading i {
+    color: var(--home-primary);
+    font-size: 16px;
   }
-.legacy-home .section-title {
-      font-size: 1.5rem;
-      font-weight: 600;
-      color: var(--text-dark);
-      margin-bottom: 20px;
-      display: flex;
-      align-items: center;
+
+  .qs-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 18px;
   }
-.legacy-home .section-title i {
-      margin-right: 10px;
-      color: var(--primary);
+
+  @media (max-width: 1200px) {
+    .qs-grid { grid-template-columns: repeat(2, 1fr); }
   }
-.legacy-home .steps {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 20px;
+  @media (max-width: 640px) {
+    .qs-grid { grid-template-columns: 1fr; }
   }
-.legacy-home .step {
-      display: flex;
-      align-items: flex-start;
+
+  .qs-step {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
   }
-.legacy-home .step-number {
-      width: 30px;
-      height: 30px;
-      background: var(--primary);
-      color: white;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 600;
-      margin-right: 15px;
-      flex-shrink: 0;
+
+  .qs-num {
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--home-primary);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
-.legacy-home .step-content {
-      flex-grow: 1;
+
+  .qs-step h4 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--home-text);
+    margin: 0 0 4px;
   }
-.legacy-home .step-title {
-      font-weight: 600;
-      color: var(--text-dark);
-      margin-bottom: 5px;
+
+  .qs-step p {
+    font-size: 12px;
+    color: var(--home-text-muted);
+    margin: 0;
+    line-height: 1.5;
   }
-.legacy-home .step-description {
-      color: var(--text);
-      font-size: 0.9rem;
+
+  /* ── Feature Cards ────────────────────────────────────────────────── */
+
+  .feat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 20px;
+    margin-bottom: 32px;
   }
-/* Stats Section */
-  .stats-section{
-      background: linear-gradient(135deg, var(--primary) 0%, #0a678f 100%);
-      border-radius: 16px;
-      padding: 30px;
-      color: white;
-      margin-bottom: 30px;
+
+  .feat-card {
+    background: var(--home-bg-card);
+    border: 1px solid var(--home-border);
+    border-radius: var(--home-radius);
+    padding: 24px;
+    box-shadow: var(--home-shadow-sm);
+    position: relative;
+    overflow: hidden;
+    transition: box-shadow 0.25s ease, transform 0.25s ease;
+    opacity: 0;
+    transform: translateY(16px);
   }
-.legacy-home .stats-title {
-      font-size: 1.5rem;
-      font-weight: 600;
-      margin-bottom: 25px;
-      text-align: center;
+
+  .feat-card.visible {
+    opacity: 1;
+    transform: translateY(0);
   }
-.legacy-home .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 20px;
+
+  .feat-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 4px;
+    height: 100%;
+    background: var(--home-primary);
+    border-radius: 4px 0 0 4px;
+    opacity: 0;
+    transition: opacity 0.25s ease;
   }
-.legacy-home .stat-item {
-      text-align: center;
-      padding: 20px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 10px;
-      backdrop-filter: blur(5px);
+
+  .feat-card:hover {
+    box-shadow: var(--home-shadow-lg);
+    transform: translateY(-3px);
   }
-.legacy-home .stat-value {
-      font-size: 2.5rem;
-      font-weight: 700;
-      margin-bottom: 5px;
+
+  .feat-card:hover::before { opacity: 1; }
+
+  .feat-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, var(--home-primary) 0%, var(--home-primary-hover) 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 1.2rem;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 8px rgba(28, 150, 202, 0.2);
   }
-.legacy-home .stat-label {
-      font-size: 0.9rem;
-      opacity: 0.9;
+
+  .feat-card h3 {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--home-text);
+    margin: 0 0 8px;
   }
-/* Call to Action */
-  .cta-section{
-      text-align: center;
-      padding: 40px 20px;
+
+  .feat-card .feat-desc {
+    font-size: 13px;
+    color: var(--home-text-secondary);
+    line-height: 1.55;
+    margin: 0 0 14px;
   }
-.legacy-home .cta-title {
-      font-size: 1.8rem;
-      font-weight: 700;
-      color: var(--primary);
-      margin-bottom: 15px;
+
+  .feat-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--home-primary);
+    text-decoration: none;
+    transition: color 0.15s ease;
   }
-.legacy-home .cta-button {
-      display: inline-flex;
-      align-items: center;
-      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
-      color: white;
-      padding: 12px 30px;
-      border-radius: 8px;
-      font-weight: 600;
-      text-decoration: none;
-      box-shadow: 0 4px 15px rgba(28, 150, 202, 0.3);
-      transition: all 0.3s ease;
+
+  .feat-link:hover {
+    color: var(--home-primary-hover);
+    text-decoration: none;
   }
-.legacy-home .cta-button:hover {
-      transform: translateY(-3px);
-      box-shadow: 0 8px 25px rgba(28, 150, 202, 0.4);
-      color: white;
+
+  .feat-link i {
+    font-size: 11px;
+    transition: transform 0.2s ease;
   }
-.legacy-home .cta-button i {
-      margin-left: 8px;
-      transition: transform 0.3s;
+
+  .feat-link:hover i { transform: translateX(3px); }
+
+  /* ── Stats Banner ─────────────────────────────────────────────────── */
+
+  .stats-banner {
+    background: linear-gradient(135deg, var(--home-primary) 0%, var(--home-primary-deep) 100%);
+    border-radius: var(--home-radius);
+    padding: 30px 28px;
+    margin-bottom: 32px;
+    color: #fff;
   }
-.legacy-home .cta-button:hover i {
-      transform: translateX(5px);
+
+  .stats-banner h3 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    text-align: center;
+    margin: 0 0 22px;
+    letter-spacing: 0.01em;
   }
-/* Animation */
-  @keyframes float{
-      0% { transform: translateY(0px); }
-      50% { transform: translateY(-10px); }
-      100% { transform: translateY(0px); }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px;
   }
-.legacy-home .floating {
-      animation: float 6s ease-in-out infinite;
+
+  .stat-tile {
+    text-align: center;
+    padding: 16px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    backdrop-filter: blur(4px);
+    transition: background 0.2s ease;
+  }
+
+  .stat-tile:hover { background: rgba(255, 255, 255, 0.16); }
+
+  .stat-val {
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.1;
+    margin-bottom: 4px;
+  }
+
+  .stat-label {
+    font-size: 13px;
+    opacity: 0.85;
+    font-weight: 500;
+  }
+
+  /* ── CTA Section ──────────────────────────────────────────────────── */
+
+  .cta-section {
+    text-align: center;
+    padding: 36px 20px;
+  }
+
+  .cta-section h3 {
+    font-size: 1.5rem;
+    font-weight: 800;
+    color: var(--home-primary);
+    margin: 0 0 10px;
+    letter-spacing: -0.01em;
+  }
+
+  .cta-section p {
+    color: var(--home-text-muted);
+    margin: 0 0 20px;
+    font-size: 14px;
   }
 </style>
 {% endblock %}
@@ -336,271 +503,269 @@
 
 {% block content %}
 
+<!-- ── Context Cards ──────────────────────────────────────────────── -->
+<div class="ctx-grid">
 
-<div class="row g-3">
-  <div class="col-12 col-lg-4">
-    <div class="home-card">
-      <div class="t"><i class="fas fa-building"></i> Current Tenant</div>
-      <div class="d">
-        Organization: <span class="mono">{{ sel_org|default("—", true) }}</span><br/>
-        SuperTable: <span class="mono">{{ sel_sup|default("—", true) }}</span>
-      </div>
-      <div class="k">
-        <a class="btn btn-sm btn-azure-solid" href="/reflection/tables"><i class="fas fa-sliders"></i> Select tenant</a>
-      </div>
+  <div class="ctx-card">
+    <div class="ctx-card-header">
+      <i class="fas fa-building"></i> Current Tenant
+    </div>
+    <div class="ctx-card-body">
+      Organization: <span class="mono">{{ sel_org|default("—", true) }}</span><br/>
+      SuperTable: <span class="mono">{{ sel_sup|default("—", true) }}</span>
+    </div>
+    <div class="ctx-card-actions">
+      <a class="btn-home btn-home-solid" href="/reflection/tables">
+        <i class="fas fa-sliders"></i> Select Tenant
+      </a>
     </div>
   </div>
 
-  <div class="col-12 col-lg-4">
-    <div class="home-card">
-      <div class="t"><i class="fas fa-user"></i> Session</div>
-      <div class="d">
-        User: <span class="mono">{{ session_user_name|default("—", true) }}</span><br/>
-        Hash: <span class="mono">{{ session_user_hash|default("—", true) }}</span>
-      </div>
-      <div class="k">
-        <a class="btn btn-sm btn-azure-outline" href="/reflection/admin"><i class="fas fa-gear"></i> Admin</a>
-      </div>
+  <div class="ctx-card">
+    <div class="ctx-card-header">
+      <i class="fas fa-user"></i> Session
+    </div>
+    <div class="ctx-card-body">
+      User: <span class="mono">{{ session_username|default("—", true) }}</span><br/>
+      Hash: <span class="mono">{{ session_user_hash|default("—", true) }}</span>
+    </div>
+    <div class="ctx-card-actions">
+      <a class="btn-home btn-home-outline" href="/reflection/admin">
+        <i class="fas fa-gear"></i> Admin
+      </a>
     </div>
   </div>
 
-  <div class="col-12 col-lg-4">
-    <div class="home-card">
-      <div class="t"><i class="fas fa-circle-info"></i> Next steps</div>
-      <div class="d">
-        Start exploring data (Tables / SQL), run experiments in Notebooks, then set up Connectors and Compute Pools when ready.
+  <div class="ctx-card">
+    <div class="ctx-card-header">
+      <i class="fas fa-circle-info"></i> Next Steps
+    </div>
+    <div class="ctx-card-body">
+      Explore data via Tables or the SQL Editor, run experiments in Studio, then configure Vault and Compute when ready.
+    </div>
+    <div class="ctx-card-actions">
+      <a class="btn-home btn-home-ghost" href="/reflection/execute">
+        <i class="fas fa-terminal"></i> SQL
+      </a>
+      <a class="btn-home btn-home-ghost" href="/reflection/tables">
+        <i class="fas fa-database"></i> Tables
+      </a>
+      <a class="btn-home btn-home-ghost" href="/reflection/studio">
+        <i class="fas fa-book"></i> Studio
+      </a>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Hero ───────────────────────────────────────────────────────── -->
+<div class="home-hero">
+  <h1>Welcome to Data Reflection</h1>
+  <p>
+    Manage, query, and monitor your data across Super Tables with
+    SQL execution, AI tools, and fine-grained access control — all in one place.
+  </p>
+  <div class="hero-actions">
+    <a href="/reflection/execute" class="btn-hero btn-hero-primary">
+      Launch SQL Editor <i class="fas fa-arrow-right"></i>
+    </a>
+    <a href="#features" class="btn-hero btn-hero-secondary">
+      <i class="fas fa-star"></i> Explore Features
+    </a>
+  </div>
+</div>
+
+<!-- ── Quick Start ────────────────────────────────────────────────── -->
+<div class="qs-section">
+  <h2 class="section-heading">
+    <i class="fas fa-bolt"></i> Quick Start Guide
+  </h2>
+  <div class="qs-grid">
+    <div class="qs-step">
+      <div class="qs-num">1</div>
+      <div>
+        <h4>Create a Super Table</h4>
+        <p>Organize your related data tables via the Tables page using the creation controls.</p>
       </div>
-      <div class="k">
-        <a class="btn btn-sm btn-azure-outline" href="/reflection/sql"><i class="fas fa-terminal"></i> SQL</a>
-        <a class="btn btn-sm btn-azure-outline" href="/reflection/tables"><i class="fas fa-database"></i> Tables</a>
-        <a class="btn btn-sm btn-azure-outline" href="/reflection/notebooks"><i class="fas fa-book"></i> Notebooks</a>
+    </div>
+    <div class="qs-step">
+      <div class="qs-num">2</div>
+      <div>
+        <h4>Import Your Data</h4>
+        <p>Upload CSV, JSON, or Parquet files through the Ingestion hub with built-in preview.</p>
+      </div>
+    </div>
+    <div class="qs-step">
+      <div class="qs-num">3</div>
+      <div>
+        <h4>Query Your Data</h4>
+        <p>Open the SQL Editor and run queries with syntax highlighting and autocomplete.</p>
+      </div>
+    </div>
+    <div class="qs-step">
+      <div class="qs-num">4</div>
+      <div>
+        <h4>Monitor &amp; Optimize</h4>
+        <p>Review execution plans, track write metrics, and tune your queries in the Jobs view.</p>
       </div>
     </div>
   </div>
 </div>
 
-<div style="height: 18px;"></div>
+<!-- ── Features ───────────────────────────────────────────────────── -->
+<div id="features">
+  <h2 class="section-heading">
+    <i class="fas fa-star"></i> Key Features
+  </h2>
+  <div class="feat-grid">
 
-<div class="legacy-home">
-  <!-- Legacy Home Content (ported to Jinja) -->
-              <!-- Quick Start Section -->
-            <div class="quick-start" id="quick-start">
-                <h2 class="section-title">
-                    <i class="fas fa-bolt"></i>Quick Start Guide
-                </h2>
-                <div class="steps">
-                    <div class="step">
-                        <div class="step-number">1</div>
-                        <div class="step-content">
-                            <h4 class="step-title">Create a Super Table</h4>
-                            <p class="step-description">
-                                Start by creating a Super Table to organize your related data tables.
-                                Click the "Super Tables" menu and use the creation controls.
-                            </p>
-                        </div>
-                    </div>
-                    <div class="step">
-                        <div class="step-number">2</div>
-                        <div class="step-content">
-                            <h4 class="step-title">Import Your Data</h4>
-                            <p class="step-description">
-                                Use the Import Hub to upload CSV, JSON, or Excel files. Preview your data
-                                before final import to ensure quality.
-                            </p>
-                        </div>
-                    </div>
-                    <div class="step">
-                        <div class="step-number">3</div>
-                        <div class="step-content">
-                            <h4 class="step-title">Query Your Data</h4>
-                            <p class="step-description">
-                                Navigate to the SQL Editor and run queries against your tables.
-                                Use the autocomplete features for faster query writing.
-                            </p>
-                        </div>
-                    </div>
-                    <div class="step">
-                        <div class="step-number">4</div>
-                        <div class="step-content">
-                            <h4 class="step-title">Monitor Performance</h4>
-                            <p class="step-description">
-                                Check the Monitoring section to analyze query performance and
-                                optimize your database operations.
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-
-
-            <!-- Features Section -->
-            <div id="features">
-                <h2 class="section-title">
-                    <i class="fas fa-star"></i>Key Features
-                </h2>
-                <div class="features-grid">
-
-                    <!-- Super Tables Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-layer-group"></i>
-                        </div>
-                        <h3 class="feature-title">Super Tables</h3>
-                        <p class="feature-description">
-                            Manage your data effortlessly with Super Tables — smart collections of related tables designed to streamline organization and access control. Unlike traditional databases, Super Tables let you query across multiple tables directly, without the need for unions.
-                        </p>
-
-
-                    </div>
-
-                    <!-- SQL Execution Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-terminal"></i>
-                        </div>
-                        <h3 class="feature-title">SQL Execution</h3>
-                        <p class="feature-description">
-                            Write and execute queries effortlessly with our advanced SQL editor — featuring syntax highlighting, autocomplete, and real-time, paginated results. Simply click on a Super Table to expand its contents and run your queries instantly.
-                        </p>
-                    </div>
-
-                    <!-- Data Import Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-file-import"></i>
-                        </div>
-                        <h3 class="feature-title">Data Import Hub</h3>
-                       <p class="feature-description">
-                            Quickly upload CSV, JSON, and PARQUET files with built-in preview and automatic schema detection. Use the staging area to validate your data before importing. You can create a new table on your first upload or store files for Data Staging, allowing you to reload them anytime as needed.
-                       </p>
-                    </div>
-
-                    <!-- AI Tools Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-robot"></i>
-                        </div>
-                        <h3 class="feature-title">AI Tools</h3>
-                        <p class="feature-description">
-                            Unlock AI-powered tools for query generation, data analysis, and natural language to SQL conversion. With Docu Genie, a semantic layer is automatically created, giving you full visibility into your available data.
-                        </p>
-
-                    </div>
-
-                    <!-- Monitoring Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-chart-line"></i>
-                        </div>
-                        <h3 class="feature-title">Query Monitoring</h3>
-                        <p class="feature-description">
-                            Monitor query performance with detailed statistics, visualized execution plans, and comprehensive write operation metrics — giving you deeper insights into your data flow.
-                        </p>
-
-                    </div>
-
-
-
-                    <!-- User Management Feature -->
-                    <div class="feature-card">
-                        <div class="feature-icon">
-                            <i class="fas fa-users-cog"></i>
-                        </div>
-                        <h3 class="feature-title">User Management</h3>
-                        <p class="feature-description">
-                            Administer user roles and permissions with fine-grained access control
-                            for your organization's data.
-                        </p>
-                        <a href="/reflection/users" class="feature-link">
-                            Manage Users
-                            <i class="fas fa-arrow-right"></i>
-                        </a>
-                    </div>
-                </div>
-            </div>
-
-             <!-- Stats Section -->
-            <div class="stats-section">
-                <h3 class="stats-title">Platform at a Glance</h3>
-                <div class="stats-grid">
-                    <div class="stat-item floating" style="animation-delay: 0s;">
-                        <div class="stat-value">{{ stats.supertables }}</div>
-                        <div class="stat-label">Super Tables</div>
-                    </div>
-                    <div class="stat-item floating" style="animation-delay: 0.5s;">
-                        <div class="stat-value">{{ stats.tables }}</div>
-                        <div class="stat-label">Import Data</div>
-                    </div>
-                    <div class="stat-item floating" style="animation-delay: 1s;">
-                        <div class="stat-value">{{ stats.queries }}</div>
-                        <div class="stat-label">Queries Executed</div>
-                    </div>
-                    <div class="stat-item floating" style="animation-delay: 1.5s;">
-                        <div class="stat-value">{{ stats.users }}</div>
-                        <div class="stat-label">AI Tools</div>
-                    </div>
-                </div>
-            </div>
-
-
-
-            <!-- Call to Action -->
-            <div class="cta-section">
-                <h3 class="cta-title">Ready to Elevate Your Data Experience?</h3>
-                <p class="text-muted mb-4">Discover the power of KladnaSoft by exploring our Example SuperTable.</p>
-                <a href="/reflection/execute?supertable=example" class="cta-button">
-                    Launch SQL Editor <i class="fas fa-arrow-right"></i>
-                </a>
-            </div>
-
-        </div>
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-layer-group"></i></div>
+      <h3>Super Tables</h3>
+      <p class="feat-desc">
+        Smart collections of related tables that streamline organization and access control.
+        Query across multiple tables directly — no unions needed.
+      </p>
+      <a href="/reflection/tables" class="feat-link">
+        Manage Tables <i class="fas fa-arrow-right"></i>
+      </a>
     </div>
+
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-terminal"></i></div>
+      <h3>SQL Execution</h3>
+      <p class="feat-desc">
+        Advanced SQL editor with syntax highlighting, autocomplete, and real-time paginated results.
+        Click any Super Table to expand its contents and run queries instantly.
+      </p>
+      <a href="/reflection/execute" class="feat-link">
+        Open Editor <i class="fas fa-arrow-right"></i>
+      </a>
+    </div>
+
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-file-import"></i></div>
+      <h3>Data Ingestion</h3>
+      <p class="feat-desc">
+        Upload CSV, JSON, and Parquet files with automatic schema detection. Use the staging area
+        to validate before import, and reload staged files on demand.
+      </p>
+      <a href="/reflection/ingestion" class="feat-link">
+        Import Data <i class="fas fa-arrow-right"></i>
+      </a>
+    </div>
+
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-robot"></i></div>
+      <h3>AI Tools</h3>
+      <p class="feat-desc">
+        AI-powered query generation, data analysis, and natural language to SQL conversion.
+        Docu Genie auto-creates a semantic layer for full data visibility.
+      </p>
+      <a href="/reflection/studio" class="feat-link">
+        Open Studio <i class="fas fa-arrow-right"></i>
+      </a>
+    </div>
+
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-chart-line"></i></div>
+      <h3>Monitoring &amp; Jobs</h3>
+      <p class="feat-desc">
+        Track query performance with detailed statistics, visualized execution plans,
+        scheduled jobs, and comprehensive write-operation metrics.
+      </p>
+      <a href="/reflection/jobs" class="feat-link">
+        View Jobs <i class="fas fa-arrow-right"></i>
+      </a>
+    </div>
+
+    <div class="feat-card">
+      <div class="feat-icon"><i class="fas fa-users-cog"></i></div>
+      <h3>User Management</h3>
+      <p class="feat-desc">
+        Administer user roles and permissions with fine-grained RBAC and
+        row/column-level security for your organization's data.
+      </p>
+      <a href="/reflection/admin" class="feat-link">
+        Manage Users <i class="fas fa-arrow-right"></i>
+      </a>
+    </div>
+
+  </div>
 </div>
 
-<!-- Footer -->
+<!-- ── Stats Banner ───────────────────────────────────────────────── -->
+<div class="stats-banner">
+  <h3>Platform at a Glance</h3>
+  <div class="stats-row">
+    <div class="stat-tile">
+      <div class="stat-val">{{ stats.supertables|default("–", true) }}</div>
+      <div class="stat-label">Super Tables</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-val">{{ stats.tables|default("–", true) }}</div>
+      <div class="stat-label">Data Tables</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-val">{{ stats.connectors|default("–", true) }}</div>
+      <div class="stat-label">Connectors</div>
+    </div>
+    <div class="stat-tile">
+      <div class="stat-val">{{ stats.pools|default("–", true) }}</div>
+      <div class="stat-label">Compute Pools</div>
+    </div>
+  </div>
+</div>
 
+<!-- ── CTA ─────────────────────────────────────────────────────────── -->
+<div class="cta-section">
+  <h3>Ready to Explore Your Data?</h3>
+  <p>Open the SQL Editor to start querying, or head to Tables to set up your first Super Table.</p>
+  <a href="/reflection/execute" class="btn-hero btn-hero-primary">
+    Launch SQL Editor <i class="fas fa-arrow-right"></i>
+  </a>
+</div>
 
 <script>
-    // Smooth scrolling for anchor links
-    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-        anchor.addEventListener('click', function (e) {
-            e.preventDefault();
-            document.querySelector(this.getAttribute('href')).scrollIntoView({
-                behavior: 'smooth'
-            });
-        });
+  // Smooth scroll for anchor links
+  document.querySelectorAll('a[href^="#"]').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+      var el = document.querySelector(this.getAttribute('href'));
+      if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth' }); }
     });
+  });
 
-    // Animation on scroll
-    document.addEventListener('DOMContentLoaded', function() {
-        const featureCards = document.querySelectorAll('.feature-card');
+  // Intersection Observer — fade-in feature cards
+  document.addEventListener('DOMContentLoaded', function() {
+    var cards = document.querySelectorAll('.feat-card');
+    if (!('IntersectionObserver' in window)) {
+      cards.forEach(function(c) { c.classList.add('visible'); });
+      return;
+    }
+    var obs = new IntersectionObserver(function(entries) {
+      entries.forEach(function(entry) {
+        if (entry.isIntersecting) {
+          entry.target.style.transitionDelay = (entry.target.dataset.delay || '0') + 'ms';
+          entry.target.classList.add('visible');
+          obs.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.08 });
 
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) {
-                    entry.target.style.opacity = 1;
-                    entry.target.style.transform = 'translateY(0)';
-                }
-            });
-        }, { threshold: 0.1 });
-
-        featureCards.forEach(card => {
-            card.style.opacity = 0;
-            card.style.transform = 'translateY(20px)';
-            card.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
-            observer.observe(card);
-        });
+    cards.forEach(function(c, i) {
+      c.dataset.delay = String(i * 70);
+      c.style.transition = 'opacity 0.45s ease, transform 0.45s ease';
+      obs.observe(c);
     });
+  });
 </script>
-</div>
 
 {% endblock %}
 
 {% block body_scripts %}
 <script>
 (function () {
-  const ln = document.getElementById("link-home");
+  var ln = document.getElementById("link-home");
   if (ln) ln.classList.add("active");
 })();
 </script>

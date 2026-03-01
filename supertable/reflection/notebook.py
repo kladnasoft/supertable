@@ -113,7 +113,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
 
         dr = DataReader(super_name=sup, organization=org, query=q)
         # Returns (df, status, message) in examples; pass through as-is.
-        return dr.execute(user_hash=user_hash, with_scan=with_scan, engine=engine.DUCKDB)
+        return dr.execute(role_name=user_hash, with_scan=with_scan, engine=engine.DUCKDB)
 
     def st_read_table(table: str, *, limit: int = 50) -> Any:
         t = str(table or "").strip()
@@ -153,7 +153,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
 
         dw = DataWriter(super_name=sup, organization=org)
         return dw.write(
-            user_hash=user_hash,
+            role_name=user_hash,
             simple_name=t,
             data=tbl,
             overwrite_columns=list(ow),

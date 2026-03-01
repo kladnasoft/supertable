@@ -26,9 +26,7 @@ from fastapi.templating import Jinja2Templates
 from redis import Sentinel
 from redis.sentinel import MasterNotFoundError
 
-from supertable.redis_catalog import RedisCatalog
-from supertable.super_table import SuperTable
-from supertable.storage.storage_factory import get_storage
+
 
 # Load environment variables from .env file (optional)
 try:
@@ -217,6 +215,8 @@ def session_context(request: Request) -> Dict[str, Any]:
         "session_user_hash": (sess.get("user_hash") or "").strip(),
         "session_is_superuser": bool(sess.get("is_superuser") is True) or is_superuser(request),
         "session_logged_in": bool(sess.get("org") and sess.get("username") and sess.get("user_hash")),
+        "session_role_name": (sess.get("role_name") or "").strip(),
+        "session_roles": sess.get("roles") or [],
     }
 
 
@@ -231,6 +231,8 @@ def inject_session_into_ctx(ctx: Dict[str, Any], request: Request) -> Dict[str, 
         ctx.setdefault("session_user_hash", "")
         ctx.setdefault("session_is_superuser", False)
         ctx.setdefault("session_logged_in", False)
+        ctx.setdefault("session_role_name", "")
+        ctx.setdefault("session_roles", [])
     return ctx
 
 
@@ -354,6 +356,105 @@ class _FallbackCatalog:
                 }
             except Exception:
                 continue
+
+    # -- RBAC methods (mirrors RedisCatalog API using correct rbac: key namespace) --
+
+    @staticmethod
+    def _decode_member(m) -> str:
+        return m if isinstance(m, str) else m.decode("utf-8")
+
+    def get_users(self, org: str, sup: str) -> List[Dict]:
+        users: List[Dict] = []
+        try:
+            index_key = f"supertable:{org}:{sup}:rbac:users:index"
+            members = self.r.smembers(index_key)
+            for uid_raw in (members or []):
+                uid = self._decode_member(uid_raw)
+                doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{uid}"
+                raw = self.r.hgetall(doc_key)
+                if raw:
+                    data: Dict = dict(raw)
+                    data.setdefault("user_id", uid)
+                    data.setdefault("hash", uid)
+                    if "roles" in data:
+                        try:
+                            data["roles"] = json.loads(data["roles"])
+                        except (json.JSONDecodeError, TypeError):
+                            data["roles"] = []
+                    users.append(data)
+        except Exception as e:
+            logger.warning("_FallbackCatalog.get_users error: %s", e)
+        return users
+
+    def get_roles(self, org: str, sup: str) -> List[Dict]:
+        roles: List[Dict] = []
+        try:
+            index_key = f"supertable:{org}:{sup}:rbac:roles:index"
+            members = self.r.smembers(index_key)
+            for rid_raw in (members or []):
+                rid = self._decode_member(rid_raw)
+                doc_key = f"supertable:{org}:{sup}:rbac:roles:doc:{rid}"
+                raw = self.r.hgetall(doc_key)
+                if raw:
+                    data: Dict = dict(raw)
+                    data.setdefault("role_id", rid)
+                    data.setdefault("hash", rid)
+                    for field in ("tables", "columns", "filters"):
+                        if field in data:
+                            try:
+                                data[field] = json.loads(data[field])
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                    roles.append(data)
+        except Exception as e:
+            logger.warning("_FallbackCatalog.get_roles error: %s", e)
+        return roles
+
+    def get_user_details(self, org: str, sup: str, user_id: str) -> Optional[Dict]:
+        try:
+            doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{user_id}"
+            raw = self.r.hgetall(doc_key)
+            if not raw:
+                return None
+            data: Dict = dict(raw)
+            if "roles" in data:
+                try:
+                    data["roles"] = json.loads(data["roles"])
+                except (json.JSONDecodeError, TypeError):
+                    data["roles"] = []
+            return data
+        except Exception as e:
+            logger.warning("_FallbackCatalog.get_user_details error: %s", e)
+        return None
+
+    def get_role_details(self, org: str, sup: str, role_id: str) -> Optional[Dict]:
+        try:
+            doc_key = f"supertable:{org}:{sup}:rbac:roles:doc:{role_id}"
+            raw = self.r.hgetall(doc_key)
+            if not raw:
+                return None
+            data: Dict = dict(raw)
+            for field in ("tables", "columns", "filters"):
+                if field in data:
+                    try:
+                        data[field] = json.loads(data[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return data
+        except Exception as e:
+            logger.warning("_FallbackCatalog.get_role_details error: %s", e)
+        return None
+
+    def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
+        try:
+            name_map_key = f"supertable:{org}:{sup}:rbac:users:name_to_id"
+            val = self.r.hget(name_map_key, username.lower())
+            if val is None:
+                return None
+            return self._decode_member(val)
+        except Exception as e:
+            logger.warning("_FallbackCatalog.rbac_get_user_id_by_username error: %s", e)
+        return None
 
 
 def _coerce_password(pw: Optional[str]) -> Optional[str]:
@@ -676,6 +777,26 @@ def _read_hash(key: str) -> Optional[Dict]:
 
 
 def list_users(org: str, sup: str) -> List[Dict]:
+    """Return all users via catalog.get_users() (RBAC index-based).
+
+    Normalizes each doc to always have 'user_id' and 'hash' fields.
+    """
+    try:
+        if hasattr(catalog, "get_users"):
+            users = catalog.get_users(org, sup)
+            # Normalize: ensure user_id and hash are always present
+            for u in users:
+                uid = u.get("user_id") or u.get("hash") or ""
+                u.setdefault("user_id", uid)
+                u.setdefault("hash", uid)
+            return users
+    except Exception as e:
+        logger.warning("catalog.get_users failed (%s/%s): %s — falling back to legacy scan", org, sup, e)
+    return _list_users_legacy(org, sup)
+
+
+def _list_users_legacy(org: str, sup: str) -> List[Dict]:
+    """Legacy Redis-scan fallback for old meta:users: namespace."""
     out: List[Dict] = []
     pattern = f"supertable:{org}:{sup}:meta:users:*"
     cursor = 0
@@ -711,16 +832,105 @@ def list_users(org: str, sup: str) -> List[Dict]:
     return out
 
 
-# Prefer installed package; fallback to local modules for dev
-try:
-    from supertable.meta_reader import MetaReader  # type: ignore
-except Exception:
-    from meta_reader import MetaReader  # type: ignore
+def list_roles(org: str, sup: str) -> List[Dict]:
+    """Return all roles via catalog.get_roles() (RBAC index-based)."""
+    try:
+        if hasattr(catalog, "get_roles"):
+            return catalog.get_roles(org, sup)
+    except Exception as e:
+        logger.warning("catalog.get_roles failed (%s/%s): %s", org, sup, e)
+    return []
 
-try:
-    from supertable.data_reader import DataReader, engine  # type: ignore
-except Exception:
-    from data_reader import DataReader, engine  # type: ignore
+
+def read_user(org: str, sup: str, user_id: str) -> Optional[Dict]:
+    """Read a single user document by user_id."""
+    try:
+        if hasattr(catalog, "get_user_details"):
+            doc = catalog.get_user_details(org, sup, user_id)
+            if doc and isinstance(doc, dict):
+                return doc
+    except Exception:
+        pass
+    # Fallback: direct Redis lookup (legacy key namespace)
+    key = f"supertable:{org}:{sup}:meta:users:{user_id}"
+    t = _r_type(key)
+    if t == "string":
+        return _read_string_json(key)
+    if t == "hash":
+        return _read_hash(key)
+    return None
+
+
+def read_role(org: str, sup: str, role_id: str) -> Optional[Dict]:
+    """Read a single role document by role_id."""
+    try:
+        if hasattr(catalog, "get_role_details"):
+            doc = catalog.get_role_details(org, sup, role_id)
+            if doc and isinstance(doc, dict):
+                return doc
+    except Exception:
+        pass
+    # Fallback: direct Redis lookup (legacy key namespace)
+    key = f"supertable:{org}:{sup}:meta:roles:{role_id}"
+    t = _r_type(key)
+    if t == "string":
+        return _read_string_json(key)
+    if t == "hash":
+        return _read_hash(key)
+    return None
+
+
+def get_user_roles(org: str, sup: str, username: str) -> List[Dict]:
+    """Get resolved roles for a specific user by username.
+
+    Flow: catalog.rbac_get_user_id_by_username() → user doc → role IDs
+          → catalog.get_role_details() for each.
+    """
+    try:
+        # Step 1: username → user_id
+        user_id: Optional[str] = None
+        if hasattr(catalog, "rbac_get_user_id_by_username"):
+            user_id = catalog.rbac_get_user_id_by_username(org, sup, username)
+
+        if not user_id:
+            # Fallback: scan all users and match by name (case-insensitive)
+            all_users = list_users(org, sup)
+            uname_lower = (username or "").lower()
+            for u in all_users:
+                n = (u.get("username") or u.get("name") or "").lower()
+                if n == uname_lower:
+                    user_id = u.get("user_id") or u.get("hash") or ""
+                    break
+            if not user_id:
+                return []
+
+        # Step 2: user_id → user doc → role IDs
+        user_doc = read_user(org, sup, user_id)
+        if not user_doc or not isinstance(user_doc, dict):
+            return []
+
+        role_ids = user_doc.get("roles") or []
+        if isinstance(role_ids, str):
+            try:
+                role_ids = json.loads(role_ids)
+            except Exception:
+                role_ids = [role_ids]
+
+        # Step 3: resolve each role_id
+        roles: List[Dict] = []
+        for rid in role_ids:
+            rid = str(rid).strip()
+            if not rid:
+                continue
+            role_doc = read_role(org, sup, rid)
+            if role_doc and isinstance(role_doc, dict):
+                roles.append({"role_id": rid, **role_doc})
+            else:
+                roles.append({"role_id": rid, "role_name": rid})
+        return roles
+    except Exception as e:
+        logger.warning("get_user_roles failed (%s/%s/%s): %s", org, sup, username, e)
+        return []
 
 
 # ------------------------------ Router + templates ------------------------------
@@ -808,125 +1018,6 @@ def healthz():
         return f"error: {e}"
 
 
-# -------- JSON API (read-only) --------
-
-def api_tenants(_: Any = Depends(logged_in_guard_api)):
-    pairs = discover_pairs()
-    return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
-
-
-
-def api_get_mirrors(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _: Any = Depends(logged_in_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "formats": []}
-    try:
-        fmts = catalog.get_mirrors(org, sup)
-    except Exception:
-        fmts = []
-    return {"org": org, "sup": sup, "formats": fmts}
-
-
-
-def _list_leaves(
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-        q: Optional[str] = Query(None),
-        page: int = Query(1, ge=1),
-        page_size: int = Query(50, ge=1, le=500),
-        _: Any = Depends(logged_in_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "total": 0, "page": page, "page_size": page_size, "items": []}
-
-    items: List[Dict] = []
-    total = 0
-    ql = (q or "").lower()
-
-    scan_iter = None
-    if hasattr(catalog, "scan_leaf_items"):
-        try:
-            scan_iter = catalog.scan_leaf_items(org, sup, count=1000)
-        except Exception:
-            scan_iter = None
-    if scan_iter is None:
-        pattern = f"supertable:{org}:{sup}:meta:leaf:*"
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
-            for key in keys:
-                raw = redis_client.get(key)
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    continue
-                simple = (key if isinstance(key, str) else key.decode("utf-8")).rsplit("meta:leaf:", 1)[-1]
-                rec = {
-                    "simple": simple,
-                    "version": int(obj.get("version", -1)),
-                    "ts": int(obj.get("ts", 0)),
-                    "path": obj.get("path", ""),
-                }
-                if q and ql not in simple.lower():
-                    continue
-                total += 1
-                items.append(rec)
-            if cursor == 0:
-                break
-    else:
-        for item in scan_iter:
-            simple = item.get("simple", "")
-            if q and ql not in simple.lower():
-                continue
-            total += 1
-            items.append(item)
-
-    items.sort(key=lambda x: x.get("simple", ""))
-
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = items[start:end]
-    return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
-
-
-def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"users": []}
-    return {"users": list_users(org, sup)}
-
-
-def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"roles": []}
-    return {"roles": list_roles(org, sup)}
-
-
-def api_user_details(user_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
-                     _=Depends(admin_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_user(org, sup, user_hash)
-    if not obj:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"hash": user_hash, "data": obj}
-
-
-def api_role_details(role_hash: str, org: Optional[str] = Query(None), sup: Optional[str] = Query(None),
-                     _=Depends(admin_guard_api)):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_role(org, sup, role_hash)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Role not found")
-    return {"hash": role_hash, "data": obj}
-
 
 # ------------------------------ Admin page & auth routes ------------------------------
 @router.get("/reflection/login", response_class=HTMLResponse)
@@ -1009,205 +1100,245 @@ def admin_logout():
     return resp
 
 
-def _parse_dotenv(path: str) -> Dict[str, str]:
-    env: Dict[str, str] = {}
-    if not path:
-        return env
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        return env
+# ------------------------------ Selection panel endpoints ------------------------------
+
+# Cache MetaReader instances — the constructor is expensive (~40-470ms) due to
+# Redis/storage connection setup.  Instances are stateless readers, safe to reuse.
+_meta_reader_cache: Dict[Tuple[str, str], Any] = {}
+_META_READER_CACHE_MAX = 32
+
+
+def _get_meta_reader(organization: str, super_name: str):
+    """Return a cached MetaReader instance, creating one if needed."""
+    key = (organization, super_name)
+    reader = _meta_reader_cache.get(key)
+    if reader is not None:
+        return reader
+    from supertable.meta_reader import MetaReader
+    reader = MetaReader(organization=organization, super_name=super_name)
+    # Evict oldest if cache is full
+    if len(_meta_reader_cache) >= _META_READER_CACHE_MAX:
+        try:
+            oldest = next(iter(_meta_reader_cache))
+            del _meta_reader_cache[oldest]
+        except StopIteration:
+            pass
+    _meta_reader_cache[key] = reader
+    return reader
+
+
+@router.get("/reflection/super-meta")
+def reflection_super_meta(
+    request: Request,
+    organization: str = Query(...),
+    super_name: str = Query(...),
+    role_name: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Return SuperTable metadata via MetaReader.get_super_meta(role_name).
+
+    Used by selection.html to populate the header metrics panel.
+    """
+    t0 = time.perf_counter()
+
+    organization = organization.strip()
+    super_name = super_name.strip()
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+    # Resolve role_name: prefer explicit param, then session
+    resolved_role = (role_name or "").strip()
+    if not resolved_role:
+        sess = get_session(request) or {}
+        resolved_role = (sess.get("role_name") or "").strip()
+
     try:
-        content = p.read_text(encoding="utf-8", errors="ignore")
-        for line in content.splitlines():
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            if "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            # Remove surrounding quotes if present
-            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                v = v[1:-1]
-            env[k] = v
+        t1 = time.perf_counter()
+        meta_reader = _get_meta_reader(organization, super_name)
+        t2 = time.perf_counter()
+        result = meta_reader.get_super_meta(resolved_role)
+        t3 = time.perf_counter()
     except Exception as e:
-        print(f"Error parsing .env file {path}: {e}")
-    return env
+        logger.warning("MetaReader.get_super_meta failed (%s/%s): %s", organization, super_name, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    resp = JSONResponse({"meta": result})
+    _no_store(resp)
+    t4 = time.perf_counter()
+
+    logger.debug(
+        "super-meta %s/%s timings: total=%.1fms | meta_reader=%.1fms | get_super_meta=%.1fms | response=%.1fms",
+        organization, super_name,
+        (t4 - t0) * 1000,
+        (t2 - t1) * 1000,
+        (t3 - t2) * 1000,
+        (t4 - t3) * 1000,
+    )
+    return resp
 
 
-def _effective_settings() -> Dict[str, str]:
-    keys = [
-        "SUPERTABLE_REDIS_URL",
-        "SUPERTABLE_REDIS_HOST",
-        "SUPERTABLE_REDIS_PORT",
-        "SUPERTABLE_REDIS_DB",
-        "SUPERTABLE_REDIS_PASSWORD",
-        "SUPERTABLE_REDIS_USERNAME",
-        "SUPERTABLE_ADMIN_TOKEN",
-        "DOTENV_PATH",
-        "TEMPLATES_DIR",
-        "SECURE_COOKIES",
-        "HOST",
-        "PORT",
-        "UVICORN_RELOAD",
-    ]
-    return {k: os.getenv(k) for k in keys}
-
-
-
-def api_list_tokens(
+@router.get("/reflection/user-role-names")
+def reflection_user_role_names(
     request: Request,
-    org: str = Query(None),
-    _: Any = Depends(admin_guard_api),
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
 ):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    tokens = _catalog_list_tokens(org_eff)
-    return {"ok": True, "organization": org_eff, "tokens": tokens}
+    """Return role names for the current session user on the given SuperTable.
 
-
-def api_create_token(
-    request: Request,
-    org: str = Query(None),
-    label: str = Query(""),
-    _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    created = _catalog_create_token(org_eff, created_by="superuser", label=label)
-    return {"ok": True, "organization": org_eff, **created}
-
-
-def api_delete_token(
-    request: Request,
-    token_id: str,
-    org: str = Query(None),
-    _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    ok = _catalog_delete_token(org_eff, token_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Token not found")
-    return {"ok": True, "organization": org_eff, "token_id": token_id}
-
-
-
-def admin_page(
-        request: Request,
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-):
+    Uses UserManager.get_user_hash_by_name() to get the user's role IDs,
+    then RoleManager.get_role() for each to resolve role names.
+    Returns only a flat list of role name strings.
     """
-    Main Redis admin page (no tables/leaves listing anymore).
-    Tables/Leaves are handled by /admin/tables.
-    """
-    if not _is_authorized(request):
-        # Always redirect to the login page if not authed
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
+    sess = get_session(request) or {}
+    username = (sess.get("username") or "").strip()
+    if not username:
+        return JSONResponse({"role_names": []})
 
-    provided = _get_provided_token(request) or ""
-
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-
-    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
-
-    if not sel_org or not sel_sup:
-        resp = templates.TemplateResponse("admin.html", {
-            "request": request,
-            "session_org": (get_session(request) or {}).get("org") or settings.SUPERTABLE_ORGANIZATION,
-            "session_username": (get_session(request) or {}).get("username") or "",
-            "session_user_hash": (get_session(request) or {}).get("user_hash") or "",
-            "session_is_superuser": bool((get_session(request) or {}).get("is_superuser")),
-            "authorized": True,
-            "token": provided,
-            "tenants": tenants,
-            "sel_org": sel_org,
-            "sel_sup": sel_sup,
-            "has_tenant": False,
-            "default_user_hash": "",
-        })
-        _no_store(resp)
-        return resp
+    org_val, sup_val = resolve_pair(org, sup)
+    if not org_val or not sup_val:
+        return JSONResponse({"role_names": []})
 
     try:
-        root = catalog.get_root(sel_org, sel_sup) or {}
-    except Exception:
-        root = {}
-    try:
-        mirrors = catalog.get_mirrors(sel_org, sel_sup) or []
-    except Exception:
-        mirrors = []
+        from supertable.rbac.user_manager import UserManager
+        from supertable.rbac.role_manager import RoleManager
 
-    users = list_users(sel_org, sel_sup)
-    roles = list_roles(sel_org, sel_sup)
-    # Choose a default user hash (first user) for meta/super calls
-    default_user_hash = users[0]["hash"] if users else ""
+        user_manager = UserManager(super_name=sup_val, organization=org_val)
+        user_data = user_manager.get_user_hash_by_name(username)
 
-    ctx = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": True,
-        "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
-        "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
-        "mirrors": mirrors,
-        "users": users,
-        "roles": roles,
-        "default_user_hash": default_user_hash,
-    }
-    inject_session_into_ctx(ctx, request)
-    resp = templates.TemplateResponse("admin.html", ctx)
+        if not user_data or not isinstance(user_data, dict):
+            return JSONResponse({"role_names": []})
+
+        role_ids = user_data.get("roles") or []
+        if isinstance(role_ids, str):
+            try:
+                role_ids = json.loads(role_ids)
+            except Exception:
+                role_ids = [role_ids]
+
+        role_names: List[str] = []
+        role_manager = RoleManager(super_name=sup_val, organization=org_val)
+        for role_id in role_ids:
+            role_id = str(role_id).strip()
+            if not role_id:
+                continue
+            try:
+                role_doc = role_manager.get_role(role_id)
+                if role_doc and isinstance(role_doc, dict):
+                    name = role_doc.get("role_name") or role_doc.get("role") or role_id
+                    role_names.append(str(name))
+                else:
+                    role_names.append(role_id)
+            except Exception:
+                role_names.append(role_id)
+
+        return JSONResponse({"role_names": role_names})
+
+    except Exception as e:
+        logger.warning("reflection_user_role_names failed (%s/%s/%s): %s", org_val, sup_val, username, e)
+        return JSONResponse({"role_names": []})
+
+
+# ------------------------------ Sidebar role endpoints ------------------------------
+
+@router.get("/reflection/users")
+def reflection_users(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Return users for the given org/sup. Available to all logged-in users."""
+    org_val, sup_val = resolve_pair(org, sup)
+    if not org_val or not sup_val:
+        return {"users": []}
+    return {"users": list_users(org_val, sup_val)}
+
+
+@router.get("/reflection/roles")
+def reflection_roles(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Return all roles for the given org/sup. Available to all logged-in users."""
+    org_val, sup_val = resolve_pair(org, sup)
+    if not org_val or not sup_val:
+        return {"roles": []}
+    return {"roles": list_roles(org_val, sup_val)}
+
+
+@router.get("/reflection/user-roles")
+def reflection_user_roles(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Return resolved roles for the current session user after SuperTable selection.
+
+    Flow: catalog.rbac_get_user_id_by_username(username) → role IDs
+          → catalog.get_role_details() for each.
+    Auto-selects the first role and stores it in session.
+    """
+    sess = get_session(request) or {}
+    username = (sess.get("username") or "").strip()
+    if not username:
+        return {"roles": [], "selected_role": ""}
+
+    org_val, sup_val = resolve_pair(org, sup)
+    if not org_val or not sup_val:
+        return {"roles": [], "selected_role": ""}
+
+    roles = get_user_roles(org_val, sup_val, username)
+
+    # Determine which role to select (prefer existing session value, else first)
+    current_role = (sess.get("role_name") or "").strip()
+    role_names = [r.get("role_name") or r.get("role_id") or "" for r in roles]
+    if current_role not in role_names and role_names:
+        current_role = role_names[0]
+
+    # Persist to session cookie
+    sess_data = dict(sess)
+    sess_data["role_name"] = current_role
+    sess_data["roles"] = role_names
+    sess_data["super_name"] = sup_val
+
+    resp = JSONResponse({"roles": roles, "selected_role": current_role})
+    _set_session_cookie(resp, sess_data)
+    _no_store(resp)
+    return resp
+
+
+@router.post("/reflection/set-role")
+def reflection_set_role(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Persist the selected role name into the session cookie."""
+    role_name = str(body.get("role_name") or "").strip()
+    sess = get_session(request) or {}
+
+    sess_data = dict(sess)
+    sess_data["role_name"] = role_name
+
+    resp = JSONResponse({"ok": True, "role_name": role_name})
+    _set_session_cookie(resp, sess_data)
     _no_store(resp)
     return resp
 
 
 
+@router.get("/", response_class=HTMLResponse)
+def root_redirect():
+    resp = RedirectResponse("/reflection/login", status_code=302)
+    _no_store(resp)
+    return resp
 
-# ---------------------------------------------------------------------------
-# Admin UI + API routes (extracted to admin.py)
-# ---------------------------------------------------------------------------
 
-try:
-    from .admin import attach_admin_routes  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from supertable.reflection.admin import attach_admin_routes  # type: ignore
-    except Exception:
-        from admin import attach_admin_routes  # type: ignore
-
-attach_admin_routes(
-    router,
-    templates=templates,
-    settings=settings,
-    redis_client=redis_client,
-    catalog=catalog,
-    is_authorized=_is_authorized,
-    no_store=_no_store,
-    get_provided_token=_get_provided_token,
-    discover_pairs=discover_pairs,
-    resolve_pair=resolve_pair,
-    inject_session_into_ctx=inject_session_into_ctx,
-    get_session=get_session,
-    list_users=list_users,
-    fmt_ts=_fmt_ts,
-    logged_in_guard_api=logged_in_guard_api,
-    admin_guard_api=admin_guard_api,
-    dotenv_values=dotenv_values,
-    set_key=set_key,
-)
-
-# ------------------------------ Tables tab (moved to tables.py) ------------------------------
+# ------------------------------ Tables tab (extracted to tables.py) ------------------------------
 
 try:
     from .tables import attach_tables_routes  # type: ignore
@@ -1228,26 +1359,24 @@ attach_tables_routes(
     inject_session_into_ctx=inject_session_into_ctx,
     list_users=list_users,
     fmt_ts=_fmt_ts,
-    list_leaves=_list_leaves,
     catalog=catalog,
     admin_guard_api=admin_guard_api,
+    get_session=get_session,
 )
 
-# ------------------------------ RBAC Views tab (NEW, extracted to rbac.py) ------------------------------
+# ------------------------------ Execute tab (extracted to execute.py) ------------------------------
 
 try:
-    from .rbac import attach_rbac_routes  # type: ignore
+    from .execute import attach_execute_routes  # type: ignore
 except Exception:  # pragma: no cover
     try:
-        from supertable.reflection.rbac import attach_rbac_routes  # type: ignore
+        from supertable.reflection.execute import attach_execute_routes  # type: ignore
     except Exception:
-        from rbac import attach_rbac_routes  # type: ignore
+        from execute import attach_execute_routes  # type: ignore
 
-attach_rbac_routes(
+attach_execute_routes(
     router,
     templates=templates,
-    settings=settings,
-    redis_client=redis_client,
     is_authorized=_is_authorized,
     no_store=_no_store,
     get_provided_token=_get_provided_token,
@@ -1255,948 +1384,21 @@ attach_rbac_routes(
     resolve_pair=resolve_pair,
     inject_session_into_ctx=inject_session_into_ctx,
     get_session=get_session,
+    logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
 )
 
 
 
+# ------------------------------ Ingestion (extracted to ingestion.py) ------------------------------
 
-
-@router.get("/", response_class=HTMLResponse)
-def root_redirect():
-    resp = RedirectResponse("/reflection/login", status_code=302)
-    _no_store(resp)
-    return resp
-
-
-# ------------------------------ Execute tab (helpers + endpoints) ------------------------------
-
-def _clean_sql_query(query: str) -> str:
-    # remove -- ... and /* ... */ and trailing semicolons
-    q = re.sub(r'--.*$', '', query, flags=re.MULTILINE)
-    q = re.sub(r'/\*.*?\*/', '', q, flags=re.DOTALL)
-    q = re.sub(r';+$', '', q)
-    return q.strip()
-
-
-def _apply_limit_safely(query: str, max_rows: int) -> str:
-    """
-    Ensure a LIMIT is present and not above max_rows+1.
-    """
-    limit_pattern = r'(?<!\w)(limit)\s+(\d+)(?!\w)(?=[^;]*$|;)'
-    m = re.search(limit_pattern, query, re.IGNORECASE)
-    if m:
-        cur = int(m.group(2))
-        if cur > max_rows + 1:
-            return re.sub(limit_pattern, f'LIMIT {max_rows + 1}', query, flags=re.IGNORECASE, count=1)
-        return query
-    return f"{query.rstrip(';').strip()} LIMIT {max_rows + 1}"
-
-
-def _sanitize_for_json(obj: Any) -> Any:
-    """
-    Convert arbitrary objects (e.g., Enums, Decimals, datetime, UUID, sets,
-    custom 'Status' objects, numpy scalars) into JSON-safe structures.
-    Fallback: str(obj).
-    """
-    # Fast path for already-safe primitives
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    # Common special cases
-    if isinstance(obj, Decimal):
-        return float(obj)
-    if isinstance(obj, (datetime, date)):
-        try:
-            return obj.isoformat()
-        except Exception:
-            return str(obj)
-    if isinstance(obj, uuid.UUID):
-        return str(obj)
-    if isinstance(obj, bytes):
-        try:
-            return obj.decode("utf-8", errors="ignore")
-        except Exception:
-            return str(obj)
-    if isinstance(obj, enum.Enum):
-        # Prefer the enum name if available
-        return getattr(obj, "name", str(obj))
-
-    # Numpy numbers / scalars without importing numpy explicitly
-    if obj.__class__.__name__ in ("int8","int16","int32","int64","uint8","uint16","uint32","uint64","float16","float32","float64"):
-        try:
-            return obj.item()
-        except Exception:
-            return float(obj) if "float" in obj.__class__.__name__ else int(obj)
-
-    # Containers
-    if isinstance(obj, dict):
-        return { _sanitize_for_json(k): _sanitize_for_json(v) for k, v in obj.items() }
-    if isinstance(obj, (list, tuple)):
-        return [ _sanitize_for_json(x) for x in obj ]
-    if isinstance(obj, set):
-        return [ _sanitize_for_json(x) for x in obj ]
-
-    # Objects that might have a useful dict-like view
-    for attr in ("_asdict", "dict", "__dict__"):
-        if hasattr(obj, attr):
-            try:
-                d = getattr(obj, attr)()
-                return _sanitize_for_json(d)
-            except Exception:
-                pass
-
-    # Fallback to string representation
-    return str(obj)
-
-@router.get("/reflection/execute")
-def admin_execute_page(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    leaf: Optional[str] = Query(None),  # <-- NEW
-):
-    if not _is_authorized(request):
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
-
-    provided = _get_provided_token(request) or ""
-
-    # same tenant selection UX as admin page
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
-
-    users = list_users(sel_org, sel_sup) if sel_org and sel_sup else []
-    # Default user hash for selection/metrics on the execute page
-    default_user_hash = users[0]["hash"] if users else ""
-    ctx = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": bool(sel_org and sel_sup),
-        "users": users,         # used for user selection (hash) at execution time
-        "initial_leaf": leaf,   # <-- pass through to execute.html if you want
-        "default_user_hash": default_user_hash,
-    }
-    inject_session_into_ctx(ctx, request)
-    resp = templates.TemplateResponse("execute.html", ctx)
-    _no_store(resp)
-    return resp
-
-
-
-class ExecutePayload(Dict[str, Any]):
-    query: str
-    organization: str
-    super_name: str
-    user_hash: str
-    page: int
-    page_size: int
-
-
-@router.post("/reflection/execute")
-def admin_execute_api(
-    request: Request,
-    payload: Dict[str, Any] = Body(...),
-    _=Depends(admin_guard_api)
-):
-    """
-    Run a read-only SQL (SELECT/WITH) and return a paginated JSON result.
-    """
+try:
+    from .ingestion import attach_ingestion_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        query = str(payload.get("query") or "").strip()
-        organization = str(payload.get("organization") or "")
-        super_name = str(payload.get("super_name") or "")
-        user_hash = str(payload.get("user_hash") or "")
-        page = int(payload.get("page") or 1)
-        page_size = int(payload.get("page_size") or 100)
-        max_rows = 10000
-
-        if not organization or not super_name:
-            return JSONResponse({"status": "error", "message": "organization and super_name are required", "result": []}, status_code=400)
-        if not query:
-            return JSONResponse({"status": "error", "message": "No query provided", "result": []}, status_code=400)
-        if not user_hash:
-            return JSONResponse({"status": "error", "message": "user_hash is required", "result": []}, status_code=400)
-
-        # Only allow SELECT/WITH
-        q = _clean_sql_query(query)
-        if not q.lower().lstrip().startswith(("select", "with")):
-            return JSONResponse({"status": "error", "message": "Only SELECT or WITH (CTE) queries are allowed", "result": []}, status_code=400)
-
-        q = _apply_limit_safely(q, max_rows)
-
-        dr = DataReader(super_name=super_name, organization=organization, query=q)
-        res = dr.execute(user_hash=user_hash)
-
-        df = meta1 = meta2 = None
-        if isinstance(res, tuple):
-            if len(res) >= 1:
-                df = res[0]
-            if len(res) >= 2:
-                meta1 = res[1]
-            if len(res) >= 3:
-                meta2 = res[2]
-        else:
-            df = res
-
-        # Build preview rows for JSON (use full df then paginate)
-        total_count = 0
-        rows: List[Dict[str, Any]] = []
-
-        if df is not None:
-            try:
-                # pandas-like
-                total_count = int(getattr(df, "shape", [0])[0] or 0)
-                if total_count > max_rows:
-                    df = df.iloc[:max_rows]  # type: ignore[index]
-                    total_count = max_rows
-                start = max(0, (page - 1) * page_size)
-                end = start + page_size
-                page_df = df.iloc[start:end]  # type: ignore[index]
-                # produce JSON-safe list[dict]
-                rows = json.loads(page_df.to_json(orient="records", date_format="iso"))  # type: ignore[attr-defined]
-            except Exception:
-                # duckdb relation or list of dicts/list rows fallback
-                try:
-                    if hasattr(df, "fetchall"):
-                        all_rows = df.fetchall()
-                        total_count = len(all_rows)
-                        if total_count > max_rows:
-                            all_rows = all_rows[:max_rows]
-                            total_count = max_rows
-                        start = max(0, (page - 1) * page_size)
-                        end = start + page_size
-                        page_rows = all_rows[start:end]
-                        rows = [{"c{}".format(i): _sanitize_for_json(v) for i, v in enumerate(r)} for r in page_rows]
-                    elif isinstance(df, list):
-                        total_count = len(df)
-                        if total_count > max_rows:
-                            df = df[:max_rows]
-                            total_count = max_rows
-                        start = max(0, (page - 1) * page_size)
-                        end = start + page_size
-                        rows = [_sanitize_for_json(x) for x in df[start:end]]
-                    else:
-                        rows = []
-                except Exception:
-                    rows = []
-
-        meta_payload = {
-            "result_1": meta1,
-            "result_2": meta2,
-            "timings": getattr(getattr(dr, "timer", None), "timings", None),
-            "plan_stats": getattr(getattr(dr, "plan_stats", None), "stats", None),
-        }
-        meta_safe = _sanitize_for_json(meta_payload)
-
-        return JSONResponse({
-            "status": "ok",
-            "message": None,
-            "result": rows,          # already JSON-safe
-            "total_count": total_count,
-            "meta": meta_safe,       # JSON-sanitized
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
-
-
-@router.post("/reflection/schema")
-def admin_schema_api(
-    request: Request,
-    payload: Dict[str, Any] = Body(...),
-    _=Depends(admin_guard_api)
-):
-    """
-    Return a light schema for autocomplete: { "schema": [ {table: [col,...]}, ... ] }
-    Requires: organization, super_name, user_hash
-    """
-    try:
-        organization = str(payload.get("organization") or "")
-        super_name = str(payload.get("super_name") or "")
-        user_hash = str(payload.get("user_hash") or "")
-
-        if not organization or not super_name or not user_hash:
-            return JSONResponse({"status": "error", "message": "organization, super_name and user_hash are required"}, status_code=400)
-
-        mr = MetaReader(organization=organization, super_name=super_name)
-        meta = mr.get_super_meta(user_hash)
-
-        tables = [
-            t["name"]
-            for t in (meta.get("super", {}).get("tables", []) or [])
-            if not (t["name"].startswith("__") and t["name"].endswith("__"))
-        ]
-
-        schema = []
-        for t in tables:
-            table_schema = mr.get_table_schema(t, user_hash)
-            if isinstance(table_schema, list) and table_schema and isinstance(table_schema[0], dict):
-                cols = list(table_schema[0].keys())
-            else:
-                cols = []
-            schema.append({t: cols})
-
-        return JSONResponse({"status": "ok", "schema": schema})
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": f"Get schema failed: {e}"}, status_code=500)
-
-
-@router.delete("/reflection/super")
-def api_delete_super(
-    request: Request,
-    organization: str = Query(..., description="Organization identifier"),
-    super_name: str = Query(..., description="SuperTable name"),
-    _: Any = Depends(admin_guard_api),
-):
-    """Delete a SuperTable from Redis and storage (destructive)."""
-    if not organization or not super_name:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-
-    storage = get_storage()
-    catalog = RedisCatalog()
-
-    base_dir = os.path.join(organization, super_name)
-
-    # Delete storage first; if it fails (other than missing), do not remove Redis meta.
-    try:
-        if storage.exists(base_dir):
-            storage.delete(base_dir)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
-
-    deleted_keys = 0
-    try:
-        deleted_keys = catalog.delete_super_table(organization, super_name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
-
-    return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
-
-
-@router.post("/reflection/super")
-def api_get_super_meta(
-    request: Request,
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-      resp = RedirectResponse("/reflection/login", status_code=302)
-      _no_store(resp)
-      return resp
-
-    try:
-        st = SuperTable(organization=organization, super_name=super_name)
-        storage_label = getattr(getattr(st, "storage", None), "__class__", None)
-        storage_name = getattr(storage_label, "__name__", None) if storage_label else None
-        return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": storage_name}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
-
-
-
-@router.delete("/reflection/super")
-def api_get_super_meta(
-    request: Request,
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    user_hash: str = Query(...),
-    _: Any = Depends(admin_guard_api),
-):
-    if not _is_authorized(request):
-      resp = RedirectResponse("/reflection/login", status_code=302)
-      _no_store(resp)
-      return resp
-
-    try:
-        super_table = SuperTable(super_name=super_name, organization=organization)
-        super_table.delete(user_hash)
-        return {"ok": True, "organization": organization, "name": super_name}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SuperTable deletion failed: {e}")
-
-
-# ------------------------------ Route aliases: /admin -> /reflection, /api -> /reflection ------------------------------
-
-def _add_reflection_alias_routes(_router: APIRouter) -> None:
-    """Add backward-compatible aliases under /reflection for legacy /admin and /api routes.
-
-    Notes:
-    - We keep the original routes to avoid regressions.
-    - Aliases are excluded from the OpenAPI schema to avoid duplicate entries.
-    """
-    try:
-        from fastapi.routing import APIRoute
+        from supertable.reflection.ingestion import attach_ingestion_routes  # type: ignore
     except Exception:
-        return
-
-    existing = set()
-    for r in _router.routes:
-        try:
-            methods = tuple(sorted(getattr(r, "methods", None) or []))
-            existing.add((getattr(r, "path", None), methods))
-        except Exception:
-            continue
-
-    def _try_add_alias(path: str, methods: set, endpoint, name: str) -> None:
-        key = (path, tuple(sorted(methods or [])))
-        if key in existing:
-            return
-        _router.add_api_route(
-            path,
-            endpoint,
-            methods=list(methods or []),
-            name=name,
-            include_in_schema=False,
-        )
-        existing.add(key)
-
-    # Snapshot routes to avoid iterating over newly added aliases
-    routes = list(_router.routes)
-    for r in routes:
-        if not hasattr(r, "path") or not hasattr(r, "endpoint"):
-            continue
-        path = str(getattr(r, "path") or "")
-        if not path:
-            continue
-        methods = set(getattr(r, "methods", None) or [])
-        endpoint = getattr(r, "endpoint")
-        name = str(getattr(r, "name", "") or "route")
-
-        # /admin/* -> /reflection/*
-        if path == "/admin":
-            # Keep /reflection reserved for an explicit redirect to /reflection/admin
-            continue
-        if path.startswith("/admin"):
-            _try_add_alias(
-                "/reflection" + path[len("/admin"):],
-                methods,
-                endpoint,
-                name + "_reflection_alias",
-            )
-
-        # /api/* -> /reflection/*
-        if path == "/api":
-            # Avoid colliding with /reflection root redirect
-            continue
-        if path.startswith("/api"):
-            _try_add_alias(
-                "/reflection" + path[len("/api"):],
-                methods,
-                endpoint,
-                name + "_reflection_alias",
-            )
-
-
-_add_reflection_alias_routes(router)
-
-# ------------------------------ Staging / Pipes ------------------------------
-
-_STAGING_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-
-
-def _staging_base_dir(org: str, sup: str) -> str:
-    return os.path.join(org, sup, "staging")
-
-
-def _staging_index_path(org: str, sup: str) -> str:
-    return os.path.join(_staging_base_dir(org, sup), "_staging.json")
-
-
-def _pipe_index_path(org: str, sup: str) -> str:
-    return os.path.join(_staging_base_dir(org, sup), "_pipe.json")
-
-
-def _staging_key(org: str, sup: str, staging_name: str) -> str:
-    return f"supertable:{org}:{sup}:meta:staging:{staging_name}"
-
-
-def _staging_index_key(org: str, sup: str) -> str:
-    # Index of staging names for website/UI listing.
-    return f"supertable:{org}:{sup}:meta:staging:meta"
-
-
-def _pipe_key(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
-    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}"
-
-
-def _pipe_index_key(org: str, sup: str, staging_name: str) -> str:
-    # Index of pipe names for a given staging for website/UI listing.
-    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta"
-
-
-def _redis_json_load(raw: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not raw:
-        return None
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-        return {"value": obj}
-    except Exception:
-        return {"value": raw}
-
-
-def _redis_get_staging_meta(org: str, sup: str, staging_name: str) -> Optional[Dict[str, Any]]:
-    try:
-        return _redis_json_load(redis_client.get(_staging_key(org, sup, staging_name)))
-    except Exception:
-        return None
-
-
-def _redis_get_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> Optional[Dict[str, Any]]:
-    try:
-        return _redis_json_load(redis_client.get(_pipe_key(org, sup, staging_name, pipe_name)))
-    except Exception:
-        return None
-
-
-def _redis_list_stagings(org: str, sup: str) -> List[str]:
-    idx = _staging_index_key(org, sup)
-    try:
-        names = redis_client.smembers(idx) or set()
-        if names:
-            return sorted({str(x) for x in names if str(x).strip() and str(x) != "meta"})
-    except Exception:
-        pass
-
-    # Fallback for older data: scan for staging meta keys.
-    pattern = f"supertable:{org}:{sup}:meta:staging:*"
-    cursor = 0
-    out: Set[str] = set()
-    while True:
-        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
-        for key in keys:
-            k = key if isinstance(key, str) else key.decode("utf-8")
-            tail = k.rsplit("meta:staging:", 1)[-1]
-            if not tail or tail == "meta":
-                continue
-            # staging meta key has no further ":" segments (pipe keys do)
-            if ":" in tail:
-                continue
-            out.add(tail)
-        if cursor == 0:
-            break
-    return sorted(out)
-
-
-def _redis_list_pipes(org: str, sup: str, staging_name: str) -> List[str]:
-    idx = _pipe_index_key(org, sup, staging_name)
-    try:
-        names = redis_client.smembers(idx) or set()
-        if names:
-            return sorted({str(x) for x in names if str(x).strip() and str(x) != "meta"})
-    except Exception:
-        pass
-
-    pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:*"
-    cursor = 0
-    out: Set[str] = set()
-    while True:
-        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
-        for key in keys:
-            k = key if isinstance(key, str) else key.decode("utf-8")
-            tail = k.rsplit(":pipe:", 1)[-1]
-            if not tail or tail == "meta":
-                continue
-            if ":" in tail:
-                continue
-            out.add(tail)
-        if cursor == 0:
-            break
-    return sorted(out)
-
-
-def _redis_upsert_staging_meta(org: str, sup: str, staging_name: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    payload: Dict[str, Any] = dict(meta or {})
-    payload.setdefault("organization", org)
-    payload.setdefault("super_name", sup)
-    payload.setdefault("staging_name", staging_name)
-    payload["updated_at_ms"] = int(time.time() * 1000)
-
-    try:
-        redis_client.set(_staging_key(org, sup, staging_name), json.dumps(payload, ensure_ascii=False))
-        redis_client.sadd(_staging_index_key(org, sup), staging_name)
-    except Exception:
-        # UI should not fail hard if Redis is unavailable
-        pass
-
-
-def _redis_upsert_pipe_meta(
-    org: str,
-    sup: str,
-    staging_name: str,
-    pipe_name: str,
-    meta: Optional[Dict[str, Any]] = None,
-) -> None:
-    payload: Dict[str, Any] = dict(meta or {})
-    payload.setdefault("organization", org)
-    payload.setdefault("super_name", sup)
-    payload.setdefault("staging_name", staging_name)
-    payload.setdefault("pipe_name", pipe_name)
-    payload["updated_at_ms"] = int(time.time() * 1000)
-
-    try:
-        redis_client.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(payload, ensure_ascii=False))
-        redis_client.sadd(_pipe_index_key(org, sup, staging_name), pipe_name)
-        redis_client.sadd(_staging_index_key(org, sup), staging_name)
-    except Exception:
-        pass
-
-
-def _redis_delete_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> None:
-    try:
-        redis_client.srem(_pipe_index_key(org, sup, staging_name), pipe_name)
-    except Exception:
-        pass
-    try:
-        redis_client.delete(_pipe_key(org, sup, staging_name, pipe_name))
-    except Exception:
-        pass
-
-
-def _redis_delete_staging_cascade(org: str, sup: str, staging_name: str) -> None:
-    # Remove from index + delete the base meta key.
-    try:
-        redis_client.srem(_staging_index_key(org, sup), staging_name)
-    except Exception:
-        pass
-    try:
-        redis_client.delete(_staging_key(org, sup, staging_name))
-    except Exception:
-        pass
-
-    # Delete everything under the staging namespace (pipes + indices + any future keys).
-    pattern = f"supertable:{org}:{sup}:meta:staging:{staging_name}:*"
-    cursor = 0
-    while True:
-        cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
-        if keys:
-            try:
-                pipe = redis_client.pipeline()
-                for k in keys:
-                    pipe.delete(k)
-                pipe.execute()
-            except Exception:
-                # best effort
-                pass
-        if cursor == 0:
-            break
-
-    try:
-        redis_client.delete(_pipe_index_key(org, sup, staging_name))
-    except Exception:
-        pass
-
-
-def _read_json_if_exists(storage: Any, path: str) -> Optional[Dict[str, Any]]:
-    try:
-        if not storage.exists(path):
-            return None
-    except Exception:
-        return None
-    try:
-        data = storage.read_json(path)
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _write_json_atomic(storage: Any, path: str, data: Dict[str, Any]) -> None:
-    # Storage interface is expected to handle overwrite atomically enough for our UI use.
-    base = os.path.dirname(path)
-    try:
-        if base and not storage.exists(base):
-            storage.makedirs(base)
-    except Exception:
-        # best effort; write_json might still create prefixes on object stores
-        pass
-    storage.write_json(path, data)
-
-
-def _flatten_tree_leaves(prefix: str, node: Any) -> List[str]:
-    out: List[str] = []
-
-    def dfs(p: str, n: Any) -> None:
-        if n is None:
-            out.append(p)
-            return
-        if not isinstance(n, dict):
-            return
-        for k, v in n.items():
-            dfs(os.path.join(p, k), v)
-
-    dfs(prefix, node)
-    return out
-
-
-def _scan_staging_names(storage: Any, org: str, sup: str) -> List[str]:
-    base = _staging_base_dir(org, sup)
-    try:
-        if not storage.exists(base):
-            return []
-        tree = storage.get_directory_structure(base)
-    except Exception:
-        return []
-    if not isinstance(tree, dict):
-        return []
-    names: List[str] = []
-    for name, child in tree.items():
-        if not isinstance(name, str):
-            continue
-        if name.startswith("_"):
-            continue
-        # staging folders appear as dict nodes
-        if isinstance(child, dict):
-            names.append(name)
-    return sorted(set(names))
-
-
-def _get_staging_names(storage: Any, org: str, sup: str) -> List[str]:
-    idx_path = _staging_index_path(org, sup)
-    data = _read_json_if_exists(storage, idx_path)
-    names: List[str] = []
-    if data:
-        raw = data.get("staging_names")
-        if isinstance(raw, list):
-            names = [str(x) for x in raw if isinstance(x, (str, int, float))]
-    # Merge with a best-effort scan in case index is missing/stale.
-    scanned = _scan_staging_names(storage, org, sup)
-    merged = sorted(set(names) | set(scanned))
-    if merged and (not data or sorted(set(names)) != merged):
-        _write_json_atomic(storage, idx_path, {"staging_names": merged, "updated_at_ns": time.time_ns()})
-    return merged
-
-
-def _load_pipe_index(storage: Any, org: str, sup: str) -> List[Dict[str, Any]]:
-    idx_path = _pipe_index_path(org, sup)
-    data = _read_json_if_exists(storage, idx_path)
-    pipes: List[Dict[str, Any]] = []
-    if data:
-        raw = data.get("pipes")
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, dict) and item.get("pipe_name") and item.get("staging_name"):
-                    pipes.append(item)
-    return pipes
-
-
-def _scan_pipes(storage: Any, org: str, sup: str, staging_names: List[str]) -> List[Dict[str, Any]]:
-    pipes: List[Dict[str, Any]] = []
-    from supertable.super_pipe import SuperPipe  # noqa: WPS433
-
-    for stg in staging_names:
-        try:
-            sp = SuperPipe(organization=org, super_name=sup, staging_name=stg)
-        except Exception:
-            continue
-        try:
-            tree = storage.get_directory_structure(os.path.join(_staging_base_dir(org, sup), stg, "pipes"))
-        except Exception:
-            continue
-        for path in _flatten_tree_leaves(os.path.join(_staging_base_dir(org, sup), stg, "pipes"), tree):
-            if not path.endswith(".json"):
-                continue
-            try:
-                data = storage.read_json(path)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            # normalize minimal keys
-            if not data.get("pipe_name"):
-                data["pipe_name"] = os.path.splitext(os.path.basename(path))[0]
-            if not data.get("staging_name"):
-                data["staging_name"] = stg
-            pipes.append(data)
-    return pipes
-
-
-def _get_pipes(storage: Any, org: str, sup: str, staging_names: List[str]) -> List[Dict[str, Any]]:
-    pipes = _load_pipe_index(storage, org, sup)
-    if pipes:
-        # best-effort freshness: merge with scan if index seems incomplete
-        scanned = _scan_pipes(storage, org, sup, staging_names)
-        if scanned:
-            existing_keys = {(p.get("staging_name"), p.get("pipe_name")) for p in pipes}
-            for p in scanned:
-                key = (p.get("staging_name"), p.get("pipe_name"))
-                if key not in existing_keys:
-                    pipes.append(p)
-            # persist merged index
-            _write_json_atomic(
-                storage,
-                _pipe_index_path(org, sup),
-                {"pipes": pipes, "updated_at_ns": time.time_ns()},
-            )
-        return pipes
-
-    scanned = _scan_pipes(storage, org, sup, staging_names)
-    if scanned:
-        _write_json_atomic(
-            storage,
-            _pipe_index_path(org, sup),
-            {"pipes": scanned, "updated_at_ns": time.time_ns()},
-        )
-    return scanned
-
-
-@router.get("/reflection/staging", response_class=HTMLResponse)
-def staging_page(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-):
-    if not _is_authorized(request):
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
-
-    provided = _get_provided_token(request) or ""
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
-
-    ctx: Dict[str, Any] = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": bool(sel_org and sel_sup),
-        "staging_names": [],
-        "staging_folders": [],
-        "pipes_by_staging": {},
-        "pipes_flat": [],
-    }
-    inject_session_into_ctx(ctx, request)
-
-    if not sel_org or not sel_sup:
-        resp = templates.TemplateResponse("staging.html", ctx)
-        _no_store(resp)
-        return resp
-
-    storage = get_storage()
-    staging_names = _get_staging_names(storage, sel_org, sel_sup)
-    pipes = _get_pipes(storage, sel_org, sel_sup, staging_names)
-
-    # group pipes by staging
-    by_staging: Dict[str, List[Dict[str, Any]]] = {}
-    for p in pipes:
-        stg = str(p.get("staging_name") or "")
-        if not stg:
-            continue
-        by_staging.setdefault(stg, []).append(p)
-    for stg, arr in by_staging.items():
-        arr.sort(key=lambda x: str(x.get("pipe_name") or ""))
-
-    # staging folders + files (best-effort)
-    folders: List[Dict[str, Any]] = []
-    base = _staging_base_dir(sel_org, sel_sup)
-    for stg in staging_names:
-        files_dir = os.path.join(base, stg, "files")
-        files: List[str] = []
-        try:
-            if storage.exists(files_dir):
-                tree = storage.get_directory_structure(files_dir)
-                leaves = _flatten_tree_leaves(files_dir, tree)
-                # make paths relative to files_dir
-                files = [os.path.relpath(p, files_dir) for p in leaves if p.endswith(".parquet")]
-                files.sort()
-        except Exception:
-            files = []
-        folders.append({"name": stg, "files": files})
-
-    ctx.update(
-        {
-            "staging_names": staging_names,
-            "staging_folders": folders,
-            "pipes_by_staging": by_staging,
-            "pipes_flat": sorted(
-                pipes,
-                key=lambda x: (str(x.get("staging_name") or ""), str(x.get("pipe_name") or "")),
-            ),
-        }
-    )
-
-    resp = templates.TemplateResponse("staging.html", ctx)
-    _no_store(resp)
-    return resp
-
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Ingestion UI + API routes (moved out for clarity)
-# ---------------------------------------------------------------------------
-@router.get("/reflection/ingestion/tables")
-def ingestion_tables_list(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    organization: Optional[str] = Query(None),
-    super_name: Optional[str] = Query(None),
-    user_hash: str = Query(...),
-    _: Any = Depends(logged_in_guard_api),
-):
-    """Return table names for ingestion UI autocomplete.
-
-    Accepts both (org, sup) and (organization, super_name) query params for compatibility.
-    """
-    org_val = (org or organization or "").strip()
-    sup_val = (sup or super_name or "").strip()
-    uhash = (user_hash or "").strip()
-
-    if not org_val or not sup_val or not uhash:
-        return {"ok": True, "tables": []}
-
-    # Prevent using another user's hash unless the requester is a superuser.
-    sess = get_session(request) or {}
-    sess_hash = (sess.get("user_hash") or "").strip()
-    if sess_hash and sess_hash != uhash and not is_superuser(request):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    try:
-        mr = MetaReader(organization=org_val, super_name=sup_val)
-        meta = mr.get_super_meta(uhash) or {}
-    except Exception as e:
-        logger.warning("Failed to fetch super meta for ingestion tables (%s/%s): %s", org_val, sup_val, e)
-        return {"ok": True, "tables": []}
-
-    super_meta = meta.get("super", {}) if isinstance(meta, dict) else {}
-    raw_tables = []
-    try:
-        raw_tables = super_meta.get("tables") if isinstance(super_meta, dict) else None
-    except Exception:
-        raw_tables = None
-
-    names: List[str] = []
-    if isinstance(raw_tables, list):
-        for t in raw_tables:
-            if isinstance(t, str):
-                name = t.strip()
-            elif isinstance(t, dict):
-                name = str(t.get("name") or "").strip()
-            else:
-                name = str(t or "").strip()
-            if name and name not in names:
-                names.append(name)
-
-    return {"ok": True, "tables": names}
-
-
-from supertable.reflection.ingestion import attach_ingestion_routes  # noqa: E402
+        from ingestion import attach_ingestion_routes  # type: ignore
 
 attach_ingestion_routes(
     router,
@@ -2207,104 +1409,52 @@ attach_ingestion_routes(
     discover_pairs=discover_pairs,
     resolve_pair=resolve_pair,
     inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    is_superuser=is_superuser,
     logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
-    STAGING_NAME_RE=_STAGING_NAME_RE,
-    redis_list_stagings=_redis_list_stagings,
-    redis_get_staging_meta=_redis_get_staging_meta,
-    redis_list_pipes=_redis_list_pipes,
-    pipe_key=_pipe_key,
-    redis_json_load=_redis_json_load,
     redis_client=redis_client,
-    redis_get_pipe_meta=_redis_get_pipe_meta,
-    staging_base_dir=_staging_base_dir,
-    get_staging_names=_get_staging_names,
-    write_json_atomic=_write_json_atomic,
-    staging_index_path=_staging_index_path,
-    load_pipe_index=_load_pipe_index,
-    pipe_index_path=_pipe_index_path,
-    redis_upsert_staging_meta=_redis_upsert_staging_meta,
-    redis_delete_staging_cascade=_redis_delete_staging_cascade,
-    read_json_if_exists=_read_json_if_exists,
-    redis_upsert_pipe_meta=_redis_upsert_pipe_meta,
-    redis_delete_pipe_meta=_redis_delete_pipe_meta,
-    get_storage=get_storage,
 )
 
+# ------------------------------ Admin (extracted to admin.py) ------------------------------
 
-# ---------------------------------------------------------------------------
-# Studio (formerly Lab/Notebooks) UI + API routes
-# ---------------------------------------------------------------------------
+try:
+    from .admin import attach_admin_routes  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from supertable.reflection.admin import attach_admin_routes  # type: ignore
+    except Exception:
+        from admin import attach_admin_routes  # type: ignore
 
-from supertable.reflection.studio import attach_studio_routes  # noqa: E402
+try:
+    from dotenv import dotenv_values as _dotenv_values, set_key as _set_key
+except ImportError:
+    _dotenv_values = None  # type: ignore[assignment]
+    _set_key = None        # type: ignore[assignment]
 
-attach_studio_routes(
+attach_admin_routes(
     router,
     templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    catalog=catalog,
     is_authorized=_is_authorized,
     no_store=_no_store,
     get_provided_token=_get_provided_token,
     discover_pairs=discover_pairs,
     resolve_pair=resolve_pair,
     inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    list_users=list_users,
+    fmt_ts=_fmt_ts,
     logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
+    dotenv_values=_dotenv_values,
+    set_key=_set_key,
 )
 
 # ---------------------------------------------------------------------------
-# Jobs UI routes
+# Import not_common to register additional routes on the shared router.
+# This MUST be at the bottom so all common symbols are defined first.
 # ---------------------------------------------------------------------------
-
-from supertable.reflection.jobs import attach_jobs_routes  # noqa: E402
-
-attach_jobs_routes(
-    router,
-    templates=templates,
-    is_authorized=_is_authorized,
-    no_store=_no_store,
-    get_provided_token=_get_provided_token,
-    discover_pairs=discover_pairs,
-    resolve_pair=resolve_pair,
-    inject_session_into_ctx=inject_session_into_ctx,
-    logged_in_guard_api=logged_in_guard_api,
-    admin_guard_api=admin_guard_api,
-)
-
-# ---------------------------------------------------------------------------
-# Connectors UI + API routes
-# ---------------------------------------------------------------------------
-
-from supertable.reflection.vault import attach_vault_routes  # noqa: E402
-
-attach_vault_routes(
-    router,
-    templates=templates,
-    is_authorized=_is_authorized,
-    no_store=_no_store,
-    get_provided_token=_get_provided_token,
-    discover_pairs=discover_pairs,
-    resolve_pair=resolve_pair,
-    inject_session_into_ctx=inject_session_into_ctx,
-    logged_in_guard_api=logged_in_guard_api,
-    admin_guard_api=admin_guard_api,
-)
-
-
-# ---------------------------------------------------------------------------
-# Compute UI + API routes
-# ---------------------------------------------------------------------------
-
-from supertable.reflection.compute import attach_compute_routes  # noqa: E402
-
-attach_compute_routes(
-    router,
-    templates=templates,
-    is_authorized=_is_authorized,
-    no_store=_no_store,
-    get_provided_token=_get_provided_token,
-    discover_pairs=discover_pairs,
-    resolve_pair=resolve_pair,
-    inject_session_into_ctx=inject_session_into_ctx,
-    logged_in_guard_api=logged_in_guard_api,
-    admin_guard_api=admin_guard_api,
-)
+#from supertable.reflection import not_common as _not_common  # noqa: F401, E402

@@ -63,6 +63,7 @@ class LabJobCreate(BaseModel):
     org: str = Field(..., min_length=1, max_length=256)
     sup: str = Field(..., min_length=1, max_length=256)
     user_hash: str = Field(..., min_length=1, max_length=512)
+    role_name: str = Field("", max_length=256)
     code: str = Field(..., min_length=1, max_length=200_000)
     session_id: str = Field(..., min_length=1, max_length=128)
     compute_pool_id: Optional[str] = Field(default=None, max_length=128)
@@ -84,7 +85,7 @@ def _safe_importer(allow: Sequence[str]) -> Callable[..., Any]:
     return _imp
 
 
-def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, Any]:
+def _build_kernel_globals(*, org: str, sup: str, user_hash: str, role_name: str = "") -> Dict[str, Any]:
     """Create a kernel namespace with built-in connectors.
 
     This runs inside the API process (still isolated per "session_id") and
@@ -112,6 +113,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
     ns["ORG"] = org
     ns["SUPER"] = sup
     ns["USER_HASH"] = user_hash
+    ns["ROLE_NAME"] = role_name or user_hash
 
     # Connectors (best-effort; import only when called to keep startup fast)
     def st_sql(query: str, *, with_scan: bool = False, limit: Optional[int] = None) -> Any:
@@ -127,7 +129,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
 
         dr = DataReader(super_name=sup, organization=org, query=q)
         # Returns (df, status, message) in examples; pass through as-is.
-        return dr.execute(user_hash=user_hash, with_scan=with_scan, engine=engine.DUCKDB)
+        return dr.execute(role_name=role_name or user_hash, with_scan=with_scan, engine=engine.DUCKDB)
 
     def st_read_table(table: str, *, limit: int = 50) -> Any:
         t = str(table or "").strip()
@@ -167,7 +169,7 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
 
         dw = DataWriter(super_name=sup, organization=org)
         return dw.write(
-            user_hash=user_hash,
+            role_name=role_name or user_hash,
             simple_name=t,
             data=tbl,
             overwrite_columns=list(ow),
@@ -204,11 +206,11 @@ def _exec_like_jupyter(code: str, ns: Dict[str, Any]) -> str:
     return ""
 
 
-def _run_code_in_kernel(*, session_key: str, org: str, sup: str, user_hash: str, code: str) -> Tuple[str, str]:
+def _run_code_in_kernel(*, session_key: str, org: str, sup: str, user_hash: str, role_name: str = "", code: str) -> Tuple[str, str]:
     # Acquire/initialize kernel
     ns = _KERNELS.get(session_key)
     if ns is None:
-        ns = _build_kernel_globals(org=org, sup=sup, user_hash=user_hash)
+        ns = _build_kernel_globals(org=org, sup=sup, user_hash=user_hash, role_name=role_name)
         _KERNELS[session_key] = ns
 
     out = io.StringIO()
@@ -240,6 +242,7 @@ async def _job_worker() -> None:
                     org=str(job_payload["org"]),
                     sup=str(job_payload["sup"]),
                     user_hash=str(job_payload["user_hash"]),
+                    role_name=str(job_payload.get("role_name") or ""),
                     code=str(job_payload["code"]),
                 )
             duration_ms = (time.perf_counter() - started) * 1000.0
@@ -413,6 +416,7 @@ def attach_studio_routes(
                 "org": payload.org,
                 "sup": payload.sup,
                 "user_hash": payload.user_hash,
+                "role_name": payload.role_name,
                 "code": payload.code,
                 "compute_pool_id": compute_pool_id,
             }

@@ -927,9 +927,13 @@
     }
 
     const META_BASE = '';
-    // Organization + user_hash must be per-login (session cookie). No hardcoded tenants.
+    // Organization + role_name must be per-login (session cookie). No hardcoded tenants.
     const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
-    const USER_HASH = {{ session_user_hash|default(default_user_hash|default('', true), true)|tojson }};
+    const ROLE_NAME = {{ session_role_name|default('', true)|tojson }};
+
+    function getActiveRole() {
+      return (window.__st_active_role || window.__st_role_name || ROLE_NAME || '').trim();
+    }
 
     let currentSuper = null;
     let currentStatsResources = [];
@@ -1221,7 +1225,7 @@
         META_BASE + '/reflection/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
-        '&user_hash=' + encodeURIComponent(USER_HASH)
+        '&role_name=' + encodeURIComponent(getActiveRole())
       )
         .then(data => {
           const s = data && data.meta && data.meta.super ? data.meta.super : null;
@@ -1277,7 +1281,7 @@
         META_BASE + '/reflection/super?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(currentSuper) +
-        '&user_hash=' + encodeURIComponent(USER_HASH)
+        '&role_name=' + encodeURIComponent(getActiveRole())
       )
         .then(data => {
           const s = data && data.meta && data.meta.super ? data.meta.super : null;
@@ -1433,7 +1437,7 @@ async function openSchema(simple) {
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup || '') +
           '&table=' + encodeURIComponent(simple) +
-          '&user_hash=' + encodeURIComponent(USER_HASH)
+          '&role_name=' + encodeURIComponent(getActiveRole())
         );
 
         const schemaRaw = (data && data.schema !== undefined) ? data.schema : (data || null);
@@ -1781,7 +1785,7 @@ async function openSchema(simple) {
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +
-          '&user_hash=' + encodeURIComponent(USER_HASH)
+          '&role_name=' + encodeURIComponent(getActiveRole())
         );
 
         const statsRaw = data && data.stats !== undefined ? data.stats : null;
@@ -1934,7 +1938,8 @@ function deleteTable(simple) {
         META_BASE + '/reflection/table?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(sup) +
-        '&table=' + encodeURIComponent(simple),
+        '&table=' + encodeURIComponent(simple) +
+        '&role_name=' + encodeURIComponent(getActiveRole()),
         { method: 'DELETE' }
       ).then(() => {
         // Refresh current super meta/tables
@@ -1963,13 +1968,16 @@ function deleteTable(simple) {
     $(document).ready(function () {
       window.__admintoken = "{{ token|e }}";
 
-      $("#toggleSidebar").on("click", function () {
-        $("#sidebar").toggleClass("sidebar-collapsed");
-        localStorage.setItem('st_sidebar_collapsed', $("#sidebar").hasClass("sidebar-collapsed"));
-      });
+      // Sidebar toggle — skip if sidebar.html already bound it
+      if (!window.__st_sidebar_bound) {
+        $("#toggleSidebar").on("click", function () {
+          $("#sidebar").toggleClass("sidebar-collapsed");
+          localStorage.setItem('st_sidebar_collapsed', $("#sidebar").hasClass("sidebar-collapsed"));
+        });
 
-      if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
-        $("#sidebar").addClass("sidebar-collapsed");
+        if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+          $("#sidebar").addClass("sidebar-collapsed");
+        }
       }
 
       $("#link-tables").addClass("active");

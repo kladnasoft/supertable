@@ -16,19 +16,19 @@ result = list_tables(organization=organization, super_name=super_name)
 logger.info(f"tables: {result}")
 
 
-
+print("*"*32)
 meta_reader = MetaReader(organization=organization, super_name=super_name)
 
 result = meta_reader.get_super_meta(role_name)
 logger.info(f"meta_reader.result: {result}")
-
+print("-"*32)
 
 result = meta_reader.get_table_schema(super_name, role_name)
 logger.info(f"super_name.schema.result: {result}")
 
-
 result = meta_reader.get_table_schema(simple_name, role_name)
 logger.info(f"simple_name.schema.result: {result}")
+print("*"*32)
 
 result = meta_reader.get_table_stats(super_name, role_name)
 logger.info(f"super_name.stats.result: {result}")

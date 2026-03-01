@@ -1,8 +1,17 @@
 <style>
-  /* ------------ SIDEBAR (shared for admin/execute/tables/config) ------------ */
+  /* ------------ SIDEBAR — Refined Light (Concept A) ------------ */
+
+  :root {
+    --sb-width: 280px;
+    --sb-collapsed-width: 80px;
+    --sb-transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* ── Sidebar container ────────────────────────────────────────── */
 
   .sidebar {
-    width: 280px;
+    width: var(--sb-width);
     height: 100vh;
     position: fixed;
     left: 0;
@@ -12,11 +21,23 @@
     display: flex;
     flex-direction: column;
     z-index: 1100;
-    transition: var(--transition);
+    transition: width var(--sb-transition);
     overflow: hidden;
   }
 
-  .sidebar-collapsed { width: 80px; }
+  .sidebar-collapsed {
+    width: var(--sb-collapsed-width);
+  }
+
+  /* When collapsed, all children use same horizontal padding for alignment */
+  .sidebar-collapsed .sidebar-logo,
+  .sidebar-collapsed .sidebar-nav,
+  .sidebar-collapsed .profile-section {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  /* ── Logo area ────────────────────────────────────────────────── */
 
   .sidebar-logo {
     display: flex;
@@ -27,7 +48,16 @@
     background: white;
     border-bottom: 1px solid rgba(0, 0, 0, 0.05);
     height: 80px;
+    flex-shrink: 0;
+    gap: 12px;
+    user-select: none;
   }
+
+  .sidebar-collapsed .sidebar-logo {
+    justify-content: center;
+  }
+
+  /* ── Data Reflection animated cube ────────────────────────────── */
 
   .data-reflection-icon {
     display: inline-flex;
@@ -45,7 +75,8 @@
     background: var(--primary-color);
     position: relative;
     overflow: hidden;
-    transition: var(--transition);
+    transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                box-shadow 0.3s ease;
     box-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
   }
 
@@ -54,7 +85,8 @@
     box-shadow: 0 4px 12px rgba(28, 150, 202, 0.5);
   }
 
-  .data-cube:before {
+  /* Shimmer sweep */
+  .data-cube::before {
     content: '';
     position: absolute;
     width: 150%;
@@ -71,27 +103,11 @@
     transition: transform 0.8s ease;
   }
 
-  #toggleSidebar:hover .data-cube:before {
+  #toggleSidebar:hover .data-cube::before {
     transform: translateX(100%) rotate(45deg);
   }
 
-  .reflection {
-    position: absolute;
-    width: 10px;
-    height: 10px;
-    background: rgba(255,255,255,0.8);
-    border-radius: 2px;
-    bottom: 5px;
-    right: 5px;
-    transition: var(--transition);
-    opacity: 0.7;
-  }
-
-  #toggleSidebar:hover .reflection {
-    opacity: 1;
-    transform: scale(1.3) translate(-2px, -2px);
-  }
-
+  /* Grid overlay */
   .data-grid {
     position: absolute;
     width: 100%;
@@ -101,65 +117,146 @@
       linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px);
     background-size: 7px 7px;
     opacity: 0.6;
+    transition: opacity 0.3s ease;
   }
+
+  #toggleSidebar:hover .data-grid { opacity: 0.8; }
+
+  /* Inner reflection dot */
+  .reflection {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    background: rgba(255,255,255,0.8);
+    border-radius: 2px;
+    bottom: 5px;
+    right: 5px;
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    opacity: 0.7;
+  }
+
+  #toggleSidebar:hover .reflection {
+    opacity: 1;
+    transform: scale(1.3) translate(-2px, -2px);
+  }
+
+  /* ── Logo text ────────────────────────────────────────────────── */
 
   .logo-text {
     font-size: 18px;
     font-weight: 700;
-    color: transparent;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
     background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
     -webkit-background-clip: text;
     background-clip: text;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    transition: var(--transition);
+    color: transparent;
     white-space: nowrap;
-    margin-left: 12px;
+    opacity: 1;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    transform-origin: left center;
   }
 
-  .sidebar-collapsed .logo-text { display: none; }
+  .sidebar-collapsed .logo-text {
+    opacity: 0;
+    width: 0;
+    transform: scale(0.8);
+    pointer-events: none;
+    overflow: hidden;
+  }
 
   #toggleSidebar:hover .logo-text {
-    text-shadow: 0 2px 6px rgba(28, 150, 202, 0.4);
+    text-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
   }
+
+  /* ── Navigation ───────────────────────────────────────────────── */
 
   .sidebar-nav {
     flex: 1;
     overflow-y: auto;
-    padding: 15px;
+    overflow-x: hidden;
+    padding: 4px 15px;
     scrollbar-width: thin;
-    scrollbar-color: var(--primary-light) transparent;
+    scrollbar-color: var(--primary-light, #e6f4fa) transparent;
+    transition: padding var(--sb-transition);
+  }
+
+  .sidebar-collapsed .sidebar-nav {
+    padding-top: 4px;
   }
 
   .sidebar-nav::-webkit-scrollbar { width: 4px; }
   .sidebar-nav::-webkit-scrollbar-thumb {
-    background-color: var(--primary-light);
+    background-color: var(--primary-light, #e6f4fa);
     border-radius: 4px;
   }
 
+  /* Section labels */
+  .sidebar-section {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-light);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 16px 12px 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .sidebar-section {
+    opacity: 0;
+    height: 0;
+    padding: 0;
+    margin: 0;
+    pointer-events: none;
+  }
+
+  /* Collapsed divider (replaces section labels) */
+  .sidebar-collapsed .sidebar-section-divider {
+    display: block;
+    height: 1px;
+    background: rgba(0, 0, 0, 0.05);
+    margin: 6px 10px;
+  }
+
+  .sidebar-section-divider { display: none; }
+
+  /* ── Nav links ────────────────────────────────────────────────── */
+
   .sidebar-link {
-    color: var(--text-color);
+    display: flex;
+    align-items: center;
     padding: 10px 12px;
     border-radius: 8px;
-    transition: var(--transition);
+    font-size: 13px;
     font-weight: 500;
-    margin-bottom: 4px;
+    color: var(--text-color);
+    text-decoration: none;
+    transition: background-position 0.25s ease, border-color 0.15s ease, color 0.15s ease;
+    margin-bottom: 2px;
+    border-left: 3px solid transparent;
+    position: relative;
+    white-space: nowrap;
+    overflow: hidden;
     background: linear-gradient(to right, transparent 50%, var(--primary-light) 50%);
     background-size: 200% 100%;
     background-position: right bottom;
-    border-left: 3px solid transparent;
-    display: flex;
-    align-items: center;
   }
 
   .sidebar-link i {
     margin-right: 10px;
     width: 18px;
     text-align: center;
+    font-size: 13px;
+    flex-shrink: 0;
+    transition: color 0.15s ease;
   }
 
-  .sidebar-collapsed .sidebar-link span { display: none; }
-  .sidebar-collapsed .sidebar-link i { margin-right: 0; }
+  .sidebar-link span {
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
 
   .sidebar-link:hover {
     background-position: left bottom;
@@ -174,67 +271,444 @@
     color: var(--primary-color);
   }
 
-  .profile-section {
-    padding: 12px 15px;
+  .sidebar-link.active i { color: var(--primary-color); }
+
+  /* ── Collapsed nav links ──────────────────────────────────────── */
+
+  .sidebar-collapsed .sidebar-link {
+    justify-content: center;
+    text-align: center;
+    padding: 10px 0;
+    margin-bottom: 2px;
+    border-left: none;
+    background: transparent;
+    background-size: auto;
+    border-radius: 8px;
+  }
+
+  .sidebar-collapsed .sidebar-link span {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .sidebar-collapsed .sidebar-link i {
+    margin-right: 0;
+    margin-left: 0;
+    font-size: 16px;
+  }
+
+  .sidebar-collapsed .sidebar-link:hover {
+    border-left-color: transparent;
+    background: var(--primary-light);
+  }
+
+  .sidebar-collapsed .sidebar-link.active {
+    border-left-color: transparent;
+    background: #e6f0ff;
+  }
+
+  /* ── Tooltips (collapsed only) ────────────────────────────────── */
+
+  .sidebar-link .sidebar-tooltip {
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: #0f172a;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 1200;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+
+  .sidebar-link .sidebar-tooltip::before {
+    content: '';
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    border: 5px solid transparent;
+    border-right-color: #0f172a;
+  }
+
+  .sidebar-collapsed .sidebar-link:hover .sidebar-tooltip {
+    opacity: 1;
+  }
+
+  /* ── User context panel (bottom of sidebar) ──────────────────────── */
+
+  .sidebar-ctx {
+    padding: 0 15px 8px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    transition: padding var(--sb-transition);
     border-top: 1px solid rgba(0, 0, 0, 0.05);
+  }
+
+  .sidebar-collapsed .sidebar-ctx {
+    padding: 0 0 8px;
+    align-items: center;
+  }
+
+  /* ── Toggle bar (always visible) ─────────────────────────────── */
+
+  .ctx-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 10px 10px;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .ctx-toggle:hover {
+    background: rgba(0, 0, 0, 0.03);
+  }
+
+  .ctx-toggle-icon {
+    font-size: 20px;
+    color: var(--primary-color, #1c96ca);
+    flex-shrink: 0;
+    transition: color 0.15s ease;
+  }
+
+  .ctx-toggle:hover .ctx-toggle-icon {
+    color: var(--secondary-color, #147ba3);
+  }
+
+  .ctx-toggle-arrow {
+    font-size: 10px;
+    color: var(--text-light, #8d99ae);
+    flex-shrink: 0;
+    transition: transform 0.25s ease, opacity 0.18s ease;
+  }
+
+  .ctx-toggle-arrow.collapsed {
+    transform: rotate(180deg);
+  }
+
+  /* ── Collapsed sidebar: toggle icon-only ─────────────────────── */
+
+  .sidebar-collapsed .ctx-toggle {
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .sidebar-collapsed .ctx-toggle-arrow {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
+  .sidebar-collapsed .ctx-toggle-icon {
+    font-size: 22px;
+  }
+
+  /* ── Collapsible panel ───────────────────────────────────────── */
+
+  .ctx-panel {
+    overflow: hidden;
+    max-height: 300px;
+    opacity: 1;
+    transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+    padding: 2px 0 4px;
+  }
+
+  .ctx-panel.ctx-panel-hidden {
+    max-height: 0;
+    opacity: 0;
+    padding: 0;
+  }
+
+  .sidebar-collapsed .ctx-panel {
+    max-height: 0;
+    opacity: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+
+  /* Individual context row */
+  .ctx-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    transition: background 0.15s ease;
+    position: relative;
+    min-width: 0;
+  }
+
+  .ctx-row:hover {
+    background: rgba(0, 0, 0, 0.025);
+  }
+
+  /* Left icon */
+  .ctx-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    position: relative;
+  }
+
+  .ctx-icon-org,
+  .ctx-icon-user,
+  .ctx-icon-role {
+    background: var(--primary-light, #e6f4fa);
+    color: var(--primary-color, #1c96ca);
+  }
+
+  .ctx-value {
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.4;
+    min-width: 0;
+    flex: 1;
+  }
+
+  /* Divider */
+  .ctx-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,0,0,0.06) 20%, rgba(0,0,0,0.06) 80%, transparent);
+    margin: 4px 10px;
+  }
+
+  /* Role selector */
+  .ctx-role-selector {
+    padding: 4px 10px 2px;
+  }
+
+  .ctx-role-select {
+    width: 100%;
+    padding: 7px 28px 7px 10px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    background: #fff;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238d99ae' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+
+  .ctx-role-select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(28, 150, 202, 0.1);
+  }
+
+  .ctx-role-select:hover {
+    border-color: rgba(0, 0, 0, 0.15);
+  }
+
+  /* Logout */
+  .ctx-logout {
+    padding: 2px 10px 0;
+    transition: opacity 0.18s ease;
+  }
+
+  .ctx-logout-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 0;
+    border-radius: 6px;
+    border: 1px solid rgba(0, 0, 0, 0.05);
+    background: transparent;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-light);
+    transition: all 0.15s ease;
+    text-decoration: none;
+  }
+
+  .ctx-logout-btn:hover {
+    border-color: #fca5a5;
+    color: #dc2626;
+    background: #fef2f2;
+    text-decoration: none;
+  }
+
+  .ctx-logout-btn i { font-size: 11px; }
+
+  /* ── Collapsed sidebar overrides ─────────────────────────────── */
+
+  .sidebar-collapsed .ctx-logout {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
+  /* Collapsed tooltip on toggle icon */
+  .ctx-toggle .ctx-toggle-tooltip {
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: #0f172a;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 1200;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+
+  .ctx-toggle .ctx-toggle-tooltip::before {
+    content: '';
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    border: 5px solid transparent;
+    border-right-color: #0f172a;
+  }
+
+  .sidebar-collapsed .ctx-toggle:hover .ctx-toggle-tooltip {
+    opacity: 1;
+  }
+
+  /* ── kladna Soft branding (between nav and user profile) ──────── */
+
+  .profile-section {
+    padding: 10px 15px;
+    border-top: 1px solid rgba(0, 0, 0, 0.05);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
     background: white;
     flex-shrink: 0;
+    transition: padding var(--sb-transition);
+  }
+
+  .sidebar-collapsed .profile-section {
+    padding: 10px 0;
   }
 
   .profile-section-inner {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: center;
     font-size: 13px;
     color: var(--text-light);
-    transition: var(--transition);
   }
 
-  /* Collapsed state - stack vertically */
-  .sidebar-collapsed .profile-section-inner {
-    flex-direction: column;
+  .footer-logo-link {
+    display: inline-flex;
+    align-items: center;
     gap: 8px;
-    justify-content: center;
+    font-size: 12px;
+    color: var(--text-light);
+    text-decoration: none;
+    transition: color 0.2s ease;
+  }
+
+  .footer-logo-link:hover {
+    color: var(--primary-color);
+    text-decoration: none;
+  }
+
+  .footer-dna-icon i {
+    font-size: 14px;
+    transition: transform 0.4s ease;
+  }
+
+  .footer-logo-link:hover .footer-dna-icon i {
+    transform: rotate(180deg);
+  }
+
+  .footer-brand-text {
+    font-weight: 600;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .footer-brand-text {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
   }
 
   /* ------------ MAIN CONTENT LAYOUT HELPERS (shared) ------------ */
 
   .content-container {
-    margin-left: 280px;
+    margin-left: var(--sb-width);
     min-height: 100vh;
     background-color: #f3f6fb;
-    transition: var(--transition);
+    transition: margin-left var(--sb-transition);
     padding-bottom: 40px;
   }
 
   .sidebar-collapsed ~ .content-container {
-    margin-left: 80px;
+    margin-left: var(--sb-collapsed-width);
   }
 
   .wrap {
-    max-width: 1400px; /* Increased width */
+    max-width: 1400px;
     margin: 0 auto;
     padding: 24px;
   }
 
   .card {
-    background: var(--panel-bg);
+    background: var(--panel-bg, #ffffff);
     border-radius: 16px;
-    box-shadow: var(--panel-shadow);
-    border: 1px solid var(--panel-border);
+    box-shadow: var(--panel-shadow, 0 4px 12px rgba(15, 23, 42, 0.06));
+    border: 1px solid var(--panel-border, #e0e5f0);
   }
 
   .section { padding: 16px 20px; }
-  .muted { color: var(--text-light); }
+  .muted { color: var(--text-light, #8d99ae); }
   .text-xs { font-size: 11px; }
   .text-sm { font-size: 12px; }
 
   .header-row {
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:12px;
-    margin-bottom:12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
   }
 
   .btn-ghost {
@@ -247,122 +721,8 @@
     font-size: 12px;
   }
 
-  .btn-ghost:hover { background:#e2e8f0; }
-
-  /* ------------ kladna Soft footer logo inside profile bar ------------ */
-
-  .footer-logo-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--text-light);
-    text-decoration: none;
-    transition: var(--transition);
-  }
-
-  .footer-logo-link:hover {
-    color: var(--primary-color);
-    text-decoration: none;
-  }
-
-  .footer-dna-icon i {
-    font-size: 14px;
-    transition: transform 0.3s ease;
-  }
-
-  .footer-logo-link:hover .footer-dna-icon i {
-    transform: rotate(180deg);
-  }
-
-  .footer-brand-text {
-    font-weight: 600;
-    transition: var(--transition);
-  }
-
-  /* Hide brand text when sidebar is collapsed */
-  .sidebar-collapsed .footer-brand-text {
-    display: none;
-  }
-
-  .logout-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition: var(--transition);
-  }
-
-  .logout-link span {
-    transition: var(--transition);
-  }
-
-  /* Hide logout text when sidebar is collapsed */
-  .sidebar-collapsed .logout-link span {
-    display: none;
-  }
-
-  /* Center align icons when collapsed */
-  .sidebar-collapsed .footer-logo-link,
-  .sidebar-collapsed .logout-link {
-    justify-content: center;
-    width: 100%;
-  }
-
-  /* ------------ Logged-in user display (sidebar footer) ------------ */
-
-  .profile-section-inner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .profile-left {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
-    min-width: 0;
-  }
-
-  .profile-user {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 2px;
-    padding-left: 10px;
-    border-left: 1px solid rgba(208, 215, 231, 0.9);
-    min-width: 0;
-  }
-
-  .profile-user .user-label {
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: #64748b;
-    line-height: 1.1;
-  }
-
-  .profile-user .user-name {
-    font-size: 13px;
-    font-weight: 700;
-    color: #0f172a;
-    line-height: 1.2;
-    max-width: 140px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .sidebar-collapsed .profile-user {
-    display: none;
-  }
-
-
-  /* --- selection-only footer --- */
-  .profile-section-inner { justify-content: center; }
+  .btn-ghost:hover { background: #e2e8f0; }
 </style>
-
 
 
 <!-- Shared sidebar for SuperTable Admin -->
@@ -378,68 +738,296 @@
   </div>
 
   <nav class="nav flex-column sidebar-nav">
-  <a href="/reflection/home" class="sidebar-link" id="link-home">
-    <i class="fas fa-house"></i>
-    <span>Home</span>
-  </a>
 
-  <a href="/reflection/execute" class="sidebar-link" id="link-execute">
-    <i class="fas fa-terminal"></i>
-    <span>Execute SQL</span>
-  </a>
-  <a href="/reflection/tables" class="sidebar-link" id="link-tables">
-    <i class="fas fa-table"></i>
-    <span>Tables</span>
-  </a>
-  <a href="/reflection/ingestion" class="sidebar-link" id="link-staging">
-    <i class="fas fa-layer-group"></i>
-    <span>Ingestion</span>
-  </a>
+    <div class="sidebar-section">Navigation</div>
+    <div class="sidebar-section-divider"></div>
 
-  <a href="/reflection/studio" class="sidebar-link" id="link-studio">
-    <i class="fas fa-book"></i>
-    <span>Studio</span>
-  </a>
+    <a href="/reflection/home" class="sidebar-link" id="link-home">
+      <i class="fas fa-house"></i>
+      <span>Home</span>
+      <span class="sidebar-tooltip">Home</span>
+    </a>
 
-  <a href="/reflection/jobs" class="sidebar-link" id="link-jobs">
-    <i class="fas fa-clock"></i>
-    <span>Jobs</span>
-  </a>
+    <a href="/reflection/execute" class="sidebar-link" id="link-execute">
+      <i class="fas fa-terminal"></i>
+      <span>Execute SQL</span>
+      <span class="sidebar-tooltip">Execute SQL</span>
+    </a>
 
-  <a href="/reflection/vault" class="sidebar-link" id="link-vault">
-    <i class="fas fa-plug"></i>
-    <span>Vault</span>
-  </a>
+    <a href="/reflection/tables" class="sidebar-link" id="link-tables">
+      <i class="fas fa-table"></i>
+      <span>Tables</span>
+      <span class="sidebar-tooltip">Tables</span>
+    </a>
 
-  <a href="/reflection/compute" class="sidebar-link" id="link-compute">
-    <i class="fas fa-server"></i>
-    <span>Compute</span>
-  </a>
+    <a href="/reflection/ingestion" class="sidebar-link" id="link-staging">
+      <i class="fas fa-layer-group"></i>
+      <span>Ingestion</span>
+      <span class="sidebar-tooltip">Ingestion</span>
+    </a>
 
-  <a href="/reflection/admin" class="sidebar-link" id="link-admin">
-    <i class="fas fa-user-shield"></i>
-    <span>Admin</span>
-  </a>
+    <a href="/reflection/studio" class="sidebar-link" id="link-studio">
+      <i class="fas fa-book"></i>
+      <span>Studio</span>
+      <span class="sidebar-tooltip">Studio</span>
+    </a>
 
+    <a href="/reflection/jobs" class="sidebar-link" id="link-jobs">
+      <i class="fas fa-clock"></i>
+      <span>Jobs</span>
+      <span class="sidebar-tooltip">Jobs</span>
+    </a>
 
-  <a href="/reflection/rbac" class="sidebar-link" id="link-rbac">
-    <i class="fas fa-user-lock"></i>
-    <span>RBAC Views</span>
-  </a>
-</nav>
+    <div class="sidebar-section">Infrastructure</div>
+    <div class="sidebar-section-divider"></div>
 
+    <a href="/reflection/vault" class="sidebar-link" id="link-vault">
+      <i class="fas fa-plug"></i>
+      <span>Vault</span>
+      <span class="sidebar-tooltip">Vault</span>
+    </a>
+
+    <a href="/reflection/compute" class="sidebar-link" id="link-compute">
+      <i class="fas fa-server"></i>
+      <span>Compute</span>
+      <span class="sidebar-tooltip">Compute</span>
+    </a>
+
+    <div class="sidebar-section">Access Control</div>
+    <div class="sidebar-section-divider"></div>
+
+    <a href="/reflection/admin" class="sidebar-link" id="link-admin">
+      <i class="fas fa-user-shield"></i>
+      <span>Admin</span>
+      <span class="sidebar-tooltip">Admin</span>
+    </a>
+
+    <a href="/reflection/rbac" class="sidebar-link" id="link-rbac">
+      <i class="fas fa-user-lock"></i>
+      <span>RBAC Views</span>
+      <span class="sidebar-tooltip">RBAC Views</span>
+    </a>
+
+  </nav>
+
+  <!-- User context: toggle bar + collapsible panel -->
+  <div class="sidebar-ctx" id="sidebarUserSection">
+
+    <!-- Toggle bar — always visible -->
+    <button type="button" class="ctx-toggle" id="ctxToggleBtn" title="Account &amp; role settings">
+      <i class="fas fa-circle-user ctx-toggle-icon"></i>
+      <i class="fas fa-chevron-up ctx-toggle-arrow" id="ctxToggleArrow"></i>
+    </button>
+
+    <!-- Collapsible panel -->
+    <div class="ctx-panel" id="ctxPanel">
+
+      <!-- Organization -->
+      <div class="ctx-row" title="Organization">
+        <div class="ctx-icon ctx-icon-org">
+          <i class="fas fa-building"></i>
+        </div>
+        <span class="ctx-value" id="ctxOrgValue">—</span>
+      </div>
+
+      <!-- User -->
+      <div class="ctx-row" title="User">
+        <div class="ctx-icon ctx-icon-user">
+          <i class="fas fa-user"></i>
+        </div>
+        <span class="ctx-value" id="ctxUserValue">—</span>
+      </div>
+
+      <!-- Active Role -->
+      <div class="ctx-row" title="Active Role">
+        <div class="ctx-icon ctx-icon-role">
+          <i class="fas fa-shield-halved"></i>
+        </div>
+        <span class="ctx-value" id="ctxRoleValue">—</span>
+      </div>
+
+      <div class="ctx-divider"></div>
+
+      <!-- Role selector -->
+      <div class="ctx-role-selector" id="ctxRoleSelectorWrap">
+        <select class="ctx-role-select" id="sbRoleSelect" title="Switch active role">
+          <option value="">— select SuperTable first —</option>
+        </select>
+      </div>
+
+    </div>
+
+    <!-- Logout — always visible below panel -->
+    <div class="ctx-logout">
+      <a href="/reflection/logout" class="ctx-logout-btn" title="Sign out">
+        <i class="fas fa-arrow-right-from-bracket"></i>
+        <span>Sign out</span>
+      </a>
+    </div>
+
+  </div>
+
+  <!-- kladna Soft branding -->
   <div class="profile-section">
-
     <div class="profile-section-inner">
-      <div style="display:flex; align-items:center; justify-content:center; width:100%;">
-        <!-- kladna Soft logo -->
       <a class="footer-logo-link" href="https://kladnasoft.com/kladnasoft/index/">
         <span class="footer-dna-icon">
           <i class="fas fa-dna"></i>
         </span>
         <span class="footer-brand-text">kladna Soft</span>
       </a>
-      </div>
     </div>
   </div>
+
 </div>
+
+<!-- Sidebar collapse/expand — shared across all pages -->
+<script>
+(function () {
+  var sidebar = document.getElementById("sidebar");
+  var toggle = document.getElementById("toggleSidebar");
+  if (!sidebar || !toggle) return;
+
+  // Restore persisted state immediately (before paint).
+  if (localStorage.getItem("st_sidebar_collapsed") === "true" ||
+      localStorage.getItem("sidebar-collapsed") === "true") {
+    sidebar.classList.add("sidebar-collapsed");
+  }
+
+  toggle.addEventListener("click", function () {
+    sidebar.classList.toggle("sidebar-collapsed");
+    var collapsed = sidebar.classList.contains("sidebar-collapsed");
+    localStorage.setItem("st_sidebar_collapsed", String(collapsed));
+    localStorage.setItem("sidebar-collapsed", String(collapsed));
+  });
+
+  // Flag so legacy per-page jQuery handlers can skip their own binding.
+  window.__st_sidebar_bound = true;
+
+  // ── Collapsible user-context panel ──────────────────────────────
+  var ctxToggle = document.getElementById("ctxToggleBtn");
+  var ctxPanel = document.getElementById("ctxPanel");
+  var ctxArrow = document.getElementById("ctxToggleArrow");
+
+  // Start collapsed
+  if (ctxPanel) ctxPanel.classList.add("ctx-panel-hidden");
+  if (ctxArrow) ctxArrow.classList.add("collapsed");
+
+  // Restore persisted state
+  if (localStorage.getItem("st_ctx_open") === "true") {
+    if (ctxPanel) ctxPanel.classList.remove("ctx-panel-hidden");
+    if (ctxArrow) ctxArrow.classList.remove("collapsed");
+  }
+
+  if (ctxToggle && ctxPanel) {
+    ctxToggle.addEventListener("click", function () {
+      var isHidden = ctxPanel.classList.toggle("ctx-panel-hidden");
+      if (ctxArrow) ctxArrow.classList.toggle("collapsed", isHidden);
+      localStorage.setItem("st_ctx_open", String(!isHidden));
+    });
+  }
+
+  // ── User context population ──────────────────────────────────
+  var username = {{ session_username|default("", true)|tojson }};
+  var org = {{ session_org|default("", true)|tojson }};
+  var userHash = {{ session_user_hash|default("", true)|tojson }};
+  var isSuperuser = {{ session_is_superuser|default(false, true)|tojson }};
+  var sessionRoleName = {{ session_role_name|default("", true)|tojson }};
+
+  // Store globally so selection.html and other scripts can read them
+  window.__st_username = username;
+  window.__st_org = org;
+  window.__st_user_hash = userHash;
+  window.__st_is_superuser = isSuperuser;
+  window.__st_role_name = sessionRoleName || localStorage.getItem("st_active_role") || "";
+
+  var orgValueEl = document.getElementById("ctxOrgValue");
+  var userValueEl = document.getElementById("ctxUserValue");
+  var roleValueEl = document.getElementById("ctxRoleValue");
+
+  if (org && orgValueEl) {
+    orgValueEl.textContent = org;
+  }
+
+  if (username && userValueEl) {
+    userValueEl.textContent = username;
+  }
+
+  var initialRole = sessionRoleName || localStorage.getItem("st_active_role") || "";
+  if (initialRole && roleValueEl) {
+    roleValueEl.textContent = initialRole;
+  }
+
+  // ── Role selector logic ──────────────────────────────────────
+  var roleSelect = document.getElementById("sbRoleSelect");
+  window.__st_active_role = localStorage.getItem("st_active_role") || "";
+
+  // Called by selection.html with already-fetched (or cached) role names.
+  // This function only populates the dropdown — no network calls.
+  window.__st_applyRoleNames = function (roleNames) {
+    if (!roleSelect) return;
+
+    if (!roleNames || !roleNames.length) {
+      roleSelect.innerHTML = '<option value="">No roles assigned</option>';
+      window.__st_active_role = "";
+      return;
+    }
+
+    roleSelect.innerHTML = "";
+    var savedRole = sessionRoleName || localStorage.getItem("st_active_role") || "";
+    var foundSaved = false;
+
+    for (var k = 0; k < roleNames.length; k++) {
+      var rname = roleNames[k];
+      var opt = document.createElement("option");
+      opt.value = rname;
+      opt.textContent = rname;
+      if (rname === savedRole) { opt.selected = true; foundSaved = true; }
+      roleSelect.appendChild(opt);
+    }
+
+    if (!foundSaved && roleSelect.options.length) {
+      roleSelect.options[0].selected = true;
+    }
+
+    window.__st_active_role = roleSelect.value;
+    localStorage.setItem("st_active_role", window.__st_active_role);
+    if (roleValueEl) roleValueEl.textContent = roleSelect.value || "—";
+  };
+
+  // On role change
+  if (roleSelect) {
+    roleSelect.addEventListener("change", function () {
+      window.__st_active_role = roleSelect.value;
+      window.__st_role_name = roleSelect.value;
+      localStorage.setItem("st_active_role", roleSelect.value);
+      // Update displayed role value
+      if (roleValueEl) roleValueEl.textContent = roleSelect.value || "—";
+      // Persist to server session
+      fetch("/reflection/set-role", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({role_name: roleSelect.value})
+      }).catch(function (e) { console.warn("Failed to persist role:", e); });
+      // Notify any listeners
+      try {
+        window.dispatchEvent(new CustomEvent("role-changed", {
+          detail: { role_name: roleSelect.value }
+        }));
+      } catch (e) {}
+    });
+  }
+
+  // Clear all cached data on logout
+  var logoutLink = document.querySelector('a[href="/reflection/logout"]');
+  if (logoutLink) {
+    logoutLink.addEventListener("click", function () {
+      try {
+        if (typeof window.__st_clearAllCaches === "function") {
+          window.__st_clearAllCaches();
+        }
+      } catch (e) {}
+    });
+  }
+})();
+</script>

@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – RBAC Views</title>
+  <title>SuperTable – RBAC</title>
 
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 
   <!-- Fonts & Icons -->
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
   <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
         integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
@@ -47,6 +47,56 @@
 
     .muted { color: var(--text-light); }
 
+    /* ── Tab navigation ─────────────────────────────── */
+    .rbac-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 2px solid var(--panel-border);
+      margin-bottom: 0;
+    }
+
+    .rbac-tab {
+      padding: 11px 22px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-light);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      user-select: none;
+    }
+
+    .rbac-tab:hover { color: var(--text-color); }
+
+    .rbac-tab.active {
+      color: var(--primary-color);
+      border-bottom-color: var(--primary-color);
+    }
+
+    .rbac-tab .tab-count {
+      background: var(--panel-border);
+      color: var(--text-light);
+      font-size: 11px;
+      font-weight: 800;
+      padding: 1px 7px;
+      border-radius: 99px;
+      min-width: 22px;
+      text-align: center;
+    }
+
+    .rbac-tab.active .tab-count {
+      background: var(--primary-light);
+      color: var(--primary-color);
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Grid layout ─────────────────────────────── */
     .rbac-grid {
       display: grid;
       grid-template-columns: 420px 1fr;
@@ -93,7 +143,8 @@
       color: #0f172a;
     }
 
-    .views-table thead th {
+    /* ── Tables ─────────────────────────────── */
+    .rbac-table thead th {
       border-top: none;
       color: var(--text-light);
       font-size: 12px;
@@ -102,33 +153,108 @@
       background: #f8fafc;
     }
 
-    .views-table tbody tr {
+    .rbac-table tbody tr { cursor: pointer; }
+    .rbac-table tbody tr:hover { background: #f8fafc; }
+    .rbac-table tbody tr.selected { background: rgba(28,150,202,0.10); }
+    .rbac-table tbody td { padding: 10px 12px; vertical-align: middle; }
+
+    /* ── Badges ─────────────────────────────── */
+    .role-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .role-badge-superadmin { background: #fef3c7; color: #92400e; }
+    .role-badge-admin { background: #ede9fe; color: #5b21b6; }
+    .role-badge-writer { background: #dbeafe; color: #1e40af; }
+    .role-badge-reader { background: #d1fae5; color: #065f46; }
+    .role-badge-meta { background: #f1f5f9; color: #475569; }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+    .status-dot-on { background: #22c55e; }
+    .status-dot-off { background: #e2e8f0; }
+
+    /* ── Tag chips (for role assignment) ─────────────────────────────── */
+    .tag-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 34px;
+      padding: 6px 8px;
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      background: #fff;
+      align-items: center;
+    }
+
+    .tag-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--primary-light);
+      color: var(--secondary-color);
+    }
+
+    .tag-chip .remove-tag {
       cursor: pointer;
+      opacity: 0.6;
+      margin-left: 2px;
+      font-size: 14px;
+      line-height: 1;
     }
 
-    .views-table tbody tr:hover {
-      background: #f8fafc;
-    }
+    .tag-chip .remove-tag:hover { opacity: 1; }
 
-    .views-table tbody tr.selected {
-      background: rgba(28,150,202,0.10);
-    }
-
-    .views-table tbody td {
-      padding: 10px 12px;
-      vertical-align: middle;
-    }
-
+    /* ── CodeMirror ─────────────────────────────── */
     .CodeMirror {
       border: 1px solid var(--panel-border);
       border-radius: 10px;
-      height: 360px;
+      height: 300px;
       font-size: 13px;
     }
 
-    .status {
+    .status-msg {
       margin-top: 10px;
       font-size: 13px;
+    }
+
+    /* ── Empty state ─────────────────────────────── */
+    .empty-state {
+      padding: 40px 20px;
+      text-align: center;
+    }
+
+    .empty-state i {
+      font-size: 32px;
+      color: var(--panel-border);
+      margin-bottom: 12px;
+    }
+
+    .empty-state .empty-title {
+      font-weight: 700;
+      font-size: 14px;
+      color: var(--text-color);
+      margin-bottom: 4px;
+    }
+
+    .empty-state .empty-sub {
+      font-size: 12px;
+      color: var(--text-light);
     }
   </style>
 </head>
@@ -141,16 +267,27 @@
       {% include "selection.html" %}
 
       <div class="card" style="margin-top:20px;">
-        <div class="section" style="padding-bottom:16px; border-bottom:1px solid rgba(15,23,42,.08);">
+        <!-- Header -->
+        <div class="section" style="padding-bottom:0; border-bottom:none;">
           <div class="d-flex align-items-start justify-content-between" style="gap:12px;">
             <div>
-              <div style="font-weight:800; font-size:18px; color:#0f172a;">RBAC Views</div>
+              <div style="font-weight:800; font-size:18px; color:#0f172a;">Access Control</div>
               <div class="muted" style="font-size:13px; margin-top:4px;">
-                Save read-only SQL queries as reusable “views”. Next step will be assigning these views to roles/users.
+                Manage roles, users, and SQL views for fine-grained access control.
               </div>
             </div>
             <div class="d-flex align-items-center" style="gap:10px;">
-              <div class="pill" title="Number of saved views for the selected SuperTable">
+              <div class="pill" title="Users">
+                <i class="fa-solid fa-users" style="color:#1c96ca;"></i>
+                <span class="muted">Users</span>
+                <strong id="usersCount">0</strong>
+              </div>
+              <div class="pill" title="Roles">
+                <i class="fa-solid fa-shield-halved" style="color:#1c96ca;"></i>
+                <span class="muted">Roles</span>
+                <strong id="rolesCount">0</strong>
+              </div>
+              <div class="pill" title="Views">
                 <i class="fa-solid fa-database" style="color:#1c96ca;"></i>
                 <span class="muted">Views</span>
                 <strong id="viewsCount">0</strong>
@@ -159,29 +296,197 @@
           </div>
         </div>
 
-        <div class="section" style="padding-top:16px;">
+        <!-- Tabs -->
+        <div class="section" style="padding-top:10px; padding-bottom:0;">
           {% if not has_tenant %}
-            <div class="alert alert-info mb-0">
-              Select a SuperTable above to manage views.
+            <div class="alert alert-info mb-0" style="margin-top:10px;">
+              Select a SuperTable above to manage access control.
             </div>
           {% else %}
+            <div class="rbac-tabs">
+              <div class="rbac-tab active" data-tab="roles">
+                <i class="fa-solid fa-shield-halved"></i> Roles
+                <span class="tab-count" id="rolesTabCount">0</span>
+              </div>
+              <div class="rbac-tab" data-tab="users">
+                <i class="fa-solid fa-users"></i> Users
+                <span class="tab-count" id="usersTabCount">0</span>
+              </div>
+              <div class="rbac-tab" data-tab="views">
+                <i class="fa-solid fa-database"></i> Views
+                <span class="tab-count" id="viewsTabCount">0</span>
+              </div>
+            </div>
+        </div>
 
+        <div class="section" style="padding-top:16px;">
+
+          <!-- ═══════════════ ROLES TAB ═══════════════ -->
+          <div class="tab-panel active" id="panel-roles">
             <div class="rbac-grid">
+              <!-- Role list -->
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div style="font-weight:800; color:#0f172a;">Roles</div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <input id="roleSearch" class="form-control form-control-sm" placeholder="Search…" style="width:160px;"/>
+                    <button id="roleRefreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                  </div>
+                </div>
+                <div style="padding:0;">
+                  <table class="table table-sm mb-0 rbac-table">
+                    <thead>
+                      <tr>
+                        <th style="width:35%;">Name</th>
+                        <th style="width:25%;">Type</th>
+                        <th style="width:20%;">Tables</th>
+                        <th style="width:20%;">Columns</th>
+                      </tr>
+                    </thead>
+                    <tbody id="rolesBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- Role editor -->
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div>
+                    <div style="font-weight:800; color:#0f172a;">Role editor</div>
+                    <div class="hint">Define permissions for this role.</div>
+                  </div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <button id="roleNewBtn" class="btn btn-sm btn-outline-secondary">New</button>
+                    <button id="roleDeleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
+                    <button id="roleSaveBtn" class="btn btn-sm btn-primary">Save</button>
+                  </div>
+                </div>
+
+                <div class="section" style="padding-top:14px;">
+                  <div class="form-row">
+                    <div class="form-group col-md-6">
+                      <label class="text-sm muted" style="font-weight:700;">Role name</label>
+                      <input id="roleName" class="form-control" placeholder="e.g. analytics_reader"/>
+                    </div>
+                    <div class="form-group col-md-6">
+                      <label class="text-sm muted" style="font-weight:700;">Role type</label>
+                      <select id="roleType" class="form-control">
+                        <option value="superadmin">superadmin</option>
+                        <option value="admin">admin</option>
+                        <option value="writer">writer</option>
+                        <option value="reader" selected>reader</option>
+                        <option value="meta">meta</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Tables</label>
+                    <input id="roleTables" class="form-control" placeholder='Comma-separated, or * for all'/>
+                    <small class="hint">e.g. <code>customers, orders</code> or <code>*</code> for all tables</small>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Columns</label>
+                    <input id="roleColumns" class="form-control" placeholder='Comma-separated, or * for all'/>
+                    <small class="hint">e.g. <code>id, name, email</code> or <code>*</code> for all columns</small>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Filters</label>
+                    <input id="roleFilters" class="form-control" placeholder='* for no filters'/>
+                    <small class="hint"><code>*</code> for no row-level filters</small>
+                  </div>
+
+                  <div class="status-msg" id="roleStatus"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ═══════════════ USERS TAB ═══════════════ -->
+          <div class="tab-panel" id="panel-users">
+            <div class="rbac-grid">
+              <!-- User list -->
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div style="font-weight:800; color:#0f172a;">Users</div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <input id="userSearch" class="form-control form-control-sm" placeholder="Search…" style="width:160px;"/>
+                    <button id="userRefreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                  </div>
+                </div>
+                <div style="padding:0;">
+                  <table class="table table-sm mb-0 rbac-table">
+                    <thead>
+                      <tr>
+                        <th style="width:35%;">Username</th>
+                        <th style="width:40%;">Roles</th>
+                        <th style="width:25%;">Created</th>
+                      </tr>
+                    </thead>
+                    <tbody id="usersBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- User editor -->
+              <div class="card">
+                <div class="rbac-card-h">
+                  <div>
+                    <div style="font-weight:800; color:#0f172a;">User editor</div>
+                    <div class="hint">Create or modify a user and assign roles.</div>
+                  </div>
+                  <div class="d-flex align-items-center" style="gap:8px;">
+                    <button id="userNewBtn" class="btn btn-sm btn-outline-secondary">New</button>
+                    <button id="userDeleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
+                    <button id="userSaveBtn" class="btn btn-sm btn-primary">Save</button>
+                  </div>
+                </div>
+
+                <div class="section" style="padding-top:14px;">
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Username</label>
+                    <input id="userName" class="form-control" placeholder="e.g. john.doe"/>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Assigned roles</label>
+                    <div class="tag-list" id="userRoleTags"></div>
+                    <div style="margin-top:8px;">
+                      <select id="userRoleSelect" class="form-control form-control-sm" style="display:inline-block; width:auto;">
+                        <option value="">— Add a role —</option>
+                      </select>
+                    </div>
+                    <small class="hint">Select roles to assign to this user.</small>
+                  </div>
+
+                  <div class="status-msg" id="userStatus"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ═══════════════ VIEWS TAB ═══════════════ -->
+          <div class="tab-panel" id="panel-views">
+            <div class="rbac-grid">
+              <!-- View list -->
               <div class="card">
                 <div class="rbac-card-h">
                   <div style="font-weight:800; color:#0f172a;">Saved views</div>
                   <div class="d-flex align-items-center" style="gap:8px;">
-                    <input id="search" class="form-control form-control-sm" placeholder="Search…" style="width: 210px;"/>
-                    <button id="refreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                    <input id="viewSearch" class="form-control form-control-sm" placeholder="Search…" style="width:160px;"/>
+                    <button id="viewRefreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
                   </div>
                 </div>
                 <div style="padding:0;">
-                  <table class="table table-sm mb-0 views-table">
+                  <table class="table table-sm mb-0 rbac-table">
                     <thead>
                       <tr>
-                        <th style="width: 40%;">Name</th>
-                        <th style="width: 35%;">Updated</th>
-                        <th style="width: 25%;">Creator</th>
+                        <th style="width:35%;">Name</th>
+                        <th style="width:15%;">Status</th>
+                        <th style="width:25%;">Updated</th>
+                        <th style="width:25%;">Creator</th>
                       </tr>
                     </thead>
                     <tbody id="viewsBody"></tbody>
@@ -189,16 +494,17 @@
                 </div>
               </div>
 
+              <!-- View editor -->
               <div class="card">
                 <div class="rbac-card-h">
                   <div>
-                    <div style="font-weight:800; color:#0f172a;">Editor</div>
+                    <div style="font-weight:800; color:#0f172a;">View editor</div>
                     <div class="hint">Only SELECT / WITH queries are allowed.</div>
                   </div>
                   <div class="d-flex align-items-center" style="gap:8px;">
-                    <button id="newBtn" class="btn btn-sm btn-outline-secondary">New</button>
-                    <button id="deleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
-                    <button id="saveBtn" class="btn btn-sm btn-primary">Save</button>
+                    <button id="viewNewBtn" class="btn btn-sm btn-outline-secondary">New</button>
+                    <button id="viewDeleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
+                    <button id="viewSaveBtn" class="btn btn-sm btn-primary">Save</button>
                   </div>
                 </div>
 
@@ -206,11 +512,11 @@
                   <div class="form-row">
                     <div class="form-group col-md-8">
                       <label class="text-sm muted" style="font-weight:700;">Name</label>
-                      <input id="name" class="form-control" placeholder="e.g. Active customers"/>
+                      <input id="viewName" class="form-control" placeholder="e.g. Active customers"/>
                     </div>
                     <div class="form-group col-md-4">
                       <label class="text-sm muted" style="font-weight:700;">Enabled</label>
-                      <select id="enabled" class="form-control">
+                      <select id="viewEnabled" class="form-control">
                         <option value="1">Enabled</option>
                         <option value="0">Disabled</option>
                       </select>
@@ -219,22 +525,30 @@
 
                   <div class="form-group">
                     <label class="text-sm muted" style="font-weight:700;">Description</label>
-                    <input id="description" class="form-control" placeholder="Optional"/>
+                    <input id="viewDescription" class="form-control" placeholder="Optional"/>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="text-sm muted" style="font-weight:700;">Roles</label>
+                    <div class="tag-list" id="viewRoleTags"></div>
+                    <div style="margin-top:8px;">
+                      <select id="viewRoleSelect" class="form-control form-control-sm" style="display:inline-block; width:auto;">
+                        <option value="">— Assign roles —</option>
+                      </select>
+                    </div>
+                    <small class="hint">Roles that can access this view.</small>
                   </div>
 
                   <div class="form-group">
                     <label class="text-sm muted" style="font-weight:700;">Query</label>
-                    <textarea id="query" class="form-control" rows="10"></textarea>
+                    <textarea id="viewQuery" class="form-control" rows="10"></textarea>
                   </div>
 
-                  <div class="status" id="status"></div>
-
-                  <div class="hint" style="margin-top:10px;">
-                    Tip: later we’ll attach role hashes to a view (field already stored as <code>roles</code> in Redis).
-                  </div>
+                  <div class="status-msg" id="viewStatus"></div>
                 </div>
               </div>
             </div>
+          </div>
 
           {% endif %}
         </div>
@@ -254,31 +568,42 @@
     const DEFAULT_ORG = {{ sel_org|default('', true)|tojson }};
     const DEFAULT_SUP = {{ sel_sup|default('', true)|tojson }};
 
-    let selectedViewId = null;
+    /* ── State ─────────────────────────────── */
+    let allRoles = [];
+    let allUsers = [];
     let allViews = [];
 
-    function el(id){ return document.getElementById(id); }
+    let selectedRoleId = null;
+    let selectedUserId = null;
+    let selectedViewId = null;
 
-    function setStatus(msg, kind='info'){
-      const node = el('status');
+    // roles assigned to the user being edited (role_ids)
+    let editUserRoles = [];
+    // roles assigned to the view being edited (role_ids)
+    let editViewRoles = [];
+
+    /* ── Helpers ─────────────────────────────── */
+    function el(id) { return document.getElementById(id); }
+
+    function setStatus(nodeId, msg, kind) {
+      const node = el(nodeId);
       if (!node) return;
       const cls = kind === 'error' ? 'text-danger' : (kind === 'ok' ? 'text-success' : 'muted');
-      node.className = 'status ' + cls;
+      node.className = 'status-msg ' + cls;
       node.textContent = msg || '';
     }
 
-    async function api(url, opts={}){
+    async function api(url, opts) {
+      opts = opts || {};
       const res = await fetch(url, {
         method: opts.method || 'GET',
-        headers: Object.assign({'Content-Type':'application/json'}, opts.headers || {}),
+        headers: Object.assign({'Content-Type': 'application/json'}, opts.headers || {}),
         body: opts.body ? JSON.stringify(opts.body) : undefined,
         credentials: 'same-origin'
       });
-
       const text = await res.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch(e) {}
-
       if (!res.ok) {
         const detail = (data && (data.detail || data.message)) ? (data.detail || data.message) : (text || res.statusText);
         throw new Error(detail);
@@ -286,114 +611,484 @@
       return data;
     }
 
-    function currentTenant(){
+    function currentTenant() {
       const p = new URLSearchParams(window.location.search);
       const org = (p.get('org') || DEFAULT_ORG || '').trim();
       const sup = (p.get('sup') || DEFAULT_SUP || '').trim();
       return {org, sup};
     }
 
-    function updateCount(){
-      const c = document.getElementById('viewsCount');
-      if (c) c.textContent = String(allViews.length || 0);
+    function roleBadgeClass(type) {
+      const t = (type || '').toLowerCase();
+      return 'role-badge role-badge-' + (t || 'meta');
     }
 
-    function renderViews(){
+    function roleDisplayName(role) {
+      return role.role_name || role.role_id || role.id || '—';
+    }
+
+    function findRoleById(roleId) {
+      return allRoles.find(r => (r.role_id || r.id) === roleId);
+    }
+
+    function formatList(arr) {
+      if (!arr || !arr.length) return '—';
+      if (arr.length === 1 && arr[0] === '*') return '* (all)';
+      if (arr.length > 3) return arr.slice(0, 3).join(', ') + ' +' + (arr.length - 3);
+      return arr.join(', ');
+    }
+
+    function formatTs(ms) {
+      if (!ms) return '—';
+      try {
+        const d = new Date(parseInt(ms));
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      } catch(e) { return '—'; }
+    }
+
+    /* ── Tab switching ─────────────────────────────── */
+    document.addEventListener('click', function(e) {
+      const tab = e.target.closest('.rbac-tab');
+      if (!tab) return;
+      const name = tab.dataset.tab;
+      document.querySelectorAll('.rbac-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+      if (name === 'views' && cm) cm.refresh();
+    });
+
+    /* ── Counter updates ─────────────────────────────── */
+    function updateCounts() {
+      el('usersCount').textContent = allUsers.length;
+      el('rolesCount').textContent = allRoles.length;
+      el('viewsCount').textContent = allViews.length;
+      el('usersTabCount').textContent = allUsers.length;
+      el('rolesTabCount').textContent = allRoles.length;
+      el('viewsTabCount').textContent = allViews.length;
+    }
+
+    /* ══════════════════════════════════════════════════
+       ROLES
+    ══════════════════════════════════════════════════ */
+
+    function renderRoles() {
+      const body = el('rolesBody');
+      if (!body) return;
+      const q = (el('roleSearch')?.value || '').trim().toLowerCase();
+      const items = q
+        ? allRoles.filter(r => (roleDisplayName(r)).toLowerCase().includes(q) || (r.role || '').toLowerCase().includes(q))
+        : allRoles;
+
+      body.innerHTML = '';
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="4" class="muted" style="padding:14px;">No roles found.</td></tr>';
+        return;
+      }
+      for (const r of items) {
+        const rid = r.role_id || r.id;
+        const tr = document.createElement('tr');
+        tr.dataset.id = rid;
+        if (rid === selectedRoleId) tr.classList.add('selected');
+
+        const tdName = document.createElement('td');
+        tdName.style.fontWeight = '600';
+        tdName.textContent = roleDisplayName(r);
+
+        const tdType = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = roleBadgeClass(r.role);
+        badge.textContent = r.role || '—';
+        tdType.appendChild(badge);
+
+        const tdTables = document.createElement('td');
+        tdTables.textContent = formatList(r.tables);
+        tdTables.style.fontSize = '12px';
+
+        const tdCols = document.createElement('td');
+        tdCols.textContent = formatList(r.columns);
+        tdCols.style.fontSize = '12px';
+
+        tr.appendChild(tdName);
+        tr.appendChild(tdType);
+        tr.appendChild(tdTables);
+        tr.appendChild(tdCols);
+
+        tr.addEventListener('click', () => selectRole(r));
+        body.appendChild(tr);
+      }
+      updateCounts();
+    }
+
+    function clearRoleEditor() {
+      selectedRoleId = null;
+      el('roleName').value = '';
+      el('roleType').value = 'reader';
+      el('roleTables').value = '*';
+      el('roleColumns').value = '*';
+      el('roleFilters').value = '*';
+      el('roleDeleteBtn').disabled = true;
+      renderRoles();
+      setStatus('roleStatus', '');
+    }
+
+    function selectRole(r) {
+      const rid = r.role_id || r.id;
+      selectedRoleId = rid;
+      el('roleName').value = r.role_name || '';
+      el('roleType').value = r.role || 'reader';
+      el('roleTables').value = (r.tables || []).join(', ');
+      el('roleColumns').value = (r.columns || []).join(', ');
+      el('roleFilters').value = Array.isArray(r.filters) ? r.filters.join(', ') : JSON.stringify(r.filters || '*');
+      el('roleDeleteBtn').disabled = false;
+      renderRoles();
+      setStatus('roleStatus', 'Selected: ' + roleDisplayName(r), 'info');
+    }
+
+    async function loadRoles() {
+      const {org, sup} = currentTenant();
+      if (!org || !sup) return;
+      setStatus('roleStatus', 'Loading…');
+      try {
+        const data = await api(`/reflection/rbac/roles?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`);
+        allRoles = (data && data.data && data.data.items) ? data.data.items : [];
+        renderRoles();
+        populateRoleSelectors();
+        setStatus('roleStatus', `Loaded ${allRoles.length} role(s).`, 'ok');
+      } catch(e) {
+        allRoles = [];
+        renderRoles();
+        setStatus('roleStatus', e.message || 'Failed to load roles', 'error');
+      }
+    }
+
+    async function saveRole() {
+      const {org, sup} = currentTenant();
+      const role_name = (el('roleName').value || '').trim();
+      const role = el('roleType').value;
+      const tables = (el('roleTables').value || '*').split(',').map(s => s.trim()).filter(Boolean);
+      const columns = (el('roleColumns').value || '*').split(',').map(s => s.trim()).filter(Boolean);
+      const filtersRaw = (el('roleFilters').value || '*').trim();
+      let filters;
+      if (filtersRaw === '*') {
+        filters = ['*'];
+      } else {
+        try { filters = JSON.parse(filtersRaw); } catch(e) {
+          filters = filtersRaw.split(',').map(s => s.trim()).filter(Boolean);
+        }
+      }
+
+      setStatus('roleStatus', 'Saving…');
+      try {
+        if (!selectedRoleId) {
+          await api('/reflection/rbac/roles', {
+            method: 'POST',
+            body: { organization: org, super_name: sup, role_name, role, tables, columns, filters }
+          });
+          setStatus('roleStatus', 'Created.', 'ok');
+        } else {
+          await api(`/reflection/rbac/roles/${encodeURIComponent(selectedRoleId)}`, {
+            method: 'PUT',
+            body: { organization: org, super_name: sup, role_name, role, tables, columns, filters }
+          });
+          setStatus('roleStatus', 'Updated.', 'ok');
+        }
+        await loadRoles();
+      } catch(e) {
+        setStatus('roleStatus', e.message || 'Save failed', 'error');
+      }
+    }
+
+    async function deleteRole() {
+      if (!selectedRoleId) return;
+      if (!confirm('Delete this role? Users referencing it will lose this role.')) return;
+      const {org, sup} = currentTenant();
+      setStatus('roleStatus', 'Deleting…');
+      try {
+        await api(`/reflection/rbac/roles/${encodeURIComponent(selectedRoleId)}?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`, {
+          method: 'DELETE'
+        });
+        clearRoleEditor();
+        await loadRoles();
+        setStatus('roleStatus', 'Deleted.', 'ok');
+      } catch(e) {
+        setStatus('roleStatus', e.message || 'Delete failed', 'error');
+      }
+    }
+
+
+    /* ══════════════════════════════════════════════════
+       USERS
+    ══════════════════════════════════════════════════ */
+
+    function renderUsers() {
+      const body = el('usersBody');
+      if (!body) return;
+      const q = (el('userSearch')?.value || '').trim().toLowerCase();
+      const items = q
+        ? allUsers.filter(u => (u.username || '').toLowerCase().includes(q))
+        : allUsers;
+
+      body.innerHTML = '';
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="3" class="muted" style="padding:14px;">No users found.</td></tr>';
+        return;
+      }
+      for (const u of items) {
+        const uid = u.user_id || u.id;
+        const tr = document.createElement('tr');
+        tr.dataset.id = uid;
+        if (uid === selectedUserId) tr.classList.add('selected');
+
+        const tdName = document.createElement('td');
+        tdName.style.fontWeight = '600';
+        tdName.textContent = u.username || '—';
+
+        const tdRoles = document.createElement('td');
+        const roles = u.roles || [];
+        if (roles.length) {
+          for (const rid of roles) {
+            const rInfo = findRoleById(rid);
+            const badge = document.createElement('span');
+            badge.className = roleBadgeClass(rInfo ? rInfo.role : '');
+            badge.style.marginRight = '4px';
+            badge.style.fontSize = '10px';
+            badge.textContent = rInfo ? (rInfo.role_name || rInfo.role) : rid.substring(0, 8);
+            tdRoles.appendChild(badge);
+          }
+        } else {
+          tdRoles.innerHTML = '<span class="muted" style="font-size:12px;">No roles</span>';
+        }
+
+        const tdCreated = document.createElement('td');
+        tdCreated.style.fontSize = '12px';
+        tdCreated.textContent = formatTs(u.created_ms);
+
+        tr.appendChild(tdName);
+        tr.appendChild(tdRoles);
+        tr.appendChild(tdCreated);
+
+        tr.addEventListener('click', () => selectUser(u));
+        body.appendChild(tr);
+      }
+      updateCounts();
+    }
+
+    function renderUserRoleTags() {
+      const container = el('userRoleTags');
+      container.innerHTML = '';
+      for (const rid of editUserRoles) {
+        const r = findRoleById(rid);
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.innerHTML = '<span>' + (r ? (r.role_name || r.role) : rid.substring(0, 8)) + '</span><span class="remove-tag" data-rid="' + rid + '">&times;</span>';
+        container.appendChild(chip);
+      }
+      container.querySelectorAll('.remove-tag').forEach(btn => {
+        btn.addEventListener('click', function() {
+          editUserRoles = editUserRoles.filter(x => x !== this.dataset.rid);
+          renderUserRoleTags();
+        });
+      });
+    }
+
+    function clearUserEditor() {
+      selectedUserId = null;
+      el('userName').value = '';
+      editUserRoles = [];
+      renderUserRoleTags();
+      el('userDeleteBtn').disabled = true;
+      renderUsers();
+      setStatus('userStatus', '');
+    }
+
+    function selectUser(u) {
+      const uid = u.user_id || u.id;
+      selectedUserId = uid;
+      el('userName').value = u.username || '';
+      editUserRoles = (u.roles || []).slice();
+      renderUserRoleTags();
+      el('userDeleteBtn').disabled = (u.username || '').toLowerCase() === 'superuser';
+      renderUsers();
+      setStatus('userStatus', 'Selected: ' + (u.username || uid), 'info');
+    }
+
+    async function loadUsers() {
+      const {org, sup} = currentTenant();
+      if (!org || !sup) return;
+      setStatus('userStatus', 'Loading…');
+      try {
+        const data = await api(`/reflection/rbac/users?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`);
+        allUsers = (data && data.data && data.data.items) ? data.data.items : [];
+        renderUsers();
+        setStatus('userStatus', `Loaded ${allUsers.length} user(s).`, 'ok');
+      } catch(e) {
+        allUsers = [];
+        renderUsers();
+        setStatus('userStatus', e.message || 'Failed to load users', 'error');
+      }
+    }
+
+    async function saveUser() {
+      const {org, sup} = currentTenant();
+      const username = (el('userName').value || '').trim();
+      const roles = editUserRoles.slice();
+
+      setStatus('userStatus', 'Saving…');
+      try {
+        if (!selectedUserId) {
+          await api('/reflection/rbac/users', {
+            method: 'POST',
+            body: { organization: org, super_name: sup, username, roles }
+          });
+          setStatus('userStatus', 'Created.', 'ok');
+        } else {
+          await api(`/reflection/rbac/users/${encodeURIComponent(selectedUserId)}`, {
+            method: 'PUT',
+            body: { organization: org, super_name: sup, username, roles }
+          });
+          setStatus('userStatus', 'Updated.', 'ok');
+        }
+        await loadUsers();
+      } catch(e) {
+        setStatus('userStatus', e.message || 'Save failed', 'error');
+      }
+    }
+
+    async function deleteUser() {
+      if (!selectedUserId) return;
+      if (!confirm('Delete this user?')) return;
+      const {org, sup} = currentTenant();
+      setStatus('userStatus', 'Deleting…');
+      try {
+        await api(`/reflection/rbac/users/${encodeURIComponent(selectedUserId)}?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`, {
+          method: 'DELETE'
+        });
+        clearUserEditor();
+        await loadUsers();
+        setStatus('userStatus', 'Deleted.', 'ok');
+      } catch(e) {
+        setStatus('userStatus', e.message || 'Delete failed', 'error');
+      }
+    }
+
+
+    /* ══════════════════════════════════════════════════
+       VIEWS (existing functionality, kept intact)
+    ══════════════════════════════════════════════════ */
+
+    function renderViews() {
       const body = el('viewsBody');
       if (!body) return;
-
-      const q = (el('search')?.value || '').trim().toLowerCase();
+      const q = (el('viewSearch')?.value || '').trim().toLowerCase();
       const items = q
         ? allViews.filter(v => (v.name || '').toLowerCase().includes(q) || (v.description || '').toLowerCase().includes(q))
         : allViews;
 
       body.innerHTML = '';
+      if (!items.length) {
+        body.innerHTML = '<tr><td colspan="4" class="muted" style="padding:14px;">No saved views.</td></tr>';
+        return;
+      }
       for (const v of items) {
         const tr = document.createElement('tr');
         tr.dataset.id = v.id;
         if (v.id === selectedViewId) tr.classList.add('selected');
 
-        const name = document.createElement('td');
-        name.textContent = v.name || '';
+        const tdName = document.createElement('td');
+        tdName.style.fontWeight = '600';
+        tdName.textContent = v.name || '';
 
-        const upd = document.createElement('td');
-        upd.textContent = v.updated_at || '';
+        const tdStatus = document.createElement('td');
+        const isOn = String(v.enabled) !== '0';
+        tdStatus.innerHTML = '<span class="status-dot ' + (isOn ? 'status-dot-on' : 'status-dot-off') + '"></span>' + (isOn ? 'On' : 'Off');
+        tdStatus.style.fontSize = '12px';
 
-        const cr = document.createElement('td');
-        cr.textContent = v.created_by || v.created_by_hash || '';
+        const tdUpd = document.createElement('td');
+        tdUpd.textContent = v.updated_at || '';
+        tdUpd.style.fontSize = '12px';
 
-        tr.appendChild(name);
-        tr.appendChild(upd);
-        tr.appendChild(cr);
+        const tdCr = document.createElement('td');
+        tdCr.textContent = v.created_by || v.created_by_hash || '';
+        tdCr.style.fontSize = '12px';
 
-        tr.addEventListener('click', () => {
-          selectView(v);
+        tr.appendChild(tdName);
+        tr.appendChild(tdStatus);
+        tr.appendChild(tdUpd);
+        tr.appendChild(tdCr);
+        tr.addEventListener('click', () => selectView(v));
+        body.appendChild(tr);
+      }
+      updateCounts();
+    }
+
+    function renderViewRoleTags() {
+      const container = el('viewRoleTags');
+      container.innerHTML = '';
+      for (const rid of editViewRoles) {
+        const r = findRoleById(rid);
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.innerHTML = '<span>' + (r ? (r.role_name || r.role) : rid.substring(0, 8)) + '</span><span class="remove-tag" data-rid="' + rid + '">&times;</span>';
+        container.appendChild(chip);
+      }
+      container.querySelectorAll('.remove-tag').forEach(btn => {
+        btn.addEventListener('click', function() {
+          editViewRoles = editViewRoles.filter(x => x !== this.dataset.rid);
+          renderViewRoleTags();
         });
-
-        body.appendChild(tr);
-      }
-
-      if (!items.length) {
-        const tr = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 3;
-        td.className = 'muted';
-        td.style.padding = '14px';
-        td.textContent = 'No saved views.';
-        tr.appendChild(td);
-        body.appendChild(tr);
-      }
-
-      updateCount();
+      });
     }
 
-    function clearEditor(){
+    function clearViewEditor() {
       selectedViewId = null;
-      el('name').value = '';
-      el('description').value = '';
-      el('enabled').value = '1';
+      el('viewName').value = '';
+      el('viewDescription').value = '';
+      el('viewEnabled').value = '1';
+      editViewRoles = [];
+      renderViewRoleTags();
       if (cm) cm.setValue('');
-      el('deleteBtn').disabled = true;
+      el('viewDeleteBtn').disabled = true;
       renderViews();
-      setStatus('');
+      setStatus('viewStatus', '');
     }
 
-    function selectView(v){
+    function selectView(v) {
       selectedViewId = v.id;
-      el('name').value = v.name || '';
-      el('description').value = v.description || '';
-      el('enabled').value = String(v.enabled || '1');
+      el('viewName').value = v.name || '';
+      el('viewDescription').value = v.description || '';
+      el('viewEnabled').value = String(v.enabled || '1');
+      editViewRoles = (v.roles || []).slice();
+      renderViewRoleTags();
       if (cm) cm.setValue(v.query || '');
-      el('deleteBtn').disabled = false;
+      el('viewDeleteBtn').disabled = false;
       renderViews();
-      setStatus(`Selected: ${v.name}`, 'info');
+      setStatus('viewStatus', 'Selected: ' + (v.name || v.id), 'info');
     }
 
-    async function loadViews(){
+    async function loadViews() {
       const {org, sup} = currentTenant();
       if (!org || !sup) return;
-
-      setStatus('Loading…');
+      setStatus('viewStatus', 'Loading…');
       try {
         const data = await api(`/reflection/rbac/views?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`);
         allViews = (data && data.data && data.data.items) ? data.data.items : [];
         renderViews();
-        setStatus(`Loaded ${allViews.length} view(s).`, 'ok');
-      } catch (e) {
+        setStatus('viewStatus', `Loaded ${allViews.length} view(s).`, 'ok');
+      } catch(e) {
         allViews = [];
         renderViews();
-        setStatus(e.message || 'Failed to load views', 'error');
+        setStatus('viewStatus', e.message || 'Failed to load views', 'error');
       }
     }
 
-    async function saveCurrent(){
+    async function saveView() {
       const {org, sup} = currentTenant();
-      const name = el('name').value || '';
-      const description = el('description').value || '';
-      const enabled = el('enabled').value === '1';
-      const query = cm ? cm.getValue() : (el('query').value || '');
+      const name = el('viewName').value || '';
+      const description = el('viewDescription').value || '';
+      const enabled = el('viewEnabled').value === '1';
+      const query = cm ? cm.getValue() : (el('viewQuery').value || '');
+      const roles = editViewRoles.slice();
 
-      setStatus('Saving…');
+      setStatus('viewStatus', 'Saving…');
       try {
         if (!selectedViewId) {
           const data = await api('/reflection/rbac/views', {
@@ -401,51 +1096,87 @@
             body: { organization: org, super_name: sup, name, description, query }
           });
           const doc = data && data.data ? data.data : null;
-          await loadViews();
-          if (doc && doc.id) {
-            const found = allViews.find(x => x.id === doc.id);
-            if (found) selectView(found);
+          if (doc && doc.id && roles.length) {
+            await api(`/reflection/rbac/views/${encodeURIComponent(doc.id)}`, {
+              method: 'PUT',
+              body: { organization: org, super_name: sup, roles }
+            });
           }
-          setStatus('Created.', 'ok');
+          setStatus('viewStatus', 'Created.', 'ok');
         } else {
-          const data = await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}`, {
+          await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}`, {
             method: 'PUT',
-            body: { organization: org, super_name: sup, name, description, query, enabled }
+            body: { organization: org, super_name: sup, name, description, query, enabled, roles }
           });
-          const doc = data && data.data ? data.data : null;
-          await loadViews();
-          if (doc && doc.id) {
-            const found = allViews.find(x => x.id === doc.id);
-            if (found) selectView(found);
-          }
-          setStatus('Updated.', 'ok');
+          setStatus('viewStatus', 'Updated.', 'ok');
         }
-      } catch (e) {
-        setStatus(e.message || 'Save failed', 'error');
+        await loadViews();
+      } catch(e) {
+        setStatus('viewStatus', e.message || 'Save failed', 'error');
       }
     }
 
-    async function deleteCurrent(){
+    async function deleteView() {
       if (!selectedViewId) return;
       if (!confirm('Delete this view?')) return;
-
       const {org, sup} = currentTenant();
-      setStatus('Deleting…');
+      setStatus('viewStatus', 'Deleting…');
       try {
         await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`, {
           method: 'DELETE'
         });
-        clearEditor();
+        clearViewEditor();
         await loadViews();
-        setStatus('Deleted.', 'ok');
-      } catch (e) {
-        setStatus(e.message || 'Delete failed', 'error');
+        setStatus('viewStatus', 'Deleted.', 'ok');
+      } catch(e) {
+        setStatus('viewStatus', e.message || 'Delete failed', 'error');
       }
     }
 
+
+    /* ══════════════════════════════════════════════════
+       ROLE SELECTORS (shared dropdown for user + view editors)
+    ══════════════════════════════════════════════════ */
+
+    function populateRoleSelectors() {
+      ['userRoleSelect', 'viewRoleSelect'].forEach(selId => {
+        const sel = el(selId);
+        if (!sel) return;
+        const current = sel.value;
+        sel.innerHTML = '<option value="">— Add a role —</option>';
+        for (const r of allRoles) {
+          const rid = r.role_id || r.id;
+          const opt = document.createElement('option');
+          opt.value = rid;
+          opt.textContent = (r.role_name || r.role || rid.substring(0, 8)) + ' (' + (r.role || '') + ')';
+          sel.appendChild(opt);
+        }
+      });
+    }
+
+    function handleRoleSelectAdd(selectId, rolesArray, renderFn) {
+      const sel = el(selectId);
+      if (!sel) return;
+      sel.addEventListener('change', function() {
+        const rid = this.value;
+        if (!rid) return;
+        if (!rolesArray.includes(rid)) {
+          rolesArray.push(rid);
+          renderFn();
+        }
+        this.value = '';
+      });
+    }
+
+
+    /* ══════════════════════════════════════════════════
+       INIT
+    ══════════════════════════════════════════════════ */
+
     let cm = null;
-    document.addEventListener('DOMContentLoaded', () => {
-      const q = el('query');
+
+    document.addEventListener('DOMContentLoaded', function() {
+      const q = el('viewQuery');
       if (q) {
         cm = CodeMirror.fromTextArea(q, {
           mode: 'text/x-sql',
@@ -454,25 +1185,51 @@
         });
       }
 
-      el('refreshBtn')?.addEventListener('click', loadViews);
-      el('search')?.addEventListener('input', renderViews);
-      el('newBtn')?.addEventListener('click', clearEditor);
-      el('saveBtn')?.addEventListener('click', saveCurrent);
-      el('deleteBtn')?.addEventListener('click', deleteCurrent);
+      // Roles
+      el('roleRefreshBtn')?.addEventListener('click', loadRoles);
+      el('roleSearch')?.addEventListener('input', renderRoles);
+      el('roleNewBtn')?.addEventListener('click', clearRoleEditor);
+      el('roleSaveBtn')?.addEventListener('click', saveRole);
+      el('roleDeleteBtn')?.addEventListener('click', deleteRole);
 
-      loadViews();
+      // Users
+      el('userRefreshBtn')?.addEventListener('click', loadUsers);
+      el('userSearch')?.addEventListener('input', renderUsers);
+      el('userNewBtn')?.addEventListener('click', clearUserEditor);
+      el('userSaveBtn')?.addEventListener('click', saveUser);
+      el('userDeleteBtn')?.addEventListener('click', deleteUser);
+      handleRoleSelectAdd('userRoleSelect', editUserRoles, renderUserRoleTags);
+
+      // Views
+      el('viewRefreshBtn')?.addEventListener('click', loadViews);
+      el('viewSearch')?.addEventListener('input', renderViews);
+      el('viewNewBtn')?.addEventListener('click', clearViewEditor);
+      el('viewSaveBtn')?.addEventListener('click', saveView);
+      el('viewDeleteBtn')?.addEventListener('click', deleteView);
+      handleRoleSelectAdd('viewRoleSelect', editViewRoles, renderViewRoleTags);
+
+      // Load all data
+      loadRoles().then(() => {
+        loadUsers();
+        loadViews();
+      });
     });
 
-    // Sidebar UX (same behavior as other pages)
+    // Sidebar UX
     $(document).ready(function() {
-      const isCollapsed = localStorage.getItem('sidebar-collapsed') === 'true';
-      if (isCollapsed) {
-        $('.sidebar').addClass('sidebar-collapsed');
+      if (!window.__st_sidebar_bound) {
+        const isCollapsed = localStorage.getItem('st_sidebar_collapsed') === 'true' ||
+                            localStorage.getItem('sidebar-collapsed') === 'true';
+        if (isCollapsed) {
+          $('.sidebar').addClass('sidebar-collapsed');
+        }
+        $('#toggleSidebar').on('click', function() {
+          $('.sidebar').toggleClass('sidebar-collapsed');
+          var c = $('.sidebar').hasClass('sidebar-collapsed');
+          localStorage.setItem('st_sidebar_collapsed', c);
+          localStorage.setItem('sidebar-collapsed', c);
+        });
       }
-      $('#toggleSidebar').on('click', function() {
-        $('.sidebar').toggleClass('sidebar-collapsed');
-        localStorage.setItem('sidebar-collapsed', $('.sidebar').hasClass('sidebar-collapsed'));
-      });
       $('#link-rbac').addClass('active');
     });
   </script>

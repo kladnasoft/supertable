@@ -179,7 +179,7 @@ def query_sql(
         sql: str,
         limit: int,
         engine: Any,
-        user_hash: str,
+        role_name: str,
 ) -> Tuple[List[str], List[List[Any]], List[Dict[str, Any]]]:
     """
     Execute SQL query and return results in the format expected by MCP server.
@@ -193,7 +193,7 @@ def query_sql(
 
     # Execute the query
     result_df, status, message = reader.execute(
-        role_name=user_hash,
+        role_name=role_name,
         engine=engine,
         with_scan=False,
     )

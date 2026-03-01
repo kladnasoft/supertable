@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -33,20 +34,30 @@ def attach_tables_routes(
     inject_session_into_ctx: Callable[[Dict[str, Any], Request], Dict[str, Any]],
     list_users: Callable[[str, str], List[Dict[str, Any]]],
     fmt_ts: Callable[[int], str],
-    list_leaves: Callable[..., Dict[str, Any]],
     catalog: Any,
     admin_guard_api: Any,
+    get_session: Callable[[Request], Optional[Dict[str, Any]]],
 ) -> None:
     """
     Register everything used by templates/tables.html.
 
     tables.html calls:
       - GET    /reflection/supers?organization=...
-      - GET    /reflection/super?organization=...&super_name=...&user_hash=...
-      - GET    /reflection/schema?organization=...&super_name=...&table=...&user_hash=...
-      - GET    /reflection/stats?organization=...&super_name=...&table=...&user_hash=...
+      - GET    /reflection/super?organization=...&super_name=...&role_name=...
+      - GET    /reflection/schema?organization=...&super_name=...&table=...&role_name=...
+      - GET    /reflection/stats?organization=...&super_name=...&table=...&role_name=...
       - DELETE /reflection/table?organization=...&super_name=...&table=...
     """
+
+    # ------------------------------ Role resolution (param → session fallback) ------------------------------
+
+    def _resolve_role(request: Request, role_name: str = "", user_hash: str = "") -> str:
+        """Resolve role: prefer explicit param, then session cookie."""
+        role = (role_name or user_hash or "").strip()
+        if not role:
+            sess = get_session(request) or {}
+            role = (sess.get("role_name") or "").strip()
+        return role
 
     # ------------------------------ Redis helpers (SuperTables discovery) ------------------------------
 
@@ -94,6 +105,73 @@ def attach_tables_routes(
 
         return sorted({s for s in supers if s})
 
+    # ------------------------------ Leaf listing (tables discovery) ------------------------------
+
+    def _list_leaves(
+        org: Optional[str] = None,
+        sup: Optional[str] = None,
+        q: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
+        """List leaf items (simple tables) for a given tenant, with optional search and pagination."""
+        org, sup = resolve_pair(org, sup)
+        if not org or not sup:
+            return {"org": org, "sup": sup, "total": 0, "page": page, "page_size": page_size, "items": []}
+
+        items: List[Dict] = []
+        total = 0
+        ql = (q or "").lower()
+
+        scan_iter = None
+        if hasattr(catalog, "scan_leaf_items"):
+            try:
+                scan_iter = catalog.scan_leaf_items(org, sup, count=1000)
+            except Exception:
+                scan_iter = None
+
+        if scan_iter is None:
+            rc = RedisCatalog()
+            pattern = f"supertable:{org}:{sup}:meta:leaf:*"
+            cursor = 0
+            while True:
+                cursor, keys = rc.r.scan(cursor=cursor, match=pattern, count=1000)
+                for key in keys:
+                    raw = rc.r.get(key)
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    simple = (key if isinstance(key, str) else key.decode("utf-8")).rsplit("meta:leaf:", 1)[-1]
+                    rec = {
+                        "simple": simple,
+                        "version": int(obj.get("version", -1)),
+                        "ts": int(obj.get("ts", 0)),
+                        "path": obj.get("path", ""),
+                    }
+                    if q and ql not in simple.lower():
+                        continue
+                    total += 1
+                    items.append(rec)
+                if cursor == 0:
+                    break
+        else:
+            for item in scan_iter:
+                simple = item.get("simple", "")
+                if q and ql not in simple.lower():
+                    continue
+                total += 1
+                items.append(item)
+
+        items.sort(key=lambda x: x.get("simple", ""))
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_items = items[start:end]
+        return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
+
     # ------------------------------ Page: /reflection/tables ------------------------------
 
     @router.get("/reflection/tables", response_class=HTMLResponse)
@@ -127,7 +205,7 @@ def attach_tables_routes(
         pages = 1
 
         if has_tenant:
-            listing = list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
+            listing = _list_leaves(org=sel_org, sup=sel_sup, q=None, page=page, page_size=page_size)
             try:
                 total = int(listing.get("total", 0) or 0)
             except Exception:
@@ -214,7 +292,7 @@ def attach_tables_routes(
         request: Request,
         organization: str = Query(...),
         super_name: str = Query(...),
-        user_hash: str = Query(...),
+        role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         if not is_authorized(request):
@@ -222,12 +300,14 @@ def attach_tables_routes(
             no_store(resp)
             return resp
 
+        role = _resolve_role(request, role_name, "")
+
         debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS") or "").strip() == "1"
         t0 = time.perf_counter()
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
             t1 = time.perf_counter()
-            meta = mr.get_super_meta(user_hash)
+            meta = mr.get_super_meta(role)
             t2 = time.perf_counter()
 
             payload = {"ok": True, "meta": meta}
@@ -240,13 +320,13 @@ def attach_tables_routes(
 
             client_host = getattr(getattr(request, "client", None), "host", None) or "-"
             logger.info(
-                "[timing][reflection/super] total_ms=%.2f mr_ms=%.2f get_super_meta_ms=%.2f org=%s super=%s user_hash=%s client=%s",
+                "[timing][reflection/super] total_ms=%.2f mr_ms=%.2f get_super_meta_ms=%.2f org=%s super=%s role_name=%s client=%s",
                 total_ms,
                 mr_ms,
                 get_ms,
                 organization,
                 super_name,
-                (user_hash or "")[:12],
+                (role or "")[:12],
                 client_host,
             )
 
@@ -260,32 +340,36 @@ def attach_tables_routes(
 
     @router.get("/reflection/schema")
     def api_get_table_schema(
+        request: Request,
         organization: str = Query(...),
         super_name: str = Query(...),
         table: str = Query(..., description="Table simple name"),
-        user_hash: str = Query(...),
+        role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Return schema for one table (by simple name)."""
+        role = _resolve_role(request, role_name)
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
-            schema = mr.get_table_schema(table, user_hash)
+            schema = mr.get_table_schema(table, role)
             return {"ok": True, "schema": schema}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
     @router.get("/reflection/stats")
     def api_get_table_stats(
+        request: Request,
         organization: str = Query(...),
         super_name: str = Query(...),
         table: str = Query(..., description="Table simple name"),
-        user_hash: str = Query(...),
+        role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Return stats for one table (by simple name)."""
+        role = _resolve_role(request, role_name)
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
-            stats = mr.get_table_stats(table, user_hash)
+            stats = mr.get_table_stats(table, role)
             return {"ok": True, "stats": stats}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
@@ -295,32 +379,22 @@ def attach_tables_routes(
         request: Request,
         organization: str = Query(..., description="Organization identifier"),
         super_name: str = Query(..., description="SuperTable name"),
-        table: Optional[str] = Query(None, description="Simple table name (preferred query param: table)"),
-        table_name: Optional[str] = Query(None, description="Simple table name (compat)"),
+        table: str = Query(..., description="Simple table name"),
+        role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Delete a simple table (leaf) from Redis and its folder from storage (destructive)."""
-        simple = (table or table_name or "").strip()
-        if not organization or not super_name or not simple:
+
+        role = _resolve_role(request, role_name)
+        simple = (table or "").strip()
+        if not organization or not super_name or not simple or not role:
             raise HTTPException(status_code=400, detail="organization, super_name and table are required")
 
-        storage = get_storage()
-        rcatalog = RedisCatalog()
+        from supertable.simple_table import SimpleTable
+        from supertable.super_table import SuperTable
 
-        simple_folder = os.path.join(organization, super_name, "tables", simple)
-
-        # Delete storage first; if it fails (other than missing), do not remove Redis meta.
-        try:
-            if storage.exists(simple_folder):
-                storage.delete(simple_folder)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
-
-        try:
-            rcatalog.delete_simple_table(organization, super_name, simple)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
+        super_table = SuperTable(super_name=super_name, organization=organization)
+        simple_table = SimpleTable(super_table=super_table, simple_name=simple)
+        simple_table.delete(role_name=role)
 
         return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}

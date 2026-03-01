@@ -1008,13 +1008,16 @@ function switchTab(id) {
       window.__admintoken = "{{ token|e }}";
       window.__org = {{ session_org|default(sel_org|default("", true), true)|tojson }};
 
-      $("#toggleSidebar").on("click", function() {
-        $("#sidebar").toggleClass("sidebar-collapsed");
-        localStorage.setItem('st_sidebar_collapsed', $("#sidebar").hasClass("sidebar-collapsed"));
-      });
+      // Sidebar toggle — skip if sidebar.html already bound it
+      if (!window.__st_sidebar_bound) {
+        $("#toggleSidebar").on("click", function() {
+          $("#sidebar").toggleClass("sidebar-collapsed");
+          localStorage.setItem('st_sidebar_collapsed', $("#sidebar").hasClass("sidebar-collapsed"));
+        });
 
-      if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
-        $("#sidebar").addClass("sidebar-collapsed");
+        if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+          $("#sidebar").addClass("sidebar-collapsed");
+        }
       }
 
       var path = window.location.pathname;

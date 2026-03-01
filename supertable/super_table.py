@@ -81,7 +81,7 @@ class SuperTable:
 
 
     # ------------------------------------------------------------------ delete
-    def delete(self) -> None:
+    def delete(self, role_name) -> None:
         """Delete this SuperTable's Redis metadata and underlying storage folder.
 
         WARNING: This is destructive and intended for admin flows.

@@ -1,7 +1,11 @@
+# path: supertable/reflection/admin.py
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import re as _re
 import secrets
 import time
 from pathlib import Path
@@ -9,6 +13,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from supertable.super_table import SuperTable
+from supertable.storage.storage_factory import get_storage
+
+try:
+    from supertable.redis_catalog import RedisCatalog  # type: ignore
+except Exception:  # pragma: no cover
+    RedisCatalog = None  # type: ignore[assignment,misc]
+
+logger = logging.getLogger(__name__)
 
 
 def attach_admin_routes(
@@ -34,7 +48,6 @@ def attach_admin_routes(
 ) -> None:
     """Attach admin.html-related endpoints to an existing router."""
 
-    # Bind names used by the legacy code for minimal diffs
     _is_authorized = is_authorized
     _no_store = no_store
     _get_provided_token = get_provided_token
@@ -91,8 +104,8 @@ def attach_admin_routes(
                 break
         return out
 
-    def read_user(org: str, sup: str, user_hash: str) -> Optional[Dict[str, Any]]:
-        k = f"supertable:{org}:{sup}:meta:users:{user_hash}"
+    def read_user(org: str, sup: str, user_id: str) -> Optional[Dict[str, Any]]:
+        k = f"supertable:{org}:{sup}:meta:users:{user_id}"
         t = _r_type(k)
         if t == "string":
             return _read_string_json(k)
@@ -100,8 +113,8 @@ def attach_admin_routes(
             return _read_hash(k)
         return None
 
-    def read_role(org: str, sup: str, role_hash: str) -> Optional[Dict[str, Any]]:
-        k = f"supertable:{org}:{sup}:meta:roles:{role_hash}"
+    def read_role(org: str, sup: str, role_id: str) -> Optional[Dict[str, Any]]:
+        k = f"supertable:{org}:{sup}:meta:roles:{role_id}"
         t = _r_type(k)
         if t == "string":
             return _read_string_json(k)
@@ -174,22 +187,16 @@ def attach_admin_routes(
     # ------------------------------ .env helpers (admin-only) ------------------------------
 
     _SENSITIVE_KEY_PARTS = (
-        "PASSWORD",
-        "PASS",
-        "SECRET",
-        "TOKEN",
-        "KEY",
-        "ACCESS_KEY",
-        "CONNECTION_STRING",
-        "API_KEY",
-        "CLIENT_SECRET",
+        "PASSWORD", "PASS", "SECRET", "TOKEN", "KEY",
+        "ACCESS_KEY", "CONNECTION_STRING", "API_KEY", "CLIENT_SECRET",
     )
+
+    _ENV_KEY_RE = _re.compile(r"^[A-Z0-9_]+$")
 
     def _env_file_path() -> Path:
         here = Path(__file__).resolve()
         reflection_dir = here.parent
         pkg_dir = reflection_dir.parent
-        # project root is one level up from package root
         return (pkg_dir.parent / (settings.DOTENV_PATH or ".env")).resolve()
 
     def _is_sensitive_env_key(key: str) -> bool:
@@ -202,9 +209,6 @@ def attach_admin_routes(
         if len(v) <= 4:
             return "****"
         return "****" + v[-4:]
-
-    import re as _re
-    _ENV_KEY_RE = _re.compile(r"^[A-Z0-9_]+$")
 
     # ------------------------------ Routes used by admin.html ------------------------------
 
@@ -228,23 +232,9 @@ def attach_admin_routes(
             fmts = []
         return {"org": org, "sup": sup, "formats": fmts}
 
-    @router.get("/reflection/users")
-    def api_users(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
-        org, sup = resolve_pair(org, sup)
-        if not org or not sup:
-            return {"users": []}
-        return {"users": list_users(org, sup)}
-
-    @router.get("/reflection/roles")
-    def api_roles(org: Optional[str] = Query(None), sup: Optional[str] = Query(None), _=Depends(admin_guard_api)):
-        org, sup = resolve_pair(org, sup)
-        if not org or not sup:
-            return {"roles": []}
-        return {"roles": list_roles(org, sup)}
-
-    @router.get("/reflection/user/{user_hash}")
+    @router.get("/reflection/user/{user_id}")
     def api_user_details(
-        user_hash: str,
+        user_id: str,
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
         _=Depends(admin_guard_api),
@@ -252,14 +242,14 @@ def attach_admin_routes(
         org, sup = resolve_pair(org, sup)
         if not org or not sup:
             raise HTTPException(404, "Tenant not found")
-        obj = read_user(org, sup, user_hash)
+        obj = read_user(org, sup, user_id)
         if not obj:
             raise HTTPException(status_code=404, detail="User not found")
-        return {"hash": user_hash, "data": obj}
+        return {"user_id": user_id, "data": obj}
 
-    @router.get("/reflection/role/{role_hash}")
+    @router.get("/reflection/role/{role_id}")
     def api_role_details(
-        role_hash: str,
+        role_id: str,
         org: Optional[str] = Query(None),
         sup: Optional[str] = Query(None),
         _=Depends(admin_guard_api),
@@ -267,10 +257,10 @@ def attach_admin_routes(
         org, sup = resolve_pair(org, sup)
         if not org or not sup:
             raise HTTPException(404, "Tenant not found")
-        obj = read_role(org, sup, role_hash)
+        obj = read_role(org, sup, role_id)
         if not obj:
             raise HTTPException(status_code=404, detail="Role not found")
-        return {"hash": role_hash, "data": obj}
+        return {"role_id": role_id, "data": obj}
 
     @router.get("/reflection/env")
     def admin_env_get(_=Depends(admin_guard_api)):
@@ -286,13 +276,11 @@ def attach_admin_routes(
             for k, v in values.items():
                 val = "" if v is None else str(v)
                 is_sensitive = _is_sensitive_env_key(k)
-                items.append(
-                    {
-                        "key": k,
-                        "value": _mask_secret(val) if is_sensitive else val,
-                        "is_sensitive": is_sensitive,
-                    }
-                )
+                items.append({
+                    "key": k,
+                    "value": _mask_secret(val) if is_sensitive else val,
+                    "is_sensitive": is_sensitive,
+                })
 
         return {"found": found, "path": str(env_path), "items": items}
 
@@ -350,6 +338,8 @@ def attach_admin_routes(
             raise HTTPException(status_code=404, detail="Token not found")
         return {"ok": True, "organization": org_eff, "token_id": token_id}
 
+    # ------------------------------ Admin page ------------------------------
+
     @router.get("/reflection/admin", response_class=HTMLResponse)
     def admin_page(request: Request, org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
         if not _is_authorized(request):
@@ -365,24 +355,17 @@ def attach_admin_routes(
         tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
 
         if not sel_org or not sel_sup:
-            sess = get_session(request) or {}
-            resp = templates.TemplateResponse(
-                "admin.html",
-                {
-                    "request": request,
-                    "session_org": sess.get("org") or settings.SUPERTABLE_ORGANIZATION,
-                    "session_username": sess.get("username") or "",
-                    "session_user_hash": sess.get("user_hash") or "",
-                    "session_is_superuser": bool(sess.get("is_superuser")),
-                    "authorized": True,
-                    "token": provided,
-                    "tenants": tenants,
-                    "sel_org": sel_org,
-                    "sel_sup": sel_sup,
-                    "has_tenant": False,
-                    "default_user_hash": "",
-                },
-            )
+            ctx: Dict[str, Any] = {
+                "request": request,
+                "authorized": True,
+                "token": provided,
+                "tenants": tenants,
+                "sel_org": sel_org,
+                "sel_sup": sel_sup,
+                "has_tenant": False,
+            }
+            inject_session_into_ctx(ctx, request)
+            resp = templates.TemplateResponse("admin.html", ctx)
             _no_store(resp)
             return resp
 
@@ -397,9 +380,8 @@ def attach_admin_routes(
 
         users = list_users(sel_org, sel_sup)
         roles = list_roles(sel_org, sel_sup)
-        default_user_hash = users[0]["hash"] if users else ""
 
-        ctx: Dict[str, Any] = {
+        ctx = {
             "request": request,
             "authorized": True,
             "token": provided,
@@ -408,13 +390,132 @@ def attach_admin_routes(
             "sel_sup": sel_sup,
             "has_tenant": True,
             "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
-            "root_ts": fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "—",
+            "root_ts": fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "\u2014",
             "mirrors": mirrors,
             "users": users,
             "roles": roles,
-            "default_user_hash": default_user_hash,
         }
         inject_session_into_ctx(ctx, request)
         resp = templates.TemplateResponse("admin.html", ctx)
         _no_store(resp)
         return resp
+
+    # ------------------------------ SuperTable CRUD (admin) ------------------------------
+
+    @router.post("/reflection/super")
+    def api_create_super(
+        request: Request,
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        _: Any = Depends(admin_guard_api),
+    ):
+        try:
+            st = SuperTable(organization=organization, super_name=super_name)
+            storage_label = getattr(getattr(st, "storage", None), "__class__", None)
+            storage_name = getattr(storage_label, "__name__", None) if storage_label else None
+            return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": storage_name}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
+
+    @router.delete("/reflection/super")
+    def api_delete_super(
+        request: Request,
+        organization: str = Query(..., description="Organization identifier"),
+        super_name: str = Query(..., description="SuperTable name"),
+        role_name: str = Query(""),
+        _: Any = Depends(admin_guard_api),
+    ):
+        """Delete a SuperTable from Redis and storage (destructive)."""
+        if not organization or not super_name:
+            raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+        role = (role_name or "").strip()
+
+        # Try library-level delete first (passes role_name for RBAC checks)
+        try:
+            super_table = SuperTable(super_name=super_name, organization=organization)
+            super_table.delete(role_name=role)
+            return {"ok": True, "organization": organization, "name": super_name}
+        except Exception:
+            pass
+
+        # Fallback: manual storage + Redis cleanup
+        storage = get_storage()
+        base_dir = os.path.join(organization, super_name)
+
+        try:
+            if storage.exists(base_dir):
+                storage.delete(base_dir)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
+
+        deleted_keys = 0
+        if RedisCatalog is not None:
+            try:
+                rc = RedisCatalog()
+                deleted_keys = rc.delete_super_table(organization, super_name)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
+
+        return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
+
+    # ------------------------------ Route aliases: /admin -> /reflection, /api -> /reflection ------------------------------
+
+    def _add_reflection_alias_routes(_router: APIRouter) -> None:
+        """Add backward-compatible aliases under /reflection for legacy /admin and /api routes."""
+        try:
+            from fastapi.routing import APIRoute  # noqa: F401
+        except Exception:
+            return
+
+        existing = set()
+        for r in _router.routes:
+            try:
+                methods = tuple(sorted(getattr(r, "methods", None) or []))
+                existing.add((getattr(r, "path", None), methods))
+            except Exception:
+                continue
+
+        def _try_add_alias(path: str, methods: set, endpoint, name: str) -> None:
+            key = (path, tuple(sorted(methods or [])))
+            if key in existing:
+                return
+            _router.add_api_route(
+                path,
+                endpoint,
+                methods=list(methods or []),
+                name=name,
+                include_in_schema=False,
+            )
+            existing.add(key)
+
+        routes = list(_router.routes)
+        for r in routes:
+            if not hasattr(r, "path") or not hasattr(r, "endpoint"):
+                continue
+            path = str(getattr(r, "path") or "")
+            if not path:
+                continue
+            methods = set(getattr(r, "methods", None) or [])
+            endpoint = getattr(r, "endpoint")
+            name = str(getattr(r, "name", "") or "route")
+
+            if path == "/admin":
+                continue
+            if path.startswith("/admin"):
+                _try_add_alias(
+                    "/reflection" + path[len("/admin"):],
+                    methods, endpoint, name + "_reflection_alias",
+                )
+
+            if path == "/api":
+                continue
+            if path.startswith("/api"):
+                _try_add_alias(
+                    "/reflection" + path[len("/api"):],
+                    methods, endpoint, name + "_reflection_alias",
+                )
+
+    _add_reflection_alias_routes(router)
