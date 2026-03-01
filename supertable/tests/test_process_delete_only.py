@@ -382,7 +382,7 @@ class TestProcessDeleteOnlyMultiColumnKey:
     def test_multi_column_key_delete(self, store, patch_io):
         """
         Delete with a composite key (region + id).
-        Only rows matching on ALL key columns should be removed.
+        Only rows matching on ALL key columns should be removed (AND / anti-join).
         """
         existing = _make_df({
             "region": ["US", "US", "EU", "EU"],
@@ -391,11 +391,12 @@ class TestProcessDeleteOnlyMultiColumnKey:
         })
         store.files["/data/file1.parquet"] = existing
 
-        # Delete US-1 and EU-2: but OR logic means any row matching region=US OR id=1 OR region=EU OR id=2
-        # With the current OR-based is_in logic, this will match ALL rows
-        # because region is_in(["US","EU"]) matches everything and id is_in([1,2]) matches everything.
-        #
-        # This is consistent with how process_files_with_overlap works (OR across columns).
+        # Delete keys as composite tuples: (US,1) and (EU,2).
+        # AND semantics (anti-join): a row is deleted only when it matches
+        # on ALL key columns simultaneously.
+        #   (US,1) → matches row 0
+        #   (EU,2) → matches row 3
+        #   (US,2) and (EU,1) do NOT match any delete key → kept
         delete_keys = _make_df({"region": ["US", "EU"], "id": [1, 2]})
         overlapping = _overlapping_set([("/data/file1.parquet", True, 1000)])
 
@@ -407,16 +408,17 @@ class TestProcessDeleteOnlyMultiColumnKey:
             compression_level=1,
         )
 
-        # OR semantics: region in (US, EU) OR id in (1, 2) → all 4 rows deleted
-        assert deleted == 4
-        assert total_rows == 0
-        assert len(new_resources) == 0
+        # AND semantics: only exact composite matches (US,1) and (EU,2) → 2 deleted, 2 kept
+        assert deleted == 2
+        assert total_rows == 2
+        assert len(new_resources) == 1
         assert "/data/file1.parquet" in sunset_files
 
     def test_multi_column_key_partial_match(self, store, patch_io):
         """
         Multi-column key where only one column matches some rows.
-        OR semantics: any column match triggers deletion.
+        AND semantics (anti-join): ALL key columns must match for deletion.
+        A match on only one column is not sufficient.
         """
         existing = _make_df({
             "region": ["US", "EU", "APAC"],
@@ -425,7 +427,10 @@ class TestProcessDeleteOnlyMultiColumnKey:
         })
         store.files["/data/file1.parquet"] = existing
 
-        # Delete where region=US — this matches row 0; id=99 matches nothing
+        # Delete key tuple: (US, 99).
+        # AND semantics: needs region=US AND id=99 in the same row.
+        # Row 0 has region=US but id=1 (not 99) → no match.
+        # No row has id=99 → composite key (US,99) matches nothing.
         delete_keys = _make_df({"region": ["US"], "id": [99]})
         overlapping = _overlapping_set([("/data/file1.parquet", True, 1000)])
 
@@ -437,6 +442,6 @@ class TestProcessDeleteOnlyMultiColumnKey:
             compression_level=1,
         )
 
-        # region in ("US") matches row 0; id in (99) matches nothing → 1 deleted
-        assert deleted == 1
-        assert total_rows == 2
+        # AND semantics: no row matches (US, 99) → 0 deleted, file untouched
+        assert deleted == 0
+        assert total_rows == 0

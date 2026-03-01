@@ -186,7 +186,7 @@ class TestQuerySqlNATypeSanitization:
             sql="SELECT * FROM t",
             limit=1000,
             engine=MagicMock(),
-            user_hash="u",
+            role_name="admin",
         )
         return columns, rows, meta
 
@@ -258,7 +258,7 @@ class TestQuerySqlNATypeSanitization:
             sql="SELECT * FROM t",
             limit=500,
             engine=MagicMock(),
-            user_hash="u",
+            role_name="admin",
         )
 
         # DataReader should have been constructed with the LIMIT-appended SQL

@@ -968,7 +968,7 @@ class TestSimpleTableDelete:
         mock_super.storage.exists.return_value = True
 
         st = SimpleTable(mock_super, "del_table")
-        st.delete(user_hash="test_hash")
+        st.delete(role_name="test_role")
 
         mock_access.assert_called_once()
         mock_super.storage.delete.assert_called_once()
@@ -992,7 +992,7 @@ class TestSimpleTableDelete:
 
         st = SimpleTable(mock_super, "del_table")
         # Should not raise
-        st.delete(user_hash="test_hash")
+        st.delete(role_name="test_role")
         mock_catalog.delete_simple_table.assert_called_once()
 
 
@@ -1144,7 +1144,7 @@ class TestSuperTableDelete:
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete()
+        st.delete(role_name="admin")
         mock_storage.delete.assert_called_once()
         mock_catalog.delete_super_table.assert_called_once_with("o", "s")
 
@@ -1165,7 +1165,7 @@ class TestSuperTableDelete:
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete()
+        st.delete(role_name="admin")
         # Should still delete Redis meta
         mock_catalog.delete_super_table.assert_called_once()
 
@@ -1185,7 +1185,7 @@ class TestSuperTableDelete:
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete()
+        st.delete(role_name="admin")
         mock_storage.delete.assert_not_called()
         mock_catalog.delete_super_table.assert_called_once()
 
@@ -1632,7 +1632,7 @@ class TestEngineEnum:
 
     def test_duckdb_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB.value == "duckdb"
+        assert engine.DUCKDB.value == "duckdb_pinned"
 
     def test_spark_value(self):
         from supertable.data_reader import engine
@@ -1640,7 +1640,7 @@ class TestEngineEnum:
 
     def test_to_internal(self):
         from supertable.data_reader import engine
-        from supertable.executor import Engine
+        from supertable.engine.executor import Engine
         assert engine.DUCKDB.to_internal() == Engine.DUCKDB
         assert engine.AUTO.to_internal() == Engine.AUTO
 
@@ -1832,7 +1832,7 @@ class TestQuerySql:
             sql="SELECT * FROM tbl",
             limit=100,
             engine=MagicMock(),
-            user_hash="u1",
+            role_name="admin",
         )
         assert columns == ["x", "y"]
         assert len(rows) == 3
@@ -1856,7 +1856,7 @@ class TestQuerySql:
                 sql="SELECT bad",
                 limit=100,
                 engine=MagicMock(),
-                user_hash="u1",
+                role_name="admin",
             )
 
 
@@ -1930,12 +1930,12 @@ class TestPlanStats:
     """Tests for PlanStats."""
 
     def test_init_empty(self):
-        from supertable.plan_stats import PlanStats
+        from supertable.engine.plan_stats import PlanStats
         ps = PlanStats()
         assert ps.stats == []
 
     def test_add_stat(self):
-        from supertable.plan_stats import PlanStats
+        from supertable.engine.plan_stats import PlanStats
         ps = PlanStats()
         ps.add_stat({"ENGINE": "duckdb"})
         ps.add_stat({"ROWS": 100})
