@@ -12,6 +12,7 @@ import sqlglot
 from sqlglot import exp
 
 from supertable.config.defaults import logger
+from supertable.config.homedir import get_app_home
 
 
 # =========================================================
@@ -362,22 +363,57 @@ def init_connection(
         con: duckdb.DuckDBPyConnection,
         temp_dir: str,
         profile_path: Optional[str] = None,
-        memory_limit: str = "2GB",
+        memory_limit: str = "1GB",
 ) -> None:
-    """Apply standard PRAGMA settings to a DuckDB connection."""
-    con.execute(f"PRAGMA memory_limit='{memory_limit}';")
-    con.execute(f"PRAGMA temp_directory='{temp_dir}';")
+    """Apply standard PRAGMA settings to a DuckDB connection.
+
+    Memory notes:
+    - ``memory_limit`` defaults to 1 GB (overridable via
+      ``SUPERTABLE_DUCKDB_MEMORY_LIMIT`` env var).  Keeping this well below
+      the container's physical RAM is what enables DuckDB to spill to disk
+      instead of raising an OOM error.
+    - ``temp_directory`` is resolved to an absolute path; DuckDB silently
+      ignores relative paths that it cannot resolve, which prevents spilling.
+    - ``preserve_insertion_order=false`` reduces memory pressure during
+      large Parquet scans at the cost of non-deterministic row order (ORDER
+      BY in queries is unaffected).
+    - Thread count defaults to 4 to limit concurrent buffer-pool competition
+      inside a constrained container.  Override with ``SUPERTABLE_DUCKDB_THREADS``.
+    """
+    # Resolve memory limit: caller arg < env var override.
+    effective_memory_limit = os.getenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", memory_limit)
+    con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
+
+    # Absolute temp path is required for DuckDB to actually spill to disk.
+    # Prefer a path rooted under the app home (~/supertable), which is
+    # guaranteed to be created and writable at import time.  Absolute paths
+    # from callers are used as-is; relative paths are re-rooted under the
+    # app home so DuckDB can always resolve and write the spill directory.
+    if os.path.isabs(temp_dir):
+        abs_temp_dir = temp_dir
+    else:
+        abs_temp_dir = os.path.join(get_app_home(), "tmp", temp_dir)
+    os.makedirs(abs_temp_dir, exist_ok=True)
+    con.execute(f"PRAGMA temp_directory='{abs_temp_dir}';")
+
     if profile_path:
         con.execute("PRAGMA enable_profiling='json';")
         con.execute(f"PRAGMA profile_output='{profile_path}';")
     con.execute("PRAGMA default_collation='nocase';")
 
-    threads_env = os.getenv("SUPERTABLE_DUCKDB_THREADS")
-    if threads_env:
-        try:
-            con.execute(f"SET threads={int(threads_env)};")
-        except Exception:
-            pass
+    # Reduce memory pressure during large parquet scans.
+    # Row order is still deterministic for queries that include ORDER BY.
+    try:
+        con.execute("SET preserve_insertion_order=false;")
+    except Exception:
+        pass  # older DuckDB builds may not support this setting
+
+    # Thread cap: prevents all cores competing for the same limited buffer pool.
+    threads_env = os.getenv("SUPERTABLE_DUCKDB_THREADS", "4")
+    try:
+        con.execute(f"SET threads={int(threads_env)};")
+    except Exception:
+        pass
 
 
 # =========================================================

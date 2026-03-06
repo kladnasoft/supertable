@@ -82,7 +82,9 @@ class DuckDBPinned:
             return self._con
 
         self._temp_dir = temp_dir
-        memory_limit = os.getenv("SUPERTABLE_DUCKDB_PINNED_MEMORY_LIMIT", "2GB")
+        # Default to 1 GB so DuckDB spills to disk before hitting an OOM error.
+        # Override with SUPERTABLE_DUCKDB_PINNED_MEMORY_LIMIT for larger hosts.
+        memory_limit = os.getenv("SUPERTABLE_DUCKDB_PINNED_MEMORY_LIMIT", "1GB")
         con = duckdb.connect()
         init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
         self._con = con
