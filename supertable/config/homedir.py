@@ -54,7 +54,7 @@ logger.debug(f"Current working directory: {os.getcwd()}")
 # ---------- public API ----------
 
 # Kept for backward compatibility; prefer get_app_home() for the expanded path.
-app_home = os.getenv("SUPERTABLE_HOME", "~/supertable")
+app_home = _app_home
 
 def get_app_home() -> str:
     """Return the fully expanded, absolute application home directory."""

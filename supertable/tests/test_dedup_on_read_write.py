@@ -126,6 +126,7 @@ def _make_writer_for_write():
     class _Ctx:
         catalog = mock_catalog
         process_overlap = mocks["process_overlap"]
+        find_overlap = mocks["find_overlap"]
         _patches = patches
 
         @staticmethod
@@ -749,3 +750,276 @@ class TestDedupEdgeCases:
     def test_init_has_empty_cache(self):
         dw, _ = _make_writer()
         assert dw._table_config_cache == {}
+
+
+# ===========================================================================
+# 7. configure_table — per-table limits (max_memory_chunk_size / max_overlapping_files)
+# ===========================================================================
+
+class TestConfigureTableLimits:
+    """Validation, persistence, and cache behaviour for per-table limits."""
+
+    # -- Validation ----------------------------------------------------------
+
+    def test_zero_max_memory_chunk_size_raises(self):
+        dw, _ = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            with pytest.raises(ValueError, match="max_memory_chunk_size"):
+                dw.configure_table("admin", "events", ["id"], max_memory_chunk_size=0)
+
+    def test_negative_max_memory_chunk_size_raises(self):
+        dw, _ = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            with pytest.raises(ValueError, match="max_memory_chunk_size"):
+                dw.configure_table("admin", "events", ["id"], max_memory_chunk_size=-1)
+
+    def test_zero_max_overlapping_files_raises(self):
+        dw, _ = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            with pytest.raises(ValueError, match="max_overlapping_files"):
+                dw.configure_table("admin", "events", ["id"], max_overlapping_files=0)
+
+    def test_negative_max_overlapping_files_raises(self):
+        dw, _ = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            with pytest.raises(ValueError, match="max_overlapping_files"):
+                dw.configure_table("admin", "events", ["id"], max_overlapping_files=-100)
+
+    # -- Persistence ---------------------------------------------------------
+
+    def test_max_memory_chunk_size_persisted_to_redis(self):
+        dw, mock_catalog = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_memory_chunk_size=32 * 1024 * 1024,
+            )
+
+        config_arg = mock_catalog.set_table_config.call_args[0][3]
+        assert config_arg["max_memory_chunk_size"] == 32 * 1024 * 1024
+
+    def test_max_overlapping_files_persisted_to_redis(self):
+        dw, mock_catalog = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_overlapping_files=50,
+            )
+
+        config_arg = mock_catalog.set_table_config.call_args[0][3]
+        assert config_arg["max_overlapping_files"] == 50
+
+    def test_both_limits_persisted_together(self):
+        dw, mock_catalog = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_memory_chunk_size=8 * 1024 * 1024,
+                max_overlapping_files=200,
+            )
+
+        config_arg = mock_catalog.set_table_config.call_args[0][3]
+        assert config_arg["max_memory_chunk_size"] == 8 * 1024 * 1024
+        assert config_arg["max_overlapping_files"] == 200
+        assert config_arg["primary_keys"] == ["id"]
+        assert config_arg["dedup_on_read"] is False
+
+    def test_limits_stored_in_local_cache(self):
+        dw, _ = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_memory_chunk_size=16 * 1024 * 1024,
+                max_overlapping_files=75,
+            )
+
+        cached = dw._table_config_cache["events"]
+        assert cached["max_memory_chunk_size"] == 16 * 1024 * 1024
+        assert cached["max_overlapping_files"] == 75
+
+    # -- Omitting limits does not read Redis (cache guarantee) ---------------
+
+    def test_omitting_limits_does_not_call_get_table_config(self):
+        """configure_table without limit args must not trigger a Redis read."""
+        dw, mock_catalog = _make_writer()
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table("admin", "events", ["id"], dedup_on_read=True)
+
+        mock_catalog.get_table_config.assert_not_called()
+
+    def test_setting_limits_reads_existing_config_from_redis(self):
+        """When a limit is provided, existing Redis config is fetched to preserve other fields."""
+        dw, mock_catalog = _make_writer()
+        mock_catalog.get_table_config.return_value = {
+            "primary_keys": ["id"],
+            "dedup_on_read": True,
+        }
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_memory_chunk_size=4 * 1024 * 1024,
+            )
+
+        mock_catalog.get_table_config.assert_called_once_with(
+            "test_org", "test_super", "events"
+        )
+
+    def test_existing_limit_preserved_when_not_overridden(self):
+        """A second configure_table call without a limit leaves the stored limit intact."""
+        dw, mock_catalog = _make_writer()
+        # Simulate Redis already has a limit set from a prior call
+        mock_catalog.get_table_config.return_value = {
+            "primary_keys": ["id"],
+            "dedup_on_read": False,
+            "max_memory_chunk_size": 64 * 1024 * 1024,
+        }
+        with patch(f"{_DW_MOD}.check_write_access"):
+            # This call sets a new limit, triggering a Redis read
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_overlapping_files=25,
+            )
+
+        config_arg = mock_catalog.set_table_config.call_args[0][3]
+        # max_memory_chunk_size from Redis must be carried forward
+        assert config_arg["max_memory_chunk_size"] == 64 * 1024 * 1024
+        assert config_arg["max_overlapping_files"] == 25
+
+    def test_limit_overrides_previous_value(self):
+        """A second configure_table call with a new limit replaces the old one."""
+        dw, mock_catalog = _make_writer()
+        mock_catalog.get_table_config.return_value = {
+            "primary_keys": ["id"],
+            "dedup_on_read": False,
+            "max_memory_chunk_size": 16 * 1024 * 1024,
+        }
+        with patch(f"{_DW_MOD}.check_write_access"):
+            dw.configure_table(
+                "admin", "events", ["id"],
+                max_memory_chunk_size=128 * 1024 * 1024,
+            )
+
+        config_arg = mock_catalog.set_table_config.call_args[0][3]
+        assert config_arg["max_memory_chunk_size"] == 128 * 1024 * 1024
+
+
+# ===========================================================================
+# 8. write() — table_config propagated to processing functions
+# ===========================================================================
+
+class TestWritePropagatesTableConfig:
+    """write() must forward table_config to find_and_lock and process_overlapping_files."""
+
+    def test_table_config_passed_to_find_and_lock(self):
+        dw, ctx = _make_writer_for_write()
+        try:
+            dw._table_config_cache["my_table"] = {
+                "primary_keys": ["x"],
+                "dedup_on_read": False,
+                "max_memory_chunk_size": 8 * 1024 * 1024,
+                "max_overlapping_files": 50,
+            }
+
+            arrow = _arrow_table({"x": [1], "y": ["a"]})
+            dw.write("admin", "my_table", arrow, ["x"])
+
+            _, kwargs = ctx.find_overlap.call_args
+            assert kwargs["table_config"]["max_memory_chunk_size"] == 8 * 1024 * 1024
+            assert kwargs["table_config"]["max_overlapping_files"] == 50
+        finally:
+            ctx.stop_all()
+
+    def test_table_config_passed_to_process_overlapping_files(self):
+        dw, ctx = _make_writer_for_write()
+        try:
+            dw._table_config_cache["my_table"] = {
+                "primary_keys": ["x"],
+                "dedup_on_read": False,
+                "max_memory_chunk_size": 32 * 1024 * 1024,
+                "max_overlapping_files": 200,
+            }
+
+            arrow = _arrow_table({"x": [1], "y": ["a"]})
+            dw.write("admin", "my_table", arrow, ["x"])
+
+            _, kwargs = ctx.process_overlap.call_args
+            assert kwargs["table_config"]["max_memory_chunk_size"] == 32 * 1024 * 1024
+            assert kwargs["table_config"]["max_overlapping_files"] == 200
+        finally:
+            ctx.stop_all()
+
+    def test_no_config_passes_none_to_processing(self):
+        """When no table config exists, table_config=None is forwarded (falls back to global default)."""
+        dw, ctx = _make_writer_for_write()
+        try:
+            # Empty cache and Redis returns None → table_config == {}
+            arrow = _arrow_table({"x": [1], "y": ["a"]})
+            dw.write("admin", "my_table", arrow, ["x"])
+
+            _, kwargs = ctx.process_overlap.call_args
+            # table_config is an empty dict (falsy), _resolve_limits falls back to global default
+            assert not kwargs["table_config"]
+        finally:
+            ctx.stop_all()
+
+
+# ===========================================================================
+# 9. _resolve_limits — unit tests
+# ===========================================================================
+
+class TestResolveLimits:
+    """_resolve_limits() falls back correctly through config → global default."""
+
+    def _get_resolve_limits(self):
+        from supertable.processing import _resolve_limits
+        return _resolve_limits
+
+    def test_returns_table_config_values_when_set(self):
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits({
+            "max_memory_chunk_size": 4 * 1024 * 1024,
+            "max_overlapping_files": 25,
+        })
+        assert max_mem == 4 * 1024 * 1024
+        assert max_files == 25
+
+    def test_falls_back_to_global_default_when_config_is_none(self):
+        from supertable.config.defaults import default
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits(None)
+        assert max_mem == default.MAX_MEMORY_CHUNK_SIZE
+        assert max_files == default.MAX_OVERLAPPING_FILES
+
+    def test_falls_back_to_global_default_when_config_is_empty(self):
+        from supertable.config.defaults import default
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits({})
+        assert max_mem == default.MAX_MEMORY_CHUNK_SIZE
+        assert max_files == default.MAX_OVERLAPPING_FILES
+
+    def test_partial_config_falls_back_per_field(self):
+        """Only max_memory_chunk_size set → max_files still falls back to global default."""
+        from supertable.config.defaults import default
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits({"max_memory_chunk_size": 1024})
+        assert max_mem == 1024
+        assert max_files == default.MAX_OVERLAPPING_FILES
+
+    def test_partial_config_other_field(self):
+        """Only max_overlapping_files set → max_mem still falls back to global default."""
+        from supertable.config.defaults import default
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits({"max_overlapping_files": 10})
+        assert max_mem == default.MAX_MEMORY_CHUNK_SIZE
+        assert max_files == 10
+
+    def test_ignores_unrelated_config_keys(self):
+        """Unrelated keys in table_config do not affect limit resolution."""
+        from supertable.config.defaults import default
+        _resolve_limits = self._get_resolve_limits()
+        max_mem, max_files = _resolve_limits({
+            "primary_keys": ["id"],
+            "dedup_on_read": True,
+        })
+        assert max_mem == default.MAX_MEMORY_CHUNK_SIZE
+        assert max_files == default.MAX_OVERLAPPING_FILES

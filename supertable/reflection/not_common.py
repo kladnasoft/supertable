@@ -14,6 +14,9 @@ from supertable.reflection.common import (
     templates,
     settings,
     redis_client,
+    catalog,
+    dotenv_values,
+    set_key,
     _is_authorized,
     _no_store,
     _get_provided_token,
@@ -24,6 +27,10 @@ from supertable.reflection.common import (
     logged_in_guard_api,
     admin_guard_api,
     is_superuser,
+    list_users,
+    list_roles,
+    read_user,
+    read_role,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,5 +155,53 @@ attach_rbac_routes(
     resolve_pair=resolve_pair,
     inject_session_into_ctx=inject_session_into_ctx,
     get_session=get_session,
+    admin_guard_api=admin_guard_api,
+)
+
+# ---------------------------------------------------------------------------
+# .env configuration page
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.env import attach_env_routes  # noqa: E402
+
+attach_env_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    admin_guard_api=admin_guard_api,
+    dotenv_values=dotenv_values,
+    set_key=set_key,
+)
+
+
+# ---------------------------------------------------------------------------
+# Users & Tokens page
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.users import attach_users_routes  # noqa: E402
+
+attach_users_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    catalog=catalog,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    list_users=list_users,
+    list_roles=list_roles,
+    read_user=read_user,
+    read_role=read_role,
+    logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
 )

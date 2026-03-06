@@ -56,6 +56,7 @@ The flat files map to a logical package structure under `supertable`:
 ### Tier 0 — Leaf / No Internal Dependencies
 These files depend only on external libraries, not on other project files.
 
+- **`from supertable.config.homedir import app_home`** — this must be always included in the super_table.py
 - **`data_classes.py`** — `dataclass` definitions (`TableDefinition`, `Reflection`, `SuperSnapshot`, `RbacViewDef`)
 - **`permissions.py`** — `Permission`, `RoleType` enums
 - **`filter_builder.py`** — pure logic, no imports from project

@@ -904,6 +904,208 @@
       font-size: 12px;
     }
 
+
+    /* --- Per-table limits / settings overlay --- */
+    #limitsOverlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.65);
+      z-index: 1500;
+    }
+
+    #limitsCard {
+      width: min(480px, 94vw);
+      background: #ffffff;
+      border-radius: 14px;
+      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.35);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--panel-border);
+      overflow: hidden;
+    }
+
+    #limitsHeader {
+      padding: 14px 18px;
+      border-bottom: 1px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--header-bg);
+    }
+
+    #limitsBody { padding: 20px 22px; }
+
+    .limits-field { margin-bottom: 18px; }
+
+    .limits-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .limits-label i { color: var(--primary-color); }
+
+    .limits-input-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .limits-input {
+      flex: 1;
+      font-size: 14px;
+      border: 1px solid #d0d7e7;
+      border-radius: 8px;
+      padding: 8px 12px;
+      outline: none;
+      color: #111827;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      background: #f9fafb;
+    }
+
+    .limits-input:focus {
+      border-color: var(--primary-color);
+      box-shadow: 0 0 0 3px var(--primary-light);
+      background: #fff;
+    }
+
+    .limits-unit {
+      font-size: 12px;
+      font-weight: 600;
+      color: #6b7280;
+      min-width: 30px;
+    }
+
+    .limits-hint {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 5px;
+      line-height: 1.4;
+    }
+
+    .limits-hint code {
+      font-family: ui-monospace, monospace;
+      background: #f1f5f9;
+      padding: 1px 4px;
+      border-radius: 4px;
+      font-size: 10.5px;
+      color: #475569;
+    }
+
+    .limits-footer {
+      padding: 14px 22px;
+      border-top: 1px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #f8fafc;
+      gap: 10px;
+    }
+
+    .limits-status {
+      font-size: 12px;
+      color: #6b7280;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .limits-status.success { color: #059669; }
+    .limits-status.error   { color: #dc2626; }
+
+    .btn-limits-save {
+      background: var(--primary-color);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 20px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .btn-limits-save:hover { background: var(--secondary-color); }
+    .btn-limits-save:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .btn-limits-cancel {
+      background: transparent;
+      color: #6b7280;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn-limits-cancel:hover { background: #f1f5f9; }
+
+    .limits-defaults-note {
+      font-size: 11px;
+      color: #9ca3af;
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 18px;
+      line-height: 1.5;
+    }
+
+    .limits-defaults-note strong { color: #374151; }
+
+
+    /* --- Execute button (actionable, distinct from view buttons) --- */
+    .btn-execute {
+      background: #0e7490;
+      border: 1px solid #0e7490;
+      color: #ffffff;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+      line-height: 1;
+    }
+    .btn-execute:hover {
+      background: #0c6280;
+      border-color: #0c6280;
+      box-shadow: 0 2px 6px rgba(14,116,144,0.35);
+    }
+
+    /* --- Option C: amber settings button --- */
+    .btn-settings-amber {
+      background: transparent;
+      border: 1px solid #f59e0b;
+      color: #d97706;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+      line-height: 1;
+    }
+    .btn-settings-amber:hover {
+      background: #fffbeb;
+      color: #b45309;
+      border-color: #d97706;
+    }
+
   </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -1166,15 +1368,15 @@
         const tdActions = document.createElement('td');
         tdActions.className = 'actions-cell';
         tdActions.innerHTML =
-          // Changed btn-outline-primary to btn-primary
           '<button class="btn btn-primary btn-sm" type="button" onclick="openSchema(\'' + safeName + '\')">' +
           '<i class="fas fa-table"></i>&nbsp;Schema</button>' +
-          // Changed btn-outline-primary to btn-primary
           ' <button class="btn btn-primary btn-sm" type="button" onclick="openStats(\'' + safeName + '\')">' +
           '<i class="fas fa-chart-bar"></i>&nbsp;Stats</button>' +
-          // Changed btn-outline-primary to btn-primary
-          ' <button class="btn btn-primary btn-sm" type="button" onclick="goExecuteWithLeaf(\'' + safeName + '\')">' +
-          '<i class="fas fa-terminal"></i></button>';
+          ' <button class="btn-settings-amber" type="button" onclick="openLimits(\'' + safeName + '\')"' +
+          ' title="Table settings"><i class="fas fa-sliders-h"></i></button>' +
+          ' <span style="display:inline-block;width:8px;"></span>' +
+          '<button class="btn-execute" type="button" onclick="goExecuteWithLeaf(\'' + safeName + '\')"' +
+          ' title="Execute query"><i class="fas fa-terminal"></i></button>';
         tr.appendChild(tdActions);
 
         const tdDelete = document.createElement('td');
@@ -1925,6 +2127,112 @@ async function openSchema(simple) {
       window.location.href = url.toString();
     }
 
+    // ---- Per-table limits overlay ----
+
+    let _limitsCurrentTable = null;
+
+    async function openLimits(simple) {
+      const sel = document.getElementById('pairSel');
+      const sup = sel && sel.value ? sel.value : currentSuper;
+      _limitsCurrentTable = simple;
+
+      document.getElementById('limitsTitleSub').textContent = sup ? 'SuperTable: ' + sup : '';
+      document.getElementById('limitsTitleTable').textContent = simple;
+      document.getElementById('limitsChunkMB').value = '';
+      document.getElementById('limitsMaxFiles').value = '';
+      setLimitsStatus('', '');
+      document.getElementById('limitsOverlay').style.display = 'flex';
+
+      try {
+        const data = await api(
+          META_BASE + '/reflection/table/config?organization=' +
+          encodeURIComponent(ORGANIZATION) +
+          '&super_name=' + encodeURIComponent(sup || '') +
+          '&table=' + encodeURIComponent(simple)
+        );
+        const cfg = (data && data.config) ? data.config : {};
+        if (cfg.max_memory_chunk_size) {
+          document.getElementById('limitsChunkMB').value =
+            (cfg.max_memory_chunk_size / (1024 * 1024)).toFixed(0);
+        }
+        if (cfg.max_overlapping_files) {
+          document.getElementById('limitsMaxFiles').value = cfg.max_overlapping_files;
+        }
+      } catch (e) {
+        setLimitsStatus('Could not load config: ' + escapeHtml((e && e.message) || String(e)), 'error');
+      }
+    }
+
+    function closeLimits() {
+      document.getElementById('limitsOverlay').style.display = 'none';
+      _limitsCurrentTable = null;
+    }
+
+    function setLimitsStatus(msg, type) {
+      const el = document.getElementById('limitsStatus');
+      el.textContent = msg;
+      el.className = 'limits-status' + (type ? ' ' + type : '');
+    }
+
+    async function saveLimits() {
+      const sel = document.getElementById('pairSel');
+      const sup = sel && sel.value ? sel.value : currentSuper;
+      const simple = _limitsCurrentTable;
+      if (!simple || !sup) return;
+
+      const chunkRaw = document.getElementById('limitsChunkMB').value.trim();
+      const filesRaw = document.getElementById('limitsMaxFiles').value.trim();
+      const body = {};
+
+      if (chunkRaw !== '') {
+        const mb = parseFloat(chunkRaw);
+        if (isNaN(mb) || mb <= 0) {
+          setLimitsStatus('Chunk size must be a positive number.', 'error');
+          return;
+        }
+        body.max_memory_chunk_size = Math.round(mb * 1024 * 1024);
+      } else {
+        body.max_memory_chunk_size = null;
+      }
+
+      if (filesRaw !== '') {
+        const mf = parseInt(filesRaw, 10);
+        if (isNaN(mf) || mf <= 0) {
+          setLimitsStatus('Max files must be a positive integer.', 'error');
+          return;
+        }
+        body.max_overlapping_files = mf;
+      } else {
+        body.max_overlapping_files = null;
+      }
+
+      const btn = document.getElementById('limitsSaveBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+      setLimitsStatus('', '');
+
+      try {
+        await api(
+          META_BASE + '/reflection/table/config?organization=' +
+          encodeURIComponent(ORGANIZATION) +
+          '&super_name=' + encodeURIComponent(sup) +
+          '&table=' + encodeURIComponent(simple),
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+        );
+        setLimitsStatus('Saved successfully.', 'success');
+        setTimeout(closeLimits, 900);
+      } catch (e) {
+        setLimitsStatus('Save failed: ' + escapeHtml((e && e.message) || String(e)), 'error');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-save"></i> Save';
+      }
+    }
+
 function deleteTable(simple) {
       const sel = document.getElementById('pairSel');
       const sup = sel && sel.value ? sel.value : currentSuper;
@@ -1991,6 +2299,7 @@ function deleteTable(simple) {
           closeSchemaOverlay();
           closeStatsOverlay();
           closeOverviewOverlay();
+          closeLimits();
         }
       });
 
@@ -2007,6 +2316,11 @@ function deleteTable(simple) {
       document.getElementById('overviewOverlay').addEventListener('click', function (e) {
         if (e.target === this) {
           closeOverviewOverlay();
+        }
+      });
+      document.getElementById('limitsOverlay').addEventListener('click', function (e) {
+        if (e.target === this) {
+          closeLimits();
         }
       });
     });
@@ -2169,6 +2483,83 @@ function deleteTable(simple) {
       </div>
     </div>
     <div id="statsBody" class="inline-card-body"></div>
+  </div>
+</div>
+
+
+<!-- Per-table limits / settings overlay -->
+<div id="limitsOverlay">
+  <div id="limitsCard">
+
+    <div id="limitsHeader">
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <div style="font-size:15px;font-weight:600;color:#111827;display:flex;align-items:center;gap:8px;">
+          <i class="fas fa-sliders-h" style="color:var(--primary-color);"></i>
+          <span>Table Limits &ndash; <span id="limitsTitleTable" style="color:var(--primary-color);"></span></span>
+        </div>
+        <div id="limitsTitleSub" style="font-size:11px;color:#6b7280;"></div>
+      </div>
+      <button class="icon-button" type="button" onclick="closeLimits()" title="Close">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+
+    <div id="limitsBody">
+
+      <div class="limits-defaults-note">
+        Leave a field <strong>blank</strong> to inherit the global default
+        (<code>MAX_MEMORY_CHUNK_SIZE</code> / <code>MAX_OVERLAPPING_FILES</code>).
+        Set a value to override it for this table only.
+      </div>
+
+      <div class="limits-field">
+        <div class="limits-label">
+          <i class="fas fa-memory"></i> Memory chunk size
+        </div>
+        <div class="limits-input-row">
+          <input id="limitsChunkMB"
+                 class="limits-input"
+                 type="number"
+                 min="1"
+                 step="1"
+                 placeholder="e.g. 16  (global default)">
+          <span class="limits-unit">MB</span>
+        </div>
+        <div class="limits-hint">
+          Max bytes loaded into memory per merge chunk.
+          Clear to use the global default.
+        </div>
+      </div>
+
+      <div class="limits-field">
+        <div class="limits-label">
+          <i class="fas fa-layer-group"></i> Max overlapping files
+        </div>
+        <div class="limits-input-row">
+          <input id="limitsMaxFiles"
+                 class="limits-input"
+                 type="number"
+                 min="1"
+                 step="1"
+                 placeholder="e.g. 100  (global default)">
+          <span class="limits-unit">files</span>
+        </div>
+        <div class="limits-hint">
+          Triggers compaction when this many non-overlapping files accumulate.
+          Clear to use the global default.
+        </div>
+      </div>
+
+    </div>
+
+    <div class="limits-footer">
+      <span id="limitsStatus" class="limits-status"></span>
+      <button class="btn-limits-cancel" type="button" onclick="closeLimits()">Cancel</button>
+      <button id="limitsSaveBtn" class="btn-limits-save" type="button" onclick="saveLimits()">
+        <i class="fas fa-save"></i> Save
+      </button>
+    </div>
+
   </div>
 </div>
 

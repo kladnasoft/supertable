@@ -15,6 +15,19 @@ from supertable.utils.helper import generate_filename, collect_schema
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
 
+
+def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:
+    """Return (max_mem_bytes, max_files) for the given table config.
+
+    Resolution order:
+      1. Per-table value stored in Redis (table_config dict)
+      2. Global default (from environment / defaults.py)
+    """
+    cfg = table_config or {}
+    max_mem = int(cfg.get("max_memory_chunk_size") or getattr(default, "MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024))
+    max_files = int(cfg.get("max_overlapping_files") or getattr(default, "MAX_OVERLAPPING_FILES", 100))
+    return max_mem, max_files
+
 # Lazy storage accessor to avoid import-time initialization failures
 _storage = None
 
@@ -199,8 +212,10 @@ def is_file_in_overlapping_files(file: str, overlapping_files: Set[Tuple[str, bo
     return False
 
 
-def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, bool, int]]) -> Set[
-    Tuple[str, bool, int]]:
+def prune_not_overlapping_files_by_threshold(
+        overlapping_files: Set[Tuple[str, bool, int]],
+        table_config: Optional[dict] = None,
+) -> Set[Tuple[str, bool, int]]:
     """
     Policy:
       - Always include entries with has_overlap=True
@@ -210,9 +225,10 @@ def prune_not_overlapping_files_by_threshold(overlapping_files: Set[Tuple[str, b
         When the gate opens, ALL false items are included (the downstream
         process_files_without_overlap handles chunked flushing at memory
         boundaries, so we must not drop files here).
+
+    Limits are resolved per-table (table_config) with fallback to global default.
     """
-    max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
-    max_files = int(getattr(default, "MAX_OVERLAPPING_FILES", 100))
+    max_mem, max_files = _resolve_limits(table_config)
 
     total_size = sum(item[2] for item in overlapping_files)
     total_false = len([item for item in overlapping_files if item[1] is False])
@@ -239,12 +255,15 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
         df: polars.DataFrame,
         overwrite_columns: List[str],
         locking: Locking,  # not used anymore for per-file locks; higher-level lock covers us
+        table_config: Optional[dict] = None,
 ) -> Set[Tuple[str, bool, int]]:
     """
     Builds the candidate set:
       - has_overlap=True for files whose stats indicate key overlap (or missing stats)
       - has_overlap=False for small, non-overlapping files (< MAX_MEMORY_CHUNK_SIZE)
     Then applies prune_not_overlapping_files_by_threshold to decide the final merge set.
+
+    Limits are resolved per-table (table_config) with fallback to global default.
 
     NOTE:
       - No per-file locking here (consistent with new locking model).
@@ -309,9 +328,9 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
                     overlapping_files.add((file, True, file_size))
                 else:
                     # non-overlapping small files can be considered for compaction
-                    if (file_size < int(getattr(default, "MAX_MEMORY_CHUNK_SIZE",
-                                                512 * 1024 * 1024))) and not is_file_in_overlapping_files(file,
-                                                                                                          overlapping_files):
+                    _max_mem, _ = _resolve_limits(table_config)
+                    if (file_size < _max_mem) and not is_file_in_overlapping_files(file,
+                                                                                   overlapping_files):
                         overlapping_files.add((file, False, file_size))
             else:
                 # Missing stats → treat as overlapping (be conservative)
@@ -322,11 +341,12 @@ def find_and_lock_overlapping_files(  # keep name/signature for compatibility
         for resource in resources:
             file = resource["file"]
             file_size = int(resource.get("file_size") or 0)
-            if file_size < int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024)):
+            _max_mem, _ = _resolve_limits(table_config)
+            if file_size < _max_mem:
                 overlapping_files.add((file, False, file_size))
 
     # Apply pruning logic to trigger compaction when many/large small files accumulate
-    overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files)
+    overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files, table_config=table_config)
 
     # Per-file locks removed intentionally; higher-level simple/table lock handles concurrency
     return overlapping_files
@@ -343,6 +363,7 @@ def process_overlapping_files(
         data_dir: str,
         compression_level: int,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        table_config: Optional[dict] = None,
 ):
     """
     Merge implementation:
@@ -350,6 +371,8 @@ def process_overlapping_files(
       - For has_overlap=True entries, read existing file, drop rows being overwritten, append the remainder
       - Periodically flush chunks if they get too big
       - Write any remainder at the end
+
+    Limits are resolved per-table (table_config) with fallback to global default.
     """
     inserted = df.shape[0]
     deleted = 0
@@ -372,6 +395,7 @@ def process_overlapping_files(
         overwrite_columns=overwrite_columns,
         sunset_files=sunset_files,
         compression_level=compression_level,
+        table_config=table_config,
     )
 
     # Start merged with compaction chunk + incoming df
@@ -391,6 +415,7 @@ def process_overlapping_files(
         total_rows=total_rows,
         compression_level=compression_level,
         file_cache=file_cache,
+        table_config=table_config,
     )
 
     # Phase 3: compact skipped small files when file count exceeds threshold.
@@ -403,8 +428,7 @@ def process_overlapping_files(
     # MAX_OVERLAPPING_FILES, merge ALL of them into the output buffer.
     # process_files_without_overlap already handles this pattern for
     # has_overlap=False files; this does the same for the skipped True files.
-    max_files = int(getattr(default, "MAX_OVERLAPPING_FILES", 100))
-    max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
+    max_mem, max_files = _resolve_limits(table_config)
 
     if len(skipped_files) >= max_files:
         compact_size = 0
@@ -457,6 +481,7 @@ def process_files_with_overlap(
         total_rows,
         compression_level,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        table_config: Optional[dict] = None,
 ):
     # Pre-compute unique values for overwrite columns (ORIGINAL FAST APPROACH)
     unique_values_map = {}
@@ -510,7 +535,8 @@ def process_files_with_overlap(
         sunset_files.add(file)
 
         # Spill chunk if too large (ORIGINAL APPROACH - 2x memory chunk)
-        if merged_df.estimated_size() > int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024)) * 2:
+        _max_mem, _ = _resolve_limits(table_config)
+        if merged_df.estimated_size() > _max_mem * 2:
             total_rows += merged_df.shape[0]
             write_parquet_and_collect_resources(
                 write_df=merged_df,
@@ -532,11 +558,12 @@ def process_files_without_overlap(
         overwrite_columns,
         sunset_files,
         compression_level,
+        table_config: Optional[dict] = None,
 ):
     # ORIGINAL COMPACTION APPROACH - simple and fast
     chunk_size = 0
     chunk_df = empty_df.clone()
-    max_mem = int(getattr(default, "MAX_MEMORY_CHUNK_SIZE", 512 * 1024 * 1024))
+    max_mem, _ = _resolve_limits(table_config)
 
     # Pull in has_overlap=False files (selected by threshold pruning) for compaction
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if not has_overlap):

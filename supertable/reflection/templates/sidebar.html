@@ -202,6 +202,45 @@
     white-space: nowrap;
     overflow: hidden;
     transition: opacity 0.18s ease;
+    /* clickable toggle */
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-radius: 6px;
+    user-select: none;
+  }
+
+  .sidebar-section:hover {
+    color: var(--primary-color);
+  }
+
+  /* Chevron inside section header */
+  .sidebar-section .section-chevron {
+    font-size: 9px;
+    transition: transform 0.22s ease;
+    color: var(--text-light);
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
+
+  .sidebar-section.section-open .section-chevron {
+    transform: rotate(180deg);
+  }
+
+  /* Nav group wrapper — links slide in/out */
+  .nav-group-links {
+    overflow: hidden;
+    max-height: 600px;       /* large enough to never clip */
+    transition: max-height 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity    0.2s ease;
+    opacity: 1;
+  }
+
+  .nav-group-links.nav-group-collapsed {
+    max-height: 0;
+    opacity: 0;
+    pointer-events: none;
   }
 
   .sidebar-collapsed .sidebar-section {
@@ -210,6 +249,13 @@
     padding: 0;
     margin: 0;
     pointer-events: none;
+  }
+
+  /* Collapsed sidebar: always show all links (groups irrelevant) */
+  .sidebar-collapsed .nav-group-links {
+    max-height: 600px !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
   }
 
   /* Collapsed divider (replaces section labels) */
@@ -566,17 +612,6 @@
 
   .ctx-logout-btn i { font-size: 11px; }
 
-  /* ── Collapsed sidebar overrides ─────────────────────────────── */
-
-  .sidebar-collapsed .ctx-logout {
-    opacity: 0;
-    width: 0;
-    height: 0;
-    overflow: hidden;
-    pointer-events: none;
-    position: absolute;
-  }
-
   /* Collapsed tooltip on toggle icon */
   .ctx-toggle .ctx-toggle-tooltip {
     position: absolute;
@@ -739,74 +774,89 @@
 
   <nav class="nav flex-column sidebar-nav">
 
-    <div class="sidebar-section">Navigation</div>
+    <div class="sidebar-section section-open" data-group="navigation">
+      <span>Navigation</span>
+      <i class="fas fa-chevron-down section-chevron"></i>
+    </div>
     <div class="sidebar-section-divider"></div>
 
-    <a href="/reflection/home" class="sidebar-link" id="link-home">
-      <i class="fas fa-house"></i>
-      <span>Home</span>
-      <span class="sidebar-tooltip">Home</span>
-    </a>
+    <div class="nav-group-links" id="nav-group-navigation">
+      <a href="/reflection/home" class="sidebar-link" id="link-home">
+        <i class="fas fa-house"></i>
+        <span>Home</span>
+        <span class="sidebar-tooltip">Home</span>
+      </a>
 
-    <a href="/reflection/execute" class="sidebar-link" id="link-execute">
-      <i class="fas fa-terminal"></i>
-      <span>Execute SQL</span>
-      <span class="sidebar-tooltip">Execute SQL</span>
-    </a>
+      <a href="/reflection/execute" class="sidebar-link" id="link-execute">
+        <i class="fas fa-terminal"></i>
+        <span>Execute SQL</span>
+        <span class="sidebar-tooltip">Execute SQL</span>
+      </a>
 
-    <a href="/reflection/tables" class="sidebar-link" id="link-tables">
-      <i class="fas fa-table"></i>
-      <span>Tables</span>
-      <span class="sidebar-tooltip">Tables</span>
-    </a>
+      <a href="/reflection/tables" class="sidebar-link" id="link-tables">
+        <i class="fas fa-table"></i>
+        <span>Tables</span>
+        <span class="sidebar-tooltip">Tables</span>
+      </a>
 
-    <a href="/reflection/ingestion" class="sidebar-link" id="link-staging">
-      <i class="fas fa-layer-group"></i>
-      <span>Ingestion</span>
-      <span class="sidebar-tooltip">Ingestion</span>
-    </a>
+      <a href="/reflection/ingestion" class="sidebar-link" id="link-staging">
+        <i class="fas fa-layer-group"></i>
+        <span>Ingestion</span>
+        <span class="sidebar-tooltip">Ingestion</span>
+      </a>
 
-    <a href="/reflection/studio" class="sidebar-link" id="link-studio">
-      <i class="fas fa-book"></i>
-      <span>Studio</span>
-      <span class="sidebar-tooltip">Studio</span>
-    </a>
+      <a href="/reflection/studio" class="sidebar-link" id="link-studio">
+        <i class="fas fa-book"></i>
+        <span>Studio</span>
+        <span class="sidebar-tooltip">Studio</span>
+      </a>
 
-    <a href="/reflection/jobs" class="sidebar-link" id="link-jobs">
-      <i class="fas fa-clock"></i>
-      <span>Jobs</span>
-      <span class="sidebar-tooltip">Jobs</span>
-    </a>
+      <a href="/reflection/jobs" class="sidebar-link" id="link-jobs">
+        <i class="fas fa-clock"></i>
+        <span>Jobs</span>
+        <span class="sidebar-tooltip">Jobs</span>
+      </a>
+    </div>
 
-    <div class="sidebar-section">Infrastructure</div>
+    <div class="sidebar-section" data-group="infrastructure">
+      <span>Infrastructure</span>
+      <i class="fas fa-chevron-down section-chevron"></i>
+    </div>
     <div class="sidebar-section-divider"></div>
 
-    <a href="/reflection/vault" class="sidebar-link" id="link-vault">
-      <i class="fas fa-plug"></i>
-      <span>Vault</span>
-      <span class="sidebar-tooltip">Vault</span>
-    </a>
+    <div class="nav-group-links nav-group-collapsed" id="nav-group-infrastructure">
+      <a href="/reflection/vault" class="sidebar-link" id="link-vault">
+        <i class="fas fa-plug"></i>
+        <span>Vault</span>
+        <span class="sidebar-tooltip">Vault</span>
+      </a>
 
-    <a href="/reflection/compute" class="sidebar-link" id="link-compute">
-      <i class="fas fa-server"></i>
-      <span>Compute</span>
-      <span class="sidebar-tooltip">Compute</span>
-    </a>
+      <a href="/reflection/compute" class="sidebar-link" id="link-compute">
+        <i class="fas fa-server"></i>
+        <span>Compute</span>
+        <span class="sidebar-tooltip">Compute</span>
+      </a>
+    </div>
 
-    <div class="sidebar-section">Access Control</div>
+    <div class="sidebar-section" data-group="access-control">
+      <span>Access Control</span>
+      <i class="fas fa-chevron-down section-chevron"></i>
+    </div>
     <div class="sidebar-section-divider"></div>
 
-    <a href="/reflection/admin" class="sidebar-link" id="link-admin">
-      <i class="fas fa-user-shield"></i>
-      <span>Admin</span>
-      <span class="sidebar-tooltip">Admin</span>
-    </a>
+    <div class="nav-group-links nav-group-collapsed" id="nav-group-access-control">
+      <a href="/reflection/users-page" class="sidebar-link" id="link-users-page">
+        <i class="fas fa-users"></i>
+        <span>Users</span>
+        <span class="sidebar-tooltip">Users</span>
+      </a>
 
-    <a href="/reflection/rbac" class="sidebar-link" id="link-rbac">
-      <i class="fas fa-user-lock"></i>
-      <span>RBAC Views</span>
-      <span class="sidebar-tooltip">RBAC Views</span>
-    </a>
+      <a href="/reflection/rbac" class="sidebar-link" id="link-rbac">
+        <i class="fas fa-user-lock"></i>
+        <span>RBAC Views</span>
+        <span class="sidebar-tooltip">RBAC Views</span>
+      </a>
+    </div>
 
   </nav>
 
@@ -855,14 +905,16 @@
         </select>
       </div>
 
-    </div>
+      <div class="ctx-divider"></div>
 
-    <!-- Logout — always visible below panel -->
-    <div class="ctx-logout">
-      <a href="/reflection/logout" class="ctx-logout-btn" title="Sign out">
-        <i class="fas fa-arrow-right-from-bracket"></i>
-        <span>Sign out</span>
-      </a>
+      <!-- Logout — inside panel, collapses with it -->
+      <div class="ctx-logout">
+        <a href="/reflection/logout" class="ctx-logout-btn" title="Sign out">
+          <i class="fas fa-arrow-right-from-bracket"></i>
+          <span>Sign out</span>
+        </a>
+      </div>
+
     </div>
 
   </div>
@@ -880,6 +932,75 @@
   </div>
 
 </div>
+
+<!-- Nav group collapse/expand — accordion behaviour -->
+<script>
+(function () {
+  var STORAGE_KEY = 'st_nav_open_group';
+
+  // Map each link id → group id so we can auto-open the right group
+  var LINK_GROUP = {
+    'link-home':       'navigation',
+    'link-execute':    'navigation',
+    'link-tables':     'navigation',
+    'link-staging':    'navigation',
+    'link-studio':     'navigation',
+    'link-jobs':       'navigation',
+    'link-vault':      'infrastructure',
+    'link-compute':    'infrastructure',
+    'link-users-page': 'access-control',
+    'link-rbac':       'access-control',
+  };
+
+  function openGroup(groupId, saveToStorage) {
+    document.querySelectorAll('.sidebar-section').forEach(function (sec) {
+      var isTarget = sec.getAttribute('data-group') === groupId;
+      var linksEl  = document.getElementById('nav-group-' + sec.getAttribute('data-group'));
+      if (isTarget) {
+        sec.classList.add('section-open');
+        if (linksEl) linksEl.classList.remove('nav-group-collapsed');
+      } else {
+        sec.classList.remove('section-open');
+        if (linksEl) linksEl.classList.add('nav-group-collapsed');
+      }
+    });
+    if (saveToStorage) {
+      try { localStorage.setItem(STORAGE_KEY, groupId); } catch (e) {}
+    }
+  }
+
+  function initGroups() {
+    // Determine which group should be open:
+    // 1. The group containing the currently-active link
+    // 2. Otherwise, the group saved in localStorage
+    // 3. Otherwise, 'navigation'
+    var activeLink = document.querySelector('.sidebar-link.active');
+    var activeLinkId = activeLink ? activeLink.id : null;
+    var groupFromLink = activeLinkId ? LINK_GROUP[activeLinkId] : null;
+    var groupFromStorage;
+    try { groupFromStorage = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+
+    var openGroupId = groupFromLink || groupFromStorage || 'navigation';
+    openGroup(openGroupId, false);
+
+    // Wire up click handlers on each section header
+    document.querySelectorAll('.sidebar-section[data-group]').forEach(function (sec) {
+      sec.addEventListener('click', function () {
+        var gid = sec.getAttribute('data-group');
+        // If already open → keep open (no close-all behaviour; always one group open)
+        openGroup(gid, true);
+      });
+    });
+  }
+
+  // Run after DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initGroups);
+  } else {
+    initGroups();
+  }
+})();
+</script>
 
 <!-- Sidebar collapse/expand — shared across all pages -->
 <script>

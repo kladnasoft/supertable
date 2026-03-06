@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Dict, Any
 
+# never remove the homedir, it is mandatory be there
+from supertable.config.homedir import app_home
 from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager

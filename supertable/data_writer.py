@@ -41,8 +41,10 @@ class DataWriter:
             simple_name: str,
             primary_keys: list,
             dedup_on_read: bool = False,
+            max_memory_chunk_size: int | None = None,
+            max_overlapping_files: int | None = None,
     ) -> None:
-        """Set table-level configuration for dedup-on-read behaviour.
+        """Set table-level configuration for dedup-on-read behaviour and per-table limits.
 
         This is a one-time (or infrequent) operation.  The configuration is
         persisted in Redis so the read side can build the dedup view, and
@@ -55,6 +57,10 @@ class DataWriter:
             primary_keys: Column names that form the logical primary key.
             dedup_on_read: When True, the read side wraps queries with a
                 ROW_NUMBER window to return only the latest row per key.
+            max_memory_chunk_size: Override MAX_MEMORY_CHUNK_SIZE (bytes) for
+                this table.  None leaves the existing value unchanged.
+            max_overlapping_files: Override MAX_OVERLAPPING_FILES for this
+                table.  None leaves the existing value unchanged.
         """
         check_write_access(
             super_name=self.super_table.super_name,
@@ -66,10 +72,27 @@ class DataWriter:
         if not isinstance(primary_keys, list) or not primary_keys:
             raise ValueError("primary_keys must be a non-empty list of column names")
 
-        config = {
-            "primary_keys": primary_keys,
-            "dedup_on_read": bool(dedup_on_read),
-        }
+        # Only fetch existing Redis config when a limit override is being set,
+        # preserving the cache-population guarantee for callers that omit them.
+        if max_memory_chunk_size is not None or max_overlapping_files is not None:
+            existing = self.catalog.get_table_config(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            ) or {}
+        else:
+            existing = self._table_config_cache.get(simple_name) or {}
+        config = dict(existing)
+        config["primary_keys"] = primary_keys
+        config["dedup_on_read"] = bool(dedup_on_read)
+        if max_memory_chunk_size is not None:
+            if max_memory_chunk_size <= 0:
+                raise ValueError("max_memory_chunk_size must be a positive integer")
+            config["max_memory_chunk_size"] = int(max_memory_chunk_size)
+        if max_overlapping_files is not None:
+            if max_overlapping_files <= 0:
+                raise ValueError("max_overlapping_files must be a positive integer")
+            config["max_overlapping_files"] = int(max_overlapping_files)
 
         self.catalog.set_table_config(
             self.super_table.organization,
@@ -160,7 +183,8 @@ class DataWriter:
 
             # --- Detect overlaps ----------------------------------------------
             overlapping_files = find_and_lock_overlapping_files(
-                last_simple_table, dataframe, overwrite_columns, locking=None
+                last_simple_table, dataframe, overwrite_columns, locking=None,
+                table_config=table_config,
             )
             mark("overlap")
 
@@ -224,6 +248,7 @@ class DataWriter:
                     simple_table.data_dir,
                     compression_level,
                     file_cache=file_cache,
+                    table_config=table_config,
                 )
             mark("process")
 

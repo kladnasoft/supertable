@@ -212,22 +212,72 @@
       background-color: #ffffff; /* Ensure background is applied */
     }
 
-    /* --- Buttons (Standard) --- */
+    /* --- Buttons (Standard) — outline-blue, matches tables.html actions --- */
     .btn {
-      padding: 8px 12px;
-      border-radius: 8px;
-      background: var(--dark-color);
-      border: 1px solid var(--dark-color);
-      color: #e2e8f0;
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: transparent;
+      border: 1px solid var(--primary-color);
+      color: var(--primary-color);
       font-weight: 500;
       cursor: pointer;
-      font-size: 13px;
+      font-size: 12.5px;
       transition: var(--transition);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
     }
 
     .btn:hover {
-        filter: brightness(1.1);
-        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
+      background: var(--primary-light);
+      border-color: var(--secondary-color);
+      color: var(--secondary-color);
+    }
+
+    /* --- Engine pill selector (Option 2 top-toolbar) --- */
+    .engine-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--primary-light);
+      border: 1px solid rgba(28, 150, 202, 0.25);
+      border-radius: 999px;
+      padding: 4px 12px 4px 10px;
+    }
+    .engine-pill label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--secondary-color);
+      cursor: pointer;
+      white-space: nowrap;
+      margin: 0;
+    }
+    .engine-pill i { color: var(--primary-color); font-size: 11px; }
+    .engine-pill select {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--primary-color);
+      background: transparent;
+      border: none;
+      outline: none;
+      cursor: pointer;
+      font-family: inherit;
+      padding: 0;
+      margin: 0;
+      width: auto;
+      margin-top: 0;
+    }
+    .engine-pill select:focus { box-shadow: none; border-color: transparent; }
+
+    /* --- Toolbar separator --- */
+    .toolbar-sep {
+      width: 1px;
+      height: 20px;
+      background: var(--panel-border);
+      flex-shrink: 0;
     }
 
 
@@ -675,6 +725,14 @@
     .CodeMirror-hint-active {
       background: var(--primary-color);
       color: white;
+    }
+    /* --- SQL pre-flight error marker (squiggly underline in editor) --- */
+    .cm-sql-error {
+      text-decoration: underline wavy #ef4444;
+      text-decoration-skip-ink: none;
+      background: rgba(239, 68, 68, 0.08);
+      border-radius: 2px;
+      cursor: help;
     }
   </style>
 
@@ -1547,6 +1605,131 @@ let html = '';
       }
     }
 
+    // --- SQL pre-flight validation ---
+    // Detects common syntax problems before sending to the server.
+    // Returns null on success, or { message, line, ch, length } on error.
+    //
+    // Checks performed:
+    //   1. Bare SQL keyword used as an alias directly after a table reference,
+    //      e.g. "FROM t1 ass alias" — likely a typo for AS.
+    //   2. Double alias — two identifiers in a row after a table where a single
+    //      keyword alias was expected, e.g. "FROM t1 as as alias".
+    (function () {
+      // SQL keywords that are never valid bare table aliases.
+      // Kept intentionally small — only the most common typo targets.
+      const RESERVED = new Set([
+        'select','from','where','join','left','right','inner','outer',
+        'cross','full','on','using','group','order','having','limit',
+        'offset','union','except','intersect','insert','update','delete',
+        'set','into','values','create','drop','alter','table','view',
+        'with','recursive','by','asc','desc','and','or','not','in',
+        'between','like','is','null','true','false','case','when',
+        'then','else','end','distinct','all','exists','any','some',
+        'over','partition','row_number','rank','dense_rank',
+      ]);
+
+      // Words that ARE valid after a table name (not alias keywords but control words)
+      const AFTER_TABLE_OK = new Set([
+        'as','on','where','join','left','right','inner','outer','cross',
+        'full','using','group','order','having','limit','offset','union',
+        'except','intersect','with',',',';',
+      ]);
+
+      window._validateSqlPreflight = function (sql) {
+        if (!sql) return null;
+
+        // Tokenise: words, dots, commas, parens — preserve positions.
+        // We need (value, lineIndex, colIndex) for each token.
+        const lines = sql.split('\n');
+        const tokens = []; // { val, line, ch }
+
+        for (let li = 0; li < lines.length; li++) {
+          const lineText = lines[li];
+          // Match words or single-char punctuation
+          const re = /([A-Za-z_][A-Za-z0-9_]*|[^\s\w])/g;
+          let m;
+          while ((m = re.exec(lineText)) !== null) {
+            tokens.push({ val: m[1], line: li, ch: m.index });
+          }
+        }
+
+        // Walk tokens looking for:  <table_ref> <bad_keyword_alias>
+        // A table_ref is any identifier preceded by FROM, JOIN variant, or comma
+        // (within a FROM list).
+        // Comma intentionally excluded: we cannot distinguish a SELECT-list comma
+      // from a FROM-list comma without a full parser, so including it causes
+      // false positives on  SELECT a.x, b.y FROM …
+      const FROM_LIKE = new Set(['from','join']);
+        let expectTableRef = false;
+
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i];
+          const lower = tok.val.toLowerCase();
+
+          if (FROM_LIKE.has(lower)) {
+            expectTableRef = true;
+            continue;
+          }
+
+          if (expectTableRef) {
+            // tok is now the table name (or schema.table — skip the dot parts)
+            expectTableRef = false;
+
+            // Skip schema-qualified names: consume  identifier . identifier
+            let j = i;
+            if (tokens[j + 1] && tokens[j + 1].val === '.') {
+              j += 2; // skip  .  and  table_name
+            }
+
+            // Next non-trivial token after the table reference
+            const next = tokens[j + 1];
+            if (!next) continue;
+            const nextLower = next.val.toLowerCase();
+
+            // 'AS' is fine — skip it and what follows (the alias)
+            if (nextLower === 'as') continue;
+
+            // If the next word is a reserved keyword that can't be a bare alias
+            // AND is not one of the legal follow-on control words, flag it.
+            if (RESERVED.has(nextLower) && !AFTER_TABLE_OK.has(nextLower)) {
+              // Check: could it be an accidental reserved word used as alias?
+              // Heuristic: it's flagged only when the word after it is an identifier
+              // (suggesting  FROM t ass alias  pattern) or there's nothing after
+              // (standalone reserved word where alias should be).
+              const afterNext = tokens[j + 2];
+              const afterNextLower = afterNext ? afterNext.val.toLowerCase() : '';
+              const looksLikeTypo = !afterNext
+                || (!AFTER_TABLE_OK.has(afterNextLower) && !RESERVED.has(afterNextLower))
+                || afterNextLower === 'as';
+
+              if (looksLikeTypo) {
+                return {
+                  message: `Syntax error: "${next.val}" is a reserved keyword and cannot be used as a table alias. Did you mean "AS ${afterNext ? afterNext.val : '…'}"?`,
+                  line: next.line,
+                  ch: next.ch,
+                  length: next.val.length,
+                };
+              }
+            }
+
+            // If there are TWO consecutive plain identifiers after the table name
+            // where only one alias word is expected, flag the second one.
+            // e.g.  FROM t1 t2 t3  →  "t3" is suspicious
+            // (only flag when the first identifier is not AS)
+          }
+        }
+        return null;
+      };
+    })();
+
+    // ── clear any existing preflight markers from the editor ──────
+    window._clearSqlErrorMarkers = function () {
+      if (window._sqlErrorMarkers) {
+        window._sqlErrorMarkers.forEach(function (m) { try { m.clear(); } catch (e) {} });
+      }
+      window._sqlErrorMarkers = [];
+    };
+
     // --- execution timing state ---
     let execStartTime = null;
     let execTimerId = null;
@@ -1606,6 +1789,37 @@ let html = '';
         return;
       }
 
+      // ── Pre-flight SQL validation (client-side, before hitting server) ──
+      _clearSqlErrorMarkers();
+      const _preflightErr = window._validateSqlPreflight ? window._validateSqlPreflight(query) : null;
+      if (_preflightErr) {
+        // Mark the offending token in the editor with a squiggly underline
+        if (window.editor) {
+          const from = { line: _preflightErr.line, ch: _preflightErr.ch };
+          const to   = { line: _preflightErr.line, ch: _preflightErr.ch + _preflightErr.length };
+          const marker = window.editor.markText(from, to, {
+            className: 'cm-sql-error',
+            title: _preflightErr.message,
+          });
+          if (!window._sqlErrorMarkers) window._sqlErrorMarkers = [];
+          window._sqlErrorMarkers.push(marker);
+        }
+        setStatus('Syntax error', 'error');
+        if (session) {
+          session.errorVisible = true;
+          session.errorTitle = 'Syntax Error';
+          session.errorMessage = _preflightErr.message;
+          session.statusText = 'Syntax error';
+          session.statusCls = 'error';
+        }
+        // Show error inline — stay on execute tab so the highlight is visible
+        const errorDisplay = document.getElementById('query-error-display');
+        errorDisplay.style.display = 'block';
+        errorDisplay.querySelector('strong').textContent = 'Syntax Error:';
+        document.getElementById('query-error-message').textContent = _preflightErr.message;
+        return;
+      }
+
       const startedAt = Date.now();
       execStartTime = startedAt;
 
@@ -1648,6 +1862,7 @@ let html = '';
             super_name: superName,
             role_name: roleName,
             query,
+            engine: (document.getElementById('engineSel') || {}).value || 'auto',
             page: 1,
             page_size: pageSize
           })
@@ -1949,15 +2164,54 @@ let html = '';
 
 
 
-    // --- Save as RBAC View (stored in Redis; managed on /reflection/rbac) ---
-    function __setSaveViewStatus(text, isError) {
-      const el = document.getElementById('saveViewStatus');
-      if (!el) return;
-      el.style.display = 'block';
-      el.style.color = isError ? '#b91c1c' : '#0f766e';
-      el.textContent = text;
+    // ── Auto-detect tables and WHERE conditions from a SQL query ──────────────
+    function _detectTablesFromSQL(sql) {
+      // Strip comments
+      let q = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      const tables = new Set();
+      // Match FROM table_name [alias] and JOIN table_name [alias]
+      // Handles: FROM foo, FROM foo f, FROM foo AS f, JOIN foo, LEFT JOIN foo AS f etc.
+      const re = /(?:FROM|JOIN)\s+([a-zA-Z_][\w.]*)/gi;
+      let m;
+      while ((m = re.exec(q)) !== null) {
+        const raw = m[1];
+        // Strip schema prefix (schema.table → table)
+        const name = raw.includes('.') ? raw.split('.').pop() : raw;
+        // Skip SQL keywords that can appear after FROM in subqueries
+        if (/^(SELECT|WHERE|GROUP|ORDER|HAVING|LIMIT|UNION|WITH)$/i.test(name)) continue;
+        tables.add(name);
+      }
+      return [...tables];
     }
 
+    function _detectFiltersFromSQL(sql) {
+      // Strip comments, strip trailing semicolons
+      let q = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/;+$/, '').trim();
+      // Extract everything after the last WHERE up to GROUP BY / ORDER BY / LIMIT / HAVING
+      const whereMatch = q.match(/\bWHERE\b([\s\S]+?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$)/i);
+      if (!whereMatch) return [];
+      const whereClause = whereMatch[1].trim();
+      if (!whereClause) return [];
+      // Split on top-level AND (not inside parentheses)
+      const conditions = [];
+      let depth = 0, current = '';
+      for (let i = 0; i < whereClause.length; i++) {
+        const ch = whereClause[i];
+        if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+        if (depth === 0 && /\bAND\b/i.test(whereClause.slice(i, i + 3))) {
+          if (current.trim()) conditions.push(current.trim());
+          current = '';
+          i += 2; // skip "AND"
+          continue;
+        }
+        current += ch;
+      }
+      if (current.trim()) conditions.push(current.trim());
+      return conditions.filter(Boolean);
+    }
+
+    // ── Save as Role modal ────────────────────────────────────────────────────
     function openSaveViewModal() {
       const { organization, superName } = getTenant();
       const q = window.editor ? String(window.editor.getValue() || '').trim() : '';
@@ -1967,29 +2221,38 @@ let html = '';
         return;
       }
       if (!/^\s*(select|with)\b/i.test(q)) {
-        alert('Only SELECT/WITH queries can be saved as a view.');
+        alert('Only SELECT/WITH queries can be saved as a role.');
         return;
       }
 
-      const orgEl = document.getElementById('saveViewOrg');
-      const supEl = document.getElementById('saveViewSup');
-      const nameEl = document.getElementById('saveViewName');
-      const descEl = document.getElementById('saveViewDesc');
-      const qEl = document.getElementById('saveViewQueryPreview');
-      const stEl = document.getElementById('saveViewStatus');
-      const manage = document.getElementById('saveViewManageLink');
+      const orgEl   = document.getElementById('saveViewOrg');
+      const supEl   = document.getElementById('saveViewSup');
+      const nameEl  = document.getElementById('saveViewName');
+      const tablesEl = document.getElementById('saveRoleTables');
+      const colsEl  = document.getElementById('saveRoleColumns');
+      const filtersEl = document.getElementById('saveRoleFilters');
+      const qEl     = document.getElementById('saveViewQueryPreview');
+      const stEl    = document.getElementById('saveViewStatus');
+      const manage  = document.getElementById('saveViewManageLink');
 
-      if (orgEl) orgEl.textContent = organization;
-      if (supEl) supEl.textContent = superName;
-      if (qEl) qEl.value = q;
-      if (stEl) stEl.style.display = 'none';
+      if (orgEl)  orgEl.textContent  = organization;
+      if (supEl)  supEl.textContent  = superName;
+      if (qEl)    qEl.value          = q;
+      if (stEl)   stEl.style.display = 'none';
 
-      // Default name suggestion (non-destructive)
+      // Auto-detect tables and filters (best effort)
+      const detectedTables  = _detectTablesFromSQL(q);
+      const detectedFilters = _detectFiltersFromSQL(q);
+
+      if (tablesEl)  tablesEl.value  = detectedTables.length  ? detectedTables.join(', ')  : '*';
+      if (colsEl)    colsEl.value    = '*';
+      if (filtersEl) filtersEl.value = detectedFilters.length ? detectedFilters.join('\n') : '*';
+
+      // Default role name suggestion
       if (nameEl && !nameEl.value) {
-        const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
-        nameEl.value = `View (${superName}) ${ts}`;
+        const ts = new Date().toISOString().slice(0, 10);
+        nameEl.value = `${superName}-role-${ts}`;
       }
-      if (descEl && !descEl.value) descEl.value = '';
 
       if (manage) {
         const url = new URL('/reflection/rbac', window.location.origin);
@@ -2006,59 +2269,82 @@ let html = '';
       const { organization, superName } = getTenant();
       const q = window.editor ? String(window.editor.getValue() || '').trim() : '';
 
-      const nameEl = document.getElementById('saveViewName');
-      const descEl = document.getElementById('saveViewDesc');
-      const btn = document.getElementById('btnSaveViewConfirm');
+      const nameEl    = document.getElementById('saveViewName');
+      const tablesEl  = document.getElementById('saveRoleTables');
+      const colsEl    = document.getElementById('saveRoleColumns');
+      const filtersEl = document.getElementById('saveRoleFilters');
+      const btn       = document.getElementById('btnSaveViewConfirm');
 
-      const name = nameEl ? String(nameEl.value || '').trim() : '';
-      const description = descEl ? String(descEl.value || '').trim() : '';
+      const role_name = nameEl    ? String(nameEl.value    || '').trim() : '';
+      const tablesRaw = tablesEl  ? String(tablesEl.value  || '').trim() : '*';
+      const colsRaw   = colsEl    ? String(colsEl.value    || '').trim() : '*';
+      const filtersRaw = filtersEl ? String(filtersEl.value || '').trim() : '*';
 
-      if (!organization || !superName) {
-        __setSaveViewStatus('Missing organization/super_name.', true);
-        return;
-      }
-      if (!name) {
-        __setSaveViewStatus('View name is required.', true);
-        return;
-      }
-      if (!/^\s*(select|with)\b/i.test(q)) {
-        __setSaveViewStatus('Only SELECT/WITH queries can be saved as a view.', true);
-        return;
+      const errEl = document.getElementById('saveViewStatus');
+      const showErr = (msg) => {
+        errEl.style.display = 'block';
+        errEl.style.color = '#b91c1c';
+        errEl.textContent = msg;
+      };
+      errEl.style.display = 'none';
+
+      if (!organization || !superName) { showErr('Missing organization/super_name.'); return; }
+      if (!role_name)                   { showErr('Role name is required.');           return; }
+      if (!/^\s*(select|with)\b/i.test(q)) { showErr('Only SELECT/WITH queries can be saved as a role.'); return; }
+
+      // Parse tables
+      const tables = tablesRaw === '*'
+        ? ['*']
+        : tablesRaw.split(',').map(s => s.trim()).filter(Boolean);
+
+      // Parse columns
+      const columns = colsRaw === '*'
+        ? ['*']
+        : colsRaw.split(',').map(s => s.trim()).filter(Boolean);
+
+      // Parse filters — one per line or comma-separated; '*' means no filter
+      let filters;
+      if (filtersRaw === '*' || !filtersRaw) {
+        filters = ['*'];
+      } else {
+        // Try newline split first, then comma split
+        const byLine = filtersRaw.split('\n').map(s => s.trim()).filter(Boolean);
+        filters = byLine.length > 1 ? byLine : filtersRaw.split(',').map(s => s.trim()).filter(Boolean);
+        if (!filters.length) filters = ['*'];
       }
 
-      if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>&nbsp;Saving…';
-      }
+      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>&nbsp;Saving…'; }
 
       try {
-        const resp = await api('/reflection/rbac/views', {
+        await api('/reflection/rbac/roles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             organization,
             super_name: superName,
-            name,
-            description,
-            query: q
+            role_name,
+            role: 'reader',           // always reader when created from Execute
+            tables,
+            columns,
+            filters,
+            source_query: q,          // stored for display in RBAC page
           })
         });
 
-        __setSaveViewStatus('Saved successfully.', false);
+        errEl.style.display = 'block';
+        errEl.style.color = '#0f766e';
+        errEl.textContent = 'Role saved successfully.';
 
-        // Close after a short moment so the user sees success feedback.
+        // Clear name so next open gets a fresh suggestion
+        if (nameEl) nameEl.value = '';
+
         setTimeout(() => {
           try { $('#saveViewModal').modal('hide'); } catch (e) {}
         }, 350);
-
-        console.log('Saved view:', resp);
       } catch (e) {
-        __setSaveViewStatus(e && e.message ? e.message : String(e), true);
+        showErr(e && e.message ? e.message : String(e));
       } finally {
-        if (btn) {
-          btn.disabled = false;
-          btn.innerHTML = '<i class="fas fa-check"></i>&nbsp;Save';
-        }
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-shield-halved"></i>&nbsp;Save Role'; }
       }
     }
 $(document).ready(function(){
@@ -2148,27 +2434,42 @@ $(document).ready(function(){
           <div id="tab-content-execute" class="tab-content active">
               <div class="card sql-editor-card">
                   <div class="card-body">
-                      <div style="margin-top:0;">
-                        <label class="text-sm muted">SQL Query</label>
-                        <textarea id="sql" rows="8"></textarea>
-                      </div>
-
-                      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px;">
-                        <div id="status" class="text-sm muted">
-                          <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
+                      <!-- Option 2: top toolbar above editor -->
+                      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 0 10px; flex-wrap:wrap;">
+                        <!-- Left: status + engine -->
+                        <div style="display:flex; align-items:center; gap:10px;">
+                          <div id="status" class="text-sm muted" style="display:flex;align-items:center;gap:6px;">
+                            <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
+                          </div>
+                          <div class="toolbar-sep"></div>
+                          <div class="engine-pill">
+                            <i class="fas fa-microchip"></i>
+                            <label for="engineSel">Engine</label>
+                            <select id="engineSel" title="Select execution engine">
+                              <option value="auto">Auto (default)</option>
+                              <option value="duckdb_pinned">DuckDB Pinned</option>
+                              <option value="duckdb_transient">DuckDB Transient</option>
+                              <option value="spark">Spark Thrift</option>
+                            </select>
+                          </div>
                         </div>
-                        <div style="display:flex; gap:8px;">
+                        <!-- Right: actions -->
+                        <div style="display:flex; align-items:center; gap:6px;">
                           <button id="btnRefreshSchema" type="button" class="btn" title="Refresh table schemas for IntelliSense">
-  <i class="fas fa-sync-alt"></i>&nbsp;Schema
-</button>
+                            <i class="fas fa-sync-alt"></i>&nbsp;Schema
+                          </button>
                           <button id="btnSaveView" type="button" class="btn">
-  <i class="fas fa-save"></i>&nbsp;Save View
-</button>
-
+                            <i class="fas fa-shield-halved"></i>&nbsp;Save as Role
+                          </button>
+                          <span style="display:inline-block; width:6px;"></span>
                           <button id="btnExec" class="btn-exec">
                             <i class="fas fa-play"></i>&nbsp;Execute
                           </button>
                         </div>
+                      </div>
+
+                      <div style="margin-top:0;">
+                        <textarea id="sql" rows="8"></textarea>
                       </div>
                   </div>
               </div>
@@ -2210,43 +2511,86 @@ $(document).ready(function(){
 
 
 
-      <!-- Save as RBAC View Modal -->
+      <!-- Save as Role Modal -->
       <div class="modal fade" id="saveViewModal" tabindex="-1" role="dialog" aria-hidden="true">
         <div class="modal-dialog modal-lg" role="document">
           <div class="modal-content" style="border-radius: 12px;">
             <div class="modal-header" style="background: var(--header-bg); border-bottom: 1px solid var(--panel-border);">
-              <h5 class="modal-title" style="margin:0; font-weight:700;">Save as RBAC View</h5>
+              <h5 class="modal-title" style="margin:0; font-weight:700;">
+                <i class="fas fa-shield-halved" style="color:#1c96ca; margin-right:6px;"></i>Save as Role
+              </h5>
               <button type="button" class="close" data-dismiss="modal" aria-label="Close">
                 <span aria-hidden="true">&times;</span>
               </button>
             </div>
             <div class="modal-body">
-              <div class="text-sm muted" style="margin-bottom: 10px;">
+              <div class="text-sm muted" style="margin-bottom:14px;">
                 Organization: <strong id="saveViewOrg"></strong> &nbsp;•&nbsp; SuperTable: <strong id="saveViewSup"></strong>
               </div>
 
+              <!-- Role name -->
               <div class="form-group">
-                <label class="text-sm muted" for="saveViewName">View name</label>
-                <input id="saveViewName" type="text" class="form-control" placeholder="e.g. Active customers (EU)" maxlength="120" />
+                <label class="text-sm muted" for="saveViewName" style="font-weight:600;">
+                  Role name <span style="color:#ef4444;">*</span>
+                </label>
+                <input id="saveViewName" type="text" class="form-control"
+                       placeholder="e.g. eu-reader, last-week-orders" maxlength="120" />
+                <small class="text-muted">This becomes the role_name users select at login.</small>
               </div>
 
+              <!-- Tables (auto-detected, editable) -->
               <div class="form-group">
-                <label class="text-sm muted" for="saveViewDesc">Description (optional)</label>
-                <textarea id="saveViewDesc" class="form-control" rows="3" placeholder="Short description" maxlength="2000"></textarea>
+                <label class="text-sm muted" for="saveRoleTables" style="font-weight:600;">
+                  Tables
+                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected — edit if needed)</span>
+                </label>
+                <input id="saveRoleTables" type="text" class="form-control"
+                       placeholder="e.g. orders, customers — or * for all" />
+                <small class="text-muted">Comma-separated. The role's filters will apply only to these tables.</small>
               </div>
 
-              <div class="form-group" style="margin-bottom: 0;">
-                <label class="text-sm muted" for="saveViewQueryPreview">Query</label>
-                <textarea id="saveViewQueryPreview" class="form-control" rows="6" readonly></textarea>
+              <!-- Columns -->
+              <div class="form-group">
+                <label class="text-sm muted" for="saveRoleColumns" style="font-weight:600;">
+                  Columns
+                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(default: all)</span>
+                </label>
+                <input id="saveRoleColumns" type="text" class="form-control" value="*"
+                       placeholder="e.g. id, name, email — or * for all" />
               </div>
 
-              <div id="saveViewStatus" class="text-sm" style="margin-top: 10px; display:none;"></div>
+              <!-- Filters (auto-detected WHERE, editable) -->
+              <div class="form-group">
+                <label class="text-sm muted" for="saveRoleFilters" style="font-weight:600;">
+                  Filters
+                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected from WHERE — edit if needed)</span>
+                </label>
+                <textarea id="saveRoleFilters" class="form-control" rows="3"
+                          placeholder='e.g. country = &apos;EU&apos;, created_at > GETUTCDATE() - 7'
+                          style="font-family:monospace; font-size:12px;"></textarea>
+                <small class="text-muted">
+                  One condition per line, or comma-separated. Use <code>*</code> for no row-level filter.
+                </small>
+              </div>
+
+              <!-- Original query (read-only reference) -->
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="text-sm muted" for="saveViewQueryPreview" style="font-weight:600;">
+                  Source query <span style="font-weight:400; color:#94a3b8;">(stored for reference)</span>
+                </label>
+                <textarea id="saveViewQueryPreview" class="form-control" rows="5" readonly
+                          style="font-family:monospace; font-size:12px; background:#f8fafc;"></textarea>
+              </div>
+
+              <div id="saveViewStatus" class="text-sm" style="margin-top:10px; display:none;"></div>
             </div>
             <div class="modal-footer" style="border-top: 1px solid var(--panel-border);">
-              <a id="saveViewManageLink" class="text-sm" href="#" style="margin-right:auto;">Manage saved views</a>
+              <a id="saveViewManageLink" class="text-sm" href="#" style="margin-right:auto;">
+                <i class="fas fa-external-link-alt" style="font-size:10px;"></i> Manage roles in RBAC
+              </a>
               <button type="button" class="btn" data-dismiss="modal">Cancel</button>
               <button type="button" class="btn-exec" id="btnSaveViewConfirm">
-                <i class="fas fa-check"></i>&nbsp;Save
+                <i class="fas fa-shield-halved"></i>&nbsp;Save Role
               </button>
             </div>
           </div>
@@ -2454,6 +2798,8 @@ $(document).ready(function(){
     // Auto-persist execution sessions 5 seconds after the last editor change
     var _editorPersistTimer = null;
     window.editor.on('change', function () {
+      // Clear any preflight error highlights as soon as the user edits
+      if (window._clearSqlErrorMarkers) window._clearSqlErrorMarkers();
       if (_editorPersistTimer) clearTimeout(_editorPersistTimer);
       _editorPersistTimer = setTimeout(function () {
         _editorPersistTimer = null;

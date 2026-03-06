@@ -398,3 +398,73 @@ def attach_tables_routes(
         simple_table.delete(role_name=role)
 
         return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
+
+    # ------------------------------ Per-table limits config ------------------------------
+
+    @router.get("/reflection/table/config")
+    def api_get_table_config(
+        request: Request,
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Simple table name"),
+        _: Any = Depends(admin_guard_api),
+    ):
+        """Return per-table configuration (limits, dedup, primary keys)."""
+        if not is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        simple = (table or "").strip()
+        if not organization or not super_name or not simple:
+            raise HTTPException(status_code=400, detail="organization, super_name and table are required")
+        try:
+            config = catalog.get_table_config(organization, super_name, simple) or {}
+            return {"ok": True, "config": config}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Get table config failed: {e}")
+
+    @router.put("/reflection/table/config")
+    def api_put_table_config(
+        request: Request,
+        organization: str = Query(...),
+        super_name: str = Query(...),
+        table: str = Query(..., description="Simple table name"),
+        _: Any = Depends(admin_guard_api),
+        body: Dict[str, Any] = None,
+    ):
+        """Merge per-table limit overrides into the existing table config.
+
+        Accepted body keys (all optional):
+          max_memory_chunk_size  — int, bytes (must be > 0, or null to clear)
+          max_overlapping_files  — int (must be > 0, or null to clear)
+        """
+        if not is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        simple = (table or "").strip()
+        if not organization or not super_name or not simple:
+            raise HTTPException(status_code=400, detail="organization, super_name and table are required")
+        if body is None:
+            body = {}
+
+        # Validate incoming limit values
+        for field in ("max_memory_chunk_size", "max_overlapping_files"):
+            if field in body and body[field] is not None:
+                try:
+                    v = int(body[field])
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=422, detail=f"{field} must be an integer")
+                if v <= 0:
+                    raise HTTPException(status_code=422, detail=f"{field} must be a positive integer")
+                body[field] = v
+
+        try:
+            existing = catalog.get_table_config(organization, super_name, simple) or {}
+            merged = dict(existing)
+            for field in ("max_memory_chunk_size", "max_overlapping_files"):
+                if field in body:
+                    if body[field] is None:
+                        merged.pop(field, None)   # null = clear override
+                    else:
+                        merged[field] = body[field]
+            catalog.set_table_config(organization, super_name, simple, merged)
+            return {"ok": True, "config": merged}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Set table config failed: {e}")

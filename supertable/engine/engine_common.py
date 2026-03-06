@@ -340,6 +340,16 @@ def rewrite_query_with_hashed_tables(
             new_physical = alias_to_table[alias_name]
             table.set("this", exp.to_identifier(new_physical))
             table.set("db", None)
+            # Ensure the alias is always present so qualified column references
+            # (e.g. table_1.col) remain valid after the table is renamed.
+            # When the user wrote an explicit alias we keep it; when there was
+            # no alias the table name itself was used as the alias key, so we
+            # set it explicitly here.
+            if not isinstance(alias_expr, exp.TableAlias):
+                table.set(
+                    "alias",
+                    exp.TableAlias(this=exp.to_identifier(alias_name)),
+                )
 
     return parsed.sql()
 

@@ -273,24 +273,19 @@
             <div>
               <div style="font-weight:800; font-size:18px; color:#0f172a;">Access Control</div>
               <div class="muted" style="font-size:13px; margin-top:4px;">
-                Manage roles, users, and SQL views for fine-grained access control.
+                Manage roles and users for fine-grained access control.
               </div>
             </div>
             <div class="d-flex align-items-center" style="gap:10px;">
-              <div class="pill" title="Users">
-                <i class="fa-solid fa-users" style="color:#1c96ca;"></i>
-                <span class="muted">Users</span>
-                <strong id="usersCount">0</strong>
-              </div>
               <div class="pill" title="Roles">
                 <i class="fa-solid fa-shield-halved" style="color:#1c96ca;"></i>
                 <span class="muted">Roles</span>
                 <strong id="rolesCount">0</strong>
               </div>
-              <div class="pill" title="Views">
-                <i class="fa-solid fa-database" style="color:#1c96ca;"></i>
-                <span class="muted">Views</span>
-                <strong id="viewsCount">0</strong>
+              <div class="pill" title="Users">
+                <i class="fa-solid fa-users" style="color:#1c96ca;"></i>
+                <span class="muted">Users</span>
+                <strong id="usersCount">0</strong>
               </div>
             </div>
           </div>
@@ -311,10 +306,6 @@
               <div class="rbac-tab" data-tab="users">
                 <i class="fa-solid fa-users"></i> Users
                 <span class="tab-count" id="usersTabCount">0</span>
-              </div>
-              <div class="rbac-tab" data-tab="views">
-                <i class="fa-solid fa-database"></i> Views
-                <span class="tab-count" id="viewsTabCount">0</span>
               </div>
             </div>
         </div>
@@ -337,10 +328,11 @@
                   <table class="table table-sm mb-0 rbac-table">
                     <thead>
                       <tr>
-                        <th style="width:35%;">Name</th>
-                        <th style="width:25%;">Type</th>
-                        <th style="width:20%;">Tables</th>
-                        <th style="width:20%;">Columns</th>
+                        <th style="width:30%;">Name</th>
+                        <th style="width:20%;">Type</th>
+                        <th style="width:18%;">Tables</th>
+                        <th style="width:18%;">Columns</th>
+                        <th style="width:14%;">Source</th>
                       </tr>
                     </thead>
                     <tbody id="rolesBody"></tbody>
@@ -396,6 +388,16 @@
                     <label class="text-sm muted" style="font-weight:700;">Filters</label>
                     <input id="roleFilters" class="form-control" placeholder='* for no filters'/>
                     <small class="hint"><code>*</code> for no row-level filters</small>
+                  </div>
+
+                  <!-- shown only for roles created from Execute page -->
+                  <div class="form-group" id="roleSourceQueryGroup" style="display:none;">
+                    <label class="text-sm muted" style="font-weight:700;">
+                      <i class="fas fa-terminal" style="font-size:11px; color:#1c96ca;"></i>
+                      Original query <span style="font-weight:400; color:#94a3b8;">(from Execute — read only)</span>
+                    </label>
+                    <textarea id="roleSourceQuery" class="form-control" rows="5" readonly
+                              style="font-family:monospace; font-size:12px; background:#f8fafc; resize:vertical;"></textarea>
                   </div>
 
                   <div class="status-msg" id="roleStatus"></div>
@@ -467,89 +469,6 @@
             </div>
           </div>
 
-          <!-- ═══════════════ VIEWS TAB ═══════════════ -->
-          <div class="tab-panel" id="panel-views">
-            <div class="rbac-grid">
-              <!-- View list -->
-              <div class="card">
-                <div class="rbac-card-h">
-                  <div style="font-weight:800; color:#0f172a;">Saved views</div>
-                  <div class="d-flex align-items-center" style="gap:8px;">
-                    <input id="viewSearch" class="form-control form-control-sm" placeholder="Search…" style="width:160px;"/>
-                    <button id="viewRefreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
-                  </div>
-                </div>
-                <div style="padding:0;">
-                  <table class="table table-sm mb-0 rbac-table">
-                    <thead>
-                      <tr>
-                        <th style="width:35%;">Name</th>
-                        <th style="width:15%;">Status</th>
-                        <th style="width:25%;">Updated</th>
-                        <th style="width:25%;">Creator</th>
-                      </tr>
-                    </thead>
-                    <tbody id="viewsBody"></tbody>
-                  </table>
-                </div>
-              </div>
-
-              <!-- View editor -->
-              <div class="card">
-                <div class="rbac-card-h">
-                  <div>
-                    <div style="font-weight:800; color:#0f172a;">View editor</div>
-                    <div class="hint">Only SELECT / WITH queries are allowed.</div>
-                  </div>
-                  <div class="d-flex align-items-center" style="gap:8px;">
-                    <button id="viewNewBtn" class="btn btn-sm btn-outline-secondary">New</button>
-                    <button id="viewDeleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
-                    <button id="viewSaveBtn" class="btn btn-sm btn-primary">Save</button>
-                  </div>
-                </div>
-
-                <div class="section" style="padding-top:14px;">
-                  <div class="form-row">
-                    <div class="form-group col-md-8">
-                      <label class="text-sm muted" style="font-weight:700;">Name</label>
-                      <input id="viewName" class="form-control" placeholder="e.g. Active customers"/>
-                    </div>
-                    <div class="form-group col-md-4">
-                      <label class="text-sm muted" style="font-weight:700;">Enabled</label>
-                      <select id="viewEnabled" class="form-control">
-                        <option value="1">Enabled</option>
-                        <option value="0">Disabled</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="text-sm muted" style="font-weight:700;">Description</label>
-                    <input id="viewDescription" class="form-control" placeholder="Optional"/>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="text-sm muted" style="font-weight:700;">Roles</label>
-                    <div class="tag-list" id="viewRoleTags"></div>
-                    <div style="margin-top:8px;">
-                      <select id="viewRoleSelect" class="form-control form-control-sm" style="display:inline-block; width:auto;">
-                        <option value="">— Assign roles —</option>
-                      </select>
-                    </div>
-                    <small class="hint">Roles that can access this view.</small>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="text-sm muted" style="font-weight:700;">Query</label>
-                    <textarea id="viewQuery" class="form-control" rows="10"></textarea>
-                  </div>
-
-                  <div class="status-msg" id="viewStatus"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
           {% endif %}
         </div>
       </div>
@@ -571,16 +490,12 @@
     /* ── State ─────────────────────────────── */
     let allRoles = [];
     let allUsers = [];
-    let allViews = [];
 
     let selectedRoleId = null;
     let selectedUserId = null;
-    let selectedViewId = null;
 
     // roles assigned to the user being edited (role_ids)
     let editUserRoles = [];
-    // roles assigned to the view being edited (role_ids)
-    let editViewRoles = [];
 
     /* ── Helpers ─────────────────────────────── */
     function el(id) { return document.getElementById(id); }
@@ -660,10 +575,8 @@
     function updateCounts() {
       el('usersCount').textContent = allUsers.length;
       el('rolesCount').textContent = allRoles.length;
-      el('viewsCount').textContent = allViews.length;
       el('usersTabCount').textContent = allUsers.length;
       el('rolesTabCount').textContent = allRoles.length;
-      el('viewsTabCount').textContent = allViews.length;
     }
 
     /* ══════════════════════════════════════════════════
@@ -680,7 +593,7 @@
 
       body.innerHTML = '';
       if (!items.length) {
-        body.innerHTML = '<tr><td colspan="4" class="muted" style="padding:14px;">No roles found.</td></tr>';
+        body.innerHTML = '<tr><td colspan="5" class="muted" style="padding:14px;">No roles found.</td></tr>';
         return;
       }
       for (const r of items) {
@@ -707,10 +620,21 @@
         tdCols.textContent = formatList(r.columns);
         tdCols.style.fontSize = '12px';
 
+        const tdSource = document.createElement('td');
+        if (r.source_query) {
+          const srcBadge = document.createElement('span');
+          srcBadge.className = 'role-badge role-badge-meta';
+          srcBadge.style.cssText = 'font-size:10px; padding:1px 6px; white-space:nowrap;';
+          srcBadge.title = r.source_query;
+          srcBadge.innerHTML = '<i class="fas fa-terminal" style="margin-right:3px;"></i>Execute';
+          tdSource.appendChild(srcBadge);
+        }
+
         tr.appendChild(tdName);
         tr.appendChild(tdType);
         tr.appendChild(tdTables);
         tr.appendChild(tdCols);
+        tr.appendChild(tdSource);
 
         tr.addEventListener('click', () => selectRole(r));
         body.appendChild(tr);
@@ -726,6 +650,9 @@
       el('roleColumns').value = '*';
       el('roleFilters').value = '*';
       el('roleDeleteBtn').disabled = true;
+      // Hide source query
+      el('roleSourceQueryGroup').style.display = 'none';
+      el('roleSourceQuery').value = '';
       renderRoles();
       setStatus('roleStatus', '');
     }
@@ -739,6 +666,14 @@
       el('roleColumns').value = (r.columns || []).join(', ');
       el('roleFilters').value = Array.isArray(r.filters) ? r.filters.join(', ') : JSON.stringify(r.filters || '*');
       el('roleDeleteBtn').disabled = false;
+      // Show source query if present
+      if (r.source_query) {
+        el('roleSourceQueryGroup').style.display = 'block';
+        el('roleSourceQuery').value = r.source_query;
+      } else {
+        el('roleSourceQueryGroup').style.display = 'none';
+        el('roleSourceQuery').value = '';
+      }
       renderRoles();
       setStatus('roleStatus', 'Selected: ' + roleDisplayName(r), 'info');
     }
@@ -972,174 +907,11 @@
 
 
     /* ══════════════════════════════════════════════════
-       VIEWS (existing functionality, kept intact)
-    ══════════════════════════════════════════════════ */
-
-    function renderViews() {
-      const body = el('viewsBody');
-      if (!body) return;
-      const q = (el('viewSearch')?.value || '').trim().toLowerCase();
-      const items = q
-        ? allViews.filter(v => (v.name || '').toLowerCase().includes(q) || (v.description || '').toLowerCase().includes(q))
-        : allViews;
-
-      body.innerHTML = '';
-      if (!items.length) {
-        body.innerHTML = '<tr><td colspan="4" class="muted" style="padding:14px;">No saved views.</td></tr>';
-        return;
-      }
-      for (const v of items) {
-        const tr = document.createElement('tr');
-        tr.dataset.id = v.id;
-        if (v.id === selectedViewId) tr.classList.add('selected');
-
-        const tdName = document.createElement('td');
-        tdName.style.fontWeight = '600';
-        tdName.textContent = v.name || '';
-
-        const tdStatus = document.createElement('td');
-        const isOn = String(v.enabled) !== '0';
-        tdStatus.innerHTML = '<span class="status-dot ' + (isOn ? 'status-dot-on' : 'status-dot-off') + '"></span>' + (isOn ? 'On' : 'Off');
-        tdStatus.style.fontSize = '12px';
-
-        const tdUpd = document.createElement('td');
-        tdUpd.textContent = v.updated_at || '';
-        tdUpd.style.fontSize = '12px';
-
-        const tdCr = document.createElement('td');
-        tdCr.textContent = v.created_by || v.created_by_hash || '';
-        tdCr.style.fontSize = '12px';
-
-        tr.appendChild(tdName);
-        tr.appendChild(tdStatus);
-        tr.appendChild(tdUpd);
-        tr.appendChild(tdCr);
-        tr.addEventListener('click', () => selectView(v));
-        body.appendChild(tr);
-      }
-      updateCounts();
-    }
-
-    function renderViewRoleTags() {
-      const container = el('viewRoleTags');
-      container.innerHTML = '';
-      for (const rid of editViewRoles) {
-        const r = findRoleById(rid);
-        const chip = document.createElement('span');
-        chip.className = 'tag-chip';
-        chip.innerHTML = '<span>' + (r ? (r.role_name || r.role) : rid.substring(0, 8)) + '</span><span class="remove-tag" data-rid="' + rid + '">&times;</span>';
-        container.appendChild(chip);
-      }
-      container.querySelectorAll('.remove-tag').forEach(btn => {
-        btn.addEventListener('click', function() {
-          editViewRoles = editViewRoles.filter(x => x !== this.dataset.rid);
-          renderViewRoleTags();
-        });
-      });
-    }
-
-    function clearViewEditor() {
-      selectedViewId = null;
-      el('viewName').value = '';
-      el('viewDescription').value = '';
-      el('viewEnabled').value = '1';
-      editViewRoles = [];
-      renderViewRoleTags();
-      if (cm) cm.setValue('');
-      el('viewDeleteBtn').disabled = true;
-      renderViews();
-      setStatus('viewStatus', '');
-    }
-
-    function selectView(v) {
-      selectedViewId = v.id;
-      el('viewName').value = v.name || '';
-      el('viewDescription').value = v.description || '';
-      el('viewEnabled').value = String(v.enabled || '1');
-      editViewRoles = (v.roles || []).slice();
-      renderViewRoleTags();
-      if (cm) cm.setValue(v.query || '');
-      el('viewDeleteBtn').disabled = false;
-      renderViews();
-      setStatus('viewStatus', 'Selected: ' + (v.name || v.id), 'info');
-    }
-
-    async function loadViews() {
-      const {org, sup} = currentTenant();
-      if (!org || !sup) return;
-      setStatus('viewStatus', 'Loading…');
-      try {
-        const data = await api(`/reflection/rbac/views?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`);
-        allViews = (data && data.data && data.data.items) ? data.data.items : [];
-        renderViews();
-        setStatus('viewStatus', `Loaded ${allViews.length} view(s).`, 'ok');
-      } catch(e) {
-        allViews = [];
-        renderViews();
-        setStatus('viewStatus', e.message || 'Failed to load views', 'error');
-      }
-    }
-
-    async function saveView() {
-      const {org, sup} = currentTenant();
-      const name = el('viewName').value || '';
-      const description = el('viewDescription').value || '';
-      const enabled = el('viewEnabled').value === '1';
-      const query = cm ? cm.getValue() : (el('viewQuery').value || '');
-      const roles = editViewRoles.slice();
-
-      setStatus('viewStatus', 'Saving…');
-      try {
-        if (!selectedViewId) {
-          const data = await api('/reflection/rbac/views', {
-            method: 'POST',
-            body: { organization: org, super_name: sup, name, description, query }
-          });
-          const doc = data && data.data ? data.data : null;
-          if (doc && doc.id && roles.length) {
-            await api(`/reflection/rbac/views/${encodeURIComponent(doc.id)}`, {
-              method: 'PUT',
-              body: { organization: org, super_name: sup, roles }
-            });
-          }
-          setStatus('viewStatus', 'Created.', 'ok');
-        } else {
-          await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}`, {
-            method: 'PUT',
-            body: { organization: org, super_name: sup, name, description, query, enabled, roles }
-          });
-          setStatus('viewStatus', 'Updated.', 'ok');
-        }
-        await loadViews();
-      } catch(e) {
-        setStatus('viewStatus', e.message || 'Save failed', 'error');
-      }
-    }
-
-    async function deleteView() {
-      if (!selectedViewId) return;
-      if (!confirm('Delete this view?')) return;
-      const {org, sup} = currentTenant();
-      setStatus('viewStatus', 'Deleting…');
-      try {
-        await api(`/reflection/rbac/views/${encodeURIComponent(selectedViewId)}?organization=${encodeURIComponent(org)}&super_name=${encodeURIComponent(sup)}`, {
-          method: 'DELETE'
-        });
-        clearViewEditor();
-        await loadViews();
-        setStatus('viewStatus', 'Deleted.', 'ok');
-      } catch(e) {
-        setStatus('viewStatus', e.message || 'Delete failed', 'error');
-      }
-    }
-
-
-    /* ══════════════════════════════════════════════════
-       ROLE SELECTORS (shared dropdown for user + view editors)
+       ROLE SELECTORS (shared dropdown for user editor)
     ══════════════════════════════════════════════════ */
 
     function populateRoleSelectors() {
-      ['userRoleSelect', 'viewRoleSelect'].forEach(selId => {
+      ['userRoleSelect'].forEach(selId => {
         const sel = el(selId);
         if (!sel) return;
         const current = sel.value;
@@ -1176,15 +948,6 @@
     let cm = null;
 
     document.addEventListener('DOMContentLoaded', function() {
-      const q = el('viewQuery');
-      if (q) {
-        cm = CodeMirror.fromTextArea(q, {
-          mode: 'text/x-sql',
-          lineNumbers: true,
-          lineWrapping: true
-        });
-      }
-
       // Roles
       el('roleRefreshBtn')?.addEventListener('click', loadRoles);
       el('roleSearch')?.addEventListener('input', renderRoles);
@@ -1200,18 +963,9 @@
       el('userDeleteBtn')?.addEventListener('click', deleteUser);
       handleRoleSelectAdd('userRoleSelect', editUserRoles, renderUserRoleTags);
 
-      // Views
-      el('viewRefreshBtn')?.addEventListener('click', loadViews);
-      el('viewSearch')?.addEventListener('input', renderViews);
-      el('viewNewBtn')?.addEventListener('click', clearViewEditor);
-      el('viewSaveBtn')?.addEventListener('click', saveView);
-      el('viewDeleteBtn')?.addEventListener('click', deleteView);
-      handleRoleSelectAdd('viewRoleSelect', editViewRoles, renderViewRoleTags);
-
       // Load all data
       loadRoles().then(() => {
         loadUsers();
-        loadViews();
       });
     });
 
