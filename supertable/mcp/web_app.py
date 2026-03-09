@@ -8,6 +8,8 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
+from pathlib import Path
+
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -100,145 +102,20 @@ async def _shutdown() -> None:
         await _client.close()
         _client = None
 
+@app.get("/health")
+async def health_check() -> JSONResponse:
+    """Kubernetes liveness + readiness probe — no auth required."""
+    c = getattr(app.state, 'mcp_client', None) or _client
+    return JSONResponse({
+        "status": "ok",
+        "mcp_client": "ready" if c is not None else "not_initialized",
+    })
+
 @app.get("/", response_class=HTMLResponse)
 async def home(req: Request) -> str:
     _require_gateway_auth(req)
-
-    return """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Supertable MCP Web Tester</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    input, textarea { width: 100%; padding: 8px; }
-    textarea { min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    button { padding: 8px 12px; cursor: pointer; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    pre { background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 10px; overflow: auto; max-height: 55vh; }
-    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; }
-    .muted { color: #6b7280; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h2>Supertable MCP Web Tester</h2>
-  <p class="muted">
-    This UI is protected. Open this page with <code>?auth=&lt;SUPERTABLE_SUPERTOKEN&gt;</code> or send
-    <code>Authorization: Bearer …</code>. The token is also attached to API calls from the browser.
-  </p>
-
-  <div class="grid">
-    <div class="card">
-      <div class="row">
-        <button onclick="callApi('health')">health</button>
-        <button onclick="callApi('info')">info</button>
-        <button onclick="callApi('events')">refresh events</button>
-      </div>
-
-      <hr/>
-
-      <label>organization</label>
-      <input id="org" placeholder="kladna-soft"/>
-
-      <label>super_name</label>
-      <input id="super" placeholder="example"/>
-
-      <label>role <span class="muted">(RBAC role name or ID)</span></label>
-      <input id="role" placeholder="role name or UUID"/>
-
-      <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/list_supers', {organization: val('org'), role: val('role')})">list_supers</button>
-        <button onclick="postJson('/api/list_tables', {organization: val('org'), super_name: val('super'), role: val('role')})">list_tables</button>
-      </div>
-
-      <label style="margin-top: 12px;">table</label>
-      <input id="table" placeholder="facts"/>
-
-      <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/describe_table', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">describe_table</button>
-        <button onclick="postJson('/api/get_table_stats', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">get_table_stats</button>
-        <button onclick="postJson('/api/get_super_meta', {organization: val('org'), super_name: val('super'), role: val('role')})">get_super_meta</button>
-        <button onclick="postJson('/api/sample_data', {organization: val('org'), super_name: val('super'), table: val('table'), role: val('role')})">sample_data</button>
-      </div>
-
-      <label style="margin-top: 12px;">sql</label>
-      <textarea id="sql" placeholder="SELECT * FROM &quot;facts&quot; LIMIT 10"></textarea>
-
-      <div class="row" style="margin-top: 10px;">
-        <input id="limit" placeholder="limit (optional, default 200)"/>
-        <input id="engine" placeholder="engine (optional, e.g. AUTO)"/>
-        <input id="timeout" placeholder="timeout_sec (optional, e.g. 30)"/>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <button onclick="postJson('/api/query_sql', {
-          organization: val('org'),
-          super_name: val('super'),
-          sql: val('sql'),
-          role: val('role'),
-          limit: numOrNull('limit'),
-          engine: val('engine'),
-          query_timeout_sec: numOrNull('timeout')
-        })">query_sql</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3 style="margin-top: 0;">Last response</h3>
-      <pre id="out">{}</pre>
-      <h3>Event log (last 200)</h3>
-      <pre id="events">{}</pre>
-    </div>
-  </div>
-
-<script>
-function val(id){ return document.getElementById(id).value || ""; }
-function numOrNull(id){
-  const v = val(id).trim();
-  if(!v) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-async function callApi(name){
-  if(name === 'health') return await getJson('/api/health');
-  if(name === 'info') return await getJson('/api/info');
-  if(name === 'events') return await getJson('/api/events');
-}
-async function getAuthToken(){
-  // Prefer URL ?auth=... (handy for first load), else localStorage.
-  const params = new URLSearchParams(window.location.search);
-  const q = (params.get('auth') || '').trim();
-  if(q){ localStorage.setItem('supertable_auth', q); return q; }
-  return (localStorage.getItem('supertable_auth') || '').trim();
-}
-function authHeaders(token){
-  const h = {};
-  if(token){ h['authorization'] = 'Bearer ' + token; }
-  return h;
-}
-async function getJson(url){
-  const token = await getAuthToken();
-  const r = await fetch(url, { headers: authHeaders(token) });
-  const j = await r.json();
-  if(url.endsWith('/events')) document.getElementById('events').textContent = JSON.stringify(j, null, 2);
-  else document.getElementById('out').textContent = JSON.stringify(j, null, 2);
-  return j;
-}
-async function postJson(url, body){
-  const token = await getAuthToken();
-  const headers = {'content-type':'application/json', ...authHeaders(token)};
-  const r = await fetch(url, {method:'POST', headers, body: JSON.stringify(body)});
-  const j = await r.json();
-  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
-  return j;
-}
-</script>
-</body>
-</html>
-"""
+    html_file = Path(__file__).parent / "web_tester.html"
+    return html_file.read_text(encoding="utf-8")
 
 
 @app.post("/mcp_v1")

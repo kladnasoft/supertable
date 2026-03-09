@@ -42,12 +42,19 @@ _run_api_rest() {
 # ---------------------------------------------------------------------------
 # mcp — MCP stdio server (foreground) + MCP web tester UI (background, :8099)
 # ---------------------------------------------------------------------------
-_run_mcp() {
+_run_mcp_stdio() {
   exec python -u /app/supertable/mcp/mcp_server.py
 }
 
+_run_mcp_http_bg() {
+  # MCP server over streamable-http in background (:8070)
+  SUPERTABLE_MCP_TRANSPORT=streamable-http   SUPERTABLE_MCP_PORT="${SUPERTABLE_MCP_PORT:-8070}"   python -u /app/supertable/mcp/mcp_server.py >> /tmp/mcp_http.log 2>&1 &
+  MCP_HTTP_PID=$!
+  echo "MCP streamable-http server started (PID $MCP_HTTP_PID) on port ${SUPERTABLE_MCP_PORT:-8070}"
+}
+
 _start_mcp_web_bg() {
-  python -u /app/supertable/mcp/web_server.py &
+  PYTHONPATH=/app python -u /app/supertable/mcp/web_server.py &
 }
 
 # ---------------------------------------------------------------------------
@@ -92,19 +99,35 @@ case "$SERVICE" in
     ;;
 
   mcp)
-    # MCP stdio server (foreground) + web tester UI on :8099 (background).
-    # If the web UI exits unexpectedly, the container shuts down.
+    # Starts three processes:
+    #   1. MCP streamable-http server  →  :8070  (for Claude Desktop / remote clients)
+    #   2. MCP web tester UI           →  :8099  (browser dev tool)
+    #   3. MCP stdio server            →  foreground (for stdio MCP clients)
+
+    _run_mcp_http_bg
+    HTTP_PID=$MCP_HTTP_PID
+
+    # Give the http server 3 seconds to start before checking it is alive.
+    sleep 3
+    if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+      echo "ERROR: MCP http server failed to start. Log:" >&2
+      cat /tmp/mcp_http.log >&2
+      exit 1
+    fi
+    echo "MCP http server alive (PID $HTTP_PID)"
+
     _start_mcp_web_bg
     WEB_PID=$!
 
-    _watch_web() {
-      wait "$WEB_PID" || true
-      echo "ERROR: MCP web UI process (PID $WEB_PID) exited unexpectedly — shutting down." >&2
-      kill -TERM 1 2>/dev/null || true
-    }
-    _watch_web &
+    # Give web server 3 seconds to start.
+    sleep 3
+    if ! kill -0 "$WEB_PID" 2>/dev/null; then
+      echo "ERROR: MCP web UI failed to start." >&2
+      exit 1
+    fi
+    echo "MCP web UI alive (PID $WEB_PID)"
 
-    _run_mcp
+    _run_mcp_stdio
     ;;
 
   mcp-http)

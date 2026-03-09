@@ -79,6 +79,7 @@ class MCPWebClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
             env=self._subprocess_env(),
+            limit=4 * 1024 * 1024,  # 4 MB; default 64 KB causes LimitOverrunError on large tool responses
         )
         if not self._proc.stdin or not self._proc.stdout:
             raise RuntimeError("Failed to open stdio pipes to MCP server process")

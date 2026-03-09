@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid as _uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -19,7 +20,7 @@ from supertable.engine.engine_common import (
     pinned_table_name,
     hashed_table_name,
     configure_httpfs_and_s3,
-    create_reflection_table,
+    create_reflection_view,
     make_presigned_list,
     rewrite_query_with_hashed_tables,
     init_connection,
@@ -35,12 +36,12 @@ from supertable.engine.engine_common import (
 
 @dataclass
 class _PinnedEntry:
-    """Tracks a single pinned reflection table."""
-    table_name: str          # DuckDB table name (e.g. pin_a3f8c1_v5)
+    """Tracks a single pinned reflection view."""
+    table_name: str          # DuckDB view name (e.g. pin_a3f8c1_v5)
     super_name: str
     simple_name: str
     version: int
-    ref_count: int = 0      # number of in-flight queries using this table
+    ref_count: int = 0      # number of in-flight queries using this view
     stale: bool = False      # marked for removal once ref_count hits 0
 
 
@@ -50,11 +51,19 @@ class _PinnedEntry:
 
 class DuckDBPinned:
     """
-    Persistent DuckDB executor with version-based reflection table caching.
+    Persistent DuckDB executor with version-based reflection view caching.
 
-    Tables are created on first access and reused across queries.
-    When a new version is detected, a new table is created alongside the old one.
-    Old tables are dropped as soon as their reference count reaches zero.
+    Views are created on first access and reused across queries as long as
+    the data version is unchanged.  Because views are lazy (no data is
+    materialised at creation time), DuckDB applies full projection and
+    predicate pushdown on every query — only the columns and row groups
+    actually needed are read from remote storage.  Repeated reads of the
+    same row groups are served from the external file cache (disk) or the
+    HTTP metadata cache (parquet footer, in-memory), both configured in
+    configure_httpfs_and_s3.
+
+    When a new version is detected, a new view is created alongside the old
+    one.  Old views are dropped as soon as their reference count reaches zero.
 
     Thread-safe: all DDL and registry mutations are guarded by a lock.
     """
@@ -82,11 +91,15 @@ class DuckDBPinned:
             return self._con
 
         self._temp_dir = temp_dir
-        # Default to 1 GB so DuckDB spills to disk before hitting an OOM error.
-        # Override with SUPERTABLE_DUCKDB_PINNED_MEMORY_LIMIT for larger hosts.
-        memory_limit = os.getenv("SUPERTABLE_DUCKDB_PINNED_MEMORY_LIMIT", "1GB")
+        # Memory limit is shared with the transient executor via the single
+        # SUPERTABLE_DUCKDB_MEMORY_LIMIT env var.  The "1GB" fallback is only
+        # used when the env var is absent.
+        memory_limit = os.getenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", "1GB")
         con = duckdb.connect()
         init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
+        # httpfs (and both cache settings) are configured lazily on the first
+        # query via _ensure_httpfs → configure_httpfs_and_s3.  They cannot be
+        # applied here because the httpfs extension is not loaded yet.
         self._con = con
         self._httpfs_configured = False
         logger.info("[duckdb.pinned] persistent connection created")
@@ -108,7 +121,7 @@ class DuckDBPinned:
             self._con = None
             self._httpfs_configured = False
             self._registry.clear()
-            logger.warning("[duckdb.pinned] connection reset — all cached tables lost")
+            logger.warning("[duckdb.pinned] connection reset — all cached views lost")
 
     # ---------------------------------------------------------
     # Table registry management
@@ -122,7 +135,7 @@ class DuckDBPinned:
                 return entry
         return None
 
-    def _ensure_table(
+    def _ensure_view(
             self,
             con: duckdb.DuckDBPyConnection,
             super_name: str,
@@ -132,11 +145,13 @@ class DuckDBPinned:
             log_prefix: str = "",
     ) -> str:
         """
-        Ensure a reflection table exists for (super, simple, version).
-        Returns the DuckDB table name to use.
+        Ensure a reflection VIEW exists for (super, simple, version).
+        Returns the DuckDB view name to use.
 
-        If the version matches the cached entry, returns it.
-        Otherwise creates a new table and marks old entries as stale.
+        If the version matches the cached entry, returns it immediately —
+        the view is already registered on the connection and costs nothing.
+        Otherwise creates a new lazy view (no data read at creation time)
+        and marks old entries as stale for deferred cleanup.
         """
         key = (super_name, simple_name)
         current = self._current_entry(key)
@@ -145,15 +160,15 @@ class DuckDBPinned:
             return current.table_name
 
         # New version needed
-        table_name = pinned_table_name(super_name, simple_name, version)
+        view_name = pinned_table_name(super_name, simple_name, version)
 
-        # Check if this exact table already exists (e.g. race between threads)
+        # Check if this exact view already exists (e.g. race between threads)
         entries = self._registry.get(key, [])
         for entry in entries:
-            if entry.table_name == table_name and not entry.stale:
+            if entry.table_name == view_name and not entry.stale:
                 return entry.table_name
 
-        # Mark all existing entries for this key as stale
+        # Mark all existing entries for this key as stale.
         for entry in entries:
             if not entry.stale:
                 entry.stale = True
@@ -162,25 +177,26 @@ class DuckDBPinned:
                     f"(v{entry.version}, refs={entry.ref_count})"
                 )
 
-        # Create new table
+        # Create new lazy view — no data is read from remote storage here.
+        # DuckDB will apply projection and predicate pushdown at query time.
         self._ensure_httpfs(con, files)
         try:
-            create_reflection_table(con, table_name, files)
+            create_reflection_view(con, view_name, files)
         except Exception as e:
             msg = str(e)
             if any(tok in msg for tok in (
                     "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
                     "AccessDenied", "SignatureDoesNotMatch", "403", "400",
             )):
-                logger.warning(f"{log_prefix}[duckdb.pinned] presign fallback for {table_name}: {msg}")
+                logger.warning(f"{log_prefix}[duckdb.pinned] presign fallback for {view_name}: {msg}")
                 presigned_files = make_presigned_list(self.storage, files)
                 self._ensure_httpfs(con, presigned_files)
-                create_reflection_table(con, table_name, presigned_files)
+                create_reflection_view(con, view_name, presigned_files)
             else:
                 raise
 
         new_entry = _PinnedEntry(
-            table_name=table_name,
+            table_name=view_name,
             super_name=super_name,
             simple_name=simple_name,
             version=version,
@@ -191,14 +207,14 @@ class DuckDBPinned:
         self._registry[key].append(new_entry)
 
         logger.info(
-            f"{log_prefix}[duckdb.pinned] created {table_name} "
+            f"{log_prefix}[duckdb.pinned] created view {view_name} "
             f"(super={super_name}, simple={simple_name}, v{version}, files={len(files)})"
         )
 
-        # Eagerly drop stale tables with zero refs
+        # Eagerly drop stale views with zero refs
         self._drop_unreferenced_stale(con, log_prefix)
 
-        return table_name
+        return view_name
 
     def _acquire_refs(self, table_names: Set[str]) -> None:
         """Increment ref_count for each table being used by a query."""
@@ -217,19 +233,19 @@ class DuckDBPinned:
     def _drop_unreferenced_stale(
             self, con: duckdb.DuckDBPyConnection, log_prefix: str = ""
     ) -> None:
-        """DROP all stale tables with ref_count == 0."""
+        """DROP all stale views with ref_count == 0."""
         for key, entries in list(self._registry.items()):
             to_keep = []
             for entry in entries:
                 if entry.stale and entry.ref_count == 0:
                     try:
-                        con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
+                        con.execute(f"DROP VIEW IF EXISTS {entry.table_name};")
                         logger.info(
-                            f"{log_prefix}[duckdb.pinned] dropped stale: {entry.table_name} (v{entry.version})"
+                            f"{log_prefix}[duckdb.pinned] dropped stale view: {entry.table_name} (v{entry.version})"
                         )
                     except Exception as e:
                         logger.warning(
-                            f"{log_prefix}[duckdb.pinned] failed to drop {entry.table_name}: {e}"
+                            f"{log_prefix}[duckdb.pinned] failed to drop view {entry.table_name}: {e}"
                         )
                         to_keep.append(entry)
                 else:
@@ -263,13 +279,6 @@ class DuckDBPinned:
 
             timer_capture("CONNECTING")
 
-            # Enable profiling for this query
-            try:
-                con.execute("PRAGMA enable_profiling='json';")
-                con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
-            except Exception:
-                pass
-
             # Resolve tables
             snapshots_by_key = {
                 (sup.super_name, sup.simple_name): sup
@@ -284,7 +293,7 @@ class DuckDBPinned:
                 if not sup:
                     continue
 
-                table_name = self._ensure_table(
+                table_name = self._ensure_view(
                     con, sup.super_name, sup.simple_name,
                     sup.simple_version, list(sup.files), log_prefix,
                 )
@@ -296,8 +305,18 @@ class DuckDBPinned:
 
         timer_capture("CREATING_REFLECTION")
 
-        # Execute query outside the lock (allows other threads to manage tables)
+        # Enable profiling outside the lock — no shared state modified.
+        try:
+            con.execute("PRAGMA enable_profiling='json';")
+            con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
+        except Exception:
+            pass
+
+        # Both lists declared before the try block so the finally clause can
+        # always reference them, even if an exception fires before the inner
+        # assignments are reached (which would cause a NameError otherwise).
         rbac_view_names: List[str] = []
+        dedup_view_names: List[str] = []
         try:
             # Create per-query RBAC views if filtering is required
             rbac_views = getattr(reflection, "rbac_views", None) or {}
@@ -306,7 +325,6 @@ class DuckDBPinned:
             if rbac_views:
                 # RBAC views are per-query (role-specific), not cached.
                 # Use a unique suffix to avoid collisions between concurrent queries.
-                import uuid as _uuid
                 query_suffix = _uuid.uuid4().hex[:8]
                 for alias, table_name in alias_to_table_name.items():
                     view_def = rbac_views.get(alias)
@@ -319,10 +337,8 @@ class DuckDBPinned:
 
             # Create per-query dedup views if dedup-on-read is configured
             dedup_views = getattr(reflection, "dedup_views", None) or {}
-            dedup_view_names: List[str] = []
             if dedup_views:
                 if not rbac_views:
-                    import uuid as _uuid
                     query_suffix = _uuid.uuid4().hex[:8]
                 for alias in list(query_alias_to_name.keys()):
                     dedup_def = dedup_views.get(alias)
@@ -375,13 +391,13 @@ class DuckDBPinned:
     # ---------------------------------------------------------
 
     def get_cached_tables(self) -> List[Dict]:
-        """Return a snapshot of the table registry for diagnostics."""
+        """Return a snapshot of the view registry for diagnostics."""
         with self._lock:
             result = []
             for entries in self._registry.values():
                 for entry in entries:
                     result.append({
-                        "table_name": entry.table_name,
+                        "view_name": entry.table_name,
                         "super_name": entry.super_name,
                         "simple_name": entry.simple_name,
                         "version": entry.version,
@@ -391,13 +407,13 @@ class DuckDBPinned:
             return result
 
     def drop_all(self) -> None:
-        """Drop all cached tables and reset the connection. For testing/shutdown."""
+        """Drop all cached views and reset the connection. For testing/shutdown."""
         with self._lock:
             if self._con is not None:
                 for entries in self._registry.values():
                     for entry in entries:
                         try:
-                            self._con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
+                            self._con.execute(f"DROP VIEW IF EXISTS {entry.table_name};")
                         except Exception:
                             pass
             self._reset_connection()

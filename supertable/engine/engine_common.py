@@ -30,7 +30,12 @@ def quote_if_needed(col: str) -> str:
 
 
 def sanitize_sql_string(value_sql: str) -> str:
-    """Sanitize a SQL string value by escaping single quotes."""
+    """Sanitize a SQL string value by escaping single quotes.
+
+    Only operates on already-quoted string literals (values that start with a
+    single quote).  Bare SQL keywords (TRUE, FALSE) and numeric literals are
+    returned unchanged so callers can embed them directly in SET statements.
+    """
     if value_sql.startswith("'"):
         inner = value_sql[1:-1].replace("'", "''")
         return f"'{inner}'"
@@ -119,18 +124,101 @@ def detect_bucket() -> Optional[str]:
 
 
 # =========================================================
+# Memory / thread helpers
+# =========================================================
+
+def _parse_memory_limit_mb(value: str) -> Optional[int]:
+    """Parse a DuckDB memory limit string (e.g. '8GB', '512MB') into megabytes.
+
+    Returns None if the value cannot be parsed so callers can fall back safely.
+    Supported suffixes (case-insensitive): GB, GiB, MB, MiB.
+    """
+    import re as _re
+    m = _re.fullmatch(r"\s*([0-9]+(?:\.[0-9]*)?)\s*(GB|GiB|MB|MiB)\s*", value.strip(), _re.IGNORECASE)
+    if not m:
+        return None
+    amount = float(m.group(1))
+    suffix = m.group(2).upper()
+    if suffix in ("GB", "GIB"):
+        return int(amount * 1024)
+    return int(amount)
+
+
+def _derive_thread_count(memory_limit_str: str, fallback: int = 2) -> int:
+    """Derive a safe DuckDB thread count for remote parquet reads.
+
+    DuckDB uses synchronous IO: each thread can make at most one HTTP/S3
+    request at a time.  For remote file workloads the docs recommend
+    2–5× CPU cores to saturate network bandwidth.  We use 3× as a
+    practical middle ground (override with SUPERTABLE_DUCKDB_IO_MULTIPLIER).
+
+    Formula:
+      io_threads   = cpu_count * SUPERTABLE_DUCKDB_IO_MULTIPLIER  (default 3)
+      memory_floor = max(1, memory_mb // 400)   ← ~400 MB per thread minimum
+      result       = min(io_threads, memory_floor)
+
+    The memory floor prevents OOM when a small memory limit is set on a
+    large-CPU host.  400 MB is DuckDB's practical minimum working set per
+    thread for a parquet scan with aggregation.
+
+    Override everything with SUPERTABLE_DUCKDB_THREADS (checked by caller).
+    Falls back to `fallback` (default 2) if memory string cannot be parsed.
+    """
+    import os as _os
+    mb = _parse_memory_limit_mb(memory_limit_str)
+    if mb is None:
+        logger.warning(
+            f"[duckdb.threads] could not parse memory limit '{memory_limit_str}'; "
+            f"defaulting to {fallback} thread(s)"
+        )
+        return fallback
+
+    cpu_count = _os.cpu_count() or fallback
+    try:
+        multiplier = int(_os.getenv("SUPERTABLE_DUCKDB_IO_MULTIPLIER", "3"))
+    except ValueError:
+        multiplier = 3
+
+    io_threads = cpu_count * multiplier
+    # Safety ceiling: never allocate fewer than ~400 MB per thread.
+    memory_floor = max(1, mb // 400)
+    result = min(io_threads, memory_floor)
+
+    logger.debug(
+        f"[duckdb.threads] memory={memory_limit_str} ({mb}MB), "
+        f"cpu={cpu_count}×{multiplier}={io_threads} io_threads, "
+        f"memory_floor={memory_floor}, using={result}"
+    )
+    return result
+
+
+# =========================================================
 # httpfs / S3 configuration
 # =========================================================
 
 def configure_httpfs_and_s3(
         con: duckdb.DuckDBPyConnection, for_paths: List[str]
 ) -> None:
-    """Install and configure httpfs/S3 on the given connection."""
+    """Load httpfs and configure S3 credentials + caches on the given connection.
+
+    Both cache settings (HTTP metadata cache and external file cache) are
+    registered by the httpfs extension, not DuckDB core.  They must be SET
+    after LOAD httpfs — configuring them before causes a silent no-op.
+    This is the single correct place to apply both.
+
+    Load guard: tries LOAD first; only falls back to INSTALL+LOAD when the
+    extension is not yet present.  Avoids a network round-trip to the
+    extension repository on every call.
+    """
     if not for_paths:
         return
 
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
+    # Load httpfs; install only when not already available.
+    try:
+        con.execute("LOAD httpfs;")
+    except Exception:
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
 
     any_s3 = any(str(p).lower().startswith("s3://") for p in for_paths)
     any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
@@ -150,6 +238,8 @@ def configure_httpfs_and_s3(
             "s3_secret_access_key", "s3_session_token",
             "s3_url_style", "s3_use_ssl",
             "http_timeout", "enable_http_metadata_cache",
+            "enable_external_file_cache", "external_file_cache_max_size",
+            "external_file_cache_directory",
         }
 
     def set_if_supported(param: str, value_sql: str):
@@ -178,10 +268,15 @@ def configure_httpfs_and_s3(
     http_timeout_env = os.getenv("SUPERTABLE_DUCKDB_HTTP_TIMEOUT")
     if http_timeout_env:
         try:
+            # DuckDB's http_timeout is in SECONDS (UBIGINT, default 30).
+            # SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60 → SET http_timeout=60 → 60 s. No conversion needed.
+            # Ref: duckdb_settings() description: "HTTP timeout read/write/connection/retry (in seconds)"
             con.execute(f"SET http_timeout={int(http_timeout_env)};")
         except Exception:
             pass
 
+    # HTTP metadata cache — caches parquet footer (schema + row-group stats)
+    # across queries on the same persistent connection.
     meta_cache_on = (
             os.getenv("SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE", "1") or "1"
     ).lower() in ("1", "true", "yes", "on")
@@ -189,6 +284,25 @@ def configure_httpfs_and_s3(
         "enable_http_metadata_cache",
         "true" if meta_cache_on else "false",
     )
+
+    # External file cache (DuckDB >= 1.3) — caches remote data blocks on local
+    # disk so repeated queries do not re-download the same row groups.
+    # Only enabled when SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE is set.
+    cache_size = os.getenv("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "").strip()
+    if cache_size:
+        set_if_supported("enable_external_file_cache", "true")
+        set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
+        cache_dir_raw = os.getenv("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR", "").strip()
+        if cache_dir_raw:
+            # Expand ~ so DuckDB receives an absolute path.
+            cache_dir = os.path.expanduser(cache_dir_raw)
+            os.makedirs(cache_dir, exist_ok=True)
+            set_if_supported("external_file_cache_directory", f"'{cache_dir}'")
+        logger.info(
+            "[duckdb.cache] external file cache enabled"
+            + (f" size={cache_size}" if cache_size else "")
+            + (f", dir={cache_dir}" if cache_dir_raw else "")
+        )
 
 
 # =========================================================
@@ -268,7 +382,7 @@ def create_reflection_table(
         f"CREATE TABLE {table_name} AS "
         f"SELECT {select_cols} "
         f"FROM parquet_scan([{parquet_files_str}], "
-        f"union_by_name=TRUE, HIVE_PARTITIONING=TRUE);"
+        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE);"
     )
     con.execute(sql)
 
@@ -301,6 +415,89 @@ def create_reflection_table_with_presign_retry(
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
             create_reflection_table(con, table_name, presigned_files, columns)
+        else:
+            raise
+
+    return tried_presign
+
+
+# =========================================================
+# Reflection VIEW creation (lazy — no upfront data read)
+# =========================================================
+
+def create_reflection_view(
+        con: duckdb.DuckDBPyConnection,
+        view_name: str,
+        files: List[str],
+        columns: Optional[List[str]] = None,
+) -> None:
+    """CREATE OR REPLACE VIEW ... AS SELECT ... FROM parquet_scan(...).
+
+    Unlike ``create_reflection_table``, this does **not** materialise any
+    data at creation time.  DuckDB reads only parquet footer metadata
+    (schema + row-group statistics) and defers all I/O to query execution,
+    where it can apply filter and projection pushdown.
+
+    Use this in the transient executor to prevent OOM on large datasets.
+    The pinned executor continues to use TABLEs for its cross-query cache.
+    """
+    if not files:
+        raise ValueError(f"No files provided for reflection view '{view_name}'")
+
+    parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
+    select_cols = "*" if not columns else ", ".join(
+        quote_if_needed(c) for c in columns if c and c.strip()
+    )
+
+    sql = (
+        f"CREATE OR REPLACE VIEW {view_name} AS "
+        f"SELECT {select_cols} "
+        f"FROM parquet_scan([{parquet_files_str}], "
+        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE);"
+    )
+    con.execute(sql)
+
+
+def create_reflection_view_with_presign_retry(
+        con: duckdb.DuckDBPyConnection,
+        storage,
+        view_name: str,
+        files: List[str],
+        columns: Optional[List[str]] = None,
+        log_prefix: str = "",
+) -> bool:
+    """
+    Create a lazy reflection VIEW with automatic presign fallback on HTTP errors.
+
+    Mirrors ``create_reflection_table_with_presign_retry`` but uses a VIEW so
+    no data is read at creation time.  Controlled by the env var
+    ``SUPERTABLE_DUCKDB_MATERIALIZE`` (default: ``view``; set to ``table`` to
+    revert to the old eager-materialisation behaviour).
+
+    Returns True if the presign fallback was used.
+    """
+    materialize = os.getenv("SUPERTABLE_DUCKDB_MATERIALIZE", "view").lower().strip()
+    if materialize == "table":
+        return create_reflection_table_with_presign_retry(
+            con, storage, view_name, files, columns, log_prefix
+        )
+
+    configure_httpfs_and_s3(con, files)
+    tried_presign = False
+
+    try:
+        create_reflection_view(con, view_name, files, columns)
+    except Exception as e:
+        msg = str(e)
+        if any(tok in msg for tok in (
+                "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
+                "AccessDenied", "SignatureDoesNotMatch", "403", "400",
+        )):
+            logger.warning(f"{log_prefix}[duckdb.retry] presign fallback (view) for {view_name}: {msg}")
+            tried_presign = True
+            presigned_files = make_presigned_list(storage, files)
+            configure_httpfs_and_s3(con, presigned_files)
+            create_reflection_view(con, view_name, presigned_files, columns)
         else:
             raise
 
@@ -380,7 +577,9 @@ def init_connection(
     - Thread count defaults to 4 to limit concurrent buffer-pool competition
       inside a constrained container.  Override with ``SUPERTABLE_DUCKDB_THREADS``.
     """
-    # Resolve memory limit: caller arg < env var override.
+    # Resolve memory limit.
+    # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
+    # The `memory_limit` argument is the caller's fallback when the env var is absent.
     effective_memory_limit = os.getenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", memory_limit)
     con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
 
@@ -408,10 +607,27 @@ def init_connection(
     except Exception:
         pass  # older DuckDB builds may not support this setting
 
-    # Thread cap: prevents all cores competing for the same limited buffer pool.
-    threads_env = os.getenv("SUPERTABLE_DUCKDB_THREADS", "4")
+    # Thread count.
+    # If SUPERTABLE_DUCKDB_THREADS is set explicitly, honour it exactly.
+    # Otherwise derive from the effective memory limit using the IO-thread
+    # formula: min(cpu * IO_MULTIPLIER, memory_mb // 400).
+    # DuckDB uses synchronous IO — more threads = more parallel HTTP requests.
+    explicit_threads = os.getenv("SUPERTABLE_DUCKDB_THREADS", "").strip()
+    if explicit_threads:
+        try:
+            thread_count = int(explicit_threads)
+        except ValueError:
+            logger.warning(
+                f"[duckdb.threads] invalid SUPERTABLE_DUCKDB_THREADS='{explicit_threads}'; "
+                f"falling back to auto-derive"
+            )
+            thread_count = _derive_thread_count(effective_memory_limit)
+    else:
+        thread_count = _derive_thread_count(effective_memory_limit)
+
     try:
-        con.execute(f"SET threads={int(threads_env)};")
+        con.execute(f"SET threads={thread_count};")
+        logger.debug(f"[duckdb.init] threads={thread_count}, memory={effective_memory_limit}")
     except Exception:
         pass
 
@@ -513,3 +729,10 @@ def create_dedup_view(
         f") sub WHERE __rn__ = 1;"
     )
     con.execute(sql)
+
+# (ParquetMetadataCache removed: was write-only dead weight.
+#  DuckDB's built-in enable_http_metadata_cache on the persistent connection
+#  already handles parquet footer caching at the connection level.
+#  The external file cache (enable_external_file_cache) is now configured
+#  inside configure_httpfs_and_s3, after LOAD httpfs, where the setting
+#  actually exists.)

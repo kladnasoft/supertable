@@ -262,7 +262,20 @@ class DataWriter:
 
             # --- CAS set leaf pointer + atomic root bump ----------------------
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            payload = new_snapshot_dict
+
+            # Strip per-file stats before caching in Redis.
+            # Stats are only used by the write path, which reads them from the
+            # full snapshot on storage via get_simple_table_snapshot() — never
+            # from the Redis leaf.  estimate() only needs file + file_size +
+            # schema, so storing stats in Redis wastes ~73% of the payload with
+            # no benefit (~934 → ~172 bytes per resource entry).
+            payload = {
+                **new_snapshot_dict,
+                "resources": [
+                    {k: v for k, v in r.items() if k != "stats"}
+                    for r in (new_snapshot_dict.get("resources") or [])
+                ],
+            }
 
             try:
                 self.catalog.set_leaf_payload_cas(

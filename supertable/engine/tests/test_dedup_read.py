@@ -426,7 +426,7 @@ class TestDuckDBPinnedDedup:
     @patch("supertable.engine.duckdb_pinned.create_dedup_view")
     @patch("supertable.engine.duckdb_pinned.create_rbac_view")
     @patch("supertable.engine.duckdb_pinned.rewrite_query_with_hashed_tables")
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     @patch("supertable.engine.duckdb_pinned.init_connection")
     def test_dedup_view_created_and_used(
@@ -500,7 +500,7 @@ class TestDuckDBPinnedDedup:
     @patch("supertable.engine.duckdb_pinned.create_dedup_view")
     @patch("supertable.engine.duckdb_pinned.create_rbac_view")
     @patch("supertable.engine.duckdb_pinned.rewrite_query_with_hashed_tables")
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     @patch("supertable.engine.duckdb_pinned.init_connection")
     def test_rbac_then_dedup_layering(
@@ -574,7 +574,7 @@ class TestDuckDBTransientDedupColumnExtension:
     """Verify the transient engine extends columns for dedup tables."""
 
     @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_table_with_presign_retry")
+    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
     @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
     @patch("supertable.engine.duckdb_transient.init_connection")
     @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")
@@ -634,7 +634,7 @@ class TestDuckDBTransientDedupColumnExtension:
         # args: con, storage, table_name, files, cols, log_prefix
         cols_used = create_call[0][4] if len(create_call[0]) > 4 else create_call[1].get("cols", [])
         # The method is called positionally:
-        # create_reflection_table_with_presign_retry(con, self.storage, table_name, files, cols, log_prefix)
+        # create_reflection_view_with_presign_retry(con, self.storage, table_name, files, cols, log_prefix)
         cols_used = create_call[0][4]
 
         cols_lower = {c.lower() for c in cols_used}
@@ -644,7 +644,7 @@ class TestDuckDBTransientDedupColumnExtension:
         assert "__timestamp__" in cols_lower, "Order column added"
 
     @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_table_with_presign_retry")
+    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
     @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
     @patch("supertable.engine.duckdb_transient.init_connection")
     @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")
@@ -707,7 +707,7 @@ class TestDuckDBTransientDedupColumnExtension:
         assert "__timestamp__" in cols_lower
 
     @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_table_with_presign_retry")
+    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
     @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
     @patch("supertable.engine.duckdb_transient.init_connection")
     @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")

@@ -15,6 +15,13 @@ from supertable.utils.helper import generate_filename, collect_schema
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
 
+# Target row-group size for all Parquet writes.
+# 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
+# Smaller groups mean tighter min/max statistics so DuckDB can skip more groups;
+# larger groups reduce metadata overhead.  120 K is a good balance for the
+# incremental-merge pattern used here.
+_PARQUET_ROW_GROUP_SIZE = 122_880
+
 
 def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:
     """Return (max_mem_bytes, max_files) for the given table config.
@@ -711,6 +718,17 @@ def write_parquet_and_collect_resources(
     new_parquet_file = generate_filename("data", "parquet")
     new_parquet_path = os.path.join(data_dir, new_parquet_file)
 
+    # Sort before writing so each row group covers a tight min/max range.
+    # DuckDB uses these zonemaps to skip entire row groups during filtered scans.
+    # Sort order: __timestamp__ first (most-queried filter), then overwrite_columns
+    # as a tiebreaker.  Sorting is a no-op when write_df is already empty.
+    sort_cols = (
+        (["__timestamp__"] if "__timestamp__" in write_df.columns else [])
+        + [c for c in (overwrite_columns or []) if c in write_df.columns and c != "__timestamp__"]
+    )
+    if sort_cols and write_df.height > 0:
+        write_df = write_df.sort(sort_cols)
+
     # Write to the active storage backend (MinIO/local/etc.) WITHOUT changing behavior:
     # we keep zstd + compression_level + statistics exactly like before by generating
     # the Parquet bytes ourselves and uploading them.
@@ -725,6 +743,7 @@ def write_parquet_and_collect_resources(
             compression_level=int(compression_level),
             use_dictionary=True,
             write_statistics=True,
+            row_group_size=_PARQUET_ROW_GROUP_SIZE,
         )
         data = buf.getvalue()
 
@@ -741,6 +760,7 @@ def write_parquet_and_collect_resources(
                 compression="zstd",
                 compression_level=int(compression_level),
                 statistics=True,
+                row_group_size=_PARQUET_ROW_GROUP_SIZE,
             )
     except Exception:
         # As a safety net, do a local write if the storage upload path fails
@@ -749,6 +769,7 @@ def write_parquet_and_collect_resources(
             compression="zstd",
             compression_level=int(compression_level),
             statistics=True,
+            row_group_size=_PARQUET_ROW_GROUP_SIZE,
         )
 
     # size via storage if available

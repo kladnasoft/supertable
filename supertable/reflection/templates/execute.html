@@ -2164,51 +2164,185 @@ let html = '';
 
 
 
-    // ── Auto-detect tables and WHERE conditions from a SQL query ──────────────
+    // ═══════════════════════════════════════════════════════════════════
+    // SQL → FilterBuilder JSON converter
+    //
+    // FilterBuilder expects filters as a JSON structure:
+    //   list  → items joined with AND
+    //   dict  → column conditions, OR/AND/NOT logical operators
+    //
+    // Each leaf condition:
+    //   { "col": { "operation": "=", "type": "value",  "value": "EU"  } }
+    //   { "col": { "operation": ">", "type": "column", "value": 7     } }  ← numbers/functions
+    //   { "col": { "operation": "IS", "type": "null",  "value": null  } }
+    //   { "col": { "range": [ {type,operation,value}, … ] } }              ← BETWEEN
+    //   { "OR":  [ condition, … ] }
+    //   { "AND": [ condition, … ] }
+    //   { "NOT": condition }
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Split text on a top-level keyword (AND/OR), respecting parentheses and quotes.
+    function _splitTopLevel(text, keyword) {
+      const parts = [];
+      let depth = 0, inSingle = false, inDouble = false;
+      let cur = '', i = 0;
+      const kw = keyword.toUpperCase();
+      while (i < text.length) {
+        const ch = text[i];
+        if (ch === "'" && !inDouble) { inSingle = !inSingle; cur += ch; i++; continue; }
+        if (ch === '"' && !inSingle) { inDouble = !inDouble; cur += ch; i++; continue; }
+        if (!inSingle && !inDouble) {
+          if (ch === '(') depth++;
+          else if (ch === ')') depth--;
+          if (depth === 0) {
+            const rest = text.slice(i).toUpperCase();
+            if (rest.startsWith(kw) && /^\s/.test(text[i + kw.length] || ' ') &&
+                /[\s)]$/.test(text[i - 1] || ' ')) {
+              parts.push(cur.trim());
+              cur = '';
+              i += kw.length;
+              continue;
+            }
+          }
+        }
+        cur += ch; i++;
+      }
+      if (cur.trim()) parts.push(cur.trim());
+      return parts.length > 1 ? parts : null;  // null = not split
+    }
+
+    // Parse a single leaf condition: "col OP value"
+    // Returns a FilterBuilder dict or null if unparseable.
+    function _parseLeafCondition(expr) {
+      expr = expr.trim();
+
+      // Strip surrounding parens if balanced
+      while (expr.startsWith('(') && expr.endsWith(')')) {
+        let d = 0, ok = true;
+        for (let i = 0; i < expr.length - 1; i++) {
+          if (expr[i] === '(') d++;
+          else if (expr[i] === ')') d--;
+          if (d === 0) { ok = false; break; }
+        }
+        if (ok) expr = expr.slice(1, -1).trim();
+        else break;
+      }
+
+      // IS NULL / IS NOT NULL
+      let m = expr.match(/^(\w+)\s+IS\s+(NOT\s+)?NULL$/i);
+      if (m) {
+        const col = m[1], neg = !!m[2];
+        if (neg) return { NOT: { [col]: { operation: 'IS', type: 'null', value: null } } };
+        return { [col]: { operation: 'IS', type: 'null', value: null } };
+      }
+
+      // BETWEEN: col BETWEEN a AND b → range
+      m = expr.match(/^(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$/i);
+      if (m) {
+        const col = m[1], lo = m[2].trim(), hi = m[3].trim();
+        const makeRangePart = (v, op) => {
+          if (/^'.*'$/.test(v)) return { type: 'value', operation: op, value: v.slice(1, -1) };
+          return { type: 'column', operation: op, value: isNaN(Number(v)) ? v : Number(v) };
+        };
+        return { [col]: { range: [ makeRangePart(lo, '>='), makeRangePart(hi, '<=') ] } };
+      }
+
+      // Standard: col OP value
+      // Supported ops: = != <> < > <= >= LIKE ILIKE
+      m = expr.match(/^(\w+)\s*(=|!=|<>|<=|>=|<|>|ILIKE|LIKE)\s*(.+)$/i);
+      if (m) {
+        const col = m[1], op = m[2].toUpperCase(), rawVal = m[3].trim();
+        let type, value;
+        if (/^'.*'$/.test(rawVal)) {
+          type = 'value';
+          value = rawVal.slice(1, -1);
+        } else if (!isNaN(Number(rawVal))) {
+          type = 'column';
+          value = Number(rawVal);
+        } else {
+          // function or column reference (e.g. GETUTCDATE() - 7)
+          type = 'column';
+          value = rawVal;
+        }
+        return { [col]: { operation: op, type, value } };
+      }
+
+      return null;  // unparseable — caller will skip
+    }
+
+    // Parse any expression (recursive: handles AND / OR / NOT / parens).
+    function _parseExpression(expr) {
+      expr = expr.trim();
+      if (!expr) return null;
+
+      // Strip balanced outer parens
+      while (expr.startsWith('(') && expr.endsWith(')')) {
+        let d = 0, ok = true;
+        for (let i = 0; i < expr.length - 1; i++) {
+          if (expr[i] === '(') d++;
+          else if (expr[i] === ')') d--;
+          if (d === 0) { ok = false; break; }
+        }
+        if (ok) expr = expr.slice(1, -1).trim();
+        else break;
+      }
+
+      // NOT
+      if (/^NOT\s+/i.test(expr)) {
+        const inner = _parseExpression(expr.slice(4).trim());
+        return inner ? { NOT: inner } : null;
+      }
+
+      // Try OR first (lower precedence)
+      const orParts = _splitTopLevel(expr, ' OR ');
+      if (orParts && orParts.length > 1) {
+        const items = orParts.map(_parseExpression).filter(Boolean);
+        return items.length > 1 ? { OR: items } : items[0] || null;
+      }
+
+      // Try AND
+      const andParts = _splitTopLevel(expr, ' AND ');
+      if (andParts && andParts.length > 1) {
+        const items = andParts.map(_parseExpression).filter(Boolean);
+        return items.length > 1 ? items : items[0] || null;  // list = AND in FilterBuilder
+      }
+
+      // Leaf
+      return _parseLeafCondition(expr);
+    }
+
+    // Top-level: extract WHERE clause from SQL and return FilterBuilder JSON array.
+    // Returns ["*"] if no WHERE or unparseable.
     function _detectTablesFromSQL(sql) {
-      // Strip comments
       let q = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
       const tables = new Set();
-      // Match FROM table_name [alias] and JOIN table_name [alias]
-      // Handles: FROM foo, FROM foo f, FROM foo AS f, JOIN foo, LEFT JOIN foo AS f etc.
       const re = /(?:FROM|JOIN)\s+([a-zA-Z_][\w.]*)/gi;
       let m;
       while ((m = re.exec(q)) !== null) {
         const raw = m[1];
-        // Strip schema prefix (schema.table → table)
         const name = raw.includes('.') ? raw.split('.').pop() : raw;
-        // Skip SQL keywords that can appear after FROM in subqueries
         if (/^(SELECT|WHERE|GROUP|ORDER|HAVING|LIMIT|UNION|WITH)$/i.test(name)) continue;
         tables.add(name);
       }
       return [...tables];
     }
 
-    function _detectFiltersFromSQL(sql) {
-      // Strip comments, strip trailing semicolons
+    function _whereToFilterJSON(sql) {
+      // Strip comments and trailing semicolons
       let q = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/;+$/, '').trim();
-      // Extract everything after the last WHERE up to GROUP BY / ORDER BY / LIMIT / HAVING
-      const whereMatch = q.match(/\bWHERE\b([\s\S]+?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$)/i);
-      if (!whereMatch) return [];
-      const whereClause = whereMatch[1].trim();
-      if (!whereClause) return [];
-      // Split on top-level AND (not inside parentheses)
-      const conditions = [];
-      let depth = 0, current = '';
-      for (let i = 0; i < whereClause.length; i++) {
-        const ch = whereClause[i];
-        if (ch === '(') depth++;
-        else if (ch === ')') depth--;
-        if (depth === 0 && /\bAND\b/i.test(whereClause.slice(i, i + 3))) {
-          if (current.trim()) conditions.push(current.trim());
-          current = '';
-          i += 2; // skip "AND"
-          continue;
-        }
-        current += ch;
-      }
-      if (current.trim()) conditions.push(current.trim());
-      return conditions.filter(Boolean);
+
+      // Extract WHERE … (stop at GROUP BY / ORDER BY / HAVING / LIMIT)
+      const wm = q.match(/\bWHERE\b([\s\S]+?)(?=\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$)/i);
+      if (!wm) return ['*'];
+
+      const whereClause = wm[1].trim();
+      if (!whereClause) return ['*'];
+
+      const result = _parseExpression(whereClause);
+      if (!result) return ['*'];
+
+      // FilterBuilder expects a list at the top level
+      return Array.isArray(result) ? result : [result];
     }
 
     // ── Save as Role modal ────────────────────────────────────────────────────
@@ -2225,30 +2359,32 @@ let html = '';
         return;
       }
 
-      const orgEl   = document.getElementById('saveViewOrg');
-      const supEl   = document.getElementById('saveViewSup');
-      const nameEl  = document.getElementById('saveViewName');
+      const orgEl    = document.getElementById('saveViewOrg');
+      const supEl    = document.getElementById('saveViewSup');
+      const nameEl   = document.getElementById('saveViewName');
       const tablesEl = document.getElementById('saveRoleTables');
-      const colsEl  = document.getElementById('saveRoleColumns');
+      const colsEl   = document.getElementById('saveRoleColumns');
       const filtersEl = document.getElementById('saveRoleFilters');
-      const qEl     = document.getElementById('saveViewQueryPreview');
-      const stEl    = document.getElementById('saveViewStatus');
-      const manage  = document.getElementById('saveViewManageLink');
+      const qEl      = document.getElementById('saveViewQueryPreview');
+      const stEl     = document.getElementById('saveViewStatus');
+      const manage   = document.getElementById('saveViewManageLink');
 
-      if (orgEl)  orgEl.textContent  = organization;
-      if (supEl)  supEl.textContent  = superName;
-      if (qEl)    qEl.value          = q;
-      if (stEl)   stEl.style.display = 'none';
+      if (orgEl) orgEl.textContent  = organization;
+      if (supEl) supEl.textContent  = superName;
+      if (qEl)   qEl.value          = q;
+      if (stEl)  stEl.style.display = 'none';
 
-      // Auto-detect tables and filters (best effort)
-      const detectedTables  = _detectTablesFromSQL(q);
-      const detectedFilters = _detectFiltersFromSQL(q);
+      // Auto-detect tables
+      const detectedTables = _detectTablesFromSQL(q);
+      if (tablesEl) tablesEl.value = detectedTables.length ? detectedTables.join(', ') : '*';
+      if (colsEl)   colsEl.value   = '*';
 
-      if (tablesEl)  tablesEl.value  = detectedTables.length  ? detectedTables.join(', ')  : '*';
-      if (colsEl)    colsEl.value    = '*';
-      if (filtersEl) filtersEl.value = detectedFilters.length ? detectedFilters.join('\n') : '*';
+      // Auto-convert WHERE → FilterBuilder JSON
+      const filterJSON = _whereToFilterJSON(q);
+      if (filtersEl) {
+        filtersEl.value = JSON.stringify(filterJSON, null, 2);
+      }
 
-      // Default role name suggestion
       if (nameEl && !nameEl.value) {
         const ts = new Date().toISOString().slice(0, 10);
         nameEl.value = `${superName}-role-${ts}`;
@@ -2275,10 +2411,10 @@ let html = '';
       const filtersEl = document.getElementById('saveRoleFilters');
       const btn       = document.getElementById('btnSaveViewConfirm');
 
-      const role_name = nameEl    ? String(nameEl.value    || '').trim() : '';
-      const tablesRaw = tablesEl  ? String(tablesEl.value  || '').trim() : '*';
-      const colsRaw   = colsEl    ? String(colsEl.value    || '').trim() : '*';
-      const filtersRaw = filtersEl ? String(filtersEl.value || '').trim() : '*';
+      const role_name  = nameEl    ? String(nameEl.value    || '').trim() : '';
+      const tablesRaw  = tablesEl  ? String(tablesEl.value  || '').trim() : '*';
+      const colsRaw    = colsEl    ? String(colsEl.value    || '').trim() : '*';
+      const filtersRaw = filtersEl ? String(filtersEl.value || '').trim() : '["*"]';
 
       const errEl = document.getElementById('saveViewStatus');
       const showErr = (msg) => {
@@ -2302,15 +2438,14 @@ let html = '';
         ? ['*']
         : colsRaw.split(',').map(s => s.trim()).filter(Boolean);
 
-      // Parse filters — one per line or comma-separated; '*' means no filter
+      // Parse filters — must be valid FilterBuilder JSON
       let filters;
-      if (filtersRaw === '*' || !filtersRaw) {
-        filters = ['*'];
-      } else {
-        // Try newline split first, then comma split
-        const byLine = filtersRaw.split('\n').map(s => s.trim()).filter(Boolean);
-        filters = byLine.length > 1 ? byLine : filtersRaw.split(',').map(s => s.trim()).filter(Boolean);
-        if (!filters.length) filters = ['*'];
+      try {
+        filters = JSON.parse(filtersRaw);
+        if (!Array.isArray(filters)) filters = [filters];
+      } catch (e) {
+        showErr('Filters JSON is invalid. Please correct it or clear it to use ["*"].');
+        return;
       }
 
       if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>&nbsp;Saving…'; }
@@ -2323,11 +2458,11 @@ let html = '';
             organization,
             super_name: superName,
             role_name,
-            role: 'reader',           // always reader when created from Execute
+            role: 'reader',
             tables,
             columns,
             filters,
-            source_query: q,          // stored for display in RBAC page
+            source_query: q,
           })
         });
 
@@ -2335,7 +2470,6 @@ let html = '';
         errEl.style.color = '#0f766e';
         errEl.textContent = 'Role saved successfully.';
 
-        // Clear name so next open gets a fresh suggestion
         if (nameEl) nameEl.value = '';
 
         setTimeout(() => {
@@ -2559,17 +2693,17 @@ $(document).ready(function(){
                        placeholder="e.g. id, name, email — or * for all" />
               </div>
 
-              <!-- Filters (auto-detected WHERE, editable) -->
+              <!-- Filters (auto-converted from WHERE clause to FilterBuilder JSON) -->
               <div class="form-group">
                 <label class="text-sm muted" for="saveRoleFilters" style="font-weight:600;">
                   Filters
-                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected from WHERE — edit if needed)</span>
+                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-converted from WHERE clause)</span>
                 </label>
-                <textarea id="saveRoleFilters" class="form-control" rows="3"
-                          placeholder='e.g. country = &apos;EU&apos;, created_at > GETUTCDATE() - 7'
+                <textarea id="saveRoleFilters" class="form-control" rows="4"
                           style="font-family:monospace; font-size:12px;"></textarea>
                 <small class="text-muted">
-                  One condition per line, or comma-separated. Use <code>*</code> for no row-level filter.
+                  FilterBuilder JSON — <code>["*"]</code> means no row-level filter.
+                  Supports <code>=</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>LIKE</code> <code>BETWEEN</code> <code>IS NULL</code> <code>AND</code> <code>OR</code> <code>NOT</code>.
                 </small>
               </div>
 

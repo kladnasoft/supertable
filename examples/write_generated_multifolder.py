@@ -13,7 +13,7 @@ import argparse
 
 from supertable.data_writer import DataWriter
 from supertable.utils.helper import format_size
-from examples.defaults import organization, super_name, user_hash, overwrite_columns, generated_data_dir
+from examples.defaults import organization, super_name, role_name, overwrite_columns, generated_data_dir
 
 # --- Logging suppression (quiet the library, keep our prints) ---
 import logging
@@ -191,14 +191,14 @@ def process_file_core(data_writer, file_tuple, start_time, total_files):
     if SERIALIZE_WRITES:
         with write_lock:
             columns, rows, inserted, deleted = data_writer.write(
-                user_hash=user_hash,
+                role_name=role_name,
                 simple_name=hyper_name,
                 data=table,
                 overwrite_columns=overwrite_columns,
             )
     else:
         columns, rows, inserted, deleted = data_writer.write(
-            user_hash=user_hash,
+            role_name=role_name,
             simple_name=hyper_name,
             data=table,
             overwrite_columns=overwrite_columns,

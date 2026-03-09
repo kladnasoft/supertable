@@ -1,0 +1,44 @@
+# Caddyfile.https — Universal TLS sidecar for all Supertable services
+#
+# Usage: docker compose --profile <service> --profile https up
+#
+# One-time CA trust:
+#   docker compose --profile https exec caddy-https caddy trust
+{
+	local_certs
+}
+
+:8443 {
+	tls internal
+	reverse_proxy supertable-reflection:8050 {
+		header_up Host {upstream_hostport}
+	}
+}
+
+:8470 {
+	tls internal
+	reverse_proxy supertable-mcp:8070 {
+		header_up Host {upstream_hostport}
+	}
+}
+
+:8490 {
+	tls internal
+	reverse_proxy supertable-api:8090 {
+		header_up Host {upstream_hostport}
+	}
+}
+
+:8499 {
+	tls internal
+	reverse_proxy supertable-mcp:8099 {
+		header_up Host {upstream_hostport}
+	}
+}
+
+:9443 {
+	tls internal
+	reverse_proxy host.docker.internal:9002 {
+		header_up Host {upstream_hostport}
+	}
+}

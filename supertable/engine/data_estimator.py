@@ -315,6 +315,7 @@ class DataEstimator:
                 parquet_files: List[str] = []
                 schema: Set[str] = set()
 
+                current_version = 0
                 for snapshot in snapshots:
                     current_snapshot_path = snapshot["path"]
                     current_snapshot_data = snapshot.get("payload")
@@ -335,6 +336,13 @@ class DataEstimator:
                         parquet_files.append(resolved)
                         reflection_file_size += int(resource.get("file_size", 0))
 
+                # SuperSnapshot is created ONCE per (super_name, simple_name) after
+                # all snapshot iterations have accumulated their files and schema.
+                # Creating it inside the loop caused duplicate SuperSnapshot entries
+                # with cumulatively growing file lists (each iteration re-sharing the
+                # same mutable parquet_files list), inflating total_reflections and
+                # confusing the executor's snapshots_by_key lookup.
+                if snapshots:
                     super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
                                                    simple_version=current_version, files=parquet_files, columns=schema)
                     supers.append(super_snapshot)

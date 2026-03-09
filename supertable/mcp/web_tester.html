@@ -1,0 +1,886 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Supertable – MCP Tester</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"/>
+
+  <style>
+    :root {
+      --primary-color: #1c96ca;
+      --primary-light: #e6f4fa;
+      --secondary-color: #147ba3;
+      --text-color: #2b2d42;
+      --text-light: #8d99ae;
+      --transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+      --panel-bg: #ffffff;
+      --panel-border: #e0e5f0;
+      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0; padding: 0;
+      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #f3f6fb;
+      color: var(--text-color);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* ── Page shell ── */
+    .page {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      grid-template-rows: 56px 1fr;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ── */
+    .topbar {
+      grid-column: 1 / -1;
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--panel-border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 20px;
+      box-shadow: 0 1px 4px rgba(15,23,42,0.04);
+      z-index: 10;
+    }
+
+    .topbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--primary-color);
+      letter-spacing: -0.01em;
+    }
+    .topbar-brand i { font-size: 16px; }
+
+    .topbar-sep { width: 1px; height: 22px; background: var(--panel-border); }
+
+    .topbar-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-color);
+    }
+
+    .topbar-badge {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      background: var(--primary-light);
+      color: var(--primary-color);
+      border: 1px solid rgba(28,150,202,.25);
+      border-radius: 999px;
+      padding: 2px 8px;
+    }
+
+    .topbar-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ── Left panel (controls) ── */
+    .controls {
+      background: var(--panel-bg);
+      border-right: 1px solid var(--panel-border);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .ctrl-section {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--panel-border);
+    }
+
+    .ctrl-section:last-child { border-bottom: none; }
+
+    .ctrl-section-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--text-light);
+      margin-bottom: 10px;
+    }
+
+    /* ── Form fields ── */
+    .field { margin-bottom: 10px; }
+    .field:last-child { margin-bottom: 0; }
+
+    .field label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: #64748b;
+      margin-bottom: 4px;
+    }
+
+    .field input, .field textarea, .field select {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid #d0d7e7;
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--text-color);
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      transition: var(--transition);
+    }
+
+    .field input:focus,
+    .field textarea:focus,
+    .field select:focus {
+      border-color: var(--primary-color);
+      box-shadow: 0 0 0 3px var(--primary-light);
+    }
+
+    .field textarea {
+      resize: vertical;
+      min-height: 90px;
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    /* ── Buttons ── */
+    .btn {
+      padding: 6px 12px;
+      border-radius: 7px;
+      background: transparent;
+      border: 1px solid var(--primary-color);
+      color: var(--primary-color);
+      font-weight: 500;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      transition: var(--transition);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+    .btn:hover {
+      background: var(--primary-light);
+      border-color: var(--secondary-color);
+      color: var(--secondary-color);
+    }
+    .btn:active { transform: translateY(1px); }
+
+    .btn-exec {
+      background: var(--primary-color);
+      color: #fff;
+      border: 1px solid var(--primary-color);
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      font-family: inherit;
+      box-shadow: 0 4px 14px rgba(28,150,202,0.28);
+      transition: var(--transition);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .btn-exec:hover {
+      background: var(--secondary-color);
+      border-color: var(--secondary-color);
+      box-shadow: 0 6px 20px rgba(28,150,202,0.38);
+    }
+    .btn-exec:active { transform: translateY(1px); }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--panel-border);
+      color: var(--text-light);
+    }
+    .btn-ghost:hover {
+      background: #f3f6fb;
+      border-color: #c1ccdc;
+      color: var(--text-color);
+    }
+
+    .btn-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    /* ── Right panel (output) ── */
+    .output-panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: #f3f6fb;
+    }
+
+    /* ── Output toolbar ── */
+    .output-toolbar {
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--panel-border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .output-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: none;
+    }
+
+    .otab {
+      padding: 7px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-light);
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      border-bottom: 2px solid transparent;
+      font-family: inherit;
+      transition: color 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .otab:hover { color: var(--primary-color); }
+    .otab.active {
+      color: var(--primary-color);
+      border-bottom: 2px solid var(--primary-color);
+      font-weight: 600;
+    }
+
+    .output-status {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-light);
+    }
+
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #e2e8f0;
+      transition: background .3s;
+      flex-shrink: 0;
+    }
+    .status-dot.ok { background: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,.15); }
+    .status-dot.err { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,.15); }
+    .status-dot.loading {
+      background: var(--primary-color);
+      animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; }
+      50% { opacity:0.3; }
+    }
+
+    /* ── Output body ── */
+    .output-body {
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      padding: 16px 20px;
+      gap: 0;
+    }
+
+    .tab-content { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+    .tab-content.active { display: flex; }
+
+    pre.out-pre {
+      flex: 1;
+      margin: 0;
+      background: #0b1220;
+      color: #e2e8f0;
+      border-radius: 12px;
+      padding: 16px 18px;
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      overflow: auto;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    pre.out-pre .json-key    { color: #93c5fd; }
+    pre.out-pre .json-str    { color: #86efac; }
+    pre.out-pre .json-num    { color: #fcd34d; }
+    pre.out-pre .json-bool   { color: #f9a8d4; }
+    pre.out-pre .json-null   { color: #94a3b8; }
+
+    /* ── Events log ── */
+    .events-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .event-row {
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-color);
+      cursor: pointer;
+      transition: border-color .15s;
+    }
+    .event-row:hover { border-color: var(--primary-color); }
+    .event-row .ev-dir {
+      font-weight: 700;
+      font-size: 10px;
+      letter-spacing: .04em;
+      display: inline-block;
+      margin-right: 6px;
+    }
+    .event-row .ev-dir.out { color: var(--primary-color); }
+    .event-row .ev-dir.in  { color: #10b981; }
+    .event-row .ev-body {
+      display: none;
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--panel-border);
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #64748b;
+    }
+    .event-row.expanded .ev-body { display: block; }
+    .ev-method { font-weight: 600; }
+    .ev-id { color: #94a3b8; margin-left: 4px; }
+    .ev-ts { float: right; color: #94a3b8; font-size: 10px; }
+
+    /* ── Empty state ── */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--text-light);
+      user-select: none;
+    }
+    .empty-state i { font-size: 32px; opacity: .25; }
+    .empty-state p { margin: 0; font-size: 13px; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      right: 18px; top: 16px;
+      z-index: 5000;
+      background: rgba(15,23,42,0.92);
+      color: #fff;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 12px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.22);
+      display: none;
+      align-items: center;
+      gap: 8px;
+      max-width: 340px;
+      backdrop-filter: blur(8px);
+      animation: slideIn .2s ease;
+    }
+    .toast.show { display: flex; }
+    @keyframes slideIn {
+      from { transform: translateX(12px); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+    .toast i { flex-shrink: 0; }
+    .toast.toast-err { background: rgba(185,28,28,0.92); }
+    .toast.toast-ok  { background: rgba(5,122,85,0.92); }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(15,23,42,.12); border-radius: 6px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,.22); }
+
+    /* ── Misc ── */
+    .muted { color: var(--text-light); }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--primary-light);
+      color: var(--primary-color);
+      border: 1px solid rgba(28,150,202,.25);
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+  </style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ── Top bar ── -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <i class="fas fa-database"></i>
+      Supertable
+    </div>
+    <div class="topbar-sep"></div>
+    <span class="topbar-title">MCP Tester</span>
+    <span class="topbar-badge">Dev Tool</span>
+
+    <div class="topbar-right">
+      <button class="btn btn-ghost" onclick="callApi('health')">
+        <i class="fas fa-heart-pulse"></i> health
+      </button>
+      <button class="btn btn-ghost" onclick="callApi('info')">
+        <i class="fas fa-circle-info"></i> info
+      </button>
+      <button class="btn btn-ghost" onclick="refreshEvents()">
+        <i class="fas fa-rotate"></i> events
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Controls sidebar ── -->
+  <aside class="controls">
+
+    <!-- Context -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label"><i class="fas fa-key" style="margin-right:4px;"></i>Context</div>
+      <div class="field">
+        <label>Organization</label>
+        <input id="org" placeholder="kladna-soft" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label>Super name</label>
+        <input id="super" placeholder="example" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label>Role <span class="muted" style="font-weight:400;">(name or UUID)</span></label>
+        <input id="role" placeholder="role name or UUID" autocomplete="off"/>
+      </div>
+    </div>
+
+    <!-- Discovery -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label"><i class="fas fa-magnifying-glass" style="margin-right:4px;"></i>Discovery</div>
+      <div class="btn-group">
+        <button class="btn" onclick="doListSupers()">
+          <i class="fas fa-layer-group"></i> list_supers
+        </button>
+        <button class="btn" onclick="doListTables()">
+          <i class="fas fa-table"></i> list_tables
+        </button>
+      </div>
+    </div>
+
+    <!-- Table ops -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label"><i class="fas fa-table-columns" style="margin-right:4px;"></i>Table</div>
+      <div class="field">
+        <label>Table name</label>
+        <input id="table" placeholder="facts" autocomplete="off"/>
+      </div>
+      <div class="btn-group">
+        <button class="btn" onclick="doDescribeTable()">
+          <i class="fas fa-list"></i> describe
+        </button>
+        <button class="btn" onclick="doTableStats()">
+          <i class="fas fa-chart-bar"></i> stats
+        </button>
+        <button class="btn" onclick="doSuperMeta()">
+          <i class="fas fa-circle-nodes"></i> super_meta
+        </button>
+        <button class="btn" onclick="doSampleData()">
+          <i class="fas fa-eye"></i> sample
+        </button>
+      </div>
+    </div>
+
+    <!-- SQL query -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label"><i class="fas fa-terminal" style="margin-right:4px;"></i>Query SQL</div>
+      <div class="field">
+        <label>SQL</label>
+        <textarea id="sql" placeholder='SELECT * FROM "facts" LIMIT 10'></textarea>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Limit</label>
+          <input id="limit" placeholder="200"/>
+        </div>
+        <div class="field">
+          <label>Engine</label>
+          <input id="engine" placeholder="AUTO"/>
+        </div>
+      </div>
+      <div class="field">
+        <label>Timeout (sec)</label>
+        <input id="timeout" placeholder="30"/>
+      </div>
+      <div style="margin-top: 12px;">
+        <button class="btn-exec" onclick="doQuerySql()">
+          <i class="fas fa-play"></i> query_sql
+        </button>
+      </div>
+    </div>
+
+    <!-- Raw JSON-RPC -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label"><i class="fas fa-code" style="margin-right:4px;"></i>Raw JSON-RPC</div>
+      <div class="field">
+        <label>method</label>
+        <input id="rpc-method" placeholder="tools/call" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label>params <span class="muted" style="font-weight:400;">(JSON)</span></label>
+        <textarea id="rpc-params" placeholder='{"name":"whoami","arguments":{}}'></textarea>
+      </div>
+      <div class="btn-group" style="margin-top: 8px;">
+        <button class="btn-exec" onclick="doRawRpc()">
+          <i class="fas fa-paper-plane"></i> send
+        </button>
+        <button class="btn btn-ghost" onclick="clearRpc()">clear</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Output panel ── -->
+  <main class="output-panel">
+
+    <div class="output-toolbar">
+      <div class="output-tabs">
+        <button class="otab active" data-tab="response" onclick="switchTab('response', this)">
+          <i class="fas fa-brackets-curly"></i> Response
+        </button>
+        <button class="otab" data-tab="events" onclick="switchTab('events', this)">
+          <i class="fas fa-wave-square"></i> Event Log
+        </button>
+      </div>
+      <div class="output-status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Idle</span>
+        <button class="btn btn-ghost" id="copyBtn" onclick="copyOutput()" style="padding:4px 10px; font-size:11px; display:none;">
+          <i class="fas fa-copy"></i> copy
+        </button>
+      </div>
+    </div>
+
+    <div class="output-body">
+
+      <!-- Response tab -->
+      <div class="tab-content active" id="tab-response">
+        <div class="empty-state" id="responseEmpty">
+          <i class="fas fa-brackets-curly"></i>
+          <p>Run a command to see the response</p>
+        </div>
+        <pre class="out-pre" id="out" style="display:none;"></pre>
+      </div>
+
+      <!-- Events tab -->
+      <div class="tab-content" id="tab-events">
+        <div class="empty-state" id="eventsEmpty">
+          <i class="fas fa-wave-square"></i>
+          <p>No events yet — click <strong>events</strong> in the toolbar</p>
+        </div>
+        <div class="events-list" id="eventsList" style="display:none;"></div>
+      </div>
+
+    </div>
+  </main>
+
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast">
+  <i class="fas fa-circle-check" id="toastIcon"></i>
+  <span id="toastMsg"></span>
+</div>
+
+<script>
+/* ──────────────────────────────────────────────────────
+   Auth helpers
+────────────────────────────────────────────────────── */
+function getAuthToken() {
+  const p = new URLSearchParams(window.location.search);
+  const q = (p.get('auth') || '').trim();
+  if (q) { localStorage.setItem('st_auth', q); return q; }
+  return (localStorage.getItem('st_auth') || '').trim();
+}
+function authHeaders(token) {
+  return token ? { 'authorization': 'Bearer ' + token } : {};
+}
+
+/* ──────────────────────────────────────────────────────
+   UI helpers
+────────────────────────────────────────────────────── */
+function val(id) { return (document.getElementById(id)?.value || '').trim(); }
+function numOrNull(id) {
+  const v = val(id);
+  if (!v) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function setStatus(state, text) {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'status-dot' + (state ? ' ' + state : '');
+  document.getElementById('statusText').textContent = text || 'Idle';
+}
+
+function showResponse(data) {
+  const pre = document.getElementById('out');
+  const empty = document.getElementById('responseEmpty');
+  const json = JSON.stringify(data, null, 2);
+  pre.innerHTML = syntaxHighlight(json);
+  pre.style.display = '';
+  empty.style.display = 'none';
+  document.getElementById('copyBtn').style.display = '';
+  switchTab('response', document.querySelector('[data-tab="response"]'));
+}
+
+function syntaxHighlight(json) {
+  return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function(match) {
+    let cls = 'json-num';
+    if (/^"/.test(match)) {
+      cls = /:$/.test(match) ? 'json-key' : 'json-str';
+    } else if (/true|false/.test(match)) {
+      cls = 'json-bool';
+    } else if (/null/.test(match)) {
+      cls = 'json-null';
+    }
+    return '<span class="' + cls + '">' + match + '</span>';
+  });
+}
+
+function copyOutput() {
+  const pre = document.getElementById('out');
+  navigator.clipboard.writeText(pre.textContent).then(() => showToast('Copied to clipboard', 'ok'));
+}
+
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.otab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+}
+
+let _toastTimer;
+function showToast(msg, type = '') {
+  const el = document.getElementById('toast');
+  const icon = document.getElementById('toastIcon');
+  el.className = 'toast show' + (type ? ' toast-' + type : '');
+  icon.className = type === 'err' ? 'fas fa-circle-xmark' : 'fas fa-circle-check';
+  document.getElementById('toastMsg').textContent = msg;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+/* ──────────────────────────────────────────────────────
+   Fetch wrappers
+────────────────────────────────────────────────────── */
+async function getJson(url) {
+  setStatus('loading', 'Loading…');
+  try {
+    const token = getAuthToken();
+    const r = await fetch(url, { headers: authHeaders(token) });
+    const j = await r.json();
+    showResponse(j);
+    setStatus('ok', r.ok ? 'OK ' + r.status : 'Error ' + r.status);
+    return j;
+  } catch (e) {
+    setStatus('err', 'Failed');
+    showToast(e.message, 'err');
+    throw e;
+  }
+}
+
+async function postJson(url, body) {
+  setStatus('loading', 'Loading…');
+  try {
+    const token = getAuthToken();
+    const headers = { 'content-type': 'application/json', ...authHeaders(token) };
+    const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const j = await r.json();
+    showResponse(j);
+    setStatus('ok', r.ok ? 'OK ' + r.status : 'Error ' + r.status);
+    return j;
+  } catch (e) {
+    setStatus('err', 'Failed');
+    showToast(e.message, 'err');
+    throw e;
+  }
+}
+
+/* ──────────────────────────────────────────────────────
+   API actions
+────────────────────────────────────────────────────── */
+async function callApi(name) {
+  if (name === 'health') return getJson('/api/health');
+  if (name === 'info')   return getJson('/api/info');
+  if (name === 'events') return refreshEvents();
+}
+
+async function refreshEvents() {
+  setStatus('loading', 'Loading…');
+  try {
+    const token = getAuthToken();
+    const r = await fetch('/api/events', { headers: authHeaders(token) });
+    const j = await r.json();
+    renderEvents((j.events || []).reverse());
+    setStatus('ok', 'OK 200');
+    switchTab('events', document.querySelector('[data-tab="events"]'));
+  } catch (e) {
+    setStatus('err', 'Failed');
+    showToast(e.message, 'err');
+  }
+}
+
+function renderEvents(events) {
+  const list = document.getElementById('eventsList');
+  const empty = document.getElementById('eventsEmpty');
+
+  if (!events || !events.length) {
+    list.style.display = 'none';
+    empty.style.display = '';
+    return;
+  }
+
+  list.style.display = '';
+  empty.style.display = 'none';
+
+  list.innerHTML = events.slice(0, 200).map((ev, i) => {
+    const dir = ev.dir || '';
+    const isOut = dir === '->' || dir === 'out';
+    const dirLabel = isOut ? '→ OUT' : '← IN';
+    const dirClass = isOut ? 'out' : 'in';
+    const method = ev.payload?.method || ev.payload?.result && '(result)' || '(message)';
+    const id = ev.payload?.id != null ? '#' + ev.payload.id : '';
+    const ts = new Date().toLocaleTimeString();
+    const body = JSON.stringify(ev.payload, null, 2);
+    return `<div class="event-row" onclick="this.classList.toggle('expanded')">
+      <span class="ev-dir ${dirClass}">${dirLabel}</span>
+      <span class="ev-method">${method}</span><span class="ev-id">${id}</span>
+      <span class="ev-ts">${ts}</span>
+      <div class="ev-body">${body}</div>
+    </div>`;
+  }).join('');
+}
+
+function doListSupers() {
+  const org = val('org');
+  if (!org) return showToast('Organization is required', 'err');
+  postJson('/api/list_supers', { organization: org, role: val('role') });
+}
+
+function doListTables() {
+  const org = val('org'), sup = val('super');
+  if (!org || !sup) return showToast('Organization and super_name required', 'err');
+  postJson('/api/list_tables', { organization: org, super_name: sup, role: val('role') });
+}
+
+function doDescribeTable() {
+  const org = val('org'), sup = val('super'), tbl = val('table');
+  if (!org || !sup || !tbl) return showToast('Org, super_name and table required', 'err');
+  postJson('/api/describe_table', { organization: org, super_name: sup, table: tbl, role: val('role') });
+}
+
+function doTableStats() {
+  const org = val('org'), sup = val('super'), tbl = val('table');
+  if (!org || !sup || !tbl) return showToast('Org, super_name and table required', 'err');
+  postJson('/api/get_table_stats', { organization: org, super_name: sup, table: tbl, role: val('role') });
+}
+
+function doSuperMeta() {
+  const org = val('org'), sup = val('super');
+  if (!org || !sup) return showToast('Organization and super_name required', 'err');
+  postJson('/api/get_super_meta', { organization: org, super_name: sup, role: val('role') });
+}
+
+function doSampleData() {
+  const org = val('org'), sup = val('super'), tbl = val('table');
+  if (!org || !sup || !tbl) return showToast('Org, super_name and table required', 'err');
+  const args = { organization: org, super_name: sup, table: tbl, role: val('role') };
+  const lim = numOrNull('limit');
+  if (lim) args.limit = lim;
+  postJson('/api/sample_data', args);
+}
+
+function doQuerySql() {
+  const org = val('org'), sup = val('super'), sql = val('sql');
+  if (!org || !sup || !sql) return showToast('Org, super_name and SQL required', 'err');
+  const args = { organization: org, super_name: sup, sql, role: val('role') };
+  const lim = numOrNull('limit');
+  const eng = val('engine');
+  const tout = numOrNull('timeout');
+  if (lim) args.limit = lim;
+  if (eng) args.engine = eng;
+  if (tout) args.query_timeout_sec = tout;
+  postJson('/api/query_sql', args);
+}
+
+function doRawRpc() {
+  const method = val('rpc-method');
+  if (!method) return showToast('method is required', 'err');
+  let params = {};
+  const raw = val('rpc-params');
+  if (raw) {
+    try { params = JSON.parse(raw); }
+    catch { return showToast('Invalid JSON in params', 'err'); }
+  }
+  postJson('/mcp_v1', { jsonrpc: '2.0', id: 1, method, params });
+}
+
+function clearRpc() {
+  document.getElementById('rpc-method').value = '';
+  document.getElementById('rpc-params').value = '';
+}
+
+// Keyboard shortcut: Ctrl/Cmd+Enter in SQL field → run query
+document.getElementById('sql').addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    doQuerySql();
+  }
+});
+</script>
+</body>
+</html>

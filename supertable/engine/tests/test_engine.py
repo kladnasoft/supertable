@@ -143,9 +143,11 @@ class TestSanitizeSqlString:
         assert sanitize_sql_string("'it's'") == "'it''s'"
 
     def test_unquoted_passthrough(self):
+        # Bare SQL keywords must pass through unchanged (used in SET statements).
         assert sanitize_sql_string("TRUE") == "TRUE"
 
     def test_numeric_passthrough(self):
+        # Bare numeric literals must pass through unchanged.
         assert sanitize_sql_string("42") == "42"
 
 
@@ -573,7 +575,10 @@ class TestConfigureHttpfsAndS3:
         con = MagicMock()
         configure_httpfs_and_s3(con, ["/local/file.parquet"])
         calls = [str(c) for c in con.execute.call_args_list]
-        assert any("INSTALL httpfs" in s for s in calls)
+        # With a MagicMock connection, LOAD httpfs succeeds silently so INSTALL
+        # is never called.  The relevant assertion is that httpfs IS loaded and
+        # that no S3-specific settings are applied for local paths.
+        assert any("LOAD httpfs" in s for s in calls)
         assert not any("s3_endpoint" in s for s in calls)
 
 
@@ -937,7 +942,7 @@ class TestDuckDBTransient:
     @patch("supertable.engine.duckdb_transient.duckdb")
     @patch("supertable.engine.duckdb_transient.init_connection")
     @patch("supertable.engine.duckdb_transient.hashed_table_name", return_value="st_abc")
-    @patch("supertable.engine.duckdb_transient.create_reflection_table_with_presign_retry", return_value=False)
+    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry", return_value=False)
     @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables", return_value="SELECT 1")
     def test_execute_flow(self, mock_rewrite, mock_create, mock_hash, mock_init, mock_duckdb):
         fake_con = MagicMock()
@@ -965,7 +970,7 @@ class TestDuckDBTransient:
         assert "CREATING_REFLECTION" in captures
         mock_init.assert_called_once()
         mock_create.assert_called_once()
-        fake_con.close.assert_called_once()
+        # The transient executor reuses a persistent connection; it is NOT closed per query.
 
     @patch("supertable.engine.duckdb_transient.duckdb")
     @patch("supertable.engine.duckdb_transient.init_connection")
@@ -978,7 +983,8 @@ class TestDuckDBTransient:
         parser.get_table_tuples.return_value = []
         with pytest.raises(RuntimeError):
             DuckDBTransient().execute(Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
-        fake_con.close.assert_called_once()
+        # init_connection raises before self._con is assigned, so _reset_connection
+        # is a no-op (self._con is None) and close() is not called on the raw con object.
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1023,51 +1029,51 @@ class TestDuckDBPinned:
         p._reset_connection()  # should not raise
         assert p._con is None
 
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     def test_ensure_table_creates_new(self, mock_httpfs, mock_create):
         p = self._make()
-        name = p._ensure_table(MagicMock(), "s", "t", 1, ["f.parquet"])
+        name = p._ensure_view(MagicMock(), "s", "t", 1, ["f.parquet"])
         assert name.startswith("pin_")
         assert "_v1" in name
         mock_create.assert_called_once()
 
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     def test_ensure_table_reuses_cached(self, mock_httpfs, mock_create):
         p = self._make()
         con = MagicMock()
-        n1 = p._ensure_table(con, "s", "t", 1, ["f.parquet"])
-        n2 = p._ensure_table(con, "s", "t", 1, ["f.parquet"])
+        n1 = p._ensure_view(con, "s", "t", 1, ["f.parquet"])
+        n2 = p._ensure_view(con, "s", "t", 1, ["f.parquet"])
         assert n1 == n2
         mock_create.assert_called_once()
 
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     def test_ensure_table_new_version_marks_old_stale(self, mock_httpfs, mock_create):
         p = self._make()
         con = MagicMock()
-        name1 = p._ensure_table(con, "s", "t", 1, ["f1.parquet"])
+        name1 = p._ensure_view(con, "s", "t", 1, ["f1.parquet"])
         p._acquire_refs({name1})  # keep it alive
-        name2 = p._ensure_table(con, "s", "t", 2, ["f2.parquet"])
+        name2 = p._ensure_view(con, "s", "t", 2, ["f2.parquet"])
         assert name1 != name2
         assert mock_create.call_count == 2
         stale = [e for e in p._registry[("s", "t")] if e.stale]
         assert len(stale) == 1
         assert stale[0].version == 1
 
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     def test_ensure_table_new_version_drops_unreferenced_stale(self, mock_httpfs, mock_create):
         p = self._make()
         con = MagicMock()
-        name1 = p._ensure_table(con, "s", "t", 1, ["f1.parquet"])
-        p._ensure_table(con, "s", "t", 2, ["f2.parquet"])
+        name1 = p._ensure_view(con, "s", "t", 1, ["f1.parquet"])
+        p._ensure_view(con, "s", "t", 2, ["f2.parquet"])
         entries = p._registry[("s", "t")]
         assert len(entries) == 1
         assert entries[0].version == 2
         assert not entries[0].stale
-        drop_calls = [c[0][0] for c in con.execute.call_args_list if "DROP TABLE" in str(c)]
+        drop_calls = [c[0][0] for c in con.execute.call_args_list if "DROP VIEW" in str(c)]
         assert any(name1 in s for s in drop_calls)
 
     def test_acquire_and_release_refs(self):
@@ -1107,7 +1113,7 @@ class TestDuckDBPinned:
         ]
         tables = p.get_cached_tables()
         assert len(tables) == 2
-        assert tables[0]["table_name"] == "tbl1"
+        assert tables[0]["view_name"] == "tbl1"
         assert tables[0]["stale"] is False
         assert tables[1]["stale"] is True
 
@@ -1119,14 +1125,14 @@ class TestDuckDBPinned:
         assert p._con is None
         assert p._registry == {}
 
-    @patch("supertable.engine.duckdb_pinned.create_reflection_table")
+    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
     @patch("supertable.engine.duckdb_pinned.make_presigned_list")
     @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
     def test_ensure_table_presign_fallback(self, mock_httpfs, mock_presign, mock_create):
         p = self._make()
         mock_create.side_effect = [Exception("HTTP Error 403"), None]
         mock_presign.return_value = ["https://presigned/f.parquet"]
-        name = p._ensure_table(MagicMock(), "s", "t", 1, ["s3://bucket/f.parquet"])
+        name = p._ensure_view(MagicMock(), "s", "t", 1, ["s3://bucket/f.parquet"])
         assert name.startswith("pin_")
         assert mock_create.call_count == 2
         mock_presign.assert_called_once()

@@ -98,15 +98,18 @@ engine_enum = None
 data_query_sql = None
 list_supers_fn = None
 list_tables_fn = None
+DataWriter = None
 
 def _ensure_imports():
-    global MetaReader, engine_enum, data_query_sql, list_supers_fn, list_tables_fn
+    global MetaReader, engine_enum, data_query_sql, list_supers_fn, list_tables_fn, DataWriter
     if MetaReader is None or engine_enum is None or data_query_sql is None or list_supers_fn is None or list_tables_fn is None:
         # Class + enum + module functions
         from supertable.meta_reader import MetaReader as _MR, list_supers as _LS, list_tables as _LT  # :contentReference[oaicite:2]{index=2}
         from supertable.data_reader import engine as _ENG, query_sql as _DQ  # :contentReference[oaicite:3]{index=3}
+        from supertable.data_writer import DataWriter as _DW
         MetaReader, engine_enum, data_query_sql = _MR, _ENG, _DQ
         list_supers_fn, list_tables_fn = _LS, _LT
+        DataWriter = _DW
 
 # ---------- Helpers ----------
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -181,7 +184,15 @@ def _serve_streamable_http_via_uvicorn(*, mcp: FastMCP, host: str, port: int, pa
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("uvicorn must be installed to serve MCP over HTTP") from exc
 
-    uvicorn.run(app, host=host, port=port)
+    # Wrap with TrustedHostMiddleware allowing any host — required when running
+    # behind a reverse proxy (Caddy/nginx) that forwards requests from any IP/hostname.
+    try:
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
+        app = TrustedHostMiddleware(app, allowed_hosts=["*"])
+    except ImportError:
+        pass
+
+    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="*")
 
 def _env_transport(name: str, default: str = "stdio") -> str:
     return _normalize_transport_value(os.getenv(name), default=default)
@@ -436,11 +447,119 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return list(reader.get_tables(user_hash=r))
+        return list(reader.get_tables(role_name=r))
 
     async with _get_limiter():
         tables = await anyio.to_thread.run_sync(_work)
-    return {"result": tables}
+
+    # ── __catalog__ lookup ──────────────────────────────────────────────────
+    # If a __catalog__ table exists, fetch ALL its rows regardless of schema
+    # and always emit catalog_hint so the AI uses it before querying anything.
+    catalog: List[Dict[str, Any]] = []
+    catalog_hint: Optional[str] = None
+
+    if "__catalog__" in tables:
+        # Always set the hint — even if the fetch fails the AI knows it exists.
+        catalog_hint = (
+            "IMPORTANT: Before querying any table, you MUST read the 'catalog' "
+            "field in this response. It contains human-written descriptions of every "
+            "table in this SuperTable — what the data means, how it is structured, "
+            "and what questions it can answer. Use it as your primary reference for "
+            "understanding the dataset before writing any SQL."
+        )
+        try:
+            eng = _resolve_engine(None)
+            limit_n = _clamp_limit(None, 500, 500)
+
+            def _fetch_catalog():
+                return _exec_query_sync(
+                    sup, org,
+                    'SELECT * FROM "__catalog__"',
+                    limit_n, eng, r,
+                )
+
+            async with _get_limiter():
+                cat_result = await anyio.to_thread.run_sync(_fetch_catalog)
+
+            if cat_result.get("status") == "OK":
+                cols = cat_result.get("columns") or []
+                rows = cat_result.get("rows") or []
+                # Accept any schema — zip whatever columns exist into dicts.
+                catalog = [dict(zip(cols, row)) for row in rows]
+                logger.info("__catalog__ loaded: %d rows, columns=%s", len(catalog), cols)
+        except Exception as exc:
+            logger.warning("__catalog__ fetch failed (non-fatal): %s", exc)
+
+    # ── __feedback__ summary ────────────────────────────────────────────────
+    # If a __feedback__ table exists, load the last 50 rows so the AI has
+    # context on past user ratings and comments. This helps it avoid repeating
+    # poorly-rated answers and build on well-rated ones.
+    feedback: List[Dict[str, Any]] = []
+    feedback_hint: Optional[str] = None
+
+    if "__feedback__" in tables:
+        feedback_hint = (
+            "IMPORTANT: The 'feedback' field contains past user ratings and comments "
+            "on previous AI responses in this SuperTable. You MUST review it to: "
+            "1) avoid repeating approaches that received thumbs_down ratings, "
+            "2) build on patterns that received thumbs_up ratings, "
+            "3) address any recurring user comments or frustrations. "
+            "Keep this context in memory for the entire session."
+        )
+        try:
+            eng = _resolve_engine(None)
+            limit_n = _clamp_limit(None, 50, 50)
+
+            def _fetch_feedback():
+                return _exec_query_sync(
+                    sup, org,
+                    'SELECT * FROM "__feedback__" ORDER BY ts DESC LIMIT 50',
+                    limit_n, eng, r,
+                )
+
+            async with _get_limiter():
+                fb_result = await anyio.to_thread.run_sync(_fetch_feedback)
+
+            if fb_result.get("status") == "OK":
+                cols = fb_result.get("columns") or []
+                rows = fb_result.get("rows") or []
+                feedback = [dict(zip(cols, row)) for row in rows]
+                logger.info("__feedback__ loaded: %d rows", len(feedback))
+        except Exception as exc:
+            logger.warning("__feedback__ fetch failed (non-fatal): %s", exc)
+
+    return {
+        "result": tables,
+        "catalog": catalog,
+        "catalog_hint": catalog_hint,
+        "feedback": feedback,
+        "feedback_hint": feedback_hint,
+        "system_hint": (
+            "SESSION INSTRUCTIONS — follow these for the entire conversation:\n"
+            "\n"
+            "1. CATALOG: The 'catalog' field describes every table — what it contains, "
+            "its columns, known joins, filters and example questions. "
+            "Read it before writing any SQL. Never query a table without consulting it first.\n"
+            "\n"
+            "2. FEEDBACK: The 'feedback' field contains past user ratings on previous AI responses. "
+            "Avoid patterns rated thumbs_down. Repeat patterns rated thumbs_up. "
+            "If a comment field explains why, treat it as a hard constraint.\n"
+            "\n"
+            "3. COLLECTING FEEDBACK: After every response you give, ask the user: "
+            "'Was this helpful? Reply 👍 or 👎'. "
+            "When the user replies 👍 or with positive words (yes, good, great, correct, perfect), "
+            "call the submit_feedback tool with rating=thumbs_up, "
+            "set query to the question that was asked, "
+            "set response_summary to a one-sentence summary of your answer, "
+            "and set table_name to the primary table you queried. "
+            "When the user replies 👎 or with negative words (no, wrong, incorrect, bad), "
+            "call submit_feedback with rating=thumbs_down and include their words in the comment field. "
+            "Never skip this step — every interaction should be logged.\n"
+            "\n"
+            "4. MEMORY: Keep catalog and feedback in memory for the full session. "
+            "Do not re-call list_tables unless the user explicitly asks to refresh."
+        ),
+    }
 
 @mcp.tool()
 @log_tool
@@ -454,7 +573,7 @@ async def describe_table(super_name: str, organization: str, table: str, role: O
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_table_schema(tbl, user_hash=r)
+        return reader.get_table_schema(tbl, role_name=r)
 
     async with _get_limiter():
         schema = await anyio.to_thread.run_sync(_work)
@@ -472,7 +591,7 @@ async def get_table_stats(super_name: str, organization: str, table: str, role: 
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_table_stats(tbl, user_hash=r)
+        return reader.get_table_stats(tbl, role_name=r)
 
     async with _get_limiter():
         stats = await anyio.to_thread.run_sync(_work)
@@ -489,7 +608,7 @@ async def get_super_meta(super_name: str, organization: str, role: Optional[str]
 
     def _work():
         reader = MetaReader(super_name=sup, organization=org)
-        return reader.get_super_meta(user_hash=r)
+        return reader.get_super_meta(role_name=r)
 
     async with _get_limiter():
         meta = await anyio.to_thread.run_sync(_work)
@@ -510,7 +629,7 @@ def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int,
         sql=sql,
         limit=limit_n,
         engine=eng,
-        user_hash=role_name,
+        role_name=role_name,
     )
 
     # Enforce limit here (in case downstream didn't)
@@ -638,6 +757,96 @@ async def sample_data(
                 "columns_meta": [],
             }
     return out
+
+@mcp.tool()
+@log_tool
+async def submit_feedback(
+    super_name: str,
+    organization: str,
+    rating: str,
+    query: str,
+    response_summary: str,
+    table_name: Optional[str] = None,
+    comment: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Write a feedback row to the __feedback__ table.
+
+    Call this after every AI response to record user satisfaction.
+    rating must be one of: thumbs_up, thumbs_down, neutral.
+
+    Args:
+        super_name:        SuperTable name.
+        organization:      Organization name.
+        rating:            thumbs_up | thumbs_down | neutral
+        query:             The natural language question or SQL that was asked.
+        response_summary:  Brief summary of what the AI answered.
+        table_name:        Which table was primarily queried (optional).
+        comment:           Optional free-text comment from the user.
+        role:              RBAC role.
+        auth_token:        Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    valid_ratings = {"thumbs_up", "thumbs_down", "neutral"}
+    rating = (rating or "").strip().lower()
+    if rating not in valid_ratings:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": f"rating must be one of: {sorted(valid_ratings)}",
+        }
+
+    ts = datetime.datetime.utcnow().isoformat()
+
+    row = {
+        "ts":               ts,
+        "rating":           rating,
+        "query":            (query or "").strip()[:2000],
+        "response_summary": (response_summary or "").strip()[:2000],
+        "table_name":       (table_name or "").strip()[:256],
+        "comment":          (comment or "").strip()[:2000],
+        "role":             r,
+    }
+
+    def _write():
+        dw = DataWriter(super_name=sup, organization=org)
+        columns, rows, inserted, deleted = dw.write(
+            role_name=r,
+            simple_name="__feedback__",
+            data=[row],
+            overwrite_columns=["ts"],  # ts is unique per entry; never overwrite existing rows
+        )
+        return {"columns": columns, "inserted": inserted, "deleted": deleted}
+
+    async with _get_limiter():
+        try:
+            write_result = await anyio.to_thread.run_sync(_write)
+            logger.info(
+                "submit_feedback: rating=%s table=%s inserted=%s",
+                rating, row["table_name"], write_result.get("inserted"),
+            )
+            return {
+                "result": "ok",
+                "status": "OK",
+                "ts": ts,
+                "rating": rating,
+                "inserted": write_result.get("inserted"),
+            }
+        except Exception as exc:
+            logger.exception("submit_feedback failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
