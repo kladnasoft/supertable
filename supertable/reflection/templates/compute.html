@@ -19,343 +19,172 @@
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 
   .root {
-    background: #ffffff;
-    border-radius: 16px;
-    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
-    padding: 24px 28px;
-    border: 1px solid rgba(0,0,0,0.05);
-    border-left: 5px solid var(--azure);
+    background: #ffffff; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    padding: 24px 28px; border: 1px solid rgba(0,0,0,0.05); border-left: 5px solid var(--azure);
   }
-  .title { font-size: 18px; font-weight: 900; color: var(--slate-900); }
 
   .panel {
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    background: #fff;
-    padding: 14px 14px;
+    border: 1px solid var(--border); border-radius: 16px; background: #fff; padding: 14px;
   }
-  .panel + .panel { margin-top: 12px; }
   .panel-head {
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap: 10px;
-    flex-wrap: wrap;
+    display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:nowrap;
   }
-  .panel-title {
-    font-weight: 900;
-    color: var(--slate-900);
-    display:flex;
-    align-items:center;
-    gap: 8px;
-    font-size: 13px;
+  .panel-actions {
+    display:flex; align-items:center; justify-content:flex-end; gap:10px; flex-wrap:nowrap; min-width:0;
+  }
+  .panel-actions .search { flex:1 1 300px; width:300px; max-width:380px; min-width:220px; }
+  .panel-actions .badge { flex:0 0 auto; }
+  .panel-actions .btn { flex:0 0 auto; }
+  @media (max-width: 980px) {
+    .panel-head { flex-wrap:wrap; }
+    .panel-actions { width:100%; justify-content:flex-start; flex-wrap:wrap; }
+    .panel-actions .search { flex:1 1 100%; width:100%; max-width:none; min-width:0; }
   }
 
   .btn-azure-outline {
-    border: 1px solid var(--azure);
-    background: transparent;
-    color: var(--azure);
-    font-weight: 700;
-    transition: background-color 0.2s ease, color 0.2s ease, transform .05s ease;
-    border-radius: 10px;
+    border:1px solid var(--azure); background:transparent; color:var(--azure);
+    font-weight:700; border-radius:10px; transition:background-color .2s,color .2s,transform .05s;
   }
-  .btn-azure-outline:hover { background: var(--azure); color: #ffffff; }
-  .btn-azure-outline:active { transform: translateY(1px); }
+  .btn-azure-outline:hover { background:var(--azure); color:#fff; }
+  .btn-azure-outline:active { transform:translateY(1px); }
 
   .btn-danger-outline {
-    border: 1px solid rgba(239,68,68,0.75);
-    background: transparent;
-    color: rgba(239,68,68,0.95);
-    font-weight: 800;
-    transition: background-color 0.2s ease, color 0.2s ease, transform .05s ease;
-    border-radius: 10px;
+    border:1px solid rgba(239,68,68,0.75); background:transparent; color:rgba(239,68,68,0.95);
+    font-weight:800; border-radius:10px; transition:background-color .2s,color .2s,transform .05s;
   }
-  .btn-danger-outline:hover { background: rgba(239,68,68,0.92); color:#fff; }
-  .btn-danger-outline:active { transform: translateY(1px); }
+  .btn-danger-outline:hover { background:rgba(239,68,68,0.92); color:#fff; }
+
+  .btn-test {
+    border:1px solid #059669; background:transparent; color:#059669;
+    font-weight:700; border-radius:10px; transition:background-color .2s,color .2s;
+  }
+  .btn-test:hover { background:#059669; color:#fff; }
+  .btn-test:disabled { opacity:0.5; cursor:not-allowed; }
 
   .rowcard {
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    background:#fff;
-    padding: 12px;
-    display:flex;
-    align-items:flex-start;
-    justify-content:space-between;
-    gap: 10px;
-    flex-wrap: wrap;
+    border:1px solid var(--border); border-radius:16px; background:#fff; padding:12px;
+    display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;
   }
-  .rowcard + .rowcard { margin-top: 10px; }
-
-  .rowcard .name { font-weight: 900; color: var(--slate-900); font-size: 13px; }
-  .rowcard .sub { margin-top: 4px; color: var(--slate-500); font-size: 12px; }
+  .rowcard + .rowcard { margin-top:10px; }
+  .rowcard .name { font-weight:900; color:var(--slate-900); font-size:13px; }
+  .rowcard .sub { margin-top:4px; color:var(--slate-500); font-size:12px; }
 
   .search {
-    border-radius: 999px;
-    border: 1px solid var(--border-strong);
-    padding: 9px 12px;
-    outline: none;
-    width: min(420px, 100%);
-    font-size: 13px;
-    background: #fff;
+    border-radius:999px; border:1px solid var(--border-strong); padding:9px 12px;
+    outline:none; width:min(420px,100%); font-size:13px; background:#fff;
   }
-  .search:focus { border-color: var(--azure); box-shadow: var(--ring); }
+  .search:focus { border-color:var(--azure); box-shadow:var(--ring); }
 
   .badge {
-    display:inline-flex;
-    align-items:center;
-    gap:6px;
-    padding:4px 10px;
-    border-radius:999px;
-    font-size:11px;
-    font-weight:900;
-    border:1px solid var(--border);
-    background:#fff;
-    color: var(--slate-500);
+    display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+    font-size:11px; font-weight:900; border:1px solid var(--border); background:#fff; color:var(--slate-500);
   }
 
   .toast {
-    position: fixed;
-    right: 18px;
-    top: 16px;
-    z-index: 5000;
-    background: rgba(15,23,42,0.92);
-    color: #fff;
-    border-radius: 14px;
-    padding: 10px 12px;
-    font-size: 12px;
-    box-shadow: 0 18px 40px rgba(0,0,0,0.22);
-    display:none;
-    max-width: min(520px, calc(100vw - 36px));
+    position:fixed; right:18px; top:16px; z-index:5000;
+    background:rgba(15,23,42,0.92); color:#fff; border-radius:14px; padding:10px 12px;
+    font-size:12px; box-shadow:0 18px 40px rgba(0,0,0,0.22); display:none;
+    max-width:min(520px,calc(100vw - 36px));
   }
 
   /* Modal */
   .modal-backdrop {
-    position:fixed;
-    inset:0;
-    background:rgba(15,23,42,.55);
-    display:none;
-    align-items:center;
-    justify-content:center;
-    z-index:4500;
-    padding:18px;
-    backdrop-filter: blur(3px);
+    position:fixed; inset:0; background:rgba(15,23,42,.55); display:none;
+    align-items:center; justify-content:center; z-index:4500; padding:18px; backdrop-filter:blur(3px);
   }
   .modal-card {
-    width:680px;
-    max-width:95vw;
-    background:#fff;
-    border-radius:18px;
-    border:1px solid var(--border);
-    border-left:5px solid var(--azure);
-    padding:18px 18px 16px 18px;
-    box-shadow: var(--shadow);
+    width:620px; max-width:95vw; max-height:90vh; overflow-y:auto;
+    background:#fff; border-radius:18px; border:1px solid var(--border); padding:22px; box-shadow:var(--shadow);
   }
+  .modal-card.sql    { border-left:5px solid #d97706; }
+  .modal-card.python { border-left:5px solid #7c3aed; }
+  .modal-card.inproc { border-left:5px solid #059669; }
   .modal-head {
-    display:flex;
-    align-items:flex-start;
-    justify-content:space-between;
-    gap:12px;
-    margin-bottom:12px;
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:14px;
   }
   .modal-title-wrap { display:flex; align-items:flex-start; gap:10px; }
   .modal-icon {
-    width:34px; height:34px;
-    border-radius:12px;
-    background: rgba(28,150,202,.12);
-    border: 1px solid rgba(28,150,202,.22);
-    display:flex; align-items:center; justify-content:center;
-    color: var(--azure);
+    width:34px; height:34px; border-radius:12px; display:flex; align-items:center; justify-content:center;
   }
-  .modal-title { font-size:15px; font-weight: 950; color: var(--slate-900); line-height: 1.1; }
-  .modal-sub { margin-top:3px; color: var(--slate-500); font-size: 12px; }
+  .modal-icon.sql    { background:rgba(217,119,6,.12); border:1px solid rgba(217,119,6,.22); color:#d97706; }
+  .modal-icon.python { background:rgba(124,58,237,.12); border:1px solid rgba(124,58,237,.22); color:#7c3aed; }
+  .modal-icon.inproc { background:rgba(5,150,105,.12); border:1px solid rgba(5,150,105,.22); color:#059669; }
+  .modal-title { font-size:15px; font-weight:950; color:var(--slate-900); line-height:1.1; }
+  .modal-sub { margin-top:3px; color:var(--slate-500); font-size:12px; }
 
   .btn-ghost {
-    padding: 6px 10px;
-    border-radius: 10px;
-    border: 1px solid #d0d7e7;
-    background: transparent;
-    color: #475569;
-    cursor: pointer;
-    font-size: 12px;
+    padding:6px 10px; border-radius:10px; border:1px solid #d0d7e7;
+    background:transparent; color:#475569; cursor:pointer; font-size:12px;
   }
   .btn-ghost:hover { background:#e2e8f0; }
 
-  .grid {
-    display:grid;
-    grid-template-columns: 1fr 1fr;
-    gap:12px;
-  }
-  @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:780px) { .grid { grid-template-columns:1fr; } }
 
-  .field {
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 10px 10px;
-    background: #fff;
-  }
+  .field { border:1px solid var(--border); border-radius:14px; padding:10px; background:#fff; }
   .form-label {
-    font-size: 12px;
-    font-weight: 950;
-    color: var(--slate-900);
-    margin-bottom: 6px;
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap: 8px;
+    font-size:12px; font-weight:950; color:var(--slate-900); margin-bottom:6px;
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
   }
-  .form-help { font-weight: 800; font-size: 11px; color: var(--slate-500); }
-
-  /* make the Bootstrap inputs match our card style */
-  .field .form-control,
-  .field .form-select {
-    border-radius: 12px;
-    border: 1px solid rgba(15,23,42,.12);
-    box-shadow: none !important;
+  .form-help { font-weight:800; font-size:11px; color:var(--slate-500); }
+  .field .form-control, .field .form-select {
+    border-radius:4px; border:1px solid rgba(15,23,42,.14); box-shadow:none !important; font-size:13px;
   }
-  .field .form-control:focus,
-  .field .form-select:focus {
-    border-color: var(--azure);
-    box-shadow: var(--ring) !important;
-    outline: none;
+  .field .form-control:focus, .field .form-select:focus {
+    border-color:var(--azure); box-shadow:var(--ring) !important; outline:none;
   }
 
-  .switch {
-    position: relative;
-    display: inline-block;
-    width: 44px;
-    height: 24px;
-    vertical-align: middle;
-  }
-  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch { position:relative; display:inline-block; width:44px; height:24px; vertical-align:middle; }
+  .switch input { opacity:0; width:0; height:0; }
   .slider {
-    position: absolute;
-    cursor: pointer;
-    inset: 0;
-    background-color: #e2e8f0;
-    border: 1px solid rgba(15,23,42,.12);
-    transition: .2s;
-    border-radius: 999px;
+    position:absolute; cursor:pointer; inset:0; background-color:#e2e8f0;
+    border:1px solid rgba(15,23,42,.12); transition:.2s; border-radius:999px;
   }
   .slider:before {
-    position: absolute;
-    content: "";
-    height: 18px;
-    width: 18px;
-    left: 3px;
-    top: 50%;
-    transform: translateY(-50%);
-    background-color: white;
-    transition: .2s;
-    border-radius: 999px;
-    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+    position:absolute; content:""; height:18px; width:18px; left:3px; top:50%;
+    transform:translateY(-50%); background-color:white; transition:.2s; border-radius:999px;
+    box-shadow:0 1px 2px rgba(0,0,0,.15);
   }
-  .switch input:checked + .slider {
-    background-color: rgba(28,150,202,.25);
-    border-color: rgba(28,150,202,.45);
-  }
-  .switch input:checked + .slider:before {
-    transform: translate(20px, -50%);
-  }
+  .switch input:checked + .slider { background-color:rgba(28,150,202,.25); border-color:rgba(28,150,202,.45); }
+  .switch input:checked + .slider:before { transform:translate(20px,-50%); }
 
-  .modal-actions {
-    display:flex;
-    justify-content:space-between;
-    gap:8px;
-    margin-top:14px;
-    flex-wrap:wrap;
-    align-items:center;
-  }
-  .modal-actions .left {
-    display:flex;
-    gap:10px;
-    flex-wrap:wrap;
-    align-items:center;
-  }
-  .error {
-    color: rgba(239,68,68,0.95);
-    font-weight: 800;
-    font-size: 12px;
-  }
+  .error { color:rgba(239,68,68,0.95); font-weight:800; font-size:12px; }
 
+  .modal-footer {
+    display:flex; justify-content:space-between; align-items:center; margin-top:16px; gap:10px; flex-wrap:wrap;
+  }
+  .modal-footer .left { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 
-  /* ---- admin.html tab bar style ---- */
+  .test-result {
+    font-size:12px; font-weight:800; padding:5px 10px; border-radius:8px; display:none; align-items:center; gap:6px;
+  }
+  .test-result.success { display:inline-flex; color:#059669; background:rgba(5,150,105,.08); border:1px solid rgba(5,150,105,.25); }
+  .test-result.fail    { display:inline-flex; color:#dc2626; background:rgba(220,38,38,.06); border:1px solid rgba(220,38,38,.25); }
+  .test-result.testing { display:inline-flex; color:var(--azure); background:rgba(28,150,202,.08); border:1px solid rgba(28,150,202,.25); }
+
+  .kind-badge {
+    display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:999px;
+    font-size:10px; font-weight:900; border:1px solid;
+  }
+  .kind-badge.spark-thrift { color:#d97706; border-color:rgba(217,119,6,.25); background:rgba(217,119,6,.06); }
+  .kind-badge.in-process   { color:#059669; border-color:rgba(5,150,105,.25); background:rgba(5,150,105,.06); }
+  .kind-badge.spark-plug   { color:#7c3aed; border-color:rgba(124,58,237,.25); background:rgba(124,58,237,.06); }
+
+  /* Tab bar */
   #tab-navigation {
-    display: flex;
-    gap: 24px;
-    margin-top: 16px;
-    border-bottom: 1px solid #e2e8f0;
-    padding: 0 2px;
-    flex-wrap: wrap;
+    display:flex; gap:0; margin-top:16px; border-bottom:1px solid #e2e8f0; padding:0 2px; flex-wrap:wrap;
   }
-
   .tab {
-    padding: 8px 0;
-    margin-bottom: -1px;
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: transparent;
-    cursor: pointer;
-    font-size: 13px;
-    color: #64748b;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    padding:8px 16px; margin-bottom:-1px; border:none; border-bottom:2px solid transparent;
+    background:transparent; cursor:pointer; font-size:13px; color:#64748b;
+    display:inline-flex; align-items:center; gap:6px; font-weight:500;
   }
+  .tab i { font-size:13px; }
+  .tab.active-sql    { color:#d97706; border-bottom-color:#d97706; font-weight:700; }
+  .tab.active-python { color:#7c3aed; border-bottom-color:#7c3aed; font-weight:700; }
 
-  .tab i { font-size: 13px; }
-
-  .tab.active {
-    color: var(--azure);
-    border-bottom-color: var(--azure);
-    font-weight: 500;
-  }
-
-  .tab-sep {
-    width: 1px;
-    height: 22px;
-    background: rgba(15, 23, 42, 0.12);
-    margin: 0 10px;
-    align-self: center;
-    border-radius: 1px;
-  }
-
-  .hidden { display:none; }
-
-
-  /* ---- Compute Pools toolbar alignment ---- */
-  .panel-head { flex-wrap: nowrap; }
-  .panel-actions {
-    display:flex;
-    align-items:center;
-    justify-content:flex-end;
-    gap:10px;
-    flex-wrap: nowrap;
-    min-width: 0;
-  }
-  .panel-actions .search {
-    flex: 1 1 340px;
-    width: 340px;
-    max-width: 420px;
-    min-width: 260px;
-  }
-  .panel-actions .badge { flex: 0 0 auto; }
-  .panel-actions .btn { flex: 0 0 auto; }
-
-  /* Responsive: allow wrap on smaller screens */
-  @media (max-width: 980px) {
-    .panel-head { flex-wrap: wrap; }
-    .panel-actions {
-      width: 100%;
-      justify-content: flex-start;
-      flex-wrap: wrap;
-    }
-    .panel-actions .search {
-      flex: 1 1 100%;
-      width: 100%;
-      max-width: none;
-      min-width: 0;
-    }
-  }
+  .tab-pane { display:none; }
+  .tab-pane.active { display:block; }
 </style>
 {% endblock %}
 
@@ -363,11 +192,12 @@
 {% include "selection.html" %}
 <div style="height: 18px;"></div>
 
-<!-- admin-style in-page tab bar (separate from the card) -->
 <div id="tab-navigation" style="margin: 0 6px 14px 6px;">
-  <button class="tab active" type="button" aria-selected="true">
-    <i class="fas fa-microchip"></i>
-    <span>Compute</span>
+  <button class="tab active-sql" type="button" data-tab="sql" id="tabSql">
+    <i class="fas fa-database"></i> SQL Pools
+  </button>
+  <button class="tab" type="button" data-tab="python" id="tabPython">
+    <i class="fab fa-python"></i> Python Pools
   </button>
 </div>
 
@@ -375,219 +205,211 @@
 
 <div id="root" class="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}">
 
-
   {% if not has_tenant %}
     <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
   {% else %}
-<div class="panel" style="margin-top:14px;">
-      <div class="panel-head">
-        <div class="muted"> Pools</div>
 
+  <!-- ═══ SQL tab ═══ -->
+  <div class="tab-pane active" id="pane-sql">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="muted"><i class="fas fa-database"></i> Spark Thrift connections</div>
         <div class="panel-actions">
-          <input id="poolSearch" class="search" placeholder="Search pools..." />
-          <span class="badge" id="countBadge"><i class="fas fa-list"></i> <span id="countValue">0</span></span>
-          <button class="btn btn-sm btn-azure-outline" id="btnNew"><i class="fas fa-plus"></i> New pool</button>
-          <button class="btn btn-sm btn-azure-outline" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+          <input id="sqlSearch" class="search" placeholder="Search SQL pools..." />
+          <span class="badge"><i class="fas fa-list"></i> <span id="sqlCount">0</span></span>
+          <button class="btn btn-sm btn-azure-outline" id="btnNewSql"><i class="fas fa-plus"></i> New</button>
+          <button class="btn btn-sm btn-azure-outline" id="btnRefreshSql"><i class="fas fa-rotate"></i></button>
         </div>
       </div>
-
-      <div id="list" style="margin-top:12px;"></div>
-      <div id="empty" class="muted" style="display:none; margin-top:10px;">No pools yet.</div>
-    </div>
-
-<div class="panel" style="margin-top:14px; display:none;" data-disabled="true">
-  <!-- Disabled: Notebook management is handled in Studio -->
-  <div class="panel-head">
-    <div class="muted"> Notebook</div>
-
-    <div class="panel-actions">
-      <span class="badge" id="nbStatus"><i class="fas fa-book"></i> <span id="nbStatusText">—</span></span>
-      <button class="btn btn-sm btn-azure-outline" id="btnNotebookOpen"><i class="fas fa-up-right-from-square"></i> Open</button>
-      <button class="btn btn-sm btn-azure-outline" id="btnNotebookRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+      <div id="sqlList" style="margin-top:12px;"></div>
+      <div id="sqlEmpty" class="muted" style="display:none; margin-top:10px;">No SQL pools yet. Click <b>New</b> to connect a Spark Thrift server.</div>
     </div>
   </div>
 
-  <div class="grid" style="margin-top:12px;">
-    <div class="field">
-      <div class="form-label">
-        <span>Notebook port</span>
-        <span class="form-help mono">SUPERTABLE_NOTEBOOK_PORT</span>
+  <!-- ═══ Python tab ═══ -->
+  <div class="tab-pane" id="pane-python">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="muted"><i class="fab fa-python"></i> Python runtimes</div>
+        <div class="panel-actions">
+          <input id="pySearch" class="search" placeholder="Search Python pools..." />
+          <span class="badge"><i class="fas fa-list"></i> <span id="pyCount">0</span></span>
+          <button class="btn btn-sm btn-azure-outline" id="btnNewPy"><i class="fas fa-plus"></i> New Spark Plug</button>
+          <button class="btn btn-sm btn-azure-outline" id="btnRefreshPy"><i class="fas fa-rotate"></i></button>
+        </div>
       </div>
-      <input class="form-control form-control-sm mono" id="notebookPort" type="number" min="1" max="65535" step="1" value="8010" />
-      <div class="muted" style="margin-top:6px;">Port used by the notebook WebSocket server (e.g. <span class="mono">/ws/execute</span>).</div>
-    </div>
-
-    <div class="field">
-      <div class="form-label">
-        <span>Default profile</span>
-        <span class="form-help">execution</span>
-      </div>
-      <select class="form-select form-select-sm mono" id="notebookProfile">
-        <option value="no-internet">no-internet</option>
-        <option value="internet">internet</option>
-      </select>
-      <div class="muted" style="margin-top:6px;">Default execution profile for new notebooks.</div>
-    </div>
-
-    <div class="field">
-      <div class="form-label">
-        <span>Persist notebooks</span>
-        <span class="form-help">server-side</span>
-      </div>
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-        <label style="display:flex; align-items:center; gap:10px; margin:0;">
-          <span class="muted" style="font-weight:900;">Enabled</span>
-          <span class="switch">
-            <input type="checkbox" id="notebookPersist" checked />
-            <span class="slider"></span>
-          </span>
-        </label>
-        <span class="muted" id="nbStorageDir" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:320px;"></span>
-      </div>
-      <div class="muted" style="margin-top:6px;">Notebooks are stored per-tenant on the server so you can use them later.</div>
-    </div>
-
-    <div class="field">
-      <div class="form-label">
-        <span>WebSocket URL</span>
-        <span class="form-help">derived</span>
-      </div>
-      <input class="form-control form-control-sm mono" id="notebookWsUrl" readonly />
-      <div class="muted" style="margin-top:6px;">Used by the notebook UI to execute code.</div>
+      <div id="pyList" style="margin-top:12px;"></div>
+      <div id="pyEmpty" class="muted" style="display:none; margin-top:10px;">No Spark Plug pools yet. The default in-process pool is always available.</div>
     </div>
   </div>
 
-  <div class="modal-actions">
-    <div class="left">
-      <span class="error" id="nbError" style="display:none;"></span>
-    </div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap;">
-      <button class="btn btn-sm btn-azure-outline" id="btnNotebookSave"><i class="fas fa-save"></i> Save</button>
-    </div>
+  <!-- legacy hidden elements -->
+  <div style="display:none;" data-legacy="true">
+    <div id="sparkThriftSearch"></div><span id="thriftCount"></span>
+    <div id="thriftList"></div><div id="thriftEmpty"></div>
+    <button id="btnNewThrift"></button><button id="btnRefreshThrift"></button>
+    <div id="sparkPlugSearch"></div><span id="plugCount"></span>
+    <div id="plugList"></div><div id="plugEmpty"></div>
+    <button id="btnNewPlug"></button><button id="btnRefreshPlug"></button>
+    <span id="nbStatusText"></span><span id="nbStorageDir"></span>
+    <input id="notebookPort" value="8010" /><select id="notebookProfile"></select>
+    <input id="notebookPersist" type="checkbox" /><input id="notebookWsUrl" />
+    <button id="btnNotebookSave"></button><button id="btnNotebookRefresh"></button>
+    <button id="btnNotebookOpen"></button><button id="btnNbUpload"></button>
+    <input id="nbUpload" type="file" /><div id="nbList"></div><div id="nbEmpty"></div>
+    <div id="thriftModalTitle"></div><input id="thriftId" /><input id="thriftName" />
+    <input id="thriftHost" /><input id="thriftPort" /><select id="thriftStatus"></select>
+    <input id="thriftS3" type="checkbox" /><input id="thriftS3Endpoint" />
+    <input id="thriftMinBytes" /><input id="thriftMaxBytes" /><span id="thriftModalError"></span>
+    <button id="btnThriftClose"></button><button id="btnThriftCancel"></button><button id="btnThriftSave"></button>
+    <div id="plugModalTitle"></div><input id="plugId" /><input id="plugName" />
+    <input id="plugMaster" /><input id="plugWsUrl" /><input id="plugWebui" />
+    <select id="plugStatus"></select><span id="plugModalError"></span>
+    <button id="btnPlugClose"></button><button id="btnPlugCancel"></button><button id="btnPlugSave"></button>
   </div>
 
-  <div style="height: 8px;"></div>
-
-  <div class="panel" style="padding: 12px; border-radius: 14px; border: 1px solid var(--border);">
-    <div class="panel-head" style="padding: 0; border: none;">
-      <div class="muted"> Saved notebooks</div>
-      <div class="panel-actions">
-        <input id="nbUpload" type="file" class="search" style="padding: 7px 10px;" accept=".json,.ipynb,application/json" />
-        <button class="btn btn-sm btn-azure-outline" id="btnNbUpload"><i class="fas fa-upload"></i> Upload</button>
-      </div>
-    </div>
-
-    <div id="nbList" style="margin-top:12px;"></div>
-    <div id="nbEmpty" class="muted" style="display:none; margin-top:10px;">No notebooks saved yet.</div>
-  </div>
-</div>
   {% endif %}
 </div>
 
-<!-- Modal: Create/Edit pool -->
-<div class="modal-backdrop" id="modalPool" aria-hidden="true">
-  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+<!-- ═══ SQL Modal (no S3 fields) ═══ -->
+<div class="modal-backdrop" id="modalSql" aria-hidden="true">
+  <div class="modal-card sql" role="dialog" aria-modal="true">
     <div class="modal-head">
       <div class="modal-title-wrap">
-        <div class="modal-icon"><i class="fas fa-microchip"></i></div>
+        <div class="modal-icon sql"><i class="fas fa-database"></i></div>
         <div>
-          <div class="modal-title" id="modalTitle">New pool</div>
-          <div class="modal-sub">Choose backend, size and concurrency. You can change this later.</div>
+          <div class="modal-title" id="sqlModalTitle">New SQL Pool</div>
+          <div class="modal-sub">Connect to a Spark Thrift server for SQL query execution.</div>
         </div>
       </div>
-      <button class="btn-ghost" id="btnModalClose" aria-label="Close"><i class="fas fa-times"></i></button>
+      <button class="btn-ghost" id="btnSqlClose" aria-label="Close"><i class="fas fa-times"></i></button>
     </div>
-
     <div class="grid">
       <div class="field">
-        <div class="form-label">
-          <span>Name</span>
-          <span class="form-help">Human-friendly</span>
-        </div>
-        <input class="form-control form-control-sm" id="poolName" placeholder="e.g. Spark – Medium" />
-        <div class="muted" style="margin-top:6px;">Shown in routing UI and job payloads later.</div>
+        <div class="form-label"><span>Pool name</span></div>
+        <input class="form-control form-control-sm" id="sqlName" placeholder="e.g. Production Spark SQL" />
       </div>
-
       <div class="field">
-        <div class="form-label">
-          <span>Max concurrency</span>
-          <span class="form-help mono">integer</span>
-        </div>
-        <input class="form-control form-control-sm mono" id="poolMax" type="number" min="1" step="1" value="1" />
-        <div class="muted" style="margin-top:6px;">How many jobs can run concurrently in this pool.</div>
-      </div>
-
-      <div class="field">
-        <div class="form-label">
-          <span>Kind</span>
-          <span class="form-help">backend</span>
-        </div>
-        <select class="form-select form-select-sm mono" id="poolKind">
-          <option value="in-process">in-process</option>
-          <option value="spark">spark</option>
-          <option value="kubernetes">kubernetes</option>
+        <div class="form-label"><span>Status</span></div>
+        <select class="form-select form-select-sm mono" id="sqlStatus">
+          <option value="active">active</option>
+          <option value="draining">draining</option>
+          <option value="offline">offline</option>
         </select>
-        <div class="muted" style="margin-top:6px;">Execution backend for notebook jobs.</div>
       </div>
-
       <div class="field">
-        <div class="form-label">
-          <span>Size</span>
-          <span class="form-help">profile</span>
-        </div>
-        <select class="form-select form-select-sm mono" id="poolSize">
-          <option value="small">small</option>
-          <option value="medium">medium</option>
-          <option value="large">large</option>
-        </select>
-        <div class="muted" style="margin-top:6px;">Resource profile (used for routing/scheduling later).</div>
+        <div class="form-label"><span>Thrift host</span><span class="form-help mono">hostname / IP</span></div>
+        <input class="form-control form-control-sm mono" id="sqlHost" placeholder="e.g. 192.168.168.130" />
+      </div>
       <div class="field">
-        <div class="form-label">
-          <span>Internet access</span>
-          <span class="form-help">profile</span>
-        </div>
-        <label style="display:flex; align-items:center; gap:10px; margin:0;">
-          <span class="switch">
-            <input type="checkbox" id="poolInternet" />
-            <span class="slider"></span>
-          </span>
-          <span class="muted">Enable internet profile for this pool.</span>
-        </label>
+        <div class="form-label"><span>Thrift port</span><span class="form-help mono">default 10000</span></div>
+        <input class="form-control form-control-sm mono" id="sqlPort" type="number" min="1" max="65535" value="10000" />
       </div>
-
-      <div class="field" style="grid-column: 1 / -1;">
-        <div class="form-label">
-          <span>WebSocket endpoint</span>
-          <span class="form-help mono">ws://…/ws/execute</span>
-        </div>
-        <input class="form-control form-control-sm mono" id="poolWsUrl" placeholder="e.g. ws://localhost:8010/ws/execute" />
-        <div class="muted" style="margin-top:6px;">Studio uses this to execute cells on the selected notebook server.</div>
+      <div class="field">
+        <div class="form-label"><span>Min size (MB)</span><span class="form-help mono">routing</span></div>
+        <input class="form-control form-control-sm mono" id="sqlMinMB" type="number" min="0" step="0.1" value="0" />
+        <div class="muted" style="margin-top:4px;">0 = no minimum. Stored as bytes internally.</div>
       </div>
-
+      <div class="field">
+        <div class="form-label"><span>Max size (MB)</span><span class="form-help mono">routing</span></div>
+        <input class="form-control form-control-sm mono" id="sqlMaxMB" type="number" min="0" step="0.1" value="0" />
+        <div class="muted" style="margin-top:4px;">0 = unlimited. Stored as bytes internally.</div>
       </div>
     </div>
-
-    <div style="margin-top:12px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div style="display:flex; align-items:center; gap:10px;">
-        <label style="display:flex; align-items:center; gap:10px; margin:0;">
-          <span class="muted" style="font-weight:900;">Default</span>
-          <span class="switch">
-            <input type="checkbox" id="poolDefault" />
-            <span class="slider"></span>
-          </span>
-        </label>
-        <span class="muted">Default pool is used when no pool is specified.</span>
-      </div>
-      <div class="muted" id="modalHint"></div>
-    </div>
-
-    <div class="modal-actions">
+    <div class="modal-footer">
       <div class="left">
-        <span class="error" id="modalError" style="display:none;"></span>
+        <button class="btn btn-sm btn-test" id="btnSqlTest"><i class="fas fa-plug-circle-check"></i> Test connection</button>
+        <span class="test-result" id="sqlTestResult"></span>
+        <span class="error" id="sqlError" style="display:none;"></span>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button class="btn btn-sm btn-azure-outline" id="btnModalCancel">Cancel</button>
-        <button class="btn btn-sm btn-azure" id="btnModalSave"><i class="fas fa-save"></i> Save</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm btn-azure-outline" id="btnSqlCancel">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnSqlSave"><i class="fas fa-save"></i> Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Python Plug Modal (New = always Spark Plug) ═══ -->
+<div class="modal-backdrop" id="modalPlug" aria-hidden="true">
+  <div class="modal-card python" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div class="modal-title-wrap">
+        <div class="modal-icon python"><i class="fas fa-plug"></i></div>
+        <div>
+          <div class="modal-title" id="plugModalTitleNew">New Spark Plug</div>
+          <div class="modal-sub">Connect to a remote PySpark cluster via WebSocket.</div>
+        </div>
+      </div>
+      <button class="btn-ghost" id="btnPlugCloseNew" aria-label="Close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="grid">
+      <div class="field">
+        <div class="form-label"><span>Pool name</span></div>
+        <input class="form-control form-control-sm" id="plugNameNew" placeholder="e.g. Dev Spark Plug" />
+      </div>
+      <div class="field">
+        <div class="form-label"><span>Status</span></div>
+        <select class="form-select form-select-sm mono" id="plugStatusNew">
+          <option value="active">active</option>
+          <option value="draining">draining</option>
+          <option value="offline">offline</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="form-label"><span>Spark master</span><span class="form-help mono">spark://…</span></div>
+        <input class="form-control form-control-sm mono" id="plugMasterNew" placeholder="spark://spark-master:7077" value="spark://spark-master:7077" />
+      </div>
+      <div class="field">
+        <div class="form-label"><span>WebSocket URL</span><span class="form-help mono">ws://…</span></div>
+        <input class="form-control form-control-sm mono" id="plugWsUrlNew" placeholder="ws://localhost:8010/ws/spark" value="ws://localhost:8010/ws/spark" />
+      </div>
+      <div class="field" style="grid-column:1/-1;">
+        <div class="form-label"><span>Web UI URL</span><span class="form-help">optional</span></div>
+        <input class="form-control form-control-sm mono" id="plugWebuiNew" placeholder="http://localhost:8080" />
+        <div class="muted" style="margin-top:4px;">Spark Master Web UI for monitoring.</div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <div class="left">
+        <button class="btn btn-sm btn-test" id="btnPlugTest"><i class="fas fa-plug-circle-check"></i> Test WebSocket</button>
+        <span class="test-result" id="plugTestResult"></span>
+        <span class="error" id="plugError" style="display:none;"></span>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm btn-azure-outline" id="btnPlugCancelNew">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnPlugSaveNew"><i class="fas fa-save"></i> Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ In-Process rename modal (edit name only) ═══ -->
+<div class="modal-backdrop" id="modalInProc" aria-hidden="true">
+  <div class="modal-card inproc" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div class="modal-title-wrap">
+        <div class="modal-icon inproc"><i class="fas fa-microchip"></i></div>
+        <div>
+          <div class="modal-title">In-Process Pool</div>
+          <div class="modal-sub">This pool runs inside the application. You can only change its name.</div>
+        </div>
+      </div>
+      <button class="btn-ghost" id="btnInProcClose" aria-label="Close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr;">
+      <div class="field">
+        <div class="form-label"><span>Pool name</span></div>
+        <input class="form-control form-control-sm" id="inprocName" placeholder="e.g. Default" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <div class="left">
+        <span class="error" id="inprocError" style="display:none;"></span>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm btn-azure-outline" id="btnInProcCancel">Cancel</button>
+        <button class="btn btn-sm btn-azure" id="btnInProcSave"><i class="fas fa-save"></i> Save</button>
       </div>
     </div>
   </div>
@@ -602,459 +424,325 @@
   const ln = document.getElementById("link-compute") || document.getElementById("link-compute-pools");
   if (ln) ln.classList.add("active");
 
+  /* ── helpers ── */
   function toast(msg) {
-    const el = document.getElementById('toast');
-    if (!el) return;
-    el.textContent = String(msg || '');
-    el.style.display = 'block';
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => { el.style.display = 'none'; }, 1800);
+    const el=document.getElementById('toast'); if(!el)return;
+    el.textContent=String(msg||''); el.style.display='block';
+    clearTimeout(toast._t); toast._t=setTimeout(()=>{el.style.display='none';},1800);
   }
-
   function root() { return document.getElementById('root'); }
   function ctx() {
-    const r = root();
-    return {
-      org: r ? (r.dataset.org || '') : '',
-      sup: r ? (r.dataset.sup || '') : '',
-    };
+    const r=root(); return { org:r?(r.dataset.org||''):'', sup:r?(r.dataset.sup||''):'' };
   }
-
   async function getJSON(url) {
-    const resp = await fetch(url, { credentials: "same-origin" });
-    const text = await resp.text();
-    let js = null;
-    try { js = JSON.parse(text); } catch (e) { js = null; }
-    if (!resp.ok) {
-      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
-      throw new Error(msg);
-    }
+    const resp=await fetch(url,{credentials:"same-origin"});
+    const text=await resp.text(); let js=null;
+    try{js=JSON.parse(text);}catch(e){}
+    if(!resp.ok) throw new Error((js&&(js.detail||js.error))||text||("Request failed: "+resp.status));
     return js;
   }
-
-  async function postJSON(url, obj) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(obj || {}),
-      credentials: "same-origin",
-    });
-    const text = await resp.text();
-    let js = null;
-    try { js = JSON.parse(text); } catch (e) { js = null; }
-    if (!resp.ok) {
-      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
-      throw new Error(msg);
-    }
+  async function postJSON(url,obj) {
+    const resp=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj||{}),credentials:"same-origin"});
+    const text=await resp.text(); let js=null;
+    try{js=JSON.parse(text);}catch(e){}
+    if(!resp.ok) throw new Error((js&&(js.detail||js.error))||text||("Request failed: "+resp.status));
     return js;
   }
-
   async function del(url) {
-    const resp = await fetch(url, { method:'DELETE', credentials:'same-origin' });
-    const text = await resp.text();
-    let js = null;
-    try { js = JSON.parse(text); } catch (e) { js = null; }
-    if (!resp.ok) {
-      const msg = (js && (js.detail || js.error)) || text || ("Request failed: " + resp.status);
-      throw new Error(msg);
-    }
+    const resp=await fetch(url,{method:'DELETE',credentials:'same-origin'});
+    const text=await resp.text(); let js=null;
+    try{js=JSON.parse(text);}catch(e){}
+    if(!resp.ok) throw new Error((js&&(js.detail||js.error))||text||("Request failed: "+resp.status));
     return js;
   }
-
   function esc(s) {
-    return String(s||'')
-      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+    return String(s||'').replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+  function _ss(s) {
+    if(s==='active') return 'color:#059669;border-color:rgba(5,150,105,.25);background:rgba(5,150,105,.06);';
+    if(s==='draining') return 'color:#d97706;border-color:rgba(217,119,6,.25);background:rgba(217,119,6,.06);';
+    return 'color:#dc2626;border-color:rgba(220,38,38,.25);background:rgba(220,38,38,.06);';
   }
 
-  function wsUrlForPort(port) {
-    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    const host = location.hostname || 'localhost';
-    return `${proto}//${host}:${port}/ws/execute`;
+  /* ═══ Tab switching ═══ */
+  let activeTab='sql';
+  function switchTab(tab) {
+    activeTab=tab;
+    document.getElementById('tabSql').className='tab'+(tab==='sql'?' active-sql':'');
+    document.getElementById('tabPython').className='tab'+(tab==='python'?' active-python':'');
+    document.getElementById('pane-sql').className='tab-pane'+(tab==='sql'?' active':'');
+    document.getElementById('pane-python').className='tab-pane'+(tab==='python'?' active':'');
   }
+  document.getElementById('tabSql').addEventListener('click',()=>switchTab('sql'));
+  document.getElementById('tabPython').addEventListener('click',()=>switchTab('python'));
 
-  let pools = [];
-  let search = '';
+  /* ═══ Pool data ═══ */
+  let pools=[];
+  let sqlSearch='', pySearch='';
 
-  function filteredPools() {
-    const q = (search || '').trim().toLowerCase();
-    if (!q) return pools;
-    return (pools || []).filter(p => {
-      const name = String(p.name || '').toLowerCase();
-      const kind = String(p.kind || '').toLowerCase();
-      const size = String(p.size || '').toLowerCase();
-      return name.includes(q) || kind.includes(q) || size.includes(q);
-    });
+  function sqlPools() {
+    const q=(sqlSearch||'').trim().toLowerCase();
+    return pools.filter(p=>p.kind==='spark-thrift').filter(p=>!q||(p.name||'').toLowerCase().includes(q)||(p.thrift_host||'').toLowerCase().includes(q));
+  }
+  function pyPools() {
+    const q=(pySearch||'').trim().toLowerCase();
+    return pools.filter(p=>p.kind==='in-process'||p.kind==='spark-plug').filter(p=>!q||(p.name||'').toLowerCase().includes(q)||(p.kind||'').toLowerCase().includes(q));
   }
 
   async function loadPools() {
-    const { org, sup } = ctx();
-    const js = await getJSON(`/reflection/compute/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-    pools = js && js.data && Array.isArray(js.data.items) ? js.data.items : [];
-    render();
+    const {org,sup}=ctx();
+    const js=await getJSON(`/reflection/compute/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
+    pools=js&&js.data&&Array.isArray(js.data.items)?js.data.items:[];
+    renderSql(); renderPy();
   }
 
-  function render() {
-    const wrap = document.getElementById('list');
-    const empty = document.getElementById('empty');
-    const count = document.getElementById('countValue');
-    if (!wrap) return;
-
-    const items = filteredPools();
-    if (count) count.textContent = String(items.length);
-
-    wrap.innerHTML = '';
-    items.forEach(p => {
-      const div = document.createElement('div');
-      div.className = 'rowcard';
-      div.innerHTML = `
-        <div>
-          <div class="name">${esc(p.name || 'Pool')}${p.is_default ? ' <span class="muted">(default)</span>' : ''}</div>
-          <div class="sub">kind: <span class="mono">${esc(p.kind || '')}</span> • size: <span class="mono">${esc(p.size || '')}</span> • max: <span class="mono">${esc(String(p.max_concurrency || 1))}</span> • internet: <span class="mono">${p.has_internet ? 'on' : 'off'}</span> • ws: <span class="mono">${esc(String(p.ws_url||'').slice(0, 90))}${String(p.ws_url||'').length>90 ? '…' : ''}</span></div>
-        </div>
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          <button class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
-          <button class="btn btn-sm btn-azure-outline" data-act="default"><i class="fas fa-star"></i> Default</button>
-          <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
-        </div>
-      `;
-
-      div.querySelector('button[data-act="edit"]').addEventListener('click', () => openModal(p));
-      div.querySelector('button[data-act="default"]').addEventListener('click', () => setDefault(p));
-      div.querySelector('button[data-act="del"]').addEventListener('click', () => deletePool(p));
-      wrap.appendChild(div);
+  /* ── SQL rendering ── */
+  function renderSql() {
+    const wrap=document.getElementById('sqlList'), empty=document.getElementById('sqlEmpty'), cnt=document.getElementById('sqlCount');
+    if(!wrap) return;
+    const items=sqlPools();
+    if(cnt) cnt.textContent=String(items.length);
+    wrap.innerHTML='';
+    items.forEach(p=>{
+      const d=document.createElement('div'); d.className='rowcard';
+      d.innerHTML=`<div>
+        <div class="name">${esc(p.name||'SQL Pool')}</div>
+        <div class="sub">host: <span class="mono">${esc(p.thrift_host||'')}:${esc(String(p.thrift_port||10000))}</span> &bull; <span class="badge" style="${_ss(p.status||'active')}">${esc(p.status||'active')}</span></div>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
+        <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i></button>
+      </div>`;
+      d.querySelector('[data-act="edit"]').addEventListener('click',()=>openSqlModal(p));
+      d.querySelector('[data-act="del"]').addEventListener('click',()=>deletePool(p));
+      wrap.appendChild(d);
     });
+    if(empty) empty.style.display=items.length?'none':'';
+  }
 
-    if (empty) empty.style.display = items.length ? 'none' : '';
+  /* ── Python rendering ── */
+  function renderPy() {
+    const wrap=document.getElementById('pyList'), empty=document.getElementById('pyEmpty'), cnt=document.getElementById('pyCount');
+    if(!wrap) return;
+    const items=pyPools();
+    if(cnt) cnt.textContent=String(items.length);
+    wrap.innerHTML='';
+    items.forEach(p=>{
+      const d=document.createElement('div'); d.className='rowcard';
+      const isPlug=p.kind==='spark-plug';
+      const bc=isPlug?'spark-plug':'in-process', bi=isPlug?'fa-plug':'fa-microchip', bl=isPlug?'spark plug':'in-process';
+      let sub='';
+      if(isPlug) {
+        sub=`master: <span class="mono">${esc(p.spark_master||'')}</span> &bull; ws: <span class="mono">${esc((p.ws_url||'').slice(0,70))}</span> &bull; <span class="badge" style="${_ss(p.status||'active')}">${esc(p.status||'active')}</span>`;
+      }
+      const btns=isPlug
+        ? `<button class="btn btn-sm btn-azure-outline" data-act="edit"><i class="fas fa-pen"></i> Edit</button>
+           <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i></button>`
+        : `<button class="btn btn-sm btn-azure-outline" data-act="rename"><i class="fas fa-pen"></i> Rename</button>`;
+      d.innerHTML=`<div>
+        <div class="name">${esc(p.name||'Pool')} <span class="kind-badge ${bc}"><i class="fas ${bi}"></i> ${bl}</span></div>
+        ${sub?'<div class="sub">'+sub+'</div>':''}
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">${btns}</div>`;
+      if(isPlug) {
+        d.querySelector('[data-act="edit"]').addEventListener('click',()=>openPlugModal(p));
+        d.querySelector('[data-act="del"]').addEventListener('click',()=>deletePool(p));
+      } else {
+        d.querySelector('[data-act="rename"]').addEventListener('click',()=>openInProcModal(p));
+      }
+      wrap.appendChild(d);
+    });
+    if(empty) empty.style.display=items.length?'none':'';
   }
 
   async function upsertPool(pool) {
-    const { org, sup } = ctx();
-    await postJSON('/reflection/compute/upsert', { org, sup, item: pool });
+    const {org,sup}=ctx();
+    await postJSON('/reflection/compute/upsert',{org,sup,item:pool});
     await loadPools();
   }
-
   async function deletePool(pool) {
-    const { org, sup } = ctx();
-    if (!confirm('Delete this pool?')) return;
+    const {org,sup}=ctx();
+    if(!confirm('Delete this pool?')) return;
     await del(`/reflection/compute/${encodeURIComponent(pool.id)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-    await loadPools();
-    toast('Deleted');
+    await loadPools(); toast('Deleted');
   }
 
-  async function setDefault(pool) {
-    const p = { ...pool, is_default: true };
-    await upsertPool(p);
-    toast('Default updated');
+  /* ═══ SQL Modal ═══ */
+  let sqlEditId=null;
+  function sqlModal(){return document.getElementById('modalSql');}
+  function sqlModalShow(){sqlModal().style.display='flex'; setTimeout(()=>{try{document.getElementById('sqlName').focus();}catch(e){}},0);}
+  function sqlModalHide(){sqlModal().style.display='none'; sqlEditId=null; clrTest('sql'); clrErr('sql');}
+
+  function openSqlModal(existing) {
+    const isEdit=Boolean(existing&&existing.id);
+    sqlEditId=isEdit?existing.id:null;
+    document.getElementById('sqlModalTitle').textContent=isEdit?'Edit SQL Pool':'New SQL Pool';
+    document.getElementById('sqlName').value=(existing&&existing.name)||'';
+    document.getElementById('sqlStatus').value=(existing&&existing.status)||'active';
+    document.getElementById('sqlHost').value=(existing&&existing.thrift_host)||'';
+    document.getElementById('sqlPort').value=String((existing&&existing.thrift_port)||10000);
+    document.getElementById('sqlMinMB').value=String(((existing&&existing.min_bytes)||0)/1000000);
+    document.getElementById('sqlMaxMB').value=String(((existing&&existing.max_bytes)||0)/1000000);
+    clrTest('sql'); clrErr('sql'); sqlModalShow();
   }
-
-  // ---- Modal ----
-  let editingId = null;
-
-  function modalEl() { return document.getElementById('modalPool'); }
-  function modalShow() {
-    const el = modalEl();
-    if (!el) return;
-    el.style.display = 'flex';
-    setTimeout(() => { try { document.getElementById('poolName').focus(); } catch (e) {} }, 0);
-  }
-  function modalHide() {
-    const el = modalEl();
-    if (el) el.style.display = 'none';
-    const me = document.getElementById('modalError'); if (me) { me.style.display = 'none'; me.textContent = ''; }
-    editingId = null;
-  }
-
-  function openModal(existing) {
-    const isEdit = Boolean(existing && existing.id);
-    editingId = isEdit ? existing.id : null;
-
-    const me = document.getElementById('modalError'); if (me) { me.style.display = 'none'; me.textContent = ''; }
-
-    document.getElementById('modalTitle').textContent = isEdit ? 'Edit pool' : 'New pool';
-    document.getElementById('modalHint').textContent = isEdit ? `Editing: ${existing.name || ''}` : '';
-
-    document.getElementById('poolName').value = (existing && existing.name) ? existing.name : '';
-    document.getElementById('poolKind').value = (existing && existing.kind) ? existing.kind : 'in-process';
-    document.getElementById('poolSize').value = (existing && existing.size) ? existing.size : 'small';
-    document.getElementById('poolMax').value = String((existing && existing.max_concurrency) ? existing.max_concurrency : 1);
-    document.getElementById('poolDefault').checked = Boolean(existing && existing.is_default);
-    document.getElementById('poolInternet').checked = Boolean(existing && existing.has_internet);
-
-    const port = parseInt((document.getElementById('notebookPort') || {}).value || '8010', 10);
-    const defWs = wsUrlForPort(Number.isFinite(port) && port > 0 ? port : 8010);
-    document.getElementById('poolWsUrl').value = (existing && existing.ws_url) ? String(existing.ws_url) : defWs;
-
-    modalShow();
-  }
-
-  function collectModal() {
-    const name = (document.getElementById('poolName').value || '').trim();
-    if (!name) throw new Error('Name is required');
-
-    const kind = (document.getElementById('poolKind').value || 'in-process').trim();
-    const size = (document.getElementById('poolSize').value || 'small').trim();
-    const max = parseInt(document.getElementById('poolMax').value || '1', 10);
-    const isDefault = Boolean(document.getElementById('poolDefault').checked);
-    const hasInternet = Boolean(document.getElementById('poolInternet').checked);
-    const wsUrl = String((document.getElementById('poolWsUrl').value || '')).trim();
-
-    const p = {
-      id: editingId || '',
-      name,
-      kind,
-      size,
-      max_concurrency: Number.isFinite(max) && max > 0 ? max : 1,
-      is_default: isDefault,
-      has_internet: hasInternet,
-      ws_url: wsUrl,
+  function collectSql() {
+    const name=(document.getElementById('sqlName').value||'').trim();
+    if(!name) throw new Error('Pool name is required.');
+    const host=(document.getElementById('sqlHost').value||'').trim();
+    if(!host) throw new Error('Thrift host is required.');
+    return {
+      id:sqlEditId||'', name, kind:'spark-thrift',
+      thrift_host:host,
+      thrift_port:parseInt(document.getElementById('sqlPort').value||'10000',10)||10000,
+      status:document.getElementById('sqlStatus').value||'active',
+      s3_enabled:true, s3_endpoint:'',
+      min_bytes:Math.max(0,Math.round(parseFloat(document.getElementById('sqlMinMB').value||'0')*1000000)||0),
+      max_bytes:Math.max(0,Math.round(parseFloat(document.getElementById('sqlMaxMB').value||'0')*1000000)||0),
+      is_default:false, size:'small', max_concurrency:1, has_internet:false, ws_url:'',
     };
-    return p;
   }
-
-  // Wire modal buttons
-  document.getElementById('btnModalClose').addEventListener('click', (e) => { e.preventDefault(); modalHide(); });
-  document.getElementById('btnModalCancel').addEventListener('click', (e) => { e.preventDefault(); modalHide(); });
-  document.getElementById('btnModalSave').addEventListener('click', (e) => {
+  document.getElementById('btnSqlClose').addEventListener('click',e=>{e.preventDefault();sqlModalHide();});
+  document.getElementById('btnSqlCancel').addEventListener('click',e=>{e.preventDefault();sqlModalHide();});
+  document.getElementById('btnSqlSave').addEventListener('click',e=>{
     e.preventDefault();
-    try {
-      const p = collectModal();
-      upsertPool(p).then(() => {
-        modalHide();
-        toast(editingId ? 'Saved' : 'Created');
-      }).catch(err => toast(err.message));
-    } catch (err) {
-      toast(err.message || String(err));
-    }
+    try { const p=collectSql(); upsertPool(p).then(()=>{sqlModalHide();toast(sqlEditId?'Saved':'Created');}).catch(err=>showErr('sql',err.message));
+    } catch(err){showErr('sql',err.message);}
   });
+  document.getElementById('btnSqlTest').addEventListener('click',e=>{e.preventDefault();testConn('sql');});
+  sqlModal().addEventListener('click',ev=>{if(ev.target===sqlModal())sqlModalHide();});
 
-  // close modal on backdrop click / Esc
-  modalEl().addEventListener('click', (ev) => { if (ev.target === modalEl()) modalHide(); });
-  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && modalEl().style.display === 'flex') modalHide(); });
+  /* ═══ Plug Modal (New Python Pool = always Spark Plug) ═══ */
+  let plugEditId=null;
+  function plugModal(){return document.getElementById('modalPlug');}
+  function plugModalShow(){plugModal().style.display='flex'; setTimeout(()=>{try{document.getElementById('plugNameNew').focus();}catch(e){}},0);}
+  function plugModalHide(){plugModal().style.display='none'; plugEditId=null; clrTest('plug'); clrErr('plug');}
 
-  // ---- main buttons ----
-  const btnNew = document.getElementById('btnNew');
-  if (btnNew) btnNew.addEventListener('click', (e) => { e.preventDefault(); openModal(null); });
-
-  const btnRefresh = document.getElementById('btnRefresh');
-  if (btnRefresh) btnRefresh.addEventListener('click', (e) => { e.preventDefault(); loadPools().catch(err => toast(err.message)); });
-
-  const poolSearch = document.getElementById('poolSearch');
-  if (poolSearch) poolSearch.addEventListener('input', (ev) => { search = ev.target.value || ''; render(); });
-
-
-  // initial load
-  const _ctx = ctx();
-  if (_ctx.org && _ctx.sup) {
-    loadPools().catch(err => toast(err.message));
+  function openPlugModal(existing) {
+    const isEdit=Boolean(existing&&existing.id);
+    plugEditId=isEdit?existing.id:null;
+    document.getElementById('plugModalTitleNew').textContent=isEdit?'Edit Spark Plug':'New Spark Plug';
+    document.getElementById('plugNameNew').value=(existing&&existing.name)||'';
+    document.getElementById('plugStatusNew').value=(existing&&existing.status)||'active';
+    document.getElementById('plugMasterNew').value=(existing&&existing.spark_master)||'spark://spark-master:7077';
+    document.getElementById('plugWsUrlNew').value=(existing&&existing.ws_url)||'ws://localhost:8010/ws/spark';
+    document.getElementById('plugWebuiNew').value=(existing&&existing.webui_url)||'';
+    clrTest('plug'); clrErr('plug'); plugModalShow();
   }
-
-    const ENABLE_NOTEBOOK_SECTION = false;
-
-// ---- Notebook config / saved notebooks ----
-  if (!ENABLE_NOTEBOOK_SECTION) { return; }
-
-  let nbConfig = null;
-  let notebooks = [];
-
-  function wsUrlForPort(port) {
-    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    const host = location.hostname || 'localhost';
-    return `${proto}//${host}:${port}/ws/execute`;
-  }
-
-  function httpUrlForPort(port) {
-    const proto = (location.protocol === 'https:') ? 'https:' : 'http:';
-    const host = location.hostname || 'localhost';
-    return `${proto}//${host}:${port}/`;
-  }
-
-  function setNbStatus(msg) {
-    const el = document.getElementById('nbStatusText');
-    if (el) el.textContent = String(msg || '—');
-  }
-
-  function nbCtxOk() {
-    const { org, sup } = ctx();
-    return Boolean(org && sup);
-  }
-
-  async function loadNotebookConfig() {
-    if (!nbCtxOk()) return;
-    const { org, sup } = ctx();
-    const js = await getJSON(`/reflection/compute/notebook/config?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-    const data = js && js.data ? js.data : {};
-    nbConfig = data.notebook || null;
-
-    const portEl = document.getElementById('notebookPort');
-    const profEl = document.getElementById('notebookProfile');
-    const persistEl = document.getElementById('notebookPersist');
-    const wsEl = document.getElementById('notebookWsUrl');
-    const dirEl = document.getElementById('nbStorageDir');
-
-    const port = (nbConfig && nbConfig.port) ? parseInt(nbConfig.port, 10) : 8010;
-    if (portEl) portEl.value = String(Number.isFinite(port) ? port : 8010);
-    if (profEl) profEl.value = (nbConfig && nbConfig.default_profile) ? nbConfig.default_profile : 'no-internet';
-    if (persistEl) persistEl.checked = Boolean(nbConfig && nbConfig.persist);
-
-    const wsUrl = wsUrlForPort(Number.isFinite(port) ? port : 8010);
-    if (wsEl) wsEl.value = wsUrl;
-
-    if (dirEl && data.storage_dir) dirEl.textContent = String(data.storage_dir);
-    setNbStatus(`ws: ${wsUrl}`);
-  }
-
-  async function saveNotebookConfig() {
-    if (!nbCtxOk()) return;
-    const { org, sup } = ctx();
-
-    const port = parseInt((document.getElementById('notebookPort').value || '8010'), 10);
-    const profile = (document.getElementById('notebookProfile').value || 'no-internet').trim();
-    const persist = Boolean(document.getElementById('notebookPersist').checked);
-
-    const payload = {
-      org,
-      sup,
-      notebook: {
-        port: Number.isFinite(port) ? port : 8010,
-        default_profile: profile,
-        persist,
-      },
+  function collectPlug() {
+    const name=(document.getElementById('plugNameNew').value||'').trim();
+    if(!name) throw new Error('Pool name is required.');
+    return {
+      id:plugEditId||'', name, kind:'spark-plug',
+      spark_master:(document.getElementById('plugMasterNew').value||'').trim()||'spark://localhost:7077',
+      ws_url:(document.getElementById('plugWsUrlNew').value||'').trim()||'ws://localhost:8010/ws/spark',
+      webui_url:(document.getElementById('plugWebuiNew').value||'').trim(),
+      status:document.getElementById('plugStatusNew').value||'active',
+      is_default:false, size:'small', max_concurrency:1, has_internet:false,
     };
+  }
+  document.getElementById('btnPlugCloseNew').addEventListener('click',e=>{e.preventDefault();plugModalHide();});
+  document.getElementById('btnPlugCancelNew').addEventListener('click',e=>{e.preventDefault();plugModalHide();});
+  document.getElementById('btnPlugSaveNew').addEventListener('click',e=>{
+    e.preventDefault();
+    try { const p=collectPlug(); upsertPool(p).then(()=>{plugModalHide();toast(plugEditId?'Saved':'Created');}).catch(err=>showErr('plug',err.message));
+    } catch(err){showErr('plug',err.message);}
+  });
+  document.getElementById('btnPlugTest').addEventListener('click',e=>{e.preventDefault();testConn('plug');});
+  plugModal().addEventListener('click',ev=>{if(ev.target===plugModal())plugModalHide();});
 
-    await postJSON('/reflection/compute/notebook/config', payload);
-    await loadNotebookConfig();
-    toast('Notebook config saved');
+  /* ═══ In-Process rename modal ═══ */
+  let inprocPool=null;
+  function inprocModal(){return document.getElementById('modalInProc');}
+  function inprocModalShow(){inprocModal().style.display='flex'; setTimeout(()=>{try{document.getElementById('inprocName').focus();}catch(e){}},0);}
+  function inprocModalHide(){inprocModal().style.display='none'; inprocPool=null; clrErr('inproc');}
+
+  function openInProcModal(existing) {
+    inprocPool=existing;
+    document.getElementById('inprocName').value=(existing&&existing.name)||'Default';
+    clrErr('inproc'); inprocModalShow();
+  }
+  document.getElementById('btnInProcClose').addEventListener('click',e=>{e.preventDefault();inprocModalHide();});
+  document.getElementById('btnInProcCancel').addEventListener('click',e=>{e.preventDefault();inprocModalHide();});
+  document.getElementById('btnInProcSave').addEventListener('click',e=>{
+    e.preventDefault();
+    const name=(document.getElementById('inprocName').value||'').trim();
+    if(!name){showErr('inproc','Name is required.');return;}
+    if(!inprocPool){return;}
+    const p={...inprocPool, name};
+    upsertPool(p).then(()=>{inprocModalHide();toast('Renamed');}).catch(err=>showErr('inproc',err.message));
+  });
+  inprocModal().addEventListener('click',ev=>{if(ev.target===inprocModal())inprocModalHide();});
+
+  /* ═══ Test connection ═══ */
+  function clrTest(prefix) {
+    const el=document.getElementById(prefix+'TestResult');
+    if(el){el.className='test-result';el.style.display='none';el.textContent='';}
+  }
+  function showTest(prefix,status,msg) {
+    const el=document.getElementById(prefix+'TestResult'); if(!el)return;
+    el.className='test-result '+status; el.style.display='inline-flex';
+    const icon=status==='success'?'fa-check-circle':status==='fail'?'fa-times-circle':'fa-spinner fa-spin';
+    el.innerHTML='<i class="fas '+icon+'"></i> '+esc(msg);
+  }
+  function clrErr(prefix) {
+    const el=document.getElementById(prefix+'Error'); if(el){el.style.display='none';el.textContent='';}
+  }
+  function showErr(prefix,msg) {
+    const el=document.getElementById(prefix+'Error'); if(el){el.textContent=msg;el.style.display='';}
   }
 
-  async function loadNotebooks() {
-    if (!nbCtxOk()) return;
-    const { org, sup } = ctx();
-    const js = await getJSON(`/reflection/compute/notebook/list?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-    notebooks = js && Array.isArray(js.items) ? js.items : [];
-    renderNotebooks();
-  }
-
-  function renderNotebooks() {
-    const wrap = document.getElementById('nbList');
-    const empty = document.getElementById('nbEmpty');
-    if (!wrap) return;
-
-    wrap.innerHTML = '';
-    (notebooks || []).forEach(n => {
-      const div = document.createElement('div');
-      div.className = 'rowcard';
-      div.innerHTML = `
-        <div>
-          <div class="name">${esc(n.name || 'notebook.json')}</div>
-          <div class="sub">updated: <span class="mono">${esc(n.updated || '')}</span> • size: <span class="mono">${esc(String(n.size || 0))}</span> bytes</div>
-        </div>
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          <button class="btn btn-sm btn-azure-outline" data-act="dl"><i class="fas fa-download"></i> Download</button>
-          <button class="btn btn-sm btn-danger-outline" data-act="del"><i class="fas fa-trash"></i> Delete</button>
-        </div>
-      `;
-
-      div.querySelector('button[data-act="dl"]').addEventListener('click', () => downloadNotebook(n));
-      div.querySelector('button[data-act="del"]').addEventListener('click', () => deleteNotebook(n));
-      wrap.appendChild(div);
-    });
-
-    if (empty) empty.style.display = notebooks.length ? 'none' : '';
-  }
-
-  async function downloadNotebook(n) {
-    const { org, sup } = ctx();
-    const name = n && n.name ? String(n.name) : '';
-    if (!name) return;
-    const js = await getJSON(`/reflection/compute/notebook/get?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}&name=${encodeURIComponent(name)}`);
-    const nb = js && js.notebook ? js.notebook : {};
-    const blob = new Blob([JSON.stringify(nb, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
-
-  async function deleteNotebook(n) {
-    const { org, sup } = ctx();
-    const name = n && n.name ? String(n.name) : '';
-    if (!name) return;
-    if (!confirm('Delete this notebook?')) return;
-    await del(`/reflection/compute/notebook/${encodeURIComponent(name)}?org=${encodeURIComponent(org)}&sup=${encodeURIComponent(sup)}`);
-    await loadNotebooks();
-    toast('Deleted');
-  }
-
-  async function uploadNotebook() {
-    if (!nbCtxOk()) return;
-    const { org, sup } = ctx();
-    const fileEl = document.getElementById('nbUpload');
-    if (!fileEl || !fileEl.files || !fileEl.files.length) {
-      toast('Choose a notebook file first');
-      return;
-    }
-    const f = fileEl.files[0];
-    const name = (f && f.name) ? String(f.name) : 'notebook.json';
-    const txt = await f.text();
-    let nb = null;
+  async function testConn(prefix) {
+    const btnId=prefix==='sql'?'btnSqlTest':'btnPlugTest';
+    const btn=document.getElementById(btnId); if(btn)btn.disabled=true;
+    showTest(prefix,'testing','Testing...');
     try {
-      nb = JSON.parse(txt);
-    } catch (e) {
-      toast('Invalid JSON');
-      return;
-    }
-
-    await postJSON('/reflection/compute/notebook/save', { org, sup, name, notebook: nb });
-    fileEl.value = '';
-    await loadNotebooks();
-    toast('Uploaded');
+      const {org,sup}=ctx();
+      let payload={org,sup};
+      if(prefix==='sql') {
+        payload.kind='spark-thrift';
+        payload.thrift_host=(document.getElementById('sqlHost').value||'').trim();
+        payload.thrift_port=parseInt(document.getElementById('sqlPort').value||'10000',10)||10000;
+      } else {
+        payload.kind='spark-plug';
+        payload.ws_url=(document.getElementById('plugWsUrlNew').value||'').trim();
+        payload.spark_master=(document.getElementById('plugMasterNew').value||'').trim();
+      }
+      const js=await postJSON('/reflection/compute/test-connection',payload);
+      showTest(prefix,js&&js.ok?'success':'fail',(js&&js.message)||'Done');
+    } catch(err){showTest(prefix,'fail',err.message||'Failed');}
+    finally{if(btn)btn.disabled=false;}
   }
 
-  const btnNotebookSave = document.getElementById('btnNotebookSave');
-  if (btnNotebookSave) btnNotebookSave.addEventListener('click', (e) => {
-    e.preventDefault();
-    saveNotebookConfig().catch(err => toast(err.message));
+  /* ═══ Escape closes modals ═══ */
+  document.addEventListener('keydown',ev=>{
+    if(ev.key!=='Escape') return;
+    if(sqlModal().style.display==='flex') sqlModalHide();
+    if(plugModal().style.display==='flex') plugModalHide();
+    if(inprocModal().style.display==='flex') inprocModalHide();
   });
 
-  const btnNotebookRefresh = document.getElementById('btnNotebookRefresh');
-  if (btnNotebookRefresh) btnNotebookRefresh.addEventListener('click', (e) => {
-    e.preventDefault();
-    Promise.all([loadNotebookConfig(), loadNotebooks()]).catch(err => toast(err.message));
+  /* ═══ Panel buttons ═══ */
+  document.getElementById('btnNewSql').addEventListener('click',e=>{e.preventDefault();openSqlModal(null);});
+  document.getElementById('btnNewPy').addEventListener('click',e=>{e.preventDefault();openPlugModal(null);});
+  document.getElementById('btnRefreshSql').addEventListener('click',e=>{e.preventDefault();loadPools().catch(err=>toast(err.message));});
+  document.getElementById('btnRefreshPy').addEventListener('click',e=>{e.preventDefault();loadPools().catch(err=>toast(err.message));});
+  const sqlSel=document.getElementById('sqlSearch');
+  if(sqlSel) sqlSel.addEventListener('input',ev=>{sqlSearch=ev.target.value||'';renderSql();});
+  const pySel=document.getElementById('pySearch');
+  if(pySel) pySel.addEventListener('input',ev=>{pySearch=ev.target.value||'';renderPy();});
+
+  /* ═══ Legacy wiring ═══ */
+  ['btnThriftClose','btnThriftCancel','btnThriftSave','btnPlugClose','btnPlugCancel','btnPlugSave',
+   'btnNewThrift','btnRefreshThrift','btnNewPlug','btnRefreshPlug'].forEach(id=>{
+    const el=document.getElementById(id); if(el)el.addEventListener('click',e=>e.preventDefault());
   });
 
-  const btnNotebookOpen = document.getElementById('btnNotebookOpen');
-  if (btnNotebookOpen) btnNotebookOpen.addEventListener('click', (e) => {
-    e.preventDefault();
-    const port = parseInt((document.getElementById('notebookPort').value || '8010'), 10);
-    window.open(httpUrlForPort(Number.isFinite(port) ? port : 8010), '_blank', 'noopener');
-  });
+  /* ═══ Initial load ═══ */
+  const _ctx=ctx();
+  if(_ctx.org&&_ctx.sup) loadPools().catch(err=>toast(err.message));
 
-  const btnNbUpload = document.getElementById('btnNbUpload');
-  if (btnNbUpload) btnNbUpload.addEventListener('click', (e) => {
-    e.preventDefault();
-    uploadNotebook().catch(err => toast(err.message));
-  });
-
-  const nbPortEl = document.getElementById('notebookPort');
-  if (nbPortEl) nbPortEl.addEventListener('input', (ev) => {
-    const v = parseInt(ev.target.value || '8010', 10);
-    const wsEl = document.getElementById('notebookWsUrl');
-    const wsUrl = wsUrlForPort(Number.isFinite(v) ? v : 8010);
-    if (wsEl) wsEl.value = wsUrl;
-    setNbStatus(`ws: ${wsUrl}`);
-  });
-
-
-  loadPools().catch(err => toast(err.message));
-
-  if (document.getElementById('notebookPort')) {
-    Promise.all([loadNotebookConfig(), loadNotebooks()]).catch(err => toast(err.message));
-  }
+  const ENABLE_NOTEBOOK_SECTION=false;
+  if(!ENABLE_NOTEBOOK_SECTION) return;
 })();
 </script>
 {% endblock %}

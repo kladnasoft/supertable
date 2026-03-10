@@ -1,13 +1,13 @@
 services:
   spark-master:
     image: apache/spark:3.5.2
-    container_name: spark-master
+    container_name: spark-plug-master
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
     ports:
-      - "8080:8080" # Web UI
-      - "7077:7077" # RPC
+      - "8082:8080" # Web UI
+      - "7078:7077" # RPC (Host 7078 -> Container 7077)
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
       --host 0.0.0.0 --port 7077 --webui-port 8080
@@ -22,14 +22,14 @@ services:
 
   spark-worker:
     image: apache/spark:3.5.2
-    container_name: spark-worker
+    container_name: spark-plug-worker  # Renamed for consistency
     environment:
       - SPARK_MODE=worker
       - SPARK_WORKER_CORES=1
       - SPARK_WORKER_MEMORY=1G
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
-      spark://spark-master:7077 --webui-port 8081
+      spark://spark-plug-master:7077 --webui-port 8081
     depends_on:
       spark-master:
         condition: service_healthy

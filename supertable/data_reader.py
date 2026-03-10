@@ -93,7 +93,7 @@ class DataReader:
 
         try:
             # Make executor aware of storage for presign retry
-            executor = Executor(storage=self.storage)
+            executor = Executor(storage=self.storage, organization=self.organization)
 
             # Initialize plan manager and query id/hash (same as before)
             self.query_plan_manager = QueryPlanManager(

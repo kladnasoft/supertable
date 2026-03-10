@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import threading
 import uuid
 from typing import Dict, List, Optional
 
@@ -20,6 +22,67 @@ from supertable.engine.engine_common import (
     rewrite_query_with_hashed_tables,
     escape_parquet_path,
 )
+
+from urllib.parse import urlparse
+
+# Suppress verbose INFO logging from PyHive and Thrift libraries.
+# PyHive logs every SQL statement (CREATE VIEW, DROP VIEW, SET, etc.)
+# at INFO level, which floods the application log.
+for _lib in ("pyhive", "pyhive.hive", "TCLIService", "thrift", "thrift_sasl"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
+
+
+# =========================================================
+# Timeout defaults (seconds) — overridable via env vars
+# =========================================================
+
+def _spark_timeout_seconds() -> int:
+    """Overall timeout for a Spark Thrift query (connect + setup + execute + fetch).
+
+    Default: 300 s (5 min).  Override with SUPERTABLE_SPARK_QUERY_TIMEOUT.
+    """
+    try:
+        return int(os.getenv("SUPERTABLE_SPARK_QUERY_TIMEOUT", "300"))
+    except (ValueError, TypeError):
+        return 300
+
+
+def _spark_statement_timeout_seconds() -> int:
+    """Per-statement timeout for individual Thrift cursor.execute() calls.
+
+    Default: 120 s (2 min).  Override with SUPERTABLE_SPARK_STATEMENT_TIMEOUT.
+    Applies to each CREATE VIEW / SET / user-query individually.
+    """
+    try:
+        return int(os.getenv("SUPERTABLE_SPARK_STATEMENT_TIMEOUT", "120"))
+    except (ValueError, TypeError):
+        return 120
+
+
+def _to_s3a_path(file_path: str) -> str:
+    """Convert a file path to an s3a:// path suitable for Spark.
+
+    Handles three cases:
+      1. s3://bucket/key          → s3a://bucket/key
+      2. http(s)://endpoint/bucket/key?presign_params → s3a://bucket/key
+      3. s3a://… or local path    → returned as-is
+    """
+    if file_path.startswith("s3://"):
+        return "s3a://" + file_path[5:]
+
+    if file_path.startswith("s3a://"):
+        return file_path
+
+    if file_path.startswith("http://") or file_path.startswith("https://"):
+        parsed = urlparse(file_path)
+        # path is /bucket/key — strip the leading slash, split into bucket + key
+        path = parsed.path.lstrip("/")
+        if "/" in path:
+            return f"s3a://{path}"
+        # Degenerate case: only bucket, no key — return as-is
+        return file_path
+
+    return file_path
 
 
 # =========================================================
@@ -56,8 +119,24 @@ def _spark_create_table_sql(
     )
 
 
-def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> None:
-    """Register parquet files as a Spark temp view via Thrift."""
+def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> List[str]:
+    """Register parquet files as a Spark temp view via Thrift.
+
+    For a single file, uses ``USING parquet OPTIONS (path ...)`` directly.
+    For multiple files, batches them: each batch creates individual temp
+    views via ``USING parquet OPTIONS``, unions them into a batch view.
+    Finally all batch views are unioned into the target view.
+
+    **Important**: intermediate views (part views and batch views) are NOT
+    dropped here.  In Spark SQL, ``CREATE VIEW X AS SELECT * FROM Y`` stores
+    a lazy reference to Y — dropping Y invalidates X.  Intermediate views
+    must stay alive until the final query completes.
+
+    Returns a list of all intermediate view names created, so the caller
+    can drop them during cleanup.
+    """
+    intermediate_views: List[str] = []
+
     if len(files) == 1:
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {table_name} "
@@ -65,32 +144,51 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Non
             f"OPTIONS (path '{escape_parquet_path(files[0])}')"
         )
         cursor.execute(sql)
-    else:
-        # Multiple files: union them
-        # Spark can read a directory or a list via spark.read.parquet(...)
-        # Through Thrift SQL, the most reliable approach is a UNION of single-file views
-        # or using a common parent path. We use the SET + path approach.
-        parts = []
-        for i, f in enumerate(files):
-            part_name = f"__{table_name}_part{i}__"
+        return intermediate_views
+
+    batch_size = int(os.getenv("SUPERTABLE_SPARK_BATCH_SIZE", "50"))
+    batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
+
+    all_batch_views: List[str] = []
+
+    for batch_idx, batch in enumerate(batches):
+        # Create individual file views within this batch
+        part_views: List[str] = []
+        for file_idx, f in enumerate(batch):
+            part_name = f"__{table_name}_b{batch_idx}p{file_idx}__"
             cursor.execute(
                 f"CREATE OR REPLACE TEMPORARY VIEW {part_name} "
                 f"USING parquet "
                 f"OPTIONS (path '{escape_parquet_path(f)}')"
             )
-            parts.append(part_name)
+            part_views.append(part_name)
+            intermediate_views.append(part_name)
 
-        union_sql = " UNION ALL ".join(f"SELECT * FROM {p}" for p in parts)
+        # Union all parts into one batch view
+        batch_view = f"__{table_name}_batch{batch_idx}__"
+        union_sql = " UNION ALL ".join(f"SELECT * FROM {p}" for p in part_views)
         cursor.execute(
-            f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS {union_sql}"
+            f"CREATE OR REPLACE TEMPORARY VIEW {batch_view} AS {union_sql}"
         )
+        all_batch_views.append(batch_view)
+        intermediate_views.append(batch_view)
 
-        # Drop part views
-        for p in parts:
-            try:
-                cursor.execute(f"DROP VIEW IF EXISTS {p}")
-            except Exception:
-                pass
+        # Do NOT drop part views — Spark views are lazy references.
+        # Dropping the part view would invalidate the batch view.
+
+    # Final: union all batch views into the target table view
+    if len(all_batch_views) == 1:
+        union_sql = f"SELECT * FROM {all_batch_views[0]}"
+    else:
+        union_sql = " UNION ALL ".join(f"SELECT * FROM {v}" for v in all_batch_views)
+
+    cursor.execute(
+        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS {union_sql}"
+    )
+
+    # Do NOT drop batch views — the target view references them lazily.
+    # Return them so the caller drops them after the query completes.
+    return intermediate_views
 
 
 def _spark_create_rbac_view(
@@ -178,32 +276,65 @@ def _spark_rewrite_query(
 # S3/MinIO configuration for Spark
 # =========================================================
 
-def _configure_spark_s3(cursor) -> None:
-    """Set S3/MinIO configuration on the Spark Thrift session."""
-    endpoint = os.getenv("STORAGE_ENDPOINT_URL")
-    access_key = os.getenv("STORAGE_ACCESS_KEY")
-    secret_key = os.getenv("STORAGE_SECRET_KEY")
-    region = os.getenv("STORAGE_REGION", "us-east-1")
-    use_ssl = os.getenv("STORAGE_USE_SSL", "").lower() in ("1", "true", "yes", "on")
-    path_style = os.getenv("STORAGE_FORCE_PATH_STYLE", "true").lower() in ("1", "true", "yes", "on")
+def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
+    """Set S3/MinIO configuration on the Spark Thrift session.
 
+    If the cluster registration includes s3_endpoint, s3_access_key, or
+    s3_secret_key, those values are SET on the session.
+
+    **Important**: when the cluster dict does NOT include these keys, the
+    function no longer falls back to host-side environment variables
+    (e.g. ``STORAGE_ENDPOINT_URL``).  The Spark Thrift Server is typically
+    launched with ``--conf spark.hadoop.fs.s3a.*`` set to Docker-internal
+    addresses (e.g. ``http://minio:9000``).  Overriding them with the
+    host-side ``localhost:9000`` breaks S3 access from within the container.
+
+    To explicitly override S3 settings, include them in the cluster
+    registration dict (``s3_endpoint``, ``s3_access_key``, ``s3_secret_key``,
+    ``s3_region``).
+    """
+    _cluster = cluster or {}
+
+    # Only SET values that are explicitly provided in the cluster config.
+    # Falling back to host env vars (STORAGE_ENDPOINT_URL etc.) is wrong
+    # because those point to localhost which is unreachable from Docker.
     settings = []
+
+    endpoint = _cluster.get("s3_endpoint")
     if endpoint:
         settings.append(("spark.hadoop.fs.s3a.endpoint", endpoint))
+
+    access_key = _cluster.get("s3_access_key")
     if access_key:
         settings.append(("spark.hadoop.fs.s3a.access.key", access_key))
+
+    secret_key = _cluster.get("s3_secret_key")
     if secret_key:
         settings.append(("spark.hadoop.fs.s3a.secret.key", secret_key))
+
+    region = _cluster.get("s3_region")
     if region:
         settings.append(("spark.hadoop.fs.s3a.endpoint.region", region))
 
-    settings.append(("spark.hadoop.fs.s3a.connection.ssl.enabled", str(use_ssl).lower()))
-    settings.append(("spark.hadoop.fs.s3a.path.style.access", str(path_style).lower()))
+    use_ssl = _cluster.get("s3_use_ssl")
+    if use_ssl is not None:
+        settings.append(("spark.hadoop.fs.s3a.connection.ssl.enabled", str(use_ssl).lower()))
+
+    path_style = _cluster.get("s3_path_style")
+    if path_style is not None:
+        settings.append(("spark.hadoop.fs.s3a.path.style.access", str(path_style).lower()))
+
+    # Always ensure the S3A filesystem impl is set (harmless if already set).
     settings.append(("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem"))
+
+    if not settings:
+        logger.debug("[spark.thrift] no S3 overrides in cluster config; using spark-submit defaults")
 
     for key, value in settings:
         try:
-            cursor.execute(f"SET {key}={value}")
+            sql = f"SET {key}={value}"
+            logger.debug(f"[spark.thrift] {sql}")
+            cursor.execute(sql)
         except Exception as e:
             logger.debug(f"[spark.thrift] SET {key} failed: {e}")
 
@@ -224,8 +355,9 @@ class SparkThriftExecutor:
     can be provided.
     """
 
-    def __init__(self, storage: Optional[object] = None):
+    def __init__(self, storage: Optional[object] = None, organization: str = ""):
         self.storage = storage
+        self.organization = organization
         self.catalog = RedisCatalog()
 
     def _get_connection(self, cluster: Dict) -> object:
@@ -242,7 +374,7 @@ class SparkThriftExecutor:
         port = int(cluster.get("thrift_port", 10000))
 
         # Optional authentication
-        auth = cluster.get("auth", "NOSASL")
+        auth = cluster.get("auth", "NONE")
         username = cluster.get("username")
         password = cluster.get("password")
 
@@ -256,18 +388,28 @@ class SparkThriftExecutor:
         if password:
             connect_kwargs["password"] = password
 
-        logger.info(f"[spark.thrift] connecting to {host}:{port} (auth={auth})")
+        # Socket timeout prevents the connection from hanging indefinitely
+        # when the Thrift server is unreachable or overloaded.
+        try:
+            socket_timeout = int(os.getenv("SUPERTABLE_SPARK_CONNECT_TIMEOUT", "30"))
+        except (ValueError, TypeError):
+            socket_timeout = 30
+        connect_kwargs["configuration"] = {
+            "hive.server2.session.check.interval": str(socket_timeout * 1000),
+        }
+
+        logger.debug(f"[spark.thrift] connecting to {host}:{port} (auth={auth})")
         return hive.connect(**connect_kwargs)
 
     def _select_cluster(self, job_bytes: int, force: bool = False) -> Dict:
         """Select the best cluster from Redis, or raise if none available."""
-        cluster = self.catalog.select_spark_cluster(job_bytes, force=force)
+        cluster = self.catalog.select_spark_cluster(self.organization, job_bytes, force=force)
         if not cluster:
             raise RuntimeError(
                 f"No active Spark cluster available for job size {job_bytes} bytes. "
                 "Register a cluster via RedisCatalog.register_spark_cluster()."
             )
-        logger.info(
+        logger.debug(
             f"[spark.thrift] selected cluster: {cluster.get('name', cluster['cluster_id'])} "
             f"(host={cluster['thrift_host']}:{cluster.get('thrift_port', 10000)})"
         )
@@ -294,7 +436,13 @@ class SparkThriftExecutor:
         6. Rewrite and execute the user query
         7. Fetch results as pandas DataFrame
         8. Clean up temp views
+
+        The entire flow is guarded by SUPERTABLE_SPARK_QUERY_TIMEOUT (default 300 s).
+        If the timeout fires the connection is forcibly closed, which unblocks any
+        pending Thrift RPC and raises a RuntimeError to the caller.
         """
+        query_timeout = _spark_timeout_seconds()
+
         # 1. Select cluster
         cluster = self._select_cluster(reflection.reflection_bytes, force=force)
         timer_capture("CONNECTING")
@@ -304,13 +452,37 @@ class SparkThriftExecutor:
         created_views: List[str] = []
         created_tables: List[str] = []
 
+        # Watchdog: if the overall timeout fires we forcibly close the
+        # connection from a background thread. This causes any blocked
+        # cursor.execute / fetchall to raise an exception immediately.
+        _timed_out = threading.Event()
+        _conn_ref: List = []  # mutable container so watchdog can see conn
+
+        def _watchdog():
+            if not _timed_out.wait(query_timeout):
+                # Timeout expired and nobody cancelled us
+                _timed_out.set()
+                logger.error(
+                    f"{log_prefix}[spark.thrift] query timeout after {query_timeout}s — "
+                    f"forcibly closing connection"
+                )
+                for c in _conn_ref:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+
+        watchdog = threading.Thread(target=_watchdog, daemon=True, name="spark-timeout")
+        watchdog.start()
+
         try:
             # 2. Connect
             conn = self._get_connection(cluster)
+            _conn_ref.append(conn)
             cursor = conn.cursor()
 
             # 3. Configure S3
-            _configure_spark_s3(cursor)
+            _configure_spark_s3(cursor, cluster)
 
             # 4. Register reflection tables
             snapshots_by_key = {
@@ -330,14 +502,31 @@ class SparkThriftExecutor:
                     sup.super_name, sup.simple_name, sup.simple_version,
                 )
 
-                # Convert s3:// to s3a:// for Spark
-                files = [f.replace("s3://", "s3a://", 1) if f.startswith("s3://") else f for f in sup.files]
+                # Convert to s3a:// paths for Spark (handles s3://, presigned HTTP URLs, etc.)
+                files = [_to_s3a_path(f) for f in sup.files]
 
-                _spark_create_parquet_view(cursor, table_name, files)
+                logger.debug(
+                    f"{log_prefix}[spark.thrift] creating view {table_name} "
+                    f"({len(files)} file(s))"
+                )
+                intermediates = _spark_create_parquet_view(cursor, table_name, files)
                 created_tables.append(table_name)
+                # Track intermediate views (part + batch) for cleanup after query
+                created_views.extend(intermediates)
                 alias_to_table_name[td.alias] = table_name
 
+                if _timed_out.is_set():
+                    raise RuntimeError(
+                        f"Spark query timed out after {query_timeout}s "
+                        f"during view creation"
+                    )
+
             timer_capture("CREATING_REFLECTION")
+
+            logger.info(
+                f"{log_prefix}[spark.thrift] registered {len(alias_to_table_name)} table(s), "
+                f"{len(created_views)} intermediate views"
+            )
 
             # 5. Create RBAC views
             rbac_views = getattr(reflection, "rbac_views", None) or {}
@@ -367,15 +556,27 @@ class SparkThriftExecutor:
                         created_views.append(dedup_view)
                         query_alias_to_name[alias] = dedup_view
 
+            if _timed_out.is_set():
+                raise RuntimeError(
+                    f"Spark query timed out after {query_timeout}s "
+                    f"during RBAC/dedup view creation"
+                )
+
             # 6. Rewrite and execute
             executing_query = _spark_rewrite_query(
                 parser.original_query, query_alias_to_name,
             )
             parser.executing_query = executing_query
 
-            logger.debug(f"{log_prefix}[spark.thrift] executing: {executing_query}")
+            logger.debug(f"{log_prefix}[spark.thrift] SQL: {executing_query}")
 
             cursor.execute(executing_query)
+
+            if _timed_out.is_set():
+                raise RuntimeError(
+                    f"Spark query timed out after {query_timeout}s "
+                    f"during query execution"
+                )
 
             # 7. Fetch results as pandas
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
@@ -390,7 +591,17 @@ class SparkThriftExecutor:
 
             return result
 
+        except Exception as e:
+            if _timed_out.is_set():
+                raise RuntimeError(
+                    f"Spark query timed out after {query_timeout}s"
+                ) from e
+            raise
+
         finally:
+            # Cancel the watchdog so it doesn't fire after we're done.
+            _timed_out.set()
+
             # 8. Cleanup: drop RBAC views and temp tables
             if cursor:
                 for view in created_views:

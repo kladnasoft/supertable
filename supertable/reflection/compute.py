@@ -11,7 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 
-KINDS = ("in-process", "spark", "kubernetes")
+KINDS = ("in-process", "spark", "spark-thrift", "spark-plug", "kubernetes")
 SIZES = ("small", "medium", "large")
 
 def _notebook_port() -> int:
@@ -196,11 +196,23 @@ def _validate_ws_url(v: Any) -> str:
 
 
 
+def _validate_status(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s not in ("active", "draining", "offline"):
+        return "active"
+    return s
+
+
 def _sanitize_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize any incoming item to the recommended schema:
+    Normalize any incoming item to the unified pool schema.
 
-      id, name, kind, size, max_concurrency, has_internet, ws_url, is_default
+    Common fields (all kinds):
+      id, name, kind, size, max_concurrency, has_internet, ws_url, is_default, status
+
+    Kind-specific extra fields (preserved alongside common fields):
+      spark-thrift: thrift_host, thrift_port, s3_enabled, s3_endpoint, min_bytes, max_bytes
+      spark-plug:   spark_master, ws_url (overloaded), webui_url
 
     Unknown fields are discarded.
     """
@@ -209,16 +221,44 @@ def _sanitize_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
 
+    kind = _validate_kind(item.get("kind"))
+
+    # For in-process, skip ws_url validation (no external endpoint).
+    ws_raw = item.get("ws_url", item.get("ws", item.get("websocket_url")))
+    if kind == "in-process":
+        ws_url = str(ws_raw or "").strip()
+    elif kind == "spark-plug":
+        # spark-plug ws_url uses ws://…/ws/spark, allow it through
+        ws_url = str(ws_raw or "ws://localhost:8010/ws/spark").strip()
+    else:
+        ws_url = _validate_ws_url(ws_raw)
+
     out: Dict[str, Any] = {
         "id": pid,
         "name": name,
-        "kind": _validate_kind(item.get("kind")),
+        "kind": kind,
         "size": _validate_size(item.get("size")),
         "max_concurrency": _validate_max_concurrency(item.get("max_concurrency", 1)),
         "has_internet": _coerce_bool(item.get("has_internet", item.get("internet", False))),
-        "ws_url": _validate_ws_url(item.get("ws_url", item.get("ws", item.get("websocket_url")))),
+        "ws_url": ws_url,
         "is_default": _coerce_bool(item.get("is_default", False)),
+        "status": _validate_status(item.get("status", "active")),
     }
+
+    # Kind-specific extra fields
+    if kind == "spark-thrift":
+        out["thrift_host"] = str(item.get("thrift_host") or "").strip()
+        try:
+            out["thrift_port"] = max(1, min(65535, int(item.get("thrift_port") or 10000)))
+        except (ValueError, TypeError):
+            out["thrift_port"] = 10000
+        out["s3_enabled"] = _coerce_bool(item.get("s3_enabled", True))
+        out["s3_endpoint"] = str(item.get("s3_endpoint") or "").strip()
+        out["min_bytes"] = max(0, int(item.get("min_bytes") or 0))
+        out["max_bytes"] = max(0, int(item.get("max_bytes") or 0))
+    elif kind == "spark-plug":
+        out["spark_master"] = str(item.get("spark_master") or "spark://localhost:7077").strip()
+        out["webui_url"] = str(item.get("webui_url") or "").strip()
 
     # Back-compat: if an older client sends "profile", derive has_internet from it (unless explicitly set).
     if "profile" in item and "has_internet" not in item and "internet" not in item:
@@ -266,8 +306,17 @@ def _load(org: str, sup: str) -> Dict[str, Any]:
                 "has_internet": it.get("has_internet", it.get("internet", False)),
                 "ws_url": it.get("ws_url", it.get("ws", it.get("websocket_url"))),
                 "is_default": it.get("is_default", False),
+                "status": it.get("status", "active"),
                 "profile": it.get("profile"),
             }
+            # Preserve kind-specific fields for _sanitize_item
+            for extra_key in (
+                "thrift_host", "thrift_port", "s3_enabled", "s3_endpoint",
+                "min_bytes", "max_bytes",
+                "spark_master", "webui_url",
+            ):
+                if extra_key in it:
+                    sanitized[extra_key] = it[extra_key]
             sanitized = _sanitize_item(sanitized)
         except HTTPException:
             continue
@@ -407,6 +456,10 @@ def attach_compute_routes(
 
         data["items"] = out
         _save(org, sup, data)
+
+        # Sync kind-specific data to RedisCatalog for thrift/plug pools.
+        _sync_pool_to_catalog(org, sanitized)
+
         return {"ok": True, "id": item_id}
 
     @router.delete("/reflection/compute/{pool_id}")
@@ -428,3 +481,368 @@ def attach_compute_routes(
 
         _save(org, sup, data)
         return {"ok": True}
+
+    # ── Catalog sync helper ────────────────────────────────────────
+
+    def _sync_pool_to_catalog(org: str, pool: Dict[str, Any]) -> None:
+        """
+        Best-effort sync of kind-specific pool data into RedisCatalog.
+        spark-thrift pools are also stored as thrift clusters.
+        spark-plug pools are also stored as plug entries.
+        This keeps the catalog consistent for routing/selection logic.
+        """
+        kind = str(pool.get("kind") or "").strip()
+        pool_id = str(pool.get("id") or "").strip()
+        if not org or not pool_id:
+            return
+        try:
+            catalog = _get_catalog()
+        except Exception:
+            return
+
+        if kind == "spark-thrift":
+            config = {
+                "name": pool.get("name", ""),
+                "thrift_host": pool.get("thrift_host", ""),
+                "thrift_port": pool.get("thrift_port", 10000),
+                "status": pool.get("status", "active"),
+                "min_bytes": pool.get("min_bytes", 0),
+                "max_bytes": pool.get("max_bytes", 0),
+                "s3_enabled": pool.get("s3_enabled", True),
+                "s3_endpoint": pool.get("s3_endpoint", ""),
+            }
+            try:
+                catalog.register_spark_cluster(org, pool_id, config)
+            except Exception:
+                pass
+        elif kind == "spark-plug":
+            config = {
+                "name": pool.get("name", ""),
+                "spark_master": pool.get("spark_master", "spark://localhost:7077"),
+                "ws_url": pool.get("ws_url", "ws://localhost:8010/ws/spark"),
+                "webui_url": pool.get("webui_url", ""),
+                "status": pool.get("status", "active"),
+            }
+            try:
+                catalog.register_spark_plug(org, pool_id, config)
+            except Exception:
+                pass
+
+    # ── Test connection endpoint ───────────────────────────────────
+
+    @router.post("/reflection/compute/test-connection")
+    def test_connection(
+        payload: Dict[str, Any] = Body(...),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """
+        Test connectivity for a pool before saving.
+        Checks vary by kind:
+          spark-thrift: TCP connect to thrift_host:thrift_port
+          spark-plug:   WebSocket upgrade handshake to ws_url
+        """
+        import socket
+
+        kind = str(payload.get("kind") or "").strip().lower()
+        if kind == "in-process":
+            return {"ok": True, "message": "In-process — no connection needed"}
+
+        if kind == "spark-thrift":
+            host = str(payload.get("thrift_host") or "").strip()
+            try:
+                port = int(payload.get("thrift_port") or 10000)
+            except (ValueError, TypeError):
+                port = 10000
+            label = f"thrift {host}:{port}"
+            if not host:
+                raise HTTPException(status_code=400, detail="thrift_host is required for testing")
+
+            try:
+                sock = socket.create_connection((host, port), timeout=5.0)
+                sock.close()
+                return {"ok": True, "message": f"Connected to {label}"}
+            except socket.timeout:
+                return {"ok": False, "message": f"Timeout connecting to {label}"}
+            except OSError as e:
+                return {"ok": False, "message": f"Cannot reach {label}: {e}"}
+
+        # spark-plug: real WebSocket upgrade handshake
+        ws_raw = str(payload.get("ws_url") or "").strip()
+        if not ws_raw:
+            raise HTTPException(status_code=400, detail="ws_url is required for testing")
+
+        parts = urlsplit(ws_raw)
+        host = parts.hostname or ""
+        use_ssl = parts.scheme in ("wss", "https")
+        port = parts.port or (443 if use_ssl else 80)
+        path = parts.path or "/"
+        label = f"ws {host}:{port}{path}"
+        if not host:
+            raise HTTPException(status_code=400, detail="Cannot parse host from ws_url")
+
+        import hashlib
+        import base64
+
+        try:
+            sock = socket.create_connection((host, port), timeout=5.0)
+        except socket.timeout:
+            return {"ok": False, "message": f"Timeout connecting to {label}"}
+        except OSError as e:
+            return {"ok": False, "message": f"Cannot reach {label}: {e}"}
+
+        try:
+            if use_ssl:
+                import ssl
+                ctx_ssl = ssl.create_default_context()
+                sock = ctx_ssl.wrap_socket(sock, server_hostname=host)
+
+            # WebSocket upgrade request (RFC 6455)
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+            upgrade_req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"\r\n"
+            )
+            sock.sendall(upgrade_req.encode())
+
+            # Read response (up to 4KB is plenty for headers)
+            sock.settimeout(5.0)
+            resp_data = b""
+            while b"\r\n\r\n" not in resp_data and len(resp_data) < 4096:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                resp_data += chunk
+
+            resp_text = resp_data.decode("utf-8", errors="replace")
+            first_line = resp_text.split("\r\n", 1)[0] if resp_text else ""
+
+            if "101" in first_line:
+                return {"ok": True, "message": f"WebSocket handshake OK — {label}"}
+            elif first_line:
+                return {"ok": False, "message": f"Server responded: {first_line[:80]}"}
+            else:
+                return {"ok": False, "message": f"No response from {label} (connection closed)"}
+        except socket.timeout:
+            return {"ok": False, "message": f"Timeout during WebSocket handshake to {label}"}
+        except OSError as e:
+            return {"ok": False, "message": f"WebSocket handshake failed for {label}: {e}"}
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # ── Spark Thrift cluster management (org-scoped) ────────────────
+
+    def _get_catalog():
+        """Lazily import and instantiate RedisCatalog."""
+        try:
+            from supertable.redis_catalog import RedisCatalog
+        except Exception:
+            from redis_catalog import RedisCatalog  # type: ignore
+        return RedisCatalog()
+
+    @router.get("/reflection/compute/spark/thrifts")
+    def spark_thrifts_list(org: str, _: Any = Depends(logged_in_guard_api)):
+        org = str(org or "").strip()
+        if not org:
+            raise HTTPException(status_code=400, detail="org is required")
+        try:
+            catalog = _get_catalog()
+            clusters = catalog.list_spark_clusters(org)
+            return {"ok": True, "clusters": clusters}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to list Spark thrifts: {e}")
+
+    @router.post("/reflection/compute/spark/thrifts")
+    def spark_thrift_upsert(
+        payload: Dict[str, Any] = Body(...),
+        _: Any = Depends(admin_guard_api),
+    ):
+        org = str(payload.get("org") or "").strip()
+        cluster_id = str(payload.get("cluster_id") or "").strip()
+        name = str(payload.get("name") or "").strip()
+        thrift_host = str(payload.get("thrift_host") or "").strip()
+
+        if not org:
+            raise HTTPException(status_code=400, detail="org is required")
+        if not cluster_id:
+            raise HTTPException(status_code=400, detail="cluster_id is required")
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        if not thrift_host:
+            raise HTTPException(status_code=400, detail="thrift_host is required")
+
+        thrift_port = 10000
+        try:
+            thrift_port = int(payload.get("thrift_port") or 10000)
+        except (ValueError, TypeError):
+            pass
+        if thrift_port < 1 or thrift_port > 65535:
+            thrift_port = 10000
+
+        status_val = str(payload.get("status") or "active").strip().lower()
+        if status_val not in ("active", "draining", "offline"):
+            status_val = "active"
+
+        min_bytes = max(0, int(payload.get("min_bytes") or 0))
+        max_bytes = max(0, int(payload.get("max_bytes") or 0))
+
+        config = {
+            "name": name,
+            "thrift_host": thrift_host,
+            "thrift_port": thrift_port,
+            "status": status_val,
+            "min_bytes": min_bytes,
+            "max_bytes": max_bytes,
+            "s3_enabled": bool(payload.get("s3_enabled", True)),
+        }
+        for field_name in ("auth", "username", "password"):
+            val = payload.get(field_name)
+            if val is not None:
+                config[field_name] = str(val)
+
+        try:
+            catalog = _get_catalog()
+            catalog.register_spark_cluster(org, cluster_id, config)
+            return {"ok": True, "cluster_id": cluster_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to register thrift: {e}")
+
+    @router.post("/reflection/compute/spark/thrifts/status")
+    def spark_thrift_status_update(
+        payload: Dict[str, Any] = Body(...),
+        _: Any = Depends(admin_guard_api),
+    ):
+        org = str(payload.get("org") or "").strip()
+        cluster_id = str(payload.get("cluster_id") or "").strip()
+        status_val = str(payload.get("status") or "").strip().lower()
+
+        if not org or not cluster_id:
+            raise HTTPException(status_code=400, detail="org and cluster_id are required")
+        if status_val not in ("active", "draining", "offline"):
+            raise HTTPException(status_code=400, detail="status must be: active, draining, offline")
+
+        try:
+            catalog = _get_catalog()
+            ok = catalog.update_spark_cluster_status(org, cluster_id, status_val)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Cluster not found")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to update status: {e}")
+
+    @router.delete("/reflection/compute/spark/thrifts/{cluster_id}")
+    def spark_thrift_delete(cluster_id: str, org: str, _: Any = Depends(admin_guard_api)):
+        org = str(org or "").strip()
+        cluster_id = str(cluster_id or "").strip()
+        if not org or not cluster_id:
+            raise HTTPException(status_code=400, detail="org and cluster_id are required")
+        try:
+            catalog = _get_catalog()
+            ok = catalog.deregister_spark_cluster(org, cluster_id)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Cluster not found")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to deregister thrift: {e}")
+
+    # ── Spark Plug management (org-scoped) ──────────────────────────
+
+    @router.get("/reflection/compute/spark/plugs")
+    def spark_plugs_list(org: str, _: Any = Depends(logged_in_guard_api)):
+        org = str(org or "").strip()
+        if not org:
+            raise HTTPException(status_code=400, detail="org is required")
+        try:
+            catalog = _get_catalog()
+            plugs = catalog.list_spark_plugs(org)
+            return {"ok": True, "plugs": plugs}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to list Spark plugs: {e}")
+
+    @router.post("/reflection/compute/spark/plugs")
+    def spark_plug_upsert(
+        payload: Dict[str, Any] = Body(...),
+        _: Any = Depends(admin_guard_api),
+    ):
+        org = str(payload.get("org") or "").strip()
+        plug_id = str(payload.get("plug_id") or "").strip()
+        name = str(payload.get("name") or "").strip()
+
+        if not org:
+            raise HTTPException(status_code=400, detail="org is required")
+        if not plug_id:
+            raise HTTPException(status_code=400, detail="plug_id is required")
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+
+        status_val = str(payload.get("status") or "active").strip().lower()
+        if status_val not in ("active", "draining", "offline"):
+            status_val = "active"
+
+        config = {
+            "name": name,
+            "spark_master": str(payload.get("spark_master") or "spark://localhost:7077").strip(),
+            "ws_url": str(payload.get("ws_url") or "ws://localhost:8010/ws/spark").strip(),
+            "webui_url": str(payload.get("webui_url") or "").strip(),
+            "status": status_val,
+        }
+
+        try:
+            catalog = _get_catalog()
+            catalog.register_spark_plug(org, plug_id, config)
+            return {"ok": True, "plug_id": plug_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to register plug: {e}")
+
+    @router.post("/reflection/compute/spark/plugs/status")
+    def spark_plug_status_update(
+        payload: Dict[str, Any] = Body(...),
+        _: Any = Depends(admin_guard_api),
+    ):
+        org = str(payload.get("org") or "").strip()
+        plug_id = str(payload.get("plug_id") or "").strip()
+        status_val = str(payload.get("status") or "").strip().lower()
+
+        if not org or not plug_id:
+            raise HTTPException(status_code=400, detail="org and plug_id are required")
+        if status_val not in ("active", "draining", "offline"):
+            raise HTTPException(status_code=400, detail="status must be: active, draining, offline")
+
+        try:
+            catalog = _get_catalog()
+            ok = catalog.update_spark_plug_status(org, plug_id, status_val)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Plug not found")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to update plug status: {e}")
+
+    @router.delete("/reflection/compute/spark/plugs/{plug_id}")
+    def spark_plug_delete(plug_id: str, org: str, _: Any = Depends(admin_guard_api)):
+        org = str(org or "").strip()
+        plug_id = str(plug_id or "").strip()
+        if not org or not plug_id:
+            raise HTTPException(status_code=400, detail="org and plug_id are required")
+        try:
+            catalog = _get_catalog()
+            ok = catalog.deregister_spark_plug(org, plug_id)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Plug not found")
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to deregister plug: {e}")

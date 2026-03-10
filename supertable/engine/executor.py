@@ -47,8 +47,9 @@ class Executor:
     Chooses execution engine and runs the query against the provided file list.
     """
 
-    def __init__(self, storage: Optional[object] = None):
+    def __init__(self, storage: Optional[object] = None, organization: str = ""):
         self.storage = storage
+        self.organization = organization
         self.transient_exec = DuckDBTransient(storage=storage)
         self.spark_exec = None
 
@@ -102,7 +103,9 @@ class Executor:
         elif chosen == Engine.SPARK:
             if self.spark_exec is None:
                 from supertable.engine.spark_thrift import SparkThriftExecutor
-                self.spark_exec = SparkThriftExecutor(storage=self.storage)
+                self.spark_exec = SparkThriftExecutor(
+                    storage=self.storage, organization=self.organization,
+                )
             # force=True when user explicitly requested Spark (not via AUTO)
             df = self.spark_exec.execute(
                 reflection=reflection,

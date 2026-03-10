@@ -114,9 +114,29 @@ def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Spark cluster key helpers
+# Spark cluster key helpers (org-scoped)
 # --------------------------------------------------------------------------- #
 
+def _spark_thrifts_key(org: str) -> str:
+    """HASH: cluster_id → JSON cluster config, scoped per organization."""
+    return f"spark:{org}:thrifts"
+
+
+def _spark_plugs_key(org: str) -> str:
+    """HASH: plug_id → JSON plug config, scoped per organization."""
+    return f"spark:{org}:plugs"
+
+
+def _compute_pools_key(org: str, sup: str) -> str:
+    """Key for unified compute pool state (org+sup scoped).
+
+    Pools of all kinds (in-process, spark-thrift, spark-plug, spark, kubernetes)
+    are stored together under one JSON blob keyed by tenant.
+    """
+    return f"supertable:reflection:compute:{org}__{sup}"
+
+
+# Deprecated: kept for backward compatibility / migration reference.
 def _spark_clusters_key() -> str:
     """HASH: cluster_id → JSON cluster config (global, not org-scoped)."""
     return "supertable:spark:clusters"
@@ -367,6 +387,16 @@ return 1
         self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
         self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
         self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
+
+    # ------------- Health check -------------
+
+    def ping(self) -> bool:
+        """Test Redis connectivity. Returns True if the server responds to PING."""
+        try:
+            return bool(self.r.ping())
+        except redis.RedisError as e:
+            logger.debug(f"[redis-catalog] ping failed: {e}")
+            return False
 
     # ------------- Locking -------------
 
@@ -1365,12 +1395,12 @@ return 1
             return 0
 
     # ========================================================================= #
-    # Spark cluster management
+    # Spark Thrift cluster management (org-scoped: spark:{org}:thrifts)
     # ========================================================================= #
 
-    def register_spark_cluster(self, cluster_id: str, config: Dict[str, Any]) -> None:
+    def register_spark_cluster(self, org: str, cluster_id: str, config: Dict[str, Any]) -> None:
         """
-        Register or update a Spark Thrift cluster.
+        Register or update a Spark Thrift cluster for an organization.
 
         config should include:
             thrift_host: str       — hostname of the Thrift Server
@@ -1381,9 +1411,12 @@ return 1
             status: str            — "active" | "draining" | "offline"
             s3_enabled: bool       — can read from S3/MinIO directly
         """
+        if not org:
+            raise ValueError("organization is required")
         try:
             doc = dict(config)
             doc["cluster_id"] = cluster_id
+            doc["organization"] = org
             doc.setdefault("status", "active")
             doc.setdefault("thrift_port", 10000)
             doc.setdefault("min_bytes", 0)
@@ -1391,36 +1424,42 @@ return 1
             doc.setdefault("s3_enabled", True)
             doc["modified_ms"] = _now_ms()
             self.r.hset(
-                _spark_clusters_key(),
+                _spark_thrifts_key(org),
                 cluster_id,
                 json.dumps(doc, default=str),
             )
-            logger.info(f"[redis-catalog] spark cluster registered: {cluster_id}")
+            logger.info(f"[redis-catalog] spark thrift registered: {org}/{cluster_id}")
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] register_spark_cluster error: {e}")
 
-    def deregister_spark_cluster(self, cluster_id: str) -> bool:
-        """Remove a Spark cluster from the registry."""
+    def deregister_spark_cluster(self, org: str, cluster_id: str) -> bool:
+        """Remove a Spark Thrift cluster from the registry."""
+        if not org:
+            return False
         try:
-            return bool(self.r.hdel(_spark_clusters_key(), cluster_id))
+            return bool(self.r.hdel(_spark_thrifts_key(org), cluster_id))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] deregister_spark_cluster error: {e}")
             return False
 
-    def get_spark_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
-        """Return config for a specific cluster."""
+    def get_spark_cluster(self, org: str, cluster_id: str) -> Optional[Dict[str, Any]]:
+        """Return config for a specific Spark Thrift cluster."""
+        if not org:
+            return None
         try:
-            raw = self.r.hget(_spark_clusters_key(), cluster_id)
+            raw = self.r.hget(_spark_thrifts_key(org), cluster_id)
             if raw:
                 return json.loads(raw)
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"[redis-catalog] get_spark_cluster error: {e}")
         return None
 
-    def list_spark_clusters(self) -> List[Dict[str, Any]]:
-        """Return all registered Spark clusters."""
+    def list_spark_clusters(self, org: str) -> List[Dict[str, Any]]:
+        """Return all registered Spark Thrift clusters for an organization."""
+        if not org:
+            return []
         try:
-            raw = self.r.hgetall(_spark_clusters_key())
+            raw = self.r.hgetall(_spark_thrifts_key(org))
             clusters = []
             for _cid, data in raw.items():
                 try:
@@ -1432,24 +1471,26 @@ return 1
             logger.error(f"[redis-catalog] list_spark_clusters error: {e}")
             return []
 
-    def update_spark_cluster_status(self, cluster_id: str, status: str) -> bool:
-        """Update only the status of a cluster (active/draining/offline)."""
+    def update_spark_cluster_status(self, org: str, cluster_id: str, status: str) -> bool:
+        """Update only the status of a Spark Thrift cluster (active/draining/offline)."""
+        if not org:
+            return False
         try:
-            raw = self.r.hget(_spark_clusters_key(), cluster_id)
+            raw = self.r.hget(_spark_thrifts_key(org), cluster_id)
             if not raw:
                 return False
             doc = json.loads(raw)
             doc["status"] = status
             doc["modified_ms"] = _now_ms()
-            self.r.hset(_spark_clusters_key(), cluster_id, json.dumps(doc, default=str))
+            self.r.hset(_spark_thrifts_key(org), cluster_id, json.dumps(doc, default=str))
             return True
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"[redis-catalog] update_spark_cluster_status error: {e}")
             return False
 
-    def select_spark_cluster(self, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
+    def select_spark_cluster(self, org: str, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
         """
-        Select the best active Spark cluster for a job of the given size.
+        Select the best active Spark Thrift cluster for a job of the given size.
 
         Selection logic:
         1. Filter clusters where status == "active"
@@ -1458,7 +1499,7 @@ return 1
         4. Among matches, prefer the cluster with the tightest max_bytes
            (most specialized for this job size), breaking ties by name.
         """
-        clusters = self.list_spark_clusters()
+        clusters = self.list_spark_clusters(org)
         candidates = []
 
         for c in clusters:
@@ -1484,6 +1525,97 @@ return 1
 
         candidates.sort(key=sort_key)
         return candidates[0]
+
+    # ========================================================================= #
+    # Spark Plug management (org-scoped: spark:{org}:plugs)
+    # ========================================================================= #
+
+    def register_spark_plug(self, org: str, plug_id: str, config: Dict[str, Any]) -> None:
+        """
+        Register or update a Spark Plug (PySpark notebook runtime).
+
+        config should include:
+            name: str              — human-readable name
+            spark_master: str      — Spark master URL (e.g. spark://spark-master:7077)
+            ws_url: str            — WebSocket URL (e.g. ws://host:8010/ws/spark)
+            webui_url: str         — Spark Master Web UI URL (optional)
+            status: str            — "active" | "draining" | "offline"
+        """
+        if not org:
+            raise ValueError("organization is required")
+        try:
+            doc = dict(config)
+            doc["plug_id"] = plug_id
+            doc["organization"] = org
+            doc.setdefault("status", "active")
+            doc.setdefault("spark_master", "spark://localhost:7077")
+            doc.setdefault("ws_url", "ws://localhost:8010/ws/spark")
+            doc.setdefault("webui_url", "")
+            doc["modified_ms"] = _now_ms()
+            self.r.hset(
+                _spark_plugs_key(org),
+                plug_id,
+                json.dumps(doc, default=str),
+            )
+            logger.info(f"[redis-catalog] spark plug registered: {org}/{plug_id}")
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] register_spark_plug error: {e}")
+
+    def deregister_spark_plug(self, org: str, plug_id: str) -> bool:
+        """Remove a Spark Plug from the registry."""
+        if not org:
+            return False
+        try:
+            return bool(self.r.hdel(_spark_plugs_key(org), plug_id))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] deregister_spark_plug error: {e}")
+            return False
+
+    def get_spark_plug(self, org: str, plug_id: str) -> Optional[Dict[str, Any]]:
+        """Return config for a specific Spark Plug."""
+        if not org:
+            return None
+        try:
+            raw = self.r.hget(_spark_plugs_key(org), plug_id)
+            if raw:
+                return json.loads(raw)
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] get_spark_plug error: {e}")
+        return None
+
+    def list_spark_plugs(self, org: str) -> List[Dict[str, Any]]:
+        """Return all registered Spark Plugs for an organization."""
+        if not org:
+            return []
+        try:
+            raw = self.r.hgetall(_spark_plugs_key(org))
+            plugs = []
+            for _pid, data in raw.items():
+                try:
+                    plugs.append(json.loads(data))
+                except json.JSONDecodeError:
+                    pass
+            return plugs
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_spark_plugs error: {e}")
+            return []
+
+    def update_spark_plug_status(self, org: str, plug_id: str, status: str) -> bool:
+        """Update only the status of a Spark Plug."""
+        if not org:
+            return False
+        try:
+            raw = self.r.hget(_spark_plugs_key(org), plug_id)
+            if not raw:
+                return False
+            doc = json.loads(raw)
+            doc["status"] = status
+            doc["modified_ms"] = _now_ms()
+            self.r.hset(_spark_plugs_key(org), plug_id, json.dumps(doc, default=str))
+            return True
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] update_spark_plug_status error: {e}")
+            return False
 
     # ========================================================================= #
     # Table configuration (dedup-on-read, primary keys, etc.)

@@ -201,6 +201,14 @@ def attach_execute_routes(
             page_size = int(payload.get("page_size") or 100)
             max_rows = 10_000
 
+            # Engine selection — validate against allowed values
+            engine_raw = str(payload.get("engine") or "auto").strip().lower()
+            _ALLOWED_ENGINES = {
+                "auto", "duckdb_pinned", "duckdb_transient", "spark",
+            }
+            if engine_raw not in _ALLOWED_ENGINES:
+                engine_raw = "auto"
+
             if not organization or not super_name:
                 return JSONResponse(
                     {"status": "error",
@@ -234,7 +242,22 @@ def attach_execute_routes(
 
             DR = _get_data_reader()
             dr = DR(super_name=super_name, organization=organization, query=q)
-            res = dr.execute(role_name=role_name)
+
+            # Resolve the engine enum from data_reader
+            try:
+                from supertable.data_reader import engine as _EngineEnum
+            except Exception:
+                from data_reader import engine as _EngineEnum  # type: ignore
+
+            _ENGINE_MAP = {
+                "auto": _EngineEnum.AUTO,
+                "duckdb_pinned": _EngineEnum.DUCKDB_PINNED,
+                "duckdb_transient": _EngineEnum.DUCKDB_TRANSIENT,
+                "spark": _EngineEnum.SPARK,
+            }
+            selected_engine = _ENGINE_MAP.get(engine_raw, _EngineEnum.AUTO)
+
+            res = dr.execute(role_name=role_name, engine=selected_engine)
 
             df = meta1 = meta2 = None
             if isinstance(res, tuple):

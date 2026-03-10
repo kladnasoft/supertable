@@ -22,9 +22,10 @@ class SparkClusterManager:
                 try:
                     yield f"Initializing Spark session (Attempt {attempt + 1}/{retries})..."
 
+                    # Connects to the master via the remapped host port 7078
                     self.spark = SparkSession.builder \
-                        .appName("SupertableSparkNotebook") \
-                        .master("spark://localhost:7077") \
+                        .appName("SparkPlugNotebook") \
+                        .master("spark://localhost:7078") \
                         .config("spark.driver.host", "127.0.0.1") \
                         .config("spark.driver.bindAddress", "127.0.0.1") \
                         .config("spark.executor.memory", "512m") \
@@ -46,7 +47,6 @@ class SparkClusterManager:
             return {"status": "error", "message": "Spark session not started"}
 
         output = io.StringIO()
-        # Ensure 'spark' is available in the local scope of the executed code
         exec_globals = {"spark": self.spark, "__builtins__": __builtins__}
 
         try:
