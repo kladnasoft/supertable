@@ -1,4 +1,4 @@
-# supertable/engine/duckdb_pinned.py
+# supertable/engine/duckdb_pro.py
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from supertable.utils.sql_parser import SQLParser
 from supertable.data_classes import Reflection
 
 from supertable.engine.engine_common import (
-    pinned_table_name,
+    pro_table_name,
     hashed_table_name,
     configure_httpfs_and_s3,
     create_reflection_view,
@@ -35,9 +35,9 @@ from supertable.engine.engine_common import (
 # =========================================================
 
 @dataclass
-class _PinnedEntry:
-    """Tracks a single pinned reflection view."""
-    table_name: str          # DuckDB view name (e.g. pin_a3f8c1_v5)
+class _ProCacheEntry:
+    """Tracks a single cached reflection view."""
+    table_name: str          # DuckDB view name (e.g. pro_a3f8c1_v5)
     super_name: str
     simple_name: str
     version: int
@@ -46,10 +46,10 @@ class _PinnedEntry:
 
 
 # =========================================================
-# Pinned executor (singleton connection + table cache)
+# Pro executor (singleton connection + table cache)
 # =========================================================
 
-class DuckDBPinned:
+class DuckDBPro:
     """
     Persistent DuckDB executor with version-based reflection view caching.
 
@@ -74,9 +74,9 @@ class DuckDBPinned:
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
 
-        # Registry: (super_name, simple_name) → list of _PinnedEntry
+        # Registry: (super_name, simple_name) → list of _ProCacheEntry
         # Multiple entries per key when old version still has in-flight queries.
-        self._registry: Dict[Tuple[str, str], List[_PinnedEntry]] = {}
+        self._registry: Dict[Tuple[str, str], List[_ProCacheEntry]] = {}
 
         # Temp dir for spill — set on first query
         self._temp_dir: Optional[str] = None
@@ -102,7 +102,7 @@ class DuckDBPinned:
         # applied here because the httpfs extension is not loaded yet.
         self._con = con
         self._httpfs_configured = False
-        logger.info("[duckdb.pinned] persistent connection created")
+        logger.info("[duckdb.pro] persistent connection created")
         return con
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
@@ -121,13 +121,13 @@ class DuckDBPinned:
             self._con = None
             self._httpfs_configured = False
             self._registry.clear()
-            logger.warning("[duckdb.pinned] connection reset — all cached views lost")
+            logger.warning("[duckdb.pro] connection reset — all cached views lost")
 
     # ---------------------------------------------------------
     # Table registry management
     # ---------------------------------------------------------
 
-    def _current_entry(self, key: Tuple[str, str]) -> Optional[_PinnedEntry]:
+    def _current_entry(self, key: Tuple[str, str]) -> Optional[_ProCacheEntry]:
         """Return the latest (non-stale) entry for a table key, if any."""
         entries = self._registry.get(key, [])
         for entry in reversed(entries):
@@ -160,7 +160,7 @@ class DuckDBPinned:
             return current.table_name
 
         # New version needed
-        view_name = pinned_table_name(super_name, simple_name, version)
+        view_name = pro_table_name(super_name, simple_name, version)
 
         # Check if this exact view already exists (e.g. race between threads)
         entries = self._registry.get(key, [])
@@ -173,7 +173,7 @@ class DuckDBPinned:
             if not entry.stale:
                 entry.stale = True
                 logger.debug(
-                    f"{log_prefix}[duckdb.pinned] marked stale: {entry.table_name} "
+                    f"{log_prefix}[duckdb.pro] marked stale: {entry.table_name} "
                     f"(v{entry.version}, refs={entry.ref_count})"
                 )
 
@@ -188,14 +188,14 @@ class DuckDBPinned:
                     "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
                     "AccessDenied", "SignatureDoesNotMatch", "403", "400",
             )):
-                logger.warning(f"{log_prefix}[duckdb.pinned] presign fallback for {view_name}: {msg}")
+                logger.warning(f"{log_prefix}[duckdb.pro] presign fallback for {view_name}: {msg}")
                 presigned_files = make_presigned_list(self.storage, files)
                 self._ensure_httpfs(con, presigned_files)
                 create_reflection_view(con, view_name, presigned_files)
             else:
                 raise
 
-        new_entry = _PinnedEntry(
+        new_entry = _ProCacheEntry(
             table_name=view_name,
             super_name=super_name,
             simple_name=simple_name,
@@ -207,7 +207,7 @@ class DuckDBPinned:
         self._registry[key].append(new_entry)
 
         logger.info(
-            f"{log_prefix}[duckdb.pinned] created view {view_name} "
+            f"{log_prefix}[duckdb.pro] created view {view_name} "
             f"(super={super_name}, simple={simple_name}, v{version}, files={len(files)})"
         )
 
@@ -241,11 +241,11 @@ class DuckDBPinned:
                     try:
                         con.execute(f"DROP VIEW IF EXISTS {entry.table_name};")
                         logger.info(
-                            f"{log_prefix}[duckdb.pinned] dropped stale view: {entry.table_name} (v{entry.version})"
+                            f"{log_prefix}[duckdb.pro] dropped stale view: {entry.table_name} (v{entry.version})"
                         )
                     except Exception as e:
                         logger.warning(
-                            f"{log_prefix}[duckdb.pinned] failed to drop view {entry.table_name}: {e}"
+                            f"{log_prefix}[duckdb.pro] failed to drop view {entry.table_name}: {e}"
                         )
                         to_keep.append(entry)
                 else:
@@ -355,7 +355,7 @@ class DuckDBPinned:
             )
             parser.executing_query = executing_query
 
-            logger.debug(f"{log_prefix}[duckdb.pinned] executing: {executing_query}")
+            logger.debug(f"{log_prefix}[duckdb.pro] executing: {executing_query}")
 
             # The actual query execution can use a thread-local cursor
             # DuckDB allows concurrent reads on the same connection.

@@ -20,7 +20,8 @@ from supertable.engine.plan_stats import PlanStats
 from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 
 from supertable.engine.data_estimator import DataEstimator
-from supertable.engine.executor import Executor, Engine as _Engine
+from supertable.engine.executor import Executor
+from supertable.engine.engine_enum import Engine as engine
 from supertable.data_classes import TableDefinition, DedupViewDef
 from supertable.redis_catalog import RedisCatalog
 
@@ -28,18 +29,6 @@ from supertable.redis_catalog import RedisCatalog
 class Status(Enum):
     OK = "ok"
     ERROR = "error"
-
-
-# Expose an enum named `engine` to match your call style:
-class engine(Enum):  # noqa: N801
-    AUTO = _Engine.AUTO.value
-    DUCKDB = _Engine.DUCKDB.value
-    DUCKDB_TRANSIENT = _Engine.DUCKDB_TRANSIENT.value
-    DUCKDB_PINNED = _Engine.DUCKDB_PINNED.value
-    SPARK = _Engine.SPARK.value
-
-    def to_internal(self) -> _Engine:
-        return _Engine(self.value)
 
 
 from collections import defaultdict
@@ -141,7 +130,7 @@ class DataReader:
 
             # 2) EXECUTE
             result_df, engine_used = executor.execute(
-                engine=engine.to_internal(),
+                engine=engine,
                 reflection=reflection,
                 parser=self.parser,
                 query_manager=self.query_plan_manager,

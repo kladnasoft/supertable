@@ -64,15 +64,15 @@ def hashed_table_name(
     return f"st_{digest}"
 
 
-def pinned_table_name(
+def pro_table_name(
         super_name: str,
         simple_name: str,
         simple_version: int,
 ) -> str:
-    """Generate a deterministic table name for pinned mode (all columns, version-scoped)."""
+    """Generate a deterministic table name for pro mode (all columns, version-scoped)."""
     key = f"{super_name}_{simple_name}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return f"pin_{digest}_v{simple_version}"
+    return f"pro_{digest}_v{simple_version}"
 
 
 # =========================================================

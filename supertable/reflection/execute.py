@@ -204,7 +204,7 @@ def attach_execute_routes(
             # Engine selection — validate against allowed values
             engine_raw = str(payload.get("engine") or "auto").strip().lower()
             _ALLOWED_ENGINES = {
-                "auto", "duckdb_pinned", "duckdb_transient", "spark",
+                "auto", "duckdb_pro", "duckdb_lite", "spark_sql",
             }
             if engine_raw not in _ALLOWED_ENGINES:
                 engine_raw = "auto"
@@ -243,17 +243,17 @@ def attach_execute_routes(
             DR = _get_data_reader()
             dr = DR(super_name=super_name, organization=organization, query=q)
 
-            # Resolve the engine enum from data_reader
+            # Resolve the engine enum
             try:
-                from supertable.data_reader import engine as _EngineEnum
+                from supertable.engine.engine_enum import Engine as _EngineEnum
             except Exception:
-                from data_reader import engine as _EngineEnum  # type: ignore
+                from engine.engine_enum import Engine as _EngineEnum  # type: ignore
 
             _ENGINE_MAP = {
                 "auto": _EngineEnum.AUTO,
-                "duckdb_pinned": _EngineEnum.DUCKDB_PINNED,
-                "duckdb_transient": _EngineEnum.DUCKDB_TRANSIENT,
-                "spark": _EngineEnum.SPARK,
+                "duckdb_pro": _EngineEnum.DUCKDB_PRO,
+                "duckdb_lite": _EngineEnum.DUCKDB_LITE,
+                "spark_sql": _EngineEnum.SPARK_SQL,
             }
             selected_engine = _ENGINE_MAP.get(engine_raw, _EngineEnum.AUTO)
 
@@ -337,6 +337,7 @@ def attach_execute_routes(
         except HTTPException:
             raise
         except Exception as e:
+            logger.exception("Execute SQL failed")
             return JSONResponse(
                 {"status": "error",
                  "message": f"Execution failed: {e}",

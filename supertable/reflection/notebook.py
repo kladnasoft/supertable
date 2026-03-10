@@ -109,11 +109,12 @@ def _build_kernel_globals(*, org: str, sup: str, user_hash: str) -> Dict[str, An
                     q = f"{q.rstrip().rstrip(';')} limit {lim}"
             except Exception:
                 pass
-        from supertable.data_reader import DataReader, engine  # noqa: WPS433
+        from supertable.data_reader import DataReader  # noqa: WPS433
+        from supertable.engine.engine_enum import Engine  # noqa: WPS433
 
         dr = DataReader(super_name=sup, organization=org, query=q)
         # Returns (df, status, message) in examples; pass through as-is.
-        return dr.execute(role_name=user_hash, with_scan=with_scan, engine=engine.DUCKDB)
+        return dr.execute(role_name=user_hash, with_scan=with_scan, engine=Engine.DUCKDB_PRO)
 
     def st_read_table(table: str, *, limit: int = 50) -> Any:
         t = str(table or "").strip()

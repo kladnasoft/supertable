@@ -1,4 +1,4 @@
-# supertable/engine/duckdb_transient.py
+# supertable/engine/duckdb_lite.py
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from supertable.engine.engine_common import (
 )
 
 
-class DuckDBTransient:
+class DuckDBLite:
     """
     Per-query DuckDB executor backed by a single persistent connection.
 
@@ -37,7 +37,7 @@ class DuckDBTransient:
 
     Query isolation is preserved: VIEWs are created with unique names and
     dropped in the finally block after each query.  No materialised TABLE
-    state is retained between queries (contrast with DuckDBPinned).
+    state is retained between queries (contrast with DuckDBPro).
 
     Cache layers (innermost to outermost):
       1. DuckDB external file cache  -- disk-level data block cache (DuckDB >= 1.3)
@@ -72,7 +72,7 @@ class DuckDBTransient:
         # applied here because the httpfs extension is not loaded yet.
         self._con = con
         self._httpfs_configured = False
-        logger.info("[duckdb.transient] persistent connection created")
+        logger.info("[duckdb.lite] persistent connection created")
         return con
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
@@ -91,7 +91,7 @@ class DuckDBTransient:
                 pass
             self._con = None
             self._httpfs_configured = False
-            logger.warning("[duckdb.transient] connection reset")
+            logger.warning("[duckdb.lite] connection reset")
 
     # ------------------------------------------------------------------
     # Core execution
@@ -209,11 +209,11 @@ class DuckDBTransient:
             )
             parser.executing_query = executing_query
 
-            logger.debug(f"{log_prefix}[duckdb.transient] executing: {executing_query}")
+            logger.debug(f"{log_prefix}[duckdb.lite] executing: {executing_query}")
             result = con.execute(executing_query).fetchdf()
 
             if tried_presign:
-                logger.debug(f"{log_prefix}[duckdb.transient] presigned fallback succeeded")
+                logger.debug(f"{log_prefix}[duckdb.lite] presigned fallback succeeded")
 
             return result
 
@@ -224,3 +224,4 @@ class DuckDBTransient:
                     con.execute(f"DROP VIEW IF EXISTS {view};")
                 except Exception:
                     pass
+

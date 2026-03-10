@@ -12,8 +12,8 @@ Tests are organized around these concerns:
      - composite primary keys
      - single PK column
      - ties broken deterministically
-  4. DuckDB Pinned executor — dedup view creation, cleanup, column visibility
-  5. DuckDB Transient executor — column extension for dedup, dedup view creation
+  4. DuckDB Pro executor — dedup view creation, cleanup, column visibility
+  5. DuckDB Lite executor — column extension for dedup, dedup view creation
   6. Spark executor — _spark_create_dedup_view, DESCRIBE introspection, cleanup
   7. DataReader — dedup config lookup from Redis, DedupViewDef population
 
@@ -420,15 +420,15 @@ class TestCreateDedupViewEdgeCases:
 # 4. DuckDB Pinned — executor-level dedup
 # ===========================================================================
 
-class TestDuckDBPinnedDedup:
-    """Test dedup view creation and cleanup in pinned executor."""
+class TestDuckDBProDedup:
+    """Test dedup view creation and cleanup in pro executor."""
 
-    @patch("supertable.engine.duckdb_pinned.create_dedup_view")
-    @patch("supertable.engine.duckdb_pinned.create_rbac_view")
-    @patch("supertable.engine.duckdb_pinned.rewrite_query_with_hashed_tables")
-    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
-    @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
-    @patch("supertable.engine.duckdb_pinned.init_connection")
+    @patch("supertable.engine.duckdb_pro.create_dedup_view")
+    @patch("supertable.engine.duckdb_pro.create_rbac_view")
+    @patch("supertable.engine.duckdb_pro.rewrite_query_with_hashed_tables")
+    @patch("supertable.engine.duckdb_pro.create_reflection_view")
+    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
+    @patch("supertable.engine.duckdb_pro.init_connection")
     def test_dedup_view_created_and_used(
         self,
         mock_init,
@@ -438,7 +438,7 @@ class TestDuckDBPinnedDedup:
         mock_rbac,
         mock_dedup,
     ):
-        from supertable.engine.duckdb_pinned import DuckDBPinned
+        from supertable.engine.duckdb_pro import DuckDBPro
 
         # Setup: make the connection execute return a DataFrame
         mock_con = MagicMock()
@@ -447,9 +447,9 @@ class TestDuckDBPinnedDedup:
 
         mock_rewrite.return_value = "SELECT * FROM dedup_view"
 
-        pinned = DuckDBPinned(storage=None)
-        pinned._con = mock_con
-        pinned._httpfs_configured = True
+        pro = DuckDBPro(storage=None)
+        pro._con = mock_con
+        pro._httpfs_configured = True
 
         # Build reflection with one dedup-enabled table
         reflection = Reflection(
@@ -476,7 +476,7 @@ class TestDuckDBPinnedDedup:
         qm.temp_dir = "/tmp"
         qm.query_plan_path = "/tmp/plan.json"
 
-        pinned.execute(
+        pro.execute(
             reflection=reflection,
             parser=parser,
             query_manager=qm,
@@ -497,12 +497,12 @@ class TestDuckDBPinnedDedup:
         ]
         assert len(drop_calls) >= 1
 
-    @patch("supertable.engine.duckdb_pinned.create_dedup_view")
-    @patch("supertable.engine.duckdb_pinned.create_rbac_view")
-    @patch("supertable.engine.duckdb_pinned.rewrite_query_with_hashed_tables")
-    @patch("supertable.engine.duckdb_pinned.create_reflection_view")
-    @patch("supertable.engine.duckdb_pinned.configure_httpfs_and_s3")
-    @patch("supertable.engine.duckdb_pinned.init_connection")
+    @patch("supertable.engine.duckdb_pro.create_dedup_view")
+    @patch("supertable.engine.duckdb_pro.create_rbac_view")
+    @patch("supertable.engine.duckdb_pro.rewrite_query_with_hashed_tables")
+    @patch("supertable.engine.duckdb_pro.create_reflection_view")
+    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
+    @patch("supertable.engine.duckdb_pro.init_connection")
     def test_rbac_then_dedup_layering(
         self,
         mock_init,
@@ -513,16 +513,16 @@ class TestDuckDBPinnedDedup:
         mock_dedup,
     ):
         """Dedup view should be created on top of RBAC view, not raw table."""
-        from supertable.engine.duckdb_pinned import DuckDBPinned
+        from supertable.engine.duckdb_pro import DuckDBPro
 
         mock_con = MagicMock()
         mock_con.execute.return_value.fetchdf.return_value = pd.DataFrame()
         mock_con.execute.return_value.fetchall.return_value = []
         mock_rewrite.return_value = "SELECT * FROM v"
 
-        pinned = DuckDBPinned(storage=None)
-        pinned._con = mock_con
-        pinned._httpfs_configured = True
+        pro = DuckDBPro(storage=None)
+        pro._con = mock_con
+        pro._httpfs_configured = True
 
         reflection = Reflection(
             storage_type="test",
@@ -549,7 +549,7 @@ class TestDuckDBPinnedDedup:
         qm.temp_dir = "/tmp"
         qm.query_plan_path = "/tmp/plan.json"
 
-        pinned.execute(
+        pro.execute(
             reflection=reflection,
             parser=parser,
             query_manager=qm,
@@ -570,14 +570,14 @@ class TestDuckDBPinnedDedup:
 # 5. DuckDB Transient — column extension + dedup
 # ===========================================================================
 
-class TestDuckDBTransientDedupColumnExtension:
-    """Verify the transient engine extends columns for dedup tables."""
+class TestDuckDBLiteDedupColumnExtension:
+    """Verify the lite engine extends columns for dedup tables."""
 
-    @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
-    @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
-    @patch("supertable.engine.duckdb_transient.init_connection")
-    @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")
+    @patch("supertable.engine.duckdb_lite.create_dedup_view")
+    @patch("supertable.engine.duckdb_lite.create_reflection_view_with_presign_retry")
+    @patch("supertable.engine.duckdb_lite.configure_httpfs_and_s3")
+    @patch("supertable.engine.duckdb_lite.init_connection")
+    @patch("supertable.engine.duckdb_lite.rewrite_query_with_hashed_tables")
     def test_columns_extended_with_pk_and_timestamp(
         self,
         mock_rewrite,
@@ -586,11 +586,11 @@ class TestDuckDBTransientDedupColumnExtension:
         mock_create_tbl,
         mock_dedup,
     ):
-        from supertable.engine.duckdb_transient import DuckDBTransient
+        from supertable.engine.duckdb_lite import DuckDBLite
 
         mock_rewrite.return_value = "SELECT value FROM dedup_v"
 
-        transient = DuckDBTransient(storage=None)
+        lite = DuckDBLite(storage=None)
 
         reflection = Reflection(
             storage_type="test",
@@ -617,12 +617,12 @@ class TestDuckDBTransientDedupColumnExtension:
         qm.query_plan_path = "/tmp/plan.json"
 
         # The real duckdb.connect() inside execute() needs to work
-        with patch("supertable.engine.duckdb_transient.duckdb") as mock_duckdb:
+        with patch("supertable.engine.duckdb_lite.duckdb") as mock_duckdb:
             mock_con = MagicMock()
             mock_con.execute.return_value.fetchdf.return_value = pd.DataFrame({"value": ["x"]})
             mock_duckdb.connect.return_value = mock_con
 
-            transient.execute(
+            lite.execute(
                 reflection=reflection,
                 parser=parser,
                 query_manager=qm,
@@ -643,11 +643,11 @@ class TestDuckDBTransientDedupColumnExtension:
         assert "region" in cols_lower, "PK column 'region' added"
         assert "__timestamp__" in cols_lower, "Order column added"
 
-    @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
-    @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
-    @patch("supertable.engine.duckdb_transient.init_connection")
-    @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")
+    @patch("supertable.engine.duckdb_lite.create_dedup_view")
+    @patch("supertable.engine.duckdb_lite.create_reflection_view_with_presign_retry")
+    @patch("supertable.engine.duckdb_lite.configure_httpfs_and_s3")
+    @patch("supertable.engine.duckdb_lite.init_connection")
+    @patch("supertable.engine.duckdb_lite.rewrite_query_with_hashed_tables")
     def test_no_duplicate_columns_when_pk_already_selected(
         self,
         mock_rewrite,
@@ -657,11 +657,11 @@ class TestDuckDBTransientDedupColumnExtension:
         mock_dedup,
     ):
         """If user already SELECTs the PK column, it should not be added twice."""
-        from supertable.engine.duckdb_transient import DuckDBTransient
+        from supertable.engine.duckdb_lite import DuckDBLite
 
         mock_rewrite.return_value = "SELECT id, value FROM dedup_v"
 
-        transient = DuckDBTransient(storage=None)
+        lite = DuckDBLite(storage=None)
 
         reflection = Reflection(
             storage_type="test",
@@ -687,12 +687,12 @@ class TestDuckDBTransientDedupColumnExtension:
         qm.temp_dir = "/tmp"
         qm.query_plan_path = "/tmp/plan.json"
 
-        with patch("supertable.engine.duckdb_transient.duckdb") as mock_duckdb:
+        with patch("supertable.engine.duckdb_lite.duckdb") as mock_duckdb:
             mock_con = MagicMock()
             mock_con.execute.return_value.fetchdf.return_value = pd.DataFrame()
             mock_duckdb.connect.return_value = mock_con
 
-            transient.execute(
+            lite.execute(
                 reflection=reflection,
                 parser=parser,
                 query_manager=qm,
@@ -706,11 +706,11 @@ class TestDuckDBTransientDedupColumnExtension:
         # __timestamp__ should be added
         assert "__timestamp__" in cols_lower
 
-    @patch("supertable.engine.duckdb_transient.create_dedup_view")
-    @patch("supertable.engine.duckdb_transient.create_reflection_view_with_presign_retry")
-    @patch("supertable.engine.duckdb_transient.configure_httpfs_and_s3")
-    @patch("supertable.engine.duckdb_transient.init_connection")
-    @patch("supertable.engine.duckdb_transient.rewrite_query_with_hashed_tables")
+    @patch("supertable.engine.duckdb_lite.create_dedup_view")
+    @patch("supertable.engine.duckdb_lite.create_reflection_view_with_presign_retry")
+    @patch("supertable.engine.duckdb_lite.configure_httpfs_and_s3")
+    @patch("supertable.engine.duckdb_lite.init_connection")
+    @patch("supertable.engine.duckdb_lite.rewrite_query_with_hashed_tables")
     def test_select_star_no_column_extension(
         self,
         mock_rewrite,
@@ -721,11 +721,11 @@ class TestDuckDBTransientDedupColumnExtension:
     ):
         """SELECT * means td.columns=[] — no column extension needed,
         all columns are already loaded."""
-        from supertable.engine.duckdb_transient import DuckDBTransient
+        from supertable.engine.duckdb_lite import DuckDBLite
 
         mock_rewrite.return_value = "SELECT * FROM dedup_v"
 
-        transient = DuckDBTransient(storage=None)
+        lite = DuckDBLite(storage=None)
 
         reflection = Reflection(
             storage_type="test",
@@ -751,12 +751,12 @@ class TestDuckDBTransientDedupColumnExtension:
         qm.temp_dir = "/tmp"
         qm.query_plan_path = "/tmp/plan.json"
 
-        with patch("supertable.engine.duckdb_transient.duckdb") as mock_duckdb:
+        with patch("supertable.engine.duckdb_lite.duckdb") as mock_duckdb:
             mock_con = MagicMock()
             mock_con.execute.return_value.fetchdf.return_value = pd.DataFrame()
             mock_duckdb.connect.return_value = mock_con
 
-            transient.execute(
+            lite.execute(
                 reflection=reflection,
                 parser=parser,
                 query_manager=qm,
@@ -1009,7 +1009,7 @@ class TestDataReaderDedupLookup:
 
         # Setup executor
         mock_executor = MagicMock()
-        mock_executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb_pinned")
+        mock_executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb_pro")
         mock_executor_cls.return_value = mock_executor
 
         # Setup catalog: table has dedup_on_read enabled
@@ -1084,7 +1084,7 @@ class TestDataReaderDedupLookup:
         mock_estimator_cls.return_value = mock_estimator
 
         mock_executor = MagicMock()
-        mock_executor.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_executor.execute.return_value = (pd.DataFrame(), "duckdb_pro")
         mock_executor_cls.return_value = mock_executor
 
         # No dedup config
@@ -1147,7 +1147,7 @@ class TestDataReaderDedupLookup:
         mock_estimator_cls.return_value = mock_estimator
 
         mock_executor = MagicMock()
-        mock_executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb_pinned")
+        mock_executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb_pro")
         mock_executor_cls.return_value = mock_executor
 
         # Redis throws an exception
