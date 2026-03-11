@@ -1,0 +1,14 @@
+[
+  {
+    "name": "mymaster (Sentinel)",
+    "sentinelMasterName": "mymaster",
+    "sentinelPassword": "${REDIS_PASSWORD:-change_me_to_a_strong_password}",
+    "password": "${REDIS_PASSWORD:-change_me_to_a_strong_password}",
+    "db": 1,
+    "sentinels": [
+      { "host": "redis-sentinel-1", "port": 26379 },
+      { "host": "redis-sentinel-2", "port": 26379 },
+      { "host": "redis-sentinel-3", "port": 26379 }
+    ]
+  }
+]

@@ -1,0 +1,112 @@
+# docker-compose.spark-thrift.yml
+
+x-spark-common: &spark-common
+  image: docker.io/bitnamilegacy/spark:3.5
+  environment: &spark-env
+    SPARK_MODE: worker
+    SPARK_MASTER_URL: spark://spark-thrift-master:7077
+    SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
+    SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+    SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+    SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+    SPARK_SSL_ENABLED: "no"
+    SPARK_USER: spark
+  networks:
+    - supertable-net
+
+services:
+
+  spark-thrift-master:
+    image: docker.io/bitnamilegacy/spark:3.5
+    container_name: spark-thrift-master
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-thrift-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+      SPARK_USER: spark
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT:-8180}:8080"
+      - "7077:7077"
+    networks:
+      - supertable-net
+
+  spark-thrift-worker-1:
+    <<: *spark-common
+    container_name: spark-thrift-worker-1
+    depends_on:
+      - spark-thrift-master
+
+  spark-thrift-server:
+    image: docker.io/bitnamilegacy/spark:3.5
+    container_name: spark-thrift-server
+    user: root
+    depends_on:
+      - spark-thrift-master
+    ports:
+      - "${SPARK_THRIFT_PORT:-10000}:10000"
+      - "${SPARK_THRIFT_WEBUI_PORT:-4040}:4040"
+    volumes:
+      - spark-warehouse:/opt/spark/warehouse
+    # Pass S3 config as container env vars so bash never interprets
+    # special characters (like ! in passwords) in the command block.
+    environment:
+      ST_S3A_ENDPOINT: "${STORAGE_SPARK_ENDPOINT_URL:-http://minio:9000}"
+      ST_S3A_ACCESS_KEY: "${STORAGE_ACCESS_KEY:-minioadmin}"
+      ST_S3A_SECRET_KEY: "${STORAGE_SECRET_KEY:-minioadmin123!}"
+      ST_S3A_PATH_STYLE: "${STORAGE_FORCE_PATH_STYLE:-true}"
+      ST_S3A_SSL: "${STORAGE_USE_SSL:-false}"
+      ST_S3A_REGION: "${STORAGE_REGION:-eu-central-1}"
+    networks:
+      - supertable-net
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Wait for master to be ready
+        echo "Waiting for Spark master..."
+        while ! (echo > /dev/tcp/spark-thrift-master/7077) 2>/dev/null; do sleep 2; done
+        echo "Spark master is up."
+
+        # Debug: log the S3 config being used
+        echo "S3 config: endpoint=$$ST_S3A_ENDPOINT region=$$ST_S3A_REGION access_key=$$ST_S3A_ACCESS_KEY path_style=$$ST_S3A_PATH_STYLE ssl=$$ST_S3A_SSL"
+
+        # Start the Thrift Server directly (foreground via --class)
+        # S3 credentials come from environment variables (set above)
+        # to avoid bash mangling special characters like ! in passwords.
+        # Use $$ to escape dollar signs from Docker Compose interpolation
+        # so they are resolved by bash inside the container at runtime.
+        /opt/bitnami/spark/bin/spark-submit \
+          --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 \
+          --name "Thrift JDBC/ODBC Server" \
+          --master spark://spark-thrift-master:7077 \
+          --conf "spark.sql.warehouse.dir=/opt/spark/warehouse" \
+          --conf "spark.sql.caseSensitive=false" \
+          --conf "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem" \
+          --conf "spark.hadoop.fs.s3a.endpoint=$$ST_S3A_ENDPOINT" \
+          --conf "spark.hadoop.fs.s3a.access.key=$$ST_S3A_ACCESS_KEY" \
+          --conf "spark.hadoop.fs.s3a.secret.key=$$ST_S3A_SECRET_KEY" \
+          --conf "spark.hadoop.fs.s3a.path.style.access=$$ST_S3A_PATH_STYLE" \
+          --conf "spark.hadoop.fs.s3a.connection.ssl.enabled=$$ST_S3A_SSL" \
+          --conf "spark.hadoop.fs.s3a.endpoint.region=$$ST_S3A_REGION" \
+          --conf "spark.driver.memory=2g" \
+          --conf "spark.executor.memory=2g" \
+          --conf "spark.hadoop.fs.s3a.experimental.input.fadvise=random" \
+          --conf "spark.hadoop.fs.s3a.readahead.range=256K" \
+          --conf "spark.driver.extraJavaOptions=-Dderby.system.home=/opt/spark/warehouse/metastore" \
+          --hiveconf hive.server2.thrift.port=10000 \
+          --hiveconf hive.server2.thrift.bind.host=0.0.0.0
+
+volumes:
+  spark-warehouse:
+    driver: local
+
+networks:
+  supertable-net:
+    name: supertable-net
+    external: true

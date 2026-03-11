@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  minio1:
+    image: quay.io/minio/minio
+    hostname: minio1
+    ports:
+      - "9000:9000"  # Added S3 API port
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123!
+      MINIO_REGION: eu-central-1  # Added region
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - ./data/minio1:/data
+      - ./config/minio1:/root/.minio
+      - ./scripts:/scripts  # Mount scripts directory
+    command: server http://minio{1...4}/data --console-address ":9001"
+    networks:
+      minio-cluster:
+      supertable-net:
+        aliases:
+          - minio
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio2:
+    image: quay.io/minio/minio
+    hostname: minio2
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123!
+      MINIO_REGION: eu-central-1
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - ./data/minio2:/data
+      - ./config/minio2:/root/.minio
+    command: server http://minio{1...4}/data
+    networks:
+      minio-cluster:
+    restart: unless-stopped
+
+  minio3:
+    image: quay.io/minio/minio
+    hostname: minio3
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123!
+      MINIO_REGION: eu-central-1
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - ./data/minio3:/data
+      - ./config/minio3:/root/.minio
+    command: server http://minio{1...4}/data
+    networks:
+      minio-cluster:
+    restart: unless-stopped
+
+  minio4:
+    image: quay.io/minio/minio
+    hostname: minio4
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123!
+      MINIO_REGION: eu-central-1
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - ./data/minio4:/data
+      - ./config/minio4:/root/.minio
+    command: server http://minio{1...4}/data
+    networks:
+      minio-cluster:
+    restart: unless-stopped
+
+  setup:
+    image: minio/mc
+    depends_on:
+      - minio1
+      - minio2
+      - minio3
+      - minio4
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for MinIO cluster to be ready...'
+      /scripts/wait-for-minio.sh
+      echo 'Setting up policies and access keys...'
+      /scripts/setup-keys.sh
+      "
+    networks:
+      minio-cluster:
+
+networks:
+  minio-cluster:
+    driver: bridge
+  supertable-net:
+    name: supertable-net
+    external: true

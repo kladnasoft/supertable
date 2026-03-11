@@ -37,10 +37,10 @@ coverage.xml
 
 # Virtual environments
 .env/
-.venv/
-env/
-venv/
-ENV/
+.venv-test
+.venv-testpypi
+.venv
+
 
 # Other
 .DS_Store
@@ -48,15 +48,12 @@ ENV/
 *.bak
 
 TOKEN
-/.venv-test/lib64/
-/.venv-testpypi/lib64/
-/.venv-test/bin/python
-/.venv-testpypi/bin/python
-/.venv-test/bin/python3
-/.venv-testpypi/bin/python3
-/.venv-test/bin/python3.10
-/.venv-testpypi/bin/python3.10
-/.venv-test/pyvenv.cfg
-/.venv-testpypi/pyvenv.cfg
-/.venv-test/lib64/
-/.venv-testpypi/lib64/
+
+
+supertable/infrastructure/minio/config
+supertable/infrastructure/minio/data
+supertable/infrastructure/minio/minio-data1
+supertable/infrastructure/minio/minio-data2
+supertable/infrastructure/minio/minio-data3
+supertable/infrastructure/minio/minio-data4
+supertable/infrastructure/minio/scripts
