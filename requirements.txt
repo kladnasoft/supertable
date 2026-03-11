@@ -41,6 +41,7 @@ websockets>=12.0,<14.0
 pyhive>=0.7,<1.0
 thrift>=0.16,<1.0
 pure-sasl>=0.6,<1.0     # pure-Python SASL (no C dependency)
+thrift-sasl>=0.4,<1.0
 
 # NOTE:
 # • Using uvicorn[standard] adds uvloop, httptools, watchfiles for better perf/dev.

@@ -1,35 +1,52 @@
+# =====================================================================
+# Supertable Services
+# =====================================================================
+#
+# Prerequisites:
+#   Infrastructure must be running before starting any Supertable service:
+#     - Redis:  infrastructure/redis/    (docker compose up -d)
+#     - MinIO:  infrastructure/minio/    (docker compose up -d)
+#
+#   All services communicate via the shared "supertable-net" Docker network,
+#   which is auto-created by whichever compose file starts first.
+#
+# Profiles:
+#   reflection  — Admin UI + REST API           :8050
+#   api         — REST API                       :8090
+#   mcp         — MCP stdio + http + web tester  :8070, :8099
+#   mcp-http    — MCP over HTTPS (+ Caddy TLS)   :8070
+#   notebook    — Notebook WebSocket server       :8000
+#   spark       — Spark plug WebSocket server     :8010
+#   https       — Caddy TLS sidecar (combinable)
+#
+# Examples:
+#   docker compose --profile reflection up -d
+#   docker compose --profile api --profile mcp up -d
+#   docker compose --profile reflection --profile https up -d
+# =====================================================================
+
+x-common-env: &common-env
+  DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
+  SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-redis-env: &redis-env
+  REDIS_HOST: ${REDIS_HOST:-redis-master}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+x-storage-env: &storage-env
+  STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://minio:9000}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
+  STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+  STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
+  STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
+
 services:
-  # =====================================================================
-  # Optional infrastructure — start with: --profile infra
-  # =====================================================================
-
-  redis:
-    image: redis:7-alpine
-    profiles: ["infra"]
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-
-  minio:
-    image: minio/minio:latest
-    profiles: ["infra"]
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:-minioadmin123!}
-    ports:
-      - "9002:9000"   # S3 API  → http://localhost:9002
-      - "9003:9001"   # Console → http://localhost:9003
-    volumes:
-      - minio-data:/data
 
   # =====================================================================
   # reflection — Supertable admin UI + reflection REST API
-  # Start with:  docker compose --profile reflection up
+  # Start with:  docker compose --profile reflection up -d
   # URL:         http://localhost:8050
   # =====================================================================
 
@@ -40,38 +57,22 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      <<: [*common-env, *redis-env, *storage-env]
       SERVICE: reflection
       SUPERTABLE_HOST: 0.0.0.0
       SUPERTABLE_REFLECTION_PORT: ${SUPERTABLE_REFLECTION_PORT:-8050}
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
-      # Token is mandatory — set it in .env before starting.
       SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?Set SUPERTABLE_ADMIN_TOKEN in .env}
-
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB:   ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_DB: ${REDIS_DB:-0}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/0}
       UVICORN_RELOAD: ${UVICORN_RELOAD:-0}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - supertable-net
     ports:
       - "${SUPERTABLE_REFLECTION_PORT:-8050}:${SUPERTABLE_REFLECTION_PORT:-8050}"
 
   # =====================================================================
   # api — Supertable REST API
-  # Start with:  docker compose --profile api up
+  # Start with:  docker compose --profile api up -d
   # URL:         http://localhost:8090
   # =====================================================================
 
@@ -82,37 +83,22 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      <<: [*common-env, *redis-env, *storage-env]
       SERVICE: api
       SUPERTABLE_HOST: 0.0.0.0
       SUPERTABLE_API_PORT: ${SUPERTABLE_API_PORT:-8090}
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
       SUPERTABLE_ADMIN_TOKEN: ${SUPERTABLE_ADMIN_TOKEN:?Set SUPERTABLE_ADMIN_TOKEN in .env}
-
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB:   ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_DB: ${REDIS_DB:-0}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/0}
       UVICORN_RELOAD: ${UVICORN_RELOAD:-0}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - supertable-net
     ports:
       - "${SUPERTABLE_API_PORT:-8090}:${SUPERTABLE_API_PORT:-8090}"
 
   # =====================================================================
   # mcp — MCP stdio server + web tester UI
-  # Start with:  docker compose --profile mcp up
+  # Start with:  docker compose --profile mcp up -d
   # Web tester:  http://localhost:8099
   # stdio:       connected via Claude Desktop / MCP client on stdin/stdout
   # =====================================================================
@@ -127,43 +113,27 @@ services:
     tty: true
     env_file: .env
     environment:
+      <<: [*common-env, *redis-env, *storage-env]
       SERVICE: mcp
       # stdio is the foreground transport; entrypoint also starts streamable-http on :8070
       SUPERTABLE_MCP_TRANSPORT: stdio
       SUPERTABLE_MCP_PORT: ${SUPERTABLE_MCP_PORT:-8070}
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
       SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
       SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
       SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
-      # Optional allowlist — leave empty to allow all valid user hashes.
       SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
       SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH:-}
-
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB:   ${REDIS_DB:-1}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/1}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      REDIS_DB: ${REDIS_DB:-1}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/1}
+    networks:
+      - supertable-net
     ports:
-      - "8099:8099"                           # MCP web tester UI
-      - "${SUPERTABLE_MCP_PORT:-8070}:${SUPERTABLE_MCP_PORT:-8070}"  # MCP streamable-http (Claude Desktop)
+      - "8099:8099"                                                      # MCP web tester UI
+      - "${SUPERTABLE_MCP_PORT:-8070}:${SUPERTABLE_MCP_PORT:-8070}"      # MCP streamable-http
 
   # =====================================================================
   # mcp-http — MCP server over streamable-http (for remote HTTP clients)
-  # Start with:  docker compose --profile mcp-http up
+  # Start with:  docker compose --profile mcp-http up -d
   # Endpoint:    https://localhost:8070/mcp  (TLS via caddy-mcp sidecar)
   # No tty/stdin required — plain HTTP.
   # =====================================================================
@@ -175,38 +145,21 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      <<: [*common-env, *redis-env, *storage-env]
       SERVICE: mcp-http
-      # Forced to streamable-http by entrypoint; declared here for clarity.
       SUPERTABLE_MCP_TRANSPORT: streamable-http
-      SUPERTABLE_MCP_PORT: 8000                              # Caddy proxies to this port internally
+      SUPERTABLE_MCP_PORT: 8000
       SUPERTABLE_MCP_HTTP_PATH: ${SUPERTABLE_MCP_HTTP_PATH:-/mcp}
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
       SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
       SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
       SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
       SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
-
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB:   ${REDIS_DB:-1}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/1}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Trust all proxy headers from Caddy — allows any Host header through.
+      REDIS_DB: ${REDIS_DB:-1}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/1}
       FORWARDED_ALLOW_IPS: "*"
       UVICORN_PROXY_HEADERS: "1"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - supertable-net
     # Port 8000 is intentionally NOT exposed to the host — traffic comes via caddy-mcp only.
 
   # =====================================================================
@@ -214,8 +167,7 @@ services:
   # Listens on https://localhost:8070/mcp and proxies to mcp-http:8000
   # Uses Caddy's built-in local CA (tls internal) — no domain needed.
   #
-  # One-time setup: trust Caddy's local root CA so your browser / curl
-  # accepts the cert without warnings:
+  # One-time setup: trust Caddy's local root CA:
   #   docker compose --profile mcp-http exec caddy-mcp caddy trust
   # =====================================================================
 
@@ -229,12 +181,14 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      - supertable-net
     ports:
       - "8070:8070"   # HTTPS MCP endpoint → https://localhost:8070/mcp
 
   # =====================================================================
   # notebook — Supertable notebook WebSocket server
-  # Start with:  docker compose --profile notebook up
+  # Start with:  docker compose --profile notebook up -d
   # URL:         http://localhost:8000  (or SUPERTABLE_NOTEBOOK_PORT)
   # =====================================================================
 
@@ -245,36 +199,21 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      <<: [*common-env, *redis-env, *storage-env]
       SERVICE: notebook
       SUPERTABLE_NOTEBOOK_PORT: ${SUPERTABLE_NOTEBOOK_PORT:-8000}
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB:   ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://host.docker.internal:6379/0}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      REDIS_DB: ${REDIS_DB:-0}
+      SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/0}
+    networks:
+      - supertable-net
     ports:
       - "${SUPERTABLE_NOTEBOOK_PORT:-8000}:${SUPERTABLE_NOTEBOOK_PORT:-8000}"
     volumes:
-      # Persist notebooks between container restarts.
       - ./notebooks:/app/notebooks
 
   # =====================================================================
   # spark — Spark plug WebSocket server
-  # Start with:  docker compose --profile spark up
+  # Start with:  docker compose --profile spark up -d
   # URL:         http://localhost:8010
   # =====================================================================
 
@@ -285,36 +224,26 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      <<: [*common-env, *storage-env]
       SERVICE: spark
-
-      DUCKDB_EXTENSION_DIRECTORY: ${DUCKDB_EXTENSION_DIRECTORY:-~/.duckdb/extensions}
-
-      STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://host.docker.internal:9000}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-supertable}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin123!}
-      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-true}
-
-      SUPERTABLE_HOME: ${SUPERTABLE_HOME:-/app}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - supertable-net
     ports:
-      - "8010:8010"   # Spark plug WebSocket server
+      - "8010:8010"
 
   # =====================================================================
   # caddy-https — Universal TLS sidecar for all services
   # Combine with any other profile to add HTTPS on top:
   #
-  #   docker compose --profile mcp --profile https up
-  #   docker compose --profile reflection --profile https up
-  #   docker compose --profile mcp --profile api --profile https up
+  #   docker compose --profile mcp --profile https up -d
+  #   docker compose --profile reflection --profile https up -d
+  #   docker compose --profile mcp --profile api --profile https up -d
   #
   # Ports (HTTPS → HTTP internal):
-  #   8050  reflection
-  #   8070  mcp streamable-http
-  #   8090  api
-  #   8099  mcp web tester
+  #   8443  reflection
+  #   8470  mcp streamable-http
+  #   8490  api
+  #   8499  mcp web tester
   #   9443  minio S3 API
   #
   # One-time CA trust:
@@ -329,8 +258,8 @@ services:
       - ./Caddyfile.https:/etc/caddy/Caddyfile:ro
       - caddy-https-data:/data
       - caddy-https-config:/config
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      - supertable-net
     ports:
       - "8443:8443"    # reflection  → https://host:8443
       - "8470:8470"    # mcp http    → https://host:8470/mcp
@@ -338,9 +267,11 @@ services:
       - "8490:8490"    # api         → https://host:8490
       - "9443:9443"    # minio S3    → https://host:9443
 
+networks:
+  supertable-net:
+    name: supertable-net
+
 volumes:
-  redis-data:
-  minio-data:
   caddy-data:
   caddy-config:
   caddy-https-data:

@@ -6,10 +6,12 @@
 **SuperTable — The simplest data warehouse & cataloging system.**
 A high‑performance, lightweight transaction catalog that defaults to **Redis (catalog/locks)** + **MinIO (object storage)** via DuckDB httpfs.
 
-> **This README was updated to correct environment variable names and document Compose profiles.**
+> **This README was updated to reflect the new infrastructure layout and Docker Compose profiles.**
+> - Infrastructure (Redis, MinIO, Spark) lives in dedicated folders under `infrastructure/`.
+> - All services communicate via the shared `supertable-net` Docker network.
 > - Canonical storage variables are **`STORAGE_*`** (not `AWS_S3_*`), except when using real AWS S3 where `AWS_*` is expected.
 > - Redis vars are **`REDIS_HOST/PORT/DB/PASSWORD`** (DB **0** recommended by default).
-> - Profiles: `admin`, `mcp`, `infra` with “host services default” behavior.
+> - Profiles: `reflection`, `api`, `mcp`, `mcp-http`, `notebook`, `spark`, `https`.
 
 ---
 
@@ -38,10 +40,11 @@ A high‑performance, lightweight transaction catalog that defaults to **Redis (
 
 ## What’s new
 
-- **Default backends:** `LOCKING_BACKEND=redis` and `STORAGE_TYPE=MINIO`.
-- **Out-of-the-box Reflection UI** (FastAPI + Jinja2) on port **8000**.
-- **MCP stdio server** (`mcp_server.py`) with optional hash enforcement.
-- **Profiles** for flexible runtime: host-backed by default, `infra` when you want built-in Redis+MinIO.
+- **Infrastructure as separate compose stacks** under `infrastructure/` (Redis Sentinel HA, MinIO distributed, Spark Thrift, Spark Worker, Python Worker).
+- **`supertable-net`** shared Docker network — all services discover each other by container name (`redis-master`, `minio`, etc.).
+- **No more `host.docker.internal`** — defaults point to Docker service hostnames.
+- **Profiles per service:** `reflection`, `api`, `mcp`, `mcp-http`, `notebook`, `spark`, `https`.
+- **Removed inline `infra` profile** — use the dedicated `infrastructure/redis/` and `infrastructure/minio/` folders instead.
 
 ---
 
@@ -56,7 +59,7 @@ A high‑performance, lightweight transaction catalog that defaults to **Redis (
 
 ## Quick start (Docker Compose)
 
-Requirements: Docker & docker-compose.
+Requirements: Docker & Docker Compose v2.
 
 ```bash
 # 1) Clone and build
@@ -64,19 +67,23 @@ git clone https://github.com/kladnasoft/supertable.git
 cd supertable
 docker compose build --no-cache
 
-# 2) Create a .env next to docker-compose.yml (sample)
+# 2) Start infrastructure (from infrastructure/ folders)
+cd infrastructure/redis  && docker compose up -d && cd ../..
+cd infrastructure/minio  && docker compose up -d && cd ../..
+
+# 3) Create a .env next to docker-compose.yml (sample)
 cat > .env <<'ENV'
-# ---- Redis (DB 0 by default) ----
+# ---- Redis ----
 LOCKING_BACKEND=redis
-REDIS_HOST=host.docker.internal
+REDIS_HOST=redis-master
 REDIS_PORT=6379
 REDIS_DB=0
 REDIS_PASSWORD=
 
-# ---- MinIO (default backend) ----
+# ---- MinIO ----
 STORAGE_TYPE=MINIO
 STORAGE_REGION=eu-central-1
-STORAGE_ENDPOINT_URL=http://host.docker.internal:9000
+STORAGE_ENDPOINT_URL=http://minio:9000
 STORAGE_ACCESS_KEY=minioadmin
 STORAGE_SECRET_KEY=minioadmin123!
 STORAGE_BUCKET=supertable
@@ -105,12 +112,12 @@ SUPERTABLE_TEST_QUERY=
 SUPERTABLE_ADMIN_TOKEN=replace-me
 ENV
 
-# 3) Start Reflection UI against HOST services (default)
-docker compose --profile admin up -d
-# Open http://localhost:8000  (redirects to /reflection/login)
+# 4) Start Reflection UI
+docker compose --profile reflection up -d
+# Open http://localhost:8050  (redirects to /reflection/login)
 ```
 
-> Linux note: this stack uses `host.docker.internal` (provided via `extra_hosts`) so containers can reach services on the host. Replace with your host IP if needed.
+> All services communicate via the `supertable-net` Docker network. Infrastructure compose files auto-create it on first start.
 
 ---
 
@@ -118,36 +125,57 @@ docker compose --profile admin up -d
 
 **Profiles:**
 
-- `admin` — run the Reflection UI (port 8000)
-- `mcp` — run the MCP server (stdio; no port)
-- `infra` — optional Redis + MinIO inside the stack
+| Profile | Service | Port | Description |
+|---------|---------|------|-------------|
+| `reflection` | Admin UI + REST API | 8050 | Supertable admin dashboard |
+| `api` | REST API | 8090 | Supertable data API |
+| `mcp` | MCP stdio + http | 8070, 8099 | MCP server + web tester UI |
+| `mcp-http` | MCP over HTTPS | 8070 | MCP streamable-http + Caddy TLS |
+| `notebook` | Notebook server | 8000 | WebSocket notebook execution |
+| `spark` | Spark plug | 8010 | Spark WebSocket server |
+| `https` | TLS sidecar | 8443, 8470, 8490, 8499 | Caddy HTTPS (combinable) |
 
-**Defaults:** Admin/MCP point to **host** Redis/MinIO using `host.docker.internal`.  
-To use in-cluster Redis/MinIO, include `infra` and override two envs.
+**Defaults:** All services connect to `redis-master` and `minio` via `supertable-net`.
 
-### Host-backed (default)
-
-```bash
-# Admin only
-docker compose --profile admin up -d --remove-orphans
-
-# MCP only
-docker compose --profile mcp up -d --remove-orphans
-
-# Both
-docker compose --profile admin --profile mcp up -d --remove-orphans
-```
-
-### Clean start with in-cluster infra
+### Start services
 
 ```bash
-STORAGE_ENDPOINT_URL=http://minio:9000 REDIS_HOST=redis REDIS_DB=0 docker compose --profile infra --profile admin up -d --remove-orphans
+# Single service
+docker compose --profile reflection up -d
 
-# MCP:
-STORAGE_ENDPOINT_URL=http://minio:9000 REDIS_HOST=redis REDIS_DB=0 docker compose --profile infra --profile mcp up -d --remove-orphans
+# Multiple services
+docker compose --profile api --profile mcp up -d
+
+# Add HTTPS to any service
+docker compose --profile reflection --profile https up -d
+
+# Everything
+docker compose --profile reflection --profile api --profile mcp --profile notebook --profile spark up -d
 ```
 
-> The in-cluster MinIO is published on host ports **9002 (S3 API)** and **9003 (console)**. Inside the network, always use `http://minio:9000`.
+### Infrastructure
+
+Infrastructure runs in separate compose files under `infrastructure/`:
+
+```bash
+# Redis (master + replica, optional Sentinel HA)
+cd infrastructure/redis && docker compose up -d
+cd infrastructure/redis && docker compose --profile sentinel up -d
+
+# MinIO (2-node default, 4-node with --profile all-nodes)
+cd infrastructure/minio && docker compose up -d
+
+# Spark Thrift (for large SQL queries)
+cd infrastructure/spark_thrift && docker compose -f docker-compose.spark-thrift.yml up -d
+
+# Python Worker (sandboxed code execution)
+cd infrastructure/python_worker && docker compose up -d
+
+# Spark Worker (interactive PySpark)
+cd infrastructure/spark_worker && docker compose up -d
+```
+
+See each folder's `README.md` for full documentation.
 
 ---
 
@@ -327,27 +355,27 @@ Below is a complete example `.env` you can use as a starting point:
 ```dotenv
 LOG_LEVEL=INFO
 
-# STORAGE
+# STORAGE (uses Docker hostname "minio" on supertable-net)
 STORAGE_TYPE=MINIO
 STORAGE_REGION=eu-central-1
-STORAGE_ENDPOINT_URL=http://localhost:9000
+STORAGE_ENDPOINT_URL=http://minio:9000
 STORAGE_ACCESS_KEY=minioadmin
 STORAGE_SECRET_KEY=minioadmin123!
 STORAGE_BUCKET=supertable
 STORAGE_FORCE_PATH_STYLE=true
 
-# === Redis auth ===
+# === Redis auth (uses Docker hostname "redis-master" on supertable-net) ===
 LOCKING_BACKEND=redis
-#SUPERTABLE_REDIS_URL=redis://localhost:6379/1
-#SUPERTABLE_REDIS_HOST=localhost
-#SUPERTABLE_REDIS_PORT=6379
+#SUPERTABLE_REDIS_URL=redis://redis-master:6379/1
+REDIS_HOST=redis-master
+REDIS_PORT=6379
 SUPERTABLE_REDIS_DB=1
 SUPERTABLE_REDIS_PASSWORD=change_me_to_a_strong_password
 SUPERTABLE_REDIS_DECODE_RESPONSES=true
 
-# SENTINEL
+# SENTINEL (use Docker hostnames when sentinel profile is active)
 SUPERTABLE_REDIS_SENTINEL=true
-SUPERTABLE_REDIS_SENTINELS=127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+SUPERTABLE_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
 SUPERTABLE_REDIS_SENTINEL_MASTER=mymaster
 
 # ENGINE
@@ -378,7 +406,7 @@ SUPERTABLE_TEST_QUERY="select * from facts"
 
 ### Redis
 - `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` (**0 recommended**), `REDIS_PASSWORD`.
-- The app also accepts `SUPERTABLE_REDIS_URL` (e.g., `redis://host.docker.internal:6379/0`) if you prefer a single URL.
+- The app also accepts `SUPERTABLE_REDIS_URL` (e.g., `redis://redis-master:6379/0`) if you prefer a single URL.
 
 ### MinIO (default)
 - `STORAGE_TYPE=MINIO`
@@ -417,7 +445,7 @@ SUPERTABLE_TEST_QUERY="select * from facts"
 | Key | Default | Notes |
 | --- | --- | --- |
 | `LOCKING_BACKEND` | `redis` | Lock manager |
-| `REDIS_HOST` | `host.docker.internal` | Set to `redis` when using `infra` |
+| `REDIS_HOST` | `redis-master` | Docker service name on `supertable-net` |
 | `REDIS_PORT` | `6379` |  |
 | `REDIS_DB` | `0` | Recommended |
 | `REDIS_PASSWORD` | _empty_ | Set if your Redis requires auth |
@@ -456,12 +484,30 @@ python -u supertable/mcp_server.py
 
 Reflection UI only:
 ```bash
-docker run -d --name supertable-admin   -e LOCKING_BACKEND=redis   -e REDIS_HOST=your-redis -e REDIS_PORT=6379 -e REDIS_DB=0   -e STORAGE_TYPE=MINIO   -e STORAGE_ENDPOINT_URL=http://your-minio:9000   -e STORAGE_ACCESS_KEY=... -e STORAGE_SECRET_KEY=...   -e STORAGE_BUCKET=supertable -e STORAGE_FORCE_PATH_STYLE=true   -e SUPERTABLE_ADMIN_TOKEN=replace-me   -p 8000:8000   kladnasoft/supertable:latest
+docker run -d --name supertable-admin \
+  --network supertable-net \
+  -e LOCKING_BACKEND=redis \
+  -e REDIS_HOST=redis-master -e REDIS_PORT=6379 -e REDIS_DB=0 \
+  -e STORAGE_TYPE=MINIO \
+  -e STORAGE_ENDPOINT_URL=http://minio:9000 \
+  -e STORAGE_ACCESS_KEY=... -e STORAGE_SECRET_KEY=... \
+  -e STORAGE_BUCKET=supertable -e STORAGE_FORCE_PATH_STYLE=true \
+  -e SUPERTABLE_ADMIN_TOKEN=replace-me \
+  -p 8050:8050 \
+  kladnasoft/supertable:latest
 ```
 
 MCP (stdio):
 ```bash
-docker run --rm -i --name supertable-mcp   -e LOCKING_BACKEND=redis   -e REDIS_HOST=your-redis -e REDIS_PORT=6379 -e REDIS_DB=0   -e STORAGE_TYPE=MINIO   -e STORAGE_ENDPOINT_URL=http://your-minio:9000   -e STORAGE_ACCESS_KEY=... -e STORAGE_SECRET_KEY=...   -e STORAGE_BUCKET=supertable -e STORAGE_FORCE_PATH_STYLE=true   kladnasoft/supertable:latest mcp-server
+docker run --rm -i --name supertable-mcp \
+  --network supertable-net \
+  -e LOCKING_BACKEND=redis \
+  -e REDIS_HOST=redis-master -e REDIS_PORT=6379 -e REDIS_DB=0 \
+  -e STORAGE_TYPE=MINIO \
+  -e STORAGE_ENDPOINT_URL=http://minio:9000 \
+  -e STORAGE_ACCESS_KEY=... -e STORAGE_SECRET_KEY=... \
+  -e STORAGE_BUCKET=supertable -e STORAGE_FORCE_PATH_STYLE=true \
+  kladnasoft/supertable:latest mcp-server
 ```
 
 ---
@@ -472,4 +518,4 @@ docker run --rm -i --name supertable-mcp   -e LOCKING_BACKEND=redis   -e REDIS_H
 A: With MinIO we attempt to ensure the bucket exists on first use.
 
 **Q: Is the MCP server networked?**  
-A: No — MCP uses **stdio**. Integrate with tools that spawn a process and connect via stdio.
+A: MCP supports two transports: **stdio** (local, spawned by the client) and **streamable-http** (remote, runs as an HTTP endpoint). Use the `mcp` profile for stdio or `mcp-http` for HTTPS.

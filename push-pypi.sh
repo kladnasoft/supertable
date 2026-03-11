@@ -41,10 +41,18 @@ done
 echo "==> Target version: ${VERSION}"
 echo "==> Target repository: ${REPO}"
 
+# ---- load TOKEN file if present ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${PYPI_TOKEN:-}" && -f "${SCRIPT_DIR}/TOKEN" ]]; then
+  echo "==> Loading PYPI_TOKEN from TOKEN file"
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/TOKEN"
+fi
+
 # ---- require PYPI_TOKEN for upload ----
 if [[ -z "${PYPI_TOKEN:-}" ]]; then
   echo "ERROR: PYPI_TOKEN is not set in the environment." >&2
-  echo "Export it first, e.g.:" >&2
+  echo "Export it first, or create a TOKEN file next to this script containing:" >&2
   echo "  export PYPI_TOKEN='pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'" >&2
   exit 2
 fi

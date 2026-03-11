@@ -22,19 +22,17 @@ This image bundles multiple services:
 
 ### 1. Start infrastructure (Redis + MinIO)
 
+Infrastructure runs as separate compose stacks. Start them first:
+
 ```bash
-# Using docker-compose profiles
-docker compose --profile infra up -d
+# Redis (master + replica)
+cd infrastructure/redis && docker compose up -d
+
+# MinIO (2-node cluster)
+cd infrastructure/minio && docker compose up -d
 ```
 
-Or run separately:
-```bash
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-docker run -d --name minio -p 9000:9000 -p 9001:9001 \
-  -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin123! \
-  minio/minio:latest server /data --console-address ":9001"
-```
+All services communicate via the shared `supertable-net` Docker network, which is auto-created by whichever compose file starts first.
 
 ### 2. Create a `.env` file
 
@@ -47,10 +45,10 @@ SUPERTABLE_AUTH_MODE=api_key
 SUPERTABLE_API_KEY=change-me-super-secret
 SUPERTABLE_AUTH_HEADER_NAME=X-API-Key
 
-# === Storage (MinIO) ===
+# === Storage (MinIO — uses Docker hostname on supertable-net) ===
 STORAGE_TYPE=MINIO
 STORAGE_REGION=eu-central-1
-STORAGE_ENDPOINT_URL=http://host.docker.internal:9000
+STORAGE_ENDPOINT_URL=http://minio:9000
 STORAGE_ACCESS_KEY=minioadmin
 STORAGE_SECRET_KEY=minioadmin123!
 STORAGE_BUCKET=supertable
@@ -97,12 +95,14 @@ SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60
 ```bash
 # Reflection UI (Admin)
 docker run -d --name supertable-reflection \
+  --network supertable-net \
   --env-file .env \
   -p 8050:8050 \
   kladnasoft/supertable:latest reflection-server
 
 # REST API
 docker run -d --name supertable-api \
+  --network supertable-net \
   --env-file .env \
   -p 8090:8090 \
   kladnasoft/supertable:latest api-server
@@ -118,6 +118,7 @@ Open **http://localhost:8050** for the Reflection UI.
 
 ```bash
 docker run -d --name supertable-reflection \
+  --network supertable-net \
   --env-file .env \
   -e SERVICE=reflection \
   -p 8050:8050 \
@@ -126,14 +127,14 @@ docker run -d --name supertable-reflection \
 
 Or using the convenience wrapper:
 ```bash
-docker run -d --env-file .env -p 8050:8050 \
+docker run -d --network supertable-net --env-file .env -p 8050:8050 \
   kladnasoft/supertable:latest reflection-server
 ```
 
 ### REST API
 
 ```bash
-docker run -d --env-file .env -p 8090:8090 \
+docker run -d --network supertable-net --env-file .env -p 8090:8090 \
   kladnasoft/supertable:latest api-server
 ```
 
@@ -143,6 +144,7 @@ For MCP hosts that spawn processes (Claude Desktop, IDEs):
 
 ```bash
 docker run --rm -i --name supertable-mcp \
+  --network supertable-net \
   --env-file .env \
   -e SUPERTABLE_MCP_TRANSPORT=stdio \
   kladnasoft/supertable:latest mcp-server
@@ -156,6 +158,7 @@ For remote/HTTP MCP clients:
 
 ```bash
 docker run -d --name supertable-mcp-http \
+  --network supertable-net \
   --env-file .env \
   -e SUPERTABLE_MCP_TRANSPORT=streamable-http \
   -e SUPERTABLE_MCP_PORT=8070 \
@@ -169,7 +172,7 @@ MCP endpoint: `http://localhost:8070/mcp`
 ### Notebook
 
 ```bash
-docker run -d --env-file .env -p 8010:8010 \
+docker run -d --network supertable-net --env-file .env -p 8010:8010 \
   -v ./notebooks:/app/notebooks \
   kladnasoft/supertable:latest notebook-server
 ```
@@ -177,7 +180,7 @@ docker run -d --env-file .env -p 8010:8010 \
 ### Spark
 
 ```bash
-docker run -d --env-file .env -p 8010:8010 \
+docker run -d --network supertable-net --env-file .env -p 8010:8010 \
   kladnasoft/supertable:latest spark-server
 ```
 
@@ -185,29 +188,25 @@ docker run -d --env-file .env -p 8010:8010 \
 
 ## Docker Compose
 
-Use profiles to start specific services:
+Start infrastructure first, then use profiles for application services:
 
 ```bash
-# Infrastructure only (Redis + MinIO)
-docker compose --profile infra up -d
+# Infrastructure (separate compose files)
+cd infrastructure/redis && docker compose up -d
+cd infrastructure/minio && docker compose up -d
 
-# Reflection UI
+# Application services (from project root)
 docker compose --profile reflection up -d
-
-# REST API
 docker compose --profile api up -d
-
-# MCP (stdio + web tester)
 docker compose --profile mcp up -d
-
-# MCP HTTP
 docker compose --profile mcp-http up -d
-
-# Notebook
 docker compose --profile notebook up -d
 
 # Multiple profiles
-docker compose --profile infra --profile reflection --profile api up -d
+docker compose --profile reflection --profile api up -d
+
+# Add HTTPS to any service
+docker compose --profile reflection --profile https up -d
 ```
 
 ---
@@ -218,12 +217,14 @@ docker compose --profile infra --profile reflection --profile api up -d
 
 ```bash
 STORAGE_TYPE=MINIO
-STORAGE_ENDPOINT_URL=http://host.docker.internal:9000
+STORAGE_ENDPOINT_URL=http://minio:9000
 STORAGE_ACCESS_KEY=minioadmin
 STORAGE_SECRET_KEY=minioadmin123!
 STORAGE_BUCKET=supertable
 STORAGE_FORCE_PATH_STYLE=true
 ```
+
+> Inside Docker, use the service hostname `minio`. From the host, use `http://localhost:9000`.
 
 ### AWS S3
 
@@ -264,11 +265,13 @@ SUPERTABLE_REDIS_DB=1
 ```bash
 LOCKING_BACKEND=redis
 SUPERTABLE_REDIS_SENTINEL=true
-SUPERTABLE_REDIS_SENTINELS=127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+SUPERTABLE_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
 SUPERTABLE_REDIS_SENTINEL_MASTER=mymaster
 SUPERTABLE_REDIS_SENTINEL_PASSWORD=your-sentinel-password
 SUPERTABLE_REDIS_SENTINEL_STRICT=true
 ```
+
+> Start Redis with the sentinel profile: `cd infrastructure/redis && docker compose --profile sentinel up -d`
 
 ---
 
@@ -315,7 +318,7 @@ SUPERTABLE_REDIS_SENTINEL_STRICT=true
 
 Example:
 ```bash
-docker run -d --env-file .env \
+docker run -d --network supertable-net --env-file .env \
   -v $PWD/notebooks:/app/notebooks \
   -v $PWD/.env:/app/.env:ro \
   -p 8050:8050 \
@@ -377,16 +380,19 @@ Common causes:
 - Redis not reachable
 - MinIO/S3 not reachable
 
-### Cannot connect to host services
+### Cannot connect to infrastructure
 
-On Linux, use `host.docker.internal` or your host IP:
+Ensure infrastructure is running and on `supertable-net`:
 ```bash
--e STORAGE_ENDPOINT_URL=http://172.17.0.1:9000
--e REDIS_HOST=172.17.0.1
+docker network inspect supertable-net
 ```
 
-Or add:
+If running services outside of compose (standalone `docker run`), add `--network supertable-net` so the container can resolve `redis-master` and `minio`.
+
+For host-mode development without Docker networking:
 ```bash
+-e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000
+-e REDIS_HOST=host.docker.internal
 --add-host=host.docker.internal:host-gateway
 ```
 
