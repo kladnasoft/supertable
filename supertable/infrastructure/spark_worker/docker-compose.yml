@@ -1,3 +1,9 @@
+# Start everything:
+#   docker compose up -d
+#
+# Rebuild after code changes:
+#   docker compose up -d --build
+
 services:
   spark-master:
     image: apache/spark:3.5.2
@@ -6,8 +12,8 @@ services:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
     ports:
-      - "8082:8080" # Web UI
-      - "7078:7077" # RPC (Host 7078 -> Container 7077)
+      - "8082:8080"  # Web UI
+      - "7078:7077"  # RPC (Host 7078 -> Container 7077)
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
       --host 0.0.0.0 --port 7077 --webui-port 8080
@@ -18,11 +24,12 @@ services:
       retries: 5
     networks:
       - spark-network
+      - supertable-net
     restart: unless-stopped
 
   spark-worker:
     image: apache/spark:3.5.2
-    container_name: spark-plug-worker  # Renamed for consistency
+    container_name: spark-plug-worker
     environment:
       - SPARK_MODE=worker
       - SPARK_WORKER_CORES=1
@@ -37,6 +44,25 @@ services:
       - spark-network
     restart: unless-stopped
 
+  spark-ws-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: spark-ws-server
+    restart: unless-stopped
+    ports:
+      - "${SPARK_WS_PORT:-8010}:8010"
+    environment:
+      SPARK_MASTER_URL: "spark://spark-plug-master:7077"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - spark-network
+      - supertable-net
+
 networks:
   spark-network:
     driver: bridge
+  supertable-net:
+    name: supertable-net

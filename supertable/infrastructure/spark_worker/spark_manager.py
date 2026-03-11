@@ -1,9 +1,14 @@
 import io
+import os
 import sys
 import threading
 import time
 from pyspark.sql import SparkSession
 from contextlib import redirect_stdout
+
+# When running inside Docker on spark-network, use the service name.
+# When running on the host, use localhost:7078 (remapped port).
+SPARK_MASTER_URL = os.getenv("SPARK_MASTER_URL", "spark://localhost:7078")
 
 
 class SparkClusterManager:
@@ -22,10 +27,9 @@ class SparkClusterManager:
                 try:
                     yield f"Initializing Spark session (Attempt {attempt + 1}/{retries})..."
 
-                    # Connects to the master via the remapped host port 7078
                     self.spark = SparkSession.builder \
                         .appName("SparkPlugNotebook") \
-                        .master("spark://localhost:7078") \
+                        .master(SPARK_MASTER_URL) \
                         .config("spark.driver.host", "127.0.0.1") \
                         .config("spark.driver.bindAddress", "127.0.0.1") \
                         .config("spark.executor.memory", "512m") \

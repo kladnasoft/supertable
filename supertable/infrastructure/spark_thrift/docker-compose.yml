@@ -109,4 +109,3 @@ volumes:
 networks:
   supertable-net:
     name: supertable-net
-    external: true

@@ -1,7 +1,7 @@
-# worker_v20260201_2045_add-dns.py
+
 import docker
 try:
-    from supertable.notebook.resource_config import ResourceConfig
+    from supertable.infrastructure.python_worker.resource_config import ResourceConfig
 except ModuleNotFoundError:
     from resource_config import ResourceConfig
 
@@ -16,6 +16,7 @@ class ExecutionWorker:
         try:
             # Explicit DNS to fix resolution errors in networked containers
             dns_servers = ["8.8.8.8", "8.8.4.4"] if not config.network_disabled else None
+            network_name = config.network_name if not config.network_disabled else None
 
             container = self.client.containers.run(
                 image=self.image_name,
@@ -25,6 +26,7 @@ class ExecutionWorker:
                 cpu_period=config.cpu_period,
                 cpu_quota=config.cpu_quota,
                 network_disabled=config.network_disabled,
+                network=network_name or None,
                 dns=dns_servers,
                 security_opt=["no-new-privileges"]
             )

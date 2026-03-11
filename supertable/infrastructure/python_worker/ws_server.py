@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import iterate_in_threadpool
 
-from supertable.notebook.resource_config import HIGH_TIER, LOW_TIER
-from supertable.notebook.warm_pool_manager import WarmPoolManager
+from supertable.infrastructure.python_worker.resource_config import HIGH_TIER, LOW_TIER
+from supertable.infrastructure.python_worker.warm_pool_manager import WarmPoolManager
 
 load_dotenv()
 

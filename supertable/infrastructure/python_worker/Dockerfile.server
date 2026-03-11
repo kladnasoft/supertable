@@ -1,0 +1,20 @@
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt python-dotenv
+
+COPY resource_config.py .
+COPY warm_pool_manager.py .
+COPY worker.py .
+COPY ws_server.py .
+COPY execute.py .
+
+EXPOSE 8010
+
+CMD ["uvicorn", "ws_server:app", "--host", "0.0.0.0", "--port", "8010"]

@@ -21,7 +21,7 @@ from typing import Any, Dict, Set
 
 import docker
 
-from supertable.notebook.resource_config import ResourceConfig
+from supertable.infrastructure.python_worker.resource_config import ResourceConfig
 
 
 class WarmPoolManager:
@@ -135,6 +135,7 @@ class WarmPoolManager:
 
     def _add_container_to_pool(self) -> None:
         dns_servers = ["8.8.8.8", "8.8.4.4"] if not self.config.network_disabled else None
+        network_name = self.config.network_name if not self.config.network_disabled else None
 
         container = self.client.containers.run(
             image=self.image_name,
@@ -144,6 +145,7 @@ class WarmPoolManager:
             cpu_period=self.config.cpu_period,
             cpu_quota=self.config.cpu_quota,
             network_disabled=self.config.network_disabled,
+            network=network_name or None,
             dns=dns_servers,
             security_opt=["no-new-privileges"],
         )
@@ -244,6 +246,7 @@ class WarmPoolManager:
 
     def _create_session_container(self):
         dns_servers = ["8.8.8.8", "8.8.4.4"] if not self.config.network_disabled else None
+        network_name = self.config.network_name if not self.config.network_disabled else None
 
         container = self.client.containers.run(
             image=self.image_name,
@@ -253,6 +256,7 @@ class WarmPoolManager:
             cpu_period=self.config.cpu_period,
             cpu_quota=self.config.cpu_quota,
             network_disabled=self.config.network_disabled,
+            network=network_name or None,
             dns=dns_servers,
             security_opt=["no-new-privileges"],
         )
