@@ -914,3 +914,158 @@ def filter_stale_incoming_rows(
     ).drop("__existing_max__")
 
     return filtered
+
+
+# =========================
+# Tombstone (soft-delete) helpers
+# =========================
+
+# Default threshold: number of tombstoned keys before compaction is triggered.
+_DEFAULT_TOMBSTONE_COMPACT_TOTAL = 1000
+
+
+def _tombstone_threshold(table_config: Optional[dict]) -> int:
+    """Return the tombstone compaction threshold for the given table config."""
+    cfg = table_config or {}
+    return int(cfg.get("tombstone_compact_total") or _DEFAULT_TOMBSTONE_COMPACT_TOTAL)
+
+
+def extract_key_tuples(
+        df: polars.DataFrame,
+        primary_keys: List[str],
+) -> List[Tuple]:
+    """Extract unique composite-key tuples from a DataFrame.
+
+    Each element is a tuple of Python scalars ordered by *primary_keys*.
+    Suitable for JSON-serialisable tombstone storage.
+    """
+    available = [c for c in primary_keys if c in df.columns]
+    if available != list(primary_keys):
+        return []
+    key_df = df.select(primary_keys).unique()
+    return key_df.rows()  # list of tuples
+
+
+def reconcile_tombstones(
+        tombstone_keys: List,
+        incoming_keys: List,
+) -> List:
+    """Remove from *tombstone_keys* any key tuple also present in *incoming_keys*.
+
+    Both inputs are lists of tuples/lists (one entry per composite key).
+    Returns the pruned tombstone list.
+    """
+    if not tombstone_keys or not incoming_keys:
+        return list(tombstone_keys or [])
+    incoming_set = {tuple(k) for k in incoming_keys}
+    return [k for k in tombstone_keys if tuple(k) not in incoming_set]
+
+
+def compact_tombstones(
+        snapshot: dict,
+        primary_keys: List[str],
+        data_dir: str,
+        compression_level: int,
+        table_config: Optional[dict] = None,
+) -> Tuple[int, List[Dict], Set[str]]:
+    """Physically remove tombstoned rows from parquet files.
+
+    Reads the ``tombstones`` block from *snapshot*, iterates all resources
+    whose stats *might* overlap with the tombstoned keys, anti-joins the
+    rows out, and rewrites the file.
+
+    Returns:
+        (compacted_rows, new_resources, sunset_files)
+    where compacted_rows is the total number of rows physically removed.
+    After this call the caller should clear the tombstone list.
+    """
+    tombstone_block = snapshot.get("tombstones") or {}
+    deleted_keys = tombstone_block.get("deleted_keys") or []
+    if not deleted_keys or not primary_keys:
+        return 0, [], set()
+
+    # Build a Polars DataFrame of the tombstone keys for anti-join
+    try:
+        tombstone_df = polars.DataFrame(
+            {pk: [row[i] for row in deleted_keys] for i, pk in enumerate(primary_keys)}
+        )
+    except Exception:
+        return 0, [], set()
+
+    resources = snapshot.get("resources") or []
+    compacted = 0
+    new_resources: List[Dict] = []
+    sunset_files: Set[str] = set()
+
+    for resource in resources:
+        file_path = resource.get("file")
+        if not file_path:
+            continue
+
+        # Use stats to skip files that cannot contain any tombstoned key
+        stats = resource.get("stats")
+        if stats and not _tombstone_overlaps_stats(tombstone_df, primary_keys, stats):
+            continue
+
+        existing_df = _read_parquet_safe(file_path)
+        if existing_df is None:
+            continue
+
+        # Check that all primary key columns exist in the file
+        if not all(c in existing_df.columns for c in primary_keys):
+            continue
+
+        kept_df = existing_df.join(tombstone_df, on=primary_keys, how="anti")
+        difference = existing_df.shape[0] - kept_df.shape[0]
+
+        if difference == 0:
+            continue
+
+        compacted += difference
+        sunset_files.add(file_path)
+
+        if kept_df.shape[0] > 0:
+            write_parquet_and_collect_resources(
+                write_df=kept_df,
+                overwrite_columns=primary_keys,
+                data_dir=data_dir,
+                new_resources=new_resources,
+                compression_level=compression_level,
+            )
+
+    return compacted, new_resources, sunset_files
+
+
+def _tombstone_overlaps_stats(
+        tombstone_df: polars.DataFrame,
+        primary_keys: List[str],
+        stats: Dict,
+) -> bool:
+    """Check if any tombstone key *might* overlap with a file's column stats.
+
+    Conservative: returns True (might overlap) when stats are missing or
+    inconclusive.  Only returns False when we can **prove** no overlap —
+    i.e. when at least one primary-key column has *all* tombstone values
+    falling outside the file's [min, max] range for that column.
+    """
+    for col in primary_keys:
+        if col not in stats:
+            return True  # missing stats → assume overlap
+        col_stats = stats[col]
+        min_val = col_stats.get("min")
+        max_val = col_stats.get("max")
+        if min_val is None or max_val is None:
+            return True
+
+        try:
+            tomb_vals = tombstone_df[col].unique().to_list()
+        except Exception:
+            return True
+
+        # If NO tombstone value falls in [min, max] for this column,
+        # the file cannot contain any of the tombstoned keys → skip.
+        if not any(v is not None and min_val <= v <= max_val for v in tomb_vals):
+            return False
+
+    # Every column has at least one tombstone value in range → must check file
+    return True

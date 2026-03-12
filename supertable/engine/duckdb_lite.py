@@ -23,6 +23,7 @@ from supertable.engine.engine_common import (
     init_connection,
     create_rbac_view,
     create_dedup_view,
+    create_tombstone_view,
 )
 
 
@@ -191,9 +192,23 @@ class DuckDBLite:
                         created_views.append(view)
                         query_alias_to_name[alias] = view
 
+            # Tombstone views (soft-delete filtering)
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            if tombstone_views:
+                if not rbac_views:
+                    query_suffix = _uuid.uuid4().hex[:8]
+                for alias in list(query_alias_to_name.keys()):
+                    tomb_def = tombstone_views.get(alias)
+                    if tomb_def and tomb_def.deleted_keys:
+                        source = query_alias_to_name[alias]
+                        view = f"tomb_{source}_{query_suffix}"
+                        create_tombstone_view(con, source, view, tomb_def)
+                        created_views.append(view)
+                        query_alias_to_name[alias] = view
+
             # Dedup views
             if dedup_views:
-                if not rbac_views:
+                if not rbac_views and not tombstone_views:
                     query_suffix = _uuid.uuid4().hex[:8]
                 for alias in list(query_alias_to_name.keys()):
                     dedup_def = dedup_views.get(alias)

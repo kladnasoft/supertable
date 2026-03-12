@@ -19,6 +19,10 @@ from supertable.processing import (
     process_delete_only,
     find_and_lock_overlapping_files,
     filter_stale_incoming_rows,
+    extract_key_tuples,
+    reconcile_tombstones,
+    compact_tombstones,
+    _tombstone_threshold,
 )
 from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
@@ -43,6 +47,7 @@ class DataWriter:
             dedup_on_read: bool = False,
             max_memory_chunk_size: int | None = None,
             max_overlapping_files: int | None = None,
+            tombstone_compact_total: int | None = None,
     ) -> None:
         """Set table-level configuration for dedup-on-read behaviour and per-table limits.
 
@@ -61,6 +66,9 @@ class DataWriter:
                 this table.  None leaves the existing value unchanged.
             max_overlapping_files: Override MAX_OVERLAPPING_FILES for this
                 table.  None leaves the existing value unchanged.
+            tombstone_compact_total: Maximum number of soft-deleted key
+                tombstones before compaction is triggered.  Default 1000.
+                None leaves the existing value unchanged.
         """
         check_write_access(
             super_name=self.super_table.super_name,
@@ -74,7 +82,7 @@ class DataWriter:
 
         # Only fetch existing Redis config when a limit override is being set,
         # preserving the cache-population guarantee for callers that omit them.
-        if max_memory_chunk_size is not None or max_overlapping_files is not None:
+        if max_memory_chunk_size is not None or max_overlapping_files is not None or tombstone_compact_total is not None:
             existing = self.catalog.get_table_config(
                 self.super_table.organization,
                 self.super_table.super_name,
@@ -93,6 +101,10 @@ class DataWriter:
             if max_overlapping_files <= 0:
                 raise ValueError("max_overlapping_files must be a positive integer")
             config["max_overlapping_files"] = int(max_overlapping_files)
+        if tombstone_compact_total is not None:
+            if tombstone_compact_total <= 0:
+                raise ValueError("tombstone_compact_total must be a positive integer")
+            config["tombstone_compact_total"] = int(tombstone_compact_total)
 
         self.catalog.set_table_config(
             self.super_table.organization,
@@ -230,27 +242,97 @@ class DataWriter:
                     return result_tuple
                 mark("newer_than")
 
-            # --- Process & write data -----------------------------------------
-            if delete_only:
-                inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_delete_only(
-                    dataframe,
-                    overlapping_files,
-                    overwrite_columns,
-                    simple_table.data_dir,
-                    compression_level,
-                    file_cache=file_cache,
-                )
+            # --- Tombstone / soft-delete logic --------------------------------
+            primary_keys = table_config.get("primary_keys") or []
+            use_tombstones = bool(primary_keys) and table_config.get("dedup_on_read")
+            existing_tombstones = (last_simple_table.get("tombstones") or {}).get("deleted_keys") or []
+            tombstone_pk = (last_simple_table.get("tombstones") or {}).get("primary_keys") or primary_keys
+
+            if delete_only and use_tombstones:
+                # --- Soft-delete path: append keys to tombstone list, no file I/O ---
+                new_delete_keys = extract_key_tuples(dataframe, primary_keys)
+                deleted = len(new_delete_keys)
+                merged_tombstones = list(existing_tombstones) + [list(k) for k in new_delete_keys]
+                # Deduplicate tombstone list (a key may be deleted more than once)
+                seen = set()
+                deduped = []
+                for k in merged_tombstones:
+                    kt = tuple(k)
+                    if kt not in seen:
+                        seen.add(kt)
+                        deduped.append(list(k))
+                merged_tombstones = deduped
+                inserted = 0
+                total_rows = 0
+                total_columns = dataframe.width
+                new_resources = []
+                sunset_files = set()
+
+                # Check if compaction threshold is breached
+                threshold = _tombstone_threshold(table_config)
+                if len(merged_tombstones) >= threshold:
+                    logger.info(lp(f"tombstone threshold breached ({len(merged_tombstones)}>={threshold}), compacting"))
+                    compacted, compact_resources, compact_sunset = compact_tombstones(
+                        snapshot=last_simple_table,
+                        primary_keys=primary_keys,
+                        data_dir=simple_table.data_dir,
+                        compression_level=compression_level,
+                        table_config=table_config,
+                    )
+                    new_resources = compact_resources
+                    sunset_files = compact_sunset
+                    merged_tombstones = []  # clear after compaction
+                    logger.info(lp(f"compaction removed {compacted} rows from {len(compact_sunset)} files"))
+
+                # Store tombstones on snapshot for update()
+                last_simple_table["tombstones"] = {
+                    "primary_keys": primary_keys,
+                    "deleted_keys": merged_tombstones,
+                    "total_tombstones": len(merged_tombstones),
+                }
+                mark("process")
+
             else:
-                inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
-                    dataframe,
-                    overlapping_files,
-                    overwrite_columns,
-                    simple_table.data_dir,
-                    compression_level,
-                    file_cache=file_cache,
-                    table_config=table_config,
-                )
-            mark("process")
+                # --- Non-tombstone path (original) --------------------------------
+
+                # Reconcile: if incoming data (insert/overwrite/append) has keys
+                # matching existing tombstones, remove those from the tombstone list
+                # so the newly-written rows become visible.
+                if existing_tombstones and primary_keys:
+                    incoming_keys = extract_key_tuples(dataframe, primary_keys)
+                    reconciled = reconcile_tombstones(existing_tombstones, incoming_keys)
+                    last_simple_table["tombstones"] = {
+                        "primary_keys": tombstone_pk,
+                        "deleted_keys": reconciled,
+                        "total_tombstones": len(reconciled),
+                    }
+                    if len(reconciled) < len(existing_tombstones):
+                        logger.debug(lp(
+                            f"reconciled {len(existing_tombstones) - len(reconciled)} "
+                            f"tombstones against incoming keys"
+                        ))
+
+                if delete_only:
+                    # delete_only without dedup — fall back to physical delete
+                    inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_delete_only(
+                        dataframe,
+                        overlapping_files,
+                        overwrite_columns,
+                        simple_table.data_dir,
+                        compression_level,
+                        file_cache=file_cache,
+                    )
+                else:
+                    inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
+                        dataframe,
+                        overlapping_files,
+                        overwrite_columns,
+                        simple_table.data_dir,
+                        compression_level,
+                        file_cache=file_cache,
+                        table_config=table_config,
+                    )
+                mark("process")
 
             # --- Update snapshot on storage -----------------------------------
             new_snapshot_dict, new_snapshot_path = simple_table.update(

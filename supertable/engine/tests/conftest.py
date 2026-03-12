@@ -39,14 +39,24 @@ def _mock_redis_catalog():
     Prevent RedisCatalog from being instantiated in engine modules.
 
     Both DataEstimator and SparkThriftExecutor create a RedisCatalog()
-    in __init__, which attempts to connect to Redis.  Mock it everywhere.
+    in __init__, which attempts to connect to Redis.  SuperTable also
+    creates one during __init__ and calls get_storage().  Mock everything.
     """
     with (
         patch("supertable.engine.data_estimator.RedisCatalog") as MockDE,
         patch("supertable.engine.spark_thrift.RedisCatalog") as MockST,
+        patch("supertable.super_table.RedisCatalog") as MockSuper,
+        patch("supertable.super_table.get_storage") as MockStorage,
+        patch("supertable.super_table.RoleManager"),
+        patch("supertable.super_table.UserManager"),
     ):
         MockDE.return_value = MagicMock()
         MockST.return_value = MagicMock()
+        MockStorage.return_value = MagicMock()
+        # SuperTable needs root_exists to return True (fast-path, skip storage mkdirs)
+        mock_catalog_inst = MagicMock()
+        mock_catalog_inst.root_exists.return_value = True
+        MockSuper.return_value = mock_catalog_inst
         yield
 
 

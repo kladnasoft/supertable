@@ -37,6 +37,20 @@ import pytest
 # Fixtures & helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _mock_data_reader_redis():
+    """Prevent RedisCatalog() inside DataReader.execute() from connecting to Redis.
+
+    execute() instantiates RedisCatalog for dedup-on-read config and tombstone
+    lookups.  Without this mock the connection attempt hangs on Sentinel discovery.
+    """
+    with patch("supertable.data_reader.RedisCatalog") as MockCat:
+        mock_inst = MagicMock()
+        mock_inst.get_table_config.return_value = None
+        mock_inst.get_leaf.return_value = None
+        MockCat.return_value = mock_inst
+        yield MockCat
+
 def _arrow_table(data: dict) -> pa.Table:
     """Build a PyArrow Table from a dict of lists."""
     return pa.table(data)
@@ -1630,19 +1644,17 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.AUTO.value == "auto"
 
-    def test_duckdb_value(self):
+    def test_duckdb_lite_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB.value == "duckdb_pinned"
+        assert engine.DUCKDB_LITE.value == "duckdb_lite"
 
-    def test_spark_value(self):
+    def test_duckdb_pro_value(self):
         from supertable.data_reader import engine
-        assert engine.SPARK.value == "spark"
+        assert engine.DUCKDB_PRO.value == "duckdb_pro"
 
-    def test_to_internal(self):
+    def test_spark_sql_value(self):
         from supertable.data_reader import engine
-        from supertable.engine.executor import Engine
-        assert engine.DUCKDB.to_internal() == Engine.DUCKDB
-        assert engine.AUTO.to_internal() == Engine.AUTO
+        assert engine.SPARK_SQL.value == "spark_sql"
 
 
 class TestDataReaderInit:

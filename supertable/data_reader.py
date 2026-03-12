@@ -22,7 +22,7 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
-from supertable.data_classes import TableDefinition, DedupViewDef
+from supertable.data_classes import TableDefinition, DedupViewDef, TombstoneDef
 from supertable.redis_catalog import RedisCatalog
 
 
@@ -103,7 +103,7 @@ class DataReader:
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
 
-            # --- Dedup-on-read: look up table configs and build dedup view defs ---
+            # --- Dedup-on-read & tombstones: look up table configs and snapshot metadata ---
             try:
                 catalog = RedisCatalog()
                 for td in self.tables:
@@ -121,6 +121,26 @@ class DataReader:
                                 order_column="__timestamp__",
                                 visible_columns=list(td.columns or []),
                             )
+
+                    # Tombstone filtering: read from snapshot payload in Redis leaf
+                    try:
+                        leaf = catalog.get_leaf(
+                            self.organization, td.super_name, td.simple_name,
+                        )
+                        payload = (leaf or {}).get("payload") if isinstance(leaf, dict) else None
+                        if isinstance(payload, dict):
+                            tomb_block = payload.get("tombstones")
+                            if isinstance(tomb_block, dict):
+                                tomb_keys = tomb_block.get("deleted_keys") or []
+                                tomb_pk = tomb_block.get("primary_keys") or []
+                                if tomb_keys and tomb_pk:
+                                    reflection.tombstone_views[td.alias] = TombstoneDef(
+                                        primary_keys=tomb_pk,
+                                        deleted_keys=tomb_keys,
+                                    )
+                    except Exception as te:
+                        logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))
+
             except Exception as e:
                 logger.warning(self._lp(f"[dedup] config lookup failed, skipping dedup: {e}"))
 

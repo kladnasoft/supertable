@@ -264,6 +264,58 @@ def _spark_create_dedup_view(
     cursor.execute(sql)
 
 
+def _spark_create_tombstone_view(
+        cursor,
+        source_table: str,
+        view_name: str,
+        tombstone_def,
+) -> None:
+    """Create a tombstone-filtering view on top of a Spark table or RBAC view.
+
+    Uses NOT EXISTS with a VALUES subquery to exclude soft-deleted keys.
+    The tombstone list is small (bounded by compaction threshold) so the
+    VALUES list fits comfortably in Spark's query plan.
+    """
+    pk = tombstone_def.primary_keys
+    deleted = tombstone_def.deleted_keys
+    if not pk or not deleted:
+        # No tombstones — passthrough
+        cursor.execute(
+            f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
+            f"SELECT * FROM {source_table}"
+        )
+        return
+
+    def _sql_literal(val) -> str:
+        if val is None:
+            return "NULL"
+        if isinstance(val, str):
+            return "'" + val.replace("'", "''") + "'"
+        return str(val)
+
+    value_rows = []
+    for key_tuple in deleted:
+        vals = ", ".join(_sql_literal(v) for v in key_tuple)
+        value_rows.append(f"({vals})")
+    values_sql = ", ".join(value_rows)
+
+    # Spark supports VALUES ... AS alias(col1, col2)
+    pk_aliases = ", ".join(f"`{c}`" for c in pk)
+    conditions = " AND ".join(
+        f"{source_table}.`{c}` = __tombstones__.`{c}`" for c in pk
+    )
+
+    sql = (
+        f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
+        f"SELECT * FROM {source_table} "
+        f"WHERE NOT EXISTS ("
+        f"SELECT 1 FROM VALUES {values_sql} AS __tombstones__({pk_aliases}) "
+        f"WHERE {conditions}"
+        f")"
+    )
+    cursor.execute(sql)
+
+
 def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
@@ -542,10 +594,24 @@ class SparkThriftExecutor:
                         created_views.append(view_name)
                         query_alias_to_name[alias] = view_name
 
-            # 5b. Create dedup views if dedup-on-read is configured
+            # 5b. Create tombstone views if soft-deleted keys exist
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            if tombstone_views:
+                if not rbac_views:
+                    query_suffix = uuid.uuid4().hex[:8]
+                for alias in list(query_alias_to_name.keys()):
+                    tomb_def = tombstone_views.get(alias)
+                    if tomb_def and tomb_def.deleted_keys:
+                        source = query_alias_to_name[alias]
+                        tomb_view = f"tomb_{source}_{query_suffix}"
+                        _spark_create_tombstone_view(cursor, source, tomb_view, tomb_def)
+                        created_views.append(tomb_view)
+                        query_alias_to_name[alias] = tomb_view
+
+            # 5c. Create dedup views if dedup-on-read is configured
             dedup_views = getattr(reflection, "dedup_views", None) or {}
             if dedup_views:
-                if not rbac_views:
+                if not rbac_views and not tombstone_views:
                     query_suffix = uuid.uuid4().hex[:8]
                 for alias in list(query_alias_to_name.keys()):
                     dedup_def = dedup_views.get(alias)
@@ -559,7 +625,7 @@ class SparkThriftExecutor:
             if _timed_out.is_set():
                 raise RuntimeError(
                     f"Spark query timed out after {query_timeout}s "
-                    f"during RBAC/dedup view creation"
+                    f"during RBAC/tombstone/dedup view creation"
                 )
 
             # 6. Rewrite and execute

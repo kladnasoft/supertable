@@ -26,6 +26,7 @@ from supertable.engine.engine_common import (
     init_connection,
     create_rbac_view,
     create_dedup_view,
+    create_tombstone_view,
     rbac_view_name,
 )
 
@@ -317,6 +318,7 @@ class DuckDBPro:
         # assignments are reached (which would cause a NameError otherwise).
         rbac_view_names: List[str] = []
         dedup_view_names: List[str] = []
+        tombstone_view_names: List[str] = []
         try:
             # Create per-query RBAC views if filtering is required
             rbac_views = getattr(reflection, "rbac_views", None) or {}
@@ -335,10 +337,25 @@ class DuckDBPro:
                         rbac_view_names.append(view)
                         query_alias_to_name[alias] = view
 
+            # Create per-query tombstone views if soft-deleted keys exist
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            if tombstone_views:
+                if not rbac_views:
+                    query_suffix = _uuid.uuid4().hex[:8]
+                for alias in list(query_alias_to_name.keys()):
+                    tomb_def = tombstone_views.get(alias)
+                    if tomb_def and tomb_def.deleted_keys:
+                        source = query_alias_to_name[alias]
+                        view = f"tomb_{source}_{query_suffix}"
+                        with self._lock:
+                            create_tombstone_view(con, source, view, tomb_def)
+                        tombstone_view_names.append(view)
+                        query_alias_to_name[alias] = view
+
             # Create per-query dedup views if dedup-on-read is configured
             dedup_views = getattr(reflection, "dedup_views", None) or {}
             if dedup_views:
-                if not rbac_views:
+                if not rbac_views and not tombstone_views:
                     query_suffix = _uuid.uuid4().hex[:8]
                 for alias in list(query_alias_to_name.keys()):
                     dedup_def = dedup_views.get(alias)
@@ -367,6 +384,15 @@ class DuckDBPro:
             if rbac_view_names:
                 with self._lock:
                     for view in rbac_view_names:
+                        try:
+                            con.execute(f"DROP VIEW IF EXISTS {view};")
+                        except Exception:
+                            pass
+
+            # Drop per-query tombstone views
+            if tombstone_view_names:
+                with self._lock:
+                    for view in tombstone_view_names:
                         try:
                             con.execute(f"DROP VIEW IF EXISTS {view};")
                         except Exception:

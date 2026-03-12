@@ -41,3 +41,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["supertable", "supertable.*"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

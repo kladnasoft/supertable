@@ -730,6 +730,79 @@ def create_dedup_view(
     )
     con.execute(sql)
 
+
+# =========================================================
+# Tombstone (soft-delete) view creation
+# =========================================================
+
+def create_tombstone_view(
+        con: duckdb.DuckDBPyConnection,
+        source_table: str,
+        view_name: str,
+        tombstone_def,
+) -> None:
+    """
+    Create a filtering view that excludes soft-deleted (tombstoned) rows.
+
+    The view anti-joins the source table against a VALUES list of
+    tombstoned composite keys.  Because the tombstone list is bounded
+    by the compaction threshold (typically ≤1000 keys), the VALUES
+    list is small and DuckDB handles it efficiently in memory.
+
+    This view should be inserted in the chain AFTER RBAC filtering
+    and BEFORE the dedup view so that tombstoned rows are excluded
+    before dedup's ROW_NUMBER window runs.
+
+    Args:
+        con: DuckDB connection
+        source_table: the underlying table or view
+        view_name: the view name to create
+        tombstone_def: TombstoneDef with primary_keys and deleted_keys
+    """
+    pk = tombstone_def.primary_keys
+    deleted = tombstone_def.deleted_keys
+    if not pk or not deleted:
+        # No tombstones — create a passthrough view
+        con.execute(
+            f"CREATE OR REPLACE VIEW {view_name} AS "
+            f"SELECT * FROM {source_table};"
+        )
+        return
+
+    # Build VALUES rows: each key tuple becomes a row
+    # Example: VALUES (1, 'US'), (2, 'EU')
+    def _sql_literal(val) -> str:
+        if val is None:
+            return "NULL"
+        if isinstance(val, str):
+            return "'" + val.replace("'", "''") + "'"
+        return str(val)
+
+    value_rows = []
+    for key_tuple in deleted:
+        vals = ", ".join(_sql_literal(v) for v in key_tuple)
+        value_rows.append(f"({vals})")
+    values_sql = ", ".join(value_rows)
+
+    # Column aliases for the VALUES table
+    pk_aliases = ", ".join(quote_if_needed(c) for c in pk)
+
+    # Anti-join via NOT EXISTS (handles NULLs correctly, no column name collisions)
+    conditions = " AND ".join(
+        f"{source_table}.{quote_if_needed(c)} = __tombstones__.{quote_if_needed(c)}"
+        for c in pk
+    )
+
+    sql = (
+        f"CREATE OR REPLACE VIEW {view_name} AS "
+        f"SELECT * FROM {source_table} "
+        f"WHERE NOT EXISTS ("
+        f"SELECT 1 FROM (VALUES {values_sql}) AS __tombstones__({pk_aliases}) "
+        f"WHERE {conditions}"
+        f");"
+    )
+    con.execute(sql)
+
 # (ParquetMetadataCache removed: was write-only dead weight.
 #  DuckDB's built-in enable_http_metadata_cache on the persistent connection
 #  already handles parquet footer caching at the connection level.

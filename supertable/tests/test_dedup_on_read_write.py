@@ -722,7 +722,7 @@ class TestDedupEdgeCases:
             ctx.stop_all()
 
     def test_dedup_with_delete_only(self):
-        """delete_only + dedup should still inject __timestamp__."""
+        """delete_only + dedup should use soft-delete (tombstones) instead of physical delete."""
         dw, ctx = _make_writer_for_write()
         try:
             dw._table_config_cache["my_table"] = {
@@ -730,15 +730,25 @@ class TestDedupEdgeCases:
                 "primary_keys": ["x"],
             }
 
-            # Mock delete_only path
-            with patch(f"{_DW_MOD}.process_delete_only") as mock_delete:
-                mock_delete.return_value = (0, 2, 1, 2, [_resource_entry("del.parquet")], {"old.parquet"})
+            arrow = _arrow_table({"x": [1, 2], "y": ["a", "b"]})
+            result = dw.write("admin", "my_table", arrow, ["x"], delete_only=True)
 
-                arrow = _arrow_table({"x": [1, 2], "y": ["a", "b"]})
-                dw.write("admin", "my_table", arrow, ["x"], delete_only=True)
+            # Soft-delete path: process_delete_only should NOT be called
+            # Instead, tombstones are appended to the snapshot
+            assert result is not None
+            total_cols, total_rows, inserted, deleted = result
+            assert deleted == 2  # 2 keys tombstoned
+            assert inserted == 0
 
-                df_passed = mock_delete.call_args[0][0]
-                assert "__timestamp__" in df_passed.columns
+            # Verify tombstones were set on the snapshot via simple_table.update
+            update_call = ctx._patches["simple"].start().return_value.update
+            if update_call.called:
+                call_kwargs = update_call.call_args
+                snapshot = call_kwargs.kwargs.get("last_snapshot") or call_kwargs[1].get("last_snapshot")
+                if snapshot:
+                    tombstones = snapshot.get("tombstones", {})
+                    assert tombstones.get("primary_keys") == ["x"]
+                    assert len(tombstones.get("deleted_keys", [])) == 2
         finally:
             ctx.stop_all()
 

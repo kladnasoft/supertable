@@ -42,6 +42,22 @@ _PATCH_RESTRICT_READ = f"{_MOD}.restrict_read_access"
 _PATCH_EXTEND_PLAN = f"{_MOD}.extend_execution_plan"
 _PATCH_TIMER = f"{_MOD}.Timer"
 _PATCH_PLAN_STATS = f"{_MOD}.PlanStats"
+_PATCH_REDIS_CATALOG = f"{_MOD}.RedisCatalog"
+
+
+@pytest.fixture(autouse=True)
+def _mock_data_reader_redis():
+    """Prevent RedisCatalog() inside DataReader.execute() from connecting to Redis.
+
+    execute() instantiates RedisCatalog for dedup-on-read config and tombstone
+    lookups.  Without this mock the connection attempt hangs on Sentinel discovery.
+    """
+    with patch(_PATCH_REDIS_CATALOG) as MockCat:
+        mock_inst = MagicMock()
+        mock_inst.get_table_config.return_value = None
+        mock_inst.get_leaf.return_value = None
+        MockCat.return_value = mock_inst
+        yield MockCat
 
 
 # ---------------------------------------------------------------------------
@@ -114,41 +130,17 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.AUTO.value == "auto"
 
-    def test_duckdb_value(self):
+    def test_duckdb_lite_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB.value == "duckdb_pinned"
+        assert engine.DUCKDB_LITE.value == "duckdb_lite"
 
-    def test_duckdb_transient_value(self):
+    def test_duckdb_pro_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_TRANSIENT.value == "duckdb_transient"
+        assert engine.DUCKDB_PRO.value == "duckdb_pro"
 
-    def test_duckdb_pinned_value(self):
+    def test_spark_sql_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_PINNED.value == "duckdb_pinned"
-
-    def test_spark_value(self):
-        from supertable.data_reader import engine
-        assert engine.SPARK.value == "spark"
-
-    def test_to_internal_auto(self):
-        from supertable.data_reader import engine
-        from supertable.engine.executor import Engine as _Engine
-        assert engine.AUTO.to_internal() == _Engine.AUTO
-
-    def test_to_internal_duckdb_pinned(self):
-        from supertable.data_reader import engine
-        from supertable.engine.executor import Engine as _Engine
-        assert engine.DUCKDB_PINNED.to_internal() == _Engine.DUCKDB_PINNED
-
-    def test_to_internal_spark(self):
-        from supertable.data_reader import engine
-        from supertable.engine.executor import Engine as _Engine
-        assert engine.SPARK.to_internal() == _Engine.SPARK
-
-    def test_to_internal_duckdb_transient(self):
-        from supertable.data_reader import engine
-        from supertable.engine.executor import Engine as _Engine
-        assert engine.DUCKDB_TRANSIENT.to_internal() == _Engine.DUCKDB_TRANSIENT
+        assert engine.SPARK_SQL.value == "spark_sql"
 
     def test_engine_is_enum(self):
         from supertable.data_reader import engine
@@ -156,7 +148,7 @@ class TestEngineEnum:
 
     def test_engine_members(self):
         from supertable.data_reader import engine
-        assert set(engine.__members__.keys()) == {"AUTO", "DUCKDB", "DUCKDB_TRANSIENT", "DUCKDB_PINNED", "SPARK"}
+        assert set(engine.__members__.keys()) == {"AUTO", "DUCKDB_LITE", "DUCKDB_PRO", "SPARK_SQL"}
 
 
 # ====================================================================
@@ -367,16 +359,16 @@ class TestExecuteHappyPath:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_PINNED)
+        dr.execute("admin", engine=engine.DUCKDB_PRO)
 
         exec_call_kwargs = mock_exec.execute.call_args
-        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB_PINNED or exec_call_kwargs[0][0] == _Engine.DUCKDB_PINNED
+        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB_PRO or exec_call_kwargs[0][0] == _Engine.DUCKDB_PRO
 
 
 # ====================================================================
@@ -1376,16 +1368,16 @@ class TestExecuteExecutorArgs:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_TRANSIENT)
+        dr.execute("admin", engine=engine.DUCKDB_LITE)
 
-        # Executor constructed with storage
-        MockExecutor.assert_called_once_with(storage=mock_storage)
+        # Executor constructed with storage and organization
+        MockExecutor.assert_called_once_with(storage=mock_storage, organization="o")
 
         # Executor.execute called with full set of params
         exec_call = mock_exec.execute.call_args
@@ -1394,9 +1386,9 @@ class TestExecuteExecutorArgs:
 
         # Engine should be the internal enum
         if "engine" in kwargs:
-            assert kwargs["engine"] == _Engine.DUCKDB_TRANSIENT
+            assert kwargs["engine"] == _Engine.DUCKDB_LITE
         else:
-            assert args[0] == _Engine.DUCKDB_TRANSIENT
+            assert args[0] == _Engine.DUCKDB_LITE
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1536,7 +1528,7 @@ class TestExecuteEngineDefault:
         exec_call = mock_exec.execute.call_args
         kwargs = exec_call[1] if exec_call[1] else {}
         args = exec_call[0] if exec_call[0] else ()
-        # Should use AUTO.to_internal() which is _Engine.AUTO
+        # Should pass engine.AUTO (which is _Engine.AUTO) as default
         if "engine" in kwargs:
             assert kwargs["engine"] == _Engine.AUTO
         else:

@@ -53,6 +53,21 @@ class DedupViewDef:
 
 
 @dataclass
+class TombstoneDef:
+    """Tombstone definition for a single table alias.
+
+    Produced by DataReader from the snapshot's ``tombstones`` block,
+    consumed by executors to create a filtering view that excludes
+    soft-deleted keys.
+
+    - primary_keys: columns that form the composite key.
+    - deleted_keys: list of key tuples (each a list of scalars).
+    """
+    primary_keys: List[str] = field(default_factory=list)
+    deleted_keys: List = field(default_factory=list)
+
+
+@dataclass
 class Reflection:
     storage_type: str
     reflection_bytes: int
@@ -62,3 +77,5 @@ class Reflection:
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
     # alias -> DedupViewDef.  Empty dict means no dedup-on-read.
     dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
+    # alias -> TombstoneDef.  Empty dict means no tombstone filtering.
+    tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
