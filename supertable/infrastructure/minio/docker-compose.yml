@@ -25,7 +25,6 @@ services:
       - ./scripts:/scripts  # Mount scripts directory
     command: server http://minio{1...${MINIO_NODES:-2}}/data --console-address ":9001"
     networks:
-      minio-cluster:
       supertable-net:
         aliases:
           - minio
@@ -46,7 +45,7 @@ services:
       - minio2-config:/root/.minio
     command: server http://minio{1...${MINIO_NODES:-2}}/data
     networks:
-      minio-cluster:
+      - supertable-net
     restart: unless-stopped
 
   minio3:
@@ -61,7 +60,7 @@ services:
       - minio3-config:/root/.minio
     command: server http://minio{1...${MINIO_NODES:-2}}/data
     networks:
-      minio-cluster:
+      - supertable-net
     restart: unless-stopped
 
   minio4:
@@ -76,7 +75,7 @@ services:
       - minio4-config:/root/.minio
     command: server http://minio{1...${MINIO_NODES:-2}}/data
     networks:
-      minio-cluster:
+      - supertable-net
     restart: unless-stopped
 
   setup:
@@ -95,11 +94,9 @@ services:
       /scripts/setup-keys.sh
       "
     networks:
-      minio-cluster:
+      - supertable-net
 
 networks:
-  minio-cluster:
-    driver: bridge
   supertable-net:
     name: supertable-net
 

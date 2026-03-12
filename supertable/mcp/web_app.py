@@ -2,7 +2,9 @@
 # web_app.py — minimal FastAPI UI for exercising the MCP server
 from __future__ import annotations
 
+import contextlib
 import hmac
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -15,16 +17,95 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from supertable.mcp.web_client import MCPWebClient
 
+logger = logging.getLogger("supertable.mcp.web_app")
+
+# ---------- MCP SDK Streamable HTTP mount ----------
+# Import the FastMCP instance from mcp_server so we can mount its
+# streamable-http ASGI app at /mcp.  This is the endpoint Claude Desktop
+# (and any MCP SDK client) connects to.
+_mcp_sdk_available = False
+_mcp_instance = None
+_mcp_streamable_app = None
+
+try:
+    from supertable.mcp.mcp_server import mcp as _mcp_instance  # noqa: F811
+    _mcp_sdk_available = True
+except Exception as exc:
+    logger.warning("Could not import mcp instance from mcp_server: %s", exc)
+
+def _build_mcp_streamable_app():
+    """Build the ASGI sub-app for MCP Streamable HTTP transport.
+
+    The SDK's streamable_http_app() creates an internal route at /mcp by default.
+    When we mount this sub-app, we need to avoid a double-path (/mcp/mcp).
+
+    Strategy:
+    - If the SDK supports ``path`` parameter: set path="/" and mount at /mcp.
+    - If it doesn't: mount at "/" (root) so the SDK's internal /mcp works directly.
+    """
+    global _mcp_streamable_app, _mcp_mount_path
+    if _mcp_instance is None:
+        return None
+    try:
+        import inspect
+        if hasattr(_mcp_instance, "streamable_http_app"):
+            sig = inspect.signature(_mcp_instance.streamable_http_app)
+            if "path" in sig.parameters:
+                _mcp_streamable_app = _mcp_instance.streamable_http_app(path="/")
+                _mcp_mount_path = "/mcp"
+            else:
+                # SDK doesn't support path= ; it will create /mcp internally.
+                # Mount at root so final URL is /mcp (not /mcp/mcp).
+                _mcp_streamable_app = _mcp_instance.streamable_http_app()
+                _mcp_mount_path = "/"
+        elif hasattr(_mcp_instance, "http_app"):
+            sig = inspect.signature(_mcp_instance.http_app)
+            if "path" in sig.parameters:
+                _mcp_streamable_app = _mcp_instance.http_app(path="/")
+                _mcp_mount_path = "/mcp"
+            else:
+                _mcp_streamable_app = _mcp_instance.http_app()
+                _mcp_mount_path = "/"
+    except Exception as exc:
+        logger.warning("Failed to build MCP streamable HTTP app: %s", exc)
+    return _mcp_streamable_app
+
+# Where to mount the streamable-http sub-app (depends on SDK version).
+_mcp_mount_path = "/mcp"
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Replaces deprecated @app.on_event startup/shutdown.
-    await _startup()
-    try:
-        yield
-    finally:
-        await _shutdown()
+    # Start the MCP SDK session manager (required for streamable-http transport).
+    async with contextlib.AsyncExitStack() as stack:
+        if _mcp_instance is not None and hasattr(_mcp_instance, "session_manager"):
+            try:
+                await stack.enter_async_context(_mcp_instance.session_manager.run())
+                logger.info("MCP session_manager started (streamable-http ready)")
+            except Exception as exc:
+                logger.warning("MCP session_manager.run() failed (streamable-http will not work): %s", exc)
+
+        # Start the stdio subprocess client for the web tester / /api/* endpoints.
+        await _startup()
+        try:
+            yield
+        finally:
+            await _shutdown()
 
 app = FastAPI(title="Supertable MCP Web Tester", lifespan=lifespan)
+
+# Mount the MCP SDK streamable-http transport.
+# Claude Desktop connects to http://host:8099/mcp.
+_build_mcp_streamable_app()
+if _mcp_streamable_app is not None:
+    app.mount(_mcp_mount_path, _mcp_streamable_app)
+    logger.info("Mounted MCP Streamable HTTP transport at %s (endpoint: /mcp)", _mcp_mount_path)
+else:
+    logger.warning(
+        "MCP Streamable HTTP transport NOT mounted at /mcp — "
+        "install/upgrade the MCP SDK (pip install --upgrade mcp) "
+        "to enable Claude Desktop remote connections"
+    )
 
 _client: Optional[MCPWebClient] = None
 
@@ -109,6 +190,7 @@ async def health_check() -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "mcp_client": "ready" if c is not None else "not_initialized",
+        "mcp_streamable_http": "mounted" if _mcp_streamable_app is not None else "not_mounted",
     })
 
 @app.get("/", response_class=HTMLResponse)
@@ -206,43 +288,6 @@ async def api_events(req: Request) -> JSONResponse:
         }
     )
 
-
-@app.post("/mcp")
-async def mcp_http_gateway(req: Request, body: Dict[str, Any] = Body(...)) -> JSONResponse:
-    """Claude Desktop compatible MCP-over-HTTP endpoint.
-
-    This is a thin JSON-RPC pass-through into the persistent stdio MCP subprocess.
-    """
-    _require_gateway_auth(req)
-
-    method = (body.get("method") or "").strip()
-    if not method:
-        raise HTTPException(status_code=400, detail="json-rpc method required")
-
-    params = body.get("params")
-    if params is None:
-        params = {}
-    if not isinstance(params, dict):
-        raise HTTPException(status_code=400, detail="json-rpc params must be an object")
-
-    # Optional header-based injection so Claude can authenticate without embedding secrets in prompts.
-    # - Authorization: Bearer <token>  -> tool auth_token (if not provided)
-    # - X-Role: <value>                 -> tool role (if not provided)
-    bearer = _parse_bearer(req.headers.get("authorization", ""))
-    header_role = (req.headers.get("x-role") or "").strip()
-
-    if method == "tools/call" and isinstance(params.get("arguments"), dict):
-        args = params["arguments"]
-        if bearer and not args.get("auth_token"):
-            args["auth_token"] = bearer
-        if header_role:
-            args["role"] = header_role
-
-    c = _client_or_raise()
-    # Preserve Claude's ids (may be string) while still using integer ids on the stdio side.
-    external_id = body.get("id")
-    resp = await c.jsonrpc(method, params, external_id=external_id)
-    return JSONResponse(resp)
 
 @app.post("/api/list_supers")
 async def api_list_supers(req: Request, payload: Dict[str, Any] = Body(...)) -> JSONResponse:

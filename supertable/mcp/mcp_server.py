@@ -271,11 +271,22 @@ CFG = Config()
 
 # ---------- MCP app ----------
 def _build_mcp(name: str, version: str) -> FastMCP:
+    """Build a FastMCP instance compatible with both stdio and streamable-http.
+
+    ``stateless_http=True`` and ``json_response=True`` are required for the
+    MCP SDK's Streamable HTTP transport (mounted in web_app.py).  They are
+    harmless when the server is used over stdio.
+    """
     try:
         sig = inspect.signature(FastMCP)
+        kwargs: Dict[str, Any] = {}
         if "version" in sig.parameters:
-            return FastMCP(name, version=version)  # type: ignore[arg-type]
-        return FastMCP(name)
+            kwargs["version"] = version
+        if "stateless_http" in sig.parameters:
+            kwargs["stateless_http"] = True
+        if "json_response" in sig.parameters:
+            kwargs["json_response"] = True
+        return FastMCP(name, **kwargs)  # type: ignore[arg-type]
     except Exception:
         return FastMCP(name)
 

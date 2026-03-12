@@ -33,7 +33,7 @@ x-common-env: &common-env
 x-redis-env: &redis-env
   REDIS_HOST: ${REDIS_HOST:-redis-master}
   REDIS_PORT: ${REDIS_PORT:-6379}
-  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-change_me_to_a_strong_password}
 
 x-storage-env: &storage-env
   STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL:-http://minio:9000}
@@ -256,6 +256,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./Caddyfile.https:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
       - caddy-https-data:/data
       - caddy-https-config:/config
     networks:
