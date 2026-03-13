@@ -13,8 +13,8 @@
 # Profiles:
 #   reflection  — Admin UI + REST API           :8050
 #   api         — REST API                       :8090
-#   mcp         — MCP stdio + http + web tester  :8070, :8099
-#   mcp-http    — MCP over HTTPS (+ Caddy TLS)   :8070
+#   mcp         — MCP stdio + http + web app (/mcp, /web, /simulation) :8070, :8099
+#   mcp-http    — Legacy dedicated MCP HTTP profile             :8070
 #   notebook    — Notebook WebSocket server       :8000
 #   spark       — Spark plug WebSocket server     :8010
 #   https       — Caddy TLS sidecar (combinable)
@@ -97,10 +97,12 @@ services:
       - "${SUPERTABLE_API_PORT:-8090}:${SUPERTABLE_API_PORT:-8090}"
 
   # =====================================================================
-  # mcp — MCP stdio server + web tester UI
+  # mcp — MCP stdio server + HTTP/web app
   # Start with:  docker compose --profile mcp up -d
-  # Web tester:  http://localhost:8099
-  # stdio:       connected via Claude Desktop / MCP client on stdin/stdout
+  # Endpoints:   http://localhost:8099/mcp
+  #              http://localhost:8099/web
+  #              http://localhost:8099/simulation
+  # stdio:       foreground process inside the container (not exposed over the network)
   # =====================================================================
 
   supertable-mcp:
@@ -120,11 +122,14 @@ services:
       SUPERTABLE_MCP_PORT: ${SUPERTABLE_MCP_PORT:-8070}
       SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
       SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
-      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
-      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
-      SUPERTABLE_TEST_USER_HASH: ${SUPERTABLE_TEST_USER_HASH:-}
+      SUPERTABLE_REQUIRE_EXPLICIT_ROLE: ${SUPERTABLE_REQUIRE_EXPLICIT_ROLE:-1}
+      SUPERTABLE_ALLOWED_ROLES: ${SUPERTABLE_ALLOWED_ROLES:-}
+      SUPERTABLE_ROLE: ${SUPERTABLE_ROLE:-}
       REDIS_DB: ${REDIS_DB:-1}
       SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/1}
+      FORWARDED_ALLOW_IPS: "*"
+      UVICORN_PROXY_HEADERS: "1"
+      SUPERTABLE_ALLOWED_HOSTS: "*"
     networks:
       - supertable-net
     ports:
@@ -132,7 +137,7 @@ services:
       - "${SUPERTABLE_MCP_PORT:-8070}:${SUPERTABLE_MCP_PORT:-8070}"      # MCP streamable-http
 
   # =====================================================================
-  # mcp-http — MCP server over streamable-http (for remote HTTP clients)
+  # mcp-http — Legacy dedicated MCP server over streamable-http (for remote HTTP clients)
   # Start with:  docker compose --profile mcp-http up -d
   # Endpoint:    https://localhost:8070/mcp  (TLS via caddy-mcp sidecar)
   # No tty/stdin required — plain HTTP.
@@ -152,8 +157,8 @@ services:
       SUPERTABLE_MCP_HTTP_PATH: ${SUPERTABLE_MCP_HTTP_PATH:-/mcp}
       SUPERTABLE_MCP_AUTH_TOKEN: ${SUPERTABLE_MCP_AUTH_TOKEN:-}
       SUPERTABLE_REQUIRE_TOKEN: ${SUPERTABLE_REQUIRE_TOKEN:-1}
-      SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH: ${SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH:-1}
-      SUPERTABLE_ALLOWED_USER_HASHES: ${SUPERTABLE_ALLOWED_USER_HASHES:-}
+      SUPERTABLE_REQUIRE_EXPLICIT_ROLE: ${SUPERTABLE_REQUIRE_EXPLICIT_ROLE:-1}
+      SUPERTABLE_ALLOWED_ROLES: ${SUPERTABLE_ALLOWED_ROLES:-}
       REDIS_DB: ${REDIS_DB:-1}
       SUPERTABLE_REDIS_URL: ${SUPERTABLE_REDIS_URL:-redis://redis-master:6379/1}
       FORWARDED_ALLOW_IPS: "*"
@@ -241,9 +246,8 @@ services:
   #
   # Ports (HTTPS → HTTP internal):
   #   8443  reflection
-  #   8470  mcp streamable-http
+  #   8470  mcp + web + simulation (paths on the same HTTPS origin)
   #   8490  api
-  #   8499  mcp web tester
   #   9443  minio S3 API
   #
   # One-time CA trust:
@@ -263,8 +267,7 @@ services:
       - supertable-net
     ports:
       - "8443:8443"    # reflection  → https://host:8443
-      - "8470:8470"    # mcp http    → https://host:8470/mcp
-      - "8499:8499"    # mcp web UI  → https://host:8499
+      - "8470:8470"    # mcp/web/simulation → https://host:8470/{mcp,web,simulation}
       - "8490:8490"    # api         → https://host:8490
       - "9443:9443"    # minio S3    → https://host:9443
 

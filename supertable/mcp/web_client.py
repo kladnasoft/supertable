@@ -20,6 +20,7 @@ _AUTH_TOOLS = {
     "get_super_meta",
     "query_sql",
     "sample_data",
+    "submit_feedback",
 }
 
 def _default_server_path() -> str:
@@ -39,15 +40,21 @@ class MCPWebClient:
     - Serializes writes and matches responses by id.
     - Keeps an in-memory event log for debugging UI.
     """
+    # Default timeout (seconds) for awaiting a response from the MCP subprocess.
+    # Prevents indefinite hangs if the server drops a response or wedges.
+    DEFAULT_REQUEST_TIMEOUT: float = 120.0
+
     def __init__(
         self,
         server_path: Optional[str] = None,
         python_exe: Optional[str] = None,
         auth_token: Optional[str] = None,
+        request_timeout: Optional[float] = None,
     ) -> None:
         self.server_path = os.path.abspath(server_path or os.getenv("MCP_SERVER_PATH", _default_server_path()))
         self.python_exe = python_exe or sys.executable
         self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", "")).strip()
+        self.request_timeout = request_timeout if request_timeout is not None else self.DEFAULT_REQUEST_TIMEOUT
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
@@ -187,7 +194,13 @@ class MCPWebClient:
         fut: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         await self._write_json(msg)
-        return await fut
+        try:
+            return await asyncio.wait_for(fut, timeout=self.request_timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise RuntimeError(
+                f"MCP request timed out after {self.request_timeout}s (method={method}, id={req_id})"
+            )
 
     async def _notify(self, method: str, params: Dict[str, Any]) -> None:
         if not self._proc:

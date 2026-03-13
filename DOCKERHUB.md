@@ -169,6 +169,10 @@ docker run -d --name supertable-mcp-http \
 
 MCP endpoint: `http://localhost:8070/mcp`
 
+For the single-profile web app deployment, `docker compose --profile mcp --profile https up -d`
+exposes `https://localhost:8470/mcp`, `https://localhost:8470/web`, and
+`https://localhost:8470/simulation` from the same HTTPS origin.
+
 ### Notebook
 
 ```bash
@@ -199,6 +203,8 @@ cd infrastructure/minio && docker compose up -d
 docker compose --profile reflection up -d
 docker compose --profile api up -d
 docker compose --profile mcp up -d
+# Recommended remote HTTPS deployment
+# docker compose --profile mcp --profile https up -d
 docker compose --profile mcp-http up -d
 docker compose --profile notebook up -d
 
@@ -353,8 +359,8 @@ All HTTP services expose health endpoints:
 2. **Enable MCP authentication:**
    ```bash
    SUPERTABLE_REQUIRE_TOKEN=1
-   SUPERTABLE_REQUIRE_EXPLICIT_USER_HASH=1
-   SUPERTABLE_ALLOWED_USER_HASHES=hash1,hash2
+   SUPERTABLE_REQUIRE_EXPLICIT_ROLE=1
+   SUPERTABLE_ALLOWED_ROLES=reader,writer
    ```
 
 3. **Use Redis password in production:**

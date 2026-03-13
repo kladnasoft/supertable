@@ -12,6 +12,11 @@
 	reverse_proxy supertable-reflection:8050
 }
 
+# Single HTTPS origin for the MCP web app:
+#   /mcp         Streamable HTTP
+#   /web         Web tester
+#   /simulation  Claude-like simulator
+#   /simulator   Backward-compatible alias
 :8470 {
 	tls /certs/cert.pem /certs/key.pem
 

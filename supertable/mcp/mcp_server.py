@@ -229,8 +229,23 @@ _FORBIDDEN_SQL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches SQL block comments (/* ... */) including nested, and line comments (-- ...\n)
+_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\r\n]*")
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove block comments (/* ... */) and line comments (-- ...) from SQL.
+
+    This prevents evasion of the read-only check by splitting forbidden
+    keywords across comment boundaries (e.g. ``INS/**/ERT``).
+    """
+    s = _SQL_BLOCK_COMMENT_RE.sub(" ", sql)
+    s = _SQL_LINE_COMMENT_RE.sub(" ", s)
+    return s
+
 def _read_only_sql(sql: str) -> None:
-    s = (sql or "").strip().lower()
+    stripped = _strip_sql_comments(sql or "")
+    s = stripped.strip().lower()
     if not (s.startswith("select") or s.startswith("with")):
         raise ValueError("Only SELECT (or WITH … SELECT) statements are allowed.")
     if _FORBIDDEN_SQL_RE.search(s):
@@ -286,6 +301,10 @@ def _build_mcp(name: str, version: str) -> FastMCP:
             kwargs["stateless_http"] = True
         if "json_response" in sig.parameters:
             kwargs["json_response"] = True
+        # Allow any Origin header — the web_app.py gateway layer handles
+        # browser-facing auth; real MCP SDK clients don't send Origin.
+        if "allowed_origins" in sig.parameters:
+            kwargs["allowed_origins"] = ["*"]
         return FastMCP(name, **kwargs)  # type: ignore[arg-type]
     except Exception:
         return FastMCP(name)
@@ -293,11 +312,16 @@ def _build_mcp(name: str, version: str) -> FastMCP:
 mcp = _build_mcp(CFG.name, CFG.version)
 _LIMITER: Optional["anyio.CapacityLimiter"] = None
 
+import threading as _threading
+_LIMITER_INIT_LOCK = _threading.Lock()
+
 def _get_limiter() -> "anyio.CapacityLimiter":
     global _LIMITER
     if _LIMITER is None:
-        # Initialize lazily inside an async context (required by AnyIO/sniffio).
-        _LIMITER = anyio.CapacityLimiter(CFG.max_concurrency)
+        with _LIMITER_INIT_LOCK:
+            if _LIMITER is None:
+                # Initialize lazily inside an async context (required by AnyIO/sniffio).
+                _LIMITER = anyio.CapacityLimiter(CFG.max_concurrency)
     return _LIMITER
 
 
@@ -463,81 +487,81 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
     async with _get_limiter():
         tables = await anyio.to_thread.run_sync(_work)
 
-    # ── __catalog__ lookup ──────────────────────────────────────────────────
-    # If a __catalog__ table exists, fetch ALL its rows regardless of schema
-    # and always emit catalog_hint so the AI uses it before querying anything.
-    catalog: List[Dict[str, Any]] = []
-    catalog_hint: Optional[str] = None
+        # ── __catalog__ lookup ──────────────────────────────────────────────────
+        # If a __catalog__ table exists, fetch ALL its rows regardless of schema
+        # and always emit catalog_hint so the AI uses it before querying anything.
+        catalog: List[Dict[str, Any]] = []
+        catalog_hint: Optional[str] = None
 
-    if "__catalog__" in tables:
-        # Always set the hint — even if the fetch fails the AI knows it exists.
-        catalog_hint = (
-            "IMPORTANT: Before querying any table, you MUST read the 'catalog' "
-            "field in this response. It contains human-written descriptions of every "
-            "table in this SuperTable — what the data means, how it is structured, "
-            "and what questions it can answer. Use it as your primary reference for "
-            "understanding the dataset before writing any SQL."
-        )
-        try:
-            eng = _resolve_engine(None)
-            limit_n = _clamp_limit(None, 500, 500)
+        if "__catalog__" in tables:
+            # Always set the hint — even if the fetch fails the AI knows it exists.
+            catalog_hint = (
+                "IMPORTANT: Before querying any table, you MUST read the 'catalog' "
+                "field in this response. It contains human-written descriptions of every "
+                "table in this SuperTable — what the data means, how it is structured, "
+                "and what questions it can answer. Use it as your primary reference for "
+                "understanding the dataset before writing any SQL."
+            )
+            try:
+                eng = _resolve_engine(None)
+                limit_n = _clamp_limit(None, 500, 500)
 
-            def _fetch_catalog():
-                return _exec_query_sync(
-                    sup, org,
-                    'SELECT * FROM "__catalog__"',
-                    limit_n, eng, r,
-                )
+                def _fetch_catalog():
+                    return _exec_query_sync(
+                        sup, org,
+                        'SELECT * FROM "__catalog__"',
+                        limit_n, eng, r,
+                    )
 
-            async with _get_limiter():
+                # Runs inside the already-held limiter slot — no nested acquire.
                 cat_result = await anyio.to_thread.run_sync(_fetch_catalog)
 
-            if cat_result.get("status") == "OK":
-                cols = cat_result.get("columns") or []
-                rows = cat_result.get("rows") or []
-                # Accept any schema — zip whatever columns exist into dicts.
-                catalog = [dict(zip(cols, row)) for row in rows]
-                logger.info("__catalog__ loaded: %d rows, columns=%s", len(catalog), cols)
-        except Exception as exc:
-            logger.warning("__catalog__ fetch failed (non-fatal): %s", exc)
+                if cat_result.get("status") == "OK":
+                    cols = cat_result.get("columns") or []
+                    rows = cat_result.get("rows") or []
+                    # Accept any schema — zip whatever columns exist into dicts.
+                    catalog = [dict(zip(cols, row)) for row in rows]
+                    logger.info("__catalog__ loaded: %d rows, columns=%s", len(catalog), cols)
+            except Exception as exc:
+                logger.warning("__catalog__ fetch failed (non-fatal): %s", exc)
 
-    # ── __feedback__ summary ────────────────────────────────────────────────
-    # If a __feedback__ table exists, load the last 50 rows so the AI has
-    # context on past user ratings and comments. This helps it avoid repeating
-    # poorly-rated answers and build on well-rated ones.
-    feedback: List[Dict[str, Any]] = []
-    feedback_hint: Optional[str] = None
+        # ── __feedback__ summary ────────────────────────────────────────────────
+        # If a __feedback__ table exists, load the last 50 rows so the AI has
+        # context on past user ratings and comments. This helps it avoid repeating
+        # poorly-rated answers and build on well-rated ones.
+        feedback: List[Dict[str, Any]] = []
+        feedback_hint: Optional[str] = None
 
-    if "__feedback__" in tables:
-        feedback_hint = (
-            "IMPORTANT: The 'feedback' field contains past user ratings and comments "
-            "on previous AI responses in this SuperTable. You MUST review it to: "
-            "1) avoid repeating approaches that received thumbs_down ratings, "
-            "2) build on patterns that received thumbs_up ratings, "
-            "3) address any recurring user comments or frustrations. "
-            "Keep this context in memory for the entire session."
-        )
-        try:
-            eng = _resolve_engine(None)
-            limit_n = _clamp_limit(None, 50, 50)
+        if "__feedback__" in tables:
+            feedback_hint = (
+                "IMPORTANT: The 'feedback' field contains past user ratings and comments "
+                "on previous AI responses in this SuperTable. You MUST review it to: "
+                "1) avoid repeating approaches that received thumbs_down ratings, "
+                "2) build on patterns that received thumbs_up ratings, "
+                "3) address any recurring user comments or frustrations. "
+                "Keep this context in memory for the entire session."
+            )
+            try:
+                eng = _resolve_engine(None)
+                limit_n = _clamp_limit(None, 50, 50)
 
-            def _fetch_feedback():
-                return _exec_query_sync(
-                    sup, org,
-                    'SELECT * FROM "__feedback__" ORDER BY ts DESC LIMIT 50',
-                    limit_n, eng, r,
-                )
+                def _fetch_feedback():
+                    return _exec_query_sync(
+                        sup, org,
+                        'SELECT * FROM "__feedback__" ORDER BY ts DESC LIMIT 50',
+                        limit_n, eng, r,
+                    )
 
-            async with _get_limiter():
+                # Runs inside the already-held limiter slot — no nested acquire.
                 fb_result = await anyio.to_thread.run_sync(_fetch_feedback)
 
-            if fb_result.get("status") == "OK":
-                cols = fb_result.get("columns") or []
-                rows = fb_result.get("rows") or []
-                feedback = [dict(zip(cols, row)) for row in rows]
-                logger.info("__feedback__ loaded: %d rows", len(feedback))
-        except Exception as exc:
-            logger.warning("__feedback__ fetch failed (non-fatal): %s", exc)
+                if fb_result.get("status") == "OK":
+                    cols = fb_result.get("columns") or []
+                    rows = fb_result.get("rows") or []
+                    feedback = [dict(zip(cols, row)) for row in rows]
+                    logger.info("__feedback__ loaded: %d rows", len(feedback))
+            except Exception as exc:
+                logger.warning("__feedback__ fetch failed (non-fatal): %s", exc)
 
     return {
         "result": tables,
@@ -815,7 +839,7 @@ async def submit_feedback(
             "message": f"rating must be one of: {sorted(valid_ratings)}",
         }
 
-    ts = datetime.datetime.utcnow().isoformat()
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     row = {
         "ts":               ts,

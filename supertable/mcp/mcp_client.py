@@ -274,12 +274,14 @@ def wait_for_response(wire: Wire, req_id: int) -> Dict[str, Any]:
 
 AUTH_TOOLS = {
     "whoami",
+    "list_supers",
     "list_tables",
     "describe_table",
     "get_table_stats",
     "get_super_meta",
     "query_sql",
     "sample_data",
+    "submit_feedback",
 }
 
 def call_tool(

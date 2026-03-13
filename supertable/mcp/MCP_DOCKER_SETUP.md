@@ -2,6 +2,15 @@
 
 ## Architecture
 
+This deployment keeps a **single MCP profile** (`mcp`) and uses the HTTPS sidecar only for TLS. The externally documented endpoints are:
+
+- `/mcp`
+- `/web`
+- `/simulation`
+
+`/simulator` remains available as a backward-compatible alias.
+
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Docker container — single process, single port (:8099)  │
@@ -10,11 +19,12 @@
 │    └─▶ web_server.py ──▶ uvicorn ──▶ web_app.py          │
 │                                                          │
 │  Endpoints:                                              │
-│    /mcp      Streamable HTTP transport (MCP SDK)         │
-│    /         Web tester UI (web_tester.html)             │
-│    /mcp_v1   JSON-RPC proxy (used by web tester)         │
-│    /api/*    REST endpoints (used by web tester)         │
-│    /health   Liveness probe (no auth)                    │
+│    /mcp        Streamable HTTP transport (MCP SDK)       │
+│    / and /web  Web tester UI (web_tester.html)           │
+│    /simulation Claude-like MCP simulator UI              │
+│    /mcp_v1     JSON-RPC proxy (used by web tester)       │
+│    /api/*      REST endpoints (used by web tester)       │
+│    /health     Liveness probe (no auth)                  │
 │                                                          │
 │  Transport: Streamable HTTP (default, recommended).      │
 │  The FastMCP instance is created with stateless_http=True │
@@ -42,6 +52,7 @@
 | `web_server.py` | Uvicorn runner — starts `web_app.py` on the configured port |
 | `web_client.py` | Async stdio client — spawns `mcp_server.py` as subprocess for the web tester proxy |
 | `web_tester.html` | Browser UI — form-based dev tool for calling MCP tools |
+| `mcp_simulator.html` | Browser UI — Claude-like MCP simulator for a pasted MCP URL |
 
 ---
 
@@ -49,7 +60,7 @@
 
 ```env
 # ── Required ──────────────────────────────────────────
-SUPERTABLE_SUPERTOKEN=change-me-gateway-secret     # protects web UI, /web, /api/*
+SUPERTABLE_SUPERTOKEN=change-me-gateway-secret     # protects /, /web, /simulation, /api/*
 SUPERTABLE_MCP_AUTH_TOKEN=change-me-tool-secret     # protects MCP tool calls
 
 # ── Infrastructure ────────────────────────────────────
@@ -80,17 +91,18 @@ STORAGE_FORCE_PATH_STYLE=true
 ## 2. Start the container
 
 ```bash
-# Build and start (uses the mcp profile from docker-compose.yml)
-docker compose --profile mcp up -d --build
+# Build and start the single MCP profile plus HTTPS sidecar
+docker compose --profile mcp --profile https up -d --build
 
 # Check it's running
-docker compose --profile mcp ps
+docker compose --profile mcp --profile https ps
 ```
 
 Verify the health endpoint:
 
 ```bash
 curl http://localhost:8099/health
+curl -k https://localhost:8470/health
 ```
 
 Expected response:
@@ -112,7 +124,7 @@ Claude Desktop (and any MCP SDK client) connects to this endpoint.
 
 1. Open Claude Desktop → **Settings → Integrations**
 2. Click **Add custom connector**
-3. Enter the URL: `http://<host>:8099/mcp` (or `https://<host>:8470/mcp` with TLS)
+3. Enter the URL: `https://<host>:8470/mcp`
 4. No additional config needed — the server is authless at the MCP transport layer
 
 > **Note:** Claude Desktop will not connect to remote servers configured via
@@ -137,7 +149,7 @@ Edit `claude_desktop_config.json`:
       "command": "npx",
       "args": [
         "mcp-remote",
-        "http://192.168.168.130:8099/mcp"
+        "https://192.168.168.130:8470/mcp"
       ]
     }
   }
@@ -158,7 +170,10 @@ One-time CA trust (so your OS accepts the self-signed cert):
 docker compose --profile https exec caddy-https caddy trust
 ```
 
-Then use `https://<host>:8470/mcp` in any of the methods above.
+Then use the single HTTPS origin:
+- `https://<host>:8470/mcp`
+- `https://<host>:8470/web?auth=<gateway-token>`
+- `https://<host>:8470/simulation?auth=<gateway-token>`
 
 ### Claude.ai Custom Connectors (remote MCP)
 
@@ -175,7 +190,15 @@ Restart Claude Desktop after editing the config.
 ## 4. Open the Web Tester
 
 ```
-http://localhost:8099/?auth=change-me-gateway-secret
+https://localhost:8470/web?auth=change-me-gateway-secret
+```
+
+The root path `/` still serves the same tester for backward compatibility.
+
+Open the simulator:
+
+```
+https://localhost:8470/simulation?auth=change-me-gateway-secret
 ```
 
 The `?auth=` value is your `SUPERTABLE_SUPERTOKEN`. The page stores it in localStorage so you only pass it once.
@@ -193,7 +216,9 @@ https://localhost:8470/?auth=change-me-gateway-secret
 | Path | Auth | Used by |
 |------|------|---------|
 | `/mcp` | MCP SDK auth (`SUPERTABLE_MCP_AUTH_TOKEN`) | Claude Desktop / any MCP client |
-| `/` | `SUPERTABLE_SUPERTOKEN` | Browser (web tester UI) |
+| `/` and `/web` | `SUPERTABLE_SUPERTOKEN` | Browser (web tester UI) |
+| `/simulation` | `SUPERTABLE_SUPERTOKEN` | Browser (Claude-like MCP simulator UI) |
+| `/simulator` | `SUPERTABLE_SUPERTOKEN` | Browser (backward-compatible alias) |
 | `/mcp_v1` | `SUPERTABLE_SUPERTOKEN` | Web tester (JSON-RPC proxy) |
 | `/api/*` | `SUPERTABLE_SUPERTOKEN` | Web tester (REST endpoints) |
 | `/health` | none | Kubernetes / Docker healthcheck |
@@ -204,8 +229,8 @@ https://localhost:8470/?auth=change-me-gateway-secret
 
 | Port | Protocol | Service |
 |------|----------|---------|
-| 8099 | HTTP | MCP server + web tester (direct) |
-| 8470 | HTTPS | MCP server + web tester (via Caddy) |
+| 8099 | HTTP | MCP web app (`/mcp`, `/web`, `/simulation`) |
+| 8470 | HTTPS | MCP web app (`/mcp`, `/web`, `/simulation`) via Caddy |
 
 ---
 
@@ -233,6 +258,7 @@ SUPERTABLE_MCP_TRANSPORT=stdio python -m supertable.mcp.mcp_server
 
 1. Check the container: `docker compose --profile mcp ps`
 2. Check health: `curl http://localhost:8099/health`
+3. HTTPS check: `curl -k https://localhost:8470/health`
 3. Check logs: `docker compose --profile mcp logs supertable-mcp`
 4. If `mcp_streamable_http: not_mounted` — upgrade the MCP SDK inside the container (`pip install --upgrade mcp`)
 
