@@ -321,8 +321,90 @@ def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
 ) -> str:
-    """Rewrite table references in SQL — delegates to shared helper."""
-    return rewrite_query_with_hashed_tables(original_sql, alias_to_table)
+    """Rewrite table references and transpile SQL to Spark dialect.
+
+    Two-step process:
+    1. Delegate to ``rewrite_query_with_hashed_tables`` to replace table
+       references with physical hashed names (shared with DuckDB path).
+    2. Transpile the resulting SQL from DuckDB dialect to Spark dialect
+       via sqlglot.  This converts identifier quoting from double-quotes
+       (``"col"``) to backticks (`` `col` ``), and adapts other syntax
+       differences (e.g. INTERVAL literals, type names).
+
+    Falls back to a simple double-quote → backtick replacement if sqlglot
+    transpilation fails for any reason.
+    """
+    rewritten = rewrite_query_with_hashed_tables(original_sql, alias_to_table)
+
+    try:
+        import sqlglot
+        # Parse as DuckDB (which uses double-quote identifiers),
+        # generate as Spark (which uses backtick identifiers).
+        transpiled = sqlglot.transpile(
+            rewritten,
+            read="duckdb",
+            write="spark",
+            pretty=False,
+        )
+        if transpiled and transpiled[0]:
+            return transpiled[0]
+    except Exception as e:
+        logger.debug(f"[spark.thrift] sqlglot transpile failed, using quote fallback: {e}")
+
+    # Fallback: replace double-quoted identifiers with backtick-quoted ones.
+    # This handles the common case where sqlglot can't parse the rewritten SQL
+    # but the only issue is identifier quoting style.
+    return _double_quotes_to_backticks(rewritten)
+
+
+def _double_quotes_to_backticks(sql: str) -> str:
+    """Replace double-quoted identifiers with backtick-quoted identifiers.
+
+    Walks the SQL character-by-character, respecting single-quoted string
+    literals (which must not be modified).  Only double-quoted sequences
+    are converted.
+
+    Example:
+        ``SELECT "product_id", SUM("revenue") AS "total"``
+        → ``SELECT `product_id`, SUM(`revenue`) AS `total```
+    """
+    result = []
+    i = 0
+    in_single = False
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'" and not in_single:
+            # Enter single-quoted string — copy verbatim until closing '
+            in_single = True
+            result.append(ch)
+            i += 1
+            while i < len(sql):
+                c2 = sql[i]
+                result.append(c2)
+                if c2 == "'" and (i + 1 >= len(sql) or sql[i + 1] != "'"):
+                    in_single = False
+                    i += 1
+                    break
+                if c2 == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+                    # Escaped single quote — copy both
+                    result.append(sql[i + 1])
+                    i += 2
+                else:
+                    i += 1
+        elif ch == '"':
+            # Double-quoted identifier — convert to backtick
+            result.append('`')
+            i += 1
+            while i < len(sql) and sql[i] != '"':
+                result.append(sql[i])
+                i += 1
+            result.append('`')
+            if i < len(sql):
+                i += 1  # skip closing "
+        else:
+            result.append(ch)
+            i += 1
+    return ''.join(result)
 
 
 # =========================================================
@@ -537,6 +619,30 @@ class SparkThriftExecutor:
             # 3. Configure S3
             _configure_spark_s3(cursor, cluster)
 
+            # 3a. Work around Spark's inability to read TIMESTAMP(NANOS, false)
+            #     parquet columns written by DuckDB.  DuckDB writes
+            #     __timestamp__ and other timestamp columns as INT64
+            #     nanosecond-precision non-UTC-adjusted timestamps.
+            #     Spark 3.x rejects this type by default.
+            #
+            #     spark.sql.legacy.parquet.nanosAsLong=true  (Spark 3.4+)
+            #       → reads nanos INT64 as LongType instead of crashing.
+            #     spark.sql.parquet.inferTimestampNTZ.enabled=false
+            #       → disables NTZ timestamp inference, falls back to
+            #         treating all timestamps as UTC-adjusted.
+            #     spark.sql.parquet.outputTimestampType=TIMESTAMP_MICROS
+            #       → if Spark writes parquet, use micros (harmless if read-only).
+            _timestamp_workarounds = [
+                ("spark.sql.legacy.parquet.nanosAsLong", "true"),
+                ("spark.sql.parquet.inferTimestampNTZ.enabled", "false"),
+                ("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS"),
+            ]
+            for _tw_key, _tw_val in _timestamp_workarounds:
+                try:
+                    cursor.execute(f"SET {_tw_key}={_tw_val}")
+                except Exception as _tw_err:
+                    logger.debug(f"{log_prefix}[spark.thrift] SET {_tw_key} failed (non-fatal): {_tw_err}")
+
             # 4. Register reflection tables
             snapshots_by_key = {
                 (sup.super_name, sup.simple_name): sup
@@ -575,6 +681,69 @@ class SparkThriftExecutor:
                     )
 
             timer_capture("CREATING_REFLECTION")
+
+            # 4a. Wrap parquet views to CAST nanosecond-epoch BIGINT columns
+            #     back to TIMESTAMP.  When nanosAsLong=true, Spark reads
+            #     TIMESTAMP(NANOS, false) parquet columns as BIGINT (epoch
+            #     nanoseconds).  Downstream queries expect DATE/TIMESTAMP
+            #     semantics (e.g. WHERE stat_date >= CURRENT_DATE - INTERVAL
+            #     '7' DAYS), so we create a wrapper view that converts them.
+            #     The wrapper replaces the original view name in alias_to_table_name
+            #     so all downstream logic (RBAC, dedup, tombstone, user query)
+            #     sees proper TIMESTAMP columns.
+            for alias, table_name in list(alias_to_table_name.items()):
+                try:
+                    cursor.execute(f"DESCRIBE {table_name}")
+                    desc_rows = cursor.fetchall()
+
+                    # Identify BIGINT columns that look like nanosecond timestamps.
+                    # Heuristic: column name contains 'date', 'time', 'timestamp',
+                    # '_at', '_ts', or is exactly '__timestamp__'.
+                    _ts_patterns = ('date', 'time', 'timestamp', '_at', '_ts')
+                    cast_cols = []
+                    for row in desc_rows:
+                        col_name = str(row[0])
+                        col_type = str(row[1]).strip().upper()
+                        if col_type != 'BIGINT':
+                            continue
+                        col_lower = col_name.lower()
+                        if col_lower == '__timestamp__' or any(p in col_lower for p in _ts_patterns):
+                            cast_cols.append(col_name)
+
+                    if cast_cols:
+                        # Build SELECT with CASTs for timestamp columns, pass-through for others
+                        select_parts = []
+                        for row in desc_rows:
+                            col_name = str(row[0])
+                            if col_name in cast_cols:
+                                # nanos → micros → TIMESTAMP
+                                select_parts.append(
+                                    f"CAST(`{col_name}` / 1000000 AS TIMESTAMP) AS `{col_name}`"
+                                )
+                            else:
+                                select_parts.append(f"`{col_name}`")
+
+                        wrapper_name = f"__{table_name}_tscast__"
+                        wrapper_sql = (
+                            f"CREATE OR REPLACE TEMPORARY VIEW {wrapper_name} AS "
+                            f"SELECT {', '.join(select_parts)} FROM {table_name}"
+                        )
+                        cursor.execute(wrapper_sql)
+                        created_views.append(wrapper_name)
+                        alias_to_table_name[alias] = wrapper_name
+
+                        logger.debug(
+                            f"{log_prefix}[spark.thrift] CAST wrapper for {table_name}: "
+                            f"converted {len(cast_cols)} column(s): {cast_cols}"
+                        )
+                except Exception as cast_err:
+                    # Non-fatal: if DESCRIBE or CAST fails, the original view
+                    # stays in place.  The query may still fail with a type
+                    # mismatch, but at least we don't break the happy path.
+                    logger.debug(
+                        f"{log_prefix}[spark.thrift] timestamp CAST wrapper "
+                        f"failed for {table_name} (non-fatal): {cast_err}"
+                    )
 
             logger.info(
                 f"{log_prefix}[spark.thrift] registered {len(alias_to_table_name)} table(s), "
@@ -638,10 +807,10 @@ class SparkThriftExecutor:
             logger.debug(f"{log_prefix}[spark.thrift] SQL: {executing_query}")
 
             # 6a. Capture Spark query plan via EXPLAIN EXTENDED.
-            #     This runs the Catalyst optimizer without executing the query,
-            #     adding <50ms overhead.  The plan text is written to the same
+            #     Runs the Catalyst optimizer without executing the query
+            #     (<50ms overhead).  The plan text is written to the same
             #     local path that DuckDB uses for its JSON profile, so
-            #     plan_extender can read it uniformly.
+            #     plan_extender reads it uniformly.
             try:
                 cursor.execute(f"EXPLAIN EXTENDED {executing_query}")
                 explain_rows = cursor.fetchall()
@@ -649,8 +818,7 @@ class SparkThriftExecutor:
                     str(row[0]) if row else "" for row in explain_rows
                 )
 
-                # Parse the EXPLAIN output into logical sections.
-                # Spark EXPLAIN EXTENDED returns sections delimited by
+                # Parse EXPLAIN output into sections delimited by
                 # "== <Section Name> ==" headers.
                 plan_sections = {}
                 current_section = "raw"
@@ -691,7 +859,7 @@ class SparkThriftExecutor:
                             f"{plan_write_err}"
                         )
             except Exception as explain_err:
-                # EXPLAIN failure must never block the actual query execution.
+                # EXPLAIN failure must never block the actual query.
                 logger.debug(
                     f"{log_prefix}[spark.thrift] EXPLAIN EXTENDED failed (non-fatal): "
                     f"{explain_err}"

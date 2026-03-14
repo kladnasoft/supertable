@@ -548,6 +548,161 @@
     .timings-row:hover .timings-row-label { color: var(--text-color); }
     .timings-row:hover .timings-row-bar { filter: brightness(1.08); }
 
+    /* --- Query Plan Tree --- */
+    .plan-tree-section {
+      border-top: 1px solid var(--panel-border);
+      margin-top: 12px;
+      padding-top: 16px;
+    }
+    .plan-tree-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px 12px;
+    }
+    .plan-tree-header h4 {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-color);
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .plan-tree-header h4 i { color: var(--primary-color); font-size: 14px; }
+    .plan-tree-sql {
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin: 0 24px 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11px;
+      color: #334155;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 100px;
+      overflow-y: auto;
+    }
+    .plan-node {
+      margin-left: 24px;
+      border-left: 2px solid #e2e8f0;
+      padding-left: 16px;
+      padding-bottom: 4px;
+    }
+    .plan-node:last-child { border-left-color: transparent; }
+    .plan-node-card {
+      display: flex;
+      align-items: stretch;
+      gap: 12px;
+      padding: 8px 12px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      margin-bottom: 6px;
+      background: #ffffff;
+      transition: var(--transition);
+      cursor: default;
+      position: relative;
+    }
+    .plan-node-card:hover {
+      border-color: var(--primary-color);
+      box-shadow: 0 2px 8px rgba(28, 150, 202, 0.08);
+    }
+    .plan-node-card::before {
+      content: '';
+      position: absolute;
+      left: -17px;
+      top: 50%;
+      width: 16px;
+      height: 0;
+      border-top: 2px solid #e2e8f0;
+    }
+    .plan-node-bar {
+      width: 5px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+    .plan-node-body {
+      flex: 1;
+      min-width: 0;
+    }
+    .plan-node-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-color);
+      letter-spacing: 0.02em;
+    }
+    .plan-node-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 3px;
+    }
+    .plan-node-meta span {
+      font-size: 11px;
+      color: var(--text-light);
+    }
+    .plan-node-meta span strong {
+      font-weight: 600;
+      color: var(--text-color);
+    }
+    .plan-node-extra {
+      margin-top: 4px;
+      font-size: 10px;
+      color: #94a3b8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 60px;
+      overflow-y: auto;
+      display: none;
+    }
+    .plan-node-card:hover .plan-node-extra { display: block; }
+    .plan-node-timing {
+      text-align: right;
+      flex-shrink: 0;
+      min-width: 60px;
+    }
+    .plan-node-timing-val {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-color);
+      font-variant-numeric: tabular-nums;
+    }
+    .plan-node-timing-pct {
+      font-size: 10px;
+      color: var(--text-light);
+    }
+    .plan-tree-wrap {
+      padding: 0 24px 20px;
+      overflow-x: auto;
+    }
+    .plan-empty {
+      padding: 20px 24px;
+      color: var(--text-light);
+      font-size: 13px;
+      text-align: center;
+    }
+    .plan-stats-row {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 0 24px 14px;
+    }
+    .plan-stat-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: var(--primary-light);
+      border: 1px solid rgba(28, 150, 202, 0.15);
+      border-radius: 999px;
+      padding: 4px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--secondary-color);
+    }
+    .plan-stat-pill i { font-size: 10px; opacity: 0.6; }
+
 
     /* --- Results Table --- */
     #result table {
@@ -1255,8 +1410,12 @@
       // Clear pivot table
       if (typeof populatePivotControls === 'function') populatePivotControls();
 
+      // Clear query plan tree
+      if (typeof renderQueryPlan === 'function') renderQueryPlan(null);
+
       session.rows = [];
       session.timings = null;
+      session.queryProfile = null;
       session.errorVisible = false;
       session.errorTitle = '';
       session.errorMessage = '';
@@ -1317,6 +1476,9 @@
 
         if (Array.isArray(session.timings) && session.timings.length) {
           renderTimingsChart(session.timings);
+        }
+        if (session.queryProfile) {
+          renderQueryPlan(session.queryProfile);
         }
       }
 
@@ -1777,6 +1939,212 @@ let html = '';
         if (__s) __s.timings = timings;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Query Plan Tree — renders DuckDB/Spark operator tree inside Timings tab
+    // ═══════════════════════════════════════════════════════════════════
+
+    var PLAN_BAR_COLORS = [
+      '#1c96ca', '#10b981', '#f59e0b', '#ef4444',
+      '#8b5cf6', '#ec4899', '#0ea5e9', '#a8a29e',
+    ];
+
+    function _planFormatMs(sec) {
+      if (sec == null || !isFinite(sec)) return '';
+      var ms = sec * 1000;
+      if (ms >= 1) return Math.round(ms) + 'ms';
+      return ms.toFixed(2) + 'ms';
+    }
+
+    function _planFormatBytes(bytes) {
+      if (bytes == null) return '';
+      var abs = Math.abs(bytes);
+      if (abs < 1024) return bytes + ' B';
+      var units = ['KB', 'MB', 'GB', 'TB'];
+      var v = bytes, idx = -1;
+      while (Math.abs(v) >= 1024 && idx < units.length - 1) { v /= 1024; idx++; }
+      return (Math.abs(v) < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + units[idx];
+    }
+
+    function _planFormatRows(n) {
+      if (n == null) return '';
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    }
+
+    function _planCollectTimings(node) {
+      var total = 0;
+      function walk(n) {
+        if (!n) return;
+        var t = n.operator_timing || n.timing || 0;
+        total += t;
+        (n.children || []).forEach(walk);
+      }
+      walk(node);
+      return total;
+    }
+
+    function _planRenderNode(node, totalTiming, depth) {
+      if (!node) return '';
+
+      var opName = node.operator_name || node.operator_type || node.name || 'Unknown';
+      var timing = node.operator_timing || node.timing || 0;
+      var pct = totalTiming > 0 ? (timing / totalTiming * 100) : 0;
+      var cardinality = node.operator_cardinality || node.cardinality || 0;
+      var rowsScanned = node.operator_rows_scanned || node.rows_scanned || 0;
+      var color = PLAN_BAR_COLORS[depth % PLAN_BAR_COLORS.length];
+
+      var extraInfo = node.extra_info || {};
+      var extraParts = [];
+      if (typeof extraInfo === 'object') {
+        for (var k in extraInfo) {
+          if (!extraInfo.hasOwnProperty(k)) continue;
+          var v = extraInfo[k];
+          if (Array.isArray(v)) v = v.join(', ');
+          extraParts.push(k + ': ' + v);
+        }
+      }
+      var extraText = extraParts.length ? extraParts.join('\n') : '';
+
+      var html = '<div class="plan-node">';
+      html += '<div class="plan-node-card">';
+      html += '<div class="plan-node-bar" style="background:' + color + ';"></div>';
+      html += '<div class="plan-node-body">';
+      html += '<div class="plan-node-title">' + _esc(opName) + '</div>';
+      html += '<div class="plan-node-meta">';
+      if (cardinality > 0) html += '<span>Rows: <strong>' + _planFormatRows(cardinality) + '</strong></span>';
+      if (rowsScanned > 0) html += '<span>Scanned: <strong>' + _planFormatRows(rowsScanned) + '</strong></span>';
+      html += '</div>';
+      if (extraText) {
+        html += '<div class="plan-node-extra">' + _esc(extraText) + '</div>';
+      }
+      html += '</div>';
+      html += '<div class="plan-node-timing">';
+      if (timing > 0) {
+        html += '<div class="plan-node-timing-val">' + _planFormatMs(timing) + '</div>';
+        html += '<div class="plan-node-timing-pct">' + pct.toFixed(1) + '%</div>';
+      }
+      html += '</div>';
+      html += '</div>';
+
+      var children = node.children || [];
+      children.forEach(function (child) {
+        html += _planRenderNode(child, totalTiming, depth + 1);
+      });
+
+      html += '</div>';
+      return html;
+    }
+
+    function _esc(s) {
+      if (s == null) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function renderQueryPlan(profile) {
+      var section = document.getElementById('planTreeSection');
+      var wrap = document.getElementById('planTreeWrap');
+      var empty = document.getElementById('planEmpty');
+      var sqlPre = document.getElementById('planSqlPreview');
+      var statsRow = document.getElementById('planStatsRow');
+      if (!section) return;
+
+      // Clear previous
+      if (wrap) wrap.innerHTML = '';
+      if (statsRow) statsRow.innerHTML = '';
+      if (sqlPre) { sqlPre.textContent = ''; sqlPre.style.display = 'none'; }
+
+      if (!profile || typeof profile !== 'object') {
+        section.style.display = 'none';
+        return;
+      }
+
+      // Handle Spark text plan (no children tree)
+      if (profile.engine === 'spark_sql') {
+        section.style.display = 'block';
+        if (empty) empty.style.display = 'none';
+
+        var physPlan = profile.physical_plan || profile.optimized_logical_plan || '';
+        if (physPlan) {
+          if (sqlPre) {
+            sqlPre.textContent = physPlan;
+            sqlPre.style.display = 'block';
+            sqlPre.style.maxHeight = '300px';
+          }
+        } else {
+          if (empty) empty.style.display = 'block';
+        }
+
+        // Show all plan sections as pills
+        var sparkSections = ['parsed_logical_plan', 'analyzed_logical_plan', 'optimized_logical_plan', 'physical_plan'];
+        sparkSections.forEach(function (key) {
+          if (profile[key]) {
+            var pill = document.createElement('span');
+            pill.className = 'plan-stat-pill';
+            pill.style.cursor = 'pointer';
+            pill.innerHTML = '<i class="fas fa-layer-group"></i> ' + key.replace(/_/g, ' ');
+            pill.addEventListener('click', function () {
+              if (sqlPre) {
+                sqlPre.textContent = profile[key];
+                sqlPre.style.display = 'block';
+                sqlPre.style.maxHeight = '300px';
+              }
+            });
+            statsRow.appendChild(pill);
+          }
+        });
+        return;
+      }
+
+      // DuckDB plan tree
+      var hasChildren = profile.children && profile.children.length > 0;
+      if (!hasChildren && !profile.query_name) {
+        section.style.display = 'none';
+        return;
+      }
+
+      section.style.display = 'block';
+      if (empty) empty.style.display = 'none';
+
+      // SQL preview
+      var queryName = profile.query_name || '';
+      if (queryName && sqlPre) {
+        sqlPre.textContent = queryName;
+        sqlPre.style.display = 'block';
+      }
+
+      // Summary stats pills
+      var pills = [];
+      if (profile.latency != null) pills.push({ icon: 'fa-clock', text: 'Latency: ' + _planFormatMs(profile.latency) });
+      if (profile.cpu_time != null) pills.push({ icon: 'fa-microchip', text: 'CPU: ' + _planFormatMs(profile.cpu_time) });
+      if (profile.total_bytes_read != null) pills.push({ icon: 'fa-database', text: 'Read: ' + _planFormatBytes(profile.total_bytes_read) });
+      if (profile.rows_returned != null) pills.push({ icon: 'fa-arrow-right', text: 'Rows: ' + _planFormatRows(profile.rows_returned) });
+      if (profile.cumulative_rows_scanned != null) pills.push({ icon: 'fa-search', text: 'Scanned: ' + _planFormatRows(profile.cumulative_rows_scanned) });
+      if (profile.result_set_size != null) pills.push({ icon: 'fa-file', text: 'Result: ' + _planFormatBytes(profile.result_set_size) });
+
+      pills.forEach(function (p) {
+        var pill = document.createElement('span');
+        pill.className = 'plan-stat-pill';
+        pill.innerHTML = '<i class="fas ' + p.icon + '"></i> ' + p.text;
+        statsRow.appendChild(pill);
+      });
+
+      // Render operator tree
+      if (hasChildren) {
+        var totalTiming = _planCollectTimings(profile);
+        var treeHtml = '';
+        profile.children.forEach(function (child) {
+          treeHtml += _planRenderNode(child, totalTiming, 0);
+        });
+        wrap.innerHTML = treeHtml;
+      }
+
+      // Store on session
+      var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+      if (__s) __s.queryProfile = profile;
+    }
+
     // --- Schema cache for IntelliSense ---
     function _schemaCacheKey() {
       var org = (window.__st_org || '').trim();
@@ -2141,6 +2509,7 @@ let html = '';
 
         if (data.status === 'ok') {
           const timings = (data.meta && data.meta.timings) ? data.meta.timings : null;
+          const queryProfile = (data.meta && data.meta.query_profile) ? data.meta.query_profile : null;
 
           let durationMs = null;
           if (typeof data.duration_ms === 'number') {
@@ -2177,6 +2546,7 @@ let html = '';
               if (timings) {
                 renderTimingsChart(timings);
               }
+              renderQueryPlan(queryProfile);
             }
             return;
           }
@@ -2191,6 +2561,7 @@ let html = '';
           if (session) {
             session.rows = rows;
             session.timings = timings || null;
+            session.queryProfile = queryProfile || null;
             session.errorVisible = false;
             session.errorTitle = '';
             session.errorMessage = '';
@@ -2222,6 +2593,7 @@ let html = '';
             if (timings) {
               renderTimingsChart(timings);
             }
+            renderQueryPlan(queryProfile);
 
             setStatus(statusText);
           }
@@ -3745,6 +4117,19 @@ $(document).ready(function(){
                   </div>
                   <div class="timings-rows" id="timingsRows">
                       <!-- rows rendered by renderTimingsChart() -->
+                  </div>
+
+                  <!-- Query Plan Tree -->
+                  <div id="planTreeSection" class="plan-tree-section" style="display:none;">
+                    <div class="plan-tree-header">
+                      <h4><i class="fas fa-project-diagram"></i> Query plan</h4>
+                    </div>
+                    <div id="planStatsRow" class="plan-stats-row"></div>
+                    <div id="planSqlPreview" class="plan-tree-sql" style="display:none;"></div>
+                    <div id="planTreeWrap" class="plan-tree-wrap"></div>
+                    <div id="planEmpty" class="plan-empty" style="display:none;">
+                      No query plan available for this execution.
+                    </div>
                   </div>
               </div>
           </div>

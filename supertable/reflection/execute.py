@@ -324,6 +324,9 @@ def attach_execute_routes(
                 "plan_stats": getattr(
                     getattr(dr, "plan_stats", None), "stats", None
                 ),
+                "query_profile": getattr(
+                    getattr(dr, "query_plan_manager", None), "query_profile", None
+                ),
             }
 
             return JSONResponse({

@@ -79,6 +79,12 @@ def extend_execution_plan(
     message = message or ""
     result_shape = result_shape or (0, 0)
 
+    # Stash the parsed plan onto the query_plan_manager so upstream callers
+    # (e.g. execute.py API) can include it in the response without re-reading
+    # the file (which is deleted below).
+    if query_plan_manager is not None:
+        query_plan_manager.query_profile = base_plan
+
     # Build extended (in-memory) representation
     extended_plan = {
         "execution_timings": timing,
