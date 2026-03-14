@@ -8,6 +8,12 @@ from supertable.config.defaults import logger
 from supertable.utils.helper import generate_hash_uid
 from supertable.utils.sql_parser import SQLParser
 
+try:
+    from supertable.config.homedir import get_app_home
+except ImportError:
+    def get_app_home() -> str:
+        return os.path.expanduser("~/supertable")
+
 
 def _now_ms() -> int:
     """UTC timestamp in milliseconds."""
@@ -21,6 +27,13 @@ class QueryPlanManager:
       - Creates a per-table temp directory for DuckDB profile output.
       - Exposes the full path where DuckDB should write its JSON profile.
       - Optionally cleans up old plan files to keep temp tidy.
+
+    Path resolution:
+      The temp_dir and query_plan_path are always **absolute** paths rooted
+      under the app home directory.  This ensures that DuckDB (which writes
+      to local disk) and plan_extender (which reads back the JSON) agree on
+      the file location.  Previous versions stored a relative path that
+      init_connection() silently re-rooted, causing a mismatch.
     """
 
     def __init__(self, super_name: str, organization: str, current_meta_path: str, query: str):
@@ -28,8 +41,11 @@ class QueryPlanManager:
         self.organization = organization
         self.super_name = super_name
 
-        # Temp directory under the super/table scope -> avoids collisions across supers
-        self.temp_dir = os.path.join(self.organization, super_name, "tmp")
+        # Build an absolute temp directory rooted under the app home.
+        # Matches the resolution logic in engine_common.init_connection()
+        # so DuckDB's profile_output writes to the same path we read from.
+        rel_temp = os.path.join(organization, super_name, "tmp")
+        self.temp_dir = os.path.join(get_app_home(), "tmp", rel_temp)
         # Create once; safe for concurrent processes
         os.makedirs(self.temp_dir, exist_ok=True)
         logger.debug(f"Using temp dir {self.temp_dir}")

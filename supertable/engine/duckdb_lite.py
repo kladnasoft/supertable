@@ -224,6 +224,16 @@ class DuckDBLite:
             )
             parser.executing_query = executing_query
 
+            # Enable profiling for this query.  The PRAGMAs are connection-
+            # level state so we set them immediately before execute and
+            # disable profiling in the finally block to avoid capturing
+            # profile data for view-cleanup DDL statements.
+            try:
+                con.execute("PRAGMA enable_profiling='json';")
+                con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
+            except Exception:
+                pass
+
             logger.debug(f"{log_prefix}[duckdb.lite] executing: {executing_query}")
             result = con.execute(executing_query).fetchdf()
 
@@ -233,6 +243,11 @@ class DuckDBLite:
             return result
 
         finally:
+            # Disable profiling so cleanup DDL is not captured.
+            try:
+                con.execute("PRAGMA disable_profiling;")
+            except Exception:
+                pass
             # Drop all per-query VIEWs in reverse creation order.
             for view in reversed(created_views):
                 try:

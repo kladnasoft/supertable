@@ -306,13 +306,6 @@ class DuckDBPro:
 
         timer_capture("CREATING_REFLECTION")
 
-        # Enable profiling outside the lock — no shared state modified.
-        try:
-            con.execute("PRAGMA enable_profiling='json';")
-            con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
-        except Exception:
-            pass
-
         # Both lists declared before the try block so the finally clause can
         # always reference them, even if an exception fires before the inner
         # assignments are reached (which would cause a NameError otherwise).
@@ -372,6 +365,17 @@ class DuckDBPro:
             )
             parser.executing_query = executing_query
 
+            # Enable profiling immediately before execution.  PRAGMAs are
+            # connection-level state — setting them as close as possible to
+            # the execute call minimises the race window when concurrent
+            # queries share the singleton connection.  Profiling is disabled
+            # in the finally block to avoid capturing cleanup DDL.
+            try:
+                con.execute("PRAGMA enable_profiling='json';")
+                con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
+            except Exception:
+                pass
+
             logger.debug(f"{log_prefix}[duckdb.pro] executing: {executing_query}")
 
             # The actual query execution can use a thread-local cursor
@@ -380,6 +384,11 @@ class DuckDBPro:
             return result
 
         finally:
+            # Disable profiling so cleanup DDL is not captured.
+            try:
+                con.execute("PRAGMA disable_profiling;")
+            except Exception:
+                pass
             # Drop per-query RBAC views
             if rbac_view_names:
                 with self._lock:

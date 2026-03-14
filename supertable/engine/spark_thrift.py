@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -635,6 +636,66 @@ class SparkThriftExecutor:
             parser.executing_query = executing_query
 
             logger.debug(f"{log_prefix}[spark.thrift] SQL: {executing_query}")
+
+            # 6a. Capture Spark query plan via EXPLAIN EXTENDED.
+            #     This runs the Catalyst optimizer without executing the query,
+            #     adding <50ms overhead.  The plan text is written to the same
+            #     local path that DuckDB uses for its JSON profile, so
+            #     plan_extender can read it uniformly.
+            try:
+                cursor.execute(f"EXPLAIN EXTENDED {executing_query}")
+                explain_rows = cursor.fetchall()
+                explain_text = "\n".join(
+                    str(row[0]) if row else "" for row in explain_rows
+                )
+
+                # Parse the EXPLAIN output into logical sections.
+                # Spark EXPLAIN EXTENDED returns sections delimited by
+                # "== <Section Name> ==" headers.
+                plan_sections = {}
+                current_section = "raw"
+                current_lines = []
+                for line in explain_text.split("\n"):
+                    stripped = line.strip()
+                    if stripped.startswith("== ") and stripped.endswith(" =="):
+                        if current_lines:
+                            plan_sections[current_section] = "\n".join(current_lines)
+                        current_section = stripped[3:-3].strip().lower().replace(" ", "_")
+                        current_lines = []
+                    else:
+                        current_lines.append(line)
+                if current_lines:
+                    plan_sections[current_section] = "\n".join(current_lines)
+
+                spark_plan = {
+                    "engine": "spark_sql",
+                    "parsed_logical_plan": plan_sections.get("parsed_logical_plan", ""),
+                    "analyzed_logical_plan": plan_sections.get("analyzed_logical_plan", ""),
+                    "optimized_logical_plan": plan_sections.get("optimized_logical_plan", ""),
+                    "physical_plan": plan_sections.get("physical_plan", ""),
+                }
+
+                # Write to the local plan path so plan_extender finds it.
+                if query_manager and query_manager.query_plan_path:
+                    try:
+                        os.makedirs(os.path.dirname(query_manager.query_plan_path), exist_ok=True)
+                        with open(query_manager.query_plan_path, "w", encoding="utf-8") as fh:
+                            json.dump(spark_plan, fh, ensure_ascii=False)
+                        logger.debug(
+                            f"{log_prefix}[spark.thrift] query plan saved to "
+                            f"{query_manager.query_plan_path}"
+                        )
+                    except Exception as plan_write_err:
+                        logger.debug(
+                            f"{log_prefix}[spark.thrift] failed to write plan JSON: "
+                            f"{plan_write_err}"
+                        )
+            except Exception as explain_err:
+                # EXPLAIN failure must never block the actual query execution.
+                logger.debug(
+                    f"{log_prefix}[spark.thrift] EXPLAIN EXTENDED failed (non-fatal): "
+                    f"{explain_err}"
+                )
 
             cursor.execute(executing_query)
 

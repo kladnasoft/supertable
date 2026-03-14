@@ -1,3 +1,4 @@
+# route: supertable.utils.sql_parser
 from typing import Dict, List, Optional, Set, Tuple
 
 import sqlglot
@@ -193,6 +194,27 @@ class SQLParser:
         parent = col.parent
         return isinstance(parent, exp.Alias) and parent.this is col
 
+    @staticmethod
+    def _is_inside_alias_scope(col: exp.Column) -> bool:
+        """
+        True if this Column lives inside a clause where SELECT alias
+        references are legal in standard SQL: ORDER BY, HAVING, or QUALIFY.
+
+        Walking up the AST from the Column node, if we hit one of these
+        clause types before reaching the Select node, the column is in
+        alias scope and may be a reference to a computed SELECT alias
+        rather than a physical table column.
+        """
+        node = col.parent
+        while node is not None:
+            if isinstance(node, (exp.Order, exp.Having, exp.Qualify)):
+                return True
+            if isinstance(node, exp.Select):
+                # Reached the SELECT without passing through ORDER/HAVING/QUALIFY
+                return False
+            node = node.parent
+        return False
+
     # ---------------- Column extraction ----------------
 
     def _extract_columns(self) -> None:
@@ -330,6 +352,18 @@ class SQLParser:
                             alias_to_columns[resolved_alias].append(col_name)
 
         # 2) Handle remaining Column nodes (WHERE, JOIN, GROUP BY, ORDER BY, etc.)
+        #
+        # Collect SELECT-list alias names so we can recognise references to
+        # computed columns in ORDER BY / HAVING / QUALIFY.  These aliases are
+        # NOT physical table columns and must not be added to the column set.
+        select_alias_names: Set[str] = set()
+        if select_expr is not None:
+            for proj in select_expr.expressions:
+                if isinstance(proj, exp.Alias):
+                    alias_ident = proj.args.get("alias")
+                    if isinstance(alias_ident, exp.Identifier) and alias_ident.name:
+                        select_alias_names.add(alias_ident.name.lower())
+
         for col in self._parsed.find_all(exp.Column):
             col_name = col.name
             if not col_name or col_name == "*":
@@ -338,6 +372,16 @@ class SQLParser:
 
             if self._is_direct_alias_projection_column(col):
                 # Already counted from SELECT list.
+                continue
+
+            # Skip references to SELECT aliases in clauses where alias
+            # references are legal (ORDER BY, HAVING, QUALIFY).  These are
+            # not physical table columns.
+            if (
+                col_name.lower() in select_alias_names
+                and not col.table
+                and self._is_inside_alias_scope(col)
+            ):
                 continue
 
             table_alias = col.table

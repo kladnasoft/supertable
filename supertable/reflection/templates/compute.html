@@ -19,12 +19,12 @@
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 
   .root {
-    background: #ffffff; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    background: #ffffff; border-radius: 12px; box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
     padding: 24px 28px; border: 1px solid rgba(0,0,0,0.05); border-left: 5px solid var(--azure);
   }
 
   .panel {
-    border: 1px solid var(--border); border-radius: 16px; background: #fff; padding: 14px;
+    border: 1px solid var(--border); border-radius: 12px; background: #fff; padding: 14px;
   }
   .panel-head {
     display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:nowrap;
@@ -62,7 +62,7 @@
   .btn-test:disabled { opacity:0.5; cursor:not-allowed; }
 
   .rowcard {
-    border:1px solid var(--border); border-radius:16px; background:#fff; padding:12px;
+    border:1px solid var(--border); border-radius:12px; background:#fff; padding:12px;
     display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;
   }
   .rowcard + .rowcard { margin-top:10px; }
@@ -89,12 +89,12 @@
 
   /* Modal */
   .modal-backdrop {
-    position:fixed; inset:0; background:rgba(15,23,42,.55); display:none;
+    position:fixed; inset:0; background:rgba(15,23,42,.65); display:none;
     align-items:center; justify-content:center; z-index:4500; padding:18px; backdrop-filter:blur(3px);
   }
   .modal-card {
     width:620px; max-width:95vw; max-height:90vh; overflow-y:auto;
-    background:#fff; border-radius:18px; border:1px solid var(--border); padding:22px; box-shadow:var(--shadow);
+    background:#fff; border-radius:12px; border:1px solid var(--border); padding:22px; box-shadow:0 20px 60px rgba(15,23,42,0.4);
   }
   .modal-card.sql    { border-left:5px solid #d97706; }
   .modal-card.python { border-left:5px solid #7c3aed; }
@@ -113,10 +113,10 @@
   .modal-sub { margin-top:3px; color:var(--slate-500); font-size:12px; }
 
   .btn-ghost {
-    padding:6px 10px; border-radius:10px; border:1px solid #d0d7e7;
+    padding:6px 10px; border-radius:8px; border:1px solid #e0e5f0;
     background:transparent; color:#475569; cursor:pointer; font-size:12px;
   }
-  .btn-ghost:hover { background:#e2e8f0; }
+  .btn-ghost:hover { background:#f1f5f9; border-color:#cbd5e1; }
 
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   @media (max-width:780px) { .grid { grid-template-columns:1fr; } }

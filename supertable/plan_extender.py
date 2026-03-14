@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple
 
@@ -26,6 +27,19 @@ def _safe_json(obj: Any) -> str:
             return "{}"
 
 
+def _read_local_json(path: str) -> Dict[str, Any]:
+    """
+    Read a JSON file from the local filesystem.
+
+    DuckDB writes its profile JSON to a local disk path (via PRAGMA
+    profile_output).  This helper reads it back using stdlib I/O,
+    avoiding the remote-storage backend which operates on object-store
+    keys (S3, MinIO) and would never find a local temp file.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def extend_execution_plan(
     query_plan_manager: QueryPlanManager,
     role_name: str,
@@ -43,19 +57,21 @@ def extend_execution_plan(
     - Never raise from this function (monitoring must not break reads).
     - Handle missing/invalid JSON profile gracefully.
     - Avoid gigantic payloads by JSON-encoding nested parts into strings.
-    """
-    storage = get_storage()
 
-    # Load the raw plan, if present
+    Note: the plan JSON is read from the *local filesystem* (where DuckDB
+    wrote it via PRAGMA profile_output), not from the remote storage backend.
+    """
+
+    # Load the raw plan from local disk, if present
     base_plan: Dict[str, Any] = {}
+    plan_path = getattr(query_plan_manager, "query_plan_path", None) if query_plan_manager else None
     try:
-        if query_plan_manager and query_plan_manager.query_plan_path:
-            if storage.exists(query_plan_manager.query_plan_path):
-                base_plan = storage.read_json(query_plan_manager.query_plan_path)
-            else:
-                logger.debug("Plan JSON does not exist at %s", query_plan_manager.query_plan_path)
+        if plan_path and os.path.isfile(plan_path):
+            base_plan = _read_local_json(plan_path)
+        elif plan_path:
+            logger.debug("Plan JSON does not exist at %s", plan_path)
     except Exception as e:  # noqa: BLE001
-        logger.warning("Could not read plan JSON (%s): %s", getattr(query_plan_manager, "query_plan_path", "?"), e)
+        logger.warning("Could not read plan JSON (%s): %s", plan_path or "?", e)
         base_plan = {}
 
     # Normalize inputs
@@ -103,11 +119,10 @@ def extend_execution_plan(
     except Exception as e:  # noqa: BLE001
         logger.warning("Monitoring logging failed (non-fatal): %s", e)
 
-    # Delete the raw plan JSON (best-effort)
+    # Delete the raw plan JSON from local disk (best-effort)
     try:
-        if query_plan_manager and query_plan_manager.query_plan_path:
-            if storage.exists(query_plan_manager.query_plan_path):
-                storage.delete(query_plan_manager.query_plan_path)
-                logger.debug("Deleted plan JSON: %s", query_plan_manager.query_plan_path)
+        if plan_path and os.path.isfile(plan_path):
+            os.remove(plan_path)
+            logger.debug("Deleted plan JSON: %s", plan_path)
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to delete plan JSON (non-fatal): %s", e)

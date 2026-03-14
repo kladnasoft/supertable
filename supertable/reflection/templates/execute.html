@@ -35,14 +35,14 @@
       --primary-light: #e6f4fa;
       --secondary-color: #147ba3;
       --dark-color: #1a1a2e;
-      --light-color: #f8f9fa;
       --text-color: #2b2d42;
       --text-light: #8d99ae;
       --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
-      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05); /* Softer shadow */
+      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
       --header-bg: #f8fafc;
+      --data-table-header-bg: #f1f5f9;
     }
 
     * { box-sizing: border-box; }
@@ -53,7 +53,8 @@
       font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background: #f3f6fb;
       color: var(--text-color);
-      line-height: 1.5; /* Improved readability */
+      font-size: 13px;
+      line-height: 1.5;
     }
 
     a {
@@ -77,7 +78,7 @@
     }
 
     .wrap {
-      max-width: 1200px;
+      max-width: 1400px;
       margin: 0 auto;
       padding: 0px;
     }
@@ -172,19 +173,20 @@
 
     input, select, textarea {
       background: #ffffff;
-      border: 1px solid #d0d7e7;
+      border: 1px solid #e0e5f0;
       color: var(--text-color);
-      border-radius: 8px; /* Sharper radius */
+      border-radius: 8px;
       padding: 8px 12px;
       font-size: 13px;
+      font-family: inherit;
       width: 100%;
       transition: var(--transition);
-      margin-top: 4px; /* Space below label */
+      margin-top: 4px;
     }
 
     input:focus, select:focus, textarea:focus {
       outline: none;
-      box-shadow: 0 0 0 3px var(--primary-light); /* Use primary-light for soft focus ring */
+      box-shadow: 0 0 0 2px var(--primary-light);
       border-color: var(--primary-color);
     }
 
@@ -754,6 +756,201 @@
       padding: 12px;
     }
 
+    /* --- Pivot Table --- */
+    .pivot-divider {
+      border-top: 1px solid var(--panel-border);
+      margin: 24px 0 20px;
+    }
+    .pivot-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .pivot-header h4 {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-color);
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pivot-header h4 i { color: var(--primary-color); font-size: 14px; }
+
+    .pivot-dropzones {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .pivot-zone {
+      border: 1.5px dashed #d0d7e7;
+      border-radius: 10px;
+      padding: 10px 12px;
+      min-height: 72px;
+      background: #f9fafb;
+      transition: var(--transition);
+    }
+    .pivot-zone.dragover {
+      border-color: var(--primary-color);
+      background: var(--primary-light);
+    }
+    .pivot-zone-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-light);
+      margin-bottom: 6px;
+    }
+    .pivot-zone-items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      min-height: 26px;
+    }
+    .pivot-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--primary-light);
+      color: var(--secondary-color);
+      border: 1px solid rgba(28, 150, 202, 0.25);
+      padding: 3px 8px 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: grab;
+      user-select: none;
+      transition: var(--transition);
+    }
+    .pivot-chip:active { cursor: grabbing; }
+    .pivot-chip .pivot-chip-remove {
+      font-size: 9px;
+      cursor: pointer;
+      opacity: 0.5;
+      padding: 2px;
+      border-radius: 50%;
+    }
+    .pivot-chip .pivot-chip-remove:hover { opacity: 1; background: rgba(0,0,0,0.06); }
+
+    .pivot-chip.agg-chip {
+      background: #fef3c7;
+      color: #92400e;
+      border-color: rgba(245, 158, 11, 0.3);
+    }
+
+    .pivot-agg-select {
+      font-size: 10px;
+      padding: 0 2px;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      width: auto;
+      margin: 0;
+      outline: none;
+    }
+    .pivot-agg-select:focus { box-shadow: none; border: none; }
+
+    /* Available fields pool */
+    .pivot-fields-pool {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      padding: 8px 0;
+      margin-bottom: 12px;
+    }
+    .pivot-field-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #ffffff;
+      color: var(--text-color);
+      border: 1px solid #d0d7e7;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: grab;
+      user-select: none;
+      transition: var(--transition);
+    }
+    .pivot-field-chip:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    .pivot-field-chip .field-type-icon {
+      font-size: 9px;
+      opacity: 0.4;
+    }
+    .pivot-field-chip.dragging { opacity: 0.4; }
+
+    /* Pivot result grid */
+    .pivot-result-wrap {
+      overflow: auto;
+      max-height: 50vh;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+    }
+    .pivot-result-wrap table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 12px;
+    }
+    .pivot-result-wrap th {
+      position: sticky;
+      top: 0;
+      background: #f1f5f9;
+      font-weight: 600;
+      color: #4b5563;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      padding: 8px 12px;
+      border-bottom: 2px solid #e2e8f0;
+      border-right: 1px solid #e2e8f0;
+      white-space: nowrap;
+      z-index: 1;
+    }
+    .pivot-result-wrap th:last-child { border-right: none; }
+    .pivot-result-wrap th.pivot-row-header {
+      background: #eef2f7;
+      font-weight: 700;
+      text-transform: none;
+      font-size: 11px;
+    }
+    .pivot-result-wrap td {
+      padding: 6px 12px;
+      border-bottom: 1px solid #f1f5f9;
+      border-right: 1px solid #f1f5f9;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .pivot-result-wrap td:last-child { border-right: none; }
+    .pivot-result-wrap td.pivot-row-label {
+      text-align: left;
+      font-weight: 500;
+      background: #fafbfd;
+      position: sticky;
+      left: 0;
+      z-index: 1;
+    }
+    .pivot-result-wrap tr:hover td { background: #e6f4fa; }
+    .pivot-result-wrap tr:hover td.pivot-row-label { background: #dbeef7; }
+    .pivot-result-wrap .pivot-grand-total td {
+      font-weight: 700;
+      background: #f1f5f9;
+      border-top: 2px solid #e2e8f0;
+    }
+
+    .pivot-empty {
+      text-align: center;
+      padding: 30px 15px;
+      color: var(--text-light);
+      font-size: 13px;
+    }
+
     /* --- SQL pre-flight error marker (squiggly underline in editor) --- */
     .cm-sql-error {
       text-decoration: underline wavy #ef4444;
@@ -1055,6 +1252,9 @@
         window.__vizChartInstance = null;
       }
 
+      // Clear pivot table
+      if (typeof populatePivotControls === 'function') populatePivotControls();
+
       session.rows = [];
       session.timings = null;
       session.errorVisible = false;
@@ -1096,6 +1296,7 @@
 
       if (session.errorVisible) {
         displayError(session.errorTitle || 'Query Error', session.errorMessage || 'Unknown error');
+        if (typeof populatePivotControls === 'function') populatePivotControls();
       } else {
         setStatus(session.statusText || 'Ready', session.statusCls || '');
 
@@ -1103,6 +1304,7 @@
           renderTable(session.rows, session.rows.length, 1, 1000, (p) => executeSQL(p), session.statusText);
           // Restore visualization controls and chart
           populateVizControls();
+          populatePivotControls();
           if (_vizHasChartableData()) {
             renderVisualization();
           }
@@ -1110,6 +1312,7 @@
           resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">No results</div>';
           window.__curRows = [];
           window.__curHeaders = [];
+          if (typeof populatePivotControls === 'function') populatePivotControls();
         }
 
         if (Array.isArray(session.timings) && session.timings.length) {
@@ -2011,6 +2214,7 @@ let html = '';
 
             // Populate and render visualization chart
             populateVizControls();
+            populatePivotControls();
             if (_vizHasChartableData()) {
               renderVisualization();
             }
@@ -2849,6 +3053,446 @@ let html = '';
       window.__vizChartInstance = new Chart(canvas, chartConfig);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Pivot Table Engine — pure client-side, drag-and-drop OLAP cube
+    // ═══════════════════════════════════════════════════════════════════
+
+    window.__pivotConfig = { rows: [], columns: [], values: [], filters: [] };
+    var _pivotDragData = null;
+
+    var PIVOT_AGG_FNS = {
+      SUM:   function (arr) { return arr.reduce(function (s, v) { return s + (Number(v) || 0); }, 0); },
+      COUNT: function (arr) { return arr.length; },
+      AVG:   function (arr) { var s = 0, n = 0; arr.forEach(function (v) { var x = Number(v); if (isFinite(x)) { s += x; n++; } }); return n ? s / n : 0; },
+      MIN:   function (arr) { var m = Infinity; arr.forEach(function (v) { var x = Number(v); if (isFinite(x) && x < m) m = x; }); return m === Infinity ? 0 : m; },
+      MAX:   function (arr) { var m = -Infinity; arr.forEach(function (v) { var x = Number(v); if (isFinite(x) && x > m) m = x; }); return m === -Infinity ? 0 : m; },
+      MEDIAN: function (arr) {
+        var nums = arr.map(Number).filter(isFinite).sort(function (a, b) { return a - b; });
+        if (!nums.length) return 0;
+        var mid = Math.floor(nums.length / 2);
+        return nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
+      },
+    };
+
+    function _pivotFormatNumber(v) {
+      if (v == null || !isFinite(v)) return '';
+      if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+      if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+      if (Number.isInteger(v)) return v.toLocaleString();
+      return v.toFixed(2);
+    }
+
+    function _pivotGetUniqueValues(rows, col) {
+      var seen = {};
+      var result = [];
+      rows.forEach(function (r) {
+        var v = r[col];
+        var key = v == null ? '__null__' : String(v);
+        if (!seen[key]) { seen[key] = true; result.push(v == null ? '(null)' : v); }
+      });
+      return result.sort(function (a, b) { return String(a).localeCompare(String(b)); });
+    }
+
+    function _pivotMakeKey(row, cols) {
+      return cols.map(function (c) { var v = row[c]; return v == null ? '(null)' : String(v); }).join('\x00');
+    }
+
+    function _pivotCompute(rows, config) {
+      if (!rows.length || !config.rows.length || !config.values.length) return null;
+
+      var rowFields = config.rows;
+      var colFields = config.columns;
+      var valueFields = config.values;
+
+      // Apply filters
+      var filtered = rows;
+      if (config.filters.length) {
+        config.filters.forEach(function (f) {
+          if (f.allowed && f.allowed.length) {
+            var allowedSet = {};
+            f.allowed.forEach(function (v) { allowedSet[String(v)] = true; });
+            filtered = filtered.filter(function (r) {
+              return allowedSet[String(r[f.field] == null ? '(null)' : r[f.field])];
+            });
+          }
+        });
+      }
+
+      // Discover unique row and column keys
+      var rowKeys = [];
+      var rowKeySet = {};
+      var colKeys = [];
+      var colKeySet = {};
+
+      filtered.forEach(function (r) {
+        var rk = _pivotMakeKey(r, rowFields);
+        if (!rowKeySet[rk]) { rowKeySet[rk] = true; rowKeys.push(rk); }
+        if (colFields.length) {
+          var ck = _pivotMakeKey(r, colFields);
+          if (!colKeySet[ck]) { colKeySet[ck] = true; colKeys.push(ck); }
+        }
+      });
+
+      // Bucket data: buckets[rowKey][colKey] = { valField: [values...] }
+      var buckets = {};
+      filtered.forEach(function (r) {
+        var rk = _pivotMakeKey(r, rowFields);
+        var ck = colFields.length ? _pivotMakeKey(r, colFields) : '__all__';
+        if (!buckets[rk]) buckets[rk] = {};
+        if (!buckets[rk][ck]) {
+          buckets[rk][ck] = {};
+          valueFields.forEach(function (vf) { buckets[rk][ck][vf.field] = []; });
+        }
+        valueFields.forEach(function (vf) { buckets[rk][ck][vf.field].push(r[vf.field]); });
+      });
+
+      // Grand total bucket
+      var grandBucket = {};
+      if (colFields.length) {
+        colKeys.forEach(function (ck) {
+          grandBucket[ck] = {};
+          valueFields.forEach(function (vf) { grandBucket[ck][vf.field] = []; });
+        });
+      }
+      grandBucket['__all__'] = {};
+      valueFields.forEach(function (vf) { grandBucket['__all__'][vf.field] = []; });
+
+      filtered.forEach(function (r) {
+        var ck = colFields.length ? _pivotMakeKey(r, colFields) : '__all__';
+        valueFields.forEach(function (vf) {
+          if (grandBucket[ck]) grandBucket[ck][vf.field].push(r[vf.field]);
+          grandBucket['__all__'][vf.field].push(r[vf.field]);
+        });
+      });
+
+      if (!colFields.length) colKeys = ['__all__'];
+
+      return {
+        rowFields: rowFields,
+        colFields: colFields,
+        valueFields: valueFields,
+        rowKeys: rowKeys,
+        colKeys: colKeys,
+        buckets: buckets,
+        grandBucket: grandBucket,
+        filteredCount: filtered.length,
+        totalCount: rows.length,
+      };
+    }
+
+    function _pivotRender(pivot) {
+      var el = document.getElementById('pivotResult');
+      if (!el) return;
+
+      if (!pivot) {
+        el.innerHTML = '<div class="pivot-empty">Drag fields into <strong>Rows</strong> and <strong>Values</strong> to create a pivot table.</div>';
+        return;
+      }
+
+      var rowFields = pivot.rowFields;
+      var colFields = pivot.colFields;
+      var valueFields = pivot.valueFields;
+      var hasColDim = colFields.length > 0 && pivot.colKeys[0] !== '__all__';
+      var colKeys = hasColDim ? pivot.colKeys : ['__all__'];
+
+      var html = '<div class="pivot-result-wrap"><table>';
+
+      // Header rows
+      html += '<thead>';
+      if (hasColDim) {
+        // Column dimension header spanning value columns
+        html += '<tr>';
+        rowFields.forEach(function () { html += '<th></th>'; });
+        colKeys.forEach(function (ck) {
+          html += '<th colspan="' + valueFields.length + '" style="text-align:center; border-bottom:1px solid #e2e8f0;">' +
+            ck.replace(/\x00/g, ' × ') + '</th>';
+        });
+        if (colKeys.length > 1) {
+          html += '<th colspan="' + valueFields.length + '" style="text-align:center; border-bottom:1px solid #e2e8f0; background:#eef2f7;">Grand total</th>';
+        }
+        html += '</tr>';
+      }
+
+      // Value headers
+      html += '<tr>';
+      rowFields.forEach(function (rf) { html += '<th class="pivot-row-header">' + rf + '</th>'; });
+      var buildValueHeaders = function () {
+        var h = '';
+        valueFields.forEach(function (vf) { h += '<th>' + vf.agg + '(' + vf.field + ')</th>'; });
+        return h;
+      };
+      colKeys.forEach(function () { html += buildValueHeaders(); });
+      if (hasColDim && colKeys.length > 1) { html += buildValueHeaders(); }
+      html += '</tr></thead>';
+
+      // Body
+      html += '<tbody>';
+      pivot.rowKeys.forEach(function (rk) {
+        html += '<tr>';
+        var rkParts = rk.split('\x00');
+        rkParts.forEach(function (part) { html += '<td class="pivot-row-label">' + part + '</td>'; });
+
+        colKeys.forEach(function (ck) {
+          var bucket = (pivot.buckets[rk] || {})[ck];
+          valueFields.forEach(function (vf) {
+            var vals = bucket ? bucket[vf.field] || [] : [];
+            var aggFn = PIVOT_AGG_FNS[vf.agg] || PIVOT_AGG_FNS.SUM;
+            var result = vals.length ? aggFn(vals) : null;
+            html += '<td>' + (result != null ? _pivotFormatNumber(result) : '') + '</td>';
+          });
+        });
+
+        // Grand total for this row
+        if (hasColDim && colKeys.length > 1) {
+          valueFields.forEach(function (vf) {
+            var allVals = [];
+            colKeys.forEach(function (ck) {
+              var bucket = (pivot.buckets[rk] || {})[ck];
+              if (bucket && bucket[vf.field]) allVals = allVals.concat(bucket[vf.field]);
+            });
+            var aggFn = PIVOT_AGG_FNS[vf.agg] || PIVOT_AGG_FNS.SUM;
+            html += '<td style="font-weight:600; background:#f9fafb;">' + _pivotFormatNumber(aggFn(allVals)) + '</td>';
+          });
+        }
+        html += '</tr>';
+      });
+
+      // Grand total row
+      html += '<tr class="pivot-grand-total">';
+      rowFields.forEach(function (_, idx) {
+        html += '<td class="pivot-row-label" style="font-weight:700;">' + (idx === 0 ? 'Grand total' : '') + '</td>';
+      });
+      colKeys.forEach(function (ck) {
+        valueFields.forEach(function (vf) {
+          var vals = pivot.grandBucket[ck] ? pivot.grandBucket[ck][vf.field] || [] : [];
+          var aggFn = PIVOT_AGG_FNS[vf.agg] || PIVOT_AGG_FNS.SUM;
+          html += '<td>' + _pivotFormatNumber(aggFn(vals)) + '</td>';
+        });
+      });
+      if (hasColDim && colKeys.length > 1) {
+        valueFields.forEach(function (vf) {
+          var vals = pivot.grandBucket['__all__'] ? pivot.grandBucket['__all__'][vf.field] || [] : [];
+          var aggFn = PIVOT_AGG_FNS[vf.agg] || PIVOT_AGG_FNS.SUM;
+          html += '<td>' + _pivotFormatNumber(aggFn(vals)) + '</td>';
+        });
+      }
+      html += '</tr>';
+
+      html += '</tbody></table></div>';
+      html += '<div class="text-xs muted" style="text-align:right; margin-top:6px;">' +
+        pivot.filteredCount + ' of ' + pivot.totalCount + ' rows' + '</div>';
+      el.innerHTML = html;
+    }
+
+    function _pivotRefresh() {
+      var rows = window.__curRows || [];
+      if (!rows.length || !window.__pivotConfig.rows.length || !window.__pivotConfig.values.length) {
+        _pivotRender(null);
+        return;
+      }
+      var pivot = _pivotCompute(rows, window.__pivotConfig);
+      _pivotRender(pivot);
+    }
+
+    // ── Drag & drop helpers ──────────────────────────────────────
+
+    function _pivotCreateFieldChip(field, isNumeric) {
+      var chip = document.createElement('span');
+      chip.className = 'pivot-field-chip';
+      chip.draggable = true;
+      chip.dataset.field = field;
+      chip.dataset.numeric = isNumeric ? '1' : '0';
+      var icon = document.createElement('i');
+      icon.className = 'field-type-icon fas ' + (isNumeric ? 'fa-hashtag' : 'fa-font');
+      chip.appendChild(icon);
+      chip.appendChild(document.createTextNode(' ' + field));
+
+      chip.addEventListener('dragstart', function (e) {
+        _pivotDragData = { field: field, numeric: isNumeric, source: 'pool' };
+        e.dataTransfer.effectAllowed = 'move';
+        chip.classList.add('dragging');
+      });
+      chip.addEventListener('dragend', function () { chip.classList.remove('dragging'); });
+      return chip;
+    }
+
+    function _pivotCreateZoneChip(field, zone, agg) {
+      var chip = document.createElement('span');
+      chip.className = 'pivot-chip' + (zone === 'values' ? ' agg-chip' : '');
+      chip.draggable = true;
+      chip.dataset.field = field;
+      chip.dataset.zone = zone;
+
+      if (zone === 'values' && agg) {
+        var sel = document.createElement('select');
+        sel.className = 'pivot-agg-select';
+        ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'MEDIAN'].forEach(function (fn) {
+          var opt = document.createElement('option');
+          opt.value = fn;
+          opt.textContent = fn;
+          if (fn === agg) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        sel.addEventListener('change', function () {
+          var cfg = window.__pivotConfig;
+          var entry = cfg.values.find(function (v) { return v.field === field; });
+          if (entry) entry.agg = sel.value;
+          _pivotRefresh();
+        });
+        chip.appendChild(sel);
+        chip.appendChild(document.createTextNode('(' + field + ')'));
+      } else {
+        chip.appendChild(document.createTextNode(field));
+      }
+
+      var removeBtn = document.createElement('i');
+      removeBtn.className = 'fas fa-times pivot-chip-remove';
+      removeBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        _pivotRemoveFromZone(field, zone);
+      });
+      chip.appendChild(removeBtn);
+
+      chip.addEventListener('dragstart', function (e) {
+        _pivotDragData = { field: field, numeric: true, source: zone };
+        e.dataTransfer.effectAllowed = 'move';
+      });
+
+      return chip;
+    }
+
+    function _pivotRemoveFromZone(field, zone) {
+      var cfg = window.__pivotConfig;
+      if (zone === 'values') {
+        cfg.values = cfg.values.filter(function (v) { return v.field !== field; });
+      } else if (zone === 'filters') {
+        cfg.filters = cfg.filters.filter(function (v) { return v.field !== field; });
+      } else {
+        cfg[zone] = cfg[zone].filter(function (v) { return v !== field; });
+      }
+      _pivotRenderControls();
+      _pivotRefresh();
+    }
+
+    function _pivotAddToZone(field, zone, isNumeric) {
+      var cfg = window.__pivotConfig;
+      // Remove from any existing zone first
+      cfg.rows = cfg.rows.filter(function (v) { return v !== field; });
+      cfg.columns = cfg.columns.filter(function (v) { return v !== field; });
+      cfg.values = cfg.values.filter(function (v) { return v.field !== field; });
+      cfg.filters = cfg.filters.filter(function (v) { return v.field !== field; });
+
+      if (zone === 'values') {
+        cfg.values.push({ field: field, agg: isNumeric ? 'SUM' : 'COUNT' });
+      } else if (zone === 'filters') {
+        var rows = window.__curRows || [];
+        var allVals = _pivotGetUniqueValues(rows, field);
+        cfg.filters.push({ field: field, allowed: allVals.slice() });
+      } else {
+        cfg[zone].push(field);
+      }
+      _pivotRenderControls();
+      _pivotRefresh();
+    }
+
+    function _pivotIsFieldInUse(field) {
+      var cfg = window.__pivotConfig;
+      if (cfg.rows.indexOf(field) >= 0) return true;
+      if (cfg.columns.indexOf(field) >= 0) return true;
+      if (cfg.values.some(function (v) { return v.field === field; })) return true;
+      if (cfg.filters.some(function (v) { return v.field === field; })) return true;
+      return false;
+    }
+
+    function _pivotRenderControls() {
+      var rows = window.__curRows || [];
+      var headers = window.__curHeaders || [];
+      var pool = document.getElementById('pivotFieldsPool');
+      if (!pool) return;
+
+      // Rebuild pool (show only unused fields)
+      pool.innerHTML = '';
+      headers.forEach(function (h) {
+        if (!_pivotIsFieldInUse(h)) {
+          var isNum = _vizIsNumericColumn(rows, h);
+          pool.appendChild(_pivotCreateFieldChip(h, isNum));
+        }
+      });
+
+      // Rebuild zone chips
+      ['rows', 'columns', 'values', 'filters'].forEach(function (zone) {
+        var zoneEl = document.getElementById('pivotZone' + zone.charAt(0).toUpperCase() + zone.slice(1));
+        if (!zoneEl) return;
+        var items = zoneEl.querySelector('.pivot-zone-items');
+        if (!items) return;
+        items.innerHTML = '';
+
+        var cfg = window.__pivotConfig;
+        if (zone === 'values') {
+          cfg.values.forEach(function (vf) {
+            items.appendChild(_pivotCreateZoneChip(vf.field, zone, vf.agg));
+          });
+        } else if (zone === 'filters') {
+          cfg.filters.forEach(function (ff) {
+            var chip = _pivotCreateZoneChip(ff.field, zone);
+            items.appendChild(chip);
+          });
+        } else {
+          cfg[zone].forEach(function (f) {
+            items.appendChild(_pivotCreateZoneChip(f, zone));
+          });
+        }
+      });
+    }
+
+    function populatePivotControls() {
+      window.__pivotConfig = { rows: [], columns: [], values: [], filters: [] };
+      _pivotRenderControls();
+      _pivotRender(null);
+    }
+
+    function resetPivot() {
+      populatePivotControls();
+    }
+
+    // ── Zone drop handlers ───────────────────────────────────────
+
+    function _pivotInitDropZones() {
+      ['Rows', 'Cols', 'Values', 'Filters'].forEach(function (suffix) {
+        var zone = document.getElementById('pivotZone' + suffix);
+        if (!zone) return;
+        var zoneName = zone.dataset.zone;
+
+        zone.addEventListener('dragover', function (e) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          zone.classList.add('dragover');
+        });
+        zone.addEventListener('dragleave', function () { zone.classList.remove('dragover'); });
+        zone.addEventListener('drop', function (e) {
+          e.preventDefault();
+          zone.classList.remove('dragover');
+          if (_pivotDragData) {
+            _pivotAddToZone(_pivotDragData.field, zoneName, _pivotDragData.numeric);
+            _pivotDragData = null;
+          }
+        });
+      });
+
+      // Pool also accepts drops (to remove from zones)
+      var pool = document.getElementById('pivotFieldsPool');
+      if (pool) {
+        pool.addEventListener('dragover', function (e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; });
+        pool.addEventListener('drop', function (e) {
+          e.preventDefault();
+          if (_pivotDragData && _pivotDragData.source !== 'pool') {
+            _pivotRemoveFromZone(_pivotDragData.field, _pivotDragData.source);
+            _pivotDragData = null;
+          }
+        });
+      }
+    }
+
 $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
@@ -2902,6 +3546,9 @@ $(document).ready(function(){
       if (_vizTypeEl) _vizTypeEl.addEventListener('change', function () { renderVisualization(); });
       if (_vizXEl) _vizXEl.addEventListener('change', function () { renderVisualization(); });
       if (_vizYEl) _vizYEl.addEventListener('change', function () { renderVisualization(); });
+
+      // Pivot table drop zone initialization
+      _pivotInitDropZones();
 
       // Persist execution tabs before navigating away
       window.addEventListener('beforeunload', function () {
@@ -3044,6 +3691,46 @@ $(document).ready(function(){
                   </div>
                   <div id="viz-empty" class="muted text-sm" style="padding:15px; text-align:center; display:none;">
                     No chartable data. Execute a query that returns at least one numeric column.
+                  </div>
+
+                  <!-- ═══ Pivot Table Section ═══ -->
+                  <div class="pivot-divider"></div>
+                  <div class="pivot-header">
+                    <h4><i class="fas fa-table-cells"></i> Pivot table</h4>
+                    <button class="btn" onclick="resetPivot()" style="font-size:11px; padding:4px 10px;">
+                      <i class="fas fa-undo"></i>&nbsp;Reset
+                    </button>
+                  </div>
+
+                  <!-- Available fields -->
+                  <div class="pivot-zone-label">Available fields — drag into zones below</div>
+                  <div id="pivotFieldsPool" class="pivot-fields-pool"></div>
+
+                  <!-- Drop zones -->
+                  <div class="pivot-dropzones">
+                    <div class="pivot-zone" id="pivotZoneRows" data-zone="rows">
+                      <div class="pivot-zone-label"><i class="fas fa-arrows-alt-v"></i> Rows</div>
+                      <div class="pivot-zone-items"></div>
+                    </div>
+                    <div class="pivot-zone" id="pivotZoneCols" data-zone="columns">
+                      <div class="pivot-zone-label"><i class="fas fa-arrows-alt-h"></i> Columns</div>
+                      <div class="pivot-zone-items"></div>
+                    </div>
+                    <div class="pivot-zone" id="pivotZoneValues" data-zone="values">
+                      <div class="pivot-zone-label"><i class="fas fa-calculator"></i> Values</div>
+                      <div class="pivot-zone-items"></div>
+                    </div>
+                    <div class="pivot-zone" id="pivotZoneFilters" data-zone="filters">
+                      <div class="pivot-zone-label"><i class="fas fa-filter"></i> Filters</div>
+                      <div class="pivot-zone-items"></div>
+                    </div>
+                  </div>
+
+                  <!-- Pivot result -->
+                  <div id="pivotResult">
+                    <div class="pivot-empty">
+                      Drag fields into <strong>Rows</strong> and <strong>Values</strong> to create a pivot table.
+                    </div>
                   </div>
                 </div>
               </div>
