@@ -2,11 +2,12 @@ from datetime import date
 
 import supertable.config.homedir
 from synthetic_webshop_data_core import GenerationConfig, WebshopDataGenerator
+from synthetic_webshop_defaults import generated_data_dir
 
 
 def main() -> None:
     config = GenerationConfig(
-        output_dir="webshop_demo_data",
+        output_dir=generated_data_dir,
         seed=42,
         n_customers=100000,
         n_categories=12,

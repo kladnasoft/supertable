@@ -726,6 +726,34 @@
       background: var(--primary-color);
       color: white;
     }
+    /* --- Visualize tab controls --- */
+    #viz-controls select {
+      background: #ffffff;
+      border: 1px solid #d0d7e7;
+      color: var(--text-color);
+      cursor: pointer;
+      transition: var(--transition);
+    }
+    #viz-controls select:focus {
+      box-shadow: 0 0 0 3px var(--primary-light);
+      border-color: var(--primary-color);
+    }
+    #vizYAxis {
+      min-height: 28px;
+      max-height: 72px;
+    }
+    #vizYAxis option:checked {
+      background: var(--primary-light);
+      color: var(--primary-color);
+      font-weight: 600;
+    }
+    #viz-chart-wrap {
+      border: 1px solid #f1f5f9;
+      border-radius: 8px;
+      background: #fafbfd;
+      padding: 12px;
+    }
+
     /* --- SQL pre-flight error marker (squiggly underline in editor) --- */
     .cm-sql-error {
       text-decoration: underline wavy #ef4444;
@@ -1021,6 +1049,12 @@
       window.__curRows = [];
       window.__curHeaders = [];
 
+      // Clear visualization chart
+      if (window.__vizChartInstance) {
+        window.__vizChartInstance.destroy();
+        window.__vizChartInstance = null;
+      }
+
       session.rows = [];
       session.timings = null;
       session.errorVisible = false;
@@ -1052,6 +1086,11 @@
       if (window.timingsChartInstance) {
         window.timingsChartInstance = null;
       }
+      // Clear previous visualization chart
+      if (window.__vizChartInstance) {
+        window.__vizChartInstance.destroy();
+        window.__vizChartInstance = null;
+      }
       var _tr2 = document.getElementById('timingsRows');
       if (_tr2) _tr2.innerHTML = '';
 
@@ -1062,6 +1101,11 @@
 
         if (Array.isArray(session.rows) && session.rows.length) {
           renderTable(session.rows, session.rows.length, 1, 1000, (p) => executeSQL(p), session.statusText);
+          // Restore visualization controls and chart
+          populateVizControls();
+          if (_vizHasChartableData()) {
+            renderVisualization();
+          }
         } else if (resultDiv) {
           resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">No results</div>';
           window.__curRows = [];
@@ -1314,6 +1358,13 @@
             }, 0);
         }
 
+        if (tabName === 'visualize' && window.__vizChartInstance) {
+            // Chart.js needs a resize after the container becomes visible
+            setTimeout(() => {
+                try { window.__vizChartInstance.resize(); } catch (e) {}
+            }, 0);
+        }
+
 
         window.__activeInnerTabName = tabName;
         const __s = __getActiveExecSession ? __getActiveExecSession() : null;
@@ -1357,6 +1408,11 @@
 
         if (timingsChart) {
             timingsChart = null;
+        }
+        // Clear visualization chart on error
+        if (window.__vizChartInstance) {
+            window.__vizChartInstance.destroy();
+            window.__vizChartInstance = null;
         }
         var _trClear = document.getElementById('timingsRows');
         if (_trClear) _trClear.innerHTML = '';
@@ -1953,6 +2009,12 @@ let html = '';
               statusText
             );
 
+            // Populate and render visualization chart
+            populateVizControls();
+            if (_vizHasChartableData()) {
+              renderVisualization();
+            }
+
             if (timings) {
               renderTimingsChart(timings);
             }
@@ -2481,6 +2543,312 @@ let html = '';
         if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-shield-halved"></i>&nbsp;Save Role'; }
       }
     }
+    // ═══════════════════════════════════════════════════════════════════
+    // Visualize Tab — auto-detect chart-worthy data and render Chart.js
+    // ═══════════════════════════════════════════════════════════════════
+
+    window.__vizChartInstance = null;
+
+    // Pastel-inspired palette for chart series
+    var VIZ_COLORS = [
+      'rgba(28, 150, 202, 0.85)',   // primary blue
+      'rgba(16, 185, 129, 0.85)',   // emerald
+      'rgba(245, 158, 11, 0.85)',   // amber
+      'rgba(239, 68, 68, 0.80)',    // red
+      'rgba(139, 92, 246, 0.85)',   // violet
+      'rgba(236, 72, 153, 0.80)',   // pink
+      'rgba(14, 165, 233, 0.80)',   // sky
+      'rgba(168, 162, 158, 0.80)',  // stone
+    ];
+    var VIZ_COLORS_BG = [
+      'rgba(28, 150, 202, 0.12)',
+      'rgba(16, 185, 129, 0.12)',
+      'rgba(245, 158, 11, 0.12)',
+      'rgba(239, 68, 68, 0.10)',
+      'rgba(139, 92, 246, 0.12)',
+      'rgba(236, 72, 153, 0.10)',
+      'rgba(14, 165, 233, 0.10)',
+      'rgba(168, 162, 158, 0.10)',
+    ];
+
+    /**
+     * Heuristic: detect whether a column looks like a date/time label axis.
+     * Checks first non-null value for ISO-like patterns or Date parseability.
+     */
+    function _vizIsDateColumn(rows, col) {
+      for (var i = 0; i < Math.min(rows.length, 5); i++) {
+        var v = rows[i][col];
+        if (v == null || v === '') continue;
+        var s = String(v);
+        // ISO date patterns: 2025-01-01, 2025-01-01T00:00:00, etc.
+        if (/^\d{4}-\d{2}-\d{2}/.test(s)) return true;
+        // Also accept epoch-ms or epoch-s numbers that parse to sane dates
+        if (typeof v === 'number' && v > 946684800000 && !isNaN(new Date(v).getTime())) return true;
+      }
+      return false;
+    }
+
+    /**
+     * Heuristic: detect whether a column is numeric (suitable for Y-axis).
+     * Looks at up to 10 non-null values.
+     */
+    function _vizIsNumericColumn(rows, col) {
+      var numCount = 0, checked = 0;
+      for (var i = 0; i < rows.length && checked < 10; i++) {
+        var v = rows[i][col];
+        if (v == null || v === '') continue;
+        checked++;
+        if (typeof v === 'number' && isFinite(v)) { numCount++; continue; }
+        if (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v))) { numCount++; continue; }
+      }
+      return checked > 0 && numCount / checked >= 0.8;
+    }
+
+    /**
+     * Classify all columns into x-axis candidates and y-axis candidates.
+     * Returns { xCols: [...], yCols: [...] } with auto-selected defaults.
+     */
+    function _vizClassifyColumns(rows, headers) {
+      var xCols = [];
+      var yCols = [];
+
+      headers.forEach(function (h) {
+        if (_vizIsDateColumn(rows, h)) {
+          xCols.push(h);
+        } else if (_vizIsNumericColumn(rows, h)) {
+          yCols.push(h);
+        } else {
+          // String/categorical — can be x-axis label
+          xCols.push(h);
+        }
+      });
+
+      // If no explicit x candidates, use first column
+      if (xCols.length === 0 && headers.length > 0) {
+        xCols.push(headers[0]);
+      }
+
+      return { xCols: xCols, yCols: yCols };
+    }
+
+    /**
+     * Format an x-axis label: shorten ISO dates to YYYY-MM for readability.
+     */
+    function _vizFormatLabel(val) {
+      if (val == null) return '';
+      var s = String(val);
+      var m = s.match(/^(\d{4}-\d{2})(?:-\d{2})?/);
+      if (m) return m[1];
+      return s.length > 24 ? s.slice(0, 24) + '…' : s;
+    }
+
+    /**
+     * Populate the Visualize controls (dropdowns) from current result data.
+     * Called after a successful query execution.
+     */
+    function populateVizControls() {
+      var rows = window.__curRows || [];
+      var headers = window.__curHeaders || [];
+      var xSel = document.getElementById('vizXAxis');
+      var ySel = document.getElementById('vizYAxis');
+      if (!xSel || !ySel) return;
+
+      xSel.innerHTML = '';
+      ySel.innerHTML = '';
+
+      if (!rows.length || !headers.length) return;
+
+      var cls = _vizClassifyColumns(rows, headers);
+
+      // Populate x-axis dropdown — all columns, date/categorical first
+      var allForX = cls.xCols.concat(cls.yCols.filter(function (c) { return cls.xCols.indexOf(c) < 0; }));
+      allForX.forEach(function (col) {
+        var opt = document.createElement('option');
+        opt.value = col;
+        opt.textContent = col;
+        xSel.appendChild(opt);
+      });
+
+      // Populate y-axis dropdown (multi-select) — numeric columns
+      var yOptions = cls.yCols.length ? cls.yCols : headers;
+      yOptions.forEach(function (col, idx) {
+        var opt = document.createElement('option');
+        opt.value = col;
+        opt.textContent = col;
+        // Auto-select all numeric columns
+        if (cls.yCols.indexOf(col) >= 0) opt.selected = true;
+        ySel.appendChild(opt);
+      });
+
+      // Auto-select best chart type
+      var typeSel = document.getElementById('vizChartType');
+      if (typeSel) {
+        if (cls.xCols.length && _vizIsDateColumn(rows, cls.xCols[0])) {
+          typeSel.value = 'line';
+        } else if (rows.length <= 8) {
+          typeSel.value = 'doughnut';
+        } else {
+          typeSel.value = 'bar';
+        }
+      }
+    }
+
+    /**
+     * Returns true if current result data is chart-worthy
+     * (has at least 2 rows and at least 1 numeric column).
+     */
+    function _vizHasChartableData() {
+      var rows = window.__curRows || [];
+      var headers = window.__curHeaders || [];
+      if (rows.length < 2 || headers.length < 2) return false;
+      var cls = _vizClassifyColumns(rows, headers);
+      return cls.yCols.length > 0;
+    }
+
+    /**
+     * Render (or re-render) the chart based on current controls + data.
+     */
+    function renderVisualization() {
+      var rows = window.__curRows || [];
+      var headers = window.__curHeaders || [];
+      var canvas = document.getElementById('vizCanvas');
+      var emptyMsg = document.getElementById('viz-empty');
+      var chartWrap = document.getElementById('viz-chart-wrap');
+
+      if (window.__vizChartInstance) {
+        window.__vizChartInstance.destroy();
+        window.__vizChartInstance = null;
+      }
+
+      if (!rows.length || !headers.length) {
+        if (chartWrap) chartWrap.style.display = 'none';
+        if (emptyMsg) emptyMsg.style.display = 'block';
+        return;
+      }
+
+      var xSel = document.getElementById('vizXAxis');
+      var ySel = document.getElementById('vizYAxis');
+      var typeSel = document.getElementById('vizChartType');
+
+      var xCol = xSel ? xSel.value : headers[0];
+      var yColsSelected = [];
+      if (ySel) {
+        for (var i = 0; i < ySel.options.length; i++) {
+          if (ySel.options[i].selected) yColsSelected.push(ySel.options[i].value);
+        }
+      }
+      if (!yColsSelected.length) {
+        if (chartWrap) chartWrap.style.display = 'none';
+        if (emptyMsg) emptyMsg.style.display = 'block';
+        return;
+      }
+
+      if (chartWrap) chartWrap.style.display = 'block';
+      if (emptyMsg) emptyMsg.style.display = 'none';
+
+      var chartType = typeSel ? typeSel.value : 'line';
+      var isArea = chartType === 'area';
+      var isDoughnut = chartType === 'doughnut';
+      var effectiveType = isArea ? 'line' : (isDoughnut ? 'doughnut' : chartType);
+
+      var labels = rows.map(function (r) { return _vizFormatLabel(r[xCol]); });
+
+      var datasets = [];
+      if (isDoughnut && yColsSelected.length === 1) {
+        // Doughnut: single series, each row is a segment
+        var yCol = yColsSelected[0];
+        var dataVals = rows.map(function (r) {
+          var v = r[yCol];
+          return (v != null && !isNaN(Number(v))) ? Number(v) : 0;
+        });
+        datasets.push({
+          label: yCol,
+          data: dataVals,
+          backgroundColor: rows.map(function (_, idx) { return VIZ_COLORS[idx % VIZ_COLORS.length]; }),
+          borderWidth: 2,
+          borderColor: '#ffffff',
+        });
+      } else {
+        yColsSelected.forEach(function (yCol, sIdx) {
+          var dataVals = rows.map(function (r) {
+            var v = r[yCol];
+            return (v != null && !isNaN(Number(v))) ? Number(v) : null;
+          });
+          var color = VIZ_COLORS[sIdx % VIZ_COLORS.length];
+          var bgColor = VIZ_COLORS_BG[sIdx % VIZ_COLORS_BG.length];
+
+          var ds = {
+            label: yCol,
+            data: dataVals,
+            borderColor: color,
+            backgroundColor: isArea ? bgColor : color,
+            borderWidth: isArea ? 2.5 : (effectiveType === 'bar' ? 0 : 2.5),
+            pointRadius: effectiveType === 'line' || isArea ? 3 : 0,
+            pointHoverRadius: 6,
+            tension: 0.35,
+            fill: isArea,
+          };
+          datasets.push(ds);
+        });
+      }
+
+      var chartConfig = {
+        type: effectiveType,
+        data: { labels: labels, datasets: datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 500, easing: 'easeOutQuart' },
+          plugins: {
+            legend: {
+              display: datasets.length > 1 || isDoughnut,
+              position: isDoughnut ? 'right' : 'top',
+              labels: { font: { family: "'Inter', sans-serif", size: 12, weight: 500 }, padding: 14 },
+            },
+            tooltip: {
+              backgroundColor: 'rgba(15, 23, 42, 0.92)',
+              titleFont: { family: "'Inter', sans-serif", size: 13, weight: 600 },
+              bodyFont: { family: "'Inter', sans-serif", size: 12 },
+              cornerRadius: 8,
+              padding: 10,
+              callbacks: {
+                label: function (ctx) {
+                  var val = ctx.parsed !== undefined ? (typeof ctx.parsed === 'object' ? (ctx.parsed.y != null ? ctx.parsed.y : ctx.parsed) : ctx.parsed) : ctx.raw;
+                  if (typeof val === 'number') val = val.toLocaleString();
+                  return ' ' + ctx.dataset.label + ': ' + val;
+                }
+              }
+            },
+          },
+        },
+      };
+
+      // Axis config only for non-doughnut
+      if (!isDoughnut) {
+        chartConfig.options.scales = {
+          x: {
+            grid: { color: 'rgba(0,0,0,0.04)' },
+            ticks: { font: { family: "'Inter', sans-serif", size: 11 }, color: '#64748b', maxRotation: 45 },
+          },
+          y: {
+            beginAtZero: false,
+            grid: { color: 'rgba(0,0,0,0.05)' },
+            ticks: {
+              font: { family: "'Inter', sans-serif", size: 11 },
+              color: '#64748b',
+              callback: function (v) {
+                if (Math.abs(v) >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+                if (Math.abs(v) >= 1000) return (v / 1000).toFixed(0) + 'K';
+                return v;
+              }
+            },
+          },
+        };
+      }
+
+      window.__vizChartInstance = new Chart(canvas, chartConfig);
+    }
+
 $(document).ready(function(){
       window.__admintoken = "{{ token|e }}";
 
@@ -2527,6 +2895,14 @@ $(document).ready(function(){
         switchTab('execute');
       }
 
+      // Visualization control event listeners — re-render chart on change
+      var _vizTypeEl = document.getElementById('vizChartType');
+      var _vizXEl = document.getElementById('vizXAxis');
+      var _vizYEl = document.getElementById('vizYAxis');
+      if (_vizTypeEl) _vizTypeEl.addEventListener('change', function () { renderVisualization(); });
+      if (_vizXEl) _vizXEl.addEventListener('change', function () { renderVisualization(); });
+      if (_vizYEl) _vizYEl.addEventListener('change', function () { renderVisualization(); });
+
       // Persist execution tabs before navigating away
       window.addEventListener('beforeunload', function () {
         try { __saveActiveExecSessionState(); } catch (e) {}
@@ -2555,6 +2931,9 @@ $(document).ready(function(){
           </div>
           <div id="tab-result" class="tab" onclick="switchTab('result')">
               <i class="fas fa-table"></i>&nbsp;Result
+          </div>
+          <div id="tab-visualize" class="tab" onclick="switchTab('visualize')">
+              <i class="fas fa-chart-line"></i>&nbsp;Visualize
           </div>
           <div id="tab-timings" class="tab" onclick="switchTab('timings')">
               <i class="fas fa-chart-bar"></i>&nbsp;Timings
@@ -2625,6 +3004,46 @@ $(document).ready(function(){
                     <button class="btn-download" onclick="downloadCSV()">
                       <i class="fas fa-file-csv"></i>&nbsp;Download CSV
                     </button>
+                  </div>
+                </div>
+              </div>
+          </div>
+
+          <div id="tab-content-visualize" class="tab-content">
+              <div class="card" id="visualize-card">
+                <div class="section">
+                  <!-- Chart controls toolbar -->
+                  <div id="viz-controls" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
+                    <div style="display:flex; align-items:center; gap:6px;">
+                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Chart type</label>
+                      <select id="vizChartType" style="width:auto; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;">
+                        <option value="line">Line</option>
+                        <option value="bar">Bar</option>
+                        <option value="area">Area</option>
+                        <option value="doughnut">Doughnut</option>
+                      </select>
+                    </div>
+                    <div class="toolbar-sep"></div>
+                    <div style="display:flex; align-items:center; gap:6px;">
+                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">X-axis</label>
+                      <select id="vizXAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;"></select>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:6px;">
+                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Y-axis</label>
+                      <select id="vizYAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;" multiple></select>
+                    </div>
+                    <div style="margin-left:auto;">
+                      <button class="btn" onclick="renderVisualization()" style="font-size:12px;">
+                        <i class="fas fa-sync-alt"></i>&nbsp;Refresh Chart
+                      </button>
+                    </div>
+                  </div>
+                  <!-- Chart canvas -->
+                  <div id="viz-chart-wrap" style="position:relative; min-height:380px; max-height:520px;">
+                    <canvas id="vizCanvas"></canvas>
+                  </div>
+                  <div id="viz-empty" class="muted text-sm" style="padding:15px; text-align:center; display:none;">
+                    No chartable data. Execute a query that returns at least one numeric column.
                   </div>
                 </div>
               </div>

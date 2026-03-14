@@ -852,11 +852,16 @@ async def submit_feedback(
     }
 
     def _write():
+        import pyarrow as pa
+
+        # DataWriter.write() expects an Arrow-compatible object
+        # (it calls polars.from_arrow(data) internally).
+        batch = pa.RecordBatch.from_pylist([row])
         dw = DataWriter(super_name=sup, organization=org)
         columns, rows, inserted, deleted = dw.write(
             role_name=r,
             simple_name="__feedback__",
-            data=[row],
+            data=batch,
             overwrite_columns=["ts"],  # ts is unique per entry; never overwrite existing rows
         )
         return {"columns": columns, "inserted": inserted, "deleted": deleted}
