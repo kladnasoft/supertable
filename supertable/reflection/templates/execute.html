@@ -2060,57 +2060,40 @@ let html = '';
         return;
       }
 
-      // Handle Spark text plan (no children tree)
-      if (profile.engine === 'spark_sql') {
-        section.style.display = 'block';
-        if (empty) empty.style.display = 'none';
-
-        var physPlan = profile.physical_plan || profile.optimized_logical_plan || '';
-        if (physPlan) {
-          if (sqlPre) {
-            sqlPre.textContent = physPlan;
-            sqlPre.style.display = 'block';
-            sqlPre.style.maxHeight = '300px';
-          }
-        } else {
-          if (empty) empty.style.display = 'block';
-        }
-
-        // Show all plan sections as pills
-        var sparkSections = ['parsed_logical_plan', 'analyzed_logical_plan', 'optimized_logical_plan', 'physical_plan'];
-        sparkSections.forEach(function (key) {
-          if (profile[key]) {
-            var pill = document.createElement('span');
-            pill.className = 'plan-stat-pill';
-            pill.style.cursor = 'pointer';
-            pill.innerHTML = '<i class="fas fa-layer-group"></i> ' + key.replace(/_/g, ' ');
-            pill.addEventListener('click', function () {
-              if (sqlPre) {
-                sqlPre.textContent = profile[key];
-                sqlPre.style.display = 'block';
-                sqlPre.style.maxHeight = '300px';
-              }
-            });
-            statsRow.appendChild(pill);
-          }
-        });
-        return;
-      }
-
-      // DuckDB plan tree
-      var hasChildren = profile.children && profile.children.length > 0;
-      if (!hasChildren && !profile.query_name) {
-        section.style.display = 'none';
-        return;
-      }
-
       section.style.display = 'block';
       if (empty) empty.style.display = 'none';
 
+      var isSpark = (profile.engine === 'spark_sql');
+
+      // ── Engine pill ──
+      var enginePill = document.createElement('span');
+      enginePill.className = 'plan-stat-pill';
+      enginePill.innerHTML = '<i class="fas fa-bolt"></i> ' + (isSpark ? 'Spark SQL' : 'DuckDB');
+      statsRow.appendChild(enginePill);
+
+      if (isSpark) {
+        _renderSparkPlan(profile, wrap, sqlPre, statsRow, empty);
+      } else {
+        _renderDuckDBPlan(profile, wrap, sqlPre, statsRow, empty);
+      }
+
+      // Store on session
+      var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+      if (__s) __s.queryProfile = profile;
+    }
+
+    // ── DuckDB plan renderer ─────────────────────────────────
+
+    function _renderDuckDBPlan(profile, wrap, sqlPre, statsRow, empty) {
+      var hasChildren = profile.children && profile.children.length > 0;
+      if (!hasChildren && !profile.query_name) {
+        if (empty) empty.style.display = 'block';
+        return;
+      }
+
       // SQL preview
-      var queryName = profile.query_name || '';
-      if (queryName && sqlPre) {
-        sqlPre.textContent = queryName;
+      if (profile.query_name && sqlPre) {
+        sqlPre.textContent = profile.query_name;
         sqlPre.style.display = 'block';
       }
 
@@ -2139,10 +2122,155 @@ let html = '';
         });
         wrap.innerHTML = treeHtml;
       }
+    }
 
-      // Store on session
-      var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
-      if (__s) __s.queryProfile = profile;
+    // ── Spark plan renderer ──────────────────────────────────
+
+    /**
+     * Parse a Spark text plan (indented +- tree) into a structured tree:
+     *   { name: 'HashAggregate', detail: 'keys=[...], functions=[...]',
+     *     children: [...] }
+     */
+    function _sparkParsePlanText(text) {
+      if (!text || !text.trim()) return [];
+      var lines = text.split('\n').filter(function (l) { return l.trim().length > 0; });
+      if (!lines.length) return [];
+
+      // Each line: leading spaces, optional "+- ", then the operator text.
+      // Indent depth is measured by the number of leading chars before the operator name.
+      var entries = [];
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        // Find where the actual text starts (after spaces and "+- ")
+        var match = line.match(/^(\s*(?:\+- )?)(.*)/);
+        if (!match) continue;
+        var prefix = match[1];
+        var content = match[2].trim();
+        if (!content) continue;
+        // Depth = number of leading characters ÷ 3 (Spark uses 3-char indentation per level)
+        var depth = Math.floor(prefix.replace(/\+- $/, '   ').length / 3);
+        // Split operator name from parenthesized details
+        var opMatch = content.match(/^([A-Za-z_][A-Za-z0-9_ ]*?)(?:\s*\((.+)\))?$/);
+        var name, detail;
+        if (opMatch) {
+          name = opMatch[1].trim();
+          detail = opMatch[2] || '';
+        } else {
+          // Complex line — first word is the operator, rest is detail
+          var spaceIdx = content.indexOf(' ');
+          if (spaceIdx > 0) {
+            name = content.substring(0, spaceIdx);
+            detail = content.substring(spaceIdx + 1);
+          } else {
+            name = content;
+            detail = '';
+          }
+        }
+        entries.push({ depth: depth, name: name, detail: detail, children: [] });
+      }
+
+      // Build tree from flat list using depth
+      if (!entries.length) return [];
+      var roots = [];
+      var stack = []; // { depth, node }
+      entries.forEach(function (entry) {
+        var node = { name: entry.name, detail: entry.detail, children: [] };
+        // Pop stack until we find a parent with lower depth
+        while (stack.length > 0 && stack[stack.length - 1].depth >= entry.depth) {
+          stack.pop();
+        }
+        if (stack.length === 0) {
+          roots.push(node);
+        } else {
+          stack[stack.length - 1].node.children.push(node);
+        }
+        stack.push({ depth: entry.depth, node: node });
+      });
+      return roots;
+    }
+
+    /**
+     * Render a Spark parsed tree node using the same card style as DuckDB.
+     * No timing data available, so we show operator name + detail.
+     */
+    function _sparkRenderNode(node, depth) {
+      var color = PLAN_BAR_COLORS[depth % PLAN_BAR_COLORS.length];
+      var html = '<div class="plan-node">';
+      html += '<div class="plan-node-card">';
+      html += '<div class="plan-node-bar" style="background:' + color + '; opacity:0.7;"></div>';
+      html += '<div class="plan-node-body">';
+      html += '<div class="plan-node-title">' + _esc(node.name) + '</div>';
+      if (node.detail) {
+        html += '<div class="plan-node-extra" style="display:block;">' + _esc(node.detail) + '</div>';
+      }
+      html += '</div>';
+      html += '</div>';
+
+      if (node.children && node.children.length) {
+        node.children.forEach(function (child) {
+          html += _sparkRenderNode(child, depth + 1);
+        });
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function _renderSparkPlan(profile, wrap, sqlPre, statsRow, empty) {
+      // Section tabs: physical → optimized → analyzed → parsed
+      var sparkSections = [
+        { key: 'physical_plan', label: 'Physical plan', icon: 'fa-cogs' },
+        { key: 'optimized_logical_plan', label: 'Optimized', icon: 'fa-magic' },
+        { key: 'analyzed_logical_plan', label: 'Analyzed', icon: 'fa-microscope' },
+        { key: 'parsed_logical_plan', label: 'Parsed', icon: 'fa-code' },
+      ];
+
+      var availableSections = sparkSections.filter(function (s) { return profile[s.key] && profile[s.key].trim(); });
+      if (!availableSections.length) {
+        if (empty) empty.style.display = 'block';
+        return;
+      }
+
+      // Build section pills (clickable tabs)
+      var activePill = null;
+      var renderSection = function (sectionKey) {
+        var text = profile[sectionKey] || '';
+        wrap.innerHTML = '';
+        var roots = _sparkParsePlanText(text);
+        if (roots.length) {
+          var treeHtml = '';
+          roots.forEach(function (r) { treeHtml += _sparkRenderNode(r, 0); });
+          wrap.innerHTML = treeHtml;
+        } else {
+          // Fallback: raw text in monospace
+          wrap.innerHTML = '<div class="plan-tree-sql" style="margin:0; max-height:400px;">' + _esc(text) + '</div>';
+        }
+      };
+
+      availableSections.forEach(function (sec, idx) {
+        var pill = document.createElement('span');
+        pill.className = 'plan-stat-pill';
+        pill.style.cursor = 'pointer';
+        pill.innerHTML = '<i class="fas ' + sec.icon + '"></i> ' + sec.label;
+        if (idx === 0) {
+          pill.style.background = 'var(--primary-color)';
+          pill.style.color = '#fff';
+          activePill = pill;
+        }
+        pill.addEventListener('click', function () {
+          if (activePill) {
+            activePill.style.background = '';
+            activePill.style.color = '';
+          }
+          pill.style.background = 'var(--primary-color)';
+          pill.style.color = '#fff';
+          activePill = pill;
+          renderSection(sec.key);
+        });
+        statsRow.appendChild(pill);
+      });
+
+      // Render the default (physical plan)
+      renderSection(availableSections[0].key);
     }
 
     // --- Schema cache for IntelliSense ---
