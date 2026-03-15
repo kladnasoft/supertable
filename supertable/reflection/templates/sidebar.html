@@ -312,6 +312,29 @@
     transform: rotate(180deg);
   }
 
+  .ctx-toggle-username {
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    padding-left: 10px;
+    min-width: 0;
+    text-align: left;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .ctx-toggle-username {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
   /* ── Collapsed sidebar: toggle icon-only ─────────────────────── */
 
   .sidebar-collapsed .ctx-toggle {
@@ -667,7 +690,7 @@
     </a>
 
     <a href="/reflection/vault" class="nav-item" id="link-vault">
-      <i class="fas fa-plug nav-item-icon"></i>
+      <i class="fas fa-vault nav-item-icon"></i>
       <span class="nav-item-label">Vault</span>
     </a>
 
@@ -676,14 +699,9 @@
       <span class="nav-item-label">Compute</span>
     </a>
 
-    <a href="/reflection/users-page" class="nav-item" id="link-users-page">
-      <i class="fas fa-users nav-item-icon"></i>
-      <span class="nav-item-label">Users</span>
-    </a>
-
-    <a href="/reflection/rbac" class="nav-item" id="link-rbac">
-      <i class="fas fa-user-lock nav-item-icon"></i>
-      <span class="nav-item-label">RBAC Views</span>
+    <a href="/reflection/security" class="nav-item" id="link-security">
+      <i class="fas fa-shield-halved nav-item-icon"></i>
+      <span class="nav-item-label">Security</span>
     </a>
 
   </nav>
@@ -694,6 +712,7 @@
     <!-- Toggle bar — always visible -->
     <button type="button" class="ctx-toggle" id="ctxToggleBtn" title="Account &amp; role settings">
       <i class="fas fa-circle-user ctx-toggle-icon"></i>
+      <span class="ctx-toggle-username" id="ctxToggleUsername">—</span>
       <i class="fas fa-chevron-up ctx-toggle-arrow" id="ctxToggleArrow"></i>
     </button>
 
@@ -706,31 +725,6 @@
           <i class="fas fa-building"></i>
         </div>
         <span class="ctx-value" id="ctxOrgValue">—</span>
-      </div>
-
-      <!-- User -->
-      <div class="ctx-row" title="User">
-        <div class="ctx-icon ctx-icon-user">
-          <i class="fas fa-user"></i>
-        </div>
-        <span class="ctx-value" id="ctxUserValue">—</span>
-      </div>
-
-      <!-- Active Role -->
-      <div class="ctx-row" title="Active Role">
-        <div class="ctx-icon ctx-icon-role">
-          <i class="fas fa-shield-halved"></i>
-        </div>
-        <span class="ctx-value" id="ctxRoleValue">—</span>
-      </div>
-
-      <div class="ctx-divider"></div>
-
-      <!-- Role selector -->
-      <div class="ctx-role-selector" id="ctxRoleSelectorWrap">
-        <select class="ctx-role-select" id="sbRoleSelect" title="Switch active role">
-          <option value="">— select SuperTable first —</option>
-        </select>
       </div>
 
       <div class="ctx-divider"></div>
@@ -776,6 +770,7 @@
     'link-jobs':       'navigation',
     'link-vault':      'infrastructure',
     'link-compute':    'infrastructure',
+    'link-security':   'access-control',
     'link-users-page': 'access-control',
     'link-rbac':       'access-control',
   };
@@ -893,13 +888,15 @@
   var orgValueEl = document.getElementById("ctxOrgValue");
   var userValueEl = document.getElementById("ctxUserValue");
   var roleValueEl = document.getElementById("ctxRoleValue");
+  var toggleUsernameEl = document.getElementById("ctxToggleUsername");
 
   if (org && orgValueEl) {
     orgValueEl.textContent = org;
   }
 
-  if (username && userValueEl) {
-    userValueEl.textContent = username;
+  if (username) {
+    if (userValueEl) userValueEl.textContent = username;
+    if (toggleUsernameEl) toggleUsernameEl.textContent = username;
   }
 
   var initialRole = sessionRoleName || localStorage.getItem("st_active_role") || "";

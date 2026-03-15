@@ -167,7 +167,20 @@ class _AsyncMonitoringLogger:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # Do not suppress exceptions
+        # Best-effort flush so metrics enqueued inside the `with` block
+        # are shipped to Redis before the scope closes.  This is critical
+        # for short-lived processes (CLI, Lambda) where the daemon thread
+        # would be killed on exit before it gets to drain the queue.
+        #
+        # We use _try_flush (non-blocking lock acquire) rather than
+        # request_flush to avoid blocking the caller for up to 50ms when
+        # the worker thread is in its batch-formation window holding
+        # _ship_lock.  If the lock is busy, the worker is actively
+        # shipping — the item will be delivered without our help.
+        try:
+            self._try_flush()
+        except Exception:
+            pass
         return False
 
     # --- public API ---
@@ -215,6 +228,40 @@ class _AsyncMonitoringLogger:
                 self._ship_batch(batch)
             finally:
                 self._clear_current_batch()
+
+        with self.queue_stats_lock:
+            self.queue_stats["current_size"] = self.queue.qsize()
+
+    def _try_flush(self) -> None:
+        """
+        Low-contention flush used by __exit__.
+
+        Attempts a non-blocking lock acquire first.  If the worker is
+        currently holding _ship_lock, falls back to a short blocking
+        wait (100ms) — just long enough for the worker to finish its
+        current batch without adding meaningful latency to the caller.
+
+        This avoids the two failure modes:
+          - Blocking request_flush(2s) injected 50ms+ latency every call.
+          - Pure non-blocking skip lost metrics in short-lived processes
+            (CLI, Lambda) when the worker held the lock at exit time.
+        """
+        acquired = self._ship_lock.acquire(blocking=True, timeout=0.1)
+        if not acquired:
+            # Worker is mid-ship and slower than 100ms (e.g., Redis latency).
+            # In a long-lived process the daemon will deliver it.
+            return
+        try:
+            batch = self._drain_batch(deadline=time.time() + 0.5, allow_wait=False)
+            if not batch:
+                return
+            self._set_current_batch(batch)
+            try:
+                self._ship_batch(batch)
+            finally:
+                self._clear_current_batch()
+        finally:
+            self._ship_lock.release()
 
         with self.queue_stats_lock:
             self.queue_stats["current_size"] = self.queue.qsize()
@@ -306,9 +353,11 @@ class _AsyncMonitoringLogger:
 
     def _ship_batch(self, batch: list) -> None:
         """
-        Ship a batch. We count each item as processed after a successful ship attempt.
+        Ship a batch.  Only counts items as processed after successful delivery.
+        On total failure (Redis down, fallback also fails), items are counted as
+        dropped so stats remain accurate.
         """
-        # If Redis is available, use a pipeline for efficiency.
+        shipped = 0
         if self._ship_to_redis and self._redis is not None:
             try:
                 pipe = self._redis.r.pipeline()
@@ -316,16 +365,28 @@ class _AsyncMonitoringLogger:
                     s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                     pipe.rpush(self._key.redis_list_key, s)
                 pipe.execute()
+                shipped = len(batch)
             except Exception:
-                # If pipeline fails, fall back to per-item shipping with the same error handling as below.
+                # Pipeline failed — fall back to per-item shipping.
                 for payload in batch:
-                    self._ship_one(payload)
+                    try:
+                        self._ship_one(payload)
+                        shipped += 1
+                    except Exception:
+                        pass
         else:
             for payload in batch:
-                self._ship_one(payload)
+                try:
+                    self._ship_one(payload)
+                    shipped += 1
+                except Exception:
+                    pass
 
+        failed = len(batch) - shipped
         with self.queue_stats_lock:
-            self.queue_stats["total_processed"] += len(batch)
+            self.queue_stats["total_processed"] += shipped
+            if failed > 0:
+                self.queue_stats["total_dropped"] += failed
 
     def _ship_one(self, payload: Dict[str, Any]) -> None:
         if not self._ship_to_redis or self._redis is None:
@@ -338,8 +399,30 @@ class _AsyncMonitoringLogger:
 
 
 # ---- singleton cache (one worker per key) ----
+# Bounded to prevent unbounded thread/Redis-connection growth in multi-tenant
+# environments.  When the cache is full, the least-recently-used entry is
+# evicted (its daemon thread stops on the next loop iteration via _stop event).
 _MONITORS: Dict[str, MonitoringLogger] = {}
 _MONITORS_LOCK = threading.Lock()
+_MONITORS_MAX = int(os.getenv("SUPERTABLE_MONITOR_CACHE_MAX", "256"))
+
+
+def _evict_oldest_monitor() -> None:
+    """
+    Evict one entry from _MONITORS.  Must be called with _MONITORS_LOCK held.
+
+    Strategy: evict the first key (oldest insertion in dict-order, Python 3.7+).
+    Signal the evicted logger's worker thread to stop so it doesn't leak.
+    """
+    if not _MONITORS:
+        return
+    oldest_key = next(iter(_MONITORS))
+    evicted = _MONITORS.pop(oldest_key)
+    # Signal the background worker to exit its loop gracefully.
+    stop_event = getattr(evicted, "_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    logger.debug(f"[monitor] evicted cached logger for {oldest_key}")
 
 
 def _monitoring_enabled() -> bool:
@@ -370,6 +453,9 @@ def get_monitoring_logger(
             existing = _MONITORS.get(cache_key)
             if existing is not None:
                 return existing
+            # Evict oldest entry if cache is at capacity.
+            if len(_MONITORS) >= _MONITORS_MAX:
+                _evict_oldest_monitor()
             mon = _AsyncMonitoringLogger(key, redis_connector=redis_connector)
             _MONITORS[cache_key] = mon
             return mon

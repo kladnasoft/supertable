@@ -205,3 +205,23 @@ attach_users_routes(
     logged_in_guard_api=logged_in_guard_api,
     admin_guard_api=admin_guard_api,
 )
+
+
+# ---------------------------------------------------------------------------
+# Security (unified RBAC + Users page)
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.security import attach_security_routes  # noqa: E402
+
+attach_security_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    list_users=list_users,
+    list_roles=list_roles,
+)

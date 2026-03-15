@@ -97,6 +97,8 @@ def extend_execution_plan(
         stats = {
             "query_id": getattr(query_plan_manager, "query_id", ""),
             "query_hash": getattr(query_plan_manager, "query_hash", ""),
+            "organization": getattr(query_plan_manager, "organization", ""),
+            "super_name": getattr(query_plan_manager, "super_name", ""),
             "role_name": role_name,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "table_name": getattr(query_plan_manager, "original_table", ""),

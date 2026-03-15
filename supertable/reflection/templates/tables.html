@@ -123,25 +123,26 @@
     .cc-dm-value.green { color: #059669; } .cc-dm-value.amber { color: #d97706; } .cc-dm-value.red { color: #dc2626; }
 
     .cc-detail-tabs {
-      display: flex; gap: 0; padding: 0 20px; background: var(--panel-bg);
+      display: flex; gap: 0; padding: 10px 20px; background: var(--panel-bg);
       border-bottom: 1px solid var(--panel-border); flex-shrink: 0; align-items: center;
     }
     .cc-dtab {
-      padding: 8px 14px; font-size: 12px; font-weight: 500; color: var(--text-muted);
-      cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
-      transition: all .15s; display: flex; align-items: center; gap: 5px;
+      display: flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 8px;
+      cursor: pointer; transition: all .15s; border: 1px solid transparent;
+      white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-muted);
     }
-    .cc-dtab:hover { color: var(--text-secondary); }
-    .cc-dtab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); font-weight: 600; }
+    .cc-dtab:hover { background: var(--bg-hover); border-color: var(--panel-border); color: var(--text-secondary); }
+    .cc-dtab.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); font-weight: 600; }
     .cc-dtab .badge { font-size: 10px; font-weight: 700; background: var(--bg-surface); border: 1px solid var(--border-light); padding: 0 5px; border-radius: 999px; color: var(--text-muted); }
     .cc-dtab.active .badge { background: var(--primary-light); border-color: rgba(28,150,202,.2); color: var(--primary-color); }
+    .cc-dtab-sep { width: 1px; height: 24px; background: var(--panel-border); margin: 0 6px; flex-shrink: 0; }
 
     .cc-detail-content { flex: 1; overflow: auto; background: var(--bg); }
     .cc-dpanel { display: none; padding: 20px; }
     .cc-dpanel.active { display: block; }
 
-    .btn-exec-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: var(--primary-color); border: 1px solid var(--primary-color); color: #fff; font-weight: 600; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
-    .btn-exec-sm:hover { background: var(--secondary-color); border-color: var(--secondary-color); }
+    .btn-exec-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--primary-color); color: var(--primary-color); font-weight: 600; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
+    .btn-exec-sm:hover { background: var(--primary-light); }
     .btn-danger-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--error); color: var(--error); font-weight: 500; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
     .btn-danger-sm:hover { background: var(--error-bg); }
 
@@ -401,8 +402,11 @@
       var safeName = (t.name || '').replace(/'/g, "\\'");
       document.getElementById('ccDetailTabs').innerHTML =
         '<div class="cc-dtab active" onclick="ccSwitchDTab(this,\'schema\')"><i class="fas fa-columns" style="font-size:11px;"></i> Schema</div>' +
+        '<div class="cc-dtab-sep"></div>' +
         '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'quality\')"><i class="fas fa-heartbeat" style="font-size:11px;"></i> Data quality</div>' +
+        '<div class="cc-dtab-sep"></div>' +
         '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'stats\')"><i class="fas fa-chart-bar" style="font-size:11px;"></i> Stats</div>' +
+        '<div class="cc-dtab-sep"></div>' +
         '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'settings\')"><i class="fas fa-sliders-h" style="font-size:11px;"></i> Settings</div>' +
         '<div style="flex:1;"></div>' +
         '<button class="btn-exec-sm" onclick="goExecuteWithLeaf(\'' + safeName + '\')"><i class="fas fa-terminal" style="font-size:10px;"></i> Query</button>' +

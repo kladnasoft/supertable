@@ -1,574 +1,448 @@
-{% extends "base.html" %}
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Ingestion</title>
 
-{% block title %}Ingestion{% endblock %}
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
 
-{% block head_extra %}
-<style>
-    /* ---- Tabs (match admin.html style) ---- */
-  #tab-navigation,
-  .tabs-row {
-    display: flex;
-    gap: 24px;
-    margin-top: 16px;
-    border-bottom: 1px solid #e2e8f0;
-    padding: 0 2px;
-    flex-wrap: wrap;
-  }
+  <style>
+:root {
+  --primary: #1c96ca;
+  --primary-light: #e6f4fa;
+  --primary-dark: #147ba3;
+  --primary-color: #1c96ca;
+  --secondary-color: #147ba3;
+  --dark-color: #1a1a2e;
+  --text-color: #1e293b;
+  --text-secondary: #64748b;
+  --text-light: #8d99ae;
+  --bg: #f3f6fb;
+  --bg-card: #fff;
+  --bg-surface: #f8fafc;
+  --bg-hover: #f1f5f9;
+  --border: #e0e5f0;
+  --border-light: #f1f5f9;
+  --text: #1e293b;
+  --text-sec: #64748b;
+  --text-muted: #94a3b8;
+  --success: #10b981;
+  --success-bg: #ecfdf5;
+  --warn: #f59e0b;
+  --warn-bg: #fffbeb;
+  --error: #ef4444;
+  --error-bg: #fef2f2;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --font: 'Inter', -apple-system, sans-serif;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  height: 100%;
+  overflow: hidden;
+}
 
-  .tab {
-    padding: 8px 0;
-    margin-bottom: -1px;
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: transparent;
-    cursor: pointer;
-    font-size: 13px;
-    color: #64748b;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
+/* ═══ SIDEBAR COMPAT (identical to tables.html) ═══ */
+.content-container {
+  margin-left: 280px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: var(--transition);
+  background: var(--bg);
+}
+.sidebar-collapsed ~ .content-container { margin-left: 80px; }
 
-  .tab i { font-size: 13px; }
+/* ═══ TOP BAR ═══ */
+.cc-topbar {
+  display: flex; align-items: center; gap: 10px; padding: 6px 16px;
+  background: var(--bg-card); border-bottom: 1px solid var(--border);
+  flex-shrink: 0; min-height: 46px;
+}
+.topbar-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+.super-sel {
+  display: flex; align-items: center; gap: 6px; background: var(--bg-surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 0 4px 0 10px; font-size: 13px; font-weight: 600;
+}
+.super-sel select {
+  border: none; background: transparent; color: var(--text); font-weight: 600;
+  font-size: 13px; font-family: var(--font); padding: 6px 4px; outline: none;
+  cursor: pointer; min-width: 120px;
+}
+.role-pill {
+  display: flex; align-items: center; gap: 5px; background: #ecfdf5;
+  border: 1px solid rgba(16,185,129,.25); border-radius: 999px; padding: 4px 10px;
+}
+.role-pill label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #059669; margin: 0; }
+.role-pill select { font-size: 11px; font-weight: 600; color: #059669; background: transparent; border: none; outline: none; cursor: pointer; font-family: var(--font); }
 
-  /* Admin tabs do not change text color on hover */
-  .tab:hover { color: #64748b; }
+/* ═══ 3-COLUMN LAYOUT ═══ */
+.cc-cols { flex: 1; display: flex; overflow: hidden; min-height: 0; }
 
-  .tab.active {
-    color: #1c96ca;
-    border-bottom-color: #1c96ca;
-    font-weight: 500;
-  }
+/* LEFT panel */
+.panel-left {
+  width: 280px; min-width: 280px; border-right: 1px solid var(--border);
+  background: var(--bg-card); display: flex; flex-direction: column; flex-shrink: 0;
+}
+.panel-hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid var(--border-light); flex-shrink: 0;
+}
+.panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); }
+.swrap { position: relative; flex-shrink: 0; padding: 8px 10px; }
+.swrap i { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.swrap input { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface); font-family: var(--font); outline: none; }
+.swrap input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
 
-  .tab-sep {
-    width: 1px;
-    height: 22px;
-    background: rgba(15, 23, 42, 0.12);
-    margin: 0 10px;
-    align-self: center;
-    border-radius: 1px;
-  }
+.pipe-list { flex: 1; overflow-y: auto; }
+.pipe-section { border-bottom: 1px solid var(--border-light); }
+.pipe-section-hdr { display: flex; align-items: center; gap: 8px; padding: 8px 14px; cursor: pointer; transition: all .15s; font-size: 12px; font-weight: 600; color: var(--text-sec); }
+.pipe-section-hdr:hover { background: var(--bg-hover); }
+.pipe-section-hdr i.chevron { font-size: 10px; color: var(--text-muted); transition: transform .15s; }
+.pipe-section-hdr.open i.chevron { transform: rotate(90deg); color: var(--primary); }
+.pipe-section-body { display: none; padding: 0 14px 8px; }
+.pipe-section-body.open { display: block; }
+.pipe-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); cursor: pointer; transition: all .15s; font-size: 12px; margin-bottom: 2px; }
+.pipe-item:hover { background: var(--bg-hover); }
+.pipe-item.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
+.pipe-item .pipe-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.pipe-item .pipe-dot.on { background: var(--success); }
+.pipe-item .pipe-dot.off { background: var(--text-muted); }
 
-  .tabpane { margin-top: 16px; }
-  .tabpane.hidden { display:none; }
+/* CENTER */
+.cc-center { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 
-  /* ---- List rows ---- */
-  .rowcard {
-    margin-top: 10px;
-    border: 1px solid rgba(15,23,42,.10);
-    border-radius: 14px;
-    background: #fff;
-    padding: 12px 14px;
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:12px;
-  }
-  .rowcard .title { font-weight: 900; color:#0f172a; }
-  .rowcard .sub { font-size: 12px; color:#64748b; margin-top:3px; }
+/* Tab bar — pill style (matches security page) */
+.tab-row { display: flex; align-items: center; gap: 0; padding: 10px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.tab-btn { display: flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 8px; cursor: pointer; transition: var(--transition); border: 1px solid transparent; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-sec); background: transparent; font-family: var(--font); }
+.tab-btn:hover { background: var(--bg-hover); border-color: var(--border); color: var(--text); }
+.tab-btn.active { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
+.tab-btn i { font-size: 11px; }
+.tab-sep { width: 1px; height: 24px; background: var(--border); margin: 0 6px; flex-shrink: 0; }
 
-  /* ---- Pipe editor ---- */
-  .split {
-    display:flex;
-    gap: 12px;
-    margin-top: 12px;
-    align-items: stretch;
-    flex-wrap: wrap;
-  }
-  .split .left {
-    flex: 1;
-    min-width: 260px;
-  }
-  .split .right {
-    flex: 2;
-    min-width: 320px;
-  }
-  #pipeEditor {
-    width: 100%;
-    min-height: 320px;
-    resize: vertical;
-    border-radius: 8px;
-    border: 1px solid rgba(15,23,42,.14);
-    padding: 12px 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: 13px;
-    line-height: 1.35;
-    background: rgba(248,250,252,.9);
-  }
+/* Drop zone */
+.drop-zone { margin: 20px 0; border: 2px dashed var(--border); border-radius: 16px; padding: 40px; text-align: center; transition: all .2s; cursor: pointer; background: var(--bg-surface); }
+.drop-zone:hover, .drop-zone.dragover { border-color: var(--primary); background: var(--primary-light); }
+.drop-zone .icon { font-size: 36px; color: var(--primary); opacity: .5; margin-bottom: 12px; }
+.drop-zone .dz-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.drop-zone .sub { font-size: 12px; color: var(--text-muted); }
+.drop-zone .formats { display: flex; gap: 6px; justify-content: center; margin-top: 12px; }
+.drop-zone .fmt { font-size: 10px; font-weight: 600; padding: 3px 8px; border-radius: 999px; background: var(--bg-card); border: 1px solid var(--border-light); color: var(--text-sec); }
 
-  /* ---- Enable pill ---- */
-  .pill { font-size: 12px; padding: 4px 9px; border-radius: 999px; border:1px solid; font-weight: 900; }
-  .pill.on { border-color: rgba(16,185,129,35); background: rgba(16,185,129,08); color:#065f46; }
-  .pill.off { border-color: rgba(148,163,184,55); background: rgba(148,163,184,10); color:#334155; }
+/* Flow area */
+.flow-area { flex: 1; overflow: auto; padding: 0 20px 20px; }
+.step-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px; margin-bottom: 12px; }
+.step-hdr { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--primary-light); color: var(--primary); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; }
+.step-num.done { background: var(--success-bg); color: #059669; }
+.step-title { font-size: 14px; font-weight: 600; }
+.step-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
-  /* ---- Modal footer ---- */
-  #m-footer {
-    padding: 12px 15px;
-    border-top: 1px solid rgba(15,23,42,.08);
-    display:flex;
-    justify-content:flex-end;
-    gap:10px;
-    background: #fff;
-  }
+/* Target tabs */
+.target-tabs { display: flex; gap: 0; margin-bottom: 12px; }
+.target-tab { padding: 8px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); background: var(--bg-surface); color: var(--text-sec); transition: all .15s; }
+.target-tab:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.target-tab:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.target-tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 
-  /* Azure-style outline button (match admin.html) */
-  .btn-azure-outline {
-    border: 1px solid #1c96ca;
-    background: transparent;
-    color: #1c96ca;
-    font-weight: 600;
-    transition: background-color 0.2s ease, color 0.2s ease;
-  }
-  .btn-azure-outline:hover {
-    background: #1c96ca;
-    color: #ffffff;
-  }
+/* Fields */
+.field-label { font-size: 11px; font-weight: 600; color: var(--text-sec); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+.field-input { padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; font-family: var(--font); outline: none; width: 100%; max-width: 360px; transition: all .2s; }
+.field-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
+.field-input.mono { font-family: var(--mono); }
+.field-hint { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
 
-  /* ---- Load Data (modern step cards) ---- */
-  .load-steps {
-    display: grid;
-    gap: 14px;
-    margin-top: 12px;
-  }
-  .stepcard {
-    border: 1px solid rgba(15,23,42,.10);
-    border-radius: 12px;
-    background: #fff;
-    box-shadow: 0 8px 20px rgba(15,23,42,.05);
-    padding: 14px 16px;
-  }
-  .stephead {
-    display:flex;
-    align-items:baseline;
-    justify-content:space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-  }
-  .stephead .kicker {
-    font-size: 12px;
-    color: #64748b;
-    letter-spacing: .02em;
-    font-weight: 700;
-  }
-  .stephead .title {
-    font-size: 14px;
-    font-weight: 900;
-    color:#0f172a;
-    margin-top: 2px;
-  }
-  .load-row {
-    display:flex;
-    align-items:center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .file-pill {
-    display:inline-flex;
-    align-items:center;
-    gap: 8px;
-    padding: 6px 10px;
-    border-radius: 999px;
-    border: 1px solid rgba(15,23,42,.12);
-    background: rgba(248,250,252,.9);
-    font-size: 12px;
-    color:#0f172a;
-    max-width: 100%;
-  }
-  .file-pill .name { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; word-break: break-all; }
-  .segmented {
-    display:inline-flex;
-    border: 1px solid rgba(15,23,42,.12);
-    border-radius: 999px;
-    overflow:hidden;
-    background: rgba(248,250,252,.8);
-  }
-  .segmented button {
-    border: 0;
-    background: transparent;
-    padding: 8px 12px;
-    font-size: 12px;
-    font-weight: 800;
-    color: #334155;
-    cursor: pointer;
-    display:inline-flex;
-    align-items:center;
-    gap: 7px;
-  }
-  .segmented button.active {
-    background: #1c96ca;
-    color: #ffffff;
-  }
-  .segmented button.active i { color: #ffffff; }
-  .segmented button:hover { background: rgba(28,150,202,.10); }
-  .segmented button.active:hover { background: #1787b6; }
-  .segmented button i { color: #1c96ca; }
-  .field {
-    display:flex;
-    flex-direction:column;
-    gap: 6px;
-    min-width: 260px;
-    flex: 1;
-  }
-  .field label {
-    font-size: 12px;
-    color: #64748b;
-    font-weight: 800;
-  }
-  .field input, .field select, .field textarea {
-    border-radius: 14px;
-    border: 1px solid rgba(15,23,42,.14);
-    padding: 10px 12px;
-    font-size: 13px;
-    background: rgba(248,250,252,.9);
-    outline: none;
-  }
-  .field textarea {
-    resize: vertical;
-    min-height: 92px;
-  }
-  .field input.mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  }
-  .previewbox {
-    border-radius: 14px;
-    border: 1px solid rgba(15,23,42,.10);
-    background: rgba(248,250,252,.7);
-    overflow: hidden;
-  }
-  .previewhead {
-    padding: 10px 12px;
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap: 10px;
-    border-bottom: 1px solid rgba(15,23,42,.08);
-  }
-  .previewhead .h {
-    font-size: 12px;
-    font-weight: 900;
-    color:#0f172a;
-  }
-  .previewbody {
-    max-height: 220px;
-    overflow:auto;
-  }
-  .previewtable {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  .previewtable th {
-    position: sticky;
-    top: 0;
-    background: #ffffff;
-    text-align:left;
-    padding: 8px 8px;
-    border-bottom: 1px solid rgba(15,23,42,.10);
-    font-weight: 900;
-    color:#0f172a;
-    white-space: nowrap;
-  }
-  .previewtable td {
-    padding: 7px 8px;
-    border-top: 1px solid rgba(15,23,42,.06);
-    vertical-align: top;
-    max-width: 280px;
-    overflow:hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .load-footer {
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .timer {
-    font-size: 12px;
-    color:#334155;
-    display:inline-flex;
-    align-items:center;
-    gap: 8px;
-  }
-  .spinner {
-    width: 14px; height: 14px;
-    border-radius: 999px;
-    border: 2px solid rgba(28,150,202,.25);
-    border-top-color: #1c96ca;
-    animation: spin 0.9s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .muted { color:#64748b; font-size: 12px; }
-  .alert {
-    margin-top: 10px;
-    padding: 10px 12px;
-    border-radius: 14px;
-    border: 1px solid rgba(15,23,42,.10);
-    background: rgba(248,250,252,.9);
-    font-size: 12px;
-    color:#0f172a;
-  }
-  .alert.ok { border-left: 4px solid rgba(16,185,129,.9); }
-  .alert.err { border-left: 4px solid rgba(239,68,68,.9); }
+/* Preview table */
+.preview-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; max-height: 200px; margin-top: 10px; }
+.preview-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+.preview-tbl th { background: var(--bg-surface); padding: 6px 10px; font-weight: 600; color: var(--text-sec); text-transform: uppercase; font-size: 9px; letter-spacing: .05em; border-bottom: 2px solid var(--border); text-align: left; position: sticky; top: 0; }
+.preview-tbl td { padding: 5px 10px; border-bottom: 1px solid var(--border-light); font-family: var(--mono); font-size: 11px; }
+.preview-tbl tr:hover td { background: var(--primary-light); }
 
-</style>
-{% endblock %}
+/* Result card */
+.result-card { margin-top: 12px; padding: 12px 16px; border-radius: var(--radius); display: none; }
+.result-card.success { background: var(--success-bg); border: 1px solid rgba(16,185,129,.2); display: block; }
+.result-card.error { background: var(--error-bg); border: 1px solid rgba(239,68,68,.2); display: block; }
+.result-card .result-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.result-card .result-detail { font-size: 12px; color: var(--text-sec); margin-top: 4px; font-family: var(--mono); }
 
-{% block content %}
+/* Buttons */
+.btn-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--border); color: var(--text-sec); font-weight: 500; cursor: pointer; font-size: 12px; transition: all .2s; display: inline-flex; align-items: center; gap: 4px; font-family: var(--font); white-space: nowrap; }
+.btn-sm:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+.btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn-primary:hover { background: var(--primary-dark); border-color: var(--primary-dark); }
+.btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+.btn-danger { border-color: var(--error); color: var(--error); }
+.btn-danger:hover { background: var(--error-bg); }
 
-{% include "selection.html" %}
+/* RIGHT panel */
+.panel-right { width: 280px; min-width: 280px; border-left: 1px solid var(--border); background: var(--bg-card); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; }
+.summary-card { padding: 14px; border-bottom: 1px solid var(--border-light); }
+.summary-card-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin-bottom: 8px; }
+.summary-stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; }
+.summary-stat .label { color: var(--text-sec); }
+.summary-stat .val { font-weight: 600; }
+.stg-file { display: flex; align-items: center; gap: 6px; padding: 4px 14px; font-size: 11px; font-family: var(--mono); color: var(--text-sec); border-bottom: 1px solid var(--border-light); }
+.stg-file i { font-size: 10px; color: var(--text-muted); }
+.stg-file .size { margin-left: auto; font-size: 10px; color: var(--text-muted); }
 
-<div style="height: 18px;"></div>
+/* Pipe editor */
+.pipe-editor { width: 100%; min-height: 280px; resize: vertical; border-radius: var(--radius-sm); border: 1px solid var(--border); padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.4; background: var(--bg-surface); outline: none; }
+.pipe-editor:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
 
-<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
-    <div id="tab-load" class="tab active" onclick="switchTab('load')">
-      <i class="fas fa-upload"></i><span>Load Data</span>
+/* Pills */
+.pill { font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid; font-weight: 600; }
+.pill.on { border-color: rgba(16,185,129,.35); background: rgba(16,185,129,.08); color: #065f46; }
+.pill.off { border-color: rgba(148,163,184,.55); background: rgba(148,163,184,.10); color: #334155; }
+
+/* Modal */
+#modal { display: none; position: fixed; inset: 0; z-index: 9999; background: rgba(15,23,42,.4); align-items: center; justify-content: center; }
+#modal-card { background: #fff; border-radius: var(--radius); box-shadow: 0 20px 60px rgba(15,23,42,.18); width: 460px; max-width: 92vw; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+#m-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+#m-title { font-size: 14px; font-weight: 700; }
+#m-body { padding: 16px 18px; overflow-y: auto; flex: 1; }
+#m-footer { padding: 12px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 10px; background: var(--bg-card); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Animations */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner { width: 14px; height: 14px; border-radius: 999px; border: 2px solid rgba(28,150,202,.25); border-top-color: #1c96ca; animation: spin .9s linear infinite; display: inline-block; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.fade-in { animation: fadeIn .3s ease forwards; }
+
+/* Hidden compat elements */
+#pairSel { display: none; }
+  </style>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      if (!window.__st_sidebar_bound) {
+        var toggle = document.getElementById('sidebarToggle');
+        if (toggle) {
+          toggle.addEventListener('click', function() {
+            var sb = document.getElementById('sidebar');
+            if (sb) { sb.classList.toggle('sidebar-collapsed'); localStorage.setItem('st_sidebar_collapsed', sb.classList.contains('sidebar-collapsed')); }
+          });
+        }
+        if (localStorage.getItem('st_sidebar_collapsed') === 'true') {
+          var sb = document.getElementById('sidebar');
+          if (sb) sb.classList.add('sidebar-collapsed');
+        }
+      }
+    });
+  </script>
+</head>
+<body>
+
+{% include "sidebar.html" %}
+
+<div class="content-container">
+
+  {% if has_tenant %}
+
+  <select id="pairSel">
+    {% for t in tenants %}
+    <option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>
+    {% endfor %}
+  </select>
+
+  <div id="stagingRoot" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" style="display:none;"></div>
+
+  <header class="cc-topbar">
+    <div class="super-sel">
+      <i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i>
+      <select id="ccSuperSel" onchange="ccOnSuperChange(this.value)">
+        {% for t in tenants %}
+        <option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>
+        {% endfor %}
+      </select>
     </div>
-    <div class="tab-sep" aria-hidden="true"></div>
-  <div id="tab-staging" class="tab" onclick="switchTab('staging')">
-      <i class="fas fa-folder-open"></i><span>Staging</span>
+    <div class="topbar-sep"></div>
+    <div class="role-pill">
+      <i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i>
+      <label>Role</label>
+      <select id="ccRoleSel" onchange="ccOnRoleChange(this.value)">
+        <option value="superadmin" selected>superadmin</option>
+      </select>
     </div>
-    <div class="tab-sep" aria-hidden="true"></div>
-    <div id="tab-pipe" class="tab" onclick="switchTab('pipe')">
-      <i class="fas fa-diagram-project"></i><span>Pipe</span>
-    </div>
-  </div>
+    <div style="flex:1;"></div>
+    <span style="font-size:11px;color:var(--text-muted);">Ingestion</span>
+  </header>
 
-<div style="height: 10px;"></div>
+  <div class="cc-cols">
 
-<div id="stagingRoot"
-     data-org="{{ sel_org }}"
-     data-sup="{{ sel_sup }}"
-     style="
-        background: #ffffff;
-        border-radius: 12px;
-        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
-        padding: 24px 28px;
-        border: 1px solid rgba(0, 0, 0, 0.05);
-        border-left: 5px solid #1c96ca;
-     ">
-
-  <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; display:none;">
-    <div>
-      <div style="font-size: 18px; font-weight: 900; color:#0f172a;">Ingestion</div>
-    </div>
-  </div>
-
-
-
-  <!-- -------------------- STAGING TAB -------------------- -->
-  <div class="tabpane hidden" id="pane-staging">
-    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div class="muted">Staging</div>
-      <button type="button" id="btnCreateStaging" class="btn btn-sm btn-azure-outline">
-        <i class="fas fa-plus"></i> Create staging
-      </button>
+    <!-- LEFT: Staging & Pipes -->
+    <div class="panel-left">
+      <div class="panel-hdr">
+        <span class="panel-title">Staging &amp; Pipes</span>
+        <button class="btn-sm" style="padding:3px 6px;font-size:11px;" id="btnCreateStaging"><i class="fas fa-plus"></i></button>
+      </div>
+      <div class="swrap"><i class="fas fa-search"></i><input id="leftFilter" placeholder="Filter…"/></div>
+      <div class="pipe-list" id="leftPipeList"></div>
     </div>
 
-    {% if not has_tenant %}
-      <div style="margin-top: 10px; color:#64748b;">Select a SuperTable above.</div>
-    {% else %}
-      <input id="stagingFilter" class="input" placeholder="Filter staging…" style="width:100%; max-width: 420px; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14); margin-top: 10px;" />
-      <div id="stagingList" style="margin-top: 10px;"></div>
-    {% endif %}
-  </div>
+    <!-- CENTER -->
+    <div class="cc-center">
+      <div class="tab-row">
+        <button class="tab-btn active" data-tab="load" onclick="switchTab('load')"><i class="fas fa-upload"></i> Load Data</button>
+        <div class="tab-sep"></div>
+        <button class="tab-btn" data-tab="staging" onclick="switchTab('staging')"><i class="fas fa-folder-open"></i> Staging Files</button>
+        <div class="tab-sep"></div>
+        <button class="tab-btn" data-tab="pipe" onclick="switchTab('pipe')"><i class="fas fa-diagram-project"></i> Pipe Editor</button>
+      </div>
 
-  <!-- -------------------- PIPE TAB -------------------- -->
-  <div class="tabpane hidden" id="pane-pipe">
-    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-      <div class="muted">Pipe</div>
-      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-        <select id="pipeStagingSelect" class="input" style="min-width: 240px; border-radius: 12px; padding: 8px 10px; border: 1px solid rgba(15,23,42,.14);">
-          <option value="">Select staging…</option>
-        </select>
-        <button type="button" id="btnNewPipe" class="btn btn-sm btn-azure-outline">
-          <i class="fas fa-plus"></i> New pipe
-        </button>
-        <button type="button" id="btnSavePipe" class="btn btn-sm btn-azure-outline">
-          <i class="fas fa-save"></i> Save
-        </button>
+      <!-- LOAD TAB -->
+      <div class="flow-area" id="pane-load">
+        <div class="drop-zone" id="dropZone">
+          <input type="file" id="loadFileInput" style="display:none" accept=".csv,.tsv,.json,.jsonl,.ndjson,.parquet,.pq"/>
+          <div class="icon"><i class="fas fa-cloud-arrow-up"></i></div>
+          <div class="dz-title">Drop a file here or click to browse</div>
+          <div class="sub">Upload data to a table or staging area</div>
+          <div class="formats"><span class="fmt">CSV</span><span class="fmt">TSV</span><span class="fmt">JSON</span><span class="fmt">JSONL</span><span class="fmt">Parquet</span></div>
+        </div>
+        <div id="flowArea" style="display:none;">
+          <div class="step-card fade-in">
+            <div class="step-hdr">
+              <div class="step-num done" id="step1Num">1</div>
+              <div><div class="step-title">File selected</div><div class="step-sub" id="step1Info">—</div></div>
+              <button class="btn-sm" style="margin-left:auto;" id="btnChangeFile"><i class="fas fa-times"></i> Change</button>
+            </div>
+            <div id="previewArea"></div>
+          </div>
+          <div class="step-card fade-in" style="animation-delay:.1s">
+            <div class="step-hdr">
+              <div class="step-num" id="step2Num">2</div>
+              <div><div class="step-title">Choose target</div><div class="step-sub">Load into a table or staging area</div></div>
+            </div>
+            <div class="target-tabs">
+              <div class="target-tab active" id="modeTableBtn"><i class="fas fa-database" style="margin-right:4px;"></i> Table</div>
+              <div class="target-tab" id="modeStagingBtn"><i class="fas fa-folder-open" style="margin-right:4px;"></i> Staging</div>
+            </div>
+            <div id="targetTablePanel">
+              <div class="field-label">Table name</div>
+              <div style="display:flex;gap:8px;align-items:center;"><input class="field-input mono" id="loadTableName" placeholder="e.g. orders" list="loadTableSuggestions"/><datalist id="loadTableSuggestions"></datalist><button class="btn-sm" id="btnRefreshTables"><i class="fas fa-rotate"></i></button></div>
+              <div class="field-hint">Start typing to see existing tables, or enter a new name.</div>
+            </div>
+            <div id="targetStagingPanel" style="display:none;">
+              <div class="field-label">Staging area</div>
+              <div style="display:flex;gap:8px;align-items:center;"><select class="field-input" id="loadStagingName" style="max-width:360px;"><option value="">Select staging…</option></select><button class="btn-sm" id="btnRefreshStagings"><i class="fas fa-rotate"></i></button></div>
+              <div class="field-hint">Files will be stored in the staging area for pipe processing.</div>
+            </div>
+          </div>
+          <div class="step-card fade-in" style="animation-delay:.2s" id="overwriteStepCard">
+            <div class="step-hdr">
+              <div class="step-num">3</div>
+              <div><div class="step-title">Overwrite options</div><div class="step-sub">Optional: specify columns to match for upsert</div></div>
+            </div>
+            <div class="field-label">Overwrite columns</div>
+            <textarea class="field-input" id="loadOverwriteCols" rows="2" style="max-width:360px;resize:vertical;" placeholder="e.g. id&#10;email"></textarea>
+            <div class="field-hint">Comma or newline separated. Leave empty to append all rows.</div>
+          </div>
+          <div class="step-card fade-in" style="animation-delay:.3s">
+            <div class="step-hdr">
+              <div class="step-num">4</div>
+              <div><div class="step-title">Upload &amp; load</div></div>
+              <div style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+                <span id="loadTimer" style="display:none;font-size:12px;color:var(--text-sec);align-items:center;gap:6px;"><span class="spinner"></span> <span id="loadTimerVal">0.000s</span></span>
+                <button class="btn-sm btn-primary" id="loadStartBtn" disabled style="padding:8px 20px;font-size:13px;"><i class="fas fa-upload"></i> Upload &amp; Load</button>
+              </div>
+            </div>
+            <div class="result-card" id="resultCard"><div class="result-title" id="resultTitle"></div><div class="result-detail" id="resultDetail"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STAGING FILES TAB -->
+      <div class="flow-area" id="pane-staging" style="display:none;">
+        <div style="padding:10px 0;"><div style="font-size:14px;font-weight:600;">Staging Files</div><div style="font-size:12px;color:var(--text-muted);">Click a staging area in the left panel to browse its files.</div></div>
+        <div id="stagingFilesCenter"><div style="color:var(--text-muted);">Select a staging area from the left panel.</div></div>
+      </div>
+
+      <!-- PIPE EDITOR TAB -->
+      <div class="flow-area" id="pane-pipe" style="display:none;">
+        <div style="padding:10px 0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+          <div><div style="font-size:14px;font-weight:600;">Pipe Editor</div><div style="font-size:12px;color:var(--text-muted);">Select a pipe from the left panel to edit, or create a new one.</div></div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <span id="pipeEnabledPill" class="pill off" style="display:none;">disabled</span>
+            <button class="btn-sm" id="btnTogglePipe" style="display:none;"><i class="fas fa-toggle-on"></i> Toggle</button>
+            <button class="btn-sm" id="btnNewPipe"><i class="fas fa-plus"></i> New Pipe</button>
+            <button class="btn-sm btn-primary" id="btnSavePipe"><i class="fas fa-save"></i> Save</button>
+            <button class="btn-sm btn-danger" id="btnDeletePipe" style="display:none;"><i class="fas fa-trash"></i> Delete</button>
+          </div>
+        </div>
+        <textarea class="pipe-editor" id="pipeEditor" placeholder="Select a staging and pipe from the left panel, or create a new pipe…"></textarea>
       </div>
     </div>
 
-    {% if not has_tenant %}
-      <div style="margin-top: 10px; color:#64748b;">Select a SuperTable above.</div>
-    {% else %}
-      <div class="split">
-        <div class="left">
-          <div style="font-size: 12px; font-weight: 900; color:#0f172a; margin: 6px 0;">Pipes</div>
-          <div style="display:flex; align-items:center; gap:10px; margin-bottom: 10px; flex-wrap:wrap;">
-          <input id="pipeFilter" class="input" placeholder="Filter pipes (name or simple_name)…" style="flex:1; min-width: 220px; padding:9px 10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
-          <button type="button" id="btnDeletePipe" class="btn btn-sm btn-danger-outline" style="display:none; white-space:nowrap;">
-                <i class="fas fa-trash"></i> Delete
-              </button>
-        </div>
-          <div id="pipeList"></div>
-        </div>
-        <div class="right">
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin: 6px 0;">
-            <div style="font-size: 12px; font-weight: 900; color:#0f172a;">Pipe definition (JSON)</div>
-            <div style="display:flex; align-items:center; gap:10px;">
-              <span id="pipeEnabledPill" class="pill off" style="display:none;">disabled</span>
-              <button type="button" id="btnTogglePipe" class="btn btn-sm btn-azure-outline" style="display:none;">
-                <i class="fas fa-toggle-on"></i> Toggle
-              </button>
-            </div>
-          </div>
-          <textarea id="pipeEditor" placeholder="Select a staging, then create/select a pipe…"></textarea>
-        </div>
+    <!-- RIGHT: Intelligence panel -->
+    <div class="panel-right">
+      <div class="summary-card">
+        <div class="summary-card-title">Ingestion Summary</div>
+        <div class="summary-stat"><span class="label">Staging areas</span><span class="val" id="rightStagingCount">—</span></div>
+        <div class="summary-stat"><span class="label">Pipes (selected)</span><span class="val" id="rightPipeCount">—</span></div>
+        <div class="summary-stat"><span class="label">Recent loads</span><span class="val" id="rightWriteCount">—</span></div>
+        <div class="summary-stat"><span class="label">Total rows ingested</span><span class="val" style="color:var(--success);" id="rightTotalRows">—</span></div>
+        <div class="summary-stat"><span class="label">Avg duration</span><span class="val" id="rightAvgDuration">—</span></div>
       </div>
-    {% endif %}
-  </div>
-
-  <!-- -------------------- LOAD DATA TAB -------------------- -->
-  <div class="tabpane" id="pane-load">
-    <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-      <div>
-        <div class="muted">Load Data</div>
-        <div class="muted" style="margin-top:4px;">Upload a file and load into a table, or stage it for later.</div>
+      <div class="summary-card">
+        <div class="summary-card-title">Selected Staging</div>
+        <div id="rightStagingName" style="font-size:12px;color:var(--text-muted);">None</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-card-title">Files</div>
+        <div id="rightStagingFiles"><div style="font-size:11px;color:var(--text-muted);">Select a staging to browse.</div></div>
+      </div>
+      <div class="summary-card" style="border-top:1px solid var(--border);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+          <div class="summary-card-title" style="margin-bottom:0;">Recent Writes</div>
+          <button class="btn-sm" style="padding:2px 6px;font-size:10px;" id="btnRefreshWrites"><i class="fas fa-rotate"></i></button>
+        </div>
+        <div id="rightRecentWrites"><div style="font-size:11px;color:var(--text-muted);">Loading…</div></div>
       </div>
     </div>
 
-    {% if not has_tenant %}
-      <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
-    {% else %}
-      <div class="load-steps">
-
-        <!-- Step 1 -->
-        <div class="stepcard">
-          <div class="stephead">
-            <div>
-              <div class="kicker">1) CHOOSE A FILE</div>
-              <div class="title">Pick a file and preview it instantly</div>
-            </div>
-          </div>
-
-          <div class="load-row">
-            <input id="loadFileInput" type="file" style="display:none;" />
-            <label for="loadFileInput" class="btn btn-sm btn-azure-outline" style="margin:0;">
-              <i class="fas fa-file-arrow-up"></i> Choose file
-            </label>
-
-            <div id="loadFilePill" class="file-pill" style="display:none;">
-              <i class="fas fa-paperclip" style="color:#1c96ca;"></i>
-              <span class="name" id="loadFileName">—</span>
-              <span class="muted" id="loadFileMeta" style="margin-left:8px;">—</span>
-            </div>
-
-            <div class="muted">Supported: csv, tsv, json/jsonl, parquet</div>
-          </div>
-
-          <div id="loadPreview" style="margin-top: 12px; display:none;">
-            <div class="previewbox">
-              <div class="previewhead">
-                <div class="h"><i class="fas fa-table" style="color:#1c96ca; margin-right:6px;"></i> Snake peek</div>
-                <div class="muted" id="loadPreviewInfo">—</div>
-              </div>
-              <div class="previewbody">
-                <table class="previewtable">
-                  <thead id="loadPreviewThead"></thead>
-                  <tbody id="loadPreviewTbody"></tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Step 2 -->
-        <div class="stepcard">
-          <div class="stephead">
-            <div>
-              <div class="kicker">2) TARGET</div>
-              <div class="title">Choose where to load</div>
-            </div>
-            <div class="segmented" role="tablist" aria-label="Load target">
-              <button type="button" id="modeTableBtn" class="active" aria-selected="true">
-                <i class="fas fa-database"></i> Table
-              </button>
-              <button type="button" id="modeStagingBtn" aria-selected="false">
-                <i class="fas fa-folder-open"></i> Staging
-              </button>
-            </div>
-          </div>
-
-          <div class="load-row" style="margin-top:4px;">
-            <div id="targetTablePanel" class="field">
-              <label for="loadTableName">Table name (autocomplete + create new)</label>
-              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <input id="loadTableName" class="mono" placeholder="e.g. table_1" list="loadTableSuggestions" />
-                <datalist id="loadTableSuggestions"></datalist>
-                <button type="button" id="btnRefreshTables" class="btn btn-sm btn-azure-outline">
-                  <i class="fas fa-rotate"></i> Refresh
-                </button>
-              </div>
-              <div class="muted">Tip: start typing to see existing tables. You can also type a new one.</div>
-            </div>
-
-            <div id="targetStagingPanel" class="field" style="display:none;">
-              <label for="loadStagingName">Staging name</label>
-              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <select id="loadStagingName">
-                  <option value="">Select staging…</option>
-                </select>
-                <button type="button" id="btnRefreshStagings" class="btn btn-sm btn-azure-outline">
-                  <i class="fas fa-rotate"></i> Refresh
-                </button>
-              </div>
-              <div class="muted">Your file will be stored in the selected staging and listed under the Staging tab.</div>
-            </div>
-          </div>
-        </div>
-
-
-        <!-- Step 3 -->
-        <div class="stepcard" id="overwriteStepCard">
-          <div class="stephead">
-            <div>
-              <div class="kicker">3) OVERWRITE</div>
-              <div class="title">Optional: overwrite matching rows</div>
-              <div class="muted">Add column names (comma or newline separated). Leave empty to append.</div>
-            </div>
-          </div>
-
-          <div class="field" style="min-width: 320px;">
-            <label for="loadOverwriteCols">Overwrite columns</label>
-            <textarea id="loadOverwriteCols" rows="4" placeholder="e.g. id&#10;email"></textarea>
-          </div>
-        </div>
-
-<!-- Step 4 -->
-        <div class="stepcard">
-          <div class="stephead">
-            <div>
-              <div class="kicker">4) LOAD</div>
-              <div class="title">Upload & load the file</div>
-            </div>
-          </div>
-
-          <div class="load-footer">
-            <div class="timer" id="loadTimer" style="display:none;">
-              <span class="spinner"></span>
-              <span>Loading:</span>
-              <span class="mono" id="loadTimerVal">0.000s</span>
-            </div>
-
-            <button type="button" id="loadStartBtn" class="btn btn-sm btn-azure-outline" disabled>
-              <i class="fas fa-upload"></i> Upload & Load
-            </button>
-          </div>
-
-          <div id="loadResult" style="display:none;"></div>
-        </div>
-
-      </div>
-    {% endif %}
   </div>
+
+  {% else %}
+  <div style="padding:40px;text-align:center;">
+    <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to begin</div>
+    <div class="super-sel" style="display:inline-flex;">
+      <i class="fas fa-cube" style="color:var(--primary);"></i>
+      <select onchange="ccOnSuperChange(this.value)" style="min-width:200px;">
+        <option value="">— Select —</option>
+        {% for t in tenants %}
+        <option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  {% endif %}
 
 </div>
 
-<!-- Modal (shared styling from base.html) -->
+<!-- Modal -->
 <div id="modal">
   <div id="modal-card">
     <div id="m-header">
@@ -577,1300 +451,209 @@
     </div>
     <div id="m-body"></div>
     <div id="m-footer">
-      <button type="button" id="m-cancel" class="btn btn-sm btn-secondary">Cancel</button>
-      <button type="button" id="m-confirm" class="btn btn-sm btn-primary">Confirm</button>
+      <button type="button" id="m-cancel" class="btn-sm">Cancel</button>
+      <button type="button" id="m-confirm" class="btn-sm btn-primary">Confirm</button>
     </div>
   </div>
 </div>
 
-{% endblock %}
-
-{% block body_scripts %}
 <script>
 (function () {
   function enc(v) { return encodeURIComponent(v || ""); }
+  function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;"); }
+  function nsToLocal(ns) { var r=String(ns||""); if(!r)return""; try{var m=Number(BigInt(r)/1000000n);return Number.isFinite(m)?new Date(m).toLocaleString():r;}catch(e){var n=Number(r);return Number.isFinite(n)?new Date(Math.floor(n/1e6)).toLocaleString():r;} }
+  function fmtBytes(n){var v=Number(n||0);if(!Number.isFinite(v)||v<=0)return"0 B";var u=["B","KB","MB","GB"],i=0,x=v;while(x>=1024&&i<u.length-1){x/=1024;i++;}return(i===0?x.toFixed(0):x.toFixed(2))+" "+u[i];}
 
-  // Role resolution — mirrors the pattern in tables.html.
-  // selection.html may set window.__st_active_role when the user picks a role;
-  // fall back to the session role_name baked into the template at render time.
-  const ROLE_NAME = {{ session_role_name|default('', true)|tojson }};
+  var _initialRole = {{ session_role_name|default('', true)|tojson }};
+  var _initialOrg  = {{ session_org|default(sel_org|default('', true), true)|tojson }};
+  var _initialSup  = {{ sel_sup|default('', true)|tojson }};
 
-  function getActiveRole() {
-    return (window.__st_active_role || window.__st_role_name || ROLE_NAME || '').trim();
-  }
-
+  function getActiveRole() { return (window.__st_active_role || window.__st_role_name || _initialRole || "").trim(); }
   function root() { return document.getElementById("stagingRoot"); }
-  function currentOrgSup() {
-    const el = root();
-    return {
-      org: el ? (el.dataset.org || "") : "",
-      sup: el ? (el.dataset.sup || "") : "",
-      roleName: getActiveRole(),
-    };
+  function currentOrgSup() { var el=root(); return { org: el?(el.dataset.org||""):_initialOrg, sup: el?(el.dataset.sup||""):_initialSup, roleName: getActiveRole() }; }
+
+  window.ccOnSuperChange = function(val) {
+    if(!val)return; var parts=val.split("/"); if(parts.length<2)return;
+    var org=parts[0].trim(), sup=parts[1].trim(); if(!org||!sup)return;
+    var el=root(); if(el){el.dataset.org=org;el.dataset.sup=sup;}
+    var ps=document.getElementById("pairSel"); if(ps)ps.value=sup;
+    try{window.dispatchEvent(new CustomEvent("supertable-changed",{detail:{org:org,sup:sup}}));}catch(e){}
+    selectedStaging="";lastStagingNames=[];lastPipeItems=[];
+    refreshStagings().catch(function(e){console.error("refreshStagings:",e);});
+    refreshTableSuggestions(); refreshRecentWrites();
+  };
+  window.ccOnRoleChange = function(val) { window.__st_active_role = val||""; };
+
+  (function(){
+    var c=currentOrgSup(); if(!c.org||!c.sup)return;
+    fetch("/reflection/roles?org="+enc(c.org)+"&sup="+enc(c.sup),{credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var roles=(d&&d.roles)?d.roles:(Array.isArray(d)?d:[]);
+        var sel=document.getElementById("ccRoleSel"); if(!sel||!roles.length)return;
+        var roleNames=[]; roles.forEach(function(r){var n=r.role_name||r.name||r.role_id||"";if(n&&roleNames.indexOf(n)<0)roleNames.push(n);});
+        if(roleNames.indexOf("superadmin")<0)roleNames.unshift("superadmin");
+        var cur=window.__st_active_role||_initialRole;
+        if(cur&&roleNames.indexOf(cur)<0)roleNames.unshift(cur);
+        sel.innerHTML=""; roleNames.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;if(n===cur)o.selected=true;sel.appendChild(o);});
+      }).catch(function(){});
+  })();
+
+  async function getJSON(url){var r=await fetch(url,{credentials:"same-origin"});var j;try{j=await r.json();}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.error))||"Request failed: "+r.status);return j;}
+  async function postJSON(url,p){var r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:p===undefined?null:JSON.stringify(p)});var j;try{j=await r.json();}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.error))||"Request failed: "+r.status);return j;}
+
+  var _modalCloseHandler=null,_modalConfirmHandler=null;
+  function showModal(title,bodyHtml,onConfirm,confirmText){
+    var modal=document.getElementById("modal"),titleEl=document.getElementById("m-title"),bodyEl=document.getElementById("m-body"),btnClose=document.getElementById("m-close"),btnCancel=document.getElementById("m-cancel"),btnConfirm=document.getElementById("m-confirm");
+    if(_modalCloseHandler){btnClose.removeEventListener("click",_modalCloseHandler);btnCancel.removeEventListener("click",_modalCloseHandler);}
+    if(_modalConfirmHandler){btnConfirm.removeEventListener("click",_modalConfirmHandler);}
+    titleEl.textContent=title||"Modal";bodyEl.innerHTML=bodyHtml||"";btnConfirm.textContent=confirmText||"Confirm";
+    function close(){modal.style.display="none";btnClose.removeEventListener("click",close);btnCancel.removeEventListener("click",close);btnConfirm.removeEventListener("click",doConfirm);_modalCloseHandler=null;_modalConfirmHandler=null;}
+    async function doConfirm(){try{if(onConfirm)await onConfirm();close();}catch(e){alert(e&&e.message?e.message:String(e));}}
+    _modalCloseHandler=close;_modalConfirmHandler=doConfirm;
+    btnClose.addEventListener("click",close);btnCancel.addEventListener("click",close);btnConfirm.addEventListener("click",doConfirm);modal.style.display="flex";
   }
 
-  function escapeHtml(str) {
-    return String(str || "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  function nsToLocalString(nsVal) {
-    const raw = (nsVal === undefined || nsVal === null) ? "" : String(nsVal);
-    if (!raw) return "";
-    try {
-      const ms = Number(BigInt(raw) / 1000000n);
-      if (!Number.isFinite(ms)) return raw;
-      return new Date(ms).toLocaleString();
-    } catch (e) {
-      const n = Number(raw);
-      if (!Number.isFinite(n)) return raw;
-      return new Date(Math.floor(n / 1e6)).toLocaleString();
-    }
-  }
-
-  async function getJSON(url) {
-    const resp = await fetch(url, { credentials: "same-origin" });
-    let js = null;
-    try { js = await resp.json(); } catch (e) { js = null; }
-    if (!resp.ok) {
-      const msg = (js && (js.detail || js.error)) || ("Request failed: " + resp.status + " " + resp.statusText);
-      throw new Error(msg);
-    }
-    return js;
-  }
-
-  async function postJSON(url, payload) {
-    const opts = {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: payload === undefined ? null : JSON.stringify(payload),
-    };
-    const resp = await fetch(url, opts);
-    let js = null;
-    try { js = await resp.json(); } catch (e) { js = null; }
-    if (!resp.ok) {
-      const msg = (js && (js.detail || js.error)) || ("Request failed: " + resp.status + " " + resp.statusText);
-      throw new Error(msg);
-    }
-    return js;
-  }
-
-  function showModal(title, bodyHtml, onConfirm, confirmText) {
-    const modal = document.getElementById("modal");
-    const titleEl = document.getElementById("m-title");
-    const bodyEl = document.getElementById("m-body");
-    const btnClose = document.getElementById("m-close");
-    const btnCancel = document.getElementById("m-cancel");
-    const btnConfirm = document.getElementById("m-confirm");
-
-    titleEl.textContent = title || "Modal";
-    bodyEl.innerHTML = bodyHtml || "";
-    btnConfirm.textContent = confirmText || "Confirm";
-
-    function close() {
-      modal.style.display = "none";
-      btnClose.removeEventListener("click", close);
-      btnCancel.removeEventListener("click", close);
-      btnConfirm.removeEventListener("click", confirm);
-    }
-
-    async function confirm() {
-      try {
-        if (onConfirm) await onConfirm();
-        close();
-      } catch (e) {
-        alert(e && e.message ? e.message : String(e));
-      }
-    }
-
-    btnClose.addEventListener("click", close);
-    btnCancel.addEventListener("click", close);
-    btnConfirm.addEventListener("click", confirm);
-
-    modal.style.display = "flex";
-  }
-
-  function showJson(obj) {
-    const pretty = JSON.stringify(obj || {}, null, 2);
-    showModal(
-      "JSON",
-      `<pre style="margin:0;white-space:pre-wrap;font-family:monospace;font-size:13px;">${escapeHtml(pretty)}</pre>`,
-      async () => {},
-      "Close"
-    );
-  }
-
-  window.showJson = showJson;
-
-  window.switchTab = function switchTab(name) {
-    const tabs = ["staging", "pipe", "load"];
-    for (const t of tabs) {
-      const btn = document.getElementById("tab-" + t);
-      const pane = document.getElementById("pane-" + t);
-      if (btn) btn.classList.toggle("active", t === name);
-      if (pane) pane.classList.toggle("hidden", t !== name);
-    }
-    const u = new URL(window.location.href);
-    u.hash = "#" + name;
-    history.replaceState(null, "", u.toString());
-    if (name === "pipe") {
-      setTimeout(async () => {
-        const stgSel = document.getElementById("pipeStagingSelect");
-        if (stgSel && stgSel.value && String(stgSel.value).trim() && String(stgSel.value).trim() !== lastPipesStagingLoaded) {
-          try { await refreshPipes(); } catch (e) {}
-        }
-      }, 0);
-    }
-    if (name === "load") {
-      setTimeout(() => { try { initLoadTab(); } catch (e) {} }, 0);
-    }
+  window.switchTab=function(name){
+    ["load","staging","pipe"].forEach(function(t){
+      var btn=document.querySelector('.tab-btn[data-tab="'+t+'"]'),pane=document.getElementById("pane-"+t);
+      if(btn)btn.classList.toggle("active",t===name);if(pane)pane.style.display=(t===name)?"":"none";
+    });
+    var u=new URL(window.location.href);u.hash="#"+name;history.replaceState(null,"",u.toString());
   };
 
-  // -------------------- Staging (expandable, scrollable, lazy-load) --------------------
+  var lastStagingNames=[],selectedStaging="",selectedPipe="",selectedPipeEnabled=false,lastPipeItems=[];
 
-  let selectedStagingName = "";
-  let expandedStagingName = "";
-  let expandedBodyEl = null;
+  async function refreshStagings(){var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/stagings?org="+enc(c.org)+"&sup="+enc(c.sup));lastStagingNames=(d&&d.staging_names)?d.staging_names:[];var el=document.getElementById("rightStagingCount");if(el)el.textContent=String(lastStagingNames.length);renderLeftPanel();refreshLoadStagingDropdown();}
+  function refreshLoadStagingDropdown(){var sel=document.getElementById("loadStagingName");if(!sel)return;sel.innerHTML='<option value="">Select staging…</option>';lastStagingNames.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o);});}
 
-  let lastStagingNames = [];
-  const STAGING_FILES_PAGE_SIZE = 50;
-  const stagingFilesState = {}; // { [stg]: { offset:number, total:number|null, loading:boolean } }
-
-  function setSelectedStaging(stg) {
-    selectedStagingName = (stg || "").trim();
-
-    // sync pipe tab selector
-    const sel = document.getElementById("pipeStagingSelect");
-    if (sel && selectedStagingName) {
-      const has = Array.from(sel.options || []).some(o => o.value === selectedStagingName);
-      if (has) sel.value = selectedStagingName;
-    }
-  }
-
-  function _filterList(items, q) {
-    q = (q || "").trim().toLowerCase();
-    if (!q) return items;
-    return (items || []).filter(x => String(x || "").toLowerCase().includes(q));
-  }
-
-  async function fetchStagingFilesPage(stg, offset, limit) {
-    const { org, sup } = currentOrgSup();
-    return await getJSON(`/reflection/ingestion/staging/files?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&offset=${enc(String(offset))}&limit=${enc(String(limit))}`);
-  }
-
-  function ensureStagingFilesState(stg) {
-    if (!stagingFilesState[stg]) stagingFilesState[stg] = { offset: 0, total: null, loading: false };
-    return stagingFilesState[stg];
-  }
-
-  function ensureFilesTable(bodyEl) {
-    if (bodyEl.querySelector("table[data-files-table='1']")) return;
-
-    bodyEl.innerHTML = `
-      <div style="min-width:0;">
-        <table data-files-table="1" style="width:100%; border-collapse:collapse;">
-          <thead>
-            <tr>
-              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px;">file</th>
-              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px; width:90px;">rows</th>
-              <th style="text-align:left; font-size:12px; color:#64748b; font-weight:900; padding:6px 6px; width:220px;">written_at</th>
-            </tr>
-          </thead>
-          <tbody data-files-tbody="1"></tbody>
-        </table>
-        <div data-files-footer="1" style="color:#64748b; font-size:12px; margin-top:10px;"></div>
-      </div>
-    `;
-  }
-
-  function setFilesFooter(bodyEl, shown, total) {
-    const footer = bodyEl.querySelector("[data-files-footer='1']");
-    if (!footer) return;
-    const t = (total === null || total === undefined) ? "?" : String(total);
-    footer.textContent = `Showing ${shown} / ${t}`;
-  }
-
-  function appendFileRows(bodyEl, items) {
-    const tbody = bodyEl.querySelector("[data-files-tbody='1']");
-    if (!tbody) return;
-
-    for (const it of (items || [])) {
-      const file = it && it.file ? String(it.file) : "";
-      const rows = (it && it.rows !== undefined && it.rows !== null) ? String(it.rows) : "";
-      const ns = (it && it.written_at_ns !== undefined && it.written_at_ns !== null) ? String(it.written_at_ns) : "";
-      const dt = nsToLocalString(ns);
-
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px; word-break:break-all;">
-          ${escapeHtml(file)}
-        </td>
-        <td style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-size:12px;">
-          ${escapeHtml(rows)}
-        </td>
-        <td title="${escapeHtml(ns)}" style="padding:7px 6px; border-top:1px solid rgba(15,23,42,.06); font-size:12px;">
-          ${escapeHtml(dt)}
-        </td>
-      `;
-      tbody.appendChild(tr);
-    }
-  }
-
-  async function loadMoreStagingFiles(stg, bodyEl, reset) {
-    const state = ensureStagingFilesState(stg);
-    if (state.loading) return;
-    if (!reset && state.total !== null && state.offset >= state.total) return;
-
-    state.loading = true;
-    try {
-      if (reset) {
-        state.offset = 0;
-        state.total = null;
-        ensureFilesTable(bodyEl);
-        const tbody = bodyEl.querySelector("[data-files-tbody='1']");
-        if (tbody) tbody.innerHTML = "";
-        setFilesFooter(bodyEl, 0, null);
-      }
-
-      // Loading marker
-      let marker = bodyEl.querySelector("[data-loading='1']");
-      if (!marker) {
-        marker = document.createElement("div");
-        marker.dataset.loading = "1";
-        marker.style.color = "#64748b";
-        marker.style.fontSize = "12px";
-        marker.style.marginTop = "8px";
-        marker.textContent = reset ? "Loading…" : "Loading more…";
-        bodyEl.appendChild(marker);
-      } else {
-        marker.textContent = reset ? "Loading…" : "Loading more…";
-      }
-
-      const data = await fetchStagingFilesPage(stg, state.offset, STAGING_FILES_PAGE_SIZE);
-      const items = (data && data.items) ? data.items : [];
-      const total = (data && data.total !== undefined && data.total !== null) ? Number(data.total) : 0;
-
-      if (marker) marker.remove();
-
-      // No files case
-      if (reset && (!items || !items.length) && total === 0) {
-        bodyEl.innerHTML = "<div style='color:#64748b; font-size:12px;'>No files recorded yet for this staging.</div>";
-        return;
-      }
-
-      ensureFilesTable(bodyEl);
-      appendFileRows(bodyEl, items);
-
-      state.total = Number.isFinite(total) ? total : (state.total || null);
-      state.offset += (items || []).length;
-
-      setFilesFooter(bodyEl, state.offset, state.total);
-    } finally {
-      state.loading = false;
-    }
-  }
-
-  function bindLazyScroll(stg, bodyEl) {
-    if (bodyEl.dataset.lazyBound === "1") return;
-    bodyEl.dataset.lazyBound = "1";
-
-    bodyEl.addEventListener("scroll", async () => {
-      const nearBottom = bodyEl.scrollTop + bodyEl.clientHeight >= bodyEl.scrollHeight - 40;
-      if (!nearBottom) return;
-      await loadMoreStagingFiles(stg, bodyEl, false);
+  function renderLeftPanel(){
+    var list=document.getElementById("leftPipeList");if(!list)return;
+    var fl=(document.getElementById("leftFilter").value||"").toLowerCase();
+    var names=lastStagingNames;if(fl)names=names.filter(function(n){return n.toLowerCase().indexOf(fl)>=0;});
+    if(!names.length){list.innerHTML='<div style="padding:14px;color:var(--text-muted);font-size:12px;">No staging areas.</div>';return;}
+    list.innerHTML="";
+    names.forEach(function(stg){
+      var sec=document.createElement("div");sec.className="pipe-section";
+      var hdr=document.createElement("div");hdr.className="pipe-section-hdr";
+      hdr.innerHTML='<i class="fas fa-chevron-right chevron"></i><i class="fas fa-folder-open" style="color:var(--primary);font-size:12px;"></i> '+esc(stg)+'<span style="margin-left:auto;"><button class="btn-sm btn-danger" style="padding:2px 6px;font-size:10px;" onclick="event.stopPropagation();deleteStaging(\''+esc(stg)+'\')"><i class="fas fa-trash"></i></button></span>';
+      var body=document.createElement("div");body.className="pipe-section-body";
+      body.innerHTML='<div style="color:var(--text-muted);font-size:11px;padding:4px;">Click to load pipes…</div>';
+      hdr.onclick=function(){var wasOpen=hdr.classList.contains("open");document.querySelectorAll(".pipe-section-hdr").forEach(function(h){h.classList.remove("open");});document.querySelectorAll(".pipe-section-body").forEach(function(b){b.classList.remove("open");});if(!wasOpen){hdr.classList.add("open");body.classList.add("open");onSelectStaging(stg,body);}};
+      if(stg===selectedStaging){hdr.classList.add("open");body.classList.add("open");loadPipesIntoBody(stg,body);}
+      sec.appendChild(hdr);sec.appendChild(body);list.appendChild(sec);
     });
   }
 
-  function collapseExpandedIfAny() {
-    if (expandedBodyEl) {
-      expandedBodyEl.style.display = "none";
-    }
-    expandedStagingName = "";
-    expandedBodyEl = null;
+  async function onSelectStaging(stg,bodyEl){selectedStaging=stg;document.getElementById("rightStagingName").innerHTML="<strong>"+esc(stg)+"</strong>";loadPipesIntoBody(stg,bodyEl);loadStagingFilesRight(stg);loadStagingFilesCenter(stg);}
+
+  async function loadPipesIntoBody(stg,bodyEl){
+    bodyEl.innerHTML='<div style="color:var(--text-muted);font-size:11px;padding:4px;">Loading…</div>';
+    try{var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/pipes?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(stg));var items=(d&&d.items)?d.items:[];lastPipeItems=items;var pcEl=document.getElementById("rightPipeCount");if(pcEl)pcEl.textContent=String(items.length);
+      if(!items.length){bodyEl.innerHTML='<div style="color:var(--text-muted);font-size:11px;padding:4px;">No pipes.</div>';return;}
+      bodyEl.innerHTML="";
+      items.forEach(function(it){var pn=it.pipe_name||"",en=!!it.enabled;var el=document.createElement("div");el.className="pipe-item";
+        el.innerHTML='<span class="pipe-dot '+(en?"on":"off")+'"></span><span>'+esc(pn)+'</span><span style="margin-left:auto;"><span class="pill '+(en?"on":"off")+'">'+(en?"on":"off")+"</span></span>";
+        el.onclick=function(e){e.stopPropagation();document.querySelectorAll(".pipe-item").forEach(function(x){x.classList.remove("active");});el.classList.add("active");openPipeEditor(stg,pn);};bodyEl.appendChild(el);});
+    }catch(e){bodyEl.innerHTML='<div style="color:var(--error);font-size:11px;">Error: '+esc(e.message)+"</div>";}
   }
 
-  async function toggleStaging(stg, bodyEl, hintEl) {
-    const alreadyExpanded = (expandedStagingName === stg) && bodyEl.style.display !== "none";
-
-    if (alreadyExpanded) {
-      bodyEl.style.display = "none";
-      if (hintEl) hintEl.style.display = "";
-      expandedStagingName = "";
-      expandedBodyEl = null;
-      return;
-    }
-
-    // Collapse previous expanded
-    if (expandedBodyEl && expandedBodyEl !== bodyEl) {
-      expandedBodyEl.style.display = "none";
-      const prevHint = expandedBodyEl.closest("[data-stg-row='1']")?.querySelector("[data-stg-hint='1']");
-      if (prevHint) prevHint.style.display = "";
-    }
-
-    // Expand this one
-    expandedStagingName = stg;
-    expandedBodyEl = bodyEl;
-    setSelectedStaging(stg);
-
-    if (hintEl) hintEl.style.display = "none";
-    bodyEl.style.display = "";
-    bodyEl.style.maxHeight = "280px";
-    bodyEl.style.overflow = "auto";
-    bodyEl.style.paddingRight = "6px";
-
-    // Sync pipe tab and refresh pipes in background
-    const sel = document.getElementById("pipeStagingSelect");
-    if (sel && sel.value !== stg) {
-      sel.value = stg;
-      try { await refreshPipes(); } catch (e) {}
-    }
-
-    if (bodyEl.dataset.loaded !== "1") {
-      bodyEl.dataset.loaded = "1";
-      await loadMoreStagingFiles(stg, bodyEl, true);
-      bindLazyScroll(stg, bodyEl);
-    }
-  }
-
-  async function refreshStagings() {
-    const { org, sup } = currentOrgSup();
-    const list = document.getElementById("stagingList");
-    const sel = document.getElementById("pipeStagingSelect");
-    if (!org || !sup) return;
-
-    if (list) list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
-
-    const data = await getJSON(`/reflection/ingestion/stagings?org=${enc(org)}&sup=${enc(sup)}`);
-    const names = (data && data.staging_names) ? data.staging_names : [];
-    lastStagingNames = Array.isArray(names) ? names : [];
-
-    if (sel) {
-      const prev = "";
-      sel.innerHTML = "<option value=''>Select staging…</option>";
-      for (const n of lastStagingNames) {
-        const opt = document.createElement("option");
-        opt.value = n;
-        opt.textContent = n;
-        sel.appendChild(opt);
-      }
-      if (prev && lastStagingNames.includes(prev)) {
-        sel.value = "";
-      } else {
-        sel.value = "";
-      }
-      setSelectedStaging("");
-    }
-
-    renderStagingList();
-  }
-
-  function renderStagingList() {
-    const { org, sup } = currentOrgSup();
-    const list = document.getElementById("stagingList");
-    if (!list) return;
-
-    if (!lastStagingNames.length) {
-      list.innerHTML = "<div style='color:#64748b;'>No staging found.</div>";
-      return;
-    }
-
-    const filterEl = document.getElementById("stagingFilter");
-    const q = filterEl ? (filterEl.value || "") : "";
-    const names = _filterList(lastStagingNames, q);
-
-    if (!names.length) {
-      list.innerHTML = "<div style='color:#64748b;'>No staging matches the filter.</div>";
-      return;
-    }
-
-    list.innerHTML = "";
-
-    for (const n of names) {
-      const row = document.createElement("div");
-      row.className = "rowcard";
-      row.dataset.stgRow = "1";
-      row.style.display = "grid";
-      row.style.gridTemplateColumns = "minmax(160px, 240px) 1fr auto";
-      row.style.alignItems = "start";
-      row.style.gap = "12px";
-
-      row.innerHTML = `
-        <div data-stg-name="1" style="cursor:pointer; min-width:0;">
-          <div class="title">${escapeHtml(n)}</div>
-        </div>
-
-        <div style="min-width:0;">
-          <div data-stg-hint="1" class="sub" style="margin-top:2px;">Click the staging name to view files.</div>
-          <div data-stg-body="1" style="display:none; margin-top:8px;"></div>
-        </div>
-
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">          <button type="button" class="btn btn-sm btn-danger-outline" onclick="deleteStaging('${escapeHtml(n)}'); event.stopPropagation();">
-            <i class="fas fa-trash"></i> Delete
-          </button>
-        </div>
-      `;
-
-      const nameEl = row.querySelector("[data-stg-name='1']");
-      const hintEl = row.querySelector("[data-stg-hint='1']");
-      const bodyEl = row.querySelector("[data-stg-body='1']");
-      if (nameEl && bodyEl) {
-        nameEl.addEventListener("click", async () => await toggleStaging(n, bodyEl, hintEl));
-      }
-
-      list.appendChild(row);
-    }
-
-    const filter = document.getElementById("stagingFilter");
-    if (filter && filter.dataset.bound !== "1") {
-      filter.dataset.bound = "1";
-      filter.addEventListener("input", () => renderStagingList());
-    }
-  }
-
-  window.viewStagingMeta = async function viewStagingMeta(stagingName) {
-    const { org, sup } = currentOrgSup();
-    if (!org || !sup) return;
-    const data = await getJSON(`/reflection/ingestion/staging/meta?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}`);
-    showJson((data && data.meta) ? data.meta : {});
-  };
-
-  window.deleteStaging = async function deleteStaging(stagingName) {
-    const { org, sup } = currentOrgSup();
-    if (!org || !sup) return;
-    if (!confirm("Delete staging '" + stagingName + "'? This removes files and pipes under it.")) return;
-    await postJSON(`/reflection/staging/delete?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}`);
-    // If we deleted the expanded one, clear it
-    if (expandedStagingName === stagingName) collapseExpandedIfAny();
-    await refreshStagings();
-    const u = new URL(window.location.href);
-    u.hash = "#staging";
-    history.replaceState(null, "", u.toString());
-  };
-
-  // -------------------- Pipe tab (filterable) --------------------
-
-  let selectedPipeName = "";
-  let selectedPipeEnabled = false;
-  let lastPipeItems = [];
-  let lastPipesStagingLoaded = "";
-
-  function setPipeButtonsVisible(visible) {
-    const pill = document.getElementById("pipeEnabledPill");
-    const btnToggle = document.getElementById("btnTogglePipe");
-    const btnDelete = document.getElementById("btnDeletePipe");
-    if (pill) pill.style.display = visible ? "" : "none";
-    if (btnToggle) btnToggle.style.display = visible ? "" : "none";
-    if (btnDelete) btnDelete.style.display = visible ? "" : "none";
-  }
-
-  function updateEnabledPill(enabled) {
-    const pill = document.getElementById("pipeEnabledPill");
-    if (!pill) return;
-    pill.classList.toggle("on", !!enabled);
-    pill.classList.toggle("off", !enabled);
-    pill.textContent = enabled ? "enabled" : "disabled";
-  }
-
-  async function refreshPipes() {
-    const { org, sup } = currentOrgSup();
-    const stgSel = document.getElementById("pipeStagingSelect");
-    const list = document.getElementById("pipeList");
-    const editor = document.getElementById("pipeEditor");
-    if (!org || !sup || !stgSel || !list) return;
-
-    const stg = (stgSel.value || "").trim();
-
-    selectedPipeName = "";
-    selectedPipeEnabled = false;
-    setPipeButtonsVisible(false);
-    updateEnabledPill(false);
-    if (editor) editor.value = "";
-
-    if (!stg) {
-      list.innerHTML = "<div style='color:#64748b;'>Please select a staging area first.</div>";
-      lastPipeItems = [];
-      lastPipesStagingLoaded = "";
-      return;
-    }
-
-    list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
-    const data = await getJSON(`/reflection/ingestion/pipes?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}`);
-    const items = (data && data.items) ? data.items : [];
-    lastPipeItems = Array.isArray(items) ? items : [];
-    lastPipesStagingLoaded = stg;
-    renderPipeList();
-  }
-
-  function renderPipeList() {
-    const stgSel = document.getElementById("pipeStagingSelect");
-    const list = document.getElementById("pipeList");
-    if (!stgSel || !list) return;
-
-    const stg = (stgSel.value || "").trim();
-    if (!stg) return;
-
-    let items = lastPipeItems || [];
-    const filterEl = document.getElementById("pipeFilter");
-    const q = filterEl ? String(filterEl.value || "").trim().toLowerCase() : "";
-    if (q) {
-      items = items.filter(it => {
-        const pn = String(it && it.pipe_name ? it.pipe_name : "").toLowerCase();
-        const sn = String(it && it.simple_name ? it.simple_name : "").toLowerCase();
-        return pn.includes(q) || sn.includes(q);
-      });
-    }
-
-    if (!items.length) {
-      list.innerHTML = "<div style='color:#64748b;'>No pipes found.</div>";
-      return;
-    }
-
-    list.innerHTML = "";
-    for (const it of items) {
-      const pn = it.pipe_name;
-      const sn = it.simple_name || "";
-      const enabled = !!it.enabled;
-      const row = document.createElement("div");
-      row.className = "rowcard";
-      row.style.cursor = "pointer";
-      row.innerHTML = `
-        <div style="min-width:0;">
-          <div class="title">${escapeHtml(pn)}</div>
-          <div class="sub">
-            ${sn ? `simple_name: <code>${escapeHtml(sn)}</code> · ` : ""}
-            <code>...:meta:staging:${escapeHtml(stg)}:pipe:${escapeHtml(pn)}</code>
-          </div>
-        </div>
-        <div><span class="pill ${enabled ? "on" : "off"}">${enabled ? "enabled" : "disabled"}</span></div>
-      `;
-      row.addEventListener("click", () => selectPipe(stg, pn));
-      list.appendChild(row);
-    }
-
-    const filter = document.getElementById("pipeFilter");
-    if (filter && filter.dataset.bound !== "1") {
-      filter.dataset.bound = "1";
-      filter.addEventListener("input", () => renderPipeList());
-    }
-  }
-
-  async function selectPipe(stagingName, pipeName) {
-    const { org, sup } = currentOrgSup();
-    const editor = document.getElementById("pipeEditor");
-    if (!org || !sup || !editor) return;
-
-    const data = await getJSON(`/reflection/ingestion/pipe/meta?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stagingName)}&pipe_name=${enc(pipeName)}`);
-    const meta = (data && data.meta) ? data.meta : {};
-    // Ensure required routing fields exist even if legacy Redis entries are partial.
-    const cur = currentOrgSup();
-    if (meta && typeof meta === "object") {
-      meta.organization = String(meta.organization || meta.org || cur.org || "");
-      meta.super_name = String(meta.super_name || meta.sup || cur.sup || "");
-      meta.staging_name = String(meta.staging_name || stagingName || "");
-      meta.pipe_name = String(meta.pipe_name || pipeName || "");
-      meta.role_name = String(meta.role_name || cur.roleName || "");
-    }
-    selectedPipeName = String(meta.pipe_name || pipeName || "");
-    selectedPipeEnabled = !!meta.enabled;
-    editor.value = JSON.stringify(meta || {}, null, 2);
-    setPipeButtonsVisible(true);
-    updateEnabledPill(selectedPipeEnabled);
-  }
-
-  function newPipeTemplate(stg) {
-    const { org, sup, roleName } = currentOrgSup();
-    return {
-      pipe_name: "pipe_01",
-      organization: org,
-      super_name: sup,
-      staging_name: stg,
-      role_name: roleName || "",
-      simple_name: "",
-      overwrite_columns: ["day"],
-      enabled: true,
-      meta: {},
-    };
-  }
-
-  const stgSel = document.getElementById("pipeStagingSelect");
-  if (stgSel) {
-    stgSel.addEventListener("change", async () => {
-      setSelectedStaging(stgSel.value || "");
-      await refreshPipes();
-    });
-    stgSel.addEventListener("click", async () => {
-      const v = String(stgSel.value || "").trim();
-      if (v && v !== lastPipesStagingLoaded) {
-        try { await refreshPipes(); } catch (e) {}
-      }
-    });
-  }
-
-  const btnNewPipe = document.getElementById("btnNewPipe");
-  if (btnNewPipe) {
-    btnNewPipe.addEventListener("click", async () => {
-      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
-      if (!stg) { alert("Please select a staging area first."); return; }
-
-      showModal(
-        "New pipe (draft)",
-        `
-          <div style="display:flex; flex-direction:column; gap:10px;">
-            <label style="font-weight:800;">Pipe name</label>
-            <input id="modalPipeName" class="input" placeholder="pipe_01" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
-
-            <label style="font-weight:800; margin-top:6px;">simple_name</label>
-            <input id="modalPipeSimple" class="input" placeholder="" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
-
-            <label style="font-weight:800; margin-top:6px;">overwrite_columns</label>
-            <input id="modalPipeOverwrite" class="input" placeholder="day" value="day" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
-            <div style="font-size:12px;color:#64748b;">Comma-separated list (e.g. <code>day,month</code>).</div>
-
-            <label style="display:flex; align-items:center; gap:10px; font-weight:800; margin-top:6px;">
-              <input id="modalPipeEnabled" type="checkbox" checked /> enabled
-            </label>
-          </div>
-        `,
-        async () => {
-          const editor = document.getElementById("pipeEditor");
-          const pn = (document.getElementById("modalPipeName").value || "").trim() || "pipe_01";
-          const sn = (document.getElementById("modalPipeSimple").value || "").trim();
-          const rawCols = (document.getElementById("modalPipeOverwrite").value || "").trim();
-          const cols = rawCols ? rawCols.split(",").map(x => x.trim()).filter(Boolean) : [];
-          const enabled = !!document.getElementById("modalPipeEnabled").checked;
-
-          selectedPipeName = "";
-          selectedPipeEnabled = false;
-          setPipeButtonsVisible(false);
-          updateEnabledPill(false);
-
-          const obj = newPipeTemplate(stg);
-          obj.pipe_name = pn;
-          obj.simple_name = sn;
-          obj.overwrite_columns = cols;
-          obj.enabled = enabled;
-
-          if (editor) editor.value = JSON.stringify(obj, null, 2);
-        },
-        "Create draft"
-      );
-
-      setTimeout(() => {
-        const el = document.getElementById("modalPipeName");
-        if (el) el.focus();
-      }, 20);
-    });
-  }
-
-  const btnSavePipe = document.getElementById("btnSavePipe");
-  if (btnSavePipe) {
-    btnSavePipe.addEventListener("click", async () => {
-      const editor = document.getElementById("pipeEditor");
-      if (!editor) return;
-      let obj = null;
-      try { obj = JSON.parse(editor.value || "{}"); } catch (e) { alert("Invalid JSON: " + e.message); return; }
-      if (!obj || typeof obj !== "object") { alert("Pipe definition must be a JSON object."); return; }
-
-      // Fill required identity fields from current selection (helps when editing legacy/partial entries).
-      const cur = currentOrgSup();
-      const stg = (stgSel && stgSel.value) ? String(stgSel.value).trim() : "";
-      obj.organization = String(obj.organization || obj.org || cur.org || "");
-      obj.super_name = String(obj.super_name || obj.sup || cur.sup || "");
-      obj.staging_name = String(obj.staging_name || stg || "");
-      obj.pipe_name = String(obj.pipe_name || selectedPipeName || "").trim();
-      obj.role_name = String(obj.role_name || cur.roleName || "");
-
-      if (!obj.organization || !obj.super_name || !obj.staging_name || !obj.pipe_name) {
-        alert("Missing required fields: organization, super_name, staging_name, pipe_name.");
-        return;
-      }
-
-      await postJSON("/reflection/pipes/save", obj);
-      await refreshPipes();
-      alert("Saved.");
-    });
-  }
-
-  const btnToggle = document.getElementById("btnTogglePipe");
-  if (btnToggle) {
-    btnToggle.addEventListener("click", async () => {
-      const { org, sup } = currentOrgSup();
-      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
-      if (!org || !sup || !stg || !selectedPipeName) return;
-      const endpoint = selectedPipeEnabled ? "disable" : "enable";
-      await postJSON(`/reflection/pipes/${endpoint}?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&pipe_name=${enc(selectedPipeName)}`);
-      selectedPipeEnabled = !selectedPipeEnabled;
-      updateEnabledPill(selectedPipeEnabled);
-      await refreshPipes();
-    });
-  }
-
-  const btnDelete = document.getElementById("btnDeletePipe");
-  if (btnDelete) {
-    btnDelete.addEventListener("click", async () => {
-      const { org, sup } = currentOrgSup();
-      const stg = (stgSel && stgSel.value) ? stgSel.value.trim() : "";
-      if (!org || !sup || !stg || !selectedPipeName) return;
-      if (!confirm("Delete pipe '" + selectedPipeName + "'?")) return;
-      await postJSON(`/reflection/pipes/delete?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(stg)}&pipe_name=${enc(selectedPipeName)}`);
-      selectedPipeName = "";
-      selectedPipeEnabled = false;
-      setPipeButtonsVisible(false);
-      updateEnabledPill(false);
-      const editor = document.getElementById("pipeEditor");
-      if (editor) editor.value = "";
-      await refreshPipes();
-    });
-  }
-
-  // -------------------- Create staging modal --------------------
-
-  const btnCreateStaging = document.getElementById("btnCreateStaging");
-  if (btnCreateStaging) {
-    btnCreateStaging.addEventListener("click", async () => {
-      const { org, sup } = currentOrgSup();
-      if (!org || !sup) return;
-
-      showModal(
-        "Create staging",
-        `
-          <div style="display:flex; flex-direction:column; gap:10px;">
-            <label style="font-weight:800;">Staging name</label>
-            <input id="modalStagingName" class="input" placeholder="staging_01" style="width:100%; padding:10px; border-radius:12px; border:1px solid rgba(15,23,42,.14);" />
-            <div style="font-size:12px;color:#64748b;">Will create folders under <code>${escapeHtml(org)}/${escapeHtml(sup)}/staging/&lt;name&gt;</code>.</div>
-          </div>
-        `,
-        async () => {
-          const name = (document.getElementById("modalStagingName").value || "").trim();
-          if (!name) throw new Error("staging_name is required.");
-          await postJSON(`/reflection/staging/create?org=${enc(org)}&sup=${enc(sup)}&staging_name=${enc(name)}`);
-          await refreshStagings();
-        },
-        "Create"
-      );
-      setTimeout(() => {
-        const el = document.getElementById("modalStagingName");
-        if (el) el.focus();
-      }, 20);
-    });
-  }
-
-  // -------------------- Cross-page tenant change --------------------
-
-
-  window.onPairChange = async function onPairChange() {
-    const el = root();
-    if (!el) return;
-
-    const sel = document.getElementById("pairSel");
-    const nextSup = sel ? String(sel.value || "").trim() : "";
-    const nextOrg = (typeof ORG_NAME !== "undefined" && ORG_NAME) ? String(ORG_NAME || "").trim() : (el.dataset.org || "");
-    if (!nextOrg || !nextSup) return;
-
-    // Update the root dataset so all API calls use the new tenant.
-    el.dataset.org = nextOrg;
-    el.dataset.sup = nextSup;
-
-    // Reset state/caches so the page renders the new tenant cleanly.
-    selectedStagingName = "";
-    expandedStagingName = "";
-    try { collapseExpandedIfAny(); } catch (_) {}
-
-    try { lastStagingNames = []; } catch (_) {}
-    try { lastPipeItems = []; } catch (_) {}
-    try { lastPipesStagingLoaded = ""; } catch (_) {}
-    try { for (const k in stagingFilesState) { delete stagingFilesState[k]; } } catch (_) {}
-
-    const list = document.getElementById("stagingList");
-    if (list) list.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
-    const pipeList = document.getElementById("pipeList");
-    if (pipeList) pipeList.innerHTML = "<div style='color:#64748b;'>Loading…</div>";
-    const editor = document.getElementById("pipeEditor");
-    if (editor) editor.value = "";
-
-    try { await refreshStagings(); } catch (e) { console.error("refreshStagings failed:", e); }
-
-    // If Pipe tab is currently open, refresh its list as well.
-    try {
-      const pipeTab = document.getElementById("tab-pipe");
-      if (pipeTab && pipeTab.classList.contains("active")) {
-        await refreshPipes();
-      }
-    } catch (e) {
-      console.error("refreshPipes failed:", e);
-    }
-
-    // If Load tab is open, refresh the suggestions/names there too.
-    try {
-      const loadTab = document.getElementById("tab-load");
-      if (loadTab && loadTab.classList.contains("active")) {
-        if (typeof _refreshTableSuggestions === "function") await _refreshTableSuggestions();
-        const modeStg = document.getElementById("modeStagingBtn");
-        if (modeStg && modeStg.classList.contains("active") && typeof _refreshStagingNames === "function") {
-          await _refreshStagingNames();
-        }
-      }
-    } catch (_) {}
-  };
-
-
-
-  window.addEventListener("supertable-changed", function(e) {
-    const detail = (e && e.detail) ? e.detail : {};
-    const org = detail.org || "";
-    const sup = detail.sup || "";
-    if (!org || !sup) return;
-
-
-    // If the page can refresh in-place, prefer that and prevent the selection fallback reload.
-    if (typeof window.onPairChange === "function") {
-      try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } catch (_) {}
-      return;
-    }
-try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } catch (_) {}
-    const u = new URL(window.location.href);
-    u.pathname = "/reflection/ingestion";
-    u.searchParams.set("org", org);
-    u.searchParams.set("sup", sup);
-    u.hash = "#staging";
-    window.location.href = u.toString();
+  async function loadStagingFilesRight(stg){var area=document.getElementById("rightStagingFiles");if(!area)return;area.innerHTML='<div style="font-size:11px;color:var(--text-muted);">Loading…</div>';try{var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/staging/files?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(stg)+"&offset=0&limit=20");var items=(d&&d.items)?d.items:[];if(!items.length){area.innerHTML='<div style="font-size:11px;color:var(--text-muted);">No files.</div>';return;}var h="";items.forEach(function(it){var f=String(it.file||"");h+='<div class="stg-file"><i class="fas fa-file"></i> <span style="flex:1;word-break:break-all;">'+esc(f.split("/").pop())+"</span>"+(it.rows!==undefined?'<span class="size">'+it.rows+" rows</span>":"")+"</div>";});area.innerHTML=h;}catch(e){area.innerHTML='<div style="font-size:11px;color:var(--error);">Error</div>';}}
+
+  async function loadStagingFilesCenter(stg){var area=document.getElementById("stagingFilesCenter");if(!area)return;area.innerHTML='<div style="color:var(--text-muted);">Loading files for <strong>'+esc(stg)+"</strong>…</div>";try{var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/staging/files?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(stg)+"&offset=0&limit=50");var items=(d&&d.items)?d.items:[];var total=(d&&d.total!==undefined)?d.total:0;if(!items.length){area.innerHTML='<div style="color:var(--text-muted);">No files in <strong>'+esc(stg)+"</strong>.</div>";return;}var h='<div class="preview-wrap"><table class="preview-tbl"><thead><tr><th>File</th><th>Rows</th><th>Written At</th></tr></thead><tbody>';items.forEach(function(it){h+="<tr><td>"+esc(it.file||"")+"</td><td>"+esc(it.rows!==undefined?String(it.rows):"")+"</td><td>"+esc(nsToLocal(it.written_at_ns))+"</td></tr>";});h+="</tbody></table></div>";if(total>items.length)h+='<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Showing '+items.length+" of "+total+"</div>";area.innerHTML='<div style="font-size:14px;font-weight:600;margin-bottom:8px;">'+esc(stg)+"</div>"+h;}catch(e){area.innerHTML='<div style="color:var(--error);">Error: '+esc(e.message)+"</div>";}}
+
+  async function openPipeEditor(stg,pn){switchTab("pipe");selectedPipe=pn;var ed=document.getElementById("pipeEditor");if(!ed)return;ed.value="Loading…";try{var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/pipe/meta?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(stg)+"&pipe_name="+enc(pn));var m=(d&&d.meta)?d.meta:{};m.organization=String(m.organization||c.org);m.super_name=String(m.super_name||c.sup);m.staging_name=String(m.staging_name||stg);m.pipe_name=String(m.pipe_name||pn);m.role_name=String(m.role_name||c.roleName);selectedPipeEnabled=!!m.enabled;ed.value=JSON.stringify(m,null,2);setPipeVis(true);updatePill(selectedPipeEnabled);}catch(e){ed.value="// Error: "+e.message;}}
+  function setPipeVis(v){["pipeEnabledPill","btnTogglePipe","btnDeletePipe"].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display=v?"":"none";});}
+  function updatePill(en){var p=document.getElementById("pipeEnabledPill");if(!p)return;p.className="pill "+(en?"on":"off");p.textContent=en?"enabled":"disabled";}
+
+  document.getElementById("btnSavePipe").addEventListener("click",async function(){
+    var ed=document.getElementById("pipeEditor");if(!ed)return;var obj;
+    try{obj=JSON.parse(ed.value||"{}");}catch(e){alert("Invalid JSON: "+e.message);return;}
+    if(!obj||typeof obj!=="object"){alert("Pipe definition must be a JSON object.");return;}
+    var c=currentOrgSup();obj.organization=String(obj.organization||obj.org||c.org);obj.super_name=String(obj.super_name||obj.sup||c.sup);obj.staging_name=String(obj.staging_name||selectedStaging);obj.pipe_name=String(obj.pipe_name||selectedPipe||"").trim();obj.role_name=String(obj.role_name||c.roleName);
+    if(!obj.organization||!obj.super_name){alert("Missing organization or super_name.");return;}
+    if(!obj.staging_name||!obj.pipe_name){alert("Missing staging_name or pipe_name.");return;}
+    try{await postJSON("/reflection/pipes/save",obj);alert("Saved.");await refreshStagings();}catch(e){alert("Save failed: "+(e.message||String(e)));}
   });
 
-  // Initial tab from hash
-  const h = (window.location.hash || "").replace("#", "");
-  if (h === "pipe" || h === "load" || h === "staging") {
-    window.switchTab(h);
-  } else {
-    window.switchTab("load");
-  }
-
-// Initial load
-  refreshStagings().then(async () => {
-    const stgSel2 = document.getElementById("pipeStagingSelect");
-    if (stgSel2 && stgSel2.value) await refreshPipes();
+  document.getElementById("btnNewPipe").addEventListener("click",function(){
+    if(!selectedStaging){alert("Select a staging area first.");return;}var c=currentOrgSup();
+    showModal("New pipe (draft)",'<div style="display:flex;flex-direction:column;gap:10px;"><label style="font-weight:700;">Pipe name</label><input id="modalPipeName" class="field-input" placeholder="pipe_01" style="width:100%;" /><label style="font-weight:700;margin-top:6px;">simple_name</label><input id="modalPipeSimple" class="field-input" placeholder="" style="width:100%;" /><label style="font-weight:700;margin-top:6px;">overwrite_columns</label><input id="modalPipeOverwrite" class="field-input" placeholder="day" value="day" style="width:100%;" /><div style="font-size:11px;color:var(--text-muted);">Comma-separated (e.g. <code>day,month</code>).</div><label style="display:flex;align-items:center;gap:10px;font-weight:700;margin-top:6px;"><input id="modalPipeEnabled" type="checkbox" checked /> enabled</label></div>',
+      async function(){var ed=document.getElementById("pipeEditor");var pn=(document.getElementById("modalPipeName").value||"").trim()||"pipe_01";var sn=(document.getElementById("modalPipeSimple").value||"").trim();var rawCols=(document.getElementById("modalPipeOverwrite").value||"").trim();var cols=rawCols?rawCols.split(",").map(function(x){return x.trim();}).filter(Boolean):[];var enabled=!!document.getElementById("modalPipeEnabled").checked;selectedPipe="";selectedPipeEnabled=false;setPipeVis(false);var obj={pipe_name:pn,organization:c.org,super_name:c.sup,staging_name:selectedStaging,role_name:c.roleName,simple_name:sn,overwrite_columns:cols,enabled:enabled,meta:{}};if(ed)ed.value=JSON.stringify(obj,null,2);},"Create draft");
+    setTimeout(function(){var el=document.getElementById("modalPipeName");if(el)el.focus();},20);
   });
 
-  window.refreshStagings = refreshStagings;
-  window.refreshPipes = refreshPipes;
+  document.getElementById("btnTogglePipe").addEventListener("click",async function(){if(!selectedStaging||!selectedPipe)return;var c=currentOrgSup();var ep=selectedPipeEnabled?"disable":"enable";await postJSON("/reflection/pipes/"+ep+"?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(selectedStaging)+"&pipe_name="+enc(selectedPipe));selectedPipeEnabled=!selectedPipeEnabled;updatePill(selectedPipeEnabled);await refreshStagings();});
 
-  // -------------------- Load Data (modern) --------------------
+  document.getElementById("btnDeletePipe").addEventListener("click",async function(){if(!selectedStaging||!selectedPipe)return;if(!confirm('Delete pipe "'+selectedPipe+'"?'))return;var c=currentOrgSup();await postJSON("/reflection/pipes/delete?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(selectedStaging)+"&pipe_name="+enc(selectedPipe));selectedPipe="";setPipeVis(false);document.getElementById("pipeEditor").value="";await refreshStagings();});
 
-  let loadMode = "table"; // "table" | "staging"
-  let loadSelectedFile = null;
-  let loadTimerHandle = null;
-  let loadTimerStart = 0;
+  document.getElementById("btnCreateStaging").addEventListener("click",async function(){
+    var c=currentOrgSup();if(!c.org||!c.sup)return;
+    showModal("Create staging",'<div style="display:flex;flex-direction:column;gap:10px;"><label style="font-weight:700;">Staging name</label><input id="modalStagingName" class="field-input" placeholder="staging_01" style="width:100%;" /><div style="font-size:11px;color:var(--text-muted);">Will create folders under <code>'+esc(c.org)+"/"+esc(c.sup)+'/staging/&lt;name&gt;</code>.</div></div>',
+      async function(){var name=(document.getElementById("modalStagingName").value||"").trim();if(!name)throw new Error("staging_name is required.");var cc=currentOrgSup();await postJSON("/reflection/staging/create?org="+enc(cc.org)+"&sup="+enc(cc.sup)+"&staging_name="+enc(name));try{await refreshStagings();}catch(e){console.error("refreshStagings after create:",e);}},"Create");
+    setTimeout(function(){var el=document.getElementById("modalStagingName");if(el)el.focus();},20);
+  });
 
-  function _fmtBytes(n) {
-    const v = Number(n || 0);
-    if (!Number.isFinite(v) || v <= 0) return "0 B";
-    const units = ["B","KB","MB","GB"];
-    let u = 0;
-    let x = v;
-    while (x >= 1024 && u < units.length - 1) { x /= 1024; u += 1; }
-    return `${x.toFixed(u === 0 ? 0 : 2)} ${units[u]}`;
-  }
+  window.deleteStaging=async function(stg){var c=currentOrgSup();if(!confirm('Delete staging "'+stg+'"?'))return;await postJSON("/reflection/staging/delete?org="+enc(c.org)+"&sup="+enc(c.sup)+"&staging_name="+enc(stg));if(selectedStaging===stg)selectedStaging="";await refreshStagings();};
 
-  function _setMode(m) {
-    loadMode = m;
-    const ow = document.getElementById("overwriteStepCard");
-    if (ow) ow.style.display = (m === "table") ? "" : "none";
+  document.getElementById("leftFilter").addEventListener("input",function(){renderLeftPanel();});
 
-    const b1 = document.getElementById("modeTableBtn");
-    const b2 = document.getElementById("modeStagingBtn");
-    const p1 = document.getElementById("targetTablePanel");
-    const p2 = document.getElementById("targetStagingPanel");
-    if (b1) b1.classList.toggle("active", m === "table");
-    if (b2) b2.classList.toggle("active", m === "staging");
-    if (b1) b1.setAttribute("aria-selected", m === "table" ? "true" : "false");
-    if (b2) b2.setAttribute("aria-selected", m === "staging" ? "true" : "false");
-    if (p1) p1.style.display = (m === "table") ? "" : "none";
-    if (p2) p2.style.display = (m === "staging") ? "" : "none";
-    _updateLoadStartEnabled();
-  }
+  var loadMode="table",loadFile=null,timerH=null,timerS=0;
+  var dropZone=document.getElementById("dropZone"),fileInput=document.getElementById("loadFileInput");
+  dropZone.addEventListener("click",function(){fileInput.click();});
+  ["dragenter","dragover"].forEach(function(ev){dropZone.addEventListener(ev,function(e){e.preventDefault();dropZone.classList.add("dragover");});});
+  ["dragleave","drop"].forEach(function(ev){dropZone.addEventListener(ev,function(e){e.preventDefault();dropZone.classList.remove("dragover");});});
+  dropZone.addEventListener("drop",function(e){if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0]);});
+  fileInput.addEventListener("change",function(){if(fileInput.files.length)handleFile(fileInput.files[0]);});
 
-  function _updateLoadStartEnabled() {
-    const btn = document.getElementById("loadStartBtn");
-    if (!btn) return;
-    const fileOk = !!loadSelectedFile;
-    let targetOk = false;
-    if (loadMode === "table") {
-      const t = document.getElementById("loadTableName");
-      targetOk = !!(t && String(t.value || "").trim());
-    } else {
-      const s = document.getElementById("loadStagingName");
-      targetOk = !!(s && String(s.value || "").trim());
-    }
-    btn.disabled = !(fileOk && targetOk);
-  }
+  function handleFile(f){loadFile=f;dropZone.style.display="none";document.getElementById("flowArea").style.display="block";document.getElementById("step1Num").classList.add("done");document.getElementById("step1Info").textContent=f.name+" · "+f.name.split(".").pop().toUpperCase()+" · "+fmtBytes(f.size);snakePeek(f);updateBtn();}
+  document.getElementById("btnChangeFile").addEventListener("click",function(){resetUpload();});
+  window.resetUpload=function(){loadFile=null;dropZone.style.display="";document.getElementById("flowArea").style.display="none";document.getElementById("previewArea").innerHTML="";var rc=document.getElementById("resultCard");rc.style.display="none";rc.className="result-card";fileInput.value="";updateBtn();};
+  document.getElementById("modeTableBtn").addEventListener("click",function(){setTarget("table");});
+  document.getElementById("modeStagingBtn").addEventListener("click",function(){setTarget("staging");});
+  function setTarget(mode){loadMode=mode;document.querySelectorAll(".target-tab").forEach(function(t){t.classList.remove("active");});document.getElementById(mode==="table"?"modeTableBtn":"modeStagingBtn").classList.add("active");document.getElementById("targetTablePanel").style.display=mode==="table"?"":"none";document.getElementById("targetStagingPanel").style.display=mode==="staging"?"":"none";document.getElementById("overwriteStepCard").style.display=mode==="table"?"":"none";updateBtn();}
+  function updateBtn(){var btn=document.getElementById("loadStartBtn");if(!btn)return;var ok=!!loadFile;if(loadMode==="table"){var t=document.getElementById("loadTableName");ok=ok&&!!(t&&t.value.trim());}else{var s=document.getElementById("loadStagingName");ok=ok&&!!(s&&s.value.trim());}btn.disabled=!ok;}
+  document.getElementById("loadTableName").addEventListener("input",updateBtn);
+  document.getElementById("loadStagingName").addEventListener("change",updateBtn);
 
-  function _clearPreview() {
-    const box = document.getElementById("loadPreview");
-    if (box) box.style.display = "none";
-    const thead = document.getElementById("loadPreviewThead");
-    const tbody = document.getElementById("loadPreviewTbody");
-    const info = document.getElementById("loadPreviewInfo");
-    if (thead) thead.innerHTML = "";
-    if (tbody) tbody.innerHTML = "";
-    if (info) info.textContent = "—";
-  }
+  async function snakePeek(file){var area=document.getElementById("previewArea");area.innerHTML="";if(!file)return;var ext=(file.name||"").toLowerCase().split(".").pop();if(ext==="parquet"){area.innerHTML='<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Parquet preview after upload.</div>';return;}var text=await file.slice(0,512*1024).text();try{if(ext==="json"||ext==="jsonl"||ext==="ndjson"){var lines=text.trim().split(/\r?\n/).filter(function(x){return x.trim();});var arr=(ext==="jsonl"||ext==="ndjson")?lines.slice(0,50).map(function(l){return JSON.parse(l);}):(function(){var p=JSON.parse(text.trim());return Array.isArray(p)?p.slice(0,50):[p];})();var keys=[];(arr||[]).forEach(function(o){if(o&&typeof o==="object")Object.keys(o).forEach(function(k){if(keys.indexOf(k)<0)keys.push(k);});});var h=keys.length?keys:["value"];mkPreview(area,h,(arr||[]).slice(0,10).map(function(o){return h.map(function(k){return keys.length?(o&&o[k]):o;});}));return;}var sep=ext==="tsv"?"\t":",";var csvL=text.split(/\r?\n/).filter(function(l){return l.trim();});if(!csvL.length)return;mkPreview(area,csvL[0].split(sep).map(function(x){return x.trim();}),csvL.slice(1,11).map(function(l){return l.split(sep);}));}catch(e){area.innerHTML='<div style="font-size:11px;color:var(--error);">Preview failed: '+esc(e.message)+"</div>";}}
+  function mkPreview(area,headers,rows){var h='<div class="preview-wrap"><table class="preview-tbl"><thead><tr>';headers.forEach(function(x){h+="<th>"+esc(x)+"</th>";});h+="</tr></thead><tbody>";rows.forEach(function(r){h+="<tr>";headers.forEach(function(_,i){h+="<td>"+esc(r&&r[i]!==undefined?String(r[i]).substring(0,80):"")+"</td>";});h+="</tr>";});h+='</tbody></table></div><div style="font-size:11px;color:var(--text-muted);margin-top:4px;">'+headers.length+" cols · "+rows.length+" rows preview</div>";area.innerHTML=h;}
 
-  function _renderPreview(headers, rows, infoText) {
-    const box = document.getElementById("loadPreview");
-    const thead = document.getElementById("loadPreviewThead");
-    const tbody = document.getElementById("loadPreviewTbody");
-    const info = document.getElementById("loadPreviewInfo");
-    if (!box || !thead || !tbody) return;
+  async function refreshTableSuggestions(){var dl=document.getElementById("loadTableSuggestions");if(!dl)return;dl.innerHTML="";var c=currentOrgSup();try{var d=await getJSON("/reflection/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name="+enc(c.roleName));(d&&d.tables||[]).forEach(function(t){var o=document.createElement("option");o.value=String(t);dl.appendChild(o);});}catch(e){}}
+  document.getElementById("btnRefreshTables").addEventListener("click",refreshTableSuggestions);
+  document.getElementById("btnRefreshStagings").addEventListener("click",function(){refreshLoadStagingDropdown();});
 
-    const h = (headers || []).slice(0, 30);
-    thead.innerHTML = `<tr>${h.map(x => `<th>${escapeHtml(x)}</th>`).join("")}</tr>`;
-    tbody.innerHTML = (rows || []).slice(0, 20).map(r => {
-      const cells = h.map((_, i) => {
-        const v = (r && r[i] !== undefined && r[i] !== null) ? String(r[i]) : "";
-        return `<td title="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
-      });
-      return `<tr>${cells.join("")}</tr>`;
-    }).join("");
+  document.getElementById("loadStartBtn").addEventListener("click",async function(){
+    if(!loadFile)return;var btn=document.getElementById("loadStartBtn");var c=currentOrgSup();
+    var tbl=document.getElementById("loadTableName").value.trim(),stgN=document.getElementById("loadStagingName").value.trim();
+    if(loadMode==="table"&&!tbl){alert("Enter a table name.");return;}if(loadMode==="staging"&&!stgN){alert("Select a staging area.");return;}
+    btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Uploading…';timerS=performance.now();var el=document.getElementById("loadTimer"),val=document.getElementById("loadTimerVal");if(el)el.style.display="inline-flex";if(val)val.textContent="0.000s";if(timerH)clearInterval(timerH);timerH=setInterval(function(){if(val)val.textContent=((performance.now()-timerS)/1000).toFixed(3)+"s";},50);
+    var t0=performance.now();
+    try{var fd=new FormData();fd.append("org",c.org);fd.append("sup",c.sup);fd.append("role_name",c.roleName);fd.append("mode",loadMode);if(tbl)fd.append("table_name",tbl);var ow=document.getElementById("loadOverwriteCols");if(loadMode==="table"&&ow&&ow.value.trim())fd.append("overwrite_columns",ow.value.trim());if(stgN)fd.append("staging_name",stgN);fd.append("file",loadFile,loadFile.name||"upload");
+      var resp=await fetch("/reflection/ingestion/load/upload",{method:"POST",body:fd,credentials:"same-origin"});var txt=await resp.text();var data;try{data=JSON.parse(txt);}catch(e){}if(!resp.ok)throw new Error((data&&(data.detail||data.error))||txt||"Upload failed: "+resp.status);
+      var cMs=performance.now()-t0,sMs=(data&&data.server_duration_ms!==undefined)?Number(data.server_duration_ms):null;
+      var rc=document.getElementById("resultCard");rc.className="result-card success";rc.style.display="block";
+      document.getElementById("resultTitle").innerHTML='<i class="fas fa-check-circle" style="color:var(--success);"></i> Successfully loaded';
+      document.getElementById("resultDetail").innerHTML=esc((data&&data.rows!==undefined?data.rows:"")+" rows · Job: "+(data&&data.job_uuid||""))+" · Server: "+(sMs!==null?sMs.toFixed(1)+"ms":"—")+" · Client: "+cMs.toFixed(0)+"ms";
+      document.getElementById("step2Num").classList.add("done");
+      if(loadMode==="staging"){try{await refreshStagings();}catch(e){}}
+    }catch(e){var rc=document.getElementById("resultCard");rc.className="result-card error";rc.style.display="block";document.getElementById("resultTitle").innerHTML='<i class="fas fa-times-circle" style="color:var(--error);"></i> Failed';document.getElementById("resultDetail").textContent=String(e.message||e);
+    }finally{if(timerH)clearInterval(timerH);timerH=null;var el2=document.getElementById("loadTimer");if(el2)el2.style.display="none";btn.disabled=false;btn.innerHTML='<i class="fas fa-upload"></i> Upload & Load';updateBtn();}
+  });
 
-    if (info) info.textContent = infoText || "";
-    box.style.display = "";
-  }
+  async function refreshRecentWrites(){var area=document.getElementById("rightRecentWrites"),countEl=document.getElementById("rightWriteCount"),rowsEl=document.getElementById("rightTotalRows"),avgEl=document.getElementById("rightAvgDuration");if(!area)return;area.innerHTML='<div style="font-size:11px;color:var(--text-muted);">Loading…</div>';try{var c=currentOrgSup();var d=await getJSON("/reflection/ingestion/recent-writes?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=50");var items=(d&&d.items)?d.items:[];if(countEl)countEl.textContent=String(items.length);var totalRows=0,totalDur=0,durCount=0;items.forEach(function(it){if(it.inserted!==undefined)totalRows+=Number(it.inserted)||0;if(it.duration!==undefined&&it.duration!==null){totalDur+=Number(it.duration)||0;durCount++;}});if(rowsEl)rowsEl.textContent=totalRows>0?totalRows.toLocaleString():"0";if(avgEl)avgEl.textContent=durCount>0?(totalDur/durCount).toFixed(3)+"s":"—";if(!items.length){area.innerHTML='<div style="font-size:11px;color:var(--text-muted);">No recent writes.</div>';return;}
+    var html="";items.slice(0,20).forEach(function(it){var table=it.table_name||"—";var ins=(it.inserted!==undefined)?String(it.inserted):"?";var del=(it.deleted!==undefined&&Number(it.deleted)>0)?", "+it.deleted+" del":"";var dur=(it.duration!==undefined)?Number(it.duration).toFixed(3)+"s":"";var ts=it.recorded_at||"";var timeAgo="";if(ts){try{var dt=new Date(ts);var diff=Math.floor((Date.now()-dt.getTime())/1000);if(diff<60)timeAgo=diff+"s ago";else if(diff<3600)timeAgo=Math.floor(diff/60)+"m ago";else if(diff<86400)timeAgo=Math.floor(diff/3600)+"h ago";else timeAgo=Math.floor(diff/86400)+"d ago";}catch(e){timeAgo=ts;}}var dotColor=(it.inserted!==undefined&&Number(it.inserted)>0)?"green":(it.delete_only?"red":"blue");
+      html+='<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-light);font-size:11px;"><div style="width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:5px;background:var(--'+(dotColor==="green"?"success":dotColor==="red"?"error":"primary")+');"></div><div style="min-width:0;flex:1;"><div><strong>'+esc(table)+"</strong> — "+esc(ins)+" rows"+esc(del)+'</div><div style="color:var(--text-muted);font-size:10px;margin-top:1px;">'+esc(timeAgo)+(dur?" · "+esc(dur):"")+(it.role_name?" · "+esc(it.role_name):"")+"</div></div></div>";});area.innerHTML=html;}catch(e){area.innerHTML='<div style="font-size:11px;color:var(--error);">Error loading stats.</div>';}}
 
-  async function _snakePeekFile(file) {
-    _clearPreview();
-    if (!file) return;
+  document.getElementById("btnRefreshWrites").addEventListener("click",function(){refreshRecentWrites();});
 
-    const name = (file.name || "").toLowerCase();
-    const ext = name.includes(".") ? name.split(".").pop() : "";
-    const maxBytes = 512 * 1024;
+  window.addEventListener("supertable-changed",function(e){var detail=(e&&e.detail)?e.detail:{};var org=detail.org||"",sup=detail.sup||"";if(!org||!sup)return;try{if(e&&typeof e.preventDefault==="function")e.preventDefault();}catch(_){}var el=root();if(el){el.dataset.org=org;el.dataset.sup=sup;}selectedStaging="";lastStagingNames=[];lastPipeItems=[];refreshStagings().catch(function(e){console.error("refreshStagings:",e);});refreshTableSuggestions();refreshRecentWrites();});
 
-    // Parquet preview client-side is not supported without heavier deps
-    if (ext === "parquet") {
-      _renderPreview(["Preview not available"], [["Parquet preview is shown after upload/load."]], "Parquet");
-      return;
-    }
-
-    const blob = file.slice(0, maxBytes);
-    const text = await blob.text();
-
-    try {
-      if (ext === "json" || ext === "jsonl" || ext === "ndjson") {
-        const trimmed = text.trim();
-        let arr = null;
-
-        // Try JSONL first
-        const lines = trimmed.split(/\r?\n/).filter(x => x.trim());
-        if ((ext === "jsonl" || ext === "ndjson") && lines.length) {
-          arr = lines.slice(0, 50).map(l => JSON.parse(l));
-        } else {
-          const parsed = JSON.parse(trimmed);
-          if (Array.isArray(parsed)) arr = parsed.slice(0, 50);
-          else if (parsed && Array.isArray(parsed.data)) arr = parsed.data.slice(0, 50);
-          else arr = [parsed];
-        }
-
-        const keys = [];
-        for (const o of (arr || [])) {
-          if (o && typeof o === "object" && !Array.isArray(o)) {
-            for (const k of Object.keys(o)) if (!keys.includes(k)) keys.push(k);
-          }
-        }
-        const headers = keys.length ? keys : ["value"];
-        const rows = (arr || []).slice(0, 20).map(o => headers.map(k => (keys.length ? o?.[k] : o)));
-        _renderPreview(headers, rows, `JSON preview (first ${rows.length} rows)`);
-        return;
-      }
-
-      // CSV/TSV-ish
-      const sep = ext === "tsv" ? "\t" : ",";
-      const lines = text.split(/\r?\n/).filter(l => l.trim());
-      if (!lines.length) {
-        _renderPreview(["Empty file"], [["No rows detected."]], "Empty");
-        return;
-      }
-      const head = lines[0].split(sep).map(x => x.trim());
-      const rows = lines.slice(1, 21).map(l => l.split(sep));
-      _renderPreview(head, rows, `Preview (first ${rows.length} rows)`);
-    } catch (e) {
-      _renderPreview(["Preview failed"], [[String(e || "Unable to preview file")]], "Preview error");
-    }
-  }
-
-  async function _refreshStagingNames() {
-    const { org, sup } = currentOrgSup();
-    const sel = document.getElementById("loadStagingName");
-    if (!sel) return;
-    sel.innerHTML = `<option value="">Select staging…</option>`;
-    if (!org || !sup) return;
-
-    try {
-      const data = await getJSON(`/reflection/ingestion/stagings?org=${enc(org)}&sup=${enc(sup)}`);
-      const names = (data && data.items) ? data.items : ((data && data.staging_names) ? data.staging_names : (Array.isArray(data) ? data : []));
-      for (const n of (names || [])) {
-        const opt = document.createElement("option");
-        opt.value = String(n);
-        opt.textContent = String(n);
-        sel.appendChild(opt);
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  async function _refreshTableSuggestions() {
-    const { org, sup, roleName } = currentOrgSup();
-    const dl = document.getElementById("loadTableSuggestions");
-    if (!dl) return;
-    dl.innerHTML = "";
-    if (!org || !sup) return;
-
-    try {
-      const data = await getJSON(`/reflection/ingestion/tables?org=${enc(org)}&sup=${enc(sup)}&role_name=${enc(roleName)}`);
-      const tables = (data && data.tables) ? data.tables : [];
-      for (const t of (tables || [])) {
-        const opt = document.createElement("option");
-        opt.value = String(t);
-        dl.appendChild(opt);
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  function _startLoadTimer() {
-    loadTimerStart = performance.now();
-    const el = document.getElementById("loadTimer");
-    const val = document.getElementById("loadTimerVal");
-    if (el) el.style.display = "";
-    if (val) val.textContent = "0.000s";
-
-    if (loadTimerHandle) clearInterval(loadTimerHandle);
-    loadTimerHandle = setInterval(() => {
-      const ms = performance.now() - loadTimerStart;
-      if (val) val.textContent = `${(ms / 1000).toFixed(3)}s`;
-    }, 50);
-  }
-
-  function _stopLoadTimer() {
-    if (loadTimerHandle) clearInterval(loadTimerHandle);
-    loadTimerHandle = null;
-    const el = document.getElementById("loadTimer");
-    if (el) el.style.display = "none";
-  }
-
-  function _setLoadResult(ok, html) {
-    const box = document.getElementById("loadResult");
-    if (!box) return;
-    box.className = "alert " + (ok ? "ok" : "err");
-    box.innerHTML = html;
-    box.style.display = "";
-  }
-
-  function _setLoadBusy(busy) {
-    const btn = document.getElementById("loadStartBtn");
-    const fi = document.getElementById("loadFileInput");
-    const t = document.getElementById("loadTableName");
-    const s = document.getElementById("loadStagingName");
-    const b1 = document.getElementById("modeTableBtn");
-    const b2 = document.getElementById("modeStagingBtn");
-    const r1 = document.getElementById("btnRefreshTables");
-    const r2 = document.getElementById("btnRefreshStagings");
-
-    if (btn) btn.disabled = busy || btn.disabled;
-    if (fi) fi.disabled = !!busy;
-    if (t) t.disabled = !!busy;
-    if (s) s.disabled = !!busy;
-    if (b1) b1.disabled = !!busy;
-    if (b2) b2.disabled = !!busy;
-    if (r1) r1.disabled = !!busy;
-    if (r2) r2.disabled = !!busy;
-
-    if (btn && busy) btn.innerHTML = `<i class="fas fa-upload"></i> Uploading…`;
-    if (btn && !busy) btn.innerHTML = `<i class="fas fa-upload"></i> Upload & Load`;
-  }
-
-  async function _doUploadAndLoad() {
-    const { org, sup, roleName } = currentOrgSup();
-    const btn = document.getElementById("loadStartBtn");
-    if (!btn || !loadSelectedFile) return;
-
-    const tableNameEl = document.getElementById("loadTableName");
-    const stagingEl = document.getElementById("loadStagingName");
-
-    const tableName = tableNameEl ? String(tableNameEl.value || "").trim() : "";
-    const stagingName = stagingEl ? String(stagingEl.value || "").trim() : "";
-
-    if (!org || !sup) {
-      _setLoadResult(false, "Missing tenant selection (org/super).");
-      return;
-    }
-    if (!roleName) {
-      _setLoadResult(false, "Missing role name (session). Please re-login.");
-      return;
-    }
-    if (loadMode === "table" && !tableName) {
-      _setLoadResult(false, "Please enter a table name.");
-      return;
-    }
-    if (loadMode === "staging" && !stagingName) {
-      _setLoadResult(false, "Please select a staging name.");
-      return;
-    }
-
-    const clientStart = performance.now();
-    _setLoadBusy(true);
-    _startLoadTimer();
-
-    try {
-      const fd = new FormData();
-      fd.append("org", org);
-      fd.append("sup", sup);
-      fd.append("role_name", roleName);
-      fd.append("mode", loadMode);
-      if (tableName) fd.append("table_name", tableName);
-      const overwriteEl2 = document.getElementById("loadOverwriteCols");
-      const overwriteRaw = overwriteEl2 ? String(overwriteEl2.value || "").trim() : "";
-      if (loadMode === "table" && overwriteRaw) fd.append("overwrite_columns", overwriteRaw);
-      if (stagingName) fd.append("staging_name", stagingName);
-      fd.append("file", loadSelectedFile, loadSelectedFile.name || "upload");
-
-      const resp = await fetch("/reflection/ingestion/load/upload", {
-        method: "POST",
-        body: fd,
-        credentials: "same-origin",
-      });
-
-      const text = await resp.text();
-      let data = null;
-      try { data = JSON.parse(text); } catch (e) { data = null; }
-
-      if (!resp.ok) {
-        const msg = (data && (data.detail || data.error)) || text || ("Upload failed: " + resp.status);
-        throw new Error(msg);
-      }
-
-      const clientMs = performance.now() - clientStart;
-      const serverMs = data && data.server_duration_ms !== undefined ? Number(data.server_duration_ms) : null;
-
-      const modeTxt = (data && data.mode) ? String(data.mode) : loadMode;
-      const rows = (data && data.rows !== undefined) ? String(data.rows) : "";
-      const fileType = (data && data.file_type) ? String(data.file_type) : "";
-      const job = (data && data.job_uuid) ? String(data.job_uuid) : "";
-
-      const targetTxt = modeTxt === "staging"
-        ? `staging <b>${escapeHtml(String(data.staging_name || stagingName))}</b>`
-        : `table <b>${escapeHtml(String(data.table_name || tableName))}</b>`;
-
-      const sMsHtml = (serverMs !== null && Number.isFinite(serverMs))
-        ? `${serverMs.toFixed(3)} ms`
-        : "—";
-
-      _setLoadResult(true, `
-        <div style="font-weight:900;">Loaded successfully</div>
-        <div class="muted" style="margin-top:6px;">Target: ${targetTxt}</div>
-        <div class="muted">Rows: ${escapeHtml(rows)} | Type: ${escapeHtml(fileType)} | Job: <span class="mono">${escapeHtml(job)}</span></div>
-        <div style="margin-top:8px; display:flex; gap:14px; flex-wrap:wrap;">
-          <div><span class="muted">Server:</span> <span class="mono">${escapeHtml(sMsHtml)}</span></div>
-          <div><span class="muted">Client roundtrip:</span> <span class="mono">${(clientMs).toFixed(1)} ms</span></div>
-        </div>
-      `);
-
-      // If staging, refresh staging list quickly so it appears immediately
-      if (modeTxt === "staging") {
-        try { await _refreshStagingNames(); } catch (e) {}
-      }
-
-    } catch (e) {
-      _setLoadResult(false, `<div style="font-weight:900;">Error</div><div class="mono" style="margin-top:6px; white-space:pre-wrap;">${escapeHtml(String(e || "Upload failed"))}</div>`);
-    } finally {
-      _stopLoadTimer();
-      _setLoadBusy(false);
-      _updateLoadStartEnabled();
-    }
-  }
-
-  function initLoadTab() {
-    const fileInput = document.getElementById("loadFileInput");
-    const filePill = document.getElementById("loadFilePill");
-    const fileName = document.getElementById("loadFileName");
-    const fileMeta = document.getElementById("loadFileMeta");
-
-    const bTable = document.getElementById("modeTableBtn");
-    const bStg = document.getElementById("modeStagingBtn");
-    const startBtn = document.getElementById("loadStartBtn");
-    const refreshTables = document.getElementById("btnRefreshTables");
-    const refreshStagings = document.getElementById("btnRefreshStagings");
-    const tableName = document.getElementById("loadTableName");
-    const stagingName = document.getElementById("loadStagingName");
-    const overwriteEl = document.getElementById("loadOverwriteCols");
-    const overwriteCard = document.getElementById("overwriteStepCard");
-
-    if (fileInput && fileInput.dataset.bound !== "1") {
-      fileInput.dataset.bound = "1";
-      fileInput.addEventListener("change", async () => {
-        const f = (fileInput.files && fileInput.files[0]) ? fileInput.files[0] : null;
-        loadSelectedFile = f;
-        if (f && filePill && fileName && fileMeta) {
-          fileName.textContent = f.name || "upload";
-          fileMeta.textContent = `${_fmtBytes(f.size)} · ${String((f.type || "").toLowerCase() || "file")}`;
-          filePill.style.display = "";
-        } else if (filePill) {
-          filePill.style.display = "none";
-        }
-
-        await _snakePeekFile(f);
-        _updateLoadStartEnabled();
-      });
-    }
-
-    if (bTable && bTable.dataset.bound !== "1") {
-      bTable.dataset.bound = "1";
-      bTable.addEventListener("click", () => _setMode("table"));
-    }
-    if (bStg && bStg.dataset.bound !== "1") {
-      bStg.dataset.bound = "1";
-      bStg.addEventListener("click", () => _setMode("staging"));
-    }
-
-    if (refreshTables && refreshTables.dataset.bound !== "1") {
-      refreshTables.dataset.bound = "1";
-      refreshTables.addEventListener("click", async () => { await _refreshTableSuggestions(); });
-    }
-    if (refreshStagings && refreshStagings.dataset.bound !== "1") {
-      refreshStagings.dataset.bound = "1";
-      refreshStagings.addEventListener("click", async () => { await _refreshStagingNames(); });
-    }
-
-    if (tableName && tableName.dataset.bound !== "1") {
-      tableName.dataset.bound = "1";
-      tableName.addEventListener("input", _updateLoadStartEnabled);
-    }
-    if (overwriteEl && overwriteEl.dataset.bound !== "1") {
-      overwriteEl.dataset.bound = "1";
-      overwriteEl.addEventListener("input", _updateLoadStartEnabled);
-    }
-
-    if (stagingName && stagingName.dataset.bound !== "1") {
-      stagingName.dataset.bound = "1";
-      stagingName.addEventListener("change", _updateLoadStartEnabled);
-    }
-
-    if (startBtn && startBtn.dataset.bound !== "1") {
-      startBtn.dataset.bound = "1";
-      startBtn.addEventListener("click", _doUploadAndLoad);
-    }
-
-    // initial refresh
-    _setMode(loadMode || "table");
-    _refreshTableSuggestions();
-    _refreshStagingNames();
-    _updateLoadStartEnabled();
-  }
-
+  var h=(window.location.hash||"").replace("#","");if(h==="pipe"||h==="load"||h==="staging"){switchTab(h);}else{switchTab("load");}
+  refreshStagings();refreshTableSuggestions();refreshRecentWrites();
+  window.refreshStagings=refreshStagings;window.switchTab=switchTab;
 })();
 </script>
-{% endblock %}
+
+</body>
+</html>

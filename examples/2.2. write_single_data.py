@@ -12,4 +12,5 @@ columns, rows, inserted, deleted = data_writer.write(
     simple_name=simple_name,
     data=data,
     overwrite_columns=overwrite_columns,
+    lineage="example.single_data"
 )

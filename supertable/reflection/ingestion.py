@@ -541,6 +541,49 @@ def attach_ingestion_routes(
 
     # ----------------------------- Ingestion APIs ----------------------------
 
+    # ---- Recent write stats (from monitoring Redis list) ----
+
+    @router.get("/reflection/ingestion/recent-writes")
+    def api_ingestion_recent_writes(
+        org: str = Query(...),
+        sup: str = Query(...),
+        limit: int = Query(20, ge=1, le=100),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """Return the most recent write operations from the monitoring Redis list.
+
+        The DataWriter pushes a JSON payload per write to the Redis list
+        ``monitor:{org}:{sup}:stats``.  This endpoint reads the last *limit*
+        entries (LRANGE from the tail) and returns them newest-first.
+
+        Each entry contains: query_id, recorded_at, table_name, inserted,
+        deleted, total_rows, total_columns, duration, overwrite_columns,
+        delete_only, new_resources, sunset_files.
+        """
+        org_eff = (org or "").strip()
+        sup_eff = (sup or "").strip()
+        if not org_eff or not sup_eff:
+            return {"ok": True, "items": []}
+
+        key = f"monitor:{org_eff}:{sup_eff}:stats"
+        items: List[Dict[str, Any]] = []
+        try:
+            # LRANGE with negative indices reads from the tail (newest entries).
+            raw_list = redis_client.lrange(key, -limit, -1) or []
+            # Reverse so newest is first.
+            raw_list = list(reversed(raw_list))
+            for raw in raw_list:
+                try:
+                    entry = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                    if isinstance(entry, dict):
+                        items.append(entry)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning("[ingestion] Failed to read recent writes from Redis: %s", e)
+
+        return {"ok": True, "items": items}
+
     @router.get("/reflection/ingestion/stagings")
     def api_ingestion_list_stagings(
         org: str = Query(...),
@@ -803,14 +846,18 @@ def attach_ingestion_routes(
 
         storage = get_storage()
         stg_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
-        try:
-            if not storage.exists(stg_dir):
-                raise HTTPException(status_code=404, detail="Staging not found")
-        except HTTPException:
-            raise
-        except Exception:
-            # best-effort: proceed; object stores may not list prefixes reliably
-            pass
+        # Validate staging existence via the authoritative index (not storage.exists,
+        # which is unreliable on object stores for empty or freshly-created directories).
+        known_stagings = _get_staging_names(storage, org, sup)
+        if staging_name not in known_stagings:
+            try:
+                if not storage.exists(stg_dir):
+                    raise HTTPException(status_code=404, detail="Staging not found")
+            except HTTPException:
+                raise
+            except Exception:
+                # best-effort: proceed; object stores may not list prefixes reliably
+                pass
 
         # Canonicalize and persist the pipe definition.
         pipe_def: Dict[str, Any] = dict(payload)
