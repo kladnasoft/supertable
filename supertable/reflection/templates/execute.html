@@ -25,1101 +25,523 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
-    /*
-     * Professional Styling Refinements for Execute SQL page
-     * Focus: Cleanliness, Readability, Hierarchy, and Eye-Catching Execute Button.
-     * Colors maintained from existing palette.
-     */
+    /* ═══════════════════════════════════════════════════════════════
+       COMMAND CENTER LAYOUT — SuperTable Execute SQL
+       Colors preserved from original palette.
+       ═══════════════════════════════════════════════════════════════ */
     :root {
       --primary-color: #1c96ca;
       --primary-light: #e6f4fa;
       --secondary-color: #147ba3;
       --dark-color: #1a1a2e;
-      --text-color: #2b2d42;
+      --text-color: #1e293b;
+      --text-secondary: #64748b;
       --text-light: #8d99ae;
-      --transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      --text-muted: #94a3b8;
+      --transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
       --panel-bg: #ffffff;
       --panel-border: #e0e5f0;
-      --panel-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+      --panel-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
       --header-bg: #f8fafc;
       --data-table-header-bg: #f1f5f9;
+      --bg: #f3f6fb;
+      --bg-surface: #f8fafc;
+      --bg-hover: #f1f5f9;
+      --border-light: #f1f5f9;
+      --success: #10b981;
+      --success-bg: #ecfdf5;
+      --error: #ef4444;
+      --error-bg: #fef2f2;
+      --warning: #f59e0b;
+      --radius: 10px;
+      --radius-sm: 6px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
 
     * { box-sizing: border-box; }
-
     html, body {
-      margin: 0;
-      padding: 0;
-      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: #f3f6fb;
-      color: var(--text-color);
-      font-size: 13px;
-      line-height: 1.5;
+      margin: 0; padding: 0;
+      font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg); color: var(--text-color);
+      font-size: 13px; line-height: 1.5; height: 100%; overflow: hidden;
     }
-
-    a {
-      color: var(--primary-color);
-      text-decoration: none;
-    }
+    a { color: var(--primary-color); text-decoration: none; }
     a:hover { text-decoration: underline; }
 
-    /* ------------ MAIN CONTENT ------------ */
-
+    /* ═══ EXISTING SIDEBAR COMPAT ═══ */
     .content-container {
-      margin-left: 280px;
-      min-height: 100vh;
-      background-color: #f3f6fb;
-      transition: var(--transition);
-      padding-bottom: 0px;
+      margin-left: 280px; height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+      transition: var(--transition); background: var(--bg);
     }
+    .sidebar-collapsed ~ .content-container { margin-left: 80px; }
 
-    .sidebar-collapsed ~ .content-container {
-      margin-left: 80px;
+    /* ═══ TOP BAR ═══ */
+    .cc-topbar {
+      display: flex; align-items: center; gap: 10px; padding: 6px 16px;
+      background: var(--panel-bg); border-bottom: 1px solid var(--panel-border);
+      flex-shrink: 0; min-height: 46px; flex-wrap: wrap;
     }
+    .cc-topbar .topbar-sep { width: 1px; height: 20px; background: var(--panel-border); flex-shrink: 0; }
 
-    .wrap {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 0px;
-    }
-
-    .card {
-      background: var(--panel-bg);
-      border-radius: 12px; /* Professional size */
-      box-shadow: var(--panel-shadow);
-      border: 1px solid var(--panel-border);
-    }
-
-    .section { padding: 20px 24px; } /* Increased padding */
-    .muted { color: var(--text-light); }
-    .text-xs { font-size: 11px; }
-    .text-sm { font-size: 13px; } /* Slightly larger base text */
-
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px; /* Increased gap */
-      align-items: flex-start;
-    }
-
-    /* --- Tab Navigation --- */
-    #tab-navigation {
-        display: flex;
-        gap: 0; /* Tabs should touch */
-        border-bottom: 2px solid var(--panel-border);
-        margin-bottom: 16px;
-        margin-top: 16px;
-        padding-left: 8px; /* Slight left padding to match wrapper spacing */
-    }
-
-    .tab {
-        padding: 10px 18px;
-        font-size: 14px;
-        font-weight: 500;
-        color: var(--text-light);
-        cursor: pointer;
-        transition: color 0.2s, border-bottom 0.2s;
-        border-bottom: 2px solid transparent;
-        margin-bottom: -2px; /* Pulls the border up to overlap the container border */
-        display: flex;
-        align-items: center;
-        gap: 6px;
-    }
-
-    .tab:hover {
-        color: var(--primary-color);
-    }
-
-    .tab.active {
-        color: var(--primary-color);
-        border-bottom: 2px solid var(--primary-color);
-        font-weight: 600;
-    }
-
-    .chip {
-        background: #e0e5f0;
-        color: var(--text-color);
-        padding: 2px 8px;
-        border-radius: 999px;
-        font-size: 11px;
-        font-weight: 600;
-    }
-
-    .tab.active .chip {
-        background: var(--primary-color);
-        color: white;
-    }
-
-    /* --- Tab Content Containers --- */
-    .tab-content {
-        display: none;
-    }
-    /* Only the active content should be block/visible, this is handled in JS */
-    .tab-content.active {
-        display: block;
-    }
-
-    /* FIX: The card margin in the tab-content should be 0 or small */
-    #tab-content-container .card {
-        margin-top: 0 !important;
-    }
-
-    /* --- Execute Card Styling (Simplified from Header) --- */
-    .sql-editor-card .card-body {
-        padding: 24px;
-    }
-
-    /* --- Form Elements (Base Styles) --- */
-
-    input, select, textarea {
-      background: #ffffff;
-      border: 1px solid #e0e5f0;
-      color: var(--text-color);
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 13px;
-      font-family: inherit;
-      width: 100%;
-      transition: var(--transition);
-      margin-top: 4px;
-    }
-
-    input:focus, select:focus, textarea:focus {
-      outline: none;
-      box-shadow: 0 0 0 2px var(--primary-light);
-      border-color: var(--primary-color);
-    }
-
-    textarea { resize: vertical; min-height: 140px; } /* Slightly taller default */
-
-    /* --- SuperTable Selector Custom Style FIX --- */
-    #pairSel {
-      /* FIX 1: Overrides global `width: auto` to ensure 100% of parent width */
-      width: 100% !important;
-      display: block;
-      margin-top: 0;
-
-      /* FIX 2: Apply user's desired sizing, overriding generic form styles */
-      padding: 10px 12px !important;
-      font-size: 16px !important;
-      height: auto !important;
-
-      /* FIX 3: Apply custom arrow styles */
-      appearance: none;
-      -webkit-appearance: none;
-      background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Cpath%20d%3D%22M4%207L10%2013L16%207%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%0A%3C%2Fpath%3E%0A%3C%2Fsvg%3E');
-      background-repeat: no-repeat;
-      background-position: right 10px center;
-      cursor: pointer; /* Ensure cursor is applied */
-      background-color: #ffffff; /* Ensure background is applied */
-    }
-
-    /* --- Buttons (Standard) — outline-blue, matches tables.html actions --- */
-    .btn {
-      padding: 5px 12px;
-      border-radius: 6px;
-      background: transparent;
-      border: 1px solid var(--primary-color);
-      color: var(--primary-color);
-      font-weight: 500;
-      cursor: pointer;
-      font-size: 12.5px;
-      transition: var(--transition);
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      white-space: nowrap;
-    }
-
-    .btn:hover {
-      background: var(--primary-light);
-      border-color: var(--secondary-color);
-      color: var(--secondary-color);
-    }
-
-    /* --- Engine pill selector (Option 2 top-toolbar) --- */
+    /* Engine pill — preserved from original */
     .engine-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--primary-light);
-      border: 1px solid rgba(28, 150, 202, 0.25);
-      border-radius: 999px;
-      padding: 4px 12px 4px 10px;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--primary-light); border: 1px solid rgba(28,150,202,0.25);
+      border-radius: 999px; padding: 4px 12px 4px 10px;
     }
-    .engine-pill label {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-      color: var(--secondary-color);
-      cursor: pointer;
-      white-space: nowrap;
-      margin: 0;
-    }
+    .engine-pill label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary-color); cursor: pointer; white-space: nowrap; margin: 0; }
     .engine-pill i { color: var(--primary-color); font-size: 11px; }
-    .engine-pill select {
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--primary-color);
-      background: transparent;
-      border: none;
-      outline: none;
-      cursor: pointer;
-      font-family: inherit;
-      padding: 0;
-      margin: 0;
-      width: auto;
-      margin-top: 0;
-    }
+    .engine-pill select { font-size: 12px; font-weight: 600; color: var(--primary-color); background: transparent; border: none; outline: none; cursor: pointer; font-family: inherit; padding: 0; margin: 0; width: auto; margin-top: 0; }
     .engine-pill select:focus { box-shadow: none; border-color: transparent; }
 
-    /* --- Toolbar separator --- */
-    .toolbar-sep {
-      width: 1px;
-      height: 20px;
-      background: var(--panel-border);
-      flex-shrink: 0;
+    /* Status indicator */
+    .status-indicator { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-muted); }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; }
+    .status-dot.ok { background: var(--success); }
+    .status-dot.error { background: var(--error); }
+    .status-dot.executing { background: var(--warning); animation: cc-pulse 1s ease infinite; }
+    @keyframes cc-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* Buttons */
+    .btn-sm {
+      padding: 5px 10px; border-radius: var(--radius-sm); background: transparent;
+      border: 1px solid var(--panel-border); color: var(--text-secondary); font-weight: 500;
+      cursor: pointer; font-size: 12px; transition: var(--transition); display: inline-flex;
+      align-items: center; gap: 4px; white-space: nowrap; font-family: inherit;
     }
+    .btn-sm:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
 
-
-    /* --- Execution sessions (+) tabs --- */
-#exec-navigation {
-    display: flex;
-    align-items: flex-end;
-    gap: 10px;
-    border-bottom: 2px solid var(--panel-border);
-    margin-top: 16px;
-    margin-bottom: 14px;
-    padding-left: 8px;
-    flex-wrap: wrap;
-}
-
-#openExecTabs {
-    display: flex !important;
-    align-items: flex-end !important;
-    gap: 8px !important;
-    flex-wrap: wrap;
-}
-
-/* + button aligned with tabs */
-.tab-add {
-    border: 1px dashed var(--panel-border);
-    background: rgba(28, 150, 202, 0.08);
-    color: var(--primary-color);
-    padding: 9px 12px;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: var(--transition);
-    font-weight: 700;
-    line-height: 1;
-    margin-bottom: -2px; /* visually sits on the same baseline as the tabs */
-}
-
-.tab-add:hover {
-    border-color: var(--primary-color);
-    background: rgba(28, 150, 202, 0.14);
-}
-
-.exec-tab-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: flex-end;
-}
-
-/* Dedicated styling so exec tabs don't reuse inner .tab styles */
-.exec-tab-btn {
-    appearance: none;
-    border: 1px solid var(--panel-border);
-    border-bottom: none;
-    background: #f8fafc;
-    color: var(--text-light);
-    padding: 10px 38px 10px 16px; /* extra right padding for the close button */
-    border-top-left-radius: 12px;
-    border-top-right-radius: 12px;
-    cursor: pointer;
-    transition: var(--transition);
-    font-size: 14px;
-    font-weight: 600;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: -2px; /* overlap container border-bottom */
-}
-
-.exec-tab-btn:hover {
-    color: var(--primary-color);
-}
-
-.exec-tab-btn.active {
-    background: #ffffff;
-    color: var(--primary-color);
-}
-
-.exec-tab-close {
-    position: absolute;
-    right: 6px;
-    top: 6px;
-    border: none;
-    background: transparent;
-    color: #94a3b8;
-    cursor: pointer;
-    padding: 6px 8px;
-    border-radius: 8px;
-    transition: var(--transition);
-}
-
-.exec-tab-close:hover {
-    background: rgba(15, 23, 42, 0.06);
-    color: #334155;
-}
-
-#inner-tab-mount {
-    margin: 0 0 14px 0;
-}
-/* --- CodeMirror styling (INCREASED HEIGHT to 500px) --- */
-    .CodeMirror {
-      border-radius: 8px; /* Match form elements */
-      border: 1px solid #d0d7e7;
-      background: #ffffff;
-      color: #0b1220;
-      font-size: 14px; /* Slightly larger code font */
-      min-height: 500px; /* Taller editor */
-    }
-
-    .CodeMirror-focused {
-      border-color: var(--primary-color);
-      box-shadow: 0 0 0 3px var(--primary-light);
-    }
-
-    /* --- Eye-Catching Execute Button --- */
     .btn-exec {
-      color: white;
-      background: var(--primary-color);
-      border: 1px solid var(--primary-color);
-      padding: 10px 20px;
-      border-radius: 8px;
-      font-weight: 700;
-      cursor: pointer;
-      font-size: 14px;
-      box-shadow: 0 6px 20px rgba(28, 150, 202, 0.25);
+      color: white; background: var(--primary-color); border: 1px solid var(--primary-color);
+      padding: 6px 16px; border-radius: var(--radius-sm); font-weight: 700; cursor: pointer;
+      font-size: 13px; box-shadow: 0 2px 10px rgba(28,150,202,0.25);
       transition: transform .1s ease, box-shadow .2s ease, background-color .2s ease;
-      white-space: nowrap;
+      white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; font-family: inherit;
     }
-    .btn-exec:hover {
-        background: var(--secondary-color);
-        border-color: var(--secondary-color);
-        box-shadow: 0 8px 25px rgba(28, 150, 202, 0.4);
-    }
+    .btn-exec:hover { background: var(--secondary-color); border-color: var(--secondary-color); box-shadow: 0 4px 16px rgba(28,150,202,0.35); }
     .btn-exec:active { transform: translateY(1px); }
+    .btn-exec .shortcut { font-size: 10px; background: rgba(255,255,255,0.2); padding: 1px 5px; border-radius: 3px; font-family: var(--mono); }
 
-    /* --- Status Bar --- */
-    #status {
-        display: flex;
-        align-items: center;
-        gap: 6px;
+    /* ═══ 3-COLUMN LAYOUT ═══ */
+    .cc-columns { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+
+    /* ─── LEFT PANEL: Schema Explorer ─── */
+    .cc-panel-left {
+      width: 220px; min-width: 220px; border-right: 1px solid var(--panel-border);
+      background: var(--panel-bg); display: flex; flex-direction: column;
+      flex-shrink: 0; transition: width 0.25s ease, min-width 0.25s ease;
     }
-    #status i { color: #10b981; }
-    #status.executing i { color: #f59e0b; animation: spin 1s linear infinite; }
-    #status.error i { color: #ef4444; }
+    .cc-panel-left.collapsed { width: 0; min-width: 0; overflow: hidden; border-right: none; }
 
-    @keyframes spin {
-      0% { transform:rotate(0deg); }
-      100% { transform:rotate(360deg); }
+    /* Re-open tab shown when panel is collapsed */
+    .cc-panel-reopen {
+      display: none; width: 28px; flex-shrink: 0;
+      border-right: 1px solid var(--panel-border); background: var(--bg-surface);
+      cursor: pointer; transition: var(--transition); position: relative;
     }
+    .cc-panel-reopen:hover { background: var(--primary-light); }
+    .cc-panel-reopen i {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      font-size: 12px; color: var(--text-muted); transition: color 0.15s;
+    }
+    .cc-panel-reopen:hover i { color: var(--primary-color); }
+    .cc-panel-reopen .reopen-label {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%) rotate(-90deg);
+      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted); white-space: nowrap; display: none;
+    }
+    .cc-panel-reopen:hover .reopen-label { display: block; }
+    .cc-panel-reopen:hover i { display: none; }
+    .cc-panel-left.collapsed + .cc-panel-reopen-left { display: block; }
 
-    /* --- Error Block --- */
+    .cc-panel-reopen-right {
+      display: none; width: 28px; flex-shrink: 0;
+      border-left: 1px solid var(--panel-border); background: var(--bg-surface);
+      cursor: pointer; transition: var(--transition); position: relative;
+    }
+    .cc-panel-reopen-right:hover { background: var(--primary-light); }
+    .cc-panel-reopen-right i {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      font-size: 12px; color: var(--text-muted); transition: color 0.15s;
+    }
+    .cc-panel-reopen-right:hover i { color: var(--primary-color); }
+    .cc-panel-reopen-right .reopen-label {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%) rotate(90deg);
+      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted); white-space: nowrap; display: none;
+    }
+    .cc-panel-reopen-right:hover .reopen-label { display: block; }
+    .cc-panel-reopen-right:hover i { display: none; }
+
+    .cc-panel-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; border-bottom: 1px solid var(--border-light); flex-shrink: 0;
+    }
+    .cc-panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+    .cc-panel-toggle {
+      background: none; border: none; cursor: pointer; color: var(--text-muted);
+      font-size: 12px; padding: 4px; border-radius: 4px; transition: var(--transition);
+    }
+    .cc-panel-toggle:hover { background: var(--bg-hover); color: var(--text-color); }
+
+    .schema-search {
+      margin: 8px 10px; padding: 6px 10px 6px 28px; border: 1px solid var(--panel-border);
+      border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface);
+      font-family: inherit; outline: none; transition: var(--transition); width: calc(100% - 20px);
+    }
+    .schema-search:focus { border-color: var(--primary-color); box-shadow: 0 0 0 2px var(--primary-light); }
+    .schema-search-wrap { position: relative; flex-shrink: 0; }
+    .schema-search-wrap i { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
+
+    .schema-tree { flex: 1; overflow-y: auto; padding: 4px 0; }
+    .schema-table { padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: var(--transition); font-size: 12px; font-weight: 600; }
+    .schema-table:hover { background: var(--bg-hover); }
+    .schema-table.open { color: var(--primary-color); }
+    .schema-table i.chevron { font-size: 10px; color: var(--text-muted); width: 12px; text-align: center; transition: transform 0.15s; }
+    .schema-table.open > i.chevron { transform: rotate(90deg); color: var(--primary-color); }
+    .schema-table .table-icon { color: var(--primary-color); font-size: 12px; }
+    .schema-columns { padding-left: 30px; display: none; }
+    .schema-columns.open { display: block; }
+    .schema-col { padding: 3px 12px 3px 0; font-size: 11px; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 6px; transition: var(--transition); }
+    .schema-col:hover { color: var(--primary-color); }
+    .schema-col .col-type { font-size: 9px; font-family: var(--mono); background: var(--bg-surface); border: 1px solid var(--border-light); padding: 0 4px; border-radius: 3px; color: var(--text-muted); margin-left: auto; flex-shrink: 0; }
+
+    .snippets-section { border-top: 1px solid var(--border-light); flex-shrink: 0; }
+    .snippet-item { padding: 6px 12px; font-size: 11px; cursor: pointer; transition: var(--transition); display: flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+    .snippet-item:hover { background: var(--bg-hover); color: var(--primary-color); }
+    .snippet-item i { font-size: 10px; color: var(--text-muted); }
+
+    /* ─── CENTER STAGE ─── */
+    .cc-center { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+
+    /* Session tabs */
+    .cc-session-tabs {
+      display: flex; align-items: center; gap: 0; padding: 0 12px;
+      border-bottom: 1px solid var(--panel-border); background: var(--bg-surface); flex-shrink: 0;
+    }
+    .cc-session-tab {
+      padding: 7px 14px; font-size: 12px; font-weight: 600; color: var(--text-muted);
+      cursor: pointer; display: flex; align-items: center; gap: 6px;
+      border-bottom: 2px solid transparent; margin-bottom: -1px; transition: var(--transition);
+      white-space: nowrap; position: relative; background: none; border-top: none; border-left: none; border-right: none;
+    }
+    .cc-session-tab:hover { color: var(--text-secondary); }
+    .cc-session-tab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); background: var(--panel-bg); }
+    .cc-session-tab .tab-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .cc-session-tab .tab-dot.success { background: var(--success); }
+    .cc-session-tab .tab-dot.error { background: var(--error); }
+    .cc-session-tab .tab-dot.idle { background: var(--text-muted); }
+    .cc-session-tab .tab-close { margin-left: 4px; font-size: 10px; opacity: 0; padding: 2px 4px; border-radius: 3px; transition: var(--transition); background: none; border: none; cursor: pointer; color: inherit; }
+    .cc-session-tab:hover .tab-close { opacity: 0.5; }
+    .cc-session-tab:hover .tab-close:hover { opacity: 1; background: rgba(0,0,0,0.06); }
+    .cc-tab-add {
+      width: 28px; height: 28px; border: 1px dashed var(--panel-border); border-radius: var(--radius-sm);
+      background: transparent; color: var(--text-muted); cursor: pointer; font-size: 14px;
+      display: flex; align-items: center; justify-content: center; margin-left: 4px; transition: var(--transition); flex-shrink: 0;
+    }
+    .cc-tab-add:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
+
+    /* Editor area */
+    .cc-editor-area { flex-shrink: 0; position: relative; background: var(--panel-bg); }
+    .cc-editor-resize {
+      height: 5px; cursor: ns-resize; background: transparent; position: relative;
+      border-top: 1px solid var(--panel-border); transition: background 0.15s;
+    }
+    .cc-editor-resize:hover { background: var(--primary-light); }
+    .cc-editor-resize::after {
+      content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+      width: 30px; height: 3px; border-radius: 2px; background: var(--panel-border);
+    }
+    .cc-editor-resize:hover::after { background: var(--primary-color); }
+
+    /* CodeMirror */
+    .CodeMirror {
+      border: none !important; background: var(--panel-bg) !important; color: var(--text-color) !important;
+      font-size: 13px !important; height: 100% !important; line-height: 1.6 !important;
+      border-radius: 0 !important;
+    }
+    .CodeMirror-focused { outline: none !important; box-shadow: none !important; }
+    .CodeMirror-gutters { background: var(--bg-surface) !important; border-right: 1px solid var(--border-light) !important; }
+    .CodeMirror-linenumber { color: var(--text-muted) !important; font-size: 11px !important; }
+    .CodeMirror-cursor { border-left: 2px solid var(--primary-color) !important; }
+    .CodeMirror-selected { background: var(--primary-light) !important; }
+    .CodeMirror-hints { z-index: 9999; font-family: var(--mono); border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: none; background: #fff; }
+    .CodeMirror-hint { padding: 6px 12px; color: #111827; transition: all 0.2s ease; }
+    .CodeMirror-hint-active { background: var(--primary-color); color: white; }
+
+    /* SQL pre-flight error marker */
+    .cm-sql-error { text-decoration: underline wavy #ef4444; text-decoration-skip-ink: none; background: rgba(239,68,68,0.08); border-radius: 2px; cursor: help; }
+
+    /* Results summary bar */
+    .cc-results-summary {
+      display: flex; align-items: center; gap: 8px; padding: 6px 14px;
+      background: var(--bg-surface); border-bottom: 1px solid var(--border-light);
+      flex-shrink: 0; min-height: 34px;
+    }
+    .cc-results-summary.success { background: var(--success-bg); }
+    .cc-results-summary.error { background: var(--error-bg); }
+    .summary-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; display: flex; align-items: center; gap: 4px; }
+    .summary-badge.success { background: rgba(16,185,129,0.12); color: #059669; }
+    .summary-badge.error { background: rgba(239,68,68,0.12); color: #dc2626; }
+    .summary-badge.ready { background: rgba(100,116,139,0.1); color: var(--text-secondary); }
+    .summary-stat { font-size: 11px; color: var(--text-secondary); display: flex; align-items: center; gap: 4px; }
+    .summary-stat strong { font-weight: 600; color: var(--text-color); }
+    .summary-actions { margin-left: auto; display: flex; gap: 4px; }
+    .summary-btn {
+      padding: 3px 8px; border-radius: 4px; background: transparent; border: 1px solid var(--panel-border);
+      color: var(--text-secondary); cursor: pointer; font-size: 11px; font-weight: 500;
+      transition: var(--transition); font-family: inherit; display: inline-flex; align-items: center; gap: 3px;
+    }
+    .summary-btn:hover { border-color: var(--primary-color); color: var(--primary-color); }
+
+    /* Result tab strip */
+    .cc-result-tabs {
+      display: flex; align-items: center; gap: 0; padding: 0 14px;
+      border-bottom: 1px solid var(--border-light); background: var(--panel-bg); flex-shrink: 0;
+    }
+    .cc-result-tab {
+      padding: 7px 12px; font-size: 12px; font-weight: 500; color: var(--text-muted);
+      cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+      transition: var(--transition); display: flex; align-items: center; gap: 5px;
+    }
+    .cc-result-tab:hover { color: var(--text-secondary); }
+    .cc-result-tab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); font-weight: 600; }
+    .cc-result-tab .tab-badge { font-size: 10px; font-weight: 700; background: var(--bg-surface); border: 1px solid var(--border-light); padding: 0 5px; border-radius: 999px; color: var(--text-muted); }
+    .cc-result-tab.active .tab-badge { background: var(--primary-light); border-color: rgba(28,150,202,0.2); color: var(--primary-color); }
+
+    /* Result content area */
+    .cc-results-content { flex: 1; overflow: auto; background: var(--panel-bg); }
+    .cc-result-panel { display: none; height: 100%; overflow: auto; }
+    .cc-result-panel.active { display: block; }
+
+    /* Data table */
+    #result table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    #result thead { position: sticky; top: 0; z-index: 1; }
+    #result th {
+      background: var(--data-table-header-bg); padding: 8px 12px; font-weight: 600; color: var(--text-secondary);
+      text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em;
+      border-bottom: 2px solid var(--panel-border); text-align: left; white-space: nowrap;
+      cursor: pointer; user-select: none;
+    }
+    #result th:hover { color: var(--primary-color); }
+    #result td {
+      padding: 7px 12px; border-bottom: 1px solid var(--border-light);
+      font-size: 12px; white-space: nowrap; max-width: 280px; overflow: hidden; text-overflow: ellipsis;
+    }
+    #result .row-index { font-family: var(--mono); color: var(--text-muted); font-weight: 500; font-size: 11px; }
+    #result tr:nth-child(even) td { background: #f9fafb; }
+    #result tr:hover td { background: var(--primary-light); }
+
+    /* Error block */
     #query-error-display {
-        background-color: #fee2e2;
-        color: #b91c1c;
-        border: 1px solid #fca5a5;
-        border-radius: 8px;
-        padding: 16px;
-        margin-bottom: 20px;
-        display: none; /* Hidden by default, JS controls visibility */
-        font-weight: 500;
-        font-size: 14px;
+      background-color: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 8px;
+      padding: 14px; margin: 10px 14px; display: none; font-weight: 500; font-size: 13px;
     }
-    #query-error-display strong {
-        font-weight: 700;
-        margin-right: 8px;
-    }
+    #query-error-display strong { font-weight: 700; margin-right: 8px; }
     #query-error-message {
-        font-family: monospace;
-        background-color: #fecaca;
-        padding: 8px;
-        border-radius: 4px;
-        display: block;
-        margin-top: 8px;
-        white-space: pre-wrap;
-        word-break: break-all;
+      font-family: var(--mono); background-color: #fecaca; padding: 8px; border-radius: 4px;
+      display: block; margin-top: 8px; white-space: pre-wrap; word-break: break-all; font-size: 12px;
     }
 
-    /* --- Timings: Metric Rows visualization --- */
-    #timings-visualization-card {
-        display: none; /* JS controls visibility */
+    /* Download/Copy row */
+    .download-row { margin-top: 12px; padding: 0 14px 14px; text-align: right; display: flex; justify-content: flex-end; gap: 8px; }
+    .btn-clipboard, .btn-download {
+      padding: 6px 10px; border-radius: 6px; border: 1px solid var(--dark-color);
+      background: var(--dark-color); color: #e2e8f0; cursor: pointer; font-size: 12px; font-weight: 500; transition: var(--transition);
     }
+    .btn-clipboard:hover, .btn-download:hover { filter: brightness(1.1); box-shadow: 0 4px 10px rgba(26,26,46,0.2); }
 
-    .timings-header {
-        padding: 20px 24px 14px;
-        border-bottom: 1px solid var(--panel-border);
-    }
-    .timings-header h4 {
-        font-size: 16px;
-        font-weight: 700;
-        color: var(--text-color);
-        margin: 0;
-        display: inline;
-    }
-    .timings-header .timings-total {
-        font-size: 14px;
-        font-weight: 500;
-        color: var(--text-light);
-    }
-    .timings-header .timings-sub {
-        font-size: 12px;
-        color: var(--text-light);
-        margin-top: 4px;
-    }
+    /* ─── VISUALIZE TAB (preserved) ─── */
+    #viz-controls select { background: #fff; border: 1px solid #d0d7e7; color: var(--text-color); cursor: pointer; transition: var(--transition); }
+    #viz-controls select:focus { box-shadow: 0 0 0 3px var(--primary-light); border-color: var(--primary-color); }
+    #vizYAxis { min-height: 28px; max-height: 72px; }
+    #vizYAxis option:checked { background: var(--primary-light); color: var(--primary-color); font-weight: 600; }
+    #viz-chart-wrap { border: 1px solid var(--border-light); border-radius: 8px; background: #fafbfd; padding: 12px; }
 
-    .timings-rows {
-        padding: 8px 24px 20px;
-    }
+    /* ─── PIVOT TABLE (preserved) ─── */
+    .pivot-divider { border-top: 1px solid var(--panel-border); margin: 24px 0 20px; }
+    .pivot-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .pivot-header h4 { font-size: 15px; font-weight: 700; color: var(--text-color); margin: 0; display: flex; align-items: center; gap: 8px; }
+    .pivot-header h4 i { color: var(--primary-color); font-size: 14px; }
+    .pivot-dropzones { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+    .pivot-zone { border: 1.5px dashed #d0d7e7; border-radius: 10px; padding: 10px 12px; min-height: 72px; background: #f9fafb; transition: var(--transition); }
+    .pivot-zone.dragover { border-color: var(--primary-color); background: var(--primary-light); }
+    .pivot-zone-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-light); margin-bottom: 6px; }
+    .pivot-zone-items { display: flex; flex-wrap: wrap; gap: 5px; min-height: 26px; }
+    .pivot-chip { display: inline-flex; align-items: center; gap: 4px; background: var(--primary-light); color: var(--secondary-color); border: 1px solid rgba(28,150,202,0.25); padding: 3px 8px 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; cursor: grab; user-select: none; transition: var(--transition); }
+    .pivot-chip:active { cursor: grabbing; }
+    .pivot-chip .pivot-chip-remove { font-size: 9px; cursor: pointer; opacity: 0.5; padding: 2px; border-radius: 50%; }
+    .pivot-chip .pivot-chip-remove:hover { opacity: 1; background: rgba(0,0,0,0.06); }
+    .pivot-chip.agg-chip { background: #fef3c7; color: #92400e; border-color: rgba(245,158,11,0.3); }
+    .pivot-agg-select { font-size: 10px; padding: 0 2px; border: none; background: transparent; color: inherit; font-weight: 700; cursor: pointer; width: auto; margin: 0; outline: none; }
+    .pivot-agg-select:focus { box-shadow: none; border: none; }
+    .pivot-fields-pool { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px 0; margin-bottom: 12px; }
+    .pivot-field-chip { display: inline-flex; align-items: center; gap: 4px; background: #fff; color: var(--text-color); border: 1px solid #d0d7e7; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 500; cursor: grab; user-select: none; transition: var(--transition); }
+    .pivot-field-chip:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    .pivot-field-chip .field-type-icon { font-size: 9px; opacity: 0.4; }
+    .pivot-field-chip.dragging { opacity: 0.4; }
+    .pivot-result-wrap { overflow: auto; max-height: 50vh; border: 1px solid var(--panel-border); border-radius: 8px; }
+    .pivot-result-wrap table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+    .pivot-result-wrap th { position: sticky; top: 0; background: var(--data-table-header-bg); font-weight: 600; color: #4b5563; text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; padding: 8px 12px; border-bottom: 2px solid #e2e8f0; border-right: 1px solid #e2e8f0; white-space: nowrap; z-index: 1; }
+    .pivot-result-wrap th:last-child { border-right: none; }
+    .pivot-result-wrap th.pivot-row-header { background: #eef2f7; font-weight: 700; text-transform: none; font-size: 11px; }
+    .pivot-result-wrap td { padding: 6px 12px; border-bottom: 1px solid var(--border-light); border-right: 1px solid var(--border-light); text-align: right; font-variant-numeric: tabular-nums; }
+    .pivot-result-wrap td:last-child { border-right: none; }
+    .pivot-result-wrap td.pivot-row-label { text-align: left; font-weight: 500; background: #fafbfd; position: sticky; left: 0; z-index: 1; }
+    .pivot-result-wrap tr:hover td { background: var(--primary-light); }
+    .pivot-result-wrap tr:hover td.pivot-row-label { background: #dbeef7; }
+    .pivot-result-wrap .pivot-grand-total td { font-weight: 700; background: var(--data-table-header-bg); border-top: 2px solid #e2e8f0; }
+    .pivot-empty { text-align: center; padding: 30px 15px; color: var(--text-light); font-size: 13px; }
 
-    .timings-row {
-        display: grid;
-        grid-template-columns: 180px 1fr 60px 50px;
-        align-items: center;
-        gap: 14px;
-        padding: 11px 0;
-        border-bottom: 1px solid #f1f5f9;
-        opacity: 0;
-        transform: translateX(-12px);
+    /* ─── RIGHT PANEL: History + Profile ─── */
+    .cc-panel-right {
+      width: 260px; min-width: 260px; border-left: 1px solid var(--panel-border);
+      background: var(--panel-bg); display: flex; flex-direction: column; flex-shrink: 0;
+      transition: width 0.25s ease, min-width 0.25s ease;
     }
+    .cc-panel-right.collapsed { width: 0; min-width: 0; overflow: hidden; border-left: none; }
+
+    .history-list { flex: 1; overflow-y: auto; }
+    .history-item { padding: 8px 12px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: var(--transition); }
+    .history-item:hover { background: var(--bg-hover); }
+    .history-item.active { background: var(--primary-light); border-left: 3px solid var(--primary-color); }
+    .history-sql { font-family: var(--mono); font-size: 11px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; line-height: 1.4; }
+    .history-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
+    .history-meta .status-pip { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+    .history-meta .status-pip.ok { background: var(--success); }
+    .history-meta .status-pip.err { background: var(--error); }
+
+    /* Profile section — timings */
+    .profile-section { border-top: 1px solid var(--panel-border); flex-shrink: 0; max-height: 45%; overflow-y: auto; }
+    .profile-timing-row { display: flex; align-items: center; gap: 8px; padding: 5px 12px; }
+    .profile-timing-label { font-size: 11px; color: var(--text-secondary); width: 100px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .profile-timing-bar-track { flex: 1; height: 5px; background: var(--border-light); border-radius: 3px; overflow: hidden; }
+    .profile-timing-bar { height: 100%; border-radius: 3px; transition: width 0.5s cubic-bezier(0.34,1.56,0.64,1); }
+    .profile-timing-val { font-size: 11px; font-weight: 600; color: var(--text-color); width: 44px; text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+    /* Plan nodes in profile */
+    .plan-node-compact { margin-left: 14px; border-left: 1.5px solid var(--panel-border); padding-left: 10px; padding-bottom: 2px; }
+    .plan-node-compact-card { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); margin-bottom: 3px; font-size: 11px; transition: var(--transition); }
+    .plan-node-compact-card:hover { border-color: var(--primary-color); }
+    .plan-node-compact-bar { width: 3px; height: 20px; border-radius: 2px; flex-shrink: 0; }
+    .plan-node-compact-name { font-weight: 600; color: var(--text-color); }
+    .plan-node-compact-time { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-muted); }
+
+    /* ─── TIMINGS TAB (full, kept for backward compat) ─── */
+    #timings-visualization-card { display: none; }
+    .timings-header { padding: 16px 14px 10px; border-bottom: 1px solid var(--panel-border); }
+    .timings-header h4 { font-size: 15px; font-weight: 700; color: var(--text-color); margin: 0; display: inline; }
+    .timings-header .timings-total { font-size: 14px; font-weight: 500; color: var(--text-light); }
+    .timings-header .timings-sub { font-size: 12px; color: var(--text-light); margin-top: 4px; }
+    .timings-rows { padding: 8px 14px 16px; }
+    .timings-row { display: grid; grid-template-columns: 150px 1fr 60px 50px; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--border-light); opacity: 0; transform: translateX(-12px); }
     .timings-row:last-child { border-bottom: none; }
-
-    /* Animated entrance */
-    .timings-row.visible {
-        opacity: 1;
-        transform: translateX(0);
-        transition: opacity 0.35s ease, transform 0.35s ease;
-    }
-
-    .timings-row-label {
-        font-size: 12px;
-        font-weight: 600;
-        color: #475569;
-        letter-spacing: 0.02em;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    .timings-row-track {
-        height: 8px;
-        border-radius: 4px;
-        background: #f1f5f9;
-        overflow: hidden;
-    }
-
-    .timings-row-bar {
-        height: 100%;
-        border-radius: 4px;
-        width: 0%;
-        transition: width 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
-    }
-
-    .timings-row-value {
-        font-size: 13px;
-        font-weight: 700;
-        color: #0f172a;
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-    }
-
-    .timings-row-pct {
-        font-size: 11px;
-        color: #94a3b8;
-        text-align: right;
-        font-weight: 500;
-    }
-
-    /* Hover: subtle highlight */
+    .timings-row.visible { opacity: 1; transform: translateX(0); transition: opacity 0.35s ease, transform 0.35s ease; }
+    .timings-row-label { font-size: 12px; font-weight: 600; color: #475569; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .timings-row-track { height: 8px; border-radius: 4px; background: var(--border-light); overflow: hidden; }
+    .timings-row-bar { height: 100%; border-radius: 4px; width: 0%; transition: width 0.6s cubic-bezier(0.34,1.56,0.64,1); }
+    .timings-row-value { font-size: 13px; font-weight: 700; color: #0f172a; text-align: right; font-variant-numeric: tabular-nums; }
+    .timings-row-pct { font-size: 11px; color: var(--text-muted); text-align: right; font-weight: 500; }
     .timings-row:hover .timings-row-label { color: var(--text-color); }
     .timings-row:hover .timings-row-bar { filter: brightness(1.08); }
 
-    /* --- Query Plan Tree --- */
-    .plan-tree-section {
-      border-top: 1px solid var(--panel-border);
-      margin-top: 12px;
-      padding-top: 16px;
-    }
-    .plan-tree-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 24px 12px;
-    }
-    .plan-tree-header h4 {
-      font-size: 15px;
-      font-weight: 700;
-      color: var(--text-color);
-      margin: 0;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    /* Query plan tree (full version) */
+    .plan-tree-section { border-top: 1px solid var(--panel-border); margin-top: 12px; padding-top: 16px; }
+    .plan-tree-header { display: flex; align-items: center; justify-content: space-between; padding: 0 14px 12px; }
+    .plan-tree-header h4 { font-size: 15px; font-weight: 700; color: var(--text-color); margin: 0; display: flex; align-items: center; gap: 8px; }
     .plan-tree-header h4 i { color: var(--primary-color); font-size: 14px; }
-    .plan-tree-sql {
-      background: #f1f5f9;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      padding: 10px 14px;
-      margin: 0 24px 14px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 11px;
-      color: #334155;
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 100px;
-      overflow-y: auto;
-    }
-    .plan-node {
-      margin-left: 24px;
-      border-left: 2px solid #e2e8f0;
-      padding-left: 16px;
-      padding-bottom: 4px;
-    }
+    .plan-tree-sql { background: var(--data-table-header-bg); border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px; margin: 0 14px 14px; font-family: var(--mono); font-size: 11px; color: #334155; white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; }
+    .plan-node { margin-left: 24px; border-left: 2px solid #e2e8f0; padding-left: 16px; padding-bottom: 4px; }
     .plan-node:last-child { border-left-color: transparent; }
-    .plan-node-card {
-      display: flex;
-      align-items: stretch;
-      gap: 12px;
-      padding: 8px 12px;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      margin-bottom: 6px;
-      background: #ffffff;
-      transition: var(--transition);
-      cursor: default;
-      position: relative;
-    }
-    .plan-node-card:hover {
-      border-color: var(--primary-color);
-      box-shadow: 0 2px 8px rgba(28, 150, 202, 0.08);
-    }
-    .plan-node-card::before {
-      content: '';
-      position: absolute;
-      left: -17px;
-      top: 50%;
-      width: 16px;
-      height: 0;
-      border-top: 2px solid #e2e8f0;
-    }
-    .plan-node-bar {
-      width: 5px;
-      border-radius: 3px;
-      flex-shrink: 0;
-    }
-    .plan-node-body {
-      flex: 1;
-      min-width: 0;
-    }
-    .plan-node-title {
-      font-size: 12px;
-      font-weight: 700;
-      color: var(--text-color);
-      letter-spacing: 0.02em;
-    }
-    .plan-node-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 3px;
-    }
-    .plan-node-meta span {
-      font-size: 11px;
-      color: var(--text-light);
-    }
-    .plan-node-meta span strong {
-      font-weight: 600;
-      color: var(--text-color);
-    }
-    .plan-node-extra {
-      margin-top: 4px;
-      font-size: 10px;
-      color: #94a3b8;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 60px;
-      overflow-y: auto;
-      display: none;
-    }
+    .plan-node-card { display: flex; align-items: stretch; gap: 12px; padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 6px; background: #fff; transition: var(--transition); cursor: default; position: relative; }
+    .plan-node-card:hover { border-color: var(--primary-color); box-shadow: 0 2px 8px rgba(28,150,202,0.08); }
+    .plan-node-card::before { content: ''; position: absolute; left: -17px; top: 50%; width: 16px; height: 0; border-top: 2px solid #e2e8f0; }
+    .plan-node-bar { width: 5px; border-radius: 3px; flex-shrink: 0; }
+    .plan-node-body { flex: 1; min-width: 0; }
+    .plan-node-title { font-size: 12px; font-weight: 700; color: var(--text-color); letter-spacing: 0.02em; }
+    .plan-node-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 3px; }
+    .plan-node-meta span { font-size: 11px; color: var(--text-light); }
+    .plan-node-meta span strong { font-weight: 600; color: var(--text-color); }
+    .plan-node-extra { margin-top: 4px; font-size: 10px; color: var(--text-muted); font-family: var(--mono); white-space: pre-wrap; word-break: break-all; max-height: 60px; overflow-y: auto; display: none; }
     .plan-node-card:hover .plan-node-extra { display: block; }
-    .plan-node-timing {
-      text-align: right;
-      flex-shrink: 0;
-      min-width: 60px;
-    }
-    .plan-node-timing-val {
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--text-color);
-      font-variant-numeric: tabular-nums;
-    }
-    .plan-node-timing-pct {
-      font-size: 10px;
-      color: var(--text-light);
-    }
-    .plan-tree-wrap {
-      padding: 0 24px 20px;
-      overflow-x: auto;
-    }
-    .plan-empty {
-      padding: 20px 24px;
-      color: var(--text-light);
-      font-size: 13px;
-      text-align: center;
-    }
-    .plan-stats-row {
-      display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
-      padding: 0 24px 14px;
-    }
-    .plan-stat-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      background: var(--primary-light);
-      border: 1px solid rgba(28, 150, 202, 0.15);
-      border-radius: 999px;
-      padding: 4px 12px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--secondary-color);
-    }
+    .plan-node-timing { text-align: right; flex-shrink: 0; min-width: 60px; }
+    .plan-node-timing-val { font-size: 13px; font-weight: 700; color: var(--text-color); font-variant-numeric: tabular-nums; }
+    .plan-node-timing-pct { font-size: 10px; color: var(--text-light); }
+    .plan-tree-wrap { padding: 0 14px 16px; overflow-x: auto; }
+    .plan-empty { padding: 20px 14px; color: var(--text-light); font-size: 13px; text-align: center; }
+    .plan-stats-row { display: flex; gap: 12px; flex-wrap: wrap; padding: 0 14px 14px; }
+    .plan-stat-pill { display: inline-flex; align-items: center; gap: 5px; background: var(--primary-light); border: 1px solid rgba(28,150,202,0.15); border-radius: 999px; padding: 4px 12px; font-size: 11px; font-weight: 600; color: var(--secondary-color); }
     .plan-stat-pill i { font-size: 10px; opacity: 0.6; }
 
+    /* Keyboard shortcuts overlay */
+    .cc-shortcuts-overlay {
+      position: fixed; inset: 0; background: rgba(15,23,42,0.5); z-index: 9999;
+      display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px);
+    }
+    .cc-shortcuts-overlay.visible { display: flex; }
+    .cc-shortcuts-card { background: var(--panel-bg); border-radius: var(--radius); padding: 24px; width: 380px; box-shadow: 0 20px 60px rgba(0,0,0,0.2); }
+    .cc-shortcuts-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 14px; }
+    .cc-shortcut-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; }
+    .cc-shortcut-row:last-child { border-bottom: none; }
+    .cc-shortcut-keys { display: flex; gap: 3px; }
+    .cc-kbd { background: var(--bg-surface); border: 1px solid var(--panel-border); padding: 2px 7px; border-radius: 4px; font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--text-secondary); box-shadow: 0 1px 0 var(--panel-border); }
 
-    /* --- Results Table --- */
-    #result table {
-      width:100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      font-size: 13px;
-      border: 1px solid var(--panel-border);
-      border-radius: 8px;
-      overflow: hidden;
-    }
+    /* Metric cards (for tenant summary) */
+    .metric-card { display: flex; align-items: center; padding: 10px; border-radius: 8px; background: var(--panel-bg); border: 1px solid var(--panel-border); min-height: 60px; }
+    .metric-icon { width: 36px; height: 36px; border-radius: 999px; display: flex; align-items: center; justify-content: center; margin-right: 10px; background: var(--primary-light); color: var(--primary-color); flex-shrink: 0; font-size: 14px; }
+    .metric-content { display: flex; flex-direction: column; }
+    .metric-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+    .metric-value { font-size: 15px; font-weight: 700; margin-top: 2px; color: #111827; }
+    .tenant-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-top: 6px; }
+    .tenant-updated { margin-top: 6px; font-size: 11px; color: #6b7280; text-align: right; }
 
-    #result th, #result td {
-      padding: 10px 15px;
-      border:none;
-      border-right: 1px solid #e2e8f0;
-    }
+    /* Form elements scope — don't let bootstrap/global override everything */
+    .cc-topbar select, .cc-topbar input { width: auto; margin-top: 0; }
+    .cc-panel-left input { margin-top: 0; }
 
-    #result td:last-child {
-        border-right: none;
-    }
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
-    #result thead th {
-      position: sticky;
-      top: 0;
-      background: #f1f5f9;
-      z-index: 1;
-      font-weight: 600;
-      color: #4b5563;
-      text-transform: uppercase;
-      font-size: 11px;
-      letter-spacing: 0.05em;
-      border-bottom: 2px solid #e2e8f0;
-    }
+    /* Bootstrap modal overrides to match our palette */
+    .modal-content { border-radius: 12px !important; }
+    .modal-header { background: var(--header-bg); border-bottom: 1px solid var(--panel-border); }
 
-    #result tbody tr td {
-        border-bottom: 1px solid #f1f5f9;
+    /* SuperTable selector in topbar */
+    .cc-super-selector {
+      display: flex; align-items: center; gap: 6px; background: var(--bg-surface);
+      border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 0 4px 0 10px;
+      font-size: 13px; font-weight: 600; flex-shrink: 0; transition: var(--transition);
     }
+    .cc-super-selector:hover, .cc-super-selector:focus-within { border-color: var(--primary-color); }
+    .cc-super-selector .super-icon { color: var(--primary-color); font-size: 13px; flex-shrink: 0; }
+    .cc-super-selector select {
+      border: none; background: transparent; color: var(--text-color); font-weight: 600;
+      font-size: 13px; font-family: inherit; padding: 6px 4px; outline: none; cursor: pointer;
+      width: auto; margin: 0; min-width: 120px;
+    }
+    .cc-super-selector select:focus { box-shadow: none; }
 
-    #result tbody tr:last-child td {
-        border-bottom: none;
+    /* Role selector pill in topbar */
+    .cc-role-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #ecfdf5; border: 1px solid rgba(16,185,129,0.25);
+      border-radius: 999px; padding: 4px 12px 4px 10px;
     }
-
-    #result tr:nth-child(even) td {
-      background: #f9fafb;
+    .cc-role-pill i { color: #059669; font-size: 11px; }
+    .cc-role-pill label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #059669; cursor: pointer; white-space: nowrap; margin: 0; }
+    .cc-role-pill select {
+      font-size: 12px; font-weight: 600; color: #059669; background: transparent;
+      border: none; outline: none; cursor: pointer; font-family: inherit;
+      padding: 0; margin: 0; width: auto; margin-top: 0;
     }
-
-    #result tr:hover td {
-      background: #e6f4fa;
-    }
-
-    #result .row-index {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      color: #64748b;
-      font-weight: 500;
-    }
-
-    /* --- Download/Copy Row --- */
-    .download-row {
-      margin-top: 16px;
-      text-align: right;
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px; /* Space between buttons */
-    }
-
-    .btn-clipboard {
-      padding: 8px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--dark-color);
-      background: var(--dark-color);
-      color: #e2e8f0;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 500;
-      transition: var(--transition);
-    }
-    .btn-clipboard:hover {
-        filter: brightness(1.1);
-        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
-    }
-    .btn-download {
-      padding: 8px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--dark-color);
-      background: var(--dark-color);
-      color: #e2e8f0;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 500;
-      transition: var(--transition);
-    }
-    .btn-download:hover {
-        filter: brightness(1.1);
-        box-shadow: 0 4px 10px rgba(26, 26, 46, 0.2);
-    }
-
-
-    /* --- Shared metric / summary styles --- */
-    .metric-card {
-      display: flex;
-      align-items: center;
-      padding: 12px;
-      border-radius: 10px;
-      background: var(--panel-bg);
-      border: 1px solid var(--panel-border);
-      min-height: 70px;
-      transition: box-shadow 0.2s;
-    }
-
-    .metric-card:hover {
-        box-shadow: 0 4px 15px rgba(28, 150, 202, 0.08);
-    }
-
-    .metric-icon {
-      width: 40px;
-      height: 40px;
-      border-radius: 999px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin-right: 12px;
-      background: var(--primary-light);
-      color: var(--primary-color);
-      flex-shrink: 0;
-      font-size: 16px;
-    }
-
-    .metric-content {
-      display: flex;
-      flex-direction: column;
-    }
-
-    .metric-label {
-      font-size: 11px;
-      color: #6b7280;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-weight: 600;
-    }
-
-    .metric-value {
-      font-size: 16px;
-      font-weight: 700;
-      margin-top: 4px;
-      color: #111827;
-    }
-
-    .tenant-summary-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 8px;
-    }
-
-    .tenant-updated {
-      margin-top: 8px;
-      font-size: 12px;
-      color: #6b7280;
-      text-align: right;
-    }
-
-    /* Optional: style hints dropdown a bit */
-    .CodeMirror-hints {
-      z-index: 9999;
-      font-family: 'Fira Code', 'Consolas', monospace;
-      border-radius: 8px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-      border: none;
-      background: #ffffff;
-    }
-    .CodeMirror-hint {
-      padding: 6px 12px;
-      color: #111827;
-      transition: all 0.2s ease;
-    }
-    .CodeMirror-hint-active {
-      background: var(--primary-color);
-      color: white;
-    }
-    /* --- Visualize tab controls --- */
-    #viz-controls select {
-      background: #ffffff;
-      border: 1px solid #d0d7e7;
-      color: var(--text-color);
-      cursor: pointer;
-      transition: var(--transition);
-    }
-    #viz-controls select:focus {
-      box-shadow: 0 0 0 3px var(--primary-light);
-      border-color: var(--primary-color);
-    }
-    #vizYAxis {
-      min-height: 28px;
-      max-height: 72px;
-    }
-    #vizYAxis option:checked {
-      background: var(--primary-light);
-      color: var(--primary-color);
-      font-weight: 600;
-    }
-    #viz-chart-wrap {
-      border: 1px solid #f1f5f9;
-      border-radius: 8px;
-      background: #fafbfd;
-      padding: 12px;
-    }
-
-    /* --- Pivot Table --- */
-    .pivot-divider {
-      border-top: 1px solid var(--panel-border);
-      margin: 24px 0 20px;
-    }
-    .pivot-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 14px;
-    }
-    .pivot-header h4 {
-      font-size: 15px;
-      font-weight: 700;
-      color: var(--text-color);
-      margin: 0;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .pivot-header h4 i { color: var(--primary-color); font-size: 14px; }
-
-    .pivot-dropzones {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .pivot-zone {
-      border: 1.5px dashed #d0d7e7;
-      border-radius: 10px;
-      padding: 10px 12px;
-      min-height: 72px;
-      background: #f9fafb;
-      transition: var(--transition);
-    }
-    .pivot-zone.dragover {
-      border-color: var(--primary-color);
-      background: var(--primary-light);
-    }
-    .pivot-zone-label {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-light);
-      margin-bottom: 6px;
-    }
-    .pivot-zone-items {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-      min-height: 26px;
-    }
-    .pivot-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      background: var(--primary-light);
-      color: var(--secondary-color);
-      border: 1px solid rgba(28, 150, 202, 0.25);
-      padding: 3px 8px 3px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: grab;
-      user-select: none;
-      transition: var(--transition);
-    }
-    .pivot-chip:active { cursor: grabbing; }
-    .pivot-chip .pivot-chip-remove {
-      font-size: 9px;
-      cursor: pointer;
-      opacity: 0.5;
-      padding: 2px;
-      border-radius: 50%;
-    }
-    .pivot-chip .pivot-chip-remove:hover { opacity: 1; background: rgba(0,0,0,0.06); }
-
-    .pivot-chip.agg-chip {
-      background: #fef3c7;
-      color: #92400e;
-      border-color: rgba(245, 158, 11, 0.3);
-    }
-
-    .pivot-agg-select {
-      font-size: 10px;
-      padding: 0 2px;
-      border: none;
-      background: transparent;
-      color: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      width: auto;
-      margin: 0;
-      outline: none;
-    }
-    .pivot-agg-select:focus { box-shadow: none; border: none; }
-
-    /* Available fields pool */
-    .pivot-fields-pool {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-      padding: 8px 0;
-      margin-bottom: 12px;
-    }
-    .pivot-field-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      background: #ffffff;
-      color: var(--text-color);
-      border: 1px solid #d0d7e7;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 500;
-      cursor: grab;
-      user-select: none;
-      transition: var(--transition);
-    }
-    .pivot-field-chip:hover { border-color: var(--primary-color); color: var(--primary-color); }
-    .pivot-field-chip .field-type-icon {
-      font-size: 9px;
-      opacity: 0.4;
-    }
-    .pivot-field-chip.dragging { opacity: 0.4; }
-
-    /* Pivot result grid */
-    .pivot-result-wrap {
-      overflow: auto;
-      max-height: 50vh;
-      border: 1px solid var(--panel-border);
-      border-radius: 8px;
-    }
-    .pivot-result-wrap table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      font-size: 12px;
-    }
-    .pivot-result-wrap th {
-      position: sticky;
-      top: 0;
-      background: #f1f5f9;
-      font-weight: 600;
-      color: #4b5563;
-      text-transform: uppercase;
-      font-size: 10px;
-      letter-spacing: 0.05em;
-      padding: 8px 12px;
-      border-bottom: 2px solid #e2e8f0;
-      border-right: 1px solid #e2e8f0;
-      white-space: nowrap;
-      z-index: 1;
-    }
-    .pivot-result-wrap th:last-child { border-right: none; }
-    .pivot-result-wrap th.pivot-row-header {
-      background: #eef2f7;
-      font-weight: 700;
-      text-transform: none;
-      font-size: 11px;
-    }
-    .pivot-result-wrap td {
-      padding: 6px 12px;
-      border-bottom: 1px solid #f1f5f9;
-      border-right: 1px solid #f1f5f9;
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-    }
-    .pivot-result-wrap td:last-child { border-right: none; }
-    .pivot-result-wrap td.pivot-row-label {
-      text-align: left;
-      font-weight: 500;
-      background: #fafbfd;
-      position: sticky;
-      left: 0;
-      z-index: 1;
-    }
-    .pivot-result-wrap tr:hover td { background: #e6f4fa; }
-    .pivot-result-wrap tr:hover td.pivot-row-label { background: #dbeef7; }
-    .pivot-result-wrap .pivot-grand-total td {
-      font-weight: 700;
-      background: #f1f5f9;
-      border-top: 2px solid #e2e8f0;
-    }
-
-    .pivot-empty {
-      text-align: center;
-      padding: 30px 15px;
-      color: var(--text-light);
-      font-size: 13px;
-    }
-
-    /* --- SQL pre-flight error marker (squiggly underline in editor) --- */
-    .cm-sql-error {
-      text-decoration: underline wavy #ef4444;
-      text-decoration-skip-ink: none;
-      background: rgba(239, 68, 68, 0.08);
-      border-radius: 2px;
-      cursor: help;
-    }
+    .cc-role-pill select:focus { box-shadow: none; border-color: transparent; }
   </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-  <script
-    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js">
-  </script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
 
   <script>
     // --- Utility to parse URL parameters ---
@@ -1153,7 +575,7 @@
     const ORGANIZATION = {{ session_org|default(sel_org|default('', true), true)|tojson }};
     const ROLE_NAME = {{ session_role_name|default(default_role_name|default('', true), true)|tojson }};
 
-    let currentSuper = null;
+    let currentSuper = {{ sel_sup|default('', true)|tojson }} || null;
     // Track whether sessions were restored from sessionStorage
     var __sessionsRestoredFromCache = false;
 
@@ -4055,302 +3477,319 @@ $(document).ready(function(){
         try { __saveActiveExecSessionState(); } catch (e) {}
       });
     });
+
   </script>
+
 </head>
 <body>
   {% include "sidebar.html" %}
 
   <div class="content-container">
-    <div class="wrap">
 
-      {% include "selection.html" %}
+    {% if has_tenant %}
 
-      {% if has_tenant %}
-
-      <div id="exec-navigation" style="margin: 0 6px 14px 6px;">
-        <button type="button" class="tab-add" id="btnNewExecution" title="New execution">+</button>
-        <div id="openExecTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
+    <!-- ═══ TOP BAR ═══ -->
+    <header class="cc-topbar">
+      <!-- Inline SuperTable selector -->
+      <div class="cc-super-selector">
+        <i class="fas fa-cube super-icon"></i>
+        <select id="pairSel" onchange="ccOnSuperChange(this.value)">
+          {% for t in tenants %}
+          <option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>
+          {% endfor %}
+        </select>
       </div>
 
-      <div id="tab-navigation">
-          <div id="tab-execute" class="tab active" onclick="switchTab('execute')">
-              <i class="fas fa-terminal"></i>&nbsp;Execute
-          </div>
-          <div id="tab-result" class="tab" onclick="switchTab('result')">
-              <i class="fas fa-table"></i>&nbsp;Result
-          </div>
-          <div id="tab-visualize" class="tab" onclick="switchTab('visualize')">
-              <i class="fas fa-chart-line"></i>&nbsp;Visualize
-          </div>
-          <div id="tab-timings" class="tab" onclick="switchTab('timings')">
-              <i class="fas fa-chart-bar"></i>&nbsp;Timings
-          </div>
+      <div class="topbar-sep"></div>
+
+      <!-- Role selector -->
+      <div class="cc-role-pill">
+        <i class="fas fa-shield-halved"></i>
+        <label for="ccRoleSel">Role</label>
+        <select id="ccRoleSel" title="Select role" onchange="ccOnRoleChange(this.value)">
+          <option value="superadmin" selected>superadmin</option>
+        </select>
       </div>
 
-      <div id="tab-content-container">
+      <div class="topbar-sep"></div>
 
-          <div id="inner-tab-mount"></div>
+      <div class="engine-pill">
+        <i class="fas fa-microchip"></i>
+        <label for="engineSel">Engine</label>
+        <select id="engineSel" title="Select execution engine">
+          <option value="auto">Auto</option>
+          <option value="duckdb_pro">DuckDB Pro</option>
+          <option value="duckdb_lite">DuckDB Lite</option>
+          <option value="spark_sql">Spark SQL</option>
+        </select>
+      </div>
 
-          <div id="tab-content-execute" class="tab-content active">
-              <div class="card sql-editor-card">
-                  <div class="card-body">
-                      <!-- Option 2: top toolbar above editor -->
-                      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 0 10px; flex-wrap:wrap;">
-                        <!-- Left: status + engine -->
-                        <div style="display:flex; align-items:center; gap:10px;">
-                          <div id="status" class="text-sm muted" style="display:flex;align-items:center;gap:6px;">
-                            <i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;Ready
-                          </div>
-                          <div class="toolbar-sep"></div>
-                          <div class="engine-pill">
-                            <i class="fas fa-microchip"></i>
-                            <label for="engineSel">Engine</label>
-                            <select id="engineSel" title="Select execution engine">
-                              <option value="auto">Auto (default)</option>
-                              <option value="duckdb_pro">DuckDB Pro</option>
-                              <option value="duckdb_lite">DuckDB Lite</option>
-                              <option value="spark_sql">Spark SQL</option>
-                            </select>
-                          </div>
-                        </div>
-                        <!-- Right: actions -->
-                        <div style="display:flex; align-items:center; gap:6px;">
-                          <button id="btnRefreshSchema" type="button" class="btn" title="Refresh table schemas for IntelliSense">
-                            <i class="fas fa-sync-alt"></i>&nbsp;Schema
-                          </button>
-                          <button id="btnSaveView" type="button" class="btn">
-                            <i class="fas fa-shield-halved"></i>&nbsp;Save as Role
-                          </button>
-                          <span style="display:inline-block; width:6px;"></span>
-                          <button id="btnExec" class="btn-exec">
-                            <i class="fas fa-play"></i>&nbsp;Execute
-                          </button>
-                        </div>
-                      </div>
+      <button id="btnExec" class="btn-exec">
+        <i class="fas fa-play"></i> Execute
+        <span class="shortcut">⌘↵</span>
+      </button>
 
-                      <div style="margin-top:0;">
-                        <textarea id="sql" rows="8"></textarea>
-                      </div>
-                  </div>
-              </div>
+      <div class="topbar-sep"></div>
+
+      <button class="btn-sm" id="btnRefreshSchema" title="Refresh table schemas"><i class="fas fa-sync-alt"></i> Schema</button>
+      <button class="btn-sm" id="btnSaveView" title="Save as RBAC role"><i class="fas fa-shield-halved"></i> Save role</button>
+      <button class="btn-sm" onclick="ccToggleShortcuts()" title="Keyboard shortcuts"><i class="fas fa-keyboard"></i></button>
+    </header>
+
+    <!-- ═══ 3-COLUMN BODY ═══ -->
+    <div class="cc-columns">
+
+      <!-- LEFT PANEL: Schema Explorer -->
+      <aside class="cc-panel-left" id="ccPanelLeft">
+        <div class="cc-panel-header">
+          <span class="cc-panel-title">Schema explorer</span>
+          <button class="cc-panel-toggle" onclick="ccTogglePanel('left')"><i class="fas fa-chevron-left"></i></button>
+        </div>
+        <div class="schema-search-wrap">
+          <i class="fas fa-search"></i>
+          <input class="schema-search" placeholder="Filter tables…" id="schemaFilter" oninput="ccFilterSchema(this.value)"/>
+        </div>
+        <div class="schema-tree" id="schemaTree"></div>
+
+        <div class="snippets-section">
+          <div class="cc-panel-header">
+            <span class="cc-panel-title">Snippets</span>
+          </div>
+          <div class="snippet-item" onclick="ccInsertSnippet('SELECT * FROM ... LIMIT 100')"><i class="fas fa-bolt"></i> Quick select</div>
+          <div class="snippet-item" onclick="ccInsertSnippet('SELECT COUNT(*) as cnt,\n  ... as dim\nFROM ...\nGROUP BY dim\nORDER BY cnt DESC')"><i class="fas fa-bolt"></i> Group &amp; count</div>
+          <div class="snippet-item" onclick="ccInsertSnippet('WITH cte AS (\n  SELECT ...\n  FROM ...\n)\nSELECT * FROM cte')"><i class="fas fa-bolt"></i> CTE template</div>
+        </div>
+      </aside>
+
+      <!-- Re-open tab for left panel (visible only when collapsed) -->
+      <div class="cc-panel-reopen cc-panel-reopen-left" onclick="ccTogglePanel('left')">
+        <i class="fas fa-chevron-right"></i>
+        <span class="reopen-label">Schema</span>
+      </div>
+
+      <!-- CENTER STAGE -->
+      <main class="cc-center">
+
+        <!-- Session tabs -->
+        <div class="cc-session-tabs">
+          <div id="openExecTabs" style="display:flex; gap:0; align-items:center; flex-wrap:wrap;"></div>
+          <button type="button" class="cc-tab-add" id="btnNewExecution" title="New execution">+</button>
+        </div>
+
+        <!-- SQL Editor -->
+        <div class="cc-editor-area" id="ccEditorArea" style="height: 220px;">
+          <textarea id="sql" rows="8"></textarea>
+        </div>
+        <div class="cc-editor-resize" id="ccEditorResize"></div>
+
+        <!-- Results summary bar -->
+        <div class="cc-results-summary" id="ccResultsSummary">
+          <span class="summary-badge ready" id="ccSummaryBadge"><i class="fas fa-circle" style="font-size:7px;"></i> Ready</span>
+          <span class="summary-stat" id="ccSummaryStats"></span>
+          <div class="summary-actions">
+            <button class="summary-btn" onclick="copyToClipboard()"><i class="fas fa-clipboard"></i> Copy</button>
+            <button class="summary-btn" onclick="downloadCSV()"><i class="fas fa-file-csv"></i> CSV</button>
+          </div>
+        </div>
+
+        <!-- Result tab strip — 5 tabs -->
+        <div class="cc-result-tabs" id="tab-navigation">
+          <div id="tab-result" class="cc-result-tab active" onclick="switchTab('result')">
+            <i class="fas fa-table" style="font-size:11px;"></i> Result <span class="tab-badge" id="ccResultBadge"></span>
+          </div>
+          <div id="tab-visualize" class="cc-result-tab" onclick="switchTab('visualize')">
+            <i class="fas fa-chart-line" style="font-size:11px;"></i> Chart
+          </div>
+          <div id="tab-pivot" class="cc-result-tab" onclick="switchTab('pivot')">
+            <i class="fas fa-table-cells" style="font-size:11px;"></i> Pivot
+          </div>
+          <div id="tab-timings" class="cc-result-tab" onclick="switchTab('timings')">
+            <i class="fas fa-chart-bar" style="font-size:11px;"></i> Timings
+          </div>
+          <div id="tab-plan" class="cc-result-tab" onclick="switchTab('plan')">
+            <i class="fas fa-project-diagram" style="font-size:11px;"></i> Plan
+          </div>
+        </div>
+
+        <!-- Error display -->
+        <div id="query-error-display">
+          <strong>Query Error:</strong>
+          <span id="query-error-message"></span>
+        </div>
+
+        <!-- Result panels -->
+        <div class="cc-results-content">
+
+          <!-- TABLE -->
+          <div class="cc-result-panel active" id="tab-content-result">
+            <div id="result" style="padding: 0;"></div>
           </div>
 
-          <div id="tab-content-result" class="tab-content">
-              <div id="query-error-display" class="mb-4">
-                  <strong>Query Error:</strong>
-                  <span id="query-error-message"></span>
-              </div>
-
-              <div class="card" id="result-card">
-                <div class="section">
-                  <div id="result"></div>
-                  <div class="download-row">
-                    <button class="btn-clipboard" onclick="copyToClipboard()">
-                      <i class="fas fa-clipboard"></i>&nbsp;Copy to Clipboard
-                    </button>
-                    <button class="btn-download" onclick="downloadCSV()">
-                      <i class="fas fa-file-csv"></i>&nbsp;Download CSV
-                    </button>
-                  </div>
+          <!-- CHART (was: visualize) -->
+          <div class="cc-result-panel" id="tab-content-visualize">
+            <div style="padding: 14px;">
+              <div id="viz-controls" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Chart type</label>
+                  <select id="vizChartType" style="width:auto; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;">
+                    <option value="line">Line</option>
+                    <option value="bar">Bar</option>
+                    <option value="area">Area</option>
+                    <option value="doughnut">Doughnut</option>
+                  </select>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">X-axis</label>
+                  <select id="vizXAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;"></select>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Y-axis</label>
+                  <select id="vizYAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;" multiple></select>
+                </div>
+                <div style="margin-left:auto;">
+                  <button class="btn-sm" onclick="renderVisualization()" style="font-size:12px;"><i class="fas fa-sync-alt"></i>&nbsp;Refresh</button>
                 </div>
               </div>
+              <div id="viz-chart-wrap" style="position:relative; min-height:340px; max-height:500px;">
+                <canvas id="vizCanvas"></canvas>
+              </div>
+              <div id="viz-empty" class="text-sm" style="padding:15px; text-align:center; display:none; color:var(--text-muted);">
+                No chartable data. Execute a query that returns at least one numeric column.
+              </div>
+            </div>
           </div>
 
-          <div id="tab-content-visualize" class="tab-content">
-              <div class="card" id="visualize-card">
-                <div class="section">
-                  <!-- Chart controls toolbar -->
-                  <div id="viz-controls" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
-                    <div style="display:flex; align-items:center; gap:6px;">
-                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Chart type</label>
-                      <select id="vizChartType" style="width:auto; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;">
-                        <option value="line">Line</option>
-                        <option value="bar">Bar</option>
-                        <option value="area">Area</option>
-                        <option value="doughnut">Doughnut</option>
-                      </select>
-                    </div>
-                    <div class="toolbar-sep"></div>
-                    <div style="display:flex; align-items:center; gap:6px;">
-                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">X-axis</label>
-                      <select id="vizXAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;"></select>
-                    </div>
-                    <div style="display:flex; align-items:center; gap:6px;">
-                      <label class="text-sm" style="font-weight:600; color:var(--text-light); white-space:nowrap; margin:0;">Y-axis</label>
-                      <select id="vizYAxis" style="width:auto; min-width:120px; padding:5px 10px; font-size:12px; font-weight:600; border-radius:6px;" multiple></select>
-                    </div>
-                    <div style="margin-left:auto;">
-                      <button class="btn" onclick="renderVisualization()" style="font-size:12px;">
-                        <i class="fas fa-sync-alt"></i>&nbsp;Refresh Chart
-                      </button>
-                    </div>
-                  </div>
-                  <!-- Chart canvas -->
-                  <div id="viz-chart-wrap" style="position:relative; min-height:380px; max-height:520px;">
-                    <canvas id="vizCanvas"></canvas>
-                  </div>
-                  <div id="viz-empty" class="muted text-sm" style="padding:15px; text-align:center; display:none;">
-                    No chartable data. Execute a query that returns at least one numeric column.
-                  </div>
-
-                  <!-- ═══ Pivot Table Section ═══ -->
-                  <div class="pivot-divider"></div>
-                  <div class="pivot-header">
-                    <h4><i class="fas fa-table-cells"></i> Pivot table</h4>
-                    <button class="btn" onclick="resetPivot()" style="font-size:11px; padding:4px 10px;">
-                      <i class="fas fa-undo"></i>&nbsp;Reset
-                    </button>
-                  </div>
-
-                  <!-- Available fields -->
-                  <div class="pivot-zone-label">Available fields — drag into zones below</div>
-                  <div id="pivotFieldsPool" class="pivot-fields-pool"></div>
-
-                  <!-- Drop zones -->
-                  <div class="pivot-dropzones">
-                    <div class="pivot-zone" id="pivotZoneRows" data-zone="rows">
-                      <div class="pivot-zone-label"><i class="fas fa-arrows-alt-v"></i> Rows</div>
-                      <div class="pivot-zone-items"></div>
-                    </div>
-                    <div class="pivot-zone" id="pivotZoneCols" data-zone="columns">
-                      <div class="pivot-zone-label"><i class="fas fa-arrows-alt-h"></i> Columns</div>
-                      <div class="pivot-zone-items"></div>
-                    </div>
-                    <div class="pivot-zone" id="pivotZoneValues" data-zone="values">
-                      <div class="pivot-zone-label"><i class="fas fa-calculator"></i> Values</div>
-                      <div class="pivot-zone-items"></div>
-                    </div>
-                    <div class="pivot-zone" id="pivotZoneFilters" data-zone="filters">
-                      <div class="pivot-zone-label"><i class="fas fa-filter"></i> Filters</div>
-                      <div class="pivot-zone-items"></div>
-                    </div>
-                  </div>
-
-                  <!-- Pivot result -->
-                  <div id="pivotResult">
-                    <div class="pivot-empty">
-                      Drag fields into <strong>Rows</strong> and <strong>Values</strong> to create a pivot table.
-                    </div>
-                  </div>
-                </div>
+          <!-- PIVOT (now its own tab) -->
+          <div class="cc-result-panel" id="tab-content-pivot">
+            <div style="padding: 14px;">
+              <div class="pivot-header">
+                <h4><i class="fas fa-table-cells"></i> Pivot table</h4>
+                <button class="btn-sm" onclick="resetPivot()" style="font-size:11px; padding:4px 10px;"><i class="fas fa-undo"></i>&nbsp;Reset</button>
               </div>
+              <div class="pivot-zone-label">Available fields — drag into zones below</div>
+              <div id="pivotFieldsPool" class="pivot-fields-pool"></div>
+              <div class="pivot-dropzones">
+                <div class="pivot-zone" id="pivotZoneRows" data-zone="rows"><div class="pivot-zone-label"><i class="fas fa-arrows-alt-v"></i> Rows</div><div class="pivot-zone-items"></div></div>
+                <div class="pivot-zone" id="pivotZoneCols" data-zone="columns"><div class="pivot-zone-label"><i class="fas fa-arrows-alt-h"></i> Columns</div><div class="pivot-zone-items"></div></div>
+                <div class="pivot-zone" id="pivotZoneValues" data-zone="values"><div class="pivot-zone-label"><i class="fas fa-calculator"></i> Values</div><div class="pivot-zone-items"></div></div>
+                <div class="pivot-zone" id="pivotZoneFilters" data-zone="filters"><div class="pivot-zone-label"><i class="fas fa-filter"></i> Filters</div><div class="pivot-zone-items"></div></div>
+              </div>
+              <div id="pivotResult"><div class="pivot-empty">Drag fields into <strong>Rows</strong> and <strong>Values</strong> to create a pivot table.</div></div>
+            </div>
           </div>
 
-          <div id="tab-content-timings" class="tab-content">
-              <div id="timings-visualization-card" class="card">
-                  <div class="timings-header">
-                      <h4>Execution Timeline</h4>
-                      <span class="timings-total" id="timingsTotalLabel"></span>
-                      <div class="timings-sub">Internal execution steps excluding total query time.</div>
-                  </div>
-                  <div class="timings-rows" id="timingsRows">
-                      <!-- rows rendered by renderTimingsChart() -->
-                  </div>
-
-                  <!-- Query Plan Tree -->
-                  <div id="planTreeSection" class="plan-tree-section" style="display:none;">
-                    <div class="plan-tree-header">
-                      <h4><i class="fas fa-project-diagram"></i> Query plan</h4>
-                    </div>
-                    <div id="planStatsRow" class="plan-stats-row"></div>
-                    <div id="planSqlPreview" class="plan-tree-sql" style="display:none;"></div>
-                    <div id="planTreeWrap" class="plan-tree-wrap"></div>
-                    <div id="planEmpty" class="plan-empty" style="display:none;">
-                      No query plan available for this execution.
-                    </div>
-                  </div>
+          <!-- TIMINGS (without query plan — plan is its own tab now) -->
+          <div class="cc-result-panel" id="tab-content-timings">
+            <div id="timings-visualization-card">
+              <div class="timings-header">
+                <h4>Execution Timeline</h4>
+                <span class="timings-total" id="timingsTotalLabel"></span>
+                <div class="timings-sub">Internal execution steps excluding total query time.</div>
               </div>
+              <div class="timings-rows" id="timingsRows"></div>
+            </div>
           </div>
 
-
-
-      <!-- Save as Role Modal -->
-      <div class="modal fade" id="saveViewModal" tabindex="-1" role="dialog" aria-hidden="true">
-        <div class="modal-dialog modal-lg" role="document">
-          <div class="modal-content" style="border-radius: 12px;">
-            <div class="modal-header" style="background: var(--header-bg); border-bottom: 1px solid var(--panel-border);">
-              <h5 class="modal-title" style="margin:0; font-weight:700;">
-                <i class="fas fa-shield-halved" style="color:#1c96ca; margin-right:6px;"></i>Save as Role
-              </h5>
-              <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
+          <!-- QUERY PLAN (its own tab) -->
+          <div class="cc-result-panel" id="tab-content-plan">
+            <div id="planTreeSection" class="plan-tree-section" style="display:block; border-top:none; margin-top:0; padding-top:10px;">
+              <div class="plan-tree-header"><h4><i class="fas fa-project-diagram"></i> Query plan</h4></div>
+              <div id="planStatsRow" class="plan-stats-row"></div>
+              <div id="planSqlPreview" class="plan-tree-sql" style="display:none;"></div>
+              <div id="planTreeWrap" class="plan-tree-wrap"></div>
+              <div id="planEmpty" class="plan-empty">No query plan available. Execute a query first.</div>
             </div>
-            <div class="modal-body">
-              <div class="text-sm muted" style="margin-bottom:14px;">
-                Organization: <strong id="saveViewOrg"></strong> &nbsp;•&nbsp; SuperTable: <strong id="saveViewSup"></strong>
-              </div>
+          </div>
 
-              <!-- Role name -->
-              <div class="form-group">
-                <label class="text-sm muted" for="saveViewName" style="font-weight:600;">
-                  Role name <span style="color:#ef4444;">*</span>
-                </label>
-                <input id="saveViewName" type="text" class="form-control"
-                       placeholder="e.g. eu-reader, last-week-orders" maxlength="120" />
-                <small class="text-muted">This becomes the role_name users select at login.</small>
-              </div>
+        </div><!-- /cc-results-content -->
+      </main>
 
-              <!-- Tables (auto-detected, editable) -->
-              <div class="form-group">
-                <label class="text-sm muted" for="saveRoleTables" style="font-weight:600;">
-                  Tables
-                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected — edit if needed)</span>
-                </label>
-                <input id="saveRoleTables" type="text" class="form-control"
-                       placeholder="e.g. orders, customers — or * for all" />
-                <small class="text-muted">Comma-separated. The role's filters will apply only to these tables.</small>
-              </div>
+      <!-- Re-open tab for right panel (visible only when collapsed) -->
+      <div class="cc-panel-reopen-right" id="ccPanelRightReopen" onclick="ccTogglePanel('right')">
+        <i class="fas fa-chevron-left"></i>
+        <span class="reopen-label">History</span>
+      </div>
 
-              <!-- Columns -->
-              <div class="form-group">
-                <label class="text-sm muted" for="saveRoleColumns" style="font-weight:600;">
-                  Columns
-                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(default: all)</span>
-                </label>
-                <input id="saveRoleColumns" type="text" class="form-control" value="*"
-                       placeholder="e.g. id, name, email — or * for all" />
-              </div>
+      <!-- RIGHT PANEL: History on top + Execution Profile on bottom -->
+      <aside class="cc-panel-right" id="ccPanelRight">
+        <div class="cc-panel-header">
+          <span class="cc-panel-title">Query history</span>
+          <button class="cc-panel-toggle" onclick="ccTogglePanel('right')"><i class="fas fa-chevron-right"></i></button>
+        </div>
+        <div class="history-list" id="ccHistoryList"></div>
 
-              <!-- Filters (auto-converted from WHERE clause to FilterBuilder JSON) -->
-              <div class="form-group">
-                <label class="text-sm muted" for="saveRoleFilters" style="font-weight:600;">
-                  Filters
-                  <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-converted from WHERE clause)</span>
-                </label>
-                <textarea id="saveRoleFilters" class="form-control" rows="4"
-                          style="font-family:monospace; font-size:12px;"></textarea>
-                <small class="text-muted">
-                  FilterBuilder JSON — <code>["*"]</code> means no row-level filter.
-                  Supports <code>=</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>LIKE</code> <code>BETWEEN</code> <code>IS NULL</code> <code>AND</code> <code>OR</code> <code>NOT</code>.
-                </small>
-              </div>
+        <div class="profile-section">
+          <div class="cc-panel-header">
+            <span class="cc-panel-title">Execution profile</span>
+          </div>
+          <div id="ccProfileTimings"></div>
+        </div>
+      </aside>
 
-              <!-- Original query (read-only reference) -->
-              <div class="form-group" style="margin-bottom:0;">
-                <label class="text-sm muted" for="saveViewQueryPreview" style="font-weight:600;">
-                  Source query <span style="font-weight:400; color:#94a3b8;">(stored for reference)</span>
-                </label>
-                <textarea id="saveViewQueryPreview" class="form-control" rows="5" readonly
-                          style="font-family:monospace; font-size:12px; background:#f8fafc;"></textarea>
-              </div>
+    </div><!-- /cc-columns -->
 
-              <div id="saveViewStatus" class="text-sm" style="margin-top:10px; display:none;"></div>
+    <!-- Save as Role Modal (preserved verbatim) -->
+    <div class="modal fade" id="saveViewModal" tabindex="-1" role="dialog" aria-hidden="true">
+      <div class="modal-dialog modal-lg" role="document">
+        <div class="modal-content" style="border-radius: 12px;">
+          <div class="modal-header" style="background: var(--header-bg); border-bottom: 1px solid var(--panel-border);">
+            <h5 class="modal-title" style="margin:0; font-weight:700;">
+              <i class="fas fa-shield-halved" style="color:#1c96ca; margin-right:6px;"></i>Save as Role
+            </h5>
+            <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+          </div>
+          <div class="modal-body">
+            <div class="text-sm" style="color:var(--text-muted); margin-bottom:14px;">
+              Organization: <strong id="saveViewOrg"></strong> &nbsp;•&nbsp; SuperTable: <strong id="saveViewSup"></strong>
             </div>
-            <div class="modal-footer" style="border-top: 1px solid var(--panel-border);">
-              <a id="saveViewManageLink" class="text-sm" href="#" style="margin-right:auto;">
-                <i class="fas fa-external-link-alt" style="font-size:10px;"></i> Manage roles in RBAC
-              </a>
-              <button type="button" class="btn" data-dismiss="modal">Cancel</button>
-              <button type="button" class="btn-exec" id="btnSaveViewConfirm">
-                <i class="fas fa-shield-halved"></i>&nbsp;Save Role
-              </button>
-            </div>
+            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveViewName">Role name <span style="color:#ef4444;">*</span></label><input id="saveViewName" type="text" class="form-control" placeholder="e.g. eu-reader" maxlength="120" /><small class="text-muted">This becomes the role_name users select at login.</small></div>
+            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleTables">Tables <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected)</span></label><input id="saveRoleTables" type="text" class="form-control" placeholder="e.g. orders, customers — or * for all" /><small class="text-muted">Comma-separated.</small></div>
+            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleColumns">Columns <span style="font-weight:400; color:#94a3b8; font-size:11px;">(default: all)</span></label><input id="saveRoleColumns" type="text" class="form-control" value="*" /></div>
+            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleFilters">Filters <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-converted)</span></label><textarea id="saveRoleFilters" class="form-control" rows="4" style="font-family:monospace; font-size:12px;"></textarea><small class="text-muted">FilterBuilder JSON</small></div>
+            <div class="form-group" style="margin-bottom:0;"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveViewQueryPreview">Source query</label><textarea id="saveViewQueryPreview" class="form-control" rows="4" readonly style="font-family:monospace; font-size:12px; background:#f8fafc;"></textarea></div>
+            <div id="saveViewStatus" class="text-sm" style="margin-top:10px; display:none;"></div>
+          </div>
+          <div class="modal-footer" style="border-top: 1px solid var(--panel-border);">
+            <a id="saveViewManageLink" class="text-sm" href="#" style="margin-right:auto;"><i class="fas fa-external-link-alt" style="font-size:10px;"></i> Manage roles in RBAC</a>
+            <button type="button" class="btn-sm" data-dismiss="modal">Cancel</button>
+            <button type="button" class="btn-exec" id="btnSaveViewConfirm"><i class="fas fa-shield-halved"></i>&nbsp;Save Role</button>
           </div>
         </div>
       </div>
+    </div>
 
-</div> {% endif %}
+    {% else %}
+    <!-- No tenant selected — inline selector -->
+    <div style="padding: 60px 40px; text-align: center;">
+      <div style="margin: 0 auto; max-width: 400px;">
+        <i class="fas fa-cube" style="font-size: 36px; color: var(--primary-color); opacity: 0.5; margin-bottom: 16px;"></i>
+        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">Select a SuperTable</h3>
+        <p style="color: var(--text-muted); margin-bottom: 20px;">Choose an organization and SuperTable to start querying.</p>
+        <div class="cc-super-selector" style="justify-content: center; margin: 0 auto; max-width: 300px;">
+          <i class="fas fa-cube super-icon"></i>
+          <select id="pairSelFallback" onchange="ccOnSuperChange(this.value)" style="min-width: 200px;">
+            <option value="">— Select —</option>
+            {% for t in tenants %}
+            <option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+  </div><!-- /content-container -->
+
+  <!-- Keyboard shortcuts overlay -->
+  <div class="cc-shortcuts-overlay" id="ccShortcutsOverlay" onclick="if(event.target===this)ccToggleShortcuts()">
+    <div class="cc-shortcuts-card">
+      <h3><i class="fas fa-keyboard" style="color:var(--primary-color);margin-right:6px;"></i>Keyboard shortcuts</h3>
+      <div class="cc-shortcut-row"><span>Execute query</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">↵</span></div></div>
+      <div class="cc-shortcut-row"><span>New execution tab</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">T</span></div></div>
+      <div class="cc-shortcut-row"><span>Autocomplete</span><div class="cc-shortcut-keys"><span class="cc-kbd">Tab</span></div></div>
+      <div class="cc-shortcut-row"><span>Toggle schema panel</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">B</span></div></div>
+      <div class="cc-shortcut-row"><span>Toggle history panel</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">H</span></div></div>
+      <div class="cc-shortcut-row"><span>Show shortcuts</span><div class="cc-shortcut-keys"><span class="cc-kbd">?</span></div></div>
     </div>
   </div>
 
@@ -4564,6 +4003,511 @@ $(document).ready(function(){
     if (execBtn) {
       execBtn.addEventListener('click', () => executeSQL(1));
     }
+  
+
+
+    // ═══════════════════════════════════════════════════════════════
+    // COMMAND CENTER ADAPTER — bridges original functions to new layout
+    // ═══════════════════════════════════════════════════════════════
+
+    // --- Remap __renderExecTabs to use cc-session-tab style ---
+    (function() {
+      var _origRenderExecTabs = __renderExecTabs;
+      __renderExecTabs = function() {
+        var host = document.getElementById('openExecTabs');
+        if (!host) return;
+        host.innerHTML = '';
+
+        __execSessions.forEach(function(s) {
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'cc-session-tab' + (s.id === __activeExecSessionId ? ' active' : '');
+
+          var dot = document.createElement('span');
+          dot.className = 'tab-dot';
+          if (s.statusCls === 'error' || s.errorVisible) dot.className += ' error';
+          else if (s.statusCls === 'executing') dot.className += ' idle';
+          else if (s.rows && s.rows.length) dot.className += ' success';
+          else dot.className += ' idle';
+
+          var label = document.createElement('span');
+          label.textContent = s.name;
+
+          btn.appendChild(dot);
+          btn.appendChild(label);
+          btn.addEventListener('click', function() { __activateExecSession(s.id); });
+
+          if (__execSessions.length > 1) {
+            var closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.className = 'tab-close';
+            closeBtn.title = 'Close';
+            closeBtn.innerHTML = '<i class="fas fa-times"></i>';
+            closeBtn.addEventListener('click', function(e) { e.stopPropagation(); __closeExecSession(s.id); });
+            btn.appendChild(closeBtn);
+          }
+
+          host.appendChild(btn);
+        });
+      };
+    })();
+
+    // --- Remap switchTab for the Command Center result tabs (5 tabs) ---
+    (function() {
+      var _origSwitchTab = switchTab;
+      switchTab = function(tabName) {
+        // Map old 'execute' tab to 'result' since editor is always visible
+        if (tabName === 'execute') tabName = 'result';
+
+        // Deactivate all result tabs
+        document.querySelectorAll('.cc-result-tab').forEach(function(t) { t.classList.remove('active'); });
+        document.querySelectorAll('.cc-result-panel').forEach(function(p) { p.classList.remove('active'); });
+
+        // Activate selected
+        var selTab = document.getElementById('tab-' + tabName);
+        var selContent = document.getElementById('tab-content-' + tabName);
+        if (selTab) selTab.classList.add('active');
+        if (selContent) selContent.classList.add('active');
+
+        // CodeMirror refresh (editor always visible now, just refresh)
+        if (window.editor) setTimeout(function() { try { window.editor.refresh(); } catch(e){} }, 0);
+
+        // Chart.js resize
+        if (tabName === 'visualize' && window.__vizChartInstance) {
+          setTimeout(function() { try { window.__vizChartInstance.resize(); } catch(e){} }, 0);
+        }
+
+        // Show timings card when switching to timings tab
+        if (tabName === 'timings') {
+          var tc = document.getElementById('timings-visualization-card');
+          if (tc) tc.style.display = 'block';
+        }
+
+        // Show plan section when switching to plan tab
+        if (tabName === 'plan') {
+          var ps = document.getElementById('planTreeSection');
+          if (ps) ps.style.display = 'block';
+        }
+
+        window.__activeInnerTabName = tabName;
+        var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+        if (__s) __s.innerTab = tabName;
+      };
+    })();
+
+    // --- Remap setStatus to update Command Center summary bar ---
+    (function() {
+      var _origSetStatus = setStatus;
+      setStatus = function(text, cls) {
+        // Update summary bar
+        var summary = document.getElementById('ccResultsSummary');
+        var badge = document.getElementById('ccSummaryBadge');
+        var stats = document.getElementById('ccSummaryStats');
+
+        if (summary && badge) {
+          summary.className = 'cc-results-summary';
+          if (cls === 'error') {
+            summary.className += ' error';
+            badge.className = 'summary-badge error';
+            badge.innerHTML = '<i class="fas fa-times-circle" style="font-size:9px;"></i> Error';
+          } else if (cls === 'executing') {
+            badge.className = 'summary-badge ready';
+            badge.innerHTML = '<i class="fas fa-spinner fa-spin" style="font-size:9px;"></i> Running';
+          } else if (text && text.toLowerCase().indexOf('success') >= 0) {
+            summary.className += ' success';
+            badge.className = 'summary-badge success';
+            badge.innerHTML = '<i class="fas fa-check" style="font-size:9px;"></i> Success';
+          } else {
+            badge.className = 'summary-badge ready';
+            badge.innerHTML = '<i class="fas fa-circle" style="font-size:7px;"></i> Ready';
+          }
+        }
+
+        // Extract row count from status text for badges
+        var rowMatch = text ? text.match(/(\d+)\s*rows/) : null;
+        var resultBadge = document.getElementById('ccResultBadge');
+        if (resultBadge) resultBadge.textContent = rowMatch ? rowMatch[1] : '';
+        if (stats) stats.innerHTML = text && text !== 'Ready' ? text.replace(/^Success\s*—\s*/, '') : '';
+
+        // Update session state
+        var s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+        if (s) { s.statusText = text; s.statusCls = cls || ''; }
+
+        // Re-render session tabs to update dot colors
+        if (typeof __renderExecTabs === 'function') __renderExecTabs();
+      };
+    })();
+
+    // --- Remap __mountInnerTabs to no-op (tabs are inline now) ---
+    __mountInnerTabs = function() {};
+
+    // --- Also render timings in the right panel profile section ---
+    (function() {
+      var _origRenderTimingsChart = renderTimingsChart;
+      var _origAfter = function(timings) {
+        // Render compact profile in right panel
+        var el = document.getElementById('ccProfileTimings');
+        if (!el || !timings || !timings.length) return;
+
+        var colors = ['#6BAED6','#74C476','#1c96ca','#FDAE6B','#9ECAE1','#A1D99B','#C6DBEF','#E7CB94'];
+        var rawData = [], labels = [];
+        timings.forEach(function(t) {
+          var key = Object.keys(t)[0];
+          if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) return;
+          rawData.push(t[key] * 1000);
+          labels.push(key.replace(/_/g, ' '));
+        });
+        if (!rawData.length) return;
+
+        var max = Math.max.apply(null, rawData);
+        el.innerHTML = '';
+        rawData.forEach(function(ms, i) {
+          var pct = max > 0 ? (ms / max * 100) : 0;
+          var row = document.createElement('div');
+          row.className = 'profile-timing-row';
+          row.innerHTML =
+            '<span class="profile-timing-label">' + labels[i] + '</span>' +
+            '<div class="profile-timing-bar-track"><div class="profile-timing-bar" style="width:0%;background:' + colors[i % colors.length] + ';"></div></div>' +
+            '<span class="profile-timing-val">' + (ms >= 1 ? Math.round(ms) + 'ms' : ms.toFixed(2) + 'ms') + '</span>';
+          el.appendChild(row);
+          setTimeout(function() { row.querySelector('.profile-timing-bar').style.width = pct + '%'; }, 100 + i * 80);
+        });
+      };
+
+      renderTimingsChart = function(timings) {
+        _origRenderTimingsChart(timings);
+        _origAfter(timings);
+      };
+    })();
+
+    // --- Schema Browser rendering from IntelliSense cache ---
+    function ccRenderSchemaTree(filter) {
+      var tree = document.getElementById('schemaTree');
+      if (!tree) return;
+      tree.innerHTML = '';
+      var tables = window.__hintTables || {};
+      var filt = (filter || '').toLowerCase();
+
+      Object.keys(tables).forEach(function(tbl) {
+        var cols = tables[tbl].columns || [];
+        var matchTable = !filt || tbl.toLowerCase().includes(filt);
+        var matchCols = cols.filter(function(c) { return c.toLowerCase().includes(filt); });
+        if (!matchTable && !matchCols.length) return;
+
+        var div = document.createElement('div');
+        var tblEl = document.createElement('div');
+        tblEl.className = 'schema-table';
+        tblEl.innerHTML = '<i class="fas fa-chevron-right chevron"></i><i class="fas fa-table table-icon"></i>' + tbl;
+
+        var colsDiv = document.createElement('div');
+        colsDiv.className = 'schema-columns';
+
+        (matchCols.length ? matchCols : cols).forEach(function(c) {
+          var col = document.createElement('div');
+          col.className = 'schema-col';
+          col.innerHTML = '<i class="fas fa-columns" style="font-size:9px;opacity:0.4;"></i>' + c;
+          col.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (window.editor) { var cur = window.editor.getCursor(); window.editor.replaceRange(c, cur); window.editor.focus(); }
+          });
+          colsDiv.appendChild(col);
+        });
+
+        tblEl.addEventListener('click', function() {
+          tblEl.classList.toggle('open');
+          colsDiv.classList.toggle('open');
+        });
+
+        if (filt && matchCols.length) { tblEl.classList.add('open'); colsDiv.classList.add('open'); }
+
+        div.appendChild(tblEl);
+        div.appendChild(colsDiv);
+        tree.appendChild(div);
+      });
+
+      if (!Object.keys(tables).length) {
+        tree.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;text-align:center;">Schema loading…<br>Execute a query first.</div>';
+      }
+    }
+    function ccFilterSchema(val) { ccRenderSchemaTree(val); }
+
+    // Hook into _applySchema to also update the schema tree
+    (function() {
+      var _origApplySchema = _applySchema;
+      _applySchema = function(schemaMap) {
+        _origApplySchema(schemaMap);
+        ccRenderSchemaTree();
+      };
+    })();
+
+    // --- Query History ---
+    var __queryHistory = [];
+    var __queryHistoryMax = 50;
+
+    function _loadQueryHistory() {
+      try {
+        var key = 'st_query_history:' + (window.__st_org || '') + ':' + (currentSuper || '');
+        var raw = sessionStorage.getItem(key);
+        if (raw) __queryHistory = JSON.parse(raw);
+      } catch(e) {}
+    }
+    function _saveQueryHistory() {
+      try {
+        var key = 'st_query_history:' + (window.__st_org || '') + ':' + (currentSuper || '');
+        sessionStorage.setItem(key, JSON.stringify(__queryHistory.slice(0, __queryHistoryMax)));
+      } catch(e) {}
+    }
+    function ccAddToHistory(sql, rows, dur, ok) {
+      __queryHistory.unshift({ sql: sql.trim().substring(0, 300), rows: rows, dur: dur, ok: ok, time: Date.now() });
+      if (__queryHistory.length > __queryHistoryMax) __queryHistory.length = __queryHistoryMax;
+      _saveQueryHistory();
+      ccRenderHistory();
+    }
+    function ccRenderHistory() {
+      var list = document.getElementById('ccHistoryList');
+      if (!list) return;
+      list.innerHTML = '';
+      if (!__queryHistory.length) {
+        list.innerHTML = '<div style="padding:16px;color:var(--text-muted);font-size:11px;text-align:center;">No history yet.<br>Execute a query.</div>';
+        return;
+      }
+      __queryHistory.forEach(function(h, i) {
+        var item = document.createElement('div');
+        item.className = 'history-item' + (i === 0 ? ' active' : '');
+        var ago = _timeAgo(h.time);
+        var esc = function(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+        item.innerHTML = '<div class="history-sql">' + esc(h.sql) + '</div>' +
+          '<div class="history-meta"><span class="status-pip ' + (h.ok ? 'ok' : 'err') + '"></span>' +
+          (h.ok ? h.rows + ' rows' : 'Error') + ' &middot; ' + h.dur + ' &middot; ' + ago + '</div>';
+        item.addEventListener('click', function() {
+          if (window.editor) { window.editor.setValue(h.sql); window.editor.focus(); }
+          list.querySelectorAll('.history-item').forEach(function(el) { el.classList.remove('active'); });
+          item.classList.add('active');
+        });
+        list.appendChild(item);
+      });
+    }
+    function _timeAgo(ts) {
+      var diff = Math.max(0, Date.now() - ts);
+      if (diff < 60000) return 'just now';
+      if (diff < 3600000) return Math.floor(diff / 60000) + ' min ago';
+      if (diff < 86400000) return Math.floor(diff / 3600000) + ' hr ago';
+      return Math.floor(diff / 86400000) + ' days ago';
+    }
+
+    // Hook into executeSQL completion to log history
+    (function() {
+      var _origExtractError = extractExecuteError;
+      // We'll hook into the results rendering instead — patch renderTable
+      var _origRenderTable = renderTable;
+      renderTable = function(rows, total, page, pageSize, onPage, statusText) {
+        _origRenderTable(rows, total, page, pageSize, onPage, statusText);
+        // Log to history
+        var s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+        if (s && statusText) {
+          var durMatch = statusText.match(/([\d.]+s)/);
+          ccAddToHistory(s.query || '', rows ? rows.length : 0, durMatch ? durMatch[1] : '—', true);
+        }
+      };
+    })();
+
+    // --- Panel toggle ---
+    function ccTogglePanel(side) {
+      var el = side === 'left' ? document.getElementById('ccPanelLeft') : document.getElementById('ccPanelRight');
+      if (el) el.classList.toggle('collapsed');
+      // Toggle re-open tab visibility for right panel
+      if (side === 'right') {
+        var reopen = document.getElementById('ccPanelRightReopen');
+        if (reopen) reopen.style.display = el.classList.contains('collapsed') ? 'block' : 'none';
+      }
+      setTimeout(function() { if (window.editor) window.editor.refresh(); }, 300);
+    }
+
+    // --- Keyboard shortcuts ---
+    function ccToggleShortcuts() {
+      document.getElementById('ccShortcutsOverlay').classList.toggle('visible');
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === '?' && !e.ctrlKey && !e.metaKey && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA' && !document.querySelector('.CodeMirror-focused')) {
+        ccToggleShortcuts();
+      }
+      if (e.key === 'Escape') {
+        var overlay = document.getElementById('ccShortcutsOverlay');
+        if (overlay) overlay.classList.remove('visible');
+      }
+    });
+
+    // --- Snippets ---
+    function ccInsertSnippet(sql) {
+      if (window.editor) { window.editor.setValue(sql); window.editor.focus(); }
+    }
+
+    // --- Editor resize handle ---
+    (function() {
+      var handle = document.getElementById('ccEditorResize');
+      var area = document.getElementById('ccEditorArea');
+      if (!handle || !area) return;
+      var startY, startH;
+      handle.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        startY = e.clientY;
+        startH = area.offsetHeight;
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+      function onMove(e) {
+        var newH = Math.max(80, Math.min(600, startH + (e.clientY - startY)));
+        area.style.height = newH + 'px';
+        if (window.editor) window.editor.refresh();
+      }
+      function onUp() { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); }
+    })();
+
+    // --- Boot: render schema tree and history ---
+    ccRenderSchemaTree();
+    _loadQueryHistory();
+    ccRenderHistory();
+
+    // ═══════════════════════════════════════════════════════════════
+    // SUPERTABLE SELECTOR — replaces selection.html
+    // Sets the globals that the rest of the JS depends on, loads
+    // metadata from /reflection/super, and calls onSuperMetaLoaded().
+    // ═══════════════════════════════════════════════════════════════
+
+    // Set globals that selection.html used to provide
+    window.__st_org = ORGANIZATION;
+
+    // ═══════════════════════════════════════════════════════════════
+    // ROLE SELECTOR — ensures a role is always set
+    // Falls back to: session role → "superadmin" → first available role
+    // ═══════════════════════════════════════════════════════════════
+
+    // Resolve initial role: session value → "superadmin" fallback
+    var _initialRole = (ROLE_NAME || '').trim() || 'superadmin';
+    window.__st_role_name = _initialRole;
+    window.__st_active_role = _initialRole;
+
+    // Update the role dropdown to show the initial value
+    (function() {
+      var sel = document.getElementById('ccRoleSel');
+      if (!sel) return;
+      // Ensure the initial role is an option
+      var found = false;
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === _initialRole) { found = true; break; }
+      }
+      if (!found) {
+        var opt = document.createElement('option');
+        opt.value = _initialRole;
+        opt.textContent = _initialRole;
+        sel.insertBefore(opt, sel.firstChild);
+      }
+      sel.value = _initialRole;
+    })();
+
+    // Handle role change
+    function ccOnRoleChange(val) {
+      val = (val || '').trim();
+      if (!val) return;
+      window.__st_role_name = val;
+      window.__st_active_role = val;
+      // Clear cached schema so it reloads with the new role
+      if (typeof _clearCachedSchema === 'function') _clearCachedSchema();
+      // Reload schema for new role
+      if (typeof loadSchema === 'function') loadSchema(true);
+    }
+
+    // Fetch available roles from RBAC endpoint and populate the dropdown
+    (function() {
+      if (!ORGANIZATION || !currentSuper) return;
+      api('/reflection/rbac/roles?org=' + encodeURIComponent(ORGANIZATION) +
+          '&sup=' + encodeURIComponent(currentSuper))
+        .then(function(data) {
+          var roles = [];
+          if (Array.isArray(data)) {
+            roles = data;
+          } else if (data && Array.isArray(data.roles)) {
+            roles = data.roles;
+          }
+
+          var sel = document.getElementById('ccRoleSel');
+          if (!sel || !roles.length) return;
+
+          // Collect role names
+          var roleNames = [];
+          roles.forEach(function(r) {
+            var name = r.role_name || r.name || r.role_id || '';
+            if (name && roleNames.indexOf(name) < 0) roleNames.push(name);
+          });
+
+          // Always ensure superadmin and current role are present
+          if (roleNames.indexOf('superadmin') < 0) roleNames.unshift('superadmin');
+          var cur = window.__st_active_role || _initialRole;
+          if (cur && roleNames.indexOf(cur) < 0) roleNames.unshift(cur);
+
+          // Rebuild dropdown
+          sel.innerHTML = '';
+          roleNames.forEach(function(name) {
+            var opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            if (name === cur) opt.selected = true;
+            sel.appendChild(opt);
+          });
+        })
+        .catch(function(e) {
+          // Non-fatal — the default role is already set
+          console.debug('[cc] Could not fetch roles:', e.message || e);
+        });
+    })();
+
+    // Navigate on SuperTable change (same as selection.html did)
+    function ccOnSuperChange(val) {
+      if (!val) return;
+      var parts = val.split('/');
+      if (parts.length < 2) return;
+      var org = parts[0].trim();
+      var sup = parts.slice(1).join('/').trim();
+      var url = new URL('/reflection/execute', window.location.origin);
+      url.searchParams.set('org', org);
+      url.searchParams.set('sup', sup);
+      window.location.href = url.toString();
+    }
+
+    // Load SuperTable metadata on page load (replaces selection.html's loadSuperMeta)
+    (function() {
+      if (!ORGANIZATION || !currentSuper) return;
+
+      // Always fire onSuperMetaLoaded — schema loading depends on it.
+      // Try to fetch meta first; if it fails, fire with null meta.
+      var fired = false;
+      function fireOnce(meta) {
+        if (fired) return;
+        fired = true;
+        if (typeof window.onSuperMetaLoaded === 'function') {
+          window.onSuperMetaLoaded(ORGANIZATION, currentSuper, meta);
+        }
+      }
+
+      // Safety net: if meta fetch takes too long or fails silently, fire after 2s
+      var safetyTimer = setTimeout(function() { fireOnce(null); }, 2000);
+
+      var metaUrl = '/reflection/super?org=' + encodeURIComponent(ORGANIZATION) +
+                    '&sup=' + encodeURIComponent(currentSuper);
+      api(metaUrl).then(function(data) {
+        clearTimeout(safetyTimer);
+        var meta = null;
+        if (data && typeof data === 'object') {
+          meta = data.meta || data;
+        }
+        fireOnce(meta);
+      }).catch(function(e) {
+        clearTimeout(safetyTimer);
+        console.warn('[cc] Meta fetch failed (non-fatal):', e.message || e);
+        fireOnce(null);
+      });
+    })();
+
   </script>
 </body>
 </html>
