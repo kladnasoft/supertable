@@ -1,10 +1,38 @@
-{% extends "base.html" %}
-
-{% block title %}Jobs{% endblock %}
-
-{% block head_extra %}
-<style>
-    :root {
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Jobs</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --primary-color:#1c96ca;--secondary-color:#147ba3;--dark-color:#1a1a2e;
+  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;--warn:#f59e0b;--warn-bg:#fffbeb;--error:#ef4444;--error-bg:#fef2f2;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;--font:'Inter',-apple-system,sans-serif;
+  --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
+  --panel-bg:#ffffff;--panel-border:#e0e5f0;--panel-shadow:0 4px 16px rgba(15,23,42,0.06);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow-x:hidden;}
+.content-container{margin-left:280px;min-height:100vh;background:var(--bg);transition:var(--transition);padding-bottom:40px;}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
+.wrap{max-width:1400px;margin:0 auto;padding:24px;}
+.card{background:var(--panel-bg);border-radius:16px;box-shadow:var(--panel-shadow);border:1px solid var(--panel-border);}
+.section{padding:16px 20px;}
+.muted{color:var(--text-light);}
+.text-xs{font-size:11px;}.text-sm{font-size:12px;}
+:root {
       --primary-color: #1c96ca;
       --primary-light: #e6f4fa;
       --panel-bg: #ffffff;
@@ -85,11 +113,14 @@
       transition: background-color 0.2s ease, color 0.2s ease;
     }
     .btn-danger-outline:hover { background: rgba(239,68,68,0.12); }
-</style>
-{% endblock %}
+  </style>
+  <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
+</head>
+<body>
+{% include "sidebar.html" %}
+<div class="content-container">
+<div class="wrap">
 
-{% block content %}
-{% include "selection.html" %}
 
 <div class="card" style="margin-top:20px;">
     <div class="section">
@@ -211,11 +242,11 @@
     </div>
   </div>
 </div>
-{% endblock %}
+</div>
+</div>
 
-{% block body_scripts %}
 <script>
-  (function() {
+(function() {
     function qs(sel) { return document.querySelector(sel); }
     function qsa(sel) { return Array.from(document.querySelectorAll(sel)); }
 
@@ -599,4 +630,5 @@ timezone: tz || (Intl && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOpt
     });
   })();
 </script>
-{% endblock %}
+</body>
+</html>

@@ -305,6 +305,19 @@ def _build_mcp(name: str, version: str) -> FastMCP:
         # browser-facing auth; real MCP SDK clients don't send Origin.
         if "allowed_origins" in sig.parameters:
             kwargs["allowed_origins"] = ["*"]
+        # Disable DNS rebinding protection — required when connecting via
+        # IP address (e.g. http://192.168.168.130:8099/mcp) or behind a
+        # reverse proxy that rewrites the Host header.  Without this, the
+        # SDK returns HTTP 421 "Invalid Host header" for any non-localhost
+        # Host value.
+        if "transport_security" in sig.parameters:
+            try:
+                from mcp.server.transport_security import TransportSecuritySettings
+                kwargs["transport_security"] = TransportSecuritySettings(
+                    enable_dns_rebinding_protection=False,
+                )
+            except ImportError:
+                pass
         return FastMCP(name, **kwargs)  # type: ignore[arg-type]
     except Exception:
         return FastMCP(name)
@@ -563,12 +576,50 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
             except Exception as exc:
                 logger.warning("__feedback__ fetch failed (non-fatal): %s", exc)
 
+        # ── __annotations__ lookup ─────────────────────────────────────────────
+        # User annotations are persistent preferences and domain knowledge that
+        # the AI MUST read and apply when generating SQL, choosing charts, etc.
+        annotations: List[Dict[str, Any]] = []
+        annotations_hint: Optional[str] = None
+
+        if "__annotations__" in tables:
+            annotations_hint = (
+                "CRITICAL: The 'annotations' field contains user-defined rules and preferences. "
+                "These are HARD CONSTRAINTS — you MUST follow them when generating SQL, "
+                "choosing visualizations, interpreting terminology, and scoping queries. "
+                "Each annotation has a category (sql/terminology/visualization/scope/domain) "
+                "and a context (table name or '*' for global). Apply global annotations always; "
+                "apply table-specific annotations when that table is involved."
+            )
+            try:
+                eng = _resolve_engine(None)
+                limit_n = _clamp_limit(None, 200, 200)
+
+                def _fetch_annotations():
+                    return _exec_query_sync(
+                        sup, org,
+                        'SELECT * FROM "__annotations__" ORDER BY ts DESC LIMIT 200',
+                        limit_n, eng, r,
+                    )
+
+                ann_result = await anyio.to_thread.run_sync(_fetch_annotations)
+
+                if ann_result.get("status") == "OK":
+                    cols = ann_result.get("columns") or []
+                    rows = ann_result.get("rows") or []
+                    annotations = [dict(zip(cols, row)) for row in rows]
+                    logger.info("__annotations__ loaded: %d rows", len(annotations))
+            except Exception as exc:
+                logger.warning("__annotations__ fetch failed (non-fatal): %s", exc)
+
     return {
         "result": tables,
         "catalog": catalog,
         "catalog_hint": catalog_hint,
         "feedback": feedback,
         "feedback_hint": feedback_hint,
+        "annotations": annotations,
+        "annotations_hint": annotations_hint,
         "system_hint": (
             "SESSION INSTRUCTIONS — follow these for the entire conversation:\n"
             "\n"
@@ -576,11 +627,17 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
             "its columns, known joins, filters and example questions. "
             "Read it before writing any SQL. Never query a table without consulting it first.\n"
             "\n"
-            "2. FEEDBACK: The 'feedback' field contains past user ratings on previous AI responses. "
+            "2. ANNOTATIONS: The 'annotations' field contains user-defined rules and preferences. "
+            "These are HARD CONSTRAINTS. Each has a category and context. "
+            "Apply global (*) annotations to every query. "
+            "Apply table-specific annotations when that table is involved. "
+            "NEVER ignore an annotation — they represent explicit user intent.\n"
+            "\n"
+            "3. FEEDBACK: The 'feedback' field contains past user ratings on previous AI responses. "
             "Avoid patterns rated thumbs_down. Repeat patterns rated thumbs_up. "
             "If a comment field explains why, treat it as a hard constraint.\n"
             "\n"
-            "3. COLLECTING FEEDBACK: After every response you give, ask the user: "
+            "4. COLLECTING FEEDBACK: After every response you give, ask the user: "
             "'Was this helpful? Reply 👍 or 👎'. "
             "When the user replies 👍 or with positive words (yes, good, great, correct, perfect), "
             "call the submit_feedback tool with rating=thumbs_up, "
@@ -591,7 +648,7 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
             "call submit_feedback with rating=thumbs_down and include their words in the comment field. "
             "Never skip this step — every interaction should be logged.\n"
             "\n"
-            "4. MEMORY: Keep catalog and feedback in memory for the full session. "
+            "5. MEMORY: Keep catalog, annotations, and feedback in memory for the full session. "
             "Do not re-call list_tables unless the user explicitly asks to refresh."
         ),
     }
@@ -888,7 +945,344 @@ async def submit_feedback(
                 "message": f"{exc.__class__.__name__}: {exc}",
             }
 
-# ---------- Entrypoint ----------
+# ---------- Annotations (user knowledge injected into AI context) ----------
+
+@mcp.tool()
+@log_tool
+async def store_annotation(
+    super_name: str,
+    organization: str,
+    category: str,
+    context: str,
+    instruction: str,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Store a user annotation that the AI should remember for future queries.
+
+    Annotations are persistent user preferences and domain knowledge that get
+    injected into the AI context window for every future query by this role.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        category:      One of: sql, terminology, visualization, scope, domain.
+                       - sql: preferences about SQL generation (date ranges, aggregations, filters)
+                       - terminology: what user terms mean (e.g. "weekly" = last 7 rolling days)
+                       - visualization: chart type preferences, axis preferences
+                       - scope: default data ranges, limits, table preferences
+                       - domain: business rules, known relationships, data quality notes
+        context:       What table/topic this applies to, or "*" for global.
+        instruction:   The actionable instruction in English. Must be clear and imperative.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    valid_categories = {"sql", "terminology", "visualization", "scope", "domain"}
+    category = (category or "").strip().lower()
+    if category not in valid_categories:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": f"category must be one of: {sorted(valid_categories)}",
+        }
+
+    instruction = (instruction or "").strip()
+    if not instruction:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": "instruction is required and must be non-empty.",
+        }
+
+    context_val = (context or "*").strip()[:256]
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    row = {
+        "ts":          ts,
+        "category":    category,
+        "context":     context_val,
+        "instruction": instruction[:2000],
+        "role":        r,
+    }
+
+    def _write():
+        import pyarrow as pa
+        batch = pa.RecordBatch.from_pylist([row])
+        dw = DataWriter(super_name=sup, organization=org)
+        columns, rows, inserted, deleted = dw.write(
+            role_name=r,
+            simple_name="__annotations__",
+            data=batch,
+            overwrite_columns=["ts"],
+        )
+        return {"columns": columns, "inserted": inserted, "deleted": deleted}
+
+    async with _get_limiter():
+        try:
+            write_result = await anyio.to_thread.run_sync(_write)
+            logger.info(
+                "store_annotation: category=%s context=%s inserted=%s",
+                category, context_val, write_result.get("inserted"),
+            )
+            return {
+                "result": "ok",
+                "status": "OK",
+                "ts": ts,
+                "category": category,
+                "context": context_val,
+                "inserted": write_result.get("inserted"),
+            }
+        except Exception as exc:
+            logger.exception("store_annotation failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+
+
+@mcp.tool()
+@log_tool
+async def get_annotations(
+    super_name: str,
+    organization: str,
+    context: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrieve stored annotations for this role.
+
+    Returns all annotations, optionally filtered by context (table name or "*" for global).
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        context:       Filter by context. Empty or None returns all.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    ctx = (context or "").strip()
+    if ctx:
+        sql = f'SELECT * FROM "__annotations__" WHERE "context" = \'{ctx}\' OR "context" = \'*\' ORDER BY ts DESC LIMIT 200'
+    else:
+        sql = 'SELECT * FROM "__annotations__" ORDER BY ts DESC LIMIT 200'
+
+    eng = _resolve_engine(None)
+
+    async with _get_limiter():
+        try:
+            def _work():
+                return _exec_query_sync(sup, org, sql, 200, eng, r)
+            result = await anyio.to_thread.run_sync(_work)
+
+            if result.get("status") == "OK":
+                cols = result.get("columns") or []
+                rows = result.get("rows") or []
+                items = [dict(zip(cols, row)) for row in rows]
+                return {
+                    "status": "OK",
+                    "annotations": items,
+                    "count": len(items),
+                }
+            else:
+                return {
+                    "status": "OK",
+                    "annotations": [],
+                    "count": 0,
+                    "note": "No __annotations__ table found or empty.",
+                }
+        except Exception as exc:
+            logger.warning("get_annotations failed: %s", exc)
+            return {
+                "status": "OK",
+                "annotations": [],
+                "count": 0,
+                "note": f"Could not read annotations: {exc}",
+            }
+
+
+# ---------- App state (UI persistence — chat, dashboard, widget, query) ----------
+
+@mcp.tool()
+@log_tool
+async def store_app_state(
+    super_name: str,
+    organization: str,
+    namespace: str,
+    key: str,
+    value: str,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Store application state for the Agentic BI frontend.
+
+    This is a generic key-value store for UI persistence: chat history,
+    dashboard configs, widget configs, saved queries, data point notes.
+    The AI does NOT read this data — it is purely for UI state.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        namespace:     Entity type: "chat" | "dashboard" | "widget" | "query" | "note"
+        key:           Unique ID within the namespace (e.g. "dash_a1b2c3").
+        value:         JSON string containing the full entity payload.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    valid_namespaces = {"chat", "dashboard", "widget", "query", "note"}
+    namespace = (namespace or "").strip().lower()
+    if namespace not in valid_namespaces:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": f"namespace must be one of: {sorted(valid_namespaces)}",
+        }
+
+    key_val = (key or "").strip()
+    if not key_val:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": "key is required.",
+        }
+
+    value_str = (value or "").strip()
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    row = {
+        "ts":        ts,
+        "namespace": namespace,
+        "key":       key_val[:256],
+        "value":     value_str[:50000],
+        "role":      r,
+    }
+
+    def _write():
+        import pyarrow as pa
+        batch = pa.RecordBatch.from_pylist([row])
+        dw = DataWriter(super_name=sup, organization=org)
+        columns, rows, inserted, deleted = dw.write(
+            role_name=r,
+            simple_name="__app_state__",
+            data=batch,
+            overwrite_columns=["ts"],
+        )
+        return {"columns": columns, "inserted": inserted, "deleted": deleted}
+
+    async with _get_limiter():
+        try:
+            write_result = await anyio.to_thread.run_sync(_write)
+            logger.info(
+                "store_app_state: namespace=%s key=%s inserted=%s",
+                namespace, key_val, write_result.get("inserted"),
+            )
+            return {
+                "result": "ok",
+                "status": "OK",
+                "ts": ts,
+                "namespace": namespace,
+                "key": key_val,
+                "inserted": write_result.get("inserted"),
+            }
+        except Exception as exc:
+            logger.exception("store_app_state failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+
+
+@mcp.tool()
+@log_tool
+async def get_app_state(
+    super_name: str,
+    organization: str,
+    namespace: str,
+    key: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrieve application state from the __app_state__ table.
+
+    If key is provided, returns that specific entry.
+    If key is empty/None, returns all entries in the namespace.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        namespace:     Entity type: "chat" | "dashboard" | "widget" | "query" | "note"
+        key:           Optional specific key. Empty = list all in namespace.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    ns = (namespace or "").strip().lower()
+    key_val = (key or "").strip()
+
+    if key_val:
+        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' AND "key" = \'{key_val}\' ORDER BY ts DESC LIMIT 1'
+    else:
+        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' ORDER BY ts DESC LIMIT 200'
+
+    eng = _resolve_engine(None)
+
+    async with _get_limiter():
+        try:
+            def _work():
+                return _exec_query_sync(sup, org, sql, 200, eng, r)
+            result = await anyio.to_thread.run_sync(_work)
+
+            if result.get("status") == "OK":
+                cols = result.get("columns") or []
+                rows = result.get("rows") or []
+                items = [dict(zip(cols, row)) for row in rows]
+                return {
+                    "status": "OK",
+                    "items": items,
+                    "count": len(items),
+                }
+            else:
+                return {
+                    "status": "OK",
+                    "items": [],
+                    "count": 0,
+                }
+        except Exception as exc:
+            logger.warning("get_app_state failed: %s", exc)
+            return {
+                "status": "OK",
+                "items": [],
+                "count": 0,
+                "note": f"Could not read app state: {exc}",
+            }
 if __name__ == "__main__":
     try:
         transport = _normalize_transport_value(getattr(CFG, "transport", "stdio"))

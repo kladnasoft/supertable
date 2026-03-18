@@ -1,11 +1,57 @@
-{% extends "base.html" %}
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Studio</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" referrerpolicy="no-referrer" />
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --primary-color:#1c96ca;--secondary-color:#147ba3;--dark-color:#1a1a2e;
+  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;--warn:#f59e0b;--warn-bg:#fffbeb;--error:#ef4444;--error-bg:#fef2f2;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;--font:'Inter',-apple-system,sans-serif;
+  --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
+  --panel-bg:#ffffff;--panel-border:#e0e5f0;--panel-shadow:0 4px 16px rgba(15,23,42,0.06);
+  --azure:#1c96ca;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow:hidden;}
+.content-container{margin-left:280px;height:100vh;display:flex;flex-direction:column;overflow:hidden;transition:var(--transition);background:var(--bg);}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
 
-{% block title %}Studio{% endblock %}
+/* Topbar */
+.cc-topbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:46px;}
+.topbar-sep{width:1px;height:20px;background:var(--border);flex-shrink:0;}
+.super-sel{display:flex;align-items:center;gap:6px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0 4px 0 10px;font-size:13px;font-weight:600;}
+.super-sel select{border:none;background:transparent;color:var(--text);font-weight:600;font-size:13px;font-family:var(--font);padding:6px 4px;outline:none;cursor:pointer;min-width:120px;}
 
-{% block head_extra %}
-<style>
-  :root { --azure: #1c96ca; }
-  .muted { color:#64748b; font-size: 12px; }
+/* Section bar */
+.section-bar{display:flex;align-items:center;gap:0;padding:10px 20px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;}
+.section-node{display:flex;align-items:center;gap:8px;padding:7px 16px;border-radius:8px;cursor:pointer;transition:var(--transition);border:1px solid transparent;white-space:nowrap;font-size:12px;font-weight:600;color:var(--text-sec);}
+.section-node:hover{background:var(--bg-hover);border-color:var(--border);}
+.section-node.active{background:var(--primary-light);border-color:var(--primary);color:var(--primary);}
+.section-node .sicon{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;}
+.section-sep{width:1px;height:24px;background:var(--border);margin:0 6px;flex-shrink:0;}
+
+/* Main area */
+.studio-main{flex:1;overflow:auto;padding:20px;}
+
+/* Open tabs bar */
+.open-tabs-bar{display:flex;align-items:center;gap:8px;padding:6px 20px;background:var(--bg-surface);border-bottom:1px solid var(--border-light);flex-shrink:0;overflow-x:auto;min-height:0;}
+.open-tabs-bar:empty{display:none;}
+
+.muted { color:#64748b; font-size: 12px; }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   }
@@ -495,66 +541,56 @@
 .CodeMirror-lines{ padding: 10px 12px; } /* padding for code, not over the gutter */
 .CodeMirror-scroll{ padding: 0 !important; }
 
-</style>
+/* Scrollbar */
+::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
+  </style>
+  <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
+</head>
+<body>
+{% include "sidebar.html" %}
 
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" referrerpolicy="no-referrer" />
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css" referrerpolicy="no-referrer" />
-{% endblock %}
+<div class="content-container">
 
-{% block content %}
-
-{% include "selection.html" %}
-
-<div style="height: 18px;"></div>
-
-
-<div id="tab-navigation" style="margin: 0 6px 14px 6px;">
-  <button id="tab-list" type="button" class="tab active" data-pane="list" onclick="switchTab('list')" aria-selected="true">
-    <i class="fas fa-list"></i><span>Studio</span>
-  </button>
-
-  <div class="tab-sep" aria-hidden="true"></div>
-
-  <button id="tab-snippets" type="button" class="tab" data-pane="snippets" onclick="switchTab('snippets')" aria-selected="false">
-    <i class="fas fa-wand-magic-sparkles"></i><span>Snippets</span>
-  </button>
-
-  <div class="tab-sep" aria-hidden="true"></div>
-
-  <button type="button" class="tab-add" id="btnNewNotebook" title="New lab">+</button>
-
-  <div id="openTabs" style="display:flex; gap:24px; align-items:center; flex-wrap:wrap;"></div>
-</div>
-
-<div style="height: 10px;"></div>
-
+{% if has_tenant %}
 <div id="nbRoot"
-     class="nb-root"
      data-org="{{ sel_org }}"
      data-sup="{{ sel_sup }}"
      data-user-hash="{{ session_user_hash }}"
      data-user-name="{{ session_username }}"
->
-  <div class="nb-topbar">
-    <div>
-      <div class="nb-title">Studio</div>
-      <div class="muted" style="margin-top:4px;">
-        Manage lab workspaces and snippets. Open sessions in editor tabs (Synapse-style).
-      </div>
+     style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
+
+  <header class="cc-topbar">
+    <div class="super-sel"><i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i>
+      <select id="ccSuperSel" onchange="ccOnSuperChange(this.value)">{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select>
     </div>
+    <div class="topbar-sep"></div>
+    <span style="font-size:11px;color:var(--text-muted);">Studio</span>
+  </header>
+
+  <!-- Section bar: Labs / Snippets -->
+  <div class="section-bar">
+    <div class="section-node active" data-pane="list" onclick="switchTab('list')"><span class="sicon" style="background:rgba(28,150,202,.08);color:var(--primary);"><i class="fas fa-flask"></i></span> Labs</div>
+    <div class="section-sep"></div>
+    <div class="section-node" data-pane="snippets" onclick="switchTab('snippets')"><span class="sicon" style="background:rgba(124,58,237,.08);color:#7c3aed;"><i class="fas fa-wand-magic-sparkles"></i></span> Snippets</div>
+    <div class="section-sep"></div>
+    <button style="border:none;background:var(--primary);color:#fff;font-weight:700;padding:8px 18px;font-size:13px;border-radius:8px;box-shadow:0 2px 8px rgba(28,150,202,.25);cursor:pointer;display:flex;align-items:center;gap:6px;" id="btnNewNotebook"><i class="fas fa-plus"></i> New Lab</button>
+    <div style="flex:1;"></div>
+    <div id="openTabs" style="display:flex;gap:8px;align-items:center;flex-wrap:nowrap;overflow-x:auto;"></div>
   </div>
 
+  <!-- Main scrollable area -->
+  <div class="studio-main">
+    <!-- Keep original nb-root wrapper elements for JS compatibility -->
+    <div class="nb-topbar" style="display:none;">
+      <div><div class="nb-title">Studio</div></div>
+    </div>
 
-
-  {% if not has_tenant %}
-    <div style="margin-top: 14px; color:#64748b;">Select a tenant (organization + super) first.</div>
-  {% else %}
     <!-- Notebooks list pane -->
-    <div id="pane-list" style="margin-top:14px;">
+    <div id="pane-list" style="">
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title"><i class="fas fa-flask" style="color:#1c96ca;"></i> Studio</div>
-          <div class="muted">Stored locally for now. Creator = your username.</div>
+          <div class="panel-title"><i class="fas fa-flask" style="color:#1c96ca;"></i> Labs</div>
+          <div class="muted">Stored locally. Creator = your username.</div>
         </div>
 
         <div class="toolbar">
@@ -562,11 +598,8 @@
             <i class="fas fa-magnifying-glass" style="color:#94a3b8;"></i>
             <input class="form-control form-control-sm" id="nbSearch" placeholder="Search labs by name / creator..." />
           </div>
-
-          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshList">
-              <i class="fas fa-rotate"></i> Refresh
-            </button>
+          <div style="display:flex; gap:10px; align-items:center;">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshList"><i class="fas fa-rotate"></i> Refresh</button>
           </div>
         </div>
 
@@ -574,34 +607,30 @@
 
         <div class="table-responsive">
           <table class="table table-sm" style="margin-bottom:0;">
-            <thead>
-              <tr>
-                <th style="min-width:240px;">Name</th>
-                <th style="min-width:180px;">Creator</th>
-                <th style="min-width:190px;">Created</th>
-                <th style="min-width:190px;">Updated</th>
-                <th style="min-width:240px;">Actions</th>
-              </tr>
-            </thead>
+            <thead><tr>
+              <th style="min-width:240px;">Name</th>
+              <th style="min-width:180px;">Creator</th>
+              <th style="min-width:190px;">Created</th>
+              <th style="min-width:190px;">Updated</th>
+              <th style="min-width:240px;">Actions</th>
+            </tr></thead>
             <tbody id="nbListBody"></tbody>
           </table>
         </div>
 
         <div id="nbEmpty" class="muted" style="margin-top:12px; display:none;">
-          No labs yet. Click <b>+</b> to create one.
+          No labs yet. Click <b>New Lab</b> to create one.
         </div>
       </div>
     </div>
 
     <!-- Snippets pane -->
-    <div id="pane-snippets" class="hidden" style="margin-top:14px;">
+    <div id="pane-snippets" class="hidden" style="">
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title"><i class="fas fa-wand-magic-sparkles" style="color:#1c96ca;"></i> Snippets</div>
-          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnNewSnippet">
-              <i class="fas fa-plus"></i> New snippet
-            </button>
+          <div class="panel-title"><i class="fas fa-wand-magic-sparkles" style="color:#7c3aed;"></i> Snippets</div>
+          <div style="display:flex; gap:10px; align-items:center;">
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnNewSnippet"><i class="fas fa-plus"></i> New snippet</button>
           </div>
         </div>
 
@@ -620,84 +649,71 @@
       </div>
     </div>
 
-    <!-- Editor pane (shown when an editor tab is active) -->
-    <div id="pane-editor" class="hidden" style="margin-top:14px;">
+    <!-- Editor pane -->
+    <div id="pane-editor" class="hidden" style="">
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title"><i class="fas fa-code" style="color:#1c96ca;"></i> Studio editor</div>
           <div class="muted" id="editorStatus"></div>
         </div>
 
-        <!-- Row 1: Notebook name + actions -->
         <div class="editor-top">
           <div class="left">
             <input class="form-control form-control-sm nb-name-input" id="nbEditorName" placeholder="Untitled lab" />
-            <div class="name-actions" aria-label="Notebook actions">
-              <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook">
-                <i class="fas fa-save"></i> Save
-              </button>
-              <button type="button" class="btn btn-sm btn-azure-outline" id="btnDownloadNotebook">
-                <i class="fas fa-download"></i> Download
-              </button>
+            <div class="name-actions">
+              <button type="button" class="btn btn-sm btn-azure-outline" id="btnSaveNotebook"><i class="fas fa-save"></i> Save</button>
+              <button type="button" class="btn btn-sm btn-azure-outline" id="btnDownloadNotebook"><i class="fas fa-download"></i> Download</button>
             </div>
             <span class="muted" id="nbEditorMeta"></span>
           </div>
         </div>
 
-        <!-- Row 2: Compute (below editor) -->
-        <div class="compute-bar" aria-label="Compute controls">
+        <div class="compute-bar">
           <div class="compute-left">
             <span class="muted" style="font-weight:900;">Compute</span>
             <select class="form-select form-select-sm mono compute-select" id="computeSelect" style="min-width:240px;">
               <option value="">Loading…</option>
             </select>
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshCompute" title="Refresh compute pools">
-              <i class="fas fa-rotate"></i>
-            </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRefreshCompute" title="Refresh compute pools"><i class="fas fa-rotate"></i></button>
           </div>
           <div class="compute-right">
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll">
-              <i class="fas fa-play"></i> Run All
-            </button>
-            <button type="button" class="btn btn-sm btn-danger-outline" id="btnStop">
-              <i class="fas fa-stop"></i> Stop
-            </button>
-            <button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab" style="display:none;">
-              <i class="fas fa-xmark"></i> Close
-            </button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnRunAll"><i class="fas fa-play"></i> Run All</button>
+            <button type="button" class="btn btn-sm btn-danger-outline" id="btnStop"><i class="fas fa-stop"></i> Stop</button>
+            <button type="button" class="btn btn-sm btn-danger-outline" id="btnCloseTab" style="display:none;"><i class="fas fa-xmark"></i> Close</button>
           </div>
         </div>
 
-        <!-- Cells -->
         <div class="panel panel-inset" style="padding:12px; margin-top:12px;">
           <div class="panel-title" style="font-size:12px; margin-bottom:8px;">
             <i class="fas fa-table-cells" style="color:var(--azure, #1c96ca);"></i> Cells
           </div>
-
           <div class="editor-subbar" style="margin-top:0;">
-<button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets">
-              <i class="fas fa-magnifying-glass"></i> Snippets
-            </button>
-
-                        <button type="button" class="btn btn-sm btn-azure-outline" id="btnVaultPicker" title="Search vault envs">
-              <i class="fas fa-lock"></i> Vault
-            </button>
-            <button type="button" class="btn btn-sm btn-azure-outline" id="btnConnectorPicker" title="Search Airbyte connectors">
-              <i class="fas fa-plug"></i> Connectors
-            </button>
-<div style="flex:1;"></div>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnSnippetPicker" title="Search snippets"><i class="fas fa-magnifying-glass"></i> Snippets</button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnVaultPicker" title="Search vault envs"><i class="fas fa-lock"></i> Vault</button>
+            <button type="button" class="btn btn-sm btn-azure-outline" id="btnConnectorPicker" title="Search Airbyte connectors"><i class="fas fa-plug"></i> Connectors</button>
+            <div style="flex:1;"></div>
           </div>
-
           <div id="cells"></div>
         </div>
       </div>
     </div>
-  {% endif %}
+  </div>
 </div>
+
+{% else %}
+<div style="padding:40px;text-align:center;">
+  <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to use Studio</div>
+  <div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i>
+    <select onchange="ccOnSuperChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select>
+  </div>
+</div>
+{% endif %}
+
+</div><!-- /content-container -->
 
 <div class="toast" id="nbToast"></div>
 
-<!-- Modal -->
+<!-- Modal (preserved from original) -->
 <div class="nb-modal" id="nbModal">
   <div class="card">
     <div class="head">
@@ -711,9 +727,15 @@
   </div>
 </div>
 
-{% endblock %}
+<!-- Legacy hidden elements for tab JS compat -->
+<div style="display:none;">
+  <div id="tab-navigation">
+    <button id="tab-list" data-pane="list"></button>
+    <button id="tab-snippets" data-pane="snippets"></button>
+  </div>
+</div>
 
-{% block body_scripts %}
+<!-- Studio JS -->
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js" referrerpolicy="no-referrer"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js" referrerpolicy="no-referrer"></script>
@@ -2927,4 +2949,35 @@ function streamOutputInit(cellId, meta) {
 
 })();
 </script>
-{% endblock %}
+<script>
+// Section bar adapter — sync pill-style buttons with original switchTab
+(function(){
+  var origSwitch = window.switchTab;
+  window.switchTab = function(name) {
+    // Update section-bar pills
+    document.querySelectorAll('.section-node').forEach(function(n){
+      n.classList.toggle('active', n.getAttribute('data-pane') === name);
+    });
+    // Call original switchTab
+    if (origSwitch) origSwitch(name);
+  };
+  // Wire click handlers
+  document.querySelectorAll('.section-node[data-pane]').forEach(function(n){
+    n.addEventListener('click', function(){ window.switchTab(n.getAttribute('data-pane')); });
+  });
+})();
+
+// Super selector change
+window.ccOnSuperChange = function(v) {
+  if (!v) return;
+  var u = new URL(window.location.href);
+  var p = v.split('/');
+  if (p.length < 2) return;
+  u.searchParams.set('org', p[0].trim());
+  u.searchParams.set('sup', p[1].trim());
+  window.location.href = u.toString();
+};
+</script>
+
+</body>
+</html>

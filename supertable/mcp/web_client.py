@@ -21,6 +21,10 @@ _AUTH_TOOLS = {
     "query_sql",
     "sample_data",
     "submit_feedback",
+    "store_annotation",
+    "get_annotations",
+    "store_app_state",
+    "get_app_state",
 }
 
 def _default_server_path() -> str:
