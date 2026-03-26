@@ -85,6 +85,12 @@
     }
     .cc-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
     .cc-panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+    .cc-panel-actions { display: flex; align-items: center; gap: 6px; }
+    .cc-icon-btn { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--panel-border); background: transparent; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px; transition: all .15s; }
+    .cc-icon-btn:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
+    .cc-sys-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 10px; font-weight: 600; color: var(--text-muted); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--panel-border); background: transparent; transition: all .15s; font-family: inherit; white-space: nowrap; }
+    .cc-sys-toggle:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    .cc-sys-toggle.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
     .cc-search-wrap { position: relative; flex-shrink: 0; padding: 8px 10px; }
     .cc-search-wrap i { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
     .cc-search-wrap input { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface); font-family: inherit; outline: none; }
@@ -320,7 +326,9 @@
     // ═══════════════════════════════════════════════════════════════
 
     window.__cc_tables = [];       // cached tables array from super meta
-    window.__cc_selectedTable = null;
+    window.__cc_showSystemTables = false;  // toggle for __* system tables
+    // Pre-read ?table= query param so ccRenderTableList highlights it on first render
+    window.__cc_selectedTable = (new URLSearchParams(window.location.search)).get('table') || null;
 
     function ccHumanBytes(b) { if (!b) return '0 B'; if (b < 1024) return b + ' B'; var u = ['KB','MB','GB','TB'], v = b, i = -1; while (Math.abs(v) >= 1024 && i < u.length - 1) { v /= 1024; i++; } return (Math.abs(v) < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i]; }
     function ccHumanCount(n) { if (!n) return '0'; if (n < 1000) return String(n); var u = ['K','M','B'], v = n, i = -1; while (Math.abs(v) >= 1000 && i < u.length - 1) { v /= 1000; i++; } return (Math.abs(v) < 10 ? v.toFixed(1) : Math.round(v)) + u[i]; }
@@ -341,31 +349,89 @@
       list.innerHTML = '';
       var fl = (filter || '').toLowerCase();
       var tables = window.__cc_tables || [];
+      var showSys = window.__cc_showSystemTables;
+      var visibleCount = 0;
 
       tables.forEach(function(t, i) {
-        if (fl && (t.name || '').toLowerCase().indexOf(fl) < 0) return;
+        var name = t.name || '';
+        // Filter system tables (__*) unless toggle is active
+        if (!showSys && name.startsWith('__')) return;
+        if (fl && name.toLowerCase().indexOf(fl) < 0) return;
+        visibleCount++;
         var fresh = ccFreshness(t.updated_utc);
+        var isSys = name.startsWith('__');
         var div = document.createElement('div');
         div.className = 'cc-tbl-item';
         div.setAttribute('data-idx', i);
-        if (window.__cc_selectedTable === t.name) div.classList.add('active');
+        if (window.__cc_selectedTable === name) div.classList.add('active');
         div.innerHTML =
-          '<div class="cc-tbl-icon"><i class="fas fa-table"></i></div>' +
+          '<div class="cc-tbl-icon"><i class="fas fa-' + (isSys ? 'cog' : 'table') + '"></i></div>' +
           '<div class="cc-tbl-info">' +
-            '<div class="cc-tbl-name">' + ccEsc(t.name) + '</div>' +
+            '<div class="cc-tbl-name"' + (isSys ? ' style="opacity:.6;"' : '') + '>' + ccEsc(name) + '</div>' +
             '<div class="cc-tbl-meta">' +
               '<span><i class="fas fa-layer-group" style="font-size:9px;"></i> ' + ccHumanCount(t.rows) + '</span>' +
               '<span><i class="fas fa-hdd" style="font-size:9px;"></i> ' + ccHumanBytes(t.size) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="cc-freshness-dot ' + fresh + '" title="' + fresh + '"></div>';
-        div.addEventListener('click', function() { ccSelectTable(t.name, i); });
+        div.addEventListener('click', function() { ccSelectTable(name, i); });
         list.appendChild(div);
       });
 
-      // Update counts
+      // Update counts — show filtered vs total
       var countEl = document.getElementById('ccTableCount');
-      if (countEl) countEl.textContent = tables.length;
+      if (countEl) {
+        var totalNonSys = tables.filter(function(t) { return !(t.name || '').startsWith('__'); }).length;
+        var totalSys = tables.length - totalNonSys;
+        if (showSys) {
+          countEl.textContent = visibleCount + ' / ' + tables.length;
+        } else {
+          countEl.textContent = visibleCount + (totalSys > 0 ? ' (+' + totalSys + ' sys)' : '');
+        }
+      }
+    }
+
+    function ccToggleSystemTables() {
+      window.__cc_showSystemTables = !window.__cc_showSystemTables;
+      var btn = document.getElementById('ccSysToggle');
+      if (btn) {
+        btn.classList.toggle('active', window.__cc_showSystemTables);
+        btn.querySelector('i').className = window.__cc_showSystemTables ? 'fas fa-eye' : 'fas fa-eye-slash';
+        btn.setAttribute('style', btn.style.cssText); // force repaint
+      }
+      // Re-render with current search filter
+      var searchInput = document.querySelector('.cc-search-wrap input');
+      ccRenderTableList(searchInput ? searchInput.value : '');
+    }
+
+    function ccRefreshMeta() {
+      var btn = document.getElementById('ccRefreshBtn');
+      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
+
+      if (!ORGANIZATION || !currentSuper) {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
+        return;
+      }
+
+      var role = getActiveRole();
+      var metaUrl = '/reflection/super?organization=' + encodeURIComponent(ORGANIZATION) +
+                    '&super_name=' + encodeURIComponent(currentSuper) +
+                    (role ? '&role_name=' + encodeURIComponent(role) : '');
+
+      api(metaUrl).then(function(data) {
+        var meta = null;
+        if (data && data.meta) { meta = data.meta.super || data.meta; }
+        var tables = (meta && Array.isArray(meta.tables)) ? meta.tables : [];
+        window.__cc_tables = tables;
+        // Preserve search filter while re-rendering
+        var searchInput = document.querySelector('.cc-search-wrap input');
+        ccRenderTableList(searchInput ? searchInput.value : '');
+        ccUpdateSummary(tables);
+      }).catch(function(e) {
+        console.warn('[cc-tables] refresh failed:', e.message || e);
+      }).finally(function() {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
+      });
     }
 
     function ccSelectTable(name, idx) {
@@ -501,7 +567,7 @@
         qhtml += '<div style="font-size:13px;font-weight:600;color:var(--text-color);margin-bottom:4px;"><i class="fas fa-heartbeat" style="color:var(--primary-color);margin-right:5px;"></i>Column-level quality analysis</div>';
         qhtml += '<div style="font-size:11px;color:var(--text-muted);">Computes NULL rates, uniqueness, and distinct counts per column via a single aggregation query.</div>';
         qhtml += '</div>';
-        qhtml += '<button class="btn-quality" id="ccQualityBtn" onclick="ccRunQualityCheck(\'' + tableName.replace(/'/g, "\\'") + '\')"><i class="fas fa-play"></i> Run quality check</button>';
+        qhtml += '<button class="btn-quality" id="ccQualityBtn" onclick="ccRunQualityBackend(\'' + tableName.replace(/'/g, "\\'") + '\')"><i class="fas fa-play"></i> Run quality check</button>';
         qhtml += '</div>';
         qhtml += '</div>';
 
@@ -509,6 +575,9 @@
         qhtml += '<div id="ccQualityResults"></div>';
 
         qualPanel.innerHTML = qhtml;
+
+        // Auto-load cached quality results from the DQ backend
+        ccLoadQualityFromCache(tableName);
 
       } catch (e) {
         panel.innerHTML = '<div style="padding:20px;color:var(--error);">Error loading schema: ' + ccEsc(e.message || e) + '</div>';
@@ -696,6 +765,172 @@
       } catch (e) {
         resultsEl.innerHTML = '<div style="color:var(--error);padding:10px;font-size:12px;"><i class="fas fa-times-circle"></i> Quality check failed: ' + ccEsc(e.message || e) + '</div>';
         if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i> Run quality check'; }
+      }
+    }
+
+    // ── DQ Backend integration: load cached results + trigger backend checks ──
+
+    async function ccRunQualityBackend(tableName) {
+      var resultsEl = document.getElementById('ccQualityResults');
+      var btn = document.getElementById('ccQualityBtn');
+      if (!resultsEl) return;
+
+      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running…'; }
+      resultsEl.innerHTML = '<div style="color:var(--text-muted);padding:10px;"><i class="fas fa-spinner fa-spin"></i> Running quality check via backend… results will appear shortly.</div>';
+
+      try {
+        var sup = currentSuper || '';
+        var resp = await fetch('/reflection/quality/run?table=' + encodeURIComponent(tableName) +
+          '&mode=quick&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup),
+          { method: 'POST' });
+        var data = await resp.json();
+
+        if (!data.ok) {
+          // Fallback to direct SQL check if backend fails
+          if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i> Run quality check'; }
+          ccRunQualityCheck(tableName);
+          return;
+        }
+
+        // Poll for results (check runs in background thread)
+        var attempts = 0;
+        var pollTimer = setInterval(async function() {
+          attempts++;
+          try {
+            var r = await fetch('/reflection/quality/latest?table=' + encodeURIComponent(tableName) +
+              '&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup))
+              .then(function(r) { return r.json(); });
+
+            if (r.ok && r.latest && r.latest.checked_at) {
+              var checkedAt = new Date(r.latest.checked_at).getTime();
+              // Accept if checked within last 30 seconds
+              if (Date.now() - checkedAt < 30000) {
+                clearInterval(pollTimer);
+                ccLoadQualityFromCache(tableName);
+                if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-check" style="color:var(--success);"></i> Re-run quality check'; }
+                return;
+              }
+            }
+          } catch (pe) { /* keep polling */ }
+
+          if (attempts >= 15) {
+            clearInterval(pollTimer);
+            resultsEl.innerHTML = '<div style="color:var(--warning);padding:10px;font-size:12px;"><i class="fas fa-clock"></i> Check is still running. Results will appear on next page refresh.</div>';
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Refresh results'; }
+          }
+        }, 2000);
+
+      } catch (e) {
+        // Fallback to direct SQL
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i> Run quality check'; }
+        ccRunQualityCheck(tableName);
+      }
+    }
+
+    async function ccLoadQualityFromCache(tableName) {
+      var resultsEl = document.getElementById('ccQualityResults');
+      var btn = document.getElementById('ccQualityBtn');
+      var scoreEl = document.getElementById('ccQualityScore');
+      if (!resultsEl) return;
+
+      try {
+        var sup = currentSuper || '';
+        var data = await fetch('/reflection/quality/latest?table=' + encodeURIComponent(tableName) +
+          '&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup))
+          .then(function(r) { return r.json(); });
+
+        if (!data.ok || !data.latest) {
+          resultsEl.innerHTML = '<div style="color:var(--text-muted);padding:10px;font-size:12px;"><i class="fas fa-info-circle"></i> No cached quality data yet. Click "Run quality check" to analyze this table.</div>';
+          return;
+        }
+
+        var latest = data.latest;
+        var anomalies = data.anomalies || [];
+        var parsed = latest.parsed || {};
+        var colResults = parsed.columns || {};
+        var total = parsed.total || latest.row_count || 0;
+
+        // Update score in header
+        if (scoreEl && latest.quality_score != null) {
+          var score = latest.quality_score;
+          var scoreCls = score >= 85 ? 'green' : score >= 65 ? 'amber' : 'red';
+          scoreEl.innerHTML = '<div class="cc-dm-label">Quality score</div><div class="cc-dm-value ' + scoreCls + '">' + score + '/100</div>';
+        }
+
+        // Build results display from cached data
+        var pairs = window.__cc_schemaPairs[tableName] || [];
+        if (!pairs.length || !Object.keys(colResults).length) {
+          resultsEl.innerHTML = '<div style="color:var(--text-muted);padding:10px;font-size:12px;"><i class="fas fa-clock"></i> Last checked: ' + ccTimeAgo(latest.checked_at) + ' — cached results loading…</div>';
+          return;
+        }
+
+        var html = '';
+        // Summary row
+        var avgComplete = 0, avgUnique = 0, issueCount = anomalies.length;
+        var colCount = Object.keys(colResults).length || 1;
+        Object.values(colResults).forEach(function(c) { avgComplete += (100 - (c.null_rate || 0)); avgUnique += (c.uniqueness || 0); });
+        avgComplete /= colCount;
+        avgUnique /= colCount;
+
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:16px;">';
+        html += '<div class="cc-dm"><div class="cc-dm-label">Total rows</div><div class="cc-dm-value">' + Number(total).toLocaleString() + '</div></div>';
+        var compCls = avgComplete >= 90 ? 'green' : avgComplete >= 70 ? 'amber' : 'red';
+        html += '<div class="cc-dm"><div class="cc-dm-label">Avg completeness</div><div class="cc-dm-value ' + compCls + '">' + avgComplete.toFixed(1) + '%</div></div>';
+        html += '<div class="cc-dm"><div class="cc-dm-label">Avg uniqueness</div><div class="cc-dm-value">' + avgUnique.toFixed(1) + '%</div></div>';
+        var issueCls = issueCount === 0 ? 'green' : issueCount <= 2 ? 'amber' : 'red';
+        html += '<div class="cc-dm"><div class="cc-dm-label">Anomalies</div><div class="cc-dm-value ' + issueCls + '">' + issueCount + '</div></div>';
+        html += '</div>';
+
+        // Anomaly pills
+        if (anomalies.length > 0) {
+          html += '<div style="margin-bottom:12px;">';
+          anomalies.forEach(function(a) {
+            var acls = a.severity === 'critical' ? 'background:var(--error-bg);color:#991b1b;' : 'background:var(--warning-bg);color:#92400e;';
+            html += '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;padding:3px 10px;border-radius:999px;margin:2px 2px 0 0;' + acls + '">' + ccEsc(a.check_id || '') + ': ' + ccEsc(a.message || '').substring(0, 60) + '</span>';
+          });
+          html += '</div>';
+        }
+
+        // Per-column table
+        html += '<table class="cc-schema-tbl"><thead><tr>' +
+          '<th>Column</th><th>Type</th><th>Completeness</th><th>NULL %</th>' +
+          '<th>Distinct</th><th>Uniqueness</th><th>Min</th><th>Max</th><th>Status</th>' +
+        '</tr></thead><tbody>';
+
+        pairs.forEach(function(p, i) {
+          var c = colResults[p[0]];
+          if (!c) return;
+          var compColor = (100 - c.null_rate) >= 90 ? '#10b981' : (100 - c.null_rate) >= 70 ? '#f59e0b' : '#ef4444';
+          var nullColor = c.null_rate > 20 ? 'var(--error)' : c.null_rate > 0 ? 'var(--warning)' : 'var(--text-muted)';
+
+          html += '<tr class="fade-in" style="animation-delay:' + (i * 25) + 'ms;">';
+          html += '<td style="font-weight:600;">' + ccEsc(c.column_name || p[0]) + '</td>';
+          html += '<td><span class="type-pill ' + ccTypePillCls(c.column_type || p[1]) + '">' + ccEsc(c.column_type || p[1]) + '</span></td>';
+          html += '<td><div style="display:flex;align-items:center;gap:6px;">' +
+            '<div style="width:60px;height:6px;background:var(--border-light);border-radius:3px;overflow:hidden;">' +
+            '<div style="height:100%;width:' + (100 - c.null_rate) + '%;background:' + compColor + ';border-radius:3px;"></div></div>' +
+            '<span style="font-size:11px;font-weight:600;font-family:var(--mono);color:' + compColor + ';">' + (100 - c.null_rate).toFixed(1) + '%</span></div></td>';
+          html += '<td style="font-family:var(--mono);font-size:11px;color:' + nullColor + ';">' + (c.null_rate || 0).toFixed(1) + '%</td>';
+          html += '<td style="font-family:var(--mono);font-size:11px;">' + Number(c.distinct || 0).toLocaleString() + '</td>';
+          html += '<td style="font-family:var(--mono);font-size:11px;">' + (c.uniqueness || 0).toFixed(1) + '%</td>';
+          html += '<td style="font-family:var(--mono);font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + ccEsc(c.min) + '">' + (c.min != null ? ccEsc(c.min) : '<span style="color:var(--text-muted);">—</span>') + '</td>';
+          html += '<td style="font-family:var(--mono);font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + ccEsc(c.max) + '">' + (c.max != null ? ccEsc(c.max) : '<span style="color:var(--text-muted);">—</span>') + '</td>';
+          var statusIcon = c.status === 'critical' ? '<i class="fas fa-times-circle" style="color:var(--error);"></i>' :
+            c.status === 'warning' ? '<i class="fas fa-exclamation-triangle" style="color:var(--warning);"></i>' :
+            '<i class="fas fa-check-circle" style="color:var(--success);"></i>';
+          html += '<td style="font-size:11px;">' + statusIcon + '</td>';
+          html += '</tr>';
+        });
+
+        html += '</tbody></table>';
+        html += '<div style="font-size:10px;color:var(--text-muted);margin-top:8px;">Last checked: ' + (latest.checked_at ? new Date(latest.checked_at).toLocaleString() : 'unknown') + '</div>';
+
+        resultsEl.innerHTML = html;
+        if (btn) btn.innerHTML = '<i class="fas fa-sync-alt"></i> Re-run quality check';
+
+      } catch (e) {
+        // Silent fail — user can still click Run manually
+        resultsEl.innerHTML = '<div style="color:var(--text-muted);padding:10px;font-size:12px;"><i class="fas fa-info-circle"></i> Click "Run quality check" to analyze this table.</div>';
       }
     }
 
@@ -2074,6 +2309,48 @@ function deleteTable(simple) {
       };
     })();
 
+    // Auto-select table from ?table= query param.
+    // Uses polling to handle any load order — works whether meta arrives
+    // from selection.html, the fireOnce IIFE, or a delayed API response.
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      var preselect = params.get('table');
+      if (!preselect) return;
+      var targetTab = params.get('tab');  // e.g. 'quality', 'stats', 'settings'
+      var opened = false;
+      var attempts = 0;
+      var timer = setInterval(function() {
+        attempts++;
+        var tables = window.__cc_tables || [];
+        if (!opened && tables.length > 0) {
+          var idx = tables.findIndex(function(t) { return t.name === preselect; });
+          if (idx >= 0) {
+            opened = true;
+            ccSelectTable(preselect, idx);
+            // Scroll the selected item into view in the left panel
+            var item = document.querySelector('.cc-tbl-item[data-idx="' + idx + '"]');
+            if (item) item.scrollIntoView({ block: 'nearest' });
+            // Switch to the requested tab (e.g. ?tab=quality from the quality page)
+            if (targetTab) {
+              setTimeout(function() {
+                var tabs = document.querySelectorAll('.cc-dtab');
+                for (var ti = 0; ti < tabs.length; ti++) {
+                  var oc = tabs[ti].getAttribute('onclick') || '';
+                  if (oc.indexOf("'" + targetTab + "'") >= 0) {
+                    tabs[ti].click();
+                    break;
+                  }
+                }
+              }, 100);
+            }
+          }
+          clearInterval(timer);
+          return;
+        }
+        if (attempts >= 50) clearInterval(timer);  // give up after 10s
+      }, 200);
+    })();
+
     // Set globals (same pattern as execute_v2.html)
     window.__st_org = ORGANIZATION;
     var _initialRole = (ROLE_NAME || '').trim() || 'superadmin';
@@ -2202,7 +2479,11 @@ function deleteTable(simple) {
     <div class="cc-panel-left">
       <div class="cc-panel-header">
         <span class="cc-panel-title">Tables</span>
-        <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);">0</span>
+        <div class="cc-panel-actions">
+          <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);">0</span>
+          <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
+          <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh table list"><i class="fas fa-sync-alt"></i></button>
+        </div>
       </div>
       <div class="cc-search-wrap">
         <i class="fas fa-search"></i>

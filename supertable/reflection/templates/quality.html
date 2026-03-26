@@ -1,0 +1,1675 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SuperTable – Data Quality</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+/* ═══════════════════════════════════════════════════════════════
+   DATA QUALITY — Command Center (standalone, matches compute.html)
+   ═══════════════════════════════════════════════════════════════ */
+:root {
+  --primary: #1c96ca; --primary-light: #e6f4fa; --primary-dark: #147ba3;
+  --primary-color: #1c96ca;
+  --success: #10b981; --success-bg: #ecfdf5;
+  --error: #ef4444; --error-bg: #fef2f2;
+  --warning: #f59e0b; --warning-bg: #fffbeb;
+  --text-color: #1e293b; --text-secondary: #64748b; --text-muted: #94a3b8;
+  --panel-bg: #ffffff; --panel-border: #e0e5f0; --border-light: #f1f5f9;
+  --bg: #f3f6fb; --bg-surface: #f8fafc; --bg-hover: #f1f5f9;
+  --radius: 10px; --radius-sm: 6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font: 'Inter', -apple-system, sans-serif;
+  --transition: all .2s cubic-bezier(.25,.8,.25,1);
+  --amber: #d97706; --purple: #7c3aed; --green: #059669;
+}
+
+/* ═══ TOPBAR ═══ */
+.cc-topbar { display: flex; align-items: center; gap: 10px; padding: 6px 16px; background: var(--panel-bg); border-bottom: 1px solid var(--panel-border); flex-shrink: 0; min-height: 46px; }
+.topbar-sep { width: 1px; height: 20px; background: var(--panel-border); flex-shrink: 0; }
+.super-sel { display: flex; align-items: center; gap: 6px; background: var(--bg-surface); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 0 4px 0 10px; font-size: 13px; font-weight: 600; }
+.super-sel select { border: none; background: transparent; color: var(--text-color); font-weight: 600; font-size: 13px; font-family: var(--font); padding: 6px 4px; outline: none; cursor: pointer; min-width: 120px; }
+.role-pill { display: flex; align-items: center; gap: 5px; background: #ecfdf5; border: 1px solid rgba(16,185,129,.25); border-radius: 999px; padding: 4px 10px; }
+.role-pill label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #059669; margin: 0; }
+.role-pill select { font-size: 11px; font-weight: 600; color: #059669; background: transparent; border: none; outline: none; cursor: pointer; font-family: var(--font); }
+
+/* ═══ KIND BAR (secondary nav — matches compute.html) ═══ */
+.kind-bar { display: flex; align-items: center; gap: 0; padding: 10px 20px; background: var(--panel-bg); border-bottom: 1px solid var(--panel-border); flex-shrink: 0; }
+.kind-node { display: flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 8px; cursor: pointer; transition: var(--transition); border: 1px solid transparent; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.kind-node:hover { background: var(--bg-hover); border-color: var(--panel-border); }
+.kind-node.active { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
+.kind-node .kicon { width: 24px; height: 24px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
+.kind-node .kcount { font-size: 10px; color: var(--text-muted); font-family: var(--mono); margin-left: 2px; }
+.kind-node.active .kcount { color: var(--primary); }
+.kind-sep { width: 1px; height: 24px; background: var(--panel-border); margin: 0 6px; flex-shrink: 0; }
+
+/* ═══ 3-COLUMN LAYOUT ═══ */
+.cc-cols { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+
+/* ═══ SEARCH + FILTER PILLS ═══ */
+.dq-search-wrap { position: relative; min-width: 160px; max-width: 260px; flex: 1; }
+.dq-search-wrap i { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.dq-search-wrap input { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface); font-family: var(--font); outline: none; }
+.dq-search-wrap input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
+.tbl-filters { display: flex; gap: 4px; flex-shrink: 0; }
+.tbl-filter-pill { padding: 4px 10px; border-radius: 999px; font-size: 10px; font-weight: 600; cursor: pointer; border: 1px solid var(--panel-border); background: var(--panel-bg); color: var(--text-muted); transition: all .15s; display: flex; align-items: center; gap: 4px; }
+.tbl-filter-pill:hover { border-color: var(--primary); color: var(--primary); }
+.tbl-filter-pill.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.tbl-filter-pill .fc { margin-left: 3px; font-size: 9px; opacity: .7; }
+.tbl-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+.tbl-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; transition: var(--transition); margin-bottom: 2px; border: 1px solid transparent; }
+.tbl-item:hover { background: var(--bg-hover); border-color: var(--panel-border); }
+.tbl-item.active { background: var(--primary-light); border-color: var(--primary); }
+.tbl-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(0,0,0,.06); }
+.tbl-dot.ok { background: var(--success); box-shadow: 0 0 6px rgba(16,185,129,.35); }
+.tbl-dot.warning { background: var(--warning); box-shadow: 0 0 6px rgba(245,158,11,.35); }
+.tbl-dot.critical { background: var(--error); box-shadow: 0 0 6px rgba(239,68,68,.35); }
+.tbl-dot.unknown { background: var(--panel-border); }
+.tbl-meta { min-width: 0; flex: 1; }
+.tbl-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tbl-item.active .tbl-name { color: var(--primary); }
+.tbl-info { font-size: 10px; color: var(--text-muted); font-family: var(--mono); margin-top: 1px; display: flex; align-items: center; gap: 6px; }
+.tbl-score { font-size: 13px; font-weight: 800; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.tbl-score.good { color: var(--success); }
+.tbl-score.ok { color: var(--warning); }
+.tbl-score.bad { color: var(--error); }
+.tbl-score.none { color: var(--text-muted); font-size: 11px; font-weight: 600; }
+
+/* ═══ CENTER — Main Content ═══ */
+.cc-center { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.center-area { flex: 1; overflow: auto; padding: 16px 20px; }
+
+/* ═══ RIGHT PANEL — Intelligence ═══ */
+.panel-right { width: 260px; min-width: 260px; border-left: 1px solid var(--panel-border); background: var(--panel-bg); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; }
+.intel-section { padding: 14px; border-bottom: 1px solid var(--border-light); }
+.intel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin-bottom: 10px; display: flex; align-items: center; gap: 5px; }
+.intel-title i { font-size: 9px; }
+.intel-big-number { font-size: 36px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; margin-bottom: 4px; }
+.intel-big-number.good { color: var(--success); }
+.intel-big-number.ok { color: var(--warning); }
+.intel-big-number.bad { color: var(--error); }
+.intel-big-number.none { color: var(--text-muted); }
+.intel-subtitle { font-size: 11px; color: var(--text-muted); }
+.intel-stat-row { display: flex; align-items: center; justify-content: space-between; padding: 5px 0; font-size: 12px; }
+.intel-stat-label { color: var(--text-secondary); display: flex; align-items: center; gap: 5px; }
+.intel-stat-label i { font-size: 9px; }
+.intel-stat-value { font-weight: 700; font-family: var(--mono); font-size: 12px; }
+.intel-anomaly-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 0; font-size: 11px; border-bottom: 1px solid var(--border-light); }
+.intel-anomaly-item:last-child { border-bottom: none; }
+.intel-anomaly-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+.intel-anomaly-dot.warning { background: var(--warning); }
+.intel-anomaly-dot.critical { background: var(--error); }
+.intel-action-btn { width: 100%; padding: 7px 12px; border-radius: var(--radius-sm); font-weight: 600; cursor: pointer; font-size: 11px; transition: all .15s; display: flex; align-items: center; justify-content: center; gap: 5px; font-family: var(--font); border: 1px solid var(--panel-border); background: var(--panel-bg); color: var(--text-secondary); margin-bottom: 6px; }
+.intel-action-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+.intel-action-btn.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.intel-action-btn.primary:hover { background: var(--primary-dark); }
+
+/* ═══ OVERVIEW — Table Cards Grid ═══ */
+.dq-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; row-gap: 8px; }
+.dq-toolbar-right { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }
+.dq-sort-select { padding: 5px 8px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 11px; background: var(--panel-bg); font-family: var(--font); outline: none; cursor: pointer; color: var(--text-secondary); }
+.dq-sort-select:focus { border-color: var(--primary); }
+.dq-table-count { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+
+.dq-overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.dq-table-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: var(--radius); padding: 14px 16px; cursor: pointer; transition: all .15s; position: relative; }
+.dq-table-card:hover { border-color: var(--primary); box-shadow: 0 4px 12px rgba(28,150,202,.08); }
+.dq-table-card.status-ok { border-left: 4px solid var(--success); }
+.dq-table-card.status-warning { border-left: 4px solid var(--warning); }
+.dq-table-card.status-critical { border-left: 4px solid var(--error); }
+.dq-table-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.dq-table-card-name { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.dq-table-card-name i { color: var(--primary); font-size: 11px; flex-shrink: 0; }
+.dq-table-card-score { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; flex-shrink: 0; margin-left: 8px; }
+.dq-table-card-score.good { color: var(--success); }
+.dq-table-card-score.ok { color: var(--warning); }
+.dq-table-card-score.bad { color: var(--error); }
+.dq-table-card-metrics { display: flex; gap: 10px; font-size: 10px; color: var(--text-muted); flex-wrap: wrap; }
+.dq-table-card-metrics span { display: flex; align-items: center; gap: 3px; }
+.dq-table-card-anomalies { margin-top: 8px; }
+.dq-anomaly-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 9px; font-weight: 600; padding: 2px 7px; border-radius: 999px; margin: 2px 2px 0 0; }
+.dq-anomaly-pill.warning { background: var(--warning-bg); color: #92400e; }
+.dq-anomaly-pill.critical { background: var(--error-bg); color: #991b1b; }
+.dq-no-data { color: var(--text-muted); font-size: 11px; font-style: italic; }
+.dq-card-footer { margin-top: 8px; display: flex; justify-content: flex-end; }
+.dq-card-btn { padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; cursor: pointer; border: 1px solid var(--panel-border); background: var(--panel-bg); color: var(--text-secondary); transition: all .1s; font-family: var(--font); }
+.dq-card-btn:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+
+/* ═══ PAGINATION ═══ */
+.dq-pagination { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 16px; }
+.dq-page-btn { padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--panel-border); background: var(--panel-bg); color: var(--text-secondary); transition: all .15s; font-family: var(--font); }
+.dq-page-btn:hover { border-color: var(--primary); color: var(--primary); }
+.dq-page-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.dq-page-btn:disabled { opacity: .4; cursor: default; }
+.dq-page-info { font-size: 10px; color: var(--text-muted); }
+
+/* ═══ RULES TABLE ═══ */
+.dq-rules-table { width: 100%; border-collapse: collapse; font-size: 12px; background: var(--panel-bg); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--panel-border); }
+.dq-rules-table th { background: var(--bg-surface); padding: 8px 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; border-bottom: 2px solid var(--panel-border); text-align: left; }
+.dq-rules-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-light); }
+.dq-rules-table tr:hover td { background: var(--primary-light); }
+
+/* ═══ BUILT-IN CHECKS CONFIG ═══ */
+.dq-checks-group { margin-bottom: 20px; }
+.dq-checks-group-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+.dq-check-row { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: var(--radius-sm); transition: background .1s; }
+.dq-check-row:hover { background: var(--bg-hover); }
+.dq-check-toggle { width: 36px; height: 20px; background: #cbd5e1; border-radius: 10px; position: relative; cursor: pointer; transition: background .2s; flex-shrink: 0; }
+.dq-check-toggle.on { background: var(--success); }
+.dq-check-toggle::after { content: ''; position: absolute; width: 16px; height: 16px; background: #fff; border-radius: 50%; top: 2px; left: 2px; transition: left .2s; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.dq-check-toggle.on::after { left: 18px; }
+.dq-check-id { font-size: 10px; font-weight: 700; font-family: var(--mono); color: var(--primary); min-width: 24px; }
+.dq-check-name { font-size: 13px; font-weight: 600; flex: 1; }
+.dq-check-desc { font-size: 12px; color: var(--text-secondary); flex: 2; }
+.dq-check-threshold { display: flex; align-items: center; gap: 4px; }
+.dq-check-threshold input { width: 60px; padding: 3px 6px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; font-family: var(--mono); text-align: right; outline: none; }
+.dq-check-threshold input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
+.dq-check-threshold .unit { font-size: 10px; color: var(--text-muted); min-width: 20px; }
+
+/* ═══ SCHEDULE CONFIG ═══ */
+.dq-schedule-field { margin-bottom: 14px; }
+.dq-schedule-label { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; display: flex; align-items: center; gap: 5px; }
+.dq-schedule-label i { color: var(--primary); font-size: 11px; }
+.dq-schedule-input { padding: 6px 10px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; font-family: var(--mono); outline: none; width: 220px; }
+.dq-schedule-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
+.dq-schedule-hint { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+.dq-sched-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+.dq-sched-section-title i { font-size: 10px; }
+
+/* ═══ OVERRIDES ═══ */
+.dq-override-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 8px 12px; display: flex; align-items: center; gap: 10px; margin-bottom: 6px; transition: all .15s; }
+.dq-override-card:hover { border-color: var(--primary); background: var(--primary-light); }
+.dq-override-name { font-size: 12px; font-weight: 600; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dq-override-detail { font-size: 10px; color: var(--text-muted); font-family: var(--mono); flex: 1; }
+.dq-override-actions { display: flex; gap: 4px; }
+
+/* ═══ ADD FORM (shared for rules + schedule) ═══ */
+.dq-add-form { background: var(--bg-surface); border: 1px solid var(--border-light); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; display: none; }
+.dq-add-form.visible { display: block; }
+.dq-form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.dq-form-field { display: flex; flex-direction: column; gap: 4px; }
+.dq-form-field label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
+.dq-form-field select, .dq-form-field input, .dq-form-field textarea { padding: 6px 10px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; font-family: var(--font); outline: none; }
+.dq-form-field select:focus, .dq-form-field input:focus, .dq-form-field textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-light); }
+
+/* ═══ BUTTONS (matching compute.html) ═══ */
+.btn-dq { padding: 6px 14px; border-radius: var(--radius-sm); font-weight: 600; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 5px; font-family: var(--font); border: 1px solid; }
+.btn-dq-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn-dq-primary:hover { background: var(--primary-dark); }
+.btn-dq-ghost { background: transparent; color: var(--text-secondary); border-color: var(--panel-border); }
+.btn-dq-ghost:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+.btn-dq-danger { background: transparent; color: var(--error); border-color: var(--error); }
+.btn-dq-danger:hover { background: var(--error-bg); }
+.btn-dq-success { background: var(--success); color: #fff; border-color: var(--success); }
+.btn-dq-sm { padding: 3px 8px; font-size: 10px; }
+
+/* ═══ STATUS PILLS ═══ */
+.status-pill { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
+.status-pill.ok { background: var(--success-bg); color: #059669; }
+.status-pill.warning { background: var(--warning-bg); color: #92400e; }
+.status-pill.critical { background: var(--error-bg); color: #991b1b; }
+
+/* ═══ EMPTY STATE ═══ */
+.dq-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 40px; color: var(--text-muted); gap: 12px; }
+.dq-empty i { font-size: 40px; opacity: .3; }
+.dq-empty-text { font-size: 14px; }
+.dq-empty-hint { font-size: 12px; }
+
+/* ═══ LOADING / ANIMATION ═══ */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.fade-in { animation: fadeIn .3s ease forwards; }
+.dq-toast { position: fixed; bottom: 24px; right: 24px; background: var(--text-color); color: #fff; padding: 10px 18px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600; z-index: 9999; opacity: 0; transform: translateY(10px); transition: all .3s; pointer-events: none; }
+.dq-toast.show { opacity: 1; transform: translateY(0); }
+
+/* ═══ HIDDEN TAB PANELS (tabs hidden, panels controlled by kind-bar) ═══ */
+.dq-tab-panel { display: none; }
+.dq-tab-panel.active { display: block; }
+
+/* ═══ SECTION HEADERS ═══ */
+.section-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 12px; flex-wrap: wrap; }
+.section-title { font-size: 14px; font-weight: 700; color: var(--text-color); }
+.section-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--panel-border);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
+#pairSel{display:none;}
+</style>
+<script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
+</head>
+<body>
+{% include "sidebar.html" %}
+<div class="content-container">
+{% if selected_org and selected_sup %}
+<select id="pairSel">{% for t in tenants %}<option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>{% endfor %}</select>
+
+<!-- ═══ TOP BAR ═══ -->
+<header class="cc-topbar">
+  <div class="super-sel"><i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i><select onchange="dqOnTenantChange(this.value)">{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div>
+  <div class="topbar-sep"></div>
+  <div class="role-pill"><i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i><label>Role</label><select id="dqRoleSel"><option value="superadmin" selected>superadmin</option></select></div>
+  <div style="flex:1;"></div>
+  <span style="font-size:11px;color:var(--text-muted);" id="dqTopSummary"></span>
+  <div class="topbar-sep"></div>
+  <button class="btn-dq btn-dq-ghost" onclick="dqRefresh()" style="padding:4px 10px;"><i class="fas fa-sync-alt"></i> Refresh</button>
+</header>
+
+<!-- ═══ KIND BAR — Secondary Nav ═══ -->
+<div class="kind-bar" id="dqKindBar">
+  <div class="kind-node active" data-tab="overview" onclick="dqSwitchTab(this,'overview')">
+    <div class="kicon" style="background:rgba(28,150,202,.08);border:1px solid rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-th-large"></i></div>
+    Overview <span class="kcount" id="dqKindOverviewCount"></span>
+  </div>
+  <div class="kind-sep"></div>
+  <div class="kind-node" data-tab="rules" onclick="dqSwitchTab(this,'rules')">
+    <div class="kicon" style="background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-list-check"></i></div>
+    Rules <span class="kcount" id="dqRuleCount">0</span>
+  </div>
+  <div class="kind-sep"></div>
+  <div class="kind-node" data-tab="checks" onclick="dqSwitchTab(this,'checks')">
+    <div class="kicon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-sliders-h"></i></div>
+    Built-in Checks
+  </div>
+  <div class="kind-sep"></div>
+  <div class="kind-node" data-tab="schedule" onclick="dqSwitchTab(this,'schedule')">
+    <div class="kicon" style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.2);color:var(--green);"><i class="fas fa-clock"></i></div>
+    Schedule
+  </div>
+</div>
+
+<!-- ═══ 2-COLUMN LAYOUT (center + right intel) ═══ -->
+<div class="cc-cols">
+
+  <!-- ══════════ CENTER — Main Content ══════════ -->
+  <div class="cc-center">
+    <div class="center-area">
+
+      <!-- ══════════════════ OVERVIEW ══════════════════ -->
+      <div class="dq-tab-panel active" id="dqp-overview">
+        <div class="dq-toolbar">
+          <div class="dq-search-wrap">
+            <i class="fas fa-search"></i>
+            <input type="text" id="dqOverviewSearch" placeholder="Search tables…" oninput="dqFilterOverview()">
+          </div>
+          <div class="tbl-filters" id="dqLeftFilters">
+            <div class="tbl-filter-pill active" data-status="all" onclick="dqSetLeftFilter(this,'all')">All <span class="fc" id="dqLfAll">0</span></div>
+            <div class="tbl-filter-pill" data-status="ok" onclick="dqSetLeftFilter(this,'ok')"><i class="fas fa-check-circle" style="font-size:8px;color:var(--success);"></i> OK <span class="fc" id="dqLfOk">0</span></div>
+            <div class="tbl-filter-pill" data-status="warning" onclick="dqSetLeftFilter(this,'warning')"><i class="fas fa-exclamation-triangle" style="font-size:8px;color:var(--warning);"></i> Warning <span class="fc" id="dqLfWarn">0</span></div>
+            <div class="tbl-filter-pill" data-status="critical" onclick="dqSetLeftFilter(this,'critical')"><i class="fas fa-times-circle" style="font-size:8px;color:var(--error);"></i> Critical <span class="fc" id="dqLfCrit">0</span></div>
+          </div>
+          <span id="dqCountAll" style="display:none;">0</span><span id="dqCountOk" style="display:none;">0</span><span id="dqCountWarn" style="display:none;">0</span><span id="dqCountCrit" style="display:none;">0</span>
+          <div class="dq-toolbar-right">
+            <select class="dq-sort-select" id="dqOverviewSort" onchange="dqFilterOverview()">
+              <option value="name">Sort: Name</option>
+              <option value="score_asc">Score ↑</option>
+              <option value="score_desc">Score ↓</option>
+              <option value="freshness">Freshness</option>
+              <option value="status">Status</option>
+            </select>
+            <span class="dq-table-count" id="dqShowingCount"></span>
+          </div>
+        </div>
+        <div id="dqOverviewGrid" class="dq-overview-grid">
+          <div class="dq-empty"><i class="fas fa-spinner fa-spin"></i><div class="dq-empty-text">Loading quality data…</div></div>
+        </div>
+        <div id="dqPagination" class="dq-pagination" style="display:none;"></div>
+      </div>
+
+      <!-- ══════════════════ RULES ══════════════════ -->
+      <div class="dq-tab-panel" id="dqp-rules">
+        <div class="section-hdr">
+          <div>
+            <div class="section-title">Custom Quality Rules</div>
+            <div class="section-desc">Define per-table or global quality rules with custom thresholds and SQL checks.</div>
+          </div>
+          <button class="btn-dq btn-dq-primary" onclick="dqToggleAddRule()"><i class="fas fa-plus"></i> Add Rule</button>
+        </div>
+
+        <!-- Add / Edit rule form -->
+        <div class="dq-add-form" id="dqRuleForm">
+          <div style="font-size:13px;font-weight:600;margin-bottom:10px;" id="dqRuleFormTitle">New Custom Rule</div>
+          <input type="hidden" id="ruleEditId" value="">
+          <div class="dq-form-row">
+            <div class="dq-form-field">
+              <label>Table</label>
+              <select id="ruleTable" style="width:180px;" onchange="dqOnRuleTableChange()"><option value="*">* (all tables)</option></select>
+            </div>
+            <div class="dq-form-field">
+              <label>Column</label>
+              <select id="ruleColumn" style="width:180px;"><option value="">— all / none —</option></select>
+            </div>
+            <div class="dq-form-field">
+              <label>Rule Type</label>
+              <select id="ruleType" style="width:170px;" onchange="dqRuleTypeChanged()">
+                <option value="column_min">Column min (col &gt; value)</option>
+                <option value="column_max">Column max (col &lt; value)</option>
+                <option value="null_rate_max">Max NULL rate (%)</option>
+                <option value="row_count_min">Min row count</option>
+                <option value="distinct_in">Distinct values in set</option>
+                <option value="freshness_check">Freshness (rows since last check)</option>
+                <option value="custom_sql">Custom SQL</option>
+              </select>
+            </div>
+            <div class="dq-form-field" id="ruleThresholdField">
+              <label>Threshold</label>
+              <input type="number" id="ruleThreshold" placeholder="value" style="width:100px;" step="any">
+            </div>
+            <div class="dq-form-field">
+              <label>Severity</label>
+              <select id="ruleSeverity" style="width:100px;">
+                <option value="warning">Warning</option>
+                <option value="critical">Critical</option>
+              </select>
+            </div>
+          </div>
+          <div class="dq-form-row" id="ruleFreshnessRow" style="display:none;">
+            <div class="dq-form-field">
+              <label>Filter Column</label>
+              <select id="ruleFreshnessCol" style="width:180px;" onchange="dqFreshnessColChanged()"></select>
+            </div>
+            <div class="dq-form-field" id="ruleFreshnessManualField" style="display:none;">
+              <label>Since (manual date)</label>
+              <input type="datetime-local" id="ruleFreshnessManual" style="width:200px;">
+              <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">Non-date column — enter a comparison value manually</div>
+            </div>
+            <div class="dq-form-field" id="ruleFreshnessAutoField">
+              <div style="font-size:11px;color:var(--text-secondary);padding-top:18px;"><i class="fas fa-info-circle" style="color:var(--primary);"></i> Will filter: <code style="font-family:var(--mono);font-size:11px;">column &gt; last_run_time</code></div>
+            </div>
+          </div>
+          <div class="dq-form-row" id="ruleExpectedRow" style="display:none;">
+            <div class="dq-form-field" style="flex:1;">
+              <label>Expected Values (comma-separated)</label>
+              <input type="text" id="ruleExpectedValues" placeholder="value1, value2, value3" style="width:100%;">
+            </div>
+          </div>
+          <div class="dq-form-row" id="ruleSqlRow" style="display:none;">
+            <div class="dq-form-field" style="flex:1;">
+              <label>Custom SQL (must return a single numeric value in first column)</label>
+              <textarea id="ruleSql" rows="3" style="width:100%;font-family:var(--mono);font-size:12px;" placeholder="SELECT COUNT(*) FROM ..."></textarea>
+            </div>
+          </div>
+          <div class="dq-form-row">
+            <div class="dq-form-field" style="flex:1;">
+              <label>Description</label>
+              <input type="text" id="ruleDesc" placeholder="Human-readable description" style="width:100%;">
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button class="btn-dq btn-dq-ghost" onclick="dqToggleAddRule()">Cancel</button>
+            <button class="btn-dq btn-dq-primary" onclick="dqSaveRule()"><i class="fas fa-save"></i> Save Rule</button>
+          </div>
+        </div>
+
+        <div id="dqRulesBody">
+          <div style="color:var(--text-muted);padding:20px;"><i class="fas fa-spinner fa-spin"></i> Loading rules…</div>
+        </div>
+      </div>
+
+      <!-- ══════════════════ BUILT-IN CHECKS ══════════════════ -->
+      <div class="dq-tab-panel" id="dqp-checks">
+        <div class="section-hdr">
+          <div>
+            <div class="section-title">Built-in Check Configuration</div>
+            <div class="section-desc">Toggle checks on/off and adjust thresholds. Changes apply globally.</div>
+          </div>
+          <button class="btn-dq btn-dq-primary" onclick="dqSaveGlobalConfig()"><i class="fas fa-save"></i> Save Configuration</button>
+        </div>
+        <div id="dqChecksBody">
+          <div style="color:var(--text-muted);padding:20px;"><i class="fas fa-spinner fa-spin"></i> Loading…</div>
+        </div>
+      </div>
+
+      <!-- ══════════════════ SCHEDULE ══════════════════ -->
+      <div class="dq-tab-panel" id="dqp-schedule">
+
+        <div class="section-hdr">
+          <div>
+            <div class="section-title">Quality Check Schedule</div>
+            <div class="section-desc">Configure how often quality checks run globally and per table.</div>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn-dq btn-dq-ghost" onclick="dqRunAllNow('quick')"><i class="fas fa-play"></i> Run All Quick</button>
+            <button class="btn-dq btn-dq-ghost" onclick="dqRunAllNow('deep')"><i class="fas fa-microscope"></i> Run All Deep</button>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:24px;flex-wrap:wrap;">
+
+          <!-- LEFT: Global schedule -->
+          <div style="flex:0 0 auto;min-width:280px;max-width:400px;">
+            <div class="dq-sched-section-title"><i class="fas fa-globe"></i> Global Default Schedule</div>
+
+            <div class="dq-schedule-field">
+              <div class="dq-schedule-label"><i class="fas fa-bolt"></i> Quick check interval</div>
+              <select class="dq-schedule-input" id="schedQuickPreset" style="width:220px;">
+                <option value="*/15 * * * *">Every 15 minutes</option>
+                <option value="*/30 * * * *">Every 30 minutes</option>
+                <option value="0 */1 * * *">Every hour</option>
+                <option value="0 */2 * * *">Every 2 hours</option>
+                <option value="0 */4 * * *" selected>Every 4 hours</option>
+                <option value="0 */6 * * *">Every 6 hours</option>
+                <option value="0 */12 * * *">Every 12 hours</option>
+                <option value="0 2 * * *">Daily (at 02:00)</option>
+                <option value="custom">Custom cron…</option>
+              </select>
+              <input class="dq-schedule-input" id="schedQuickCron" style="display:none;width:220px;margin-top:6px;" placeholder="e.g. 0 */4 * * *">
+              <div class="dq-schedule-hint">Lightweight — single SQL per table.</div>
+            </div>
+
+            <div class="dq-schedule-field">
+              <div class="dq-schedule-label"><i class="fas fa-microscope"></i> Deep check interval</div>
+              <select class="dq-schedule-input" id="schedDeepPreset" style="width:220px;">
+                <option value="*/30 * * * *">Every 30 minutes</option>
+                <option value="0 */1 * * *">Every hour</option>
+                <option value="0 */2 * * *">Every 2 hours</option>
+                <option value="0 */4 * * *">Every 4 hours</option>
+                <option value="0 */6 * * *" selected>Every 6 hours</option>
+                <option value="0 */12 * * *">Every 12 hours</option>
+                <option value="0 */24 * * *">Every 24 hours</option>
+                <option value="disabled">Disabled</option>
+                <option value="custom">Custom cron…</option>
+              </select>
+              <input class="dq-schedule-input" id="schedDeepCron" style="display:none;width:220px;margin-top:6px;" placeholder="e.g. 0 2 * * *">
+              <div class="dq-schedule-hint">Heavier — one SQL per column.</div>
+            </div>
+
+            <div class="dq-schedule-field">
+              <div class="dq-schedule-label"><i class="fas fa-hourglass-half"></i> Cooldown between checks</div>
+              <select class="dq-schedule-input" id="schedCooldown" style="width:220px;">
+                <option value="60">1 minute</option>
+                <option value="120">2 minutes</option>
+                <option value="300" selected>5 minutes</option>
+                <option value="600">10 minutes</option>
+                <option value="900">15 minutes</option>
+                <option value="1800">30 minutes</option>
+              </select>
+              <div class="dq-schedule-hint">Prevents overload during rapid ingestion.</div>
+            </div>
+
+            <div class="dq-schedule-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" id="schedPostIngest" checked>
+                <span style="font-size:13px;font-weight:600;">Run quick check after ingest</span>
+              </label>
+              <div class="dq-schedule-hint" style="margin-left:24px;">Debounced — multiple rapid ingests trigger only one check.</div>
+            </div>
+
+            <div class="dq-schedule-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" id="schedEnabled" checked>
+                <span style="font-size:13px;font-weight:600;">Scheduler enabled</span>
+              </label>
+            </div>
+
+            <div style="margin-top:12px;">
+              <button class="btn-dq btn-dq-primary" onclick="dqSaveSchedule()"><i class="fas fa-save"></i> Save Global Schedule</button>
+            </div>
+          </div>
+
+          <!-- RIGHT: Per-table overrides -->
+          <div style="flex:1;min-width:320px;">
+            <div class="dq-sched-section-title"><i class="fas fa-table"></i> Per-Table Overrides</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">Tables without overrides use the global schedule.</div>
+
+            <div id="dqActiveOverrides" style="margin-bottom:12px;">
+              <div style="color:var(--text-muted);padding:8px;font-size:12px;"><i class="fas fa-spinner fa-spin"></i> Loading…</div>
+            </div>
+
+            <button class="btn-dq btn-dq-ghost" id="dqAddOverrideBtn" onclick="dqToggleOverrideForm()"><i class="fas fa-plus"></i> Add Override</button>
+
+            <div class="dq-add-form" id="dqOverrideForm" style="margin-top:10px;">
+              <div style="font-size:12px;font-weight:600;margin-bottom:8px;">Add Table Override</div>
+              <div class="dq-form-row">
+                <div class="dq-form-field">
+                  <label>Table</label>
+                  <select id="tsTable" style="width:200px;"></select>
+                </div>
+                <div class="dq-form-field">
+                  <label>Quick interval</label>
+                  <select id="tsQuick" style="width:170px;">
+                    <option value="">Use global default</option>
+                    <option value="*/15 * * * *">Every 15 minutes</option>
+                    <option value="*/30 * * * *">Every 30 minutes</option>
+                    <option value="0 */1 * * *">Every hour</option>
+                    <option value="0 */2 * * *">Every 2 hours</option>
+                    <option value="0 */4 * * *">Every 4 hours</option>
+                    <option value="0 */12 * * *">Every 12 hours</option>
+                    <option value="0 2 * * *">Daily</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </div>
+                <div class="dq-form-field">
+                  <label>Deep check interval</label>
+                  <select id="tsDeep" style="width:170px;">
+                    <option value="">Use global default</option>
+                    <option value="*/15 * * * *">Every 15 minutes</option>
+                    <option value="*/30 * * * *">Every 30 minutes</option>
+                    <option value="0 */1 * * *">Every hour</option>
+                    <option value="0 */2 * * *">Every 2 hours</option>
+                    <option value="0 */4 * * *">Every 4 hours</option>
+                    <option value="0 */6 * * *">Every 6 hours</option>
+                    <option value="0 */12 * * *">Every 12 hours</option>
+                    <option value="0 */24 * * *">Every 24 hours</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button class="btn-dq btn-dq-ghost" onclick="dqToggleOverrideForm()">Cancel</button>
+                <button class="btn-dq btn-dq-primary" onclick="dqSaveTableSchedule()"><i class="fas fa-save"></i> Save</button>
+              </div>
+            </div>
+
+            <div class="swrap" style="padding:8px 0;max-width:260px;" id="dqOverrideSearchWrap">
+              <i class="fas fa-search"></i>
+              <input type="text" id="dqOverrideSearch" placeholder="Filter overrides…" oninput="dqRenderScheduleOverrides()">
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /center-area -->
+  </div><!-- /cc-center -->
+
+  <!-- ══════════ RIGHT PANEL — Intelligence ══════════ -->
+  <div class="panel-right" id="dqRightPanel">
+
+    <!-- Health Score -->
+    <div class="intel-section">
+      <div class="intel-title"><i class="fas fa-heartbeat"></i> Health Score</div>
+      <div class="intel-big-number none" id="dqIntelScore">—</div>
+      <div class="intel-subtitle" id="dqIntelScoreLabel">No data yet</div>
+    </div>
+
+    <!-- Status Breakdown -->
+    <div class="intel-section">
+      <div class="intel-title"><i class="fas fa-chart-pie"></i> Status Breakdown</div>
+      <div class="intel-stat-row">
+        <div class="intel-stat-label"><i class="fas fa-check-circle" style="color:var(--success);"></i> Healthy</div>
+        <div class="intel-stat-value" style="color:var(--success);" id="dqIntelOk">0</div>
+      </div>
+      <div class="intel-stat-row">
+        <div class="intel-stat-label"><i class="fas fa-exclamation-triangle" style="color:var(--warning);"></i> Warning</div>
+        <div class="intel-stat-value" style="color:var(--warning);" id="dqIntelWarn">0</div>
+      </div>
+      <div class="intel-stat-row">
+        <div class="intel-stat-label"><i class="fas fa-times-circle" style="color:var(--error);"></i> Critical</div>
+        <div class="intel-stat-value" style="color:var(--error);" id="dqIntelCrit">0</div>
+      </div>
+      <div class="intel-stat-row">
+        <div class="intel-stat-label"><i class="fas fa-question-circle" style="color:var(--text-muted);"></i> Unchecked</div>
+        <div class="intel-stat-value" id="dqIntelUnchecked">0</div>
+      </div>
+    </div>
+
+    <!-- Anomalies -->
+    <div class="intel-section">
+      <div class="intel-title"><i class="fas fa-exclamation-circle"></i> Active Anomalies</div>
+      <div id="dqIntelAnomalies">
+        <div style="font-size:11px;color:var(--text-muted);">None detected</div>
+      </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="intel-section">
+      <div class="intel-title"><i class="fas fa-bolt"></i> Quick Actions</div>
+      <button class="intel-action-btn primary" onclick="dqRunAllNow('quick')"><i class="fas fa-play"></i> Run All Quick</button>
+      <button class="intel-action-btn" onclick="dqRunAllNow('deep')"><i class="fas fa-microscope"></i> Run All Deep</button>
+      <button class="intel-action-btn" onclick="dqRefresh()"><i class="fas fa-sync-alt"></i> Refresh Data</button>
+    </div>
+
+    <!-- Schedule Status -->
+    <div class="intel-section" style="border-bottom:none;">
+      <div class="intel-title"><i class="fas fa-clock"></i> Schedule</div>
+      <div id="dqIntelSchedule">
+        <div style="font-size:11px;color:var(--text-muted);">Loading…</div>
+      </div>
+    </div>
+
+  </div><!-- /panel-right -->
+
+</div><!-- /cc-cols -->
+
+{% else %}
+<div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view Data Quality</div><div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i><select onchange="dqOnTenantChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div></div>
+{% endif %}
+</div><!-- /content-container -->
+
+<!-- Toast notification -->
+<div class="dq-toast" id="dqToast"></div>
+
+<script>
+// Mark sidebar link active
+(function(){var ln=document.getElementById("link-quality")||document.getElementById("link-data-quality");if(ln)ln.classList.add("active");})();
+
+// ═══════════════════════════════════════════════════════════════
+// DATA QUALITY — Client-side logic (Command Center rewrite)
+// ═══════════════════════════════════════════════════════════════
+
+var DQ_ORG = '{{ selected_org }}';
+var DQ_SUP = '{{ selected_sup }}';
+var DQ_PAGE_SIZE = 60;
+
+// ── Cached data ─────────────────────────────────────────────
+var _dqOverviewData = {};    // {tableName: latestResult}
+var _dqAllTableNames = [];   // all table names from catalog
+var _dqOverviewFilter = 'all';
+var _dqOverviewPage = 1;
+var _dqGlobalConfig = null;
+var _dqScheduleOverrides = {};
+var _dqTableSchemas = {};    // {tableName: [{name, type}, ...]}
+var _dqLeftFilter = 'all';
+
+// ── API helper ──────────────────────────────────────────────
+function dqApi(path, opts) {
+  var sep = path.indexOf('?') >= 0 ? '&' : '?';
+  var url = path + sep + 'org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP);
+  return fetch(url, opts).then(function(r) { return r.json(); });
+}
+
+function dqOnTenantChange(val) {
+  if (!val) return;
+  var parts = val.split('/');
+  if (parts.length < 2) return;
+  var url = new URL('/reflection/quality', window.location.origin);
+  url.searchParams.set('org', parts[0].trim());
+  url.searchParams.set('sup', parts.slice(1).join('/').trim());
+  window.location.href = url.toString();
+}
+
+function dqToast(msg, duration) {
+  var el = document.getElementById('dqToast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(function() { el.classList.remove('show'); }, duration || 3000);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KIND BAR — Tab switching
+// ═══════════════════════════════════════════════════════════════
+
+function dqSwitchTab(el, tabName) {
+  document.querySelectorAll('.kind-node').forEach(function(n) { n.classList.remove('active'); });
+  document.querySelectorAll('.dq-tab-panel').forEach(function(p) { p.classList.remove('active'); });
+  el.classList.add('active');
+  var panel = document.getElementById('dqp-' + tabName);
+  if (panel) panel.classList.add('active');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LEFT PANEL — Table Navigator
+// ═══════════════════════════════════════════════════════════════
+
+function dqSetLeftFilter(el, status) {
+  _dqLeftFilter = status;
+  _dqOverviewPage = 1;
+  document.querySelectorAll('.tbl-filter-pill').forEach(function(p) { p.classList.remove('active'); });
+  el.classList.add('active');
+  dqFilterOverview();
+}
+
+
+
+// ═══════════════════════════════════════════════════════════════
+// RIGHT PANEL — Intelligence
+// ═══════════════════════════════════════════════════════════════
+
+function dqUpdateIntelPanel() {
+  var nTables = _dqAllTableNames.length;
+  var nChecked = Object.keys(_dqOverviewData).length;
+  var nUnchecked = nTables - nChecked;
+  var totalAnomalies = 0;
+  var scores = [];
+  var countOk = 0, countWarn = 0, countCrit = 0;
+  var topAnomalies = [];
+
+  Object.values(_dqOverviewData).forEach(function(t) {
+    var s = t.status || 'ok';
+    if (s === 'ok') countOk++;
+    else if (s === 'warning') countWarn++;
+    else if (s === 'critical') countCrit++;
+    if (t.quality_score != null) scores.push(t.quality_score);
+    (t.anomalies || []).forEach(function(a) {
+      totalAnomalies++;
+      topAnomalies.push(a);
+    });
+  });
+
+  // Health score = average of all checked tables
+  var avgScore = scores.length > 0 ? Math.round(scores.reduce(function(a, b) { return a + b; }, 0) / scores.length) : null;
+  var scoreEl = document.getElementById('dqIntelScore');
+  var labelEl = document.getElementById('dqIntelScoreLabel');
+  if (avgScore !== null) {
+    scoreEl.textContent = avgScore;
+    scoreEl.className = 'intel-big-number ' + (avgScore >= 85 ? 'good' : avgScore >= 65 ? 'ok' : 'bad');
+    labelEl.textContent = 'Avg across ' + scores.length + ' table' + (scores.length !== 1 ? 's' : '');
+  } else {
+    scoreEl.textContent = '—';
+    scoreEl.className = 'intel-big-number none';
+    labelEl.textContent = 'No data yet';
+  }
+
+  // Status breakdown
+  document.getElementById('dqIntelOk').textContent = countOk;
+  document.getElementById('dqIntelWarn').textContent = countWarn;
+  document.getElementById('dqIntelCrit').textContent = countCrit;
+  document.getElementById('dqIntelUnchecked').textContent = nUnchecked;
+
+  // Anomalies
+  var anomEl = document.getElementById('dqIntelAnomalies');
+  if (!topAnomalies.length) {
+    anomEl.innerHTML = '<div style="font-size:11px;color:var(--text-muted);">None detected</div>';
+  } else {
+    // Sort by severity (critical first), limit to 6
+    topAnomalies.sort(function(a, b) {
+      if (a.severity === 'critical' && b.severity !== 'critical') return -1;
+      if (a.severity !== 'critical' && b.severity === 'critical') return 1;
+      return 0;
+    });
+    var html = '';
+    topAnomalies.slice(0, 6).forEach(function(a) {
+      html += '<div class="intel-anomaly-item">';
+      html += '<div class="intel-anomaly-dot ' + (a.severity || 'warning') + '"></div>';
+      html += '<div style="flex:1;min-width:0;"><div style="font-weight:600;">' + dqEsc(a.check_id || '') + '</div>';
+      html += '<div style="color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + dqTruncate(a.message || '', 40) + '</div></div>';
+      html += '</div>';
+    });
+    if (topAnomalies.length > 6) {
+      html += '<div style="font-size:10px;color:var(--text-muted);margin-top:4px;">+' + (topAnomalies.length - 6) + ' more</div>';
+    }
+    anomEl.innerHTML = html;
+  }
+
+  // Top summary bar
+  var sumEl = document.getElementById('dqTopSummary');
+  if (sumEl) {
+    sumEl.innerHTML = '<strong style="color:var(--text-color);">' + nTables + '</strong> tables · <strong style="color:var(--text-color);">' + nChecked + '</strong> checked' + (totalAnomalies > 0 ? ' · <strong style="color:var(--error);">' + totalAnomalies + '</strong> anomalies' : '');
+  }
+
+  // Kind bar overview count
+  var kindCount = document.getElementById('dqKindOverviewCount');
+  if (kindCount) kindCount.textContent = nTables;
+}
+
+function dqUpdateScheduleIntel() {
+  dqApi('/reflection/quality/schedule').then(function(data) {
+    var container = document.getElementById('dqIntelSchedule');
+    if (!data.ok) {
+      container.innerHTML = '<div style="font-size:11px;color:var(--text-muted);">Unable to load</div>';
+      return;
+    }
+    var s = data.schedule;
+    var enabled = s.enabled !== false;
+    var html = '';
+    html += '<div class="intel-stat-row"><div class="intel-stat-label">Status</div>';
+    html += '<div class="intel-stat-value" style="color:' + (enabled ? 'var(--success)' : 'var(--error)') + ';">' + (enabled ? 'Active' : 'Paused') + '</div></div>';
+    html += '<div class="intel-stat-row"><div class="intel-stat-label">Quick</div>';
+    html += '<div class="intel-stat-value">' + _cronLabel(s.quick_cron || '0 */4 * * *') + '</div></div>';
+    html += '<div class="intel-stat-row"><div class="intel-stat-label">Deep</div>';
+    html += '<div class="intel-stat-value">' + (s.deep_cron && s.deep_cron !== 'disabled' ? _cronLabel(s.deep_cron) : 'Off') + '</div></div>';
+    html += '<div class="intel-stat-row"><div class="intel-stat-label">Post-ingest</div>';
+    html += '<div class="intel-stat-value">' + (s.post_ingest !== false ? 'Yes' : 'No') + '</div></div>';
+    var overrideCount = Object.keys(_dqScheduleOverrides).length;
+    if (overrideCount > 0) {
+      html += '<div class="intel-stat-row"><div class="intel-stat-label">Overrides</div>';
+      html += '<div class="intel-stat-value">' + overrideCount + ' table' + (overrideCount !== 1 ? 's' : '') + '</div></div>';
+    }
+    container.innerHTML = html;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OVERVIEW TAB
+// ═══════════════════════════════════════════════════════════════
+
+function dqUpdateFilterCounts() {
+  var entries = [];
+  var seen = {};
+  Object.keys(_dqOverviewData).forEach(function(name) { entries.push({name: name, data: _dqOverviewData[name]}); seen[name] = true; });
+  _dqAllTableNames.forEach(function(name) { if (!seen[name]) entries.push({name: name, data: null}); });
+  var countAll = entries.length, countOk = 0, countWarn = 0, countCrit = 0;
+  entries.forEach(function(e) {
+    var s = e.data ? (e.data.status || 'ok') : '';
+    if (s === 'ok') countOk++; else if (s === 'warning') countWarn++; else if (s === 'critical') countCrit++;
+  });
+  var el;
+  el = document.getElementById('dqLfAll'); if (el) el.textContent = countAll;
+  el = document.getElementById('dqLfOk'); if (el) el.textContent = countOk;
+  el = document.getElementById('dqLfWarn'); if (el) el.textContent = countWarn;
+  el = document.getElementById('dqLfCrit'); if (el) el.textContent = countCrit;
+}
+
+function dqLoadOverview() {
+  Promise.all([
+    dqApi('/reflection/quality/overview'),
+    dqApi('/reflection/quality/tables')
+  ]).then(function(results) {
+    var overviewData = results[0];
+    var tablesData = results[1];
+
+    _dqOverviewData = (overviewData.ok && overviewData.tables) ? overviewData.tables : {};
+    _dqAllTableNames = (tablesData.ok && tablesData.tables) ? tablesData.tables : [];
+
+    // Populate table selectors (rules + schedule forms)
+    dqPopulateTableSelects();
+
+    _dqOverviewPage = 1;
+    dqFilterOverview();
+
+    // Update filter counts + intelligence panel
+    dqUpdateFilterCounts();
+    dqUpdateIntelPanel();
+  });
+}
+
+function dqSetStatusFilter(el, status) {
+  _dqOverviewFilter = status;
+  _dqOverviewPage = 1;
+  dqFilterOverview();
+}
+
+function dqFilterOverview() {
+  var search = (document.getElementById('dqOverviewSearch').value || '').toLowerCase();
+
+  var sort = document.getElementById('dqOverviewSort').value;
+
+  // Build entries: merge catalog tables with quality data
+  var entries = [];
+  var seen = {};
+  Object.keys(_dqOverviewData).forEach(function(name) {
+    entries.push({name: name, data: _dqOverviewData[name], hasData: true});
+    seen[name] = true;
+  });
+  _dqAllTableNames.forEach(function(name) {
+    if (!seen[name]) entries.push({name: name, data: null, hasData: false});
+  });
+
+  // Apply search filter
+  if (search) {
+    entries = entries.filter(function(e) { return e.name.toLowerCase().indexOf(search) >= 0; });
+  }
+
+  // Apply status filter from left panel
+  var countAll = entries.length;
+  var countOk = 0, countWarn = 0, countCrit = 0;
+  entries.forEach(function(e) {
+    var s = e.data ? (e.data.status || 'ok') : '';
+    if (s === 'ok') countOk++;
+    else if (s === 'warning') countWarn++;
+    else if (s === 'critical') countCrit++;
+  });
+  document.getElementById('dqCountAll').textContent = countAll;
+  document.getElementById('dqCountOk').textContent = countOk;
+  document.getElementById('dqCountWarn').textContent = countWarn;
+  document.getElementById('dqCountCrit').textContent = countCrit;
+
+  if (_dqLeftFilter !== 'all') {
+    entries = entries.filter(function(e) {
+      if (!e.data) return false;
+      return (e.data.status || 'ok') === _dqLeftFilter;
+    });
+  }
+
+  // Sort
+  entries.sort(function(a, b) {
+    if (sort === 'name') return a.name.localeCompare(b.name);
+    if (sort === 'score_asc') return ((a.data||{}).quality_score||0) - ((b.data||{}).quality_score||0);
+    if (sort === 'score_desc') return ((b.data||{}).quality_score||0) - ((a.data||{}).quality_score||0);
+    if (sort === 'freshness') return (new Date((b.data||{}).checked_at||0)) - (new Date((a.data||{}).checked_at||0));
+    if (sort === 'status') {
+      var order = {critical:0, warning:1, ok:2};
+      return (order[(a.data||{}).status||'ok']||3) - (order[(b.data||{}).status||'ok']||3);
+    }
+    return 0;
+  });
+
+  // Pagination
+  var totalFiltered = entries.length;
+  var totalPages = Math.max(1, Math.ceil(totalFiltered / DQ_PAGE_SIZE));
+  if (_dqOverviewPage > totalPages) _dqOverviewPage = totalPages;
+  var start = (_dqOverviewPage - 1) * DQ_PAGE_SIZE;
+  var pageEntries = entries.slice(start, start + DQ_PAGE_SIZE);
+
+  document.getElementById('dqShowingCount').textContent = totalFiltered + ' table' + (totalFiltered !== 1 ? 's' : '');
+
+  // Render grid
+  var grid = document.getElementById('dqOverviewGrid');
+  if (!pageEntries.length) {
+    grid.innerHTML = '<div class="dq-empty"><i class="fas fa-search"></i><div class="dq-empty-text">No tables match your filter</div><div class="dq-empty-hint">Try adjusting the search or status filter in the left panel.</div></div>';
+    document.getElementById('dqPagination').style.display = 'none';
+    return;
+  }
+
+  var html = '';
+  pageEntries.forEach(function(entry) {
+    var name = entry.name;
+    var t = entry.data;
+    var safeName = dqEsc(name).replace(/'/g, "\\'");
+    if (!t) {
+      html += '<div class="dq-table-card fade-in" onclick="dqOpenTable(\'' + safeName + '\')">';
+      html += '<div class="dq-table-card-header"><div class="dq-table-card-name"><i class="fas fa-table"></i> ' + dqEsc(name) + '</div>';
+      html += '<div class="dq-table-card-score" style="color:var(--text-muted);">—</div></div>';
+      html += '<div class="dq-no-data">No quality data yet</div>';
+      html += '<div class="dq-card-footer"><button class="dq-card-btn" onclick="event.stopPropagation();dqRunTableNow(\'' + safeName + '\',\'quick\')"><i class="fas fa-play"></i> Run Quick Check</button></div>';
+      html += '</div>';
+      return;
+    }
+    var score = t.quality_score || 0;
+    var status = t.status || 'ok';
+    var scoreCls = score >= 85 ? 'good' : score >= 65 ? 'ok' : 'bad';
+    var anomalies = t.anomalies || [];
+
+    html += '<div class="dq-table-card status-' + status + ' fade-in" onclick="dqOpenTable(\'' + safeName + '\')">';
+    html += '<div class="dq-table-card-header">';
+    html += '<div class="dq-table-card-name"><i class="fas fa-table"></i> ' + dqEsc(name) + '</div>';
+    html += '<div class="dq-table-card-score ' + scoreCls + '">' + score + '</div>';
+    html += '</div>';
+    html += '<div class="dq-table-card-metrics">';
+    html += '<span><i class="fas fa-layer-group" style="font-size:9px;"></i> ' + (t.row_count || 0).toLocaleString() + ' rows</span>';
+    html += '<span><i class="fas fa-check-circle" style="font-size:9px;color:var(--success);"></i> ' + (t.passed || 0) + ' passed</span>';
+    if (t.warnings) html += '<span><i class="fas fa-exclamation-triangle" style="font-size:9px;color:var(--warning);"></i> ' + t.warnings + '</span>';
+    if (t.critical) html += '<span><i class="fas fa-times-circle" style="font-size:9px;color:var(--error);"></i> ' + t.critical + '</span>';
+    html += '<span><i class="fas fa-clock" style="font-size:9px;"></i> ' + dqTimeAgo(t.checked_at) + '</span>';
+    html += '</div>';
+
+    if (anomalies.length > 0) {
+      html += '<div class="dq-table-card-anomalies">';
+      anomalies.slice(0, 3).forEach(function(a) {
+        html += '<span class="dq-anomaly-pill ' + (a.severity || 'warning') + '">' + (a.check_id || '') + ': ' + dqTruncate(a.message || '', 45) + '</span>';
+      });
+      if (anomalies.length > 3) html += '<span style="font-size:10px;color:var(--text-muted);"> +' + (anomalies.length - 3) + ' more</span>';
+      html += '</div>';
+    }
+    html += '<div class="dq-card-footer"><button class="dq-card-btn" onclick="event.stopPropagation();dqRunTableNow(\'' + safeName + '\',\'quick\')"><i class="fas fa-play"></i> Run</button></div>';
+    html += '</div>';
+  });
+  grid.innerHTML = html;
+
+  // Render pagination
+  var pagEl = document.getElementById('dqPagination');
+  if (totalPages <= 1) {
+    pagEl.style.display = 'none';
+    return;
+  }
+  pagEl.style.display = 'flex';
+  var ph = '';
+  ph += '<button class="dq-page-btn" onclick="dqGoPage(' + Math.max(1, _dqOverviewPage-1) + ')" ' + (_dqOverviewPage <= 1 ? 'disabled' : '') + '>&laquo;</button>';
+  var startPage = Math.max(1, _dqOverviewPage - 3);
+  var endPage = Math.min(totalPages, startPage + 6);
+  for (var p = startPage; p <= endPage; p++) {
+    ph += '<button class="dq-page-btn' + (p === _dqOverviewPage ? ' active' : '') + '" onclick="dqGoPage(' + p + ')">' + p + '</button>';
+  }
+  ph += '<button class="dq-page-btn" onclick="dqGoPage(' + Math.min(totalPages, _dqOverviewPage+1) + ')" ' + (_dqOverviewPage >= totalPages ? 'disabled' : '') + '>&raquo;</button>';
+  ph += '<span class="dq-page-info">' + start + '–' + Math.min(start + DQ_PAGE_SIZE, totalFiltered) + ' of ' + totalFiltered + '</span>';
+  pagEl.innerHTML = ph;
+}
+
+function dqGoPage(p) { _dqOverviewPage = p; dqFilterOverview(); }
+
+function dqOpenTable(tableName) {
+  window.location.href = '/reflection/tables?table=' + encodeURIComponent(tableName) + '&tab=quality';
+}
+
+function dqRunTableNow(tableName, mode) {
+  dqApi('/reflection/quality/run?table=' + encodeURIComponent(tableName) + '&mode=' + (mode || 'quick'), { method: 'POST' })
+    .then(function(data) {
+      if (data.ok) {
+        dqToast((mode || 'quick') + ' check started for ' + tableName);
+        setTimeout(dqLoadOverview, 8000);
+      } else {
+        dqToast('Failed: ' + (data.detail || 'unknown error'));
+      }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TABLE SELECTOR POPULATION
+// ═══════════════════════════════════════════════════════════════
+
+function dqPopulateTableSelects() {
+  var selectors = ['ruleTable', 'tsTable'];
+  selectors.forEach(function(selId) {
+    var sel = document.getElementById(selId);
+    if (!sel) return;
+    var current = sel.value;
+    sel.innerHTML = '';
+    if (selId === 'ruleTable') {
+      sel.innerHTML = '<option value="*">* (all tables)</option>';
+    }
+    _dqAllTableNames.forEach(function(name) {
+      var opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    });
+    if (current) sel.value = current;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RULES TAB
+// ═══════════════════════════════════════════════════════════════
+
+function dqLoadRules() {
+  dqApi('/reflection/quality/rules').then(function(data) {
+    var body = document.getElementById('dqRulesBody');
+    var countEl = document.getElementById('dqRuleCount');
+    var rules = (data.ok && data.rules) ? data.rules : [];
+    if (countEl) countEl.textContent = rules.length;
+    if (!rules.length) {
+      body.innerHTML = '<div class="dq-empty" style="padding:30px;"><i class="fas fa-list-check"></i><div class="dq-empty-text">No custom rules defined</div><div class="dq-empty-hint">Click "Add Rule" to create your first quality rule.</div></div>';
+      return;
+    }
+    var html = '<table class="dq-rules-table"><thead><tr><th>Table</th><th>Column</th><th>Type</th><th>Threshold</th><th>Severity</th><th>Description</th><th>Status</th><th style="width:80px;"></th></tr></thead><tbody>';
+    rules.forEach(function(r) {
+      var safeName = (r.rule_id || '').replace(/'/g, "\\'");
+      html += '<tr>';
+      html += '<td style="font-weight:600;">' + dqEsc(r.table_name || '*') + '</td>';
+      html += '<td style="font-family:var(--mono);font-size:11px;">' + dqEsc(r.column_name || '—') + '</td>';
+      html += '<td><span class="status-pill ok" style="background:var(--primary-light);color:var(--primary);">' + dqEsc(r.rule_type || '') + '</span></td>';
+      html += '<td style="font-family:var(--mono);">' + (r.threshold != null ? r.threshold : '—') + '</td>';
+      html += '<td><span class="status-pill ' + (r.severity || 'warning') + '">' + dqEsc(r.severity || 'warning') + '</span></td>';
+      html += '<td style="font-size:11px;color:var(--text-secondary);">' + dqEsc(r.description || '') + '</td>';
+      html += '<td><span class="status-pill ' + (r.enabled ? 'ok' : 'warning') + '">' + (r.enabled ? 'active' : 'disabled') + '</span></td>';
+      html += '<td style="white-space:nowrap;">';
+      html += '<button class="btn-dq btn-dq-ghost btn-dq-sm" onclick="dqEditRule(\'' + safeName + '\')"><i class="fas fa-pen"></i></button> ';
+      html += '<button class="btn-dq btn-dq-danger btn-dq-sm" onclick="dqDeleteRule(\'' + safeName + '\')"><i class="fas fa-trash"></i></button>';
+      html += '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  });
+}
+
+function dqToggleAddRule() {
+  var form = document.getElementById('dqRuleForm');
+  form.classList.toggle('visible');
+  if (!form.classList.contains('visible')) {
+    dqResetRuleForm();
+  }
+}
+
+function dqResetRuleForm() {
+  document.getElementById('ruleEditId').value = '';
+  document.getElementById('dqRuleFormTitle').textContent = 'New Custom Rule';
+  document.getElementById('ruleTable').value = '*';
+  document.getElementById('ruleColumn').innerHTML = '<option value="">— all / none —</option>';
+  document.getElementById('ruleType').value = 'column_min';
+  document.getElementById('ruleThreshold').value = '';
+  document.getElementById('ruleSeverity').value = 'warning';
+  document.getElementById('ruleDesc').value = '';
+  document.getElementById('ruleExpectedValues').value = '';
+  document.getElementById('ruleSql').value = '';
+  document.getElementById('ruleFreshnessManual').value = '';
+  dqRuleTypeChanged();
+}
+
+function dqRuleTypeChanged() {
+  var rt = document.getElementById('ruleType').value;
+  document.getElementById('ruleExpectedRow').style.display = rt === 'distinct_in' ? 'flex' : 'none';
+  document.getElementById('ruleSqlRow').style.display = rt === 'custom_sql' ? 'flex' : 'none';
+  document.getElementById('ruleFreshnessRow').style.display = rt === 'freshness_check' ? 'flex' : 'none';
+  document.getElementById('ruleThresholdField').style.display = (rt === 'distinct_in' || rt === 'freshness_check') ? 'none' : 'flex';
+  if (rt === 'freshness_check') {
+    dqPopulateFreshnessCols();
+  }
+}
+
+function dqOnRuleTableChange() {
+  var table = document.getElementById('ruleTable').value;
+  var colSel = document.getElementById('ruleColumn');
+  colSel.innerHTML = '<option value="">— all / none —</option>';
+
+  if (!table || table === '*') return;
+
+  if (_dqTableSchemas[table]) {
+    _dqPopulateColumnSelect(colSel, _dqTableSchemas[table]);
+    return;
+  }
+
+  colSel.innerHTML = '<option value="">Loading…</option>';
+  fetch('/reflection/schema?organization=' + encodeURIComponent(DQ_ORG) +
+    '&super_name=' + encodeURIComponent(DQ_SUP) +
+    '&table=' + encodeURIComponent(table) + '&role_name=superadmin')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var schema = (data && data.schema !== undefined) ? data.schema : data;
+      var cols = [];
+      if (Array.isArray(schema)) {
+        schema.forEach(function(entry) {
+          if (entry && typeof entry === 'object') {
+            Object.entries(entry).forEach(function(e) {
+              if (!e[0].startsWith('_sys_')) cols.push({name: e[0], type: String(e[1])});
+            });
+          }
+        });
+      } else if (schema && typeof schema === 'object') {
+        Object.entries(schema).forEach(function(e) {
+          if (!e[0].startsWith('_sys_')) cols.push({name: e[0], type: String(e[1])});
+        });
+      }
+      _dqTableSchemas[table] = cols;
+      _dqPopulateColumnSelect(colSel, cols);
+    })
+    .catch(function() {
+      colSel.innerHTML = '<option value="">— failed to load —</option>';
+    });
+}
+
+function _dqPopulateColumnSelect(sel, cols) {
+  sel.innerHTML = '<option value="">— all / none —</option>';
+  cols.forEach(function(c) {
+    var opt = document.createElement('option');
+    opt.value = c.name;
+    opt.textContent = c.name + ' (' + c.type + ')';
+    sel.appendChild(opt);
+  });
+}
+
+function _dqIsDateType(colType) {
+  return /(date|time|timestamp)/i.test(colType || '');
+}
+
+function dqPopulateFreshnessCols() {
+  var table = document.getElementById('ruleTable').value;
+  var freshSel = document.getElementById('ruleFreshnessCol');
+  freshSel.innerHTML = '<option value="">— select column —</option>';
+  var cols = _dqTableSchemas[table] || [];
+  cols.forEach(function(c) {
+    var opt = document.createElement('option');
+    opt.value = c.name;
+    opt.textContent = c.name + ' (' + c.type + ')';
+    opt.setAttribute('data-type', c.type);
+    freshSel.appendChild(opt);
+  });
+  dqFreshnessColChanged();
+}
+
+function dqFreshnessColChanged() {
+  var freshSel = document.getElementById('ruleFreshnessCol');
+  var selectedOpt = freshSel.options[freshSel.selectedIndex];
+  var colType = selectedOpt ? (selectedOpt.getAttribute('data-type') || '') : '';
+  var isDate = _dqIsDateType(colType);
+  document.getElementById('ruleFreshnessManualField').style.display = (!isDate && freshSel.value) ? 'flex' : 'none';
+  document.getElementById('ruleFreshnessAutoField').style.display = (isDate && freshSel.value) ? 'flex' : 'none';
+}
+
+function dqEditRule(ruleId) {
+  dqApi('/reflection/quality/rules').then(function(data) {
+    var rules = (data.ok && data.rules) ? data.rules : [];
+    var rule = rules.find(function(r) { return r.rule_id === ruleId; });
+    if (!rule) return;
+    document.getElementById('ruleEditId').value = ruleId;
+    document.getElementById('dqRuleFormTitle').textContent = 'Edit Rule: ' + ruleId;
+    document.getElementById('ruleTable').value = rule.table_name || '*';
+    document.getElementById('ruleType').value = rule.rule_type || 'column_min';
+    document.getElementById('ruleThreshold').value = rule.threshold != null ? rule.threshold : '';
+    document.getElementById('ruleSeverity').value = rule.severity || 'warning';
+    document.getElementById('ruleDesc').value = rule.description || '';
+    document.getElementById('ruleExpectedValues').value = (rule.expected_values || []).join(', ');
+    document.getElementById('ruleSql').value = rule.sql || '';
+    dqRuleTypeChanged();
+
+    var tableName = rule.table_name || '*';
+    if (tableName && tableName !== '*') {
+      var colSel = document.getElementById('ruleColumn');
+      var setCol = rule.column_name || '';
+      if (_dqTableSchemas[tableName]) {
+        _dqPopulateColumnSelect(colSel, _dqTableSchemas[tableName]);
+        if (setCol) colSel.value = setCol;
+      } else {
+        colSel.innerHTML = '<option value="">Loading…</option>';
+        fetch('/reflection/schema?organization=' + encodeURIComponent(DQ_ORG) +
+          '&super_name=' + encodeURIComponent(DQ_SUP) +
+          '&table=' + encodeURIComponent(tableName) + '&role_name=superadmin')
+          .then(function(r) { return r.json(); })
+          .then(function(sData) {
+            var schema = (sData && sData.schema !== undefined) ? sData.schema : sData;
+            var cols = [];
+            if (Array.isArray(schema)) {
+              schema.forEach(function(entry) {
+                if (entry && typeof entry === 'object') {
+                  Object.entries(entry).forEach(function(e) {
+                    if (!e[0].startsWith('_sys_')) cols.push({name: e[0], type: String(e[1])});
+                  });
+                }
+              });
+            } else if (schema && typeof schema === 'object') {
+              Object.entries(schema).forEach(function(e) {
+                if (!e[0].startsWith('_sys_')) cols.push({name: e[0], type: String(e[1])});
+              });
+            }
+            _dqTableSchemas[tableName] = cols;
+            _dqPopulateColumnSelect(colSel, cols);
+            if (setCol) colSel.value = setCol;
+          });
+      }
+    }
+
+    document.getElementById('dqRuleForm').classList.add('visible');
+  });
+}
+
+function dqSaveRule() {
+  var editId = document.getElementById('ruleEditId').value;
+  var rule = {
+    table_name: document.getElementById('ruleTable').value || '*',
+    column_name: document.getElementById('ruleColumn').value || null,
+    rule_type: document.getElementById('ruleType').value,
+    threshold: parseFloat(document.getElementById('ruleThreshold').value) || null,
+    severity: document.getElementById('ruleSeverity').value,
+    description: document.getElementById('ruleDesc').value,
+  };
+  if (rule.rule_type === 'distinct_in') {
+    var ev = document.getElementById('ruleExpectedValues').value;
+    rule.expected_values = ev ? ev.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+  }
+  if (rule.rule_type === 'custom_sql') {
+    rule.sql = document.getElementById('ruleSql').value;
+  }
+  if (rule.rule_type === 'freshness_check') {
+    var freshCol = document.getElementById('ruleFreshnessCol').value;
+    var freshOpt = document.getElementById('ruleFreshnessCol').options[document.getElementById('ruleFreshnessCol').selectedIndex];
+    var freshType = freshOpt ? (freshOpt.getAttribute('data-type') || '') : '';
+    rule.freshness_column = freshCol;
+    rule.freshness_use_last_run = _dqIsDateType(freshType);
+    if (!rule.freshness_use_last_run) {
+      rule.freshness_manual_value = document.getElementById('ruleFreshnessManual').value || null;
+    }
+    rule.rule_type = 'custom_sql';
+    var qCol = '"' + freshCol.replace(/"/g, '""') + '"';
+    var fqn = DQ_SUP + '.' + rule.table_name;
+    if (rule.freshness_use_last_run) {
+      rule.sql = "SELECT COUNT(*) AS new_rows FROM " + fqn + " WHERE " + qCol + " > '{{last_run_time}}'";
+      rule.description = rule.description || 'Freshness: rows in ' + freshCol + ' since last check';
+    } else if (rule.freshness_manual_value) {
+      rule.sql = "SELECT COUNT(*) AS new_rows FROM " + fqn + " WHERE " + qCol + " > '" + rule.freshness_manual_value + "'";
+      rule.description = rule.description || 'Freshness: rows in ' + freshCol + ' > ' + rule.freshness_manual_value;
+    }
+  }
+
+  if (editId) {
+    dqApi('/reflection/quality/rules?rule_id=' + encodeURIComponent(editId), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(rule),
+    }).then(function() { dqToggleAddRule(); dqLoadRules(); dqToast('Rule updated'); });
+  } else {
+    dqApi('/reflection/quality/rules', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(rule),
+    }).then(function() { dqToggleAddRule(); dqLoadRules(); dqToast('Rule created'); });
+  }
+}
+
+function dqDeleteRule(ruleId) {
+  if (!confirm('Delete this rule?')) return;
+  dqApi('/reflection/quality/rules?rule_id=' + encodeURIComponent(ruleId), { method: 'DELETE' })
+    .then(function() { dqLoadRules(); dqToast('Rule deleted'); });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BUILT-IN CHECKS TAB
+// ═══════════════════════════════════════════════════════════════
+
+function dqLoadChecks() {
+  dqApi('/reflection/quality/global-config').then(function(data) {
+    if (!data.ok) return;
+    _dqGlobalConfig = data.config;
+    var checks = data.builtin_checks;
+    var conf = (data.config && data.config.checks) || {};
+
+    var groups = {
+      'Table-level (quick)': [],
+      'Column-level (quick)': [],
+      'Column-level (deep)': [],
+    };
+
+    Object.entries(checks).forEach(function(e) {
+      var id = e[0], def = e[1];
+      var c = conf[id] || {};
+      var enabled = c.enabled !== undefined ? c.enabled : def.enabled;
+      var threshold = c.threshold !== undefined ? c.threshold : def.threshold;
+      var groupKey = def.level === 'table' ? 'Table-level (quick)' : (def.group === 'deep' ? 'Column-level (deep)' : 'Column-level (quick)');
+      groups[groupKey].push({id: id, def: def, enabled: enabled, threshold: threshold});
+    });
+
+    var html = '';
+    Object.entries(groups).forEach(function(ge) {
+      var groupName = ge[0], items = ge[1];
+      html += '<div class="dq-checks-group">';
+      html += '<div class="dq-checks-group-title"><i class="fas fa-layer-group" style="font-size:10px;"></i> ' + groupName + '</div>';
+      items.forEach(function(item) {
+        html += '<div class="dq-check-row">';
+        html += '<div class="dq-check-toggle ' + (item.enabled ? 'on' : '') + '" data-check-id="' + item.id + '" onclick="dqToggleCheck(this)"></div>';
+        html += '<div class="dq-check-id">' + item.id + '</div>';
+        html += '<div class="dq-check-name">' + item.def.name + '</div>';
+        html += '<div class="dq-check-desc">' + item.def.description + '</div>';
+        if (item.def.threshold !== null && item.def.unit) {
+          html += '<div class="dq-check-threshold"><input type="number" data-check-id="' + item.id + '" value="' + (item.threshold || '') + '" step="any"><span class="unit">' + item.def.unit + '</span></div>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+
+    document.getElementById('dqChecksBody').innerHTML = html;
+  });
+}
+
+function dqToggleCheck(el) { el.classList.toggle('on'); }
+
+function dqSaveGlobalConfig() {
+  var checks = {};
+  document.querySelectorAll('.dq-check-toggle').forEach(function(toggle) {
+    var id = toggle.getAttribute('data-check-id');
+    checks[id] = checks[id] || {};
+    checks[id].enabled = toggle.classList.contains('on');
+  });
+  document.querySelectorAll('.dq-check-threshold input').forEach(function(inp) {
+    var id = inp.getAttribute('data-check-id');
+    checks[id] = checks[id] || {};
+    var v = parseFloat(inp.value);
+    if (!isNaN(v)) checks[id].threshold = v;
+  });
+  var config = _dqGlobalConfig || {};
+  config.checks = checks;
+  dqApi('/reflection/quality/global-config', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(config),
+  }).then(function() { dqToast('Configuration saved'); });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCHEDULE TAB
+// ═══════════════════════════════════════════════════════════════
+
+var CRON_LABELS = {
+  '*/15 * * * *': 'Every 15 min',
+  '*/30 * * * *': 'Every 30 min',
+  '0 */1 * * *':  'Every hour',
+  '0 */2 * * *':  'Every 2 hrs',
+  '0 */4 * * *':  'Every 4 hrs',
+  '0 */6 * * *':  'Every 6 hrs',
+  '0 */12 * * *': 'Every 12 hrs',
+  '0 */24 * * *': 'Every 24 hrs',
+  '0 2 * * *':    'Daily 02:00',
+  '0 2 * * 1':    'Weekly Mon 02:00',
+};
+
+function _cronLabel(cron) { return CRON_LABELS[cron] || cron || 'global default'; }
+
+function _setPreset(selectId, cronInputId, cronValue) {
+  var sel = document.getElementById(selectId);
+  var inp = document.getElementById(cronInputId);
+  if (!sel) return;
+  var matched = false;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === cronValue) { sel.selectedIndex = i; matched = true; break; }
+  }
+  if (!matched && cronValue && cronValue !== 'disabled') {
+    sel.value = 'custom';
+    if (inp) { inp.style.display = 'block'; inp.value = cronValue; }
+  } else {
+    if (inp) inp.style.display = 'none';
+  }
+}
+
+function _getCron(selectId, cronInputId) {
+  var sel = document.getElementById(selectId);
+  var inp = document.getElementById(cronInputId);
+  if (!sel) return '0 */4 * * *';
+  if (sel.value === 'custom' && inp) return inp.value.trim() || '0 */4 * * *';
+  if (sel.value === 'disabled') return 'disabled';
+  return sel.value;
+}
+
+// Show/hide custom cron input
+document.querySelectorAll('#schedQuickPreset, #schedDeepPreset').forEach(function(sel) {
+  sel.addEventListener('change', function() {
+    var cronId = sel.id === 'schedQuickPreset' ? 'schedQuickCron' : 'schedDeepCron';
+    var inp = document.getElementById(cronId);
+    if (sel.value === 'custom') { if (inp) inp.style.display = 'block'; }
+    else { if (inp) inp.style.display = 'none'; }
+  });
+});
+
+function dqLoadSchedule() {
+  Promise.all([
+    dqApi('/reflection/quality/schedule'),
+    dqApi('/reflection/quality/table-schedules'),
+    dqApi('/reflection/quality/tables')
+  ]).then(function(results) {
+    var sData = results[0];
+    if (sData.ok) {
+      var s = sData.schedule;
+      _setPreset('schedQuickPreset', 'schedQuickCron', s.quick_cron || '0 */4 * * *');
+      _setPreset('schedDeepPreset', 'schedDeepCron', s.deep_cron || '0 2 * * *');
+      document.getElementById('schedPostIngest').checked = s.post_ingest !== false;
+      document.getElementById('schedEnabled').checked = s.enabled !== false;
+      var cd = document.getElementById('schedCooldown');
+      if (cd && s.cooldown_seconds) cd.value = String(s.cooldown_seconds);
+    }
+
+    var oData = results[1];
+    _dqScheduleOverrides = (oData.ok && oData.overrides) ? oData.overrides : {};
+
+    var tData = results[2];
+    var allNames = (tData.ok && tData.tables) ? tData.tables : [];
+    _dqAllTableNames = allNames;
+    dqPopulateTableSelects();
+
+    dqRenderScheduleOverrides();
+    dqUpdateScheduleIntel();
+  });
+}
+
+function dqRenderScheduleOverrides() {
+  var container = document.getElementById('dqActiveOverrides');
+  var overrideNames = Object.keys(_dqScheduleOverrides).sort();
+  var searchEl = document.getElementById('dqOverrideSearch');
+  var search = searchEl ? searchEl.value.toLowerCase() : '';
+
+  if (search) {
+    overrideNames = overrideNames.filter(function(n) { return n.toLowerCase().indexOf(search) >= 0; });
+  }
+
+  if (!Object.keys(_dqScheduleOverrides).length) {
+    container.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 0;">No per-table overrides configured.</div>';
+    return;
+  }
+
+  if (!overrideNames.length) {
+    container.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 0;">No overrides match "' + dqEsc(search) + '"</div>';
+    return;
+  }
+
+  var html = '';
+  overrideNames.forEach(function(name) {
+    var ov = _dqScheduleOverrides[name];
+    var quickLabel = ov.quick_cron ? _cronLabel(ov.quick_cron) : 'global';
+    var deepLabel = ov.deep_cron ? _cronLabel(ov.deep_cron) : (ov.deep_enabled === false ? 'disabled' : 'global');
+    var enabledLabel = ov.enabled === false ? ' (paused)' : '';
+    var safeName = name.replace(/'/g, "\\'");
+
+    html += '<div class="dq-override-card fade-in">';
+    html += '<div class="dq-override-name">' + dqEsc(name) + enabledLabel + '</div>';
+    html += '<div class="dq-override-detail">Quick: ' + quickLabel + ' · Deep: ' + deepLabel + '</div>';
+    html += '<div class="dq-override-actions">';
+    html += '<button class="btn-dq btn-dq-ghost btn-dq-sm" onclick="dqEditOverride(\'' + safeName + '\')"><i class="fas fa-pen"></i></button>';
+    html += '<button class="btn-dq btn-dq-danger btn-dq-sm" onclick="dqDeleteOverride(\'' + safeName + '\')"><i class="fas fa-trash"></i></button>';
+    html += '<button class="btn-dq btn-dq-ghost btn-dq-sm" onclick="dqRunTableNow(\'' + safeName + '\',\'quick\')"><i class="fas fa-play"></i></button>';
+    html += '</div>';
+    html += '</div>';
+  });
+  container.innerHTML = html;
+}
+
+function dqToggleOverrideForm() {
+  var form = document.getElementById('dqOverrideForm');
+  form.classList.toggle('visible');
+  if (!form.classList.contains('visible')) {
+    document.getElementById('tsTable').value = '';
+    document.getElementById('tsQuick').value = '';
+    document.getElementById('tsDeep').value = '';
+    document.getElementById('tsTable').removeAttribute('data-editing');
+    document.getElementById('tsTable').disabled = false;
+  }
+}
+
+function dqEditOverride(tableName) {
+  var ov = _dqScheduleOverrides[tableName] || {};
+  document.getElementById('tsTable').value = tableName;
+  document.getElementById('tsTable').setAttribute('data-editing', tableName);
+  document.getElementById('tsTable').disabled = true;
+  document.getElementById('tsQuick').value = ov.quick_cron || '';
+  document.getElementById('tsDeep').value = ov.deep_cron || (ov.deep_enabled === false ? 'disabled' : '');
+  document.getElementById('dqOverrideForm').classList.add('visible');
+}
+
+function dqSaveTableSchedule() {
+  var tableEl = document.getElementById('tsTable');
+  var table = tableEl.value.trim();
+  if (!table) { alert('Please select a table'); return; }
+  var quickVal = document.getElementById('tsQuick').value;
+  var deepVal = document.getElementById('tsDeep').value;
+
+  var sched = { enabled: quickVal !== 'disabled' };
+  if (quickVal && quickVal !== 'disabled') sched.quick_cron = quickVal;
+
+  if (deepVal && deepVal !== 'disabled') {
+    sched.deep_cron = deepVal;
+    sched.deep_enabled = true;
+  } else if (deepVal === 'disabled') {
+    sched.deep_enabled = false;
+  }
+
+  dqApi('/reflection/quality/table-schedule?table=' + encodeURIComponent(table), {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(sched),
+  }).then(function(data) {
+    if (data.ok) {
+      _dqScheduleOverrides[table] = sched;
+      dqRenderScheduleOverrides();
+      dqToggleOverrideForm();
+      dqToast('Schedule saved for ' + table);
+      dqUpdateScheduleIntel();
+    }
+  });
+}
+
+function dqDeleteOverride(tableName) {
+  if (!confirm('Remove override for "' + tableName + '"? It will revert to the global schedule.')) return;
+  dqApi('/reflection/quality/table-schedule?table=' + encodeURIComponent(tableName), { method: 'DELETE' })
+    .then(function(data) {
+      if (data.ok) {
+        delete _dqScheduleOverrides[tableName];
+        dqRenderScheduleOverrides();
+        dqToast('Override removed for ' + tableName);
+        dqUpdateScheduleIntel();
+      }
+    });
+}
+
+function dqSaveSchedule() {
+  var quickCron = _getCron('schedQuickPreset', 'schedQuickCron');
+  var deepCron = _getCron('schedDeepPreset', 'schedDeepCron');
+  dqApi('/reflection/quality/schedule', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      quick_cron: quickCron,
+      deep_cron: deepCron,
+      post_ingest: document.getElementById('schedPostIngest').checked,
+      enabled: document.getElementById('schedEnabled').checked,
+      cooldown_seconds: parseInt(document.getElementById('schedCooldown').value) || 300,
+    }),
+  }).then(function() {
+    dqToast('Global schedule saved');
+    dqUpdateScheduleIntel();
+  });
+}
+
+// ── Run All Now ──────────────────────────────────────────────
+
+function dqRunAllNow(mode) {
+  if (!confirm('Run ' + mode + ' check on ALL tables now?')) return;
+  dqApi('/reflection/quality/run-all?mode=' + mode, { method: 'POST' }).then(function(data) {
+    if (!data.ok) { dqToast('Failed: ' + (data.detail || 'unknown error')); return; }
+    dqToast(mode + ' check started on ' + (data.count || 0) + ' tables');
+    var refreshCount = 0;
+    var refreshTimer = setInterval(function() {
+      dqLoadOverview();
+      refreshCount++;
+      if (refreshCount >= 10) clearInterval(refreshTimer);
+    }, 10000);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+function dqTimeAgo(iso) {
+  if (!iso) return 'never';
+  var d = Date.now() - new Date(iso).getTime();
+  if (d < 60000) return 'just now';
+  if (d < 3600000) return Math.floor(d / 60000) + ' min ago';
+  if (d < 86400000) return Math.floor(d / 3600000) + ' hr ago';
+  return Math.floor(d / 86400000) + ' days ago';
+}
+
+function dqTruncate(s, n) { return s.length > n ? s.substring(0, n) + '…' : s; }
+
+function dqEsc(s) {
+  if (s == null) return '';
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode(String(s)));
+  return d.innerHTML;
+}
+
+function dqRefresh() {
+  dqLoadOverview();
+  dqLoadRules();
+  dqLoadChecks();
+  dqLoadSchedule();
+}
+
+// ── Init ─────────────────────────────────────────────────────
+if (DQ_ORG && DQ_SUP) {
+  dqLoadOverview();
+  dqLoadRules();
+  dqLoadChecks();
+  dqLoadSchedule();
+
+  // Fetch available roles for the role selector
+  fetch('/reflection/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var roles = Array.isArray(data) ? data : (data && Array.isArray(data.roles)) ? data.roles : [];
+      var sel = document.getElementById('dqRoleSel');
+      if (!sel || !roles.length) return;
+      var roleNames = [];
+      roles.forEach(function(r) { var n = r.role_name || r.name || r.role_id || ''; if (n && roleNames.indexOf(n) < 0) roleNames.push(n); });
+      if (roleNames.indexOf('superadmin') < 0) roleNames.unshift('superadmin');
+      sel.innerHTML = '';
+      roleNames.forEach(function(rn) {
+        var o = document.createElement('option');
+        o.value = rn; o.textContent = rn;
+        if (rn === 'superadmin') o.selected = true;
+        sel.appendChild(o);
+      });
+    }).catch(function() {});
+}
+</script>
+
+</body>
+</html>

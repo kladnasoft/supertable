@@ -509,6 +509,21 @@ class DataWriter:
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
+        # ---------- DATA QUALITY: notify scheduler of new data ----------
+        # Sets a debounced "pending" flag in Redis.  The DQ scheduler will
+        # pick it up on the next tick, respecting lock + cooldown rules.
+        # Safe to call at any frequency — never blocks or fails the write.
+        try:
+            from supertable.reflection.quality.scheduler import notify_ingest
+            notify_ingest(
+                self.catalog.r,
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
+        except Exception:
+            pass  # Never fail a write due to quality scheduling
+
         return result_tuple
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):

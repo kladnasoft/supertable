@@ -245,3 +245,26 @@ attach_monitoring_routes(
     inject_session_into_ctx=inject_session_into_ctx,
     logged_in_guard_api=logged_in_guard_api,
 )
+
+
+# ---------------------------------------------------------------------------
+# Data Quality UI + API routes
+# ---------------------------------------------------------------------------
+
+from supertable.reflection.quality import attach_quality_routes  # noqa: E402
+
+attach_quality_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+    catalog=catalog,
+    redis_client=redis_client,
+    get_session=get_session,
+)
