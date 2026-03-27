@@ -912,7 +912,7 @@ class TestFilterStaleIncomingRows:
 class TestFindAndLockOverlappingFiles:
 
     def test_no_overwrite_columns_compaction_only(self):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
@@ -922,14 +922,14 @@ class TestFindAndLockOverlappingFiles:
         }
         df = _df(id=[1])
 
-        result = find_and_lock_overlapping_files(snap, df, [], MagicMock())
+        result = find_overlapping_files(snap, df, [], MagicMock())
 
         # All small files with has_overlap=False (subject to pruning)
         for f, has_overlap, _ in result:
             assert has_overlap is False
 
     def test_missing_stats_treated_as_overlap(self):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
@@ -938,12 +938,12 @@ class TestFindAndLockOverlappingFiles:
         }
         df = _df(id=[1])
 
-        result = find_and_lock_overlapping_files(snap, df, ["id"], MagicMock())
+        result = find_overlapping_files(snap, df, ["id"], MagicMock())
         matches = [f for f, overlap, _ in result if overlap]
         assert len(matches) == 1
 
     def test_stats_no_overlap_marked_false(self):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
@@ -954,13 +954,13 @@ class TestFindAndLockOverlappingFiles:
         # Incoming id=1 is outside [10,20]
         df = _df(id=[1])
 
-        result = find_and_lock_overlapping_files(snap, df, ["id"], MagicMock())
+        result = find_overlapping_files(snap, df, ["id"], MagicMock())
         for f, has_overlap, _ in result:
             if f == "f1.parquet":
                 assert has_overlap is False
 
     def test_stats_overlap_marked_true(self):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
@@ -971,17 +971,17 @@ class TestFindAndLockOverlappingFiles:
         # Incoming id=5 is within [1,10]
         df = _df(id=[5])
 
-        result = find_and_lock_overlapping_files(snap, df, ["id"], MagicMock())
+        result = find_overlapping_files(snap, df, ["id"], MagicMock())
         matches = [f for f, overlap, _ in result if overlap]
         assert "f1.parquet" in matches
 
     def test_empty_resources(self):
-        from supertable.processing import find_and_lock_overlapping_files
-        result = find_and_lock_overlapping_files({"resources": []}, _df(id=[1]), ["id"], MagicMock())
+        from supertable.processing import find_overlapping_files
+        result = find_overlapping_files({"resources": []}, _df(id=[1]), ["id"], MagicMock())
         assert result == set()
 
     def test_null_stats_min_max_treated_as_overlap(self):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
@@ -991,6 +991,6 @@ class TestFindAndLockOverlappingFiles:
         }
         df = _df(id=[1])
 
-        result = find_and_lock_overlapping_files(snap, df, ["id"], MagicMock())
+        result = find_overlapping_files(snap, df, ["id"], MagicMock())
         matches = [f for f, overlap, _ in result if overlap]
         assert len(matches) == 1

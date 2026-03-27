@@ -18,7 +18,7 @@ from supertable.utils.timer import Timer
 from supertable.processing import (
     process_overlapping_files,
     process_delete_only,
-    find_and_lock_overlapping_files,
+    find_overlapping_files,
     filter_stale_incoming_rows,
     extract_key_tuples,
     reconcile_tombstones,
@@ -227,7 +227,7 @@ class DataWriter:
             mark("snapshot")
 
             # --- Detect overlaps ----------------------------------------------
-            overlapping_files = find_and_lock_overlapping_files(
+            overlapping_files = find_overlapping_files(
                 last_simple_table, dataframe, overwrite_columns, locking=None,
                 table_config=table_config,
             )

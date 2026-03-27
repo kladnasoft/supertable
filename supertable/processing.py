@@ -10,7 +10,6 @@ import polars
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from supertable.locking import Locking
 from supertable.utils.helper import generate_filename, collect_schema
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
@@ -257,11 +256,11 @@ def prune_not_overlapping_files_by_threshold(
 # Public API: Overlap selection (with compaction triggers)
 # =========================
 
-def find_and_lock_overlapping_files(  # keep name/signature for compatibility
+def find_overlapping_files(  # keep name/signature for compatibility
         last_simple_table: dict,
         df: polars.DataFrame,
         overwrite_columns: List[str],
-        locking: Locking,  # not used anymore for per-file locks; higher-level lock covers us
+        locking: object = None,  # deprecated: kept for signature compatibility
         table_config: Optional[dict] = None,
 ) -> Set[Tuple[str, bool, int]]:
     """

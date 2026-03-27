@@ -1,8 +1,8 @@
+# route: supertable.redis_catalog
 from __future__ import annotations
 
 import json
 import time
-import uuid
 import hashlib
 import secrets
 from typing import Any, Dict, Iterator, List, Optional
@@ -14,6 +14,8 @@ try:
     from .redis_connector import RedisConnector, RedisOptions
 except ImportError:  # pragma: no cover
     from redis_connector import RedisConnector, RedisOptions
+
+from supertable.locking.redis_lock import RedisLocking
 
 
 def _now_ms() -> int:
@@ -253,29 +255,6 @@ redis.call('SET', key, new_val)
 return new_version
 """
 
-    _LUA_LOCK_RELEASE_IF_TOKEN = """
-local key = KEYS[1]
-local token = ARGV[1]
-local cur = redis.call('GET', key)
-if cur and cur == token then
-  redis.call('DEL', key)
-  return 1
-end
-return 0
-"""
-
-    _LUA_LOCK_EXTEND_IF_TOKEN = """
-local key = KEYS[1]
-local token = ARGV[1]
-local ttl_ms = tonumber(ARGV[2])
-local cur = redis.call('GET', key)
-if cur and cur == token then
-  redis.call('PEXPIRE', key, ttl_ms)
-  return 1
-end
-return 0
-"""
-
     # ------------- RBAC Lua scripts ------------- #
 
     _LUA_RBAC_BUMP_META = """
@@ -379,8 +358,9 @@ return 1
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
-        self._lock_release_if_token = self.r.register_script(self._LUA_LOCK_RELEASE_IF_TOKEN)
-        self._lock_extend_if_token = self.r.register_script(self._LUA_LOCK_EXTEND_IF_TOKEN)
+
+        # Distributed locking (delegates to supertable.locking.redis_lock)
+        self._locker = RedisLocking(self.r)
 
         # RBAC Lua scripts
         self._rbac_bump_meta = self.r.register_script(self._LUA_RBAC_BUMP_META)
@@ -403,36 +383,15 @@ return 1
     def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[
         str]:
         """SET lock key NX EX with retry/backoff <= timeout. Returns token if acquired else None."""
-        key = _lock_key(org, sup, simple)
-        token = uuid.uuid4().hex
-        deadline = time.time() + max(1, int(timeout_s))
-        while time.time() < deadline:
-            try:
-                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
-                if ok:
-                    return token
-            except redis.RedisError as e:
-                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
-            time.sleep(0.05)
-        return None
+        return self._locker.acquire(_lock_key(org, sup, simple), ttl_s=ttl_s, timeout_s=timeout_s)
 
     def release_simple_lock(self, org: str, sup: str, simple: str, token: str) -> bool:
         """Compare-and-delete via Lua."""
-        try:
-            res = self._lock_release_if_token(keys=[_lock_key(org, sup, simple)], args=[token])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-lock] release error: {e}")
-            return False
+        return self._locker.release(_lock_key(org, sup, simple), token)
 
     def extend_simple_lock(self, org: str, sup: str, simple: str, token: str, ttl_ms: int) -> bool:
         """Optionally extend TTL if token matches."""
-        try:
-            res = self._lock_extend_if_token(keys=[_lock_key(org, sup, simple)], args=[token, int(ttl_ms)])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-lock] extend error: {e}")
-            return False
+        return self._locker.extend(_lock_key(org, sup, simple), token, ttl_ms)
 
     # ---- Stage lock (staging + pipe mutations) ----
 
@@ -447,62 +406,25 @@ return 1
         """Acquire lock for staging/pipe operations:
             supertable:{org}:{sup}:lock:stage:{stage_name}
         """
-        key = _stage_lock_key(org, sup, stage_name)
-        token = uuid.uuid4().hex
-        deadline = time.time() + max(1, int(timeout_s))
-        while time.time() < deadline:
-            try:
-                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
-                if ok:
-                    return token
-            except redis.RedisError as e:
-                logger.debug(f"[redis-stage-lock] acquire error on {key}: {e}")
-            time.sleep(0.05)
-        return None
+        return self._locker.acquire(_stage_lock_key(org, sup, stage_name), ttl_s=ttl_s, timeout_s=timeout_s)
 
     def release_stage_lock(self, org: str, sup: str, stage_name: str, token: str) -> bool:
         """Release stage lock if token matches."""
-        try:
-            res = self._lock_release_if_token(keys=[_stage_lock_key(org, sup, stage_name)], args=[token])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-stage-lock] release error: {e}")
-            return False
+        return self._locker.release(_stage_lock_key(org, sup, stage_name), token)
 
     def extend_stage_lock(self, org: str, sup: str, stage_name: str, token: str, ttl_ms: int) -> bool:
         """Optionally extend stage lock TTL if token matches."""
-        try:
-            res = self._lock_extend_if_token(keys=[_stage_lock_key(org, sup, stage_name)], args=[token, int(ttl_ms)])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-stage-lock] extend error: {e}")
-            return False
+        return self._locker.extend(_stage_lock_key(org, sup, stage_name), token, ttl_ms)
 
     # ---- Stats lock (for monitoring _stats.json updates) ----
 
     def acquire_stat_lock(self, org: str, sup: str, ttl_s: int = 10, timeout_s: int = 10) -> Optional[str]:
         """Acquire stat lock: supertable:{org}:{sup}:lock:stat"""
-        key = _stat_lock_key(org, sup)
-        token = uuid.uuid4().hex
-        deadline = time.time() + max(1, int(timeout_s))
-        while time.time() < deadline:
-            try:
-                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
-                if ok:
-                    return token
-            except redis.RedisError as e:
-                logger.debug(f"[redis-stat-lock] acquire error on {key}: {e}")
-            time.sleep(0.05)
-        return None
+        return self._locker.acquire(_stat_lock_key(org, sup), ttl_s=ttl_s, timeout_s=timeout_s)
 
     def release_stat_lock(self, org: str, sup: str, token: str) -> bool:
         """Release stat lock if token matches."""
-        try:
-            res = self._lock_release_if_token(keys=[_stat_lock_key(org, sup)], args=[token])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-stat-lock] release error: {e}")
-            return False
+        return self._locker.release(_stat_lock_key(org, sup), token)
 
     # ------------- Pointers (root/leaf) -------------
 

@@ -1,56 +1,66 @@
-# supertable/locking/redis_lock.py
+# route: supertable.locking.redis_lock
+"""
+Generic Redis-backed distributed lock.
+
+Uses SET NX EX for acquisition with retry/backoff, and Lua scripts for
+atomic compare-and-delete (release) and compare-and-extend (extend).
+
+A background heartbeat thread automatically extends held locks at half-TTL,
+so operations of any duration are safe. The TTL controls *crash recovery
+time*, not operation timeout: if the holder dies, the heartbeat dies with
+it, and the lock expires within one TTL cycle.
+
+This module does NOT create its own Redis connection. It receives a
+``redis.Redis`` client from the caller — ensuring it always participates
+in whatever connection topology (Sentinel, SSL, etc.) the application uses.
+
+Usage::
+
+    from supertable.redis_connector import create_redis_client
+    from supertable.locking.redis_lock import RedisLocking
+
+    locker = RedisLocking(create_redis_client())
+    token = locker.acquire("my:lock:key", ttl_s=30, timeout_s=10)
+    if token:
+        try:
+            ...
+        finally:
+            locker.release("my:lock:key", token)
+"""
 
 from __future__ import annotations
 
-import time
-import uuid
-import threading
 import atexit
-from typing import Iterable, Optional, Set, Dict
+import time
+import threading
+import uuid
+from typing import Dict, Optional, Tuple
 
 import redis
 from supertable.config.defaults import logger
 
 
-# Lua script for atomic release: only delete if current value matches token
-_RELEASE_LUA = """
+# -- Lua scripts (atomic server-side operations) ----------------------------- #
+
+_LUA_RELEASE_IF_TOKEN = """
 local key = KEYS[1]
-local who_key = KEYS[2]
-local expected_token = ARGV[1]
-local current = redis.call('GET', key)
-if current == expected_token then
-    redis.call('DEL', key)
-    redis.call('DEL', who_key)
-    return 1
+local token = ARGV[1]
+local cur = redis.call('GET', key)
+if cur and cur == token then
+  redis.call('DEL', key)
+  return 1
 end
 return 0
 """
 
-# Lua script for atomic conditional delete (rollback): delete only if value matches
-_COND_DEL_LUA = """
+_LUA_EXTEND_IF_TOKEN = """
 local key = KEYS[1]
-local who_key = KEYS[2]
-local expected_token = ARGV[1]
-local current = redis.call('GET', key)
-if current == expected_token then
-    redis.call('DEL', key)
-    redis.call('DEL', who_key)
-end
-return 0
-"""
-
-# Lua script for atomic heartbeat refresh: only extend TTL if token still matches
-_REFRESH_LUA = """
-local key = KEYS[1]
-local who_key = KEYS[2]
-local expected_token = ARGV[1]
-local duration = tonumber(ARGV[2])
-local identity = ARGV[3]
-local current = redis.call('GET', key)
-if current == expected_token then
-    redis.call('EXPIRE', key, duration)
-    redis.call('SET', who_key, identity, 'EX', duration)
-    return 1
+local token = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+local cur = redis.call('GET', key)
+if cur and cur == token then
+  redis.call('PEXPIRE', key, ttl_ms)
+  return 1
 end
 return 0
 """
@@ -58,178 +68,182 @@ return 0
 
 class RedisLocking:
     """
-    Redis-based, multi-process safe lock manager using tokenized keys:
-      lock:{resource} -> "<token>"  (SET NX EX)
+    Generic Redis distributed lock with automatic heartbeat renewal.
 
-    * Heartbeat refreshes TTL while locks are held.
-    * `who` sidecar is optional (best effort) for observability:
-        lockwho:{resource} -> "<identity>" (EX same TTL)
+    Receives an already-configured ``redis.Redis`` client — never creates
+    its own connection.  This guarantees the lock traffic follows the same
+    Sentinel / SSL / password / DB path as every other Redis consumer.
+
+    While locks are held, a background thread extends their TTL at half
+    the original duration.  On crash, the thread dies and Redis expires
+    the key after one TTL cycle — giving fast crash recovery without
+    risking silent lock loss during long operations.
     """
 
-    def __init__(
-        self,
-        identity: str,
-        host: str = "localhost",
-        port: int = 6379,
-        db: int = 0,
-        password: str | None = None,
-        check_interval: float = 0.05,
-        socket_timeout: float | None = 3.0,
-        socket_connect_timeout: float | None = 3.0,
-    ):
-        self.identity = identity
-        self.check_interval = max(0.01, float(check_interval))
-        self.redis = redis.Redis(
-            host=host,
-            port=port,
-            db=db,
-            password=password,
-            socket_timeout=socket_timeout,
-            socket_connect_timeout=socket_connect_timeout,
-            decode_responses=True,
-        )
-        self._held: Dict[str, str] = {}  # resource -> token
+    def __init__(self, r: redis.Redis) -> None:
+        self.r = r
+        self._release_if_token = self.r.register_script(_LUA_RELEASE_IF_TOKEN)
+        self._extend_if_token = self.r.register_script(_LUA_EXTEND_IF_TOKEN)
+
+        # key -> (token, ttl_ms) for locks held by this instance
+        self._held: Dict[str, Tuple[str, int]] = {}
+        self._held_lock = threading.Lock()
+
+        # Heartbeat state
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
-        self._release_script = self.redis.register_script(_RELEASE_LUA)
-        self._cond_del_script = self.redis.register_script(_COND_DEL_LUA)
-        self._refresh_script = self.redis.register_script(_REFRESH_LUA)
+
         atexit.register(self._on_exit)
 
-    # ---------------- internals ----------------
+    # ------------------------------------------------------------------ acquire
 
-    @staticmethod
-    def _key(resource: str) -> str:
-        return f"lock:{resource}"
-
-    @staticmethod
-    def _who_key(resource: str) -> str:
-        return f"lockwho:{resource}"
-
-    # Keep old name as alias for backward compatibility
-    _who = _who_key
-
-    def _start_heartbeat(self, duration: int):
-        self._hb_stop.clear()
-        self._hb_thread = threading.Thread(target=self._hb_loop, args=(duration,), daemon=True)
-        self._hb_thread.start()
-
-    def _stop_heartbeat(self):
-        self._hb_stop.set()
-        if self._hb_thread and self._hb_thread.is_alive():
-            self._hb_thread.join(timeout=1.0)
-        self._hb_thread = None
-
-    def _hb_loop(self, duration: int):
-        interval = max(1, int(duration // 2))
-        while not self._hb_stop.is_set():
-            time.sleep(interval)
-            try:
-                # refresh TTL for all held — atomically via Lua
-                for res, token in list(self._held.items()):
-                    try:
-                        self._refresh_script(
-                            keys=[self._key(res), self._who_key(res)],
-                            args=[token, duration, self.identity],
-                        )
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.debug(f"[redis-lock] heartbeat error: {e}")
-
-    # ---------------- public API ----------------
-
-    def acquire(self, resources: Iterable[str], duration: int = 30, who: str = "") -> bool:
+    def acquire(
+        self,
+        key: str,
+        ttl_s: int = 30,
+        timeout_s: int = 30,
+        retry_interval: float = 0.05,
+    ) -> Optional[str]:
         """
-        Acquire all resources atomically. If any fails, none are kept.
-        """
-        resources = [str(r) for r in resources]
-        tokens: Dict[str, str] = {}
-        deadline = time.time() + 30
+        Attempt to acquire a lock on *key* using SET NX EX.
 
+        Retries with ``retry_interval`` sleep until ``timeout_s`` elapses.
+        Returns a unique token (``str``) on success, or ``None`` on timeout.
+        The token **must** be passed to :meth:`release` or :meth:`extend`.
+
+        A background heartbeat automatically extends the lock at half-TTL
+        while it is held.  The ``ttl_s`` controls crash recovery time only.
+        """
+        token = uuid.uuid4().hex
+        ttl_ms = max(1000, int(ttl_s) * 1000)
+        deadline = time.time() + max(1, int(timeout_s))
         while time.time() < deadline:
             try:
-                # try to set all with pipeline
-                pipe = self.redis.pipeline()
-                tokens.clear()
-                for r in resources:
-                    t = uuid.uuid4().hex
-                    tokens[r] = t
-                    pipe.set(self._key(r), t, nx=True, ex=max(1, int(duration)))
-                results = pipe.execute()
+                ok = self.r.set(key, token, nx=True, ex=max(1, int(ttl_s)))
+                if ok:
+                    with self._held_lock:
+                        self._held[key] = (token, ttl_ms)
+                        if self._hb_thread is None or not self._hb_thread.is_alive():
+                            self._start_heartbeat()
+                    return token
+            except redis.RedisError as e:
+                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
+            time.sleep(retry_interval)
+        return None
 
-                if all(bool(ok) for ok in results):
-                    # set who (best effort)
-                    try:
-                        p2 = self.redis.pipeline()
-                        for r in resources:
-                            p2.set(self._who_key(r), who or self.identity, ex=max(1, int(duration)))
-                        p2.execute()
-                    except Exception:
-                        pass
+    # ------------------------------------------------------------------ release
 
-                    self._held.update(tokens)
-                    if not self._hb_thread:
-                        self._start_heartbeat(duration)
-                    return True
+    def release(self, key: str, token: str) -> bool:
+        """
+        Release the lock on *key* only if it is still held by *token*.
 
-                # rollback partial acquisitions atomically using Lua
-                for r, t in tokens.items():
-                    try:
-                        self._cond_del_script(
-                            keys=[self._key(r), self._who_key(r)],
-                            args=[t],
-                        )
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.debug(f"[redis-lock] acquire error: {e}")
-
-            time.sleep(self.check_interval)
-
-        return False
-
-    def release(self, resources: Iterable[str]) -> None:
-        resources = [str(r) for r in resources]
+        Uses a Lua script for atomic compare-and-delete.
+        Returns ``True`` if the lock was released, ``False`` otherwise.
+        """
         try:
-            for r in resources:
-                tok = self._held.get(r)
-                if not tok:
-                    continue
+            res = self._release_if_token(keys=[key], args=[token])
+            released = int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-lock] release error on {key}: {e}")
+            released = False
+
+        # Always remove from held tracking (even if Lua returned 0, the key
+        # may have expired — either way this instance no longer owns it).
+        # Decide whether to stop heartbeat inside the lock, but execute
+        # _stop_heartbeat outside to avoid deadlock (heartbeat thread also
+        # acquires _held_lock).
+        should_stop_hb = False
+        with self._held_lock:
+            held_entry = self._held.get(key)
+            if held_entry is not None and held_entry[0] == token:
+                del self._held[key]
+            if not self._held:
+                should_stop_hb = True
+
+        if should_stop_hb:
+            self._stop_heartbeat()
+
+        return released
+
+    # ------------------------------------------------------------------ extend
+
+    def extend(self, key: str, token: str, ttl_ms: int) -> bool:
+        """
+        Extend the TTL of *key* only if it is still held by *token*.
+
+        Uses a Lua script for atomic compare-and-extend.
+        Returns ``True`` if the TTL was extended, ``False`` otherwise.
+        """
+        try:
+            res = self._extend_if_token(keys=[key], args=[token, int(ttl_ms)])
+            return int(res or 0) == 1
+        except redis.RedisError as e:
+            logger.debug(f"[redis-lock] extend error on {key}: {e}")
+            return False
+
+    # ------------------------------------------------------------------ heartbeat
+
+    def _start_heartbeat(self) -> None:
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        self._hb_stop.set()
+        if self._hb_thread is not None and self._hb_thread.is_alive():
+            self._hb_thread.join(timeout=2.0)
+        self._hb_thread = None
+
+    def _hb_loop(self) -> None:
+        """
+        Refresh all held locks at half their TTL.
+
+        The sleep interval adapts to the shortest TTL across all currently
+        held locks.  Uses ``Event.wait`` so ``_stop_heartbeat`` can interrupt
+        immediately without waiting for the full interval.
+        """
+        while not self._hb_stop.is_set():
+            # Compute sleep interval from held locks
+            with self._held_lock:
+                if not self._held:
+                    break
+                min_ttl_ms = min(ttl_ms for _, ttl_ms in self._held.values())
+
+            # Sleep for half the shortest TTL
+            interval_s = max(1.0, (min_ttl_ms / 1000.0) / 2.0)
+            self._hb_stop.wait(timeout=interval_s)
+            if self._hb_stop.is_set():
+                break
+
+            # Snapshot held locks under the lock, then extend outside of it
+            with self._held_lock:
+                snapshot = dict(self._held)
+
+            for key, (token, ttl_ms) in snapshot.items():
                 try:
-                    self._release_script(
-                        keys=[self._key(r), self._who_key(r)],
-                        args=[tok],
-                    )
+                    ok = self.extend(key, token, ttl_ms)
+                    if not ok:
+                        # Lock expired or was stolen — remove from tracking
+                        logger.debug(f"[redis-lock] heartbeat: lost lock on {key}")
+                        with self._held_lock:
+                            held_entry = self._held.get(key)
+                            if held_entry is not None and held_entry[0] == token:
+                                del self._held[key]
+                except Exception as e:
+                    logger.debug(f"[redis-lock] heartbeat error on {key}: {e}")
+
+    # ------------------------------------------------------------------ cleanup
+
+    def _on_exit(self) -> None:
+        """Best-effort release of all held locks on interpreter shutdown."""
+        try:
+            with self._held_lock:
+                snapshot = dict(self._held)
+            for key, (token, _ttl_ms) in snapshot.items():
+                try:
+                    self.release(key, token)
                 except Exception:
                     pass
-                self._held.pop(r, None)
-        finally:
-            if not self._held:
-                self._stop_heartbeat()
-
-    def who(self, resources: Iterable[str]) -> Dict[str, str]:
-        res = [str(r) for r in resources]
-        out: Dict[str, str] = {}
-        try:
-            p = self.redis.pipeline()
-            for r in res:
-                p.get(self._who_key(r))
-            vals = p.execute()
-            for r, v in zip(res, vals):
-                if v:
-                    out[r] = str(v)
-        except Exception:
-            pass
-        return out
-
-    # ---------------- cleanup ----------------
-
-    def _on_exit(self):
-        try:
-            if self._held:
-                self.release(list(self._held.keys()))
         except Exception:
             pass
         self._stop_heartbeat()

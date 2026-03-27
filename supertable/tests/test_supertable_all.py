@@ -338,34 +338,34 @@ class TestFindAndLockOverlappingFiles:
 
     @patch("supertable.processing._storage")
     def test_no_resources_returns_empty(self, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         snapshot = _dummy_snapshot(resources=[])
         df = _polars_df({"day": ["2023-01-01"], "value": [1]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         assert len(result) == 0
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema", return_value={"day": "String", "value": "Int64"})
     def test_resource_with_no_stats_marked_as_overlapping(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         resource = _resource_entry("data/file1.parquet", stats=None)
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-01"], "value": [1]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping = [f for f in result if f[1] is True]
         assert len(overlapping) == 1
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema", return_value={"day": "String", "value": "Int64"})
     def test_resource_with_stats_no_overlap(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         resource = _resource_entry(
             "data/file1.parquet",
             stats={"day": {"min": "2023-06-01", "max": "2023-06-30"}},
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-01"], "value": [1]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         # No overlap → either not in result, or has_overlap=False
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 0
@@ -373,27 +373,27 @@ class TestFindAndLockOverlappingFiles:
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema", return_value={"day": "String", "value": "Int64"})
     def test_resource_with_stats_has_overlap(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         resource = _resource_entry(
             "data/file1.parquet",
             stats={"day": {"min": "2023-01-01", "max": "2023-01-31"}},
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-15"], "value": [1]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.default")
     def test_no_overwrite_columns_compaction_path(self, mock_default, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         mock_default.MAX_MEMORY_CHUNK_SIZE = 512 * 1024 * 1024
         mock_default.MAX_OVERLAPPING_FILES = 100
         resource = _resource_entry("data/file1.parquet", file_size=1024)
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-01"], "value": [1]})
-        result = find_and_lock_overlapping_files(snapshot, df, [], locking=None)
+        result = find_overlapping_files(snapshot, df, [], locking=None)
         # Without overwrite columns → compaction path, has_overlap=False
         for item in result:
             assert item[1] is False
@@ -401,28 +401,28 @@ class TestFindAndLockOverlappingFiles:
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema", return_value={"day": "String"})
     def test_resource_stats_missing_column_treated_as_overlapping(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         resource = _resource_entry(
             "data/file1.parquet",
             stats={"other_col": {"min": "a", "max": "z"}},  # day not in stats
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-15"]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema", return_value={"day": "String"})
     def test_resource_stats_none_min_max_treated_as_overlapping(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
         resource = _resource_entry(
             "data/file1.parquet",
             stats={"day": {"min": None, "max": None}},
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": ["2023-01-15"]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
@@ -1965,7 +1965,7 @@ class TestOverlapDetectionWithDateTypes:
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema")
     def test_date_overlap_with_iso_strings(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         mock_schema.return_value = {"day": "Date"}
         resource = _resource_entry(
@@ -1974,14 +1974,14 @@ class TestOverlapDetectionWithDateTypes:
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = pl.DataFrame({"day": [date(2023, 1, 15)]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema")
     def test_datetime_overlap_with_iso_strings(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         mock_schema.return_value = {"dt": "DateTime"}
         resource = _resource_entry(
@@ -1990,7 +1990,7 @@ class TestOverlapDetectionWithDateTypes:
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = pl.DataFrame({"dt": [datetime(2023, 1, 15, 12, 0)]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["dt"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["dt"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
@@ -2001,7 +2001,7 @@ class TestMultipleOverwriteColumns:
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema")
     def test_overlap_any_column_match_triggers_overlap(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         mock_schema.return_value = {"day": "String", "client": "String"}
         resource = _resource_entry(
@@ -2015,14 +2015,14 @@ class TestMultipleOverwriteColumns:
         # day is outside range BUT client is within range → overlap detected
         # because the code checks each overwrite column and breaks on first match
         df = _polars_df({"day": ["2023-06-01"], "client": ["clientB"]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day", "client"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day", "client"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
 
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema")
     def test_no_overlap_when_all_columns_outside_range(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         mock_schema.return_value = {"day": "String", "client": "String"}
         resource = _resource_entry(
@@ -2035,7 +2035,7 @@ class TestMultipleOverwriteColumns:
         snapshot = _dummy_snapshot(resources=[resource])
         # day=2023-06-01 outside [01-01,01-31], client=clientZ outside [clientA,clientC]
         df = _polars_df({"day": ["2023-06-01"], "client": ["clientZ"]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day", "client"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day", "client"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 0
 
@@ -2046,7 +2046,7 @@ class TestNoneValuesInOverwriteColumns:
     @patch("supertable.processing._storage")
     @patch("supertable.processing.collect_schema")
     def test_none_values_treated_as_overlap(self, mock_schema, mock_storage):
-        from supertable.processing import find_and_lock_overlapping_files
+        from supertable.processing import find_overlapping_files
 
         mock_schema.return_value = {"day": "String"}
         resource = _resource_entry(
@@ -2055,6 +2055,6 @@ class TestNoneValuesInOverwriteColumns:
         )
         snapshot = _dummy_snapshot(resources=[resource])
         df = _polars_df({"day": [None, "2023-06-01"]})
-        result = find_and_lock_overlapping_files(snapshot, df, ["day"], locking=None)
+        result = find_overlapping_files(snapshot, df, ["day"], locking=None)
         overlapping_true = [f for f in result if f[1] is True]
         assert len(overlapping_true) == 1
