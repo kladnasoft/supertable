@@ -73,6 +73,10 @@ class Reflection:
     reflection_bytes: int
     total_reflections: int
     supers: List[SuperSnapshot]
+    # Max last_updated_ms across all snapshots.  Used by the engine
+    # auto-picker to distinguish fresh (still-churning) data from stable
+    # data where caching pays off.  0 means unknown.
+    freshness_ms: int = 0
     # alias -> RbacViewDef.  Empty dict means no RBAC filtering.
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
     # alias -> DedupViewDef.  Empty dict means no dedup-on-read.

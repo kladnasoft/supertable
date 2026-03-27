@@ -97,29 +97,6 @@ def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     return f"spark_{digest}_v{version}"
 
 
-def _spark_create_table_sql(
-        table_name: str,
-        files: List[str],
-) -> str:
-    """Generate Spark SQL to create a temp view from parquet files."""
-    if not files:
-        raise ValueError(f"No files for Spark table '{table_name}'")
-
-    # Spark reads multiple parquet files via a path list
-    escaped = [escape_parquet_path(f) for f in files]
-    paths_str = ", ".join(f"'{f}'" for f in escaped)
-
-    # Use CREATE OR REPLACE TEMPORARY VIEW with parquet datasource
-    return (
-        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} "
-        f"USING parquet "
-        f"OPTIONS (path '{escaped[0]}', mergeSchema 'true')"
-    ) if len(files) == 1 else (
-        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS "
-        f"SELECT * FROM parquet.`{{}}`"
-    )
-
-
 def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> List[str]:
     """Register parquet files as a Spark temp view via Thrift.
 
@@ -474,6 +451,48 @@ def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
             logger.debug(f"[spark.thrift] SET {key} failed: {e}")
 
 
+def _execute_with_stmt_timeout(
+        cursor,
+        sql: str,
+        conn,
+        stmt_timeout_s: int,
+        timed_out_event: threading.Event,
+        log_prefix: str = "",
+) -> None:
+    """Execute a single SQL statement with per-statement timeout enforcement.
+
+    If the statement does not complete within *stmt_timeout_s* seconds the
+    connection is forcibly closed (which unblocks any pending Thrift RPC)
+    and the overall *timed_out_event* is set so upstream code can detect
+    the timeout.
+
+    Use this for heavyweight operations (user query, EXPLAIN) that may
+    hang.  Lightweight DDL (CREATE VIEW, SET) can rely on the overall
+    query-level watchdog instead.
+    """
+    if timed_out_event.is_set():
+        raise RuntimeError("Query already timed out")
+
+    def _on_timeout():
+        logger.error(
+            f"{log_prefix}[spark.thrift] statement timeout after {stmt_timeout_s}s — "
+            f"closing connection: {sql[:120]}"
+        )
+        timed_out_event.set()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    timer = threading.Timer(stmt_timeout_s, _on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        cursor.execute(sql)
+    finally:
+        timer.cancel()
+
+
 # =========================================================
 # SparkThrift executor
 # =========================================================
@@ -577,6 +596,7 @@ class SparkThriftExecutor:
         pending Thrift RPC and raises a RuntimeError to the caller.
         """
         query_timeout = _spark_timeout_seconds()
+        stmt_timeout = _spark_statement_timeout_seconds()
 
         # 1. Select cluster
         cluster = self._select_cluster(reflection.reflection_bytes, force=force)
@@ -812,7 +832,10 @@ class SparkThriftExecutor:
             #     local path that DuckDB uses for its JSON profile, so
             #     plan_extender reads it uniformly.
             try:
-                cursor.execute(f"EXPLAIN EXTENDED {executing_query}")
+                _execute_with_stmt_timeout(
+                    cursor, f"EXPLAIN EXTENDED {executing_query}",
+                    conn, stmt_timeout, _timed_out, log_prefix,
+                )
                 explain_rows = cursor.fetchall()
                 explain_text = "\n".join(
                     str(row[0]) if row else "" for row in explain_rows
@@ -865,7 +888,10 @@ class SparkThriftExecutor:
                     f"{explain_err}"
                 )
 
-            cursor.execute(executing_query)
+            _execute_with_stmt_timeout(
+                cursor, executing_query,
+                conn, stmt_timeout, _timed_out, log_prefix,
+            )
 
             if _timed_out.is_set():
                 raise RuntimeError(

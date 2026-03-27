@@ -300,6 +300,7 @@ class DataEstimator:
 
         supers: List[SuperSnapshot] = []
         reflection_file_size = 0
+        max_freshness_ms = 0
 
         super_map = self._get_supertable_map()
 
@@ -317,6 +318,9 @@ class DataEstimator:
 
                 current_version = 0
                 for snapshot in snapshots:
+                    ts = int(snapshot.get("last_updated_ms", 0))
+                    if ts > max_freshness_ms:
+                        max_freshness_ms = ts
                     current_snapshot_path = snapshot["path"]
                     current_snapshot_data = snapshot.get("payload")
                     if not (isinstance(current_snapshot_data, dict) and isinstance(
@@ -382,4 +386,5 @@ class DataEstimator:
             reflection_bytes=int(reflection_file_size),
             total_reflections=total_reflections,
             supers=supers,
+            freshness_ms=max_freshness_ms,
         )

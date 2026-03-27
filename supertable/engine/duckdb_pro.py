@@ -365,21 +365,19 @@ class DuckDBPro:
             )
             parser.executing_query = executing_query
 
-            # Enable profiling immediately before execution.  PRAGMAs are
-            # connection-level state — setting them as close as possible to
-            # the execute call minimises the race window when concurrent
-            # queries share the singleton connection.  Profiling is disabled
-            # in the finally block to avoid capturing cleanup DDL.
+            logger.debug(f"{log_prefix}[duckdb.pro] executing: {executing_query}")
+
+            # Profiling PRAGMAs are connection-level state.  Under concurrent
+            # queries the last SET wins — one query's profile may land in the
+            # wrong file.  This is acceptable: profiling is best-effort
+            # diagnostics, and query_plan_path is already unique per query
+            # (contains query_id) so profiles never overwrite on disk.
             try:
                 con.execute("PRAGMA enable_profiling='json';")
                 con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
             except Exception:
                 pass
 
-            logger.debug(f"{log_prefix}[duckdb.pro] executing: {executing_query}")
-
-            # The actual query execution can use a thread-local cursor
-            # DuckDB allows concurrent reads on the same connection.
             result = con.execute(executing_query).fetchdf()
             return result
 

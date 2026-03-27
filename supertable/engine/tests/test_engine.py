@@ -896,14 +896,53 @@ class TestExecutor:
         _, kwargs = instance.execute.call_args
         assert kwargs.get("force") is True
 
-    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_pro_for_small_data(self, mock_exec):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
+    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
+    def test_auto_picks_lite_for_small_data(self, mock_exec):
         r, p, qm, t, ps = _exec_fixtures()
         r.reflection_bytes = 1000
         _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
+        assert used == "duckdb_lite"
+
+    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
+    def test_auto_picks_pro_for_medium_stable_data(self, mock_exec):
+        import supertable.engine.executor as mod
+        mod._pro_singleton = None
+        r, p, qm, t, ps = _exec_fixtures()
+        # 500 MB, stable (freshness_ms=0 means unknown → treated as stable)
+        r.reflection_bytes = 500 * 1024 * 1024
+        r.freshness_ms = 0
+        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
         assert used == "duckdb_pro"
+
+    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
+    def test_auto_picks_lite_for_medium_fresh_data(self, mock_exec):
+        import time
+        r, p, qm, t, ps = _exec_fixtures()
+        # 500 MB, just updated 10 seconds ago (fresh → cache would churn)
+        r.reflection_bytes = 500 * 1024 * 1024
+        r.freshness_ms = int(time.time() * 1000) - 10_000
+        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
+        assert used == "duckdb_lite"
+
+    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
+    def test_auto_picks_pro_for_medium_old_data(self, mock_exec):
+        import time
+        import supertable.engine.executor as mod
+        mod._pro_singleton = None
+        r, p, qm, t, ps = _exec_fixtures()
+        # 500 MB, updated 10 minutes ago (stable → cache pays off)
+        r.reflection_bytes = 500 * 1024 * 1024
+        r.freshness_ms = int(time.time() * 1000) - 600_000
+        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
+        assert used == "duckdb_pro"
+
+    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
+    def test_auto_picks_lite_at_boundary(self, mock_exec):
+        r, p, qm, t, ps = _exec_fixtures()
+        # Exactly at lite_max threshold (100 MB) — should still pick LITE
+        r.reflection_bytes = 100 * 1024 * 1024
+        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
+        assert used == "duckdb_lite"
 
     @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
     def test_plan_stats_records_engine(self, mock_exec):

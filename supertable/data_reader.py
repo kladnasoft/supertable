@@ -79,8 +79,8 @@ class DataReader:
         )
         tables = parser.get_table_tuples()
 
-        # RBAC check before returning
-        restrict_read_access(
+        # RBAC check — also returns per-alias column/row filter definitions
+        rbac_views = restrict_read_access(
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
@@ -109,6 +109,10 @@ class DataReader:
             reflection = estimator.estimate()
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
+
+            # Wire RBAC column/row filter definitions onto the reflection so
+            # executors create filtered views for restricted roles.
+            reflection.rbac_views = rbac_views
 
             # --- Dedup-on-read & tombstones: look up table configs and snapshot metadata ---
             try:
