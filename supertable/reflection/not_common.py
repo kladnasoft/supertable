@@ -224,6 +224,10 @@ attach_security_routes(
     inject_session_into_ctx=inject_session_into_ctx,
     list_users=list_users,
     list_roles=list_roles,
+    redis_client=redis_client,
+    settings=settings,
+    get_session=get_session,
+    admin_guard_api=admin_guard_api,
 )
 
 

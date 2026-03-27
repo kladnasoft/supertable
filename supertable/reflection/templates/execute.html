@@ -127,7 +127,7 @@
 
     /* ─── LEFT PANEL: Schema Explorer ─── */
     .cc-panel-left {
-      width: 220px; min-width: 220px; border-right: 1px solid var(--panel-border);
+      width: 279px; min-width: 279px; border-right: 1px solid var(--panel-border);
       background: var(--panel-bg); display: flex; flex-direction: column;
       flex-shrink: 0; transition: width 0.25s ease, min-width 0.25s ease;
     }
@@ -178,6 +178,12 @@
       padding: 8px 12px; border-bottom: 1px solid var(--border-light); flex-shrink: 0;
     }
     .cc-panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+    .cc-panel-actions { display: flex; align-items: center; gap: 6px; }
+    .cc-icon-btn { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--panel-border); background: transparent; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px; transition: all .15s; }
+    .cc-icon-btn:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
+    .cc-sys-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 10px; font-weight: 600; color: var(--text-muted); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--panel-border); background: transparent; transition: all .15s; font-family: inherit; white-space: nowrap; }
+    .cc-sys-toggle:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    .cc-sys-toggle.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
     .cc-panel-toggle {
       background: none; border: none; cursor: pointer; color: var(--text-muted);
       font-size: 12px; padding: 4px; border-radius: 4px; transition: var(--transition);
@@ -205,6 +211,13 @@
     .schema-col { padding: 3px 12px 3px 0; font-size: 11px; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 6px; transition: var(--transition); }
     .schema-col:hover { color: var(--primary-color); }
     .schema-col .col-type { font-size: 9px; font-family: var(--mono); background: var(--bg-surface); border: 1px solid var(--border-light); padding: 0 4px; border-radius: 3px; color: var(--text-muted); margin-left: auto; flex-shrink: 0; }
+
+    /* ═══ TABLE INSERT ICON ═══ */
+    .schema-table .tbl-insert { opacity: 0; margin-left: auto; font-size: 9px; color: var(--text-muted); padding: 2px 5px; border-radius: 3px; transition: all 0.15s; flex-shrink: 0; border: 1px solid transparent; }
+    .schema-table:hover .tbl-insert { opacity: 1; }
+    .schema-table .tbl-insert:hover { color: var(--primary-color); background: var(--primary-light); border-color: var(--primary-color); }
+    .schema-table.sys-table { opacity: 0.5; }
+    .schema-table.sys-table .table-icon { color: var(--text-muted); }
 
     .snippets-section { border-top: 1px solid var(--border-light); flex-shrink: 0; }
     .snippet-item { padding: 6px 12px; font-size: 11px; cursor: pointer; transition: var(--transition); display: flex; align-items: center; gap: 6px; color: var(--text-secondary); }
@@ -2579,7 +2592,7 @@ let html = '';
       }
 
       if (manage) {
-        const url = new URL('/reflection/rbac', window.location.origin);
+        const url = new URL('/reflection/security', window.location.origin);
         url.searchParams.set('org', organization);
         url.searchParams.set('sup', superName);
         manage.href = url.toString();
@@ -3542,8 +3555,13 @@ $(document).ready(function(){
       <!-- LEFT PANEL: Schema Explorer -->
       <aside class="cc-panel-left" id="ccPanelLeft">
         <div class="cc-panel-header">
-          <span class="cc-panel-title">Schema explorer</span>
-          <button class="cc-panel-toggle" onclick="ccTogglePanel('left')"><i class="fas fa-chevron-left"></i></button>
+          <span class="cc-panel-title">Schema</span>
+          <div class="cc-panel-actions">
+            <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);"></span>
+            <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
+            <button class="cc-icon-btn" onclick="loadSchema(true)" title="Refresh schema"><i class="fas fa-sync-alt"></i></button>
+            <button class="cc-panel-toggle" onclick="ccTogglePanel('left')"><i class="fas fa-chevron-left"></i></button>
+          </div>
         </div>
         <div class="schema-search-wrap">
           <i class="fas fa-search"></i>
@@ -4181,6 +4199,19 @@ $(document).ready(function(){
     })();
 
     // --- Schema Browser rendering from IntelliSense cache ---
+    var _ccShowSysTables = false;
+
+    function ccToggleSystemTables() {
+      _ccShowSysTables = !_ccShowSysTables;
+      var btn = document.getElementById('ccSysToggle');
+      if (btn) {
+        btn.classList.toggle('active', _ccShowSysTables);
+        btn.querySelector('i').className = _ccShowSysTables ? 'fas fa-eye' : 'fas fa-eye-slash';
+        btn.style.fontSize = '9px';
+      }
+      ccRenderSchemaTree(document.getElementById('schemaFilter') ? document.getElementById('schemaFilter').value : '');
+    }
+
     function ccRenderSchemaTree(filter) {
       var tree = document.getElementById('schemaTree');
       if (!tree) return;
@@ -4188,7 +4219,26 @@ $(document).ready(function(){
       var tables = window.__hintTables || {};
       var filt = (filter || '').toLowerCase();
 
-      Object.keys(tables).forEach(function(tbl) {
+      var allNames = Object.keys(tables).sort();
+      var sysCount = 0;
+      var userCount = 0;
+      allNames.forEach(function(t) { if (t.startsWith('__')) sysCount++; else userCount++; });
+
+      // Update table count display
+      var countEl = document.getElementById('ccTableCount');
+      if (countEl) {
+        if (sysCount > 0 && !_ccShowSysTables) {
+          countEl.textContent = userCount + ' (+' + sysCount + ' sys)';
+        } else {
+          countEl.textContent = (userCount + (_ccShowSysTables ? sysCount : 0)) + ' / ' + allNames.length;
+        }
+      }
+
+      allNames.forEach(function(tbl) {
+        // System table filter
+        var isSys = tbl.startsWith('__');
+        if (isSys && !_ccShowSysTables) return;
+
         var cols = tables[tbl].columns || [];
         var matchTable = !filt || tbl.toLowerCase().includes(filt);
         var matchCols = cols.filter(function(c) { return c.toLowerCase().includes(filt); });
@@ -4196,8 +4246,11 @@ $(document).ready(function(){
 
         var div = document.createElement('div');
         var tblEl = document.createElement('div');
-        tblEl.className = 'schema-table';
-        tblEl.innerHTML = '<i class="fas fa-chevron-right chevron"></i><i class="fas fa-table table-icon"></i>' + tbl;
+        tblEl.className = 'schema-table' + (isSys ? ' sys-table' : '');
+        tblEl.innerHTML = '<i class="fas fa-chevron-right chevron"></i>' +
+          '<i class="fas fa-' + (isSys ? 'cog' : 'table') + ' table-icon"></i>' +
+          '<span class="tbl-label">' + tbl + '</span>' +
+          '<span class="tbl-insert" title="Insert table name into editor"><i class="fas fa-arrow-right"></i></span>';
 
         var colsDiv = document.createElement('div');
         colsDiv.className = 'schema-columns';
@@ -4206,6 +4259,7 @@ $(document).ready(function(){
           var col = document.createElement('div');
           col.className = 'schema-col';
           col.innerHTML = '<i class="fas fa-columns" style="font-size:9px;opacity:0.4;"></i>' + c;
+          col.title = 'Click to insert column name';
           col.addEventListener('click', function(e) {
             e.stopPropagation();
             if (window.editor) { var cur = window.editor.getCursor(); window.editor.replaceRange(c, cur); window.editor.focus(); }
@@ -4213,6 +4267,21 @@ $(document).ready(function(){
           colsDiv.appendChild(col);
         });
 
+        // Insert icon click → insert table name at cursor
+        var insertBtn = tblEl.querySelector('.tbl-insert');
+        insertBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (window.editor) {
+            var cur = window.editor.getCursor();
+            window.editor.replaceRange(tbl, cur);
+            window.editor.focus();
+          }
+          // Flash feedback
+          insertBtn.style.color = 'var(--success)';
+          setTimeout(function() { insertBtn.style.color = ''; }, 400);
+        });
+
+        // Table row click → expand/collapse
         tblEl.addEventListener('click', function() {
           tblEl.classList.toggle('open');
           colsDiv.classList.toggle('open');
@@ -4225,7 +4294,7 @@ $(document).ready(function(){
         tree.appendChild(div);
       });
 
-      if (!Object.keys(tables).length) {
+      if (!allNames.length) {
         tree.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;text-align:center;">Schema loading…<br>Execute a query first.</div>';
       }
     }

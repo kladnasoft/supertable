@@ -1,3 +1,4 @@
+# route: supertable.reflection.quality.config
 # supertable/reflection/quality/config.py
 """
 Redis-backed configuration for Data Quality checks.
@@ -239,7 +240,11 @@ class DQConfig:
         return {
             "quick_cron": "0 */4 * * *",
             "deep_cron": "0 2 * * *",
+            "custom_cron": "0 */6 * * *",
             "post_ingest": True,
+            "post_ingest_quick": True,
+            "post_ingest_custom": True,
+            "post_ingest_deep": False,
             "enabled": True,
         }
 

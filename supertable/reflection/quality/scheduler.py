@@ -112,10 +112,11 @@ def _scheduler_loop() -> None:
 
     last_quick_run: Dict[str, float] = {}  # "org:sup:table" -> epoch
     last_deep_run: Dict[str, float] = {}
+    last_custom_run: Dict[str, float] = {}
 
     while True:
         try:
-            _scheduler_tick(last_quick_run, last_deep_run)
+            _scheduler_tick(last_quick_run, last_deep_run, last_custom_run)
         except Exception:
             logger.error(f"[dq-scheduler] Error in tick:\n{traceback.format_exc()}")
         time.sleep(TICK_INTERVAL_SECONDS)
@@ -124,6 +125,7 @@ def _scheduler_loop() -> None:
 def _scheduler_tick(
     last_quick_run: Dict[str, float],
     last_deep_run: Dict[str, float],
+    last_custom_run: Dict[str, float],
 ) -> None:
     """Single scheduler tick — process cron-based and pending (post-ingest) checks."""
     try:
@@ -154,6 +156,7 @@ def _scheduler_tick(
 
         quick_cron = schedule.get("quick_cron", "0 */4 * * *")
         deep_cron = schedule.get("deep_cron", "0 2 * * *")
+        custom_cron = schedule.get("custom_cron", "0 */6 * * *")
         cooldown_sec = int(schedule.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
 
         tables = _list_tables(r, org, sup)
@@ -190,13 +193,40 @@ def _scheduler_tick(
                     if _try_run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
                         last_deep_run[tkey] = now
 
+            # ── CRON-BASED CUSTOM RULES CHECK ─────────────────────
+            table_custom_cron = (ts or {}).get("custom_cron") or custom_cron
+            custom_interval = _cron_to_seconds(table_custom_cron)
+            last_c = last_custom_run.get(tkey, 0)
+            custom_enabled = (ts or {}).get("custom_enabled", True)
+
+            if custom_enabled and now - last_c >= custom_interval:
+                has_rules = bool(dqc.list_rules_for_table(table_name))
+                if has_rules:
+                    if _try_run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
+                        last_custom_run[tkey] = now
+
             # ── POST-INGEST PENDING CHECK ─────────────────────────
             pending_key = _pending_key(org, sup, table_name)
             if r.exists(pending_key):
-                if _try_run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
-                    # Successfully started — remove pending flag
+                # Determine which tiers to run on ingest
+                pi_quick = schedule.get("post_ingest_quick", schedule.get("post_ingest", True) not in (False,))
+                pi_custom = schedule.get("post_ingest_custom", schedule.get("post_ingest", True) not in (False,))
+                pi_deep = schedule.get("post_ingest_deep", False)
+
+                ran_any = False
+                if pi_quick:
+                    if _try_run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
+                        ran_any = True
+                if pi_custom and dqc.list_rules_for_table(table_name):
+                    if _try_run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
+                        ran_any = True
+                if pi_deep:
+                    if _try_run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
+                        ran_any = True
+
+                if ran_any:
                     r.delete(pending_key)
-                # If _try_run_check returns False (locked or cooling down),
+                # If nothing ran (locked or cooling down),
                 # the pending key stays — we'll retry on the next tick.
 
 
@@ -246,6 +276,8 @@ def _try_run_check(
 
         if mode == "deep":
             _run_deep_check(r, org, sup, table_name, dqc)
+        elif mode == "custom":
+            _run_custom_check(r, org, sup, table_name, dqc)
         else:
             _run_quick_check(r, org, sup, table_name, dqc)
 
@@ -339,42 +371,14 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         schema_anomalies = detect_schema_drift(columns, prev_schema_tuples, checks)
         anomalies.extend(schema_anomalies)
 
-    # Custom rules
-    custom_rules = dqc.list_rules_for_table(table_name)
+    # Custom rules run on their own schedule (custom_cron) — not during quick check
     rule_results = []
-    for rule in custom_rules:
-        rule_sql = build_custom_rule_sql(rule, table_fqn)
-        if not rule_sql:
-            continue
-        try:
-            dr2 = DataReader(super_name=sup, organization=org, query=rule_sql)
-            r_df, _, _ = dr2.execute(role_name="superadmin")
-            r_result = r_df.to_dict(orient="records") if r_df is not None and not r_df.empty else []
-            eval_result = evaluate_custom_rule(rule, r_result)
-            rule_results.append({
-                "rule_id": rule["rule_id"],
-                "rule_type": rule["rule_type"],
-                "description": rule.get("description", ""),
-                **eval_result,
-            })
-            if eval_result["status"] != "ok":
-                anomalies.append({
-                    "check_id": f"R_{rule['rule_id']}",
-                    "check_name": f"Custom: {rule.get('description', rule['rule_type'])}",
-                    "column": rule.get("column_name"),
-                    "severity": rule.get("severity", "warning"),
-                    "message": eval_result.get("detail", ""),
-                    "value": eval_result.get("value"),
-                    "detected_at": _now_iso(),
-                })
-        except Exception as e:
-            logger.warning(f"[dq-scheduler] Custom rule {rule['rule_id']} failed: {e}")
 
     score = compute_quality_score(parsed.get("columns", {}), anomalies)
 
     n_warnings = sum(1 for a in anomalies if a.get("severity") == "warning")
     n_critical = sum(1 for a in anomalies if a.get("severity") == "critical")
-    total_checks = len([c for c in checks.values() if c.get("enabled")]) + len(custom_rules)
+    total_checks = len([c for c in checks.values() if c.get("enabled")])
     passed = total_checks - n_warnings - n_critical
 
     latest = {
@@ -515,6 +519,109 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             write_history_via_sql(org, sup, table_name, "deep", deep_latest, _deep_elapsed_ms)
     except Exception as e:
         logger.debug(f"[dq-scheduler] History write skipped for deep {table_name}: {e}")
+
+
+def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
+    """Execute custom rules for one table on their own schedule.
+
+    Runs all enabled custom rules, evaluates results, merges into the
+    existing latest (from Redis), recomputes score, and stores back.
+    """
+    _custom_start_ms = int(time.time() * 1000)
+
+    from supertable.reflection.quality.checker import (
+        build_custom_rule_sql, evaluate_custom_rule, compute_quality_score,
+    )
+
+    try:
+        from supertable.data_reader import DataReader
+    except ImportError:
+        logger.error("[dq-scheduler] DataReader not available")
+        return
+
+    custom_rules = dqc.list_rules_for_table(table_name)
+    if not custom_rules:
+        return
+
+    table_fqn = f"{sup}.{table_name}"
+    rule_results = []
+    rule_anomalies = []
+
+    for rule in custom_rules:
+        rule_sql = build_custom_rule_sql(rule, table_fqn)
+        if not rule_sql:
+            continue
+        try:
+            dr = DataReader(super_name=sup, organization=org, query=rule_sql)
+            r_df, _, _ = dr.execute(role_name="superadmin")
+            r_result = r_df.to_dict(orient="records") if r_df is not None and not r_df.empty else []
+            eval_result = evaluate_custom_rule(rule, r_result)
+            rule_results.append({
+                "rule_id": rule["rule_id"],
+                "rule_type": rule["rule_type"],
+                "description": rule.get("description", ""),
+                **eval_result,
+            })
+            if eval_result["status"] != "ok":
+                rule_anomalies.append({
+                    "check_id": f"R_{rule['rule_id']}",
+                    "check_name": f"Custom: {rule.get('description', rule['rule_type'])}",
+                    "column": rule.get("column_name"),
+                    "severity": rule.get("severity", "warning"),
+                    "message": eval_result.get("detail", ""),
+                    "value": eval_result.get("value"),
+                    "detected_at": _now_iso(),
+                })
+        except Exception as e:
+            logger.warning(f"[dq-scheduler] Custom rule {rule['rule_id']} failed: {e}")
+
+    # ── Merge into existing latest ────────────────────────────
+    existing = dqc.get_latest(table_name) or {}
+    existing_parsed = existing.get("parsed", {"total": 0, "columns": {}})
+
+    # Combine: keep built-in anomalies, replace custom rule anomalies
+    builtin_anomalies = [a for a in existing.get("anomalies", [])
+                         if not (a.get("check_id", "").startswith("R_"))]
+    all_anomalies = builtin_anomalies + rule_anomalies
+
+    # Recompute score with combined anomalies
+    score = compute_quality_score(existing_parsed.get("columns", {}), all_anomalies)
+
+    n_warnings = sum(1 for a in all_anomalies if a.get("severity") == "warning")
+    n_critical = sum(1 for a in all_anomalies if a.get("severity") == "critical")
+    builtin_count = existing.get("total_checks", 0) - len(existing.get("rule_results", []))
+    total_checks = max(0, builtin_count) + len(custom_rules)
+    passed = total_checks - n_warnings - n_critical
+
+    # Update the latest record in place
+    existing.update({
+        "quality_score": score,
+        "status": "critical" if n_critical > 0 else ("warning" if n_warnings > 0 else "ok"),
+        "total_checks": total_checks,
+        "passed": max(0, passed),
+        "warnings": n_warnings,
+        "critical": n_critical,
+        "anomalies": all_anomalies,
+        "rule_results": rule_results,
+        "custom_checked_at": _now_iso(),
+    })
+
+    dqc.set_latest(table_name, existing)
+    dqc.set_anomalies(table_name, all_anomalies)
+
+    logger.info(
+        f"[dq-scheduler] Custom rules check done: {table_name} — "
+        f"{len(custom_rules)} rules, {len(rule_anomalies)} issues, score={score}"
+    )
+
+    # ── Write to __data_quality__ history table ───────────────
+    _custom_elapsed_ms = int(time.time() * 1000) - _custom_start_ms
+    try:
+        from supertable.reflection.quality.history import write_history, write_history_via_sql
+        if not write_history(org, sup, table_name, "custom", existing, _custom_elapsed_ms):
+            write_history_via_sql(org, sup, table_name, "custom", existing, _custom_elapsed_ms)
+    except Exception as e:
+        logger.debug(f"[dq-scheduler] History write skipped for custom {table_name}: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────

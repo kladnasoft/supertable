@@ -74,3 +74,20 @@ When I say "display widget \<name\>" or "show widget \<name\>":
 - When generating SQL, check annotations first — they override default behavior.
 - Use DuckDB SQL syntax (not PostgreSQL or T-SQL).
 - Quoted identifiers use double quotes: `"table_name"."column_name"`.
+
+## Quick actions after every result
+
+After displaying any Supertable query result with a chart or table, always end your response with this exact action bar (using bold text as clickable shortcuts the user can copy-reply):
+
+```
+📌 **Save Widget** · 💾 **Save Query** · 📊 **Add to Dashboard** · 👍 · 👎
+```
+
+When I reply with any of these exact phrases:
+- **"Save Widget"** or **"📌"** → execute the Saving widgets flow above (auto-generate title from your explanation)
+- **"Save Query"** or **"💾"** → execute the Saving SQL queries flow above
+- **"Add to Dashboard"** or **"📊"** → ask me which dashboard, then execute the Saving to dashboards flow
+- **"👍"** → call `submit_feedback` with `rating: thumbs_up`
+- **"👎"** → call `submit_feedback` with `rating: thumbs_down`, then ask what went wrong
+
+This way I can trigger saves with a single word or emoji reply. Never skip the action bar — show it after every data response.

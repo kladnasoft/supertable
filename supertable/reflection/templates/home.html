@@ -102,6 +102,19 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .stat-val{font-size:2rem;font-weight:800;line-height:1.1;margin-bottom:4px;}
 .stat-label{font-size:13px;opacity:.85;font-weight:500;}
 
+/* Gateway / Integrations */
+.gw-section{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;margin-bottom:32px;box-shadow:var(--shadow-sm);}
+.gw-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;}
+@media(max-width:1100px){.gw-grid{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:640px){.gw-grid{grid-template-columns:1fr;}}
+.gw-card{display:flex;flex-direction:column;align-items:center;text-align:center;padding:22px 16px;border-radius:var(--radius-sm);border:1px solid var(--border-light);background:var(--bg-surface);transition:var(--transition);cursor:default;}
+.gw-card:hover{border-color:var(--primary);background:var(--primary-light);transform:translateY(-2px);box-shadow:var(--shadow-md);}
+.gw-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;margin-bottom:12px;color:#fff;}
+.gw-card h4{font-size:13px;font-weight:700;color:var(--text);margin:0 0 6px;}
+.gw-card p{font-size:11.5px;color:var(--text-muted);margin:0 0 10px;line-height:1.5;}
+.gw-tags{display:flex;flex-wrap:wrap;gap:4px;justify-content:center;}
+.gw-tag{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:rgba(28,150,202,.08);color:var(--primary);white-space:nowrap;}
+
 /* CTA */
 .cta-section{text-align:center;padding:36px 20px;}
 .cta-section h3{font-size:1.5rem;font-weight:800;color:var(--primary);margin:0 0 10px;letter-spacing:-.01em;}
@@ -219,6 +232,60 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       <h3>Security</h3>
       <p class="feat-desc">Unified roles, users, and token management. Fine-grained RBAC with row/column-level security, role distribution, and user coverage.</p>
       <a href="/reflection/security" class="feat-link" style="color:#be185d;">Manage Access <i class="fas fa-arrow-right"></i></a>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Gateway / Integrations ────────────────────────── -->
+<div class="gw-section">
+  <h2 class="section-heading"><i class="fas fa-plug"></i> Gateway — Connect Your Tools</h2>
+  <div class="gw-grid">
+
+    <div class="gw-card">
+      <div class="gw-icon" style="background:linear-gradient(135deg,#d97706,#b45309);box-shadow:0 2px 8px rgba(217,119,6,.2);"><i class="fas fa-robot"></i></div>
+      <h4>MCP Server</h4>
+      <p>Query your data directly from AI clients. Native Model Context Protocol support — stdio &amp; HTTP transport.</p>
+      <div class="gw-tags">
+        <span class="gw-tag">Claude Desktop</span>
+        <span class="gw-tag">ChatGPT</span>
+        <span class="gw-tag">Copilot</span>
+        <span class="gw-tag">Cursor</span>
+      </div>
+    </div>
+
+    <div class="gw-card">
+      <div class="gw-icon" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);box-shadow:0 2px 8px rgba(124,58,237,.2);"><i class="fas fa-code"></i></div>
+      <h4>REST API</h4>
+      <p>Programmatic access to tables, metadata, queries, and administration. Token-authenticated JSON endpoints.</p>
+      <div class="gw-tags">
+        <span class="gw-tag">JSON</span>
+        <span class="gw-tag">Token Auth</span>
+        <span class="gw-tag">CRUD</span>
+      </div>
+    </div>
+
+    <div class="gw-card">
+      <div class="gw-icon" style="background:linear-gradient(135deg,#059669,#047857);box-shadow:0 2px 8px rgba(5,150,105,.2);"><i class="fab fa-python"></i></div>
+      <h4>Python SDK</h4>
+      <p>Native Python client for notebooks, scripts, and applications. Read, write, and query with familiar Pythonic patterns.</p>
+      <div class="gw-tags">
+        <span class="gw-tag">pip install</span>
+        <span class="gw-tag">Notebooks</span>
+        <span class="gw-tag">pandas</span>
+      </div>
+    </div>
+
+    <div class="gw-card">
+      <div class="gw-icon" style="background:linear-gradient(135deg,#0891b2,#0e7490);box-shadow:0 2px 8px rgba(8,145,178,.2);"><i class="fas fa-rss"></i></div>
+      <h4>OData Feed</h4>
+      <p>RBAC-secured data feeds for legacy BI tools. Saved queries become live, role-filtered data endpoints.</p>
+      <div class="gw-tags">
+        <span class="gw-tag">Power BI</span>
+        <span class="gw-tag">Excel</span>
+        <span class="gw-tag">Tableau</span>
+        <span class="gw-tag">SAP</span>
+      </div>
     </div>
 
   </div>

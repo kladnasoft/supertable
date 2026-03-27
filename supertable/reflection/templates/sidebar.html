@@ -169,6 +169,13 @@
     text-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
   }
 
+  .logo-text-accent {
+    background: linear-gradient(to right, #f59e0b, #f97316);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
   /* ── Navigation ───────────────────────────────────────────────── */
 
   .sidebar-nav {
@@ -654,7 +661,7 @@
         <span class="data-grid"></span>
       </span>
     </span>
-    <span class="logo-text">Data Reflection</span>
+    <span class="logo-text">Data Island <span class="logo-text-accent">Core</span></span>
   </div>
 
   <nav class="nav flex-column sidebar-nav">
@@ -679,14 +686,9 @@
       <span class="nav-item-label">Ingestion</span>
     </a>
 
-    <a href="/reflection/studio" class="nav-item" id="link-studio">
-      <i class="fas fa-book nav-item-icon"></i>
-      <span class="nav-item-label">Studio</span>
-    </a>
-
-    <a href="/reflection/jobs" class="nav-item" id="link-jobs">
-      <i class="fas fa-clock nav-item-icon"></i>
-      <span class="nav-item-label">Jobs</span>
+    <a href="/reflection/quality" class="nav-item" id="link-quality">
+      <i class="fas fa-heartbeat nav-item-icon"></i>
+      <span class="nav-item-label">Data Quality</span>
     </a>
 
     <a href="/reflection/monitoring" class="nav-item" id="link-monitoring">
@@ -694,19 +696,9 @@
       <span class="nav-item-label">Monitoring</span>
     </a>
 
-    <a href="/reflection/quality" class="nav-item" id="link-quality">
-      <i class="fas fa-heartbeat nav-item-icon"></i>
-      <span class="nav-item-label">Data Quality</span>
-    </a>
-
-    <a href="/reflection/vault" class="nav-item" id="link-vault">
-      <i class="fas fa-vault nav-item-icon"></i>
-      <span class="nav-item-label">Vault</span>
-    </a>
-
-    <a href="/reflection/compute" class="nav-item" id="link-compute">
-      <i class="fas fa-server nav-item-icon"></i>
-      <span class="nav-item-label">Compute</span>
+    <a href="/reflection/engine" class="nav-item" id="link-engine">
+      <i class="fas fa-gear nav-item-icon"></i>
+      <span class="nav-item-label">Engine</span>
     </a>
 
     <a href="/reflection/security" class="nav-item" id="link-security">
@@ -776,15 +768,10 @@
     'link-execute':    'navigation',
     'link-tables':     'navigation',
     'link-staging':    'navigation',
-    'link-studio':     'navigation',
-    'link-jobs':       'navigation',
-    'link-monitoring': 'navigation',
     'link-quality':    'navigation',
-    'link-vault':      'infrastructure',
-    'link-compute':    'infrastructure',
-    'link-security':   'access-control',
-    'link-users-page': 'access-control',
-    'link-rbac':       'access-control',
+    'link-monitoring': 'navigation',
+    'link-engine':     'navigation',
+    'link-security':   'navigation',
   };
 
   function openGroup(groupId, saveToStorage) {

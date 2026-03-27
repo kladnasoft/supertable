@@ -138,6 +138,25 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .flash-error{padding:6px 10px;border-radius:var(--radius-sm);background:var(--error-bg);border:1px solid rgba(239,68,68,.25);color:var(--error);font-size:12px;margin-top:8px;}
 .flash-ok{padding:6px 10px;border-radius:var(--radius-sm);background:var(--success-bg);border:1px solid rgba(16,185,129,.25);color:var(--green);font-size:12px;margin-top:8px;}
 
+.odata-url-box{background:#f0fdfa;border:1px solid rgba(16,185,129,.25);border-radius:var(--radius-sm);padding:12px;margin-top:10px;}
+.odata-url-box .ou-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#0f766e;margin-bottom:6px;display:flex;align-items:center;gap:5px;}
+.odata-url-box .ou-val{font-size:11px;font-family:var(--mono);color:#134e4a;word-break:break-all;background:rgba(255,255,255,.7);border:1px solid rgba(16,185,129,.15);border-radius:4px;padding:8px 10px;display:flex;align-items:center;gap:8px;}
+.odata-url-box .ou-val code{flex:1;min-width:0;word-break:break-all;}
+.odata-copy{flex-shrink:0;padding:4px 10px;border:1px solid rgba(16,185,129,.3);border-radius:4px;background:#ecfdf5;color:#0f766e;font-size:10px;font-weight:700;cursor:pointer;font-family:var(--font);transition:var(--transition);}
+.odata-copy:hover{background:#d1fae5;border-color:#10b981;}
+.conn-tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-top:14px;}
+.conn-tab{padding:6px 14px;font-size:11px;font-weight:600;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:var(--transition);}
+.conn-tab:hover{color:var(--text);}
+.conn-tab.active{color:var(--success);border-bottom-color:var(--success);}
+.conn-panel{display:none;padding:12px;background:var(--bg-surface);border:1px solid var(--border-light);border-top:none;border-radius:0 0 var(--radius-sm) var(--radius-sm);font-size:12px;}
+.conn-panel.active{display:block;}
+.conn-panel code{display:block;font-family:var(--mono);font-size:11px;background:rgba(255,255,255,.7);padding:8px 10px;border-radius:4px;border:1px solid var(--border-light);word-break:break-all;margin-top:6px;}
+.test-result{margin-top:10px;padding:10px;border-radius:var(--radius-sm);font-size:12px;font-family:var(--mono);}
+.test-ok{background:var(--success-bg);border:1px solid rgba(16,185,129,.25);color:#065f46;}
+.test-fail{background:var(--error-bg);border:1px solid rgba(239,68,68,.25);color:#991b1b;}
+.status-dot-lg{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:4px;}
+.dot-active{background:var(--success);}.dot-disabled{background:var(--text-muted);}
+
 ::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}.fade-in{animation:fadeIn .3s ease forwards;}
 .toast{position:fixed;right:18px;top:16px;z-index:9999;background:var(--text);color:#fff;border-radius:8px;padding:10px 16px;font-size:12px;font-weight:600;box-shadow:0 10px 25px rgba(0,0,0,.2);display:none;font-family:var(--font);}
@@ -166,6 +185,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="section-node" data-section="users"><span class="sicon" style="background:rgba(124,58,237,.08);color:var(--purple);"><i class="fas fa-users"></i></span> Users<span class="scount" id="countUsers">0</span></div>
     <div class="section-sep"></div>
     <div class="section-node" data-section="tokens"><span class="sicon" style="background:rgba(217,119,6,.08);color:var(--amber);"><i class="fas fa-key"></i></span> Tokens<span class="scount" id="countTokens">0</span></div>
+    <div class="section-sep"></div>
+    <div class="section-node" data-section="odata"><span class="sicon" style="background:rgba(16,185,129,.08);color:var(--success);"><i class="fas fa-plug"></i></span> OData<span class="scount" id="countEndpoints">0</span></div>
     <div style="flex:1;"></div>
     <button class="btn-accent" id="btnNew"><i class="fas fa-plus"></i> <span id="btnNewLabel">New Role</span></button>
   </div>
@@ -209,6 +230,10 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       <div class="stat-card">
         <div class="stat-card-title"><i class="fas fa-user-check" style="color:var(--success);"></i> User Coverage</div>
         <div id="rightUserCoverage"></div>
+      </div>
+      <div class="stat-card" id="rightOdataCard" style="display:none;">
+        <div class="stat-card-title"><i class="fas fa-plug" style="color:var(--success);"></i> OData Endpoints</div>
+        <div id="rightOdataStats"></div>
       </div>
     </div>
   </div>
@@ -272,6 +297,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div id="addRoleError"></div>
 </div></div>
 
+<div class="modal-backdrop" id="modalEndpoint"><div class="modal-card">
+  <div class="modal-head"><div class="modal-title"><i class="fas fa-plug" style="color:var(--success);"></i> New OData Endpoint</div><button class="btn-sm" onclick="hideModal('modalEndpoint')"><i class="fas fa-times"></i></button></div>
+  <div class="editor-field"><label>Label</label><input id="edEpLabel" placeholder="e.g. Sales Dashboard Feed"/><div class="hint">A descriptive name for this endpoint.</div></div>
+  <div class="editor-field"><label>Role (data scope)</label><select id="edEpRole" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;background:var(--bg-surface);"></select><div class="hint">The role determines which tables, columns, and filters are applied.</div></div>
+  <div style="font-size:11px;color:var(--text-muted);margin-top:6px;padding:8px 10px;background:var(--bg-surface);border-radius:var(--radius-sm);border:1px solid var(--border-light);"><i class="fas fa-info-circle" style="color:var(--primary);margin-right:4px;"></i> A dedicated bearer token will be generated. You can paste it into Power BI, Excel, or Tableau.</div>
+  <div id="edEpError"></div>
+  <div class="modal-foot"><button class="btn-sm" onclick="hideModal('modalEndpoint')">Cancel</button><button class="btn-sm btn-primary" id="btnSaveEndpoint"><i class="fas fa-plug"></i> Create Endpoint</button></div>
+</div></div>
+
+<div class="modal-backdrop" id="modalEndpointToken"><div class="modal-card">
+  <div class="modal-head"><div class="modal-title"><i class="fas fa-check-circle" style="color:var(--success);"></i> OData Endpoint Created</div><button class="btn-sm" onclick="hideModal('modalEndpointToken')"><i class="fas fa-times"></i></button></div>
+  <div class="flash-ok" style="margin-bottom:10px;">Copy this token now — it will <strong>not</strong> be shown again.</div>
+  <div class="editor-field"><label>Bearer token</label><div id="epTokPlaintext" style="font-family:var(--mono);font-size:12px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);word-break:break-all;"></div><button class="btn-sm" style="margin-top:6px;" onclick="navigator.clipboard.writeText(document.getElementById('epTokPlaintext').textContent);this.innerHTML='<i class=\'fas fa-check\'></i> Copied';var b=this;setTimeout(function(){b.innerHTML='<i class=\'fas fa-copy\'></i> Copy token';},1500);"><i class="fas fa-copy"></i> Copy token</button></div>
+  <div class="editor-field"><label>OData URL</label><div id="epTokUrl" style="font-family:var(--mono);font-size:11px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);word-break:break-all;color:var(--text-sec);"></div></div>
+  <div class="modal-foot"><button class="btn-sm btn-primary" onclick="hideModal('modalEndpointToken')">Done</button></div>
+</div></div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -297,7 +339,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   window.selectRoleType=function(card){document.querySelectorAll(".role-type-card").forEach(function(c){c.classList.remove("selected");});card.classList.add("selected");};
 
   // State
-  var section="roles",allRoles=[],allUsers=[],allTokens=[],selected=null,searchQ="",addRoleTargetUid="";
+  var section="roles",allRoles=[],allUsers=[],allTokens=[],allEndpoints=[],selected=null,searchQ="",addRoleTargetUid="";
 
   function fmtDate(ms){if(!ms)return"—";try{return new Date(Number(ms)).toLocaleString();}catch(e){return"—";}}
   function safeList(v){if(!v)return[];if(Array.isArray(v))return v;try{var p=JSON.parse(v);return Array.isArray(p)?p:[p];}catch(e){return v?[v]:[];}}
@@ -309,9 +351,10 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.querySelectorAll(".section-node").forEach(function(n){n.addEventListener("click",function(){section=n.dataset.section;selected=null;renderSectionBar();renderAll();});});
   function renderSectionBar(){
     document.querySelectorAll(".section-node").forEach(function(n){n.classList.toggle("active",n.dataset.section===section);});
-    var lbl={roles:"New Role",users:"Create User",tokens:"Create Token"};
+    var lbl={roles:"New Role",users:"Create User",tokens:"Create Token",odata:"New Endpoint"};
     document.getElementById("btnNewLabel").textContent=lbl[section]||"New";
-    document.getElementById("leftTitle").textContent={roles:"Roles",users:"Users",tokens:"Tokens"}[section]||"Items";
+    document.getElementById("leftTitle").textContent={roles:"Roles",users:"Users",tokens:"Tokens",odata:"OData Endpoints"}[section]||"Items";
+    document.getElementById("countEndpoints").textContent=String(allEndpoints.length);
   }
 
   // Left panel
@@ -339,13 +382,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         div.innerHTML='<div class="licon" style="background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-user"></i></div><div class="lmeta"><div class="lname">'+esc(u.username||u.name||"—")+'</div><div class="linfo">'+rhtml+(roles.length>3?" +"+(roles.length-3):"")+"</div></div>";
         div.onclick=function(){selected=uid;renderList();renderDetail();};wrap.appendChild(div);
       });
-    }else{
+    }else if(section==="tokens"){
       document.getElementById("countTokens").textContent=String(allTokens.length);
       if(!allTokens.length){if(empty)empty.style.display="block";return;}if(empty)empty.style.display="none";
       allTokens.forEach(function(t,i){
         var tid=t.token_id||"";var div=document.createElement("div");div.className="list-item"+(selected&&selected===tid?" active":"")+" fade-in";div.style.animationDelay=(i*.02)+"s";
         div.innerHTML='<div class="licon" style="background:rgba(217,119,6,.08);border-color:rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-key"></i></div><div class="lmeta"><div class="lname">'+esc(t.label||"Unlabeled")+'</div><div class="linfo">'+esc(tid.length>16?tid.slice(0,8)+"…"+tid.slice(-6):tid)+"</div></div>";
         div.onclick=function(){selected=tid;renderList();renderDetail();};wrap.appendChild(div);
+      });
+    }else if(section==="odata"){
+      document.getElementById("countEndpoints").textContent=String(allEndpoints.length);
+      var items=allEndpoints;if(q)items=items.filter(function(e){return(e.label||"").toLowerCase().indexOf(q)>=0||(e.role_name||"").toLowerCase().indexOf(q)>=0;});
+      if(!items.length){if(empty)empty.style.display="block";return;}if(empty)empty.style.display="none";
+      items.forEach(function(ep,i){
+        var eid=ep.endpoint_id||"";var div=document.createElement("div");div.className="list-item"+(selected&&selected===eid?" active":"")+" fade-in";div.style.animationDelay=(i*.02)+"s";
+        var dotCls=ep.enabled?"dot-active":"dot-disabled";
+        div.innerHTML='<div class="licon" style="background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.2);color:var(--success);"><i class="fas fa-plug"></i></div><div class="lmeta"><div class="lname"><span class="status-dot-lg '+dotCls+'"></span>'+esc(ep.label||"—")+'</div><div class="linfo">'+esc(ep.role_name||"—")+"</div></div>";
+        div.onclick=function(){selected=eid;renderList();renderDetail();};wrap.appendChild(div);
       });
     }
   }
@@ -382,7 +435,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         '<div class="config-card"><div class="cl">Username</div><div class="cv">'+esc(u.username||u.name||"—")+(isSu?' <span class="role-badge rb-superadmin">system</span>':'')+'</div></div>'+
         '<div class="config-card"><div class="cl">Created</div><div class="cv">'+esc(fmtDate(u.created_ms))+'</div></div>'+
         '<div class="config-card full"><div class="cl">Assigned Roles</div><div class="cv">'+rhtml+'</div></div></div>';
-    }else{
+    }else if(section==="tokens"){
       var t=allTokens.find(function(x){return x.token_id===selected;});if(!t){content.innerHTML="";return;}
       if(nameEl)nameEl.textContent=t.label||"Unlabeled";if(metaEl)metaEl.textContent="Token ID: "+esc(selected);
       if(actions)actions.innerHTML='<button class="btn-sm btn-danger" id="dDel"><i class="fas fa-trash"></i> Delete</button>';
@@ -391,6 +444,58 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         '<div class="config-card"><div class="cl">Label</div><div class="cv">'+esc(t.label||"—")+'</div></div>'+
         '<div class="config-card"><div class="cl">Created</div><div class="cv">'+esc(fmtDate(t.created_ms))+'</div></div>'+
         '<div class="config-card full"><div class="cl">Token ID (sha256)</div><div class="cv" style="font-size:11px;word-break:break-all;">'+esc(t.token_id||"—")+'</div></div></div>';
+    }else if(section==="odata"){
+      var ep=allEndpoints.find(function(x){return x.endpoint_id===selected;});if(!ep){content.innerHTML="";return;}
+      if(nameEl)nameEl.textContent=ep.label||"—";if(metaEl)metaEl.textContent="Endpoint: "+esc(selected.slice(0,12))+"…";
+      var enabledLabel=ep.enabled?'<span style="color:var(--success);font-weight:600;"><span class="status-dot-lg dot-active"></span>Active</span>':'<span style="color:var(--text-muted);font-weight:600;"><span class="status-dot-lg dot-disabled"></span>Disabled</span>';
+      if(actions)actions.innerHTML='<button class="btn-sm" id="dToggle"><i class="fas fa-'+(ep.enabled?"pause":"play")+'"></i> '+(ep.enabled?"Disable":"Enable")+'</button><button class="btn-sm btn-danger" id="dDel"><i class="fas fa-trash"></i> Delete</button>';
+      document.getElementById("dToggle").onclick=function(){toggleEndpoint(selected,!ep.enabled);};
+      document.getElementById("dDel").onclick=function(){deleteEndpoint(selected);};
+
+      var odataBase=(ep.odata_url||"").replace(/\?.*$/,"");
+      var roleEnc=encodeURIComponent(ep.role_name||"");
+      var fullUrl=ep.odata_url||"";
+      var metaUrl=odataBase+"/$metadata?role="+roleEnc;
+      var svcUrl=odataBase.replace(/\/odata$/,"/service/odata")+"?role="+roleEnc;
+      var host=window.location.origin;
+
+      content.innerHTML='<div class="config-grid">'+
+        '<div class="config-card"><div class="cl">Status</div><div class="cv">'+enabledLabel+'</div></div>'+
+        '<div class="config-card"><div class="cl">Role</div><div class="cv">'+roleBadgeHtml((findRole(ep.role_id)||{}).role||"reader")+' '+esc(ep.role_name||"—")+'</div></div>'+
+        '<div class="config-card"><div class="cl">Token</div><div class="cv" style="display:flex;align-items:center;gap:8px;">'+esc(ep.token_prefix||"—")+' <button class="btn-sm" style="padding:2px 6px;font-size:10px;" id="dRegen"><i class="fas fa-rotate"></i> Regenerate</button></div></div>'+
+        '<div class="config-card"><div class="cl">Last accessed</div><div class="cv">'+esc(ep.last_accessed_at||"Never")+'</div></div>'+
+        '</div>'+
+        '<div class="odata-url-box"><div class="ou-label"><i class="fas fa-link" style="font-size:11px;"></i> OData URL</div><div class="ou-val"><code>'+esc(host+fullUrl)+'</code><button class="odata-copy" onclick="navigator.clipboard.writeText(\''+esc(host+fullUrl).replace(/'/g,"\\'")+'\');this.textContent=\'Copied!\';var b=this;setTimeout(function(){b.textContent=\'Copy\';},1500);">Copy</button></div></div>'+
+        '<div class="conn-tabs">'+
+        '<div class="conn-tab active" data-ct="pbi">Power BI</div>'+
+        '<div class="conn-tab" data-ct="excel">Excel</div>'+
+        '<div class="conn-tab" data-ct="tableau">Tableau</div>'+
+        '</div>'+
+        '<div class="conn-panel active" id="cpPbi"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Get Data → OData Feed → paste this URL:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Authentication: <strong>Organizational account</strong> → set Header: <span style="font-family:var(--mono);">Authorization</span> = <span style="font-family:var(--mono);">Bearer &lt;token&gt;</span></div></div>'+
+        '<div class="conn-panel" id="cpExcel"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Data → Get Data → From OData Feed → paste URL:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Or use this formula in Power Query:<code>=OData.Feed("'+esc(host+fullUrl)+'", null, [Headers=[Authorization="Bearer &lt;token&gt;"]])</code></div></div>'+
+        '<div class="conn-panel" id="cpTableau"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Connect → OData → Server:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Authentication: select <strong>None</strong> and configure an Initial SQL or Custom HTTP header with <span style="font-family:var(--mono);">Authorization: Bearer &lt;token&gt;</span></div></div>'+
+        '<div style="margin-top:12px;"><button class="btn-sm" id="dTest" style="gap:6px;"><i class="fas fa-play"></i> Test $metadata</button><div id="testResult"></div></div>';
+
+      document.getElementById("dRegen").onclick=function(){regenerateEndpointToken(selected);};
+      // Connection string tabs
+      content.querySelectorAll(".conn-tab").forEach(function(tab){tab.addEventListener("click",function(){
+        content.querySelectorAll(".conn-tab").forEach(function(t){t.classList.remove("active");});
+        content.querySelectorAll(".conn-panel").forEach(function(p){p.classList.remove("active");});
+        tab.classList.add("active");
+        var target=tab.getAttribute("data-ct");
+        document.getElementById("cp"+(target==="pbi"?"Pbi":target==="excel"?"Excel":"Tableau")).classList.add("active");
+      });});
+      // Test $metadata
+      document.getElementById("dTest").addEventListener("click",async function(){
+        var resEl=document.getElementById("testResult");resEl.innerHTML='<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">Testing…</div>';
+        try{
+          var t0=performance.now();
+          var r=await fetch(metaUrl,{headers:{"Accept":"application/xml"}});
+          var ms=Math.round(performance.now()-t0);
+          if(r.ok)resEl.innerHTML='<div class="test-result test-ok"><i class="fas fa-check-circle"></i> '+r.status+' OK — '+ms+'ms</div>';
+          else resEl.innerHTML='<div class="test-result test-fail"><i class="fas fa-times-circle"></i> '+r.status+' — '+ms+'ms</div>';
+        }catch(e){resEl.innerHTML='<div class="test-result test-fail"><i class="fas fa-times-circle"></i> '+esc(e.message)+'</div>';}
+      });
     }
   }
 
@@ -412,6 +517,13 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var withRoles=0;allUsers.forEach(function(u){if(safeList(u.roles).length>0)withRoles++;});
     var pct=allUsers.length?Math.round(withRoles/allUsers.length*100):0;
     document.getElementById("rightUserCoverage").innerHTML='<div class="stat-row"><span class="label">With roles</span><span class="val" style="color:var(--success);">'+withRoles+'/'+allUsers.length+'</span></div><div style="height:5px;border-radius:3px;background:var(--bg-surface);margin-top:6px;overflow:hidden;border:1px solid var(--border-light);"><div style="height:100%;border-radius:3px;width:'+pct+'%;background:var(--success);"></div></div><div style="margin-top:5px;font-size:10px;color:var(--text-muted);">'+pct+'% of users have at least one role assigned.</div>';
+    // OData endpoints
+    var odataCard=document.getElementById("rightOdataCard");
+    if(odataCard){
+      odataCard.style.display=allEndpoints.length?"block":"none";
+      var active=0;allEndpoints.forEach(function(e){if(e.enabled)active++;});
+      document.getElementById("rightOdataStats").innerHTML='<div class="stat-row"><span class="label">Total</span><span class="val">'+allEndpoints.length+'</span></div><div class="stat-row"><span class="label">Active</span><span class="val" style="color:var(--success);">'+active+'</span></div><div class="stat-row"><span class="label">Disabled</span><span class="val" style="color:var(--text-muted);">'+(allEndpoints.length-active)+'</span></div>';
+    }
   }
 
   function renderAll(){renderSectionBar();renderList();renderDetail();renderRight();}
@@ -420,7 +532,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   async function loadRoles(){var c=ctx();try{var d=await apiGet("/reflection/rbac/roles?organization="+enc(c.org)+"&super_name="+enc(c.sup));allRoles=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allRoles=[];toast("Roles: "+e.message);}}
   async function loadUsers(){var c=ctx();try{var d=await apiGet("/reflection/users-page/list?org="+enc(c.org)+"&sup="+enc(c.sup));allUsers=d.users||[];var r2=d.roles||[];if(r2.length&&!allRoles.length)allRoles=r2;}catch(e){try{var d2=await apiGet("/reflection/rbac/users?organization="+enc(c.org)+"&super_name="+enc(c.sup));allUsers=(d2&&d2.data&&d2.data.items)?d2.data.items:[];}catch(e2){allUsers=[];toast("Users: "+e2.message);}}}
   async function loadTokens(){var c=ctx();try{var d=await apiGet("/reflection/tokens?org="+enc(c.org));allTokens=(d&&d.tokens)?d.tokens:[];}catch(e){allTokens=[];}}
-  async function refreshAll(){await loadRoles();await loadUsers();await loadTokens();renderAll();}
+  async function loadEndpoints(){var c=ctx();try{var d=await apiGet("/reflection/odata/endpoints?organization="+enc(c.org)+"&super_name="+enc(c.sup));allEndpoints=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allEndpoints=[];}}
+  async function refreshAll(){await loadRoles();await loadUsers();await loadTokens();await loadEndpoints();renderAll();}
 
   // CRUD: Roles
   var editRoleId=null;
@@ -465,15 +578,41 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   });
   async function deleteToken(tid){if(!confirm("Delete this token?"))return;var c=ctx();try{await apiDel("/reflection/tokens/"+enc(tid)+"?org="+enc(c.org));selected=null;toast("Deleted");await loadTokens();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
 
+  // CRUD: OData Endpoints
+  function openNewEndpoint(){
+    document.getElementById("edEpLabel").value="";document.getElementById("edEpError").innerHTML="";
+    var sel=document.getElementById("edEpRole");sel.innerHTML="";
+    allRoles.forEach(function(r){var opt=document.createElement("option");opt.value=(r.role_id||r.id)+"|"+(r.role_name||"");opt.textContent=esc(r.role_name||r.role_id||"")+" ("+esc(r.role||"reader")+")";sel.appendChild(opt);});
+    if(!allRoles.length)sel.innerHTML='<option value="">No roles — create a role first</option>';
+    showModal("modalEndpoint");
+  }
+  document.getElementById("btnSaveEndpoint").addEventListener("click",async function(){
+    var label=(document.getElementById("edEpLabel").value||"").trim();
+    var roleVal=(document.getElementById("edEpRole").value||"");
+    if(!roleVal){document.getElementById("edEpError").innerHTML='<div class="flash-error">Select a role.</div>';return;}
+    var parts=roleVal.split("|");var roleId=parts[0]||"";var roleName=parts[1]||"";var c=ctx();
+    try{
+      var res=await apiPost("/reflection/odata/endpoints",{organization:c.org,super_name:c.sup,label:label,role_id:roleId,role_name:roleName});
+      hideModal("modalEndpoint");
+      document.getElementById("epTokPlaintext").textContent=(res&&res.token)||"";
+      document.getElementById("epTokUrl").textContent=(res&&res.data&&res.data.odata_url)?window.location.origin+(res.data.odata_url):"";
+      showModal("modalEndpointToken");
+      await loadEndpoints();renderAll();
+    }catch(e){document.getElementById("edEpError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+  });
+  async function toggleEndpoint(eid,enable){var c=ctx();try{await apiPut("/reflection/odata/endpoints/"+enc(eid),{organization:c.org,super_name:c.sup,enabled:enable});toast(enable?"Enabled":"Disabled");await loadEndpoints();renderAll();}catch(e){toast("Failed: "+e.message);}}
+  async function regenerateEndpointToken(eid){if(!confirm("Regenerate token? The old token will stop working immediately."))return;var c=ctx();try{var res=await apiPost("/reflection/odata/endpoints/"+enc(eid)+"/regenerate",{organization:c.org,super_name:c.sup});document.getElementById("epTokPlaintext").textContent=(res&&res.token)||"";document.getElementById("epTokUrl").textContent=(res&&res.data&&res.data.odata_url)?window.location.origin+(res.data.odata_url):"";showModal("modalEndpointToken");await loadEndpoints();renderAll();}catch(e){toast("Regenerate failed: "+e.message);}}
+  async function deleteEndpoint(eid){if(!confirm("Delete this OData endpoint?"))return;var c=ctx();try{await apiDel("/reflection/odata/endpoints/"+enc(eid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await loadEndpoints();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
+
   // New button
-  document.getElementById("btnNew").addEventListener("click",function(){if(section==="roles")openNewRole();else if(section==="users")openNewUser();else openNewToken();});
+  document.getElementById("btnNew").addEventListener("click",function(){if(section==="roles")openNewRole();else if(section==="users")openNewUser();else if(section==="odata")openNewEndpoint();else openNewToken();});
   document.getElementById("btnRefresh").addEventListener("click",function(){refreshAll().catch(function(e){toast(e.message);});});
   document.getElementById("listSearch").addEventListener("input",function(ev){searchQ=ev.target.value||"";renderList();});
 
   // Escape
-  document.addEventListener("keydown",function(ev){if(ev.key!=="Escape")return;["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole"].forEach(function(id){var el=document.getElementById(id);if(el&&el.style.display==="flex")el.style.display="none";});});
+  document.addEventListener("keydown",function(ev){if(ev.key!=="Escape")return;["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el&&el.style.display==="flex")el.style.display="none";});});
   // Backdrop click
-  ["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole"].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener("click",function(ev){if(ev.target===el)el.style.display="none";});});
+  ["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener("click",function(ev){if(ev.target===el)el.style.display="none";});});
 
   renderSectionBar();
   var _ctx=ctx();if(_ctx.org&&_ctx.sup)refreshAll();

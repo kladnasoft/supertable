@@ -82,7 +82,20 @@
     .cc-panel-left {
       width: 280px; min-width: 280px; border-right: 1px solid var(--panel-border);
       background: var(--panel-bg); display: flex; flex-direction: column; flex-shrink: 0;
+      transition: width 0.25s ease, min-width 0.25s ease;
     }
+    .cc-panel-left.collapsed { width: 0; min-width: 0; overflow: hidden; border-right: none; }
+    .cc-panel-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 12px; padding: 4px; border-radius: 4px; transition: all .15s; }
+    .cc-panel-toggle:hover { background: var(--bg-hover); color: var(--text-color); }
+    .cc-panel-reopen-left {
+      display: none; width: 28px; flex-shrink: 0;
+      border-right: 1px solid var(--panel-border); background: var(--bg-surface);
+      cursor: pointer; transition: all .15s; position: relative;
+    }
+    .cc-panel-reopen-left:hover { background: var(--primary-light); }
+    .cc-panel-reopen-left i { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 12px; color: var(--text-muted); transition: color .15s; }
+    .cc-panel-reopen-left:hover i { color: var(--primary-color); }
+    .cc-panel-left.collapsed ~ .cc-panel-reopen-left { display: block; }
     .cc-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
     .cc-panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
     .cc-panel-actions { display: flex; align-items: center; gap: 6px; }
@@ -115,6 +128,8 @@
     .cc-freshness-dot.fresh { background: var(--success); }
     .cc-freshness-dot.aging { background: var(--warning); }
     .cc-freshness-dot.stale { background: var(--error); }
+    .cc-tbl-item.sys { opacity: 0.5; }
+    .cc-tbl-item.sys .cc-tbl-icon { background: var(--bg-surface); color: var(--text-muted); }
 
     /* ─── CENTER: DETAIL ─── */
     .cc-center { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
@@ -343,6 +358,11 @@
       return 'stale';
     }
 
+    function ccTogglePanel() {
+      var panel = document.getElementById('ccPanelLeft');
+      if (panel) panel.classList.toggle('collapsed');
+    }
+
     function ccRenderTableList(filter) {
       var list = document.getElementById('ccTableList');
       if (!list) return;
@@ -352,8 +372,17 @@
       var showSys = window.__cc_showSystemTables;
       var visibleCount = 0;
 
-      tables.forEach(function(t, i) {
+      // Sort by name (sys tables first when shown, then user tables alphabetically)
+      var sorted = tables.slice().sort(function(a, b) {
+        var aSys = (a.name || '').startsWith('__') ? 0 : 1;
+        var bSys = (b.name || '').startsWith('__') ? 0 : 1;
+        if (aSys !== bSys) return aSys - bSys;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+
+      sorted.forEach(function(t) {
         var name = t.name || '';
+        var origIdx = tables.indexOf(t);
         // Filter system tables (__*) unless toggle is active
         if (!showSys && name.startsWith('__')) return;
         if (fl && name.toLowerCase().indexOf(fl) < 0) return;
@@ -361,20 +390,20 @@
         var fresh = ccFreshness(t.updated_utc);
         var isSys = name.startsWith('__');
         var div = document.createElement('div');
-        div.className = 'cc-tbl-item';
-        div.setAttribute('data-idx', i);
+        div.className = 'cc-tbl-item' + (isSys ? ' sys' : '');
+        div.setAttribute('data-idx', origIdx);
         if (window.__cc_selectedTable === name) div.classList.add('active');
         div.innerHTML =
           '<div class="cc-tbl-icon"><i class="fas fa-' + (isSys ? 'cog' : 'table') + '"></i></div>' +
           '<div class="cc-tbl-info">' +
-            '<div class="cc-tbl-name"' + (isSys ? ' style="opacity:.6;"' : '') + '>' + ccEsc(name) + '</div>' +
+            '<div class="cc-tbl-name">' + ccEsc(name) + '</div>' +
             '<div class="cc-tbl-meta">' +
               '<span><i class="fas fa-layer-group" style="font-size:9px;"></i> ' + ccHumanCount(t.rows) + '</span>' +
               '<span><i class="fas fa-hdd" style="font-size:9px;"></i> ' + ccHumanBytes(t.size) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="cc-freshness-dot ' + fresh + '" title="' + fresh + '"></div>';
-        div.addEventListener('click', function() { ccSelectTable(name, i); });
+        div.addEventListener('click', function() { ccSelectTable(name, origIdx); });
         list.appendChild(div);
       });
 
@@ -2476,13 +2505,14 @@ function deleteTable(simple) {
   <div class="cc-columns">
 
     <!-- LEFT: TABLE LIST -->
-    <div class="cc-panel-left">
+    <div class="cc-panel-left" id="ccPanelLeft">
       <div class="cc-panel-header">
         <span class="cc-panel-title">Tables</span>
         <div class="cc-panel-actions">
           <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);">0</span>
           <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
           <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh table list"><i class="fas fa-sync-alt"></i></button>
+          <button class="cc-panel-toggle" onclick="ccTogglePanel()" title="Collapse panel"><i class="fas fa-chevron-left"></i></button>
         </div>
       </div>
       <div class="cc-search-wrap">
@@ -2490,6 +2520,9 @@ function deleteTable(simple) {
         <input placeholder="Filter tables…" oninput="ccRenderTableList(this.value)"/>
       </div>
       <div class="cc-table-list" id="ccTableList"></div>
+    </div>
+    <div class="cc-panel-reopen-left" onclick="ccTogglePanel()" title="Show table list">
+      <i class="fas fa-chevron-right"></i>
     </div>
 
     <!-- CENTER: DETAIL -->

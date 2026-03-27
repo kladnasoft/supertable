@@ -1,3 +1,4 @@
+# route: supertable.reflection.quality.routes
 # supertable/reflection/quality/routes.py
 """
 FastAPI routes for Data Quality module.
@@ -451,3 +452,92 @@ def attach_quality_routes(
         t.start()
 
         return {"ok": True, "message": f"{mode} check started on {len(tables)} tables (sequential)", "count": len(tables)}
+
+    # ── History (quality score over time) ─────────────────────────
+
+    @router.get("/reflection/quality/history")
+    def api_quality_history(
+        request: Request,
+        table: Optional[str] = Query(None),
+        days: int = Query(7, ge=1, le=365),
+        org: Optional[str] = Query(None),
+        sup: Optional[str] = Query(None),
+        _: Any = Depends(logged_in_guard_api),
+    ):
+        """Return quality check history for charting.
+
+        Filters by date range (last N days). Tries __data_quality__ Parquet
+        table first, falls back to Redis LIST.
+        If table param is provided, filters to that table only.
+        """
+        o, s = _resolve(org, sup)
+        if not o or not s:
+            return {"ok": True, "rows": []}
+
+        # ── Strategy 1: Query __data_quality__ via DataReader ─────
+        try:
+            from supertable.data_reader import DataReader
+
+            table_fqn = f"{s}.__data_quality__"
+            conditions = [f"checked_at >= CURRENT_TIMESTAMP - INTERVAL '{days} days'"]
+            if table:
+                safe_table = table.replace("'", "''")
+                conditions.append(f"table_name = '{safe_table}'")
+
+            where = "WHERE " + " AND ".join(conditions)
+
+            sql = (
+                f"SELECT dq_id, checked_at, table_name, check_type, "
+                f"quality_score, status, row_count, total_checks, "
+                f"passed, warnings, critical_count, anomaly_count, execution_ms "
+                f"FROM {table_fqn} {where} "
+                f"ORDER BY checked_at DESC LIMIT 1000"
+            )
+
+            dr = DataReader(super_name=s, organization=o, query=sql)
+            result_df, status, message = dr.execute(role_name="superadmin")
+
+            if result_df is not None and not result_df.empty:
+                rows = result_df.to_dict(orient="records")
+                # Convert timestamps to ISO strings
+                for row in rows:
+                    for k, v in row.items():
+                        if hasattr(v, "isoformat"):
+                            row[k] = v.isoformat()
+                return {"ok": True, "source": "parquet", "days": days, "rows": rows}
+
+        except Exception as e:
+            logger.debug(f"[dq-history] Parquet query failed, trying Redis: {e}")
+
+        # ── Strategy 2: Read from Redis LIST fallback ─────────────
+        try:
+            from supertable.reflection.quality.config import _dq_key
+            from datetime import datetime, timezone, timedelta
+
+            key = _dq_key(o, s, "history")
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+            # Read up to 1000 entries and filter by date + table
+            raw_items = redis_client.lrange(key, 0, 999)
+            rows = []
+            for raw in (raw_items or []):
+                try:
+                    item = raw if isinstance(raw, str) else raw.decode("utf-8")
+                    row = json.loads(item)
+                    # Date filter
+                    checked_at = row.get("checked_at", "")
+                    if checked_at < cutoff:
+                        continue
+                    # Table filter
+                    if table and row.get("table_name") != table:
+                        continue
+                    rows.append(row)
+                except Exception:
+                    continue
+
+            return {"ok": True, "source": "redis", "days": days, "rows": rows}
+
+        except Exception as e:
+            logger.warning(f"[dq-history] Redis history read failed: {e}")
+
+        return {"ok": True, "source": "none", "days": days, "rows": []}
