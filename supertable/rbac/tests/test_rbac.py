@@ -339,73 +339,75 @@ class TestPermissions(unittest.TestCase):
 class TestRowColumnSecurity(unittest.TestCase):
 
     def test_basic_prepare(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1", "t2"], columns=["a", "b"])
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {"columns": ["a", "b"]}, "t2": {"columns": ["a", "b"]}})
         rcs.prepare()
-        self.assertEqual(rcs.tables, ["t1", "t2"])
-        self.assertEqual(rcs.columns, ["a", "b"])
+        self.assertIn("t1", rcs.tables)
+        self.assertIn("t2", rcs.tables)
+        self.assertEqual(rcs.tables["t1"]["columns"], ["a", "b"])
         self.assertIsNotNone(rcs.content_hash)
 
     def test_empty_tables_defaults_to_wildcard(self):
-        rcs = RowColumnSecurity(role="admin", tables=[])
+        rcs = RowColumnSecurity(role="admin", tables={})
         rcs.prepare()
-        self.assertEqual(rcs.tables, ["*"])
+        self.assertIn("*", rcs.tables)
+        self.assertEqual(rcs.tables["*"]["columns"], ["*"])
+        self.assertEqual(rcs.tables["*"]["filters"], ["*"])
 
     def test_empty_columns_defaults_to_wildcard(self):
-        rcs = RowColumnSecurity(role="admin", tables=["t1"])
+        rcs = RowColumnSecurity(role="admin", tables={"t1": {}})
         rcs.prepare()
-        self.assertEqual(rcs.columns, ["*"])
+        self.assertEqual(rcs.tables["t1"]["columns"], ["*"])
 
     def test_empty_filters_defaults_to_wildcard(self):
-        rcs = RowColumnSecurity(role="admin", tables=["t1"])
+        rcs = RowColumnSecurity(role="admin", tables={"t1": {}})
         rcs.prepare()
-        self.assertEqual(rcs.filters, ["*"])
+        self.assertEqual(rcs.tables["t1"]["filters"], ["*"])
 
     def test_tables_sorted_and_deduped(self):
-        rcs = RowColumnSecurity(role="reader", tables=["z", "a", "a", "m"])
+        rcs = RowColumnSecurity(role="reader", tables={"z": {}, "a": {}, "m": {}})
         rcs.prepare()
-        self.assertEqual(rcs.tables, ["a", "m", "z"])
+        self.assertEqual(set(rcs.tables.keys()), {"a", "m", "z"})
 
     def test_columns_sorted_and_deduped(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1"], columns=["z", "a", "a"])
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {"columns": ["z", "a", "a"]}})
         rcs.prepare()
-        self.assertEqual(rcs.columns, ["a", "z"])
+        self.assertEqual(rcs.tables["t1"]["columns"], ["a", "z"])
 
     def test_wildcard_columns_not_sorted(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1"], columns=["*"])
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {"columns": ["*"]}})
         rcs.prepare()
-        self.assertEqual(rcs.columns, ["*"])
+        self.assertEqual(rcs.tables["t1"]["columns"], ["*"])
 
     def test_content_hash_deterministic(self):
-        rcs1 = RowColumnSecurity(role="reader", tables=["b", "a"], columns=["x", "y"])
+        rcs1 = RowColumnSecurity(role="reader", tables={"b": {"columns": ["x", "y"]}, "a": {"columns": ["x", "y"]}})
         rcs1.prepare()
-        rcs2 = RowColumnSecurity(role="reader", tables=["a", "b"], columns=["y", "x"])
+        rcs2 = RowColumnSecurity(role="reader", tables={"a": {"columns": ["y", "x"]}, "b": {"columns": ["y", "x"]}})
         rcs2.prepare()
         self.assertEqual(rcs1.content_hash, rcs2.content_hash)
 
     def test_different_content_different_hash(self):
-        rcs1 = RowColumnSecurity(role="reader", tables=["t1"])
+        rcs1 = RowColumnSecurity(role="reader", tables={"t1": {}})
         rcs1.prepare()
-        rcs2 = RowColumnSecurity(role="writer", tables=["t1"])
+        rcs2 = RowColumnSecurity(role="writer", tables={"t1": {}})
         rcs2.prepare()
         self.assertNotEqual(rcs1.content_hash, rcs2.content_hash)
 
     def test_hash_property_alias(self):
-        rcs = RowColumnSecurity(role="admin", tables=["t1"])
+        rcs = RowColumnSecurity(role="admin", tables={"t1": {}})
         rcs.prepare()
         self.assertEqual(rcs.hash, rcs.content_hash)
 
     def test_to_json(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1"], columns=["a"], filters={"x": 1})
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {"columns": ["a"], "filters": {"x": 1}}})
         rcs.prepare()
         j = rcs.to_json()
         self.assertEqual(j["role"], "reader")
-        self.assertEqual(j["tables"], ["t1"])
-        self.assertEqual(j["columns"], ["a"])
-        self.assertEqual(j["filters"], {"x": 1})
+        self.assertIn("t1", j["tables"])
+        self.assertEqual(j["tables"]["t1"]["columns"], ["a"])
 
     def test_invalid_role_raises(self):
         with self.assertRaises(ValueError):
-            RowColumnSecurity(role="nonexistent", tables=["t1"])
+            RowColumnSecurity(role="nonexistent", tables={"t1": {}})
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -430,9 +432,7 @@ class TestRedisCatalogRbac(unittest.TestCase):
         role_data = {
             "role_id": "r1",
             "role": "reader",
-            "tables": ["t1"],
-            "columns": ["a"],
-            "filters": ["*"],
+            "tables": {"t1": {"columns": ["a"], "filters": ["*"]}},
             "content_hash": "abc123",
         }
         self.cat.rbac_create_role(ORG, SUP, "r1", role_data)
@@ -440,8 +440,8 @@ class TestRedisCatalogRbac(unittest.TestCase):
         fetched = self.cat.get_role_details(ORG, SUP, "r1")
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched["role"], "reader")
-        self.assertEqual(fetched["tables"], ["t1"])
-        self.assertEqual(fetched["columns"], ["a"])
+        self.assertIn("t1", fetched["tables"])
+        self.assertEqual(fetched["tables"]["t1"]["columns"], ["a"])
 
     def test_role_exists(self):
         self.cat.rbac_init_role_meta(ORG, SUP)
@@ -469,16 +469,19 @@ class TestRedisCatalogRbac(unittest.TestCase):
     def test_update_role(self):
         self.cat.rbac_init_role_meta(ORG, SUP)
         self.cat.rbac_create_role(ORG, SUP, "r1", {
-            "role": "reader", "role_id": "r1", "tables": '["t1"]', "columns": '["a"]',
+            "role": "reader", "role_id": "r1",
+            "tables": {"t1": {"columns": ["a"]}},
         })
-        self.cat.rbac_update_role(ORG, SUP, "r1", {"columns": ["a", "b", "c"]})
+        self.cat.rbac_update_role(ORG, SUP, "r1", {
+            "tables": {"t1": {"columns": ["a", "b", "c"]}},
+        })
         fetched = self.cat.get_role_details(ORG, SUP, "r1")
-        self.assertEqual(fetched["columns"], ["a", "b", "c"])
+        self.assertEqual(fetched["tables"]["t1"]["columns"], ["a", "b", "c"])
 
     def test_update_nonexistent_role_raises(self):
         self.cat.rbac_init_role_meta(ORG, SUP)
         with self.assertRaises(ValueError):
-            self.cat.rbac_update_role(ORG, SUP, "nope", {"columns": ["x"]})
+            self.cat.rbac_update_role(ORG, SUP, "nope", {"tables": {"t1": {}}})
 
     def test_delete_role_strips_from_users(self):
         self.cat.rbac_init_role_meta(ORG, SUP)
@@ -623,57 +626,57 @@ class TestRoleManager(unittest.TestCase):
         self.assertIsNotNone(sa_id)
         role = self.rm.get_role(sa_id)
         self.assertEqual(role["role"], "superadmin")
-        self.assertEqual(role["tables"], ["*"])
+        self.assertIn("*", role["tables"])
 
     def test_create_role_returns_uuid(self):
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.assertEqual(len(role_id), 32)  # UUID hex
 
     def test_create_role_stored_correctly(self):
         role_id = self.rm.create_role({
-            "role": "reader", "tables": ["t1"], "columns": ["a", "b"],
+            "role": "reader", "tables": {"t1": {"columns": ["a", "b"]}},
         })
         role = self.rm.get_role(role_id)
         self.assertEqual(role["role"], "reader")
-        self.assertEqual(role["tables"], ["t1"])
-        self.assertEqual(role["columns"], ["a", "b"])
+        self.assertIn("t1", role["tables"])
+        self.assertEqual(role["tables"]["t1"]["columns"], ["a", "b"])
         self.assertIn("content_hash", role)
         self.assertEqual(role["role_id"], role_id)
 
     def test_duplicate_content_creates_separate_roles(self):
         """No dedup — two roles with same content get different IDs."""
-        id1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        id2 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        id1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        id2 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.assertNotEqual(id1, id2)
 
     def test_update_role_in_place(self):
         role_id = self.rm.create_role({
-            "role": "reader", "tables": ["t1"], "columns": ["a"],
+            "role": "reader", "tables": {"t1": {"columns": ["a"]}},
         })
         old_hash = self.rm.get_role(role_id)["content_hash"]
-        new_hash = self.rm.update_role(role_id, {"columns": ["a", "b", "c"]})
+        new_hash = self.rm.update_role(role_id, {"tables": {"t1": {"columns": ["a", "b", "c"]}}})
         self.assertNotEqual(old_hash, new_hash)
 
         role = self.rm.get_role(role_id)
-        self.assertEqual(role["columns"], ["a", "b", "c"])
+        self.assertEqual(role["tables"]["t1"]["columns"], ["a", "b", "c"])
         self.assertEqual(role["role_id"], role_id)  # ID unchanged
 
     def test_update_role_partial(self):
         """Only supplied fields change."""
         role_id = self.rm.create_role({
-            "role": "reader", "tables": ["t1", "t2"], "columns": ["a"],
+            "role": "reader", "tables": {"t1": {"columns": ["a"]}, "t2": {"columns": ["a"]}},
         })
-        self.rm.update_role(role_id, {"columns": ["x", "y"]})
+        self.rm.update_role(role_id, {"tables": {"t1": {"columns": ["x", "y"]}, "t2": {"columns": ["x", "y"]}}})
         role = self.rm.get_role(role_id)
-        self.assertEqual(role["tables"], ["t1", "t2"])  # Unchanged
-        self.assertEqual(role["columns"], ["x", "y"])    # Changed
+        self.assertIn("t1", role["tables"])
+        self.assertEqual(role["tables"]["t1"]["columns"], ["x", "y"])
 
     def test_update_nonexistent_raises(self):
         with self.assertRaises(ValueError):
-            self.rm.update_role("bogus", {"columns": ["x"]})
+            self.rm.update_role("bogus", {"tables": {"t1": {"columns": ["x"]}}})
 
     def test_delete_role(self):
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.assertTrue(self.rm.delete_role(role_id))
         self.assertEqual(self.rm.get_role(role_id), {})
 
@@ -681,16 +684,16 @@ class TestRoleManager(unittest.TestCase):
         self.assertFalse(self.rm.delete_role("bogus"))
 
     def test_list_roles(self):
-        self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        self.rm.create_role({"role": "writer", "tables": ["t2"]})
+        self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
         roles = self.rm.list_roles()
         # +1 for the auto-created superadmin
         self.assertEqual(len(roles), 3)
 
     def test_get_roles_by_type(self):
-        self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        self.rm.create_role({"role": "reader", "tables": ["t2"]})
-        self.rm.create_role({"role": "writer", "tables": ["t3"]})
+        self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        self.rm.create_role({"role": "reader", "tables": {"t2": {}}})
+        self.rm.create_role({"role": "writer", "tables": {"t3": {}}})
         readers = self.rm.get_roles_by_type("reader")
         writers = self.rm.get_roles_by_type("writer")
         self.assertEqual(len(readers), 2)
@@ -698,7 +701,7 @@ class TestRoleManager(unittest.TestCase):
 
     def test_invalid_role_type_raises(self):
         with self.assertRaises(ValueError):
-            self.rm.create_role({"role": "invalid_type", "tables": ["t1"]})
+            self.rm.create_role({"role": "invalid_type", "tables": {"t1": {}}})
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -756,7 +759,7 @@ class TestUserManager(unittest.TestCase):
             self.um.get_user_by_name("nobody")
 
     def test_modify_user_roles(self):
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "carol", "roles": []})
         self.um.modify_user(uid, {"roles": [role_id]})
         user = self.um.get_user(uid)
@@ -813,14 +816,14 @@ class TestUserManager(unittest.TestCase):
         self.assertIn("superuser", usernames)
 
     def test_add_role_atomic(self):
-        role_id = self.rm.create_role({"role": "writer", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "writer", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "ivan", "roles": []})
         self.assertTrue(self.um.add_role(uid, role_id))
         user = self.um.get_user(uid)
         self.assertIn(role_id, user["roles"])
 
     def test_add_role_idempotent(self):
-        role_id = self.rm.create_role({"role": "writer", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "writer", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "judy", "roles": [role_id]})
         self.assertFalse(self.um.add_role(uid, role_id))  # Already has it
 
@@ -830,7 +833,7 @@ class TestUserManager(unittest.TestCase):
             self.um.add_role(uid, "fake_role")
 
     def test_remove_role_atomic(self):
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "lisa", "roles": [role_id]})
         self.assertTrue(self.um.remove_role(uid, role_id))
         user = self.um.get_user(uid)
@@ -841,9 +844,9 @@ class TestUserManager(unittest.TestCase):
         self.assertFalse(self.um.remove_role(uid, "r999"))
 
     def test_user_with_multiple_roles(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
-        r3 = self.rm.create_role({"role": "admin", "tables": ["*"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
+        r3 = self.rm.create_role({"role": "admin", "tables": {"*": {}}})
         uid = self.um.create_user({"username": "multi", "roles": [r1, r2, r3]})
         user = self.um.get_user(uid)
         self.assertEqual(len(user["roles"]), 3)
@@ -879,33 +882,33 @@ class TestAccessControl(unittest.TestCase):
 
     def test_writer_can_write_allowed_table(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "writer", "role_name": "sales_writer", "tables": ["sales"]})
+        self.rm.create_role({"role": "writer", "role_name": "sales_writer", "tables": {"sales": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "sales_writer", "sales")
 
     def test_writer_cannot_write_other_table(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "writer", "role_name": "sales_writer2", "tables": ["sales"]})
+        self.rm.create_role({"role": "writer", "role_name": "sales_writer2", "tables": {"sales": {}}})
         with self._patch_manager():
             with self.assertRaises(PermissionError):
                 check_write_access(SUP, ORG, "sales_writer2", "secrets")
 
     def test_reader_cannot_write(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "reader", "role_name": "all_reader", "tables": ["*"]})
+        self.rm.create_role({"role": "reader", "role_name": "all_reader", "tables": {"*": {}}})
         with self._patch_manager():
             with self.assertRaises(PermissionError):
                 check_write_access(SUP, ORG, "all_reader", "any_table")
 
     def test_meta_role_can_meta(self):
         from supertable.rbac.access_control import check_meta_access
-        self.rm.create_role({"role": "meta", "role_name": "stats_meta", "tables": ["stats"]})
+        self.rm.create_role({"role": "meta", "role_name": "stats_meta", "tables": {"stats": {}}})
         with self._patch_manager():
             check_meta_access(SUP, ORG, "stats_meta", "stats")
 
     def test_meta_role_cannot_meta_other_table(self):
         from supertable.rbac.access_control import check_meta_access
-        self.rm.create_role({"role": "meta", "role_name": "stats_meta2", "tables": ["stats"]})
+        self.rm.create_role({"role": "meta", "role_name": "stats_meta2", "tables": {"stats": {}}})
         with self._patch_manager():
             with self.assertRaises(PermissionError):
                 check_meta_access(SUP, ORG, "stats_meta2", "other")
@@ -918,7 +921,7 @@ class TestAccessControl(unittest.TestCase):
 
     def test_wildcard_table_grants_all(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "admin", "role_name": "full_admin", "tables": ["*"]})
+        self.rm.create_role({"role": "admin", "role_name": "full_admin", "tables": {"*": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "full_admin", "anything")
             check_write_access(SUP, ORG, "full_admin", "some_other_table")
@@ -926,8 +929,8 @@ class TestAccessControl(unittest.TestCase):
     def test_writer_role_covers_only_its_tables(self):
         """Must USE the correct role — writer for t2 cannot write t1."""
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "reader", "role_name": "t1_reader", "tables": ["t1"]})
-        self.rm.create_role({"role": "writer", "role_name": "t2_writer", "tables": ["t2"]})
+        self.rm.create_role({"role": "reader", "role_name": "t1_reader", "tables": {"t1": {}}})
+        self.rm.create_role({"role": "writer", "role_name": "t2_writer", "tables": {"t2": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "t2_writer", "t2")  # OK
             with self.assertRaises(PermissionError):
@@ -935,7 +938,7 @@ class TestAccessControl(unittest.TestCase):
 
     def test_role_name_case_insensitive(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "writer", "role_name": "CamelWriter", "tables": ["t1"]})
+        self.rm.create_role({"role": "writer", "role_name": "CamelWriter", "tables": {"t1": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "camelwriter", "t1")
             check_write_access(SUP, ORG, "CAMELWRITER", "t1")
@@ -955,25 +958,25 @@ class TestIntegrationEdgeCases(unittest.TestCase):
     def test_role_update_visible_to_existing_users(self):
         """Update a role's columns — user's resolved permissions change instantly."""
         role_id = self.rm.create_role({
-            "role": "reader", "tables": ["t1"], "columns": ["a"],
+            "role": "reader", "tables": {"t1": {"columns": ["a"]}},
         })
         uid = self.um.create_user({"username": "alice", "roles": [role_id]})
 
         # Before update
         user = self.um.get_user(uid)
         role = self.rm.get_role(user["roles"][0])
-        self.assertEqual(role["columns"], ["a"])
+        self.assertEqual(role["tables"]["t1"]["columns"], ["a"])
 
         # Update the role
-        self.rm.update_role(role_id, {"columns": ["a", "b", "c"]})
+        self.rm.update_role(role_id, {"tables": {"t1": {"columns": ["a", "b", "c"]}}})
 
         # Same user, same role_id — new content
         role_after = self.rm.get_role(user["roles"][0])
-        self.assertEqual(role_after["columns"], ["a", "b", "c"])
+        self.assertEqual(role_after["tables"]["t1"]["columns"], ["a", "b", "c"])
 
     def test_delete_role_with_many_users(self):
         """Role deleted — stripped from all 10 users atomically."""
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         user_ids = []
         for i in range(10):
             uid = self.um.create_user({"username": f"user_{i}", "roles": [role_id]})
@@ -986,8 +989,8 @@ class TestIntegrationEdgeCases(unittest.TestCase):
             self.assertNotIn(role_id, user["roles"])
 
     def test_user_retains_other_roles_after_one_deleted(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
         uid = self.um.create_user({"username": "multi", "roles": [r1, r2]})
 
         self.rm.delete_role(r1)
@@ -999,7 +1002,7 @@ class TestIntegrationEdgeCases(unittest.TestCase):
     def test_create_many_roles_different_types(self):
         ids = {}
         for rtype in ("admin", "writer", "reader", "meta"):
-            ids[rtype] = self.rm.create_role({"role": rtype, "tables": ["*"]})
+            ids[rtype] = self.rm.create_role({"role": rtype, "tables": {"*": {}}})
 
         for rtype, rid in ids.items():
             role = self.rm.get_role(rid)
@@ -1007,34 +1010,34 @@ class TestIntegrationEdgeCases(unittest.TestCase):
 
     def test_shared_catalog_between_managers(self):
         """RoleManager and UserManager sharing same catalog see each other's data."""
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         # UserManager should be able to validate this role
         uid = self.um.create_user({"username": "shared_test", "roles": [role_id]})
         user = self.um.get_user(uid)
         self.assertIn(role_id, user["roles"])
 
     def test_role_id_stable_after_multiple_updates(self):
-        role_id = self.rm.create_role({"role": "reader", "tables": ["t1"], "columns": ["a"]})
+        role_id = self.rm.create_role({"role": "reader", "tables": {"t1": {"columns": ["a"]}}})
         for i in range(5):
-            self.rm.update_role(role_id, {"columns": [f"col_{i}"]})
+            self.rm.update_role(role_id, {"tables": {"t1": {"columns": [f"col_{i}"]}}})
         role = self.rm.get_role(role_id)
         self.assertEqual(role["role_id"], role_id)
-        self.assertEqual(role["columns"], ["col_4"])
+        self.assertEqual(role["tables"]["t1"]["columns"], ["col_4"])
 
     def test_user_id_stable_after_modifications(self):
         uid = self.um.create_user({"username": "stable", "roles": []})
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.um.add_role(uid, r1)
         self.um.modify_user(uid, {"username": "stable_renamed"})
         user = self.um.get_user(uid)
         self.assertEqual(user["user_id"], uid)
 
     def test_restrict_read_access_disabled(self):
-        """restrict_read_access returns immediately (disabled)."""
+        """restrict_read_access returns empty dict for superadmin with no tables."""
         from supertable.rbac.access_control import restrict_read_access
-        # Should not raise
-        result = restrict_read_access(SUP, ORG, "any_role_name", [])
-        self.assertIsNone(result)
+        with patch("supertable.rbac.access_control.RoleManager", return_value=self.rm):
+            result = restrict_read_access(SUP, ORG, "superadmin", [], [])
+        self.assertEqual(result, {})
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -1051,7 +1054,7 @@ class TestBulkOperations(unittest.TestCase):
     def test_create_50_roles(self):
         ids = []
         for i in range(50):
-            rid = self.rm.create_role({"role": "reader", "tables": [f"t{i}"]})
+            rid = self.rm.create_role({"role": "reader", "tables": {f"t{i}": {}}})
             ids.append(rid)
         self.assertEqual(len(set(ids)), 50)
         # +1 for superadmin
@@ -1068,13 +1071,13 @@ class TestBulkOperations(unittest.TestCase):
         self.assertEqual(len(users), 51)
 
     def test_assign_many_roles_to_one_user(self):
-        role_ids = [self.rm.create_role({"role": "reader", "tables": [f"t{i}"]}) for i in range(20)]
+        role_ids = [self.rm.create_role({"role": "reader", "tables": {f"t{i}": {}}}) for i in range(20)]
         uid = self.um.create_user({"username": "multi_role", "roles": role_ids})
         user = self.um.get_user(uid)
         self.assertEqual(len(user["roles"]), 20)
 
     def test_one_role_assigned_to_many_users(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["shared"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"shared": {}}})
         uids = []
         for i in range(30):
             uid = self.um.create_user({"username": f"user_{i}", "roles": [rid]})
@@ -1086,9 +1089,9 @@ class TestBulkOperations(unittest.TestCase):
             self.assertNotIn(rid, user["roles"])
 
     def test_sequential_add_remove_roles(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
-        r3 = self.rm.create_role({"role": "admin", "tables": ["*"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
+        r3 = self.rm.create_role({"role": "admin", "tables": {"*": {}}})
         uid = self.um.create_user({"username": "toggle", "roles": []})
 
         self.um.add_role(uid, r1)
@@ -1106,7 +1109,7 @@ class TestBulkOperations(unittest.TestCase):
         self.assertEqual(self.um.get_user(uid)["roles"], [])
 
     def test_delete_all_roles_except_superadmin(self):
-        ids = [self.rm.create_role({"role": "reader", "tables": [f"t{i}"]}) for i in range(10)]
+        ids = [self.rm.create_role({"role": "reader", "tables": {f"t{i}": {}}}) for i in range(10)]
         for rid in ids:
             self.rm.delete_role(rid)
         remaining = self.rm.list_roles()
@@ -1126,13 +1129,13 @@ class TestCascadeAndDependency(unittest.TestCase):
         self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
     def test_delete_role_removes_from_type_index(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.assertIn(rid, self.cat.rbac_get_role_ids_by_type(ORG, SUP, "reader"))
         self.rm.delete_role(rid)
         self.assertNotIn(rid, self.cat.rbac_get_role_ids_by_type(ORG, SUP, "reader"))
 
     def test_delete_role_removes_from_global_index(self):
-        rid = self.rm.create_role({"role": "writer", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "writer", "tables": {"t1": {}}})
         self.assertIn(rid, self.cat.rbac_list_role_ids(ORG, SUP))
         self.rm.delete_role(rid)
         self.assertNotIn(rid, self.cat.rbac_list_role_ids(ORG, SUP))
@@ -1151,9 +1154,9 @@ class TestCascadeAndDependency(unittest.TestCase):
 
     def test_user_with_all_roles_deleted(self):
         """User had 3 roles, all 3 get deleted — user ends up with empty roles."""
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
-        r3 = self.rm.create_role({"role": "admin", "tables": ["t3"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
+        r3 = self.rm.create_role({"role": "admin", "tables": {"t3": {}}})
         uid = self.um.create_user({"username": "doomed", "roles": [r1, r2, r3]})
 
         self.rm.delete_role(r1)
@@ -1164,30 +1167,30 @@ class TestCascadeAndDependency(unittest.TestCase):
         self.assertEqual(user["roles"], [])
 
     def test_role_update_does_not_affect_other_roles(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"], "columns": ["a"]})
-        r2 = self.rm.create_role({"role": "reader", "tables": ["t2"], "columns": ["b"]})
-        self.rm.update_role(r1, {"columns": ["x", "y", "z"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {"columns": ["a"]}}})
+        r2 = self.rm.create_role({"role": "reader", "tables": {"t2": {"columns": ["b"]}}})
+        self.rm.update_role(r1, {"tables": {"t1": {"columns": ["x", "y", "z"]}}})
         role2 = self.rm.get_role(r2)
-        self.assertEqual(role2["columns"], ["b"])
+        self.assertEqual(role2["tables"]["t2"]["columns"], ["b"])  # Untouched
 
     def test_role_update_changes_content_hash(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"], "columns": ["a"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {"columns": ["a"]}}})
         hash_before = self.rm.get_role(rid)["content_hash"]
-        self.rm.update_role(rid, {"columns": ["a", "b"]})
+        self.rm.update_role(rid, {"tables": {"t1": {"columns": ["a", "b"]}}})
         hash_after = self.rm.get_role(rid)["content_hash"]
         self.assertNotEqual(hash_before, hash_after)
 
     def test_delete_role_then_recreate_same_content(self):
         """After deleting a role, creating one with same content gets a new ID."""
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.rm.delete_role(r1)
-        r2 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        r2 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.assertNotEqual(r1, r2)
         self.assertIsNotNone(self.rm.get_role(r2))
 
     def test_user_references_to_deleted_role_are_cleaned(self):
         """After role deletion, user's role list no longer contains it, even via list_users."""
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "checker", "roles": [rid]})
         self.rm.delete_role(rid)
 
@@ -1238,7 +1241,7 @@ class TestUsernameEdgeCases(unittest.TestCase):
         self.assertEqual(user["username"], "Alice")
 
     def test_rename_preserves_roles(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "before", "roles": [rid]})
         self.um.modify_user(uid, {"username": "after"})
         user = self.um.get_user(uid)
@@ -1267,7 +1270,7 @@ class TestBackwardCompatAliases(unittest.TestCase):
         self.assertEqual(user["user_id"], uid)
 
     def test_remove_role_from_users_deprecated(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         u1 = self.um.create_user({"username": "u1", "roles": [rid]})
         u2 = self.um.create_user({"username": "u2", "roles": [rid]})
         self.um.remove_role_from_users(rid)
@@ -1365,19 +1368,19 @@ class TestVersionTracking(unittest.TestCase):
 
     def test_role_create_bumps_version(self):
         v0 = self._get_role_meta_version()
-        self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         v1 = self._get_role_meta_version()
         self.assertGreater(v1, v0)
 
     def test_role_update_bumps_version(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         v0 = self._get_role_meta_version()
-        self.rm.update_role(rid, {"columns": ["a"]})
+        self.rm.update_role(rid, {"tables": {"t1": {"columns": ["a"]}}})
         v1 = self._get_role_meta_version()
         self.assertGreater(v1, v0)
 
     def test_role_delete_bumps_version(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         v0 = self._get_role_meta_version()
         self.rm.delete_role(rid)
         v1 = self._get_role_meta_version()
@@ -1397,7 +1400,7 @@ class TestVersionTracking(unittest.TestCase):
         self.assertGreater(v1, v0)
 
     def test_add_role_to_user_bumps_user_version(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "v_test", "roles": []})
         v0 = self._get_user_meta_version()
         self.um.add_role(uid, rid)
@@ -1407,7 +1410,7 @@ class TestVersionTracking(unittest.TestCase):
     def test_multiple_operations_monotonic_version(self):
         versions = [self._get_role_meta_version()]
         for i in range(5):
-            self.rm.create_role({"role": "reader", "tables": [f"t{i}"]})
+            self.rm.create_role({"role": "reader", "tables": {f"t{i}": {}}})
             versions.append(self._get_role_meta_version())
         for i in range(1, len(versions)):
             self.assertGreater(versions[i], versions[i - 1])
@@ -1427,8 +1430,8 @@ class TestCrossOrgIsolation(unittest.TestCase):
         self.um_b = UserManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat)
 
     def test_roles_isolated_between_orgs(self):
-        r_a = self.rm_a.create_role({"role": "reader", "tables": ["org_a_table"]})
-        r_b = self.rm_b.create_role({"role": "writer", "tables": ["org_b_table"]})
+        r_a = self.rm_a.create_role({"role": "reader", "tables": {"org_a_table": {}}})
+        r_b = self.rm_b.create_role({"role": "writer", "tables": {"org_b_table": {}}})
 
         roles_a = self.rm_a.list_roles()
         roles_b = self.rm_b.list_roles()
@@ -1447,8 +1450,8 @@ class TestCrossOrgIsolation(unittest.TestCase):
         self.assertNotEqual(u_a, u_b)
 
     def test_delete_role_in_org_a_does_not_affect_org_b(self):
-        r_a = self.rm_a.create_role({"role": "reader", "tables": ["t1"]})
-        r_b = self.rm_b.create_role({"role": "reader", "tables": ["t1"]})
+        r_a = self.rm_a.create_role({"role": "reader", "tables": {"t1": {}}})
+        r_b = self.rm_b.create_role({"role": "reader", "tables": {"t1": {}}})
         self.rm_a.delete_role(r_a)
         # org_b role unaffected
         self.assertIsNotNone(self.rm_b.get_role(r_b))
@@ -1466,15 +1469,15 @@ class TestRedisCatalogReadMethods(unittest.TestCase):
         self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
     def test_get_roles_returns_list_with_deserialized_fields(self):
-        self.rm.create_role({"role": "reader", "tables": ["t1", "t2"], "columns": ["a"]})
+        self.rm.create_role({"role": "reader", "tables": {"t1": {"columns": ["a"]}, "t2": {"columns": ["a"]}}})
         roles = self.cat.get_roles(ORG, SUP)
         reader_roles = [r for r in roles if r.get("role") == "reader"]
         self.assertEqual(len(reader_roles), 1)
-        self.assertIsInstance(reader_roles[0]["tables"], list)
-        self.assertIsInstance(reader_roles[0]["columns"], list)
+        self.assertIsInstance(reader_roles[0]["tables"], dict)
+        self.assertIn("t1", reader_roles[0]["tables"])
 
     def test_get_users_returns_list_with_deserialized_roles(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         self.um.create_user({"username": "test", "roles": [rid]})
         users = self.cat.get_users(ORG, SUP)
         test_users = [u for u in users if u.get("username") == "test"]
@@ -1504,14 +1507,14 @@ class TestAccessControlAdvanced(unittest.TestCase):
 
     def test_admin_can_write_any_table(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "admin", "role_name": "adv_admin", "tables": ["*"]})
+        self.rm.create_role({"role": "admin", "role_name": "adv_admin", "tables": {"*": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "adv_admin", "any_table")
             check_write_access(SUP, ORG, "adv_admin", "another_table")
 
     def test_writer_specific_tables_only(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "writer", "role_name": "order_writer", "tables": ["sales", "orders"]})
+        self.rm.create_role({"role": "writer", "role_name": "order_writer", "tables": {"sales": {}, "orders": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "order_writer", "sales")
             check_write_access(SUP, ORG, "order_writer", "orders")
@@ -1521,11 +1524,11 @@ class TestAccessControlAdvanced(unittest.TestCase):
     def test_access_after_role_update(self):
         """Update a role's tables — access should reflect new tables."""
         from supertable.rbac.access_control import check_write_access
-        rid = self.rm.create_role({"role": "writer", "role_name": "evolving_role", "tables": ["old_table"]})
+        rid = self.rm.create_role({"role": "writer", "role_name": "evolving_role", "tables": {"old_table": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "evolving_role", "old_table")
 
-        self.rm.update_role(rid, {"tables": ["new_table"]})
+        self.rm.update_role(rid, {"tables": {"new_table": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "evolving_role", "new_table")
             with self.assertRaises(PermissionError):
@@ -1534,7 +1537,7 @@ class TestAccessControlAdvanced(unittest.TestCase):
     def test_access_after_role_deleted(self):
         """Role deleted entirely — using its name gets denied."""
         from supertable.rbac.access_control import check_write_access
-        rid = self.rm.create_role({"role": "writer", "role_name": "doomed_role", "tables": ["t1"]})
+        rid = self.rm.create_role({"role": "writer", "role_name": "doomed_role", "tables": {"t1": {}}})
         self.rm.delete_role(rid)
         with self._patch_manager():
             with self.assertRaises(PermissionError):
@@ -1543,8 +1546,8 @@ class TestAccessControlAdvanced(unittest.TestCase):
     def test_two_writer_roles_different_tables(self):
         """Two separate named writer roles — each covers only its own tables."""
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "writer", "role_name": "w_t1", "tables": ["t1"]})
-        self.rm.create_role({"role": "writer", "role_name": "w_t2", "tables": ["t2"]})
+        self.rm.create_role({"role": "writer", "role_name": "w_t1", "tables": {"t1": {}}})
+        self.rm.create_role({"role": "writer", "role_name": "w_t2", "tables": {"t2": {}}})
         with self._patch_manager():
             check_write_access(SUP, ORG, "w_t1", "t1")
             check_write_access(SUP, ORG, "w_t2", "t2")
@@ -1556,13 +1559,13 @@ class TestAccessControlAdvanced(unittest.TestCase):
     def test_reader_role_can_meta(self):
         """Reader role has META permission."""
         from supertable.rbac.access_control import check_meta_access
-        self.rm.create_role({"role": "reader", "role_name": "adv_reader", "tables": ["t1"]})
+        self.rm.create_role({"role": "reader", "role_name": "adv_reader", "tables": {"t1": {}}})
         with self._patch_manager():
             check_meta_access(SUP, ORG, "adv_reader", "t1")
 
     def test_meta_role_cannot_write(self):
         from supertable.rbac.access_control import check_write_access
-        self.rm.create_role({"role": "meta", "role_name": "meta_only", "tables": ["*"]})
+        self.rm.create_role({"role": "meta", "role_name": "meta_only", "tables": {"*": {}}})
         with self._patch_manager():
             with self.assertRaises(PermissionError):
                 check_write_access(SUP, ORG, "meta_only", "any_table")
@@ -1602,26 +1605,26 @@ class TestRoleTypeUpdate(unittest.TestCase):
         self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
     def test_update_role_tables(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        self.rm.update_role(rid, {"tables": ["t1", "t2", "t3"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        self.rm.update_role(rid, {"tables": {"t1": {}, "t2": {}, "t3": {}}})
         role = self.rm.get_role(rid)
-        self.assertEqual(role["tables"], ["t1", "t2", "t3"])
+        self.assertEqual(set(role["tables"].keys()), {"t1", "t2", "t3"})
 
     def test_update_role_filters(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"], "filters": {"col": "val"}})
-        self.rm.update_role(rid, {"filters": {"col": "new_val"}})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {"filters": {"col": "val"}}}})
+        self.rm.update_role(rid, {"tables": {"t1": {"filters": {"col": "new_val"}}}})
         role = self.rm.get_role(rid)
-        self.assertEqual(role["filters"], {"col": "new_val"})
+        self.assertEqual(role["tables"]["t1"]["filters"], {"col": "new_val"})
 
     def test_update_preserves_role_id(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        self.rm.update_role(rid, {"tables": ["t2"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        self.rm.update_role(rid, {"tables": {"t2": {}}})
         role = self.rm.get_role(rid)
         self.assertEqual(role["role_id"], rid)
 
     def test_update_preserves_role_type(self):
-        rid = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        self.rm.update_role(rid, {"columns": ["x"]})
+        rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        self.rm.update_role(rid, {"tables": {"t1": {"columns": ["x"]}}})
         role = self.rm.get_role(rid)
         self.assertEqual(role["role"], "reader")
 
@@ -1690,8 +1693,8 @@ class TestModifyUserCombined(unittest.TestCase):
         self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
     def test_modify_username_and_roles_together(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
         uid = self.um.create_user({"username": "before", "roles": [r1]})
         self.um.modify_user(uid, {"username": "after", "roles": [r2]})
         user = self.um.get_user(uid)
@@ -1705,16 +1708,16 @@ class TestModifyUserCombined(unittest.TestCase):
         self.assertEqual(user["username"], "static")
 
     def test_modify_roles_to_empty(self):
-        r = self.rm.create_role({"role": "reader", "tables": ["t1"]})
+        r = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
         uid = self.um.create_user({"username": "clearing", "roles": [r]})
         self.um.modify_user(uid, {"roles": []})
         user = self.um.get_user(uid)
         self.assertEqual(user["roles"], [])
 
     def test_modify_roles_replace_all(self):
-        r1 = self.rm.create_role({"role": "reader", "tables": ["t1"]})
-        r2 = self.rm.create_role({"role": "writer", "tables": ["t2"]})
-        r3 = self.rm.create_role({"role": "admin", "tables": ["*"]})
+        r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
+        r2 = self.rm.create_role({"role": "writer", "tables": {"t2": {}}})
+        r3 = self.rm.create_role({"role": "admin", "tables": {"*": {}}})
         uid = self.um.create_user({"username": "replacer", "roles": [r1, r2]})
         self.um.modify_user(uid, {"roles": [r3]})
         user = self.um.get_user(uid)
@@ -1729,38 +1732,38 @@ class TestRowColumnSecurityAdvanced(unittest.TestCase):
 
     def test_all_role_types_accepted(self):
         for rtype in ("superadmin", "admin", "writer", "reader", "meta"):
-            rcs = RowColumnSecurity(role=rtype, tables=["t1"])
+            rcs = RowColumnSecurity(role=rtype, tables={"t1": {}})
             rcs.prepare()
             self.assertEqual(rcs.role.value, rtype)
 
     def test_filters_preserved(self):
         f = {"region": "US", "status": "active"}
-        rcs = RowColumnSecurity(role="reader", tables=["t1"], filters=f)
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {"filters": f}})
         rcs.prepare()
-        self.assertEqual(rcs.filters, f)
+        self.assertEqual(rcs.tables["t1"]["filters"], f)
 
     def test_create_content_hash_alias(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1"])
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {}})
         rcs.prepare()
         old_hash = rcs.content_hash
         rcs.create_content_hash()  # re-compute
         self.assertEqual(rcs.content_hash, old_hash)
 
     def test_content_hash_is_32_hex(self):
-        rcs = RowColumnSecurity(role="reader", tables=["t1"])
+        rcs = RowColumnSecurity(role="reader", tables={"t1": {}})
         rcs.prepare()
         self.assertEqual(len(rcs.content_hash), 32)
         int(rcs.content_hash, 16)  # should not raise
 
     def test_single_table_no_sort_needed(self):
-        rcs = RowColumnSecurity(role="reader", tables=["only_one"])
+        rcs = RowColumnSecurity(role="reader", tables={"only_one": {}})
         rcs.prepare()
-        self.assertEqual(rcs.tables, ["only_one"])
+        self.assertIn("only_one", rcs.tables)
 
     def test_wildcard_table(self):
-        rcs = RowColumnSecurity(role="admin", tables=["*"])
+        rcs = RowColumnSecurity(role="admin", tables={"*": {}})
         rcs.prepare()
-        self.assertEqual(rcs.tables, ["*"])
+        self.assertIn("*", rcs.tables)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

@@ -485,11 +485,13 @@ class MetaReader:
 
 
 
-def list_supers(organization: str) -> List[str]:
+def list_supers(organization: str, role_name: str) -> List[str]:
     """
     Searches the organization's directory for subdirectories that contain a
     "super" folder and a "_super.json" file. Uses the storage interface's
     get_directory_structure() for portability.
+
+    Filters results to only include supers where *role_name* has META access.
     """
     result = []
     pattern = f"supertable:{organization}:*:meta:root"
@@ -497,16 +499,27 @@ def list_supers(organization: str) -> List[str]:
     items = _get_redis_items(pattern)
     for item in items:
         super_name = item.split(':')[2]
-        result.append(super_name)
+        try:
+            check_meta_access(
+                super_name=super_name,
+                organization=organization,
+                role_name=role_name,
+                table_name=super_name,
+            )
+            result.append(super_name)
+        except PermissionError:
+            continue
 
     return sorted(result)
 
 
-def list_tables(organization: str, super_name: str) -> List[str]:
+def list_tables(organization: str, super_name: str, role_name: str) -> List[str]:
     """
     Searches the organization's directory for subdirectories that contain a
     "super" folder and a "_super.json" file. Uses the storage interface's
     get_directory_structure() for portability.
+
+    Filters results to only include tables where *role_name* has META access.
     """
     result = []
     pattern = f"supertable:{organization}:{super_name}:meta:leaf:*"
@@ -514,6 +527,15 @@ def list_tables(organization: str, super_name: str) -> List[str]:
     items = _get_redis_items(pattern)
     for item in items:
         table_name = item.split(':')[-1]
-        result.append(table_name)
+        try:
+            check_meta_access(
+                super_name=super_name,
+                organization=organization,
+                role_name=role_name,
+                table_name=table_name,
+            )
+            result.append(table_name)
+        except PermissionError:
+            continue
 
     return sorted(result)

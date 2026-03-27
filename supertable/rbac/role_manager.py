@@ -46,9 +46,7 @@ class RoleManager:
                     sysadmin_data = {
                         "role": "superadmin",
                         "role_name": "superadmin",
-                        "tables": ["*"],
-                        "columns": ["*"],
-                        "filters": ["*"],
+                        "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
                     }
                     role_id = self.create_role(sysadmin_data)
                     logger.info(f"Default superadmin role created: {role_id}")
@@ -65,9 +63,20 @@ class RoleManager:
         Create a new role and return its ``role_id`` (UUID).
 
         ``data`` must contain at least ``role`` (a RoleType string)
-        and ``tables``.  ``columns`` and ``filters`` are optional.
+        and ``tables`` (a dict of per-table definitions).
         ``role_name`` is optional but must be unique (case-insensitive)
         when provided; it enables name-based lookups.
+
+        Table definition format::
+
+            {
+                "role": "reader",
+                "role_name": "sales_analyst",
+                "tables": {
+                    "orders": {"columns": ["order_id", "amount"], "filters": [...]},
+                    "customers": {"columns": ["*"], "filters": ["*"]}
+                }
+            }
         """
         org, sup = self.organization, self.super_name
         role_name = data.get("role_name")
@@ -104,11 +113,11 @@ class RoleManager:
         if not existing:
             raise ValueError(f"Role {role_id} does not exist")
 
+        default_tables = {"*": {"columns": ["*"], "filters": ["*"]}}
+
         merged = {
             "role": data.get("role", existing.get("role")),
-            "tables": data.get("tables", existing.get("tables", ["*"])),
-            "columns": data.get("columns", existing.get("columns", ["*"])),
-            "filters": data.get("filters", existing.get("filters", ["*"])),
+            "tables": data.get("tables", existing.get("tables", default_tables)),
         }
 
         rcs = RowColumnSecurity(**merged)

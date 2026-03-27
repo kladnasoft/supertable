@@ -12,6 +12,7 @@ import pyarrow as pa
 from supertable.config.defaults import logger
 from supertable.storage.storage_factory import get_storage
 from supertable.redis_catalog import RedisCatalog
+from supertable.rbac.access_control import check_write_access, check_meta_access
 
 
 def _resolve_super_name(super_table: Any) -> Optional[str]:
@@ -125,12 +126,18 @@ class Staging:
             staging_name=staging_name,
         )
 
-    def get_directory_structure(self) -> Dict[str, Any]:
+    def get_directory_structure(self, role_name: str) -> Dict[str, Any]:
         """
         Backwards-compatible method used by examples/3.4. read_staging.py.
 
         Returns a JSON-serializable dict describing the staging area and stages.
         """
+        check_meta_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
         # Ensure base exists (read-only; no lock)
         base_exists = self.storage.exists(self.base_staging_dir)
         stagings = self.catalog.list_stagings(self.organization, self.super_name)
@@ -223,8 +230,14 @@ class Staging:
         if not self.storage.exists(self.files_index_path):
             self.storage.write_json(self.files_index_path, [])
 
-    def save_as_parquet(self, *, arrow_table: pa.Table, base_file_name: str) -> str:
+    def save_as_parquet(self, *, role_name: str, arrow_table: pa.Table, base_file_name: str) -> str:
         self._require_stage_mode()
+        check_write_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
 
         def _op():
             ts_ns = time.time_ns()
@@ -245,15 +258,27 @@ class Staging:
 
         return self._with_lock(_op)
 
-    def list_files(self) -> List[str]:
+    def list_files(self, role_name: str) -> List[str]:
         self._require_stage_mode()
+        check_meta_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
         if not self.storage.exists(self.files_index_path):
             return []
         data = self.storage.read_json(self.files_index_path) or []
         return [item.get("file") for item in data if isinstance(item, dict) and item.get("file")]
 
-    def delete(self) -> None:
+    def delete(self, role_name: str) -> None:
         self._require_stage_mode()
+        check_write_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
 
         def _op():
             if self.storage.exists(self.stage_dir):

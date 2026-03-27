@@ -88,6 +88,7 @@ class SQLParser:
         self._alias_to_columns: Dict[str, List[str]] = {}
 
         self._extract_tables()
+        self._cte_names: Set[str] = self._collect_cte_names()
         self._extract_columns()
 
     # ---------------- Parsing helpers ----------------
@@ -192,6 +193,25 @@ class SQLParser:
             raise ValueError("No tables found in SQL query.")
 
         self._alias_to_table = alias_to_table
+
+    # ---------------- CTE detection ────────────────────────────────── #
+
+    def _collect_cte_names(self) -> Set[str]:
+        """
+        Return the set of CTE names defined in WITH clauses.
+
+        These names are *not* physical tables — they are query-scoped
+        aliases for subqueries.  ``get_physical_tables()`` uses this set
+        to exclude CTE references from the physical table list.
+        """
+        names: Set[str] = set()
+        for cte in self._parsed.find_all(exp.CTE):
+            alias_expr = cte.args.get("alias")
+            if isinstance(alias_expr, exp.TableAlias):
+                ident = alias_expr.this
+                if isinstance(ident, exp.Identifier) and ident.name:
+                    names.add(ident.name)
+        return names
 
     # ---------------- Column extraction helpers ----------------
 
@@ -448,5 +468,72 @@ class SQLParser:
                 columns=columns,
             )
             result.append(definition)
+
+        return result
+
+    def get_physical_tables(self) -> List[TableDefinition]:
+        """
+        Return deduplicated *physical* tables with merged columns.
+
+        This method is designed for RBAC and engine reflection creation
+        where the question is "which real tables does this query touch,
+        and which columns from each?"
+
+        Differences from ``get_table_tuples()``:
+
+        1. **CTE aliases are excluded.**  A reference to ``summary`` in
+           ``WITH summary AS (SELECT … FROM orders) SELECT … FROM summary``
+           is not a physical table.  The real table (``orders``) is
+           returned instead — with columns collected from inside the CTE body.
+
+        2. **Same table, multiple aliases → merged.**
+           ``FROM orders a JOIN orders b ON …`` produces a single entry
+           for ``orders`` whose column list is the union of both aliases.
+
+        3. **Star semantics propagate.**  If *any* alias for a table has
+           ``[]`` (meaning ``SELECT *`` or ``t.*``), the merged result
+           is ``[]`` (all columns).
+
+        4. **The ``alias`` field is set to ``simple_name``** since the
+           per-alias distinction is meaningless after merging.
+
+        Downstream callers:
+        - ``restrict_read_access()``  — RBAC column/table validation.
+        - ``DataEstimator``           — snapshot resolution (one per table).
+        - Engine reflection creation  — one ``parquet_scan`` per table.
+
+        For alias-level operations (query rewriting, view naming) continue
+        using ``get_table_tuples()``.
+        """
+        # Group by (super_name, simple_name), merge columns across aliases.
+        merged: Dict[Tuple[str, str], List[str]] = {}
+
+        for alias, (super_name, table_name) in self._alias_to_table.items():
+            # Skip CTE aliases — they are not physical tables.
+            if table_name in self._cte_names:
+                continue
+
+            key = (super_name, table_name)
+            cols = self._alias_to_columns.get(alias, [])
+
+            if key not in merged:
+                merged[key] = list(cols)
+            else:
+                existing = merged[key]
+                if not existing or not cols:
+                    # [] means star (all columns) — star wins.
+                    merged[key] = []
+                else:
+                    combined = set(existing) | set(cols)
+                    merged[key] = sorted(combined)
+
+        result: List[TableDefinition] = []
+        for (super_name, table_name), columns in merged.items():
+            result.append(TableDefinition(
+                super_name=super_name,
+                simple_name=table_name,
+                alias=table_name,
+                columns=columns,
+            ))
 
         return result

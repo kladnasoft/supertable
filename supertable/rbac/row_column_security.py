@@ -2,7 +2,7 @@
 
 import json
 import hashlib
-from typing import List, Optional, Dict, Union
+from typing import Dict, Optional
 
 from supertable.rbac.permissions import RoleType
 
@@ -12,9 +12,25 @@ class RowColumnSecurity:
     Value object that validates and normalises role permission data.
 
     * ``role``    – one of the ``RoleType`` enum values.
-    * ``tables``  – list of table names, or ``["*"]`` for all.
-    * ``columns`` – list of column names, or ``["*"]`` for all.
-    * ``filters`` – filter definition (dict/list), or ``["*"]`` for none.
+    * ``tables``  – dict mapping table names to per-table definitions.
+      Each entry is ``{"columns": [...], "filters": [...]}``.
+      A ``"*"`` key acts as the default for tables not explicitly listed.
+      Example::
+
+          {
+              "*": {"columns": ["*"], "filters": ["*"]},
+              "orders": {
+                  "columns": ["order_id", "amount", "status"],
+                  "filters": [{"status": {"operation": "=",
+                                          "type": "value",
+                                          "value": "completed"}}]
+              },
+              "customers": {
+                  "columns": ["customer_id", "name", "region"],
+                  "filters": ["*"]
+              }
+          }
+
     * ``content_hash`` – deterministic hash of the *content* above.
       Used for change-detection / logging, **not** as the identity.
       The stable identity is ``role_id`` (UUID), assigned by RoleManager.
@@ -23,32 +39,27 @@ class RowColumnSecurity:
     def __init__(
             self,
             role: str,
-            tables: List[str],
-            columns: Optional[List[str]] = None,
-            filters: Optional[Union[List, Dict]] = None,
+            tables: Optional[Dict[str, dict]] = None,
             role_name: Optional[str] = None,
     ):
         # Convert the string role to RoleType from the permissions module.
         self.role = RoleType(role)
-        self.tables = tables
-        self.columns = columns
-        self.filters = filters
+        self.tables: Dict[str, dict] = tables or {}
         self.role_name = role_name
         self.content_hash: Optional[str] = None
 
-    def sort_all(self):
-        """Ensure tables and columns are unique and sorted for consistency."""
-        self.tables = sorted(set(self.tables))
-        if self.columns and self.columns != ["*"]:
-            self.columns = sorted(set(self.columns))
+    def sort_all(self) -> None:
+        """Ensure per-table column lists are unique and sorted for consistency."""
+        for table_name, table_def in self.tables.items():
+            cols = table_def.get("columns", ["*"])
+            if cols and cols != ["*"]:
+                table_def["columns"] = sorted(set(cols))
 
     def to_json(self) -> dict:
         """Return a dict representation of the role data."""
         return {
             "role": self.role.value,
             "tables": self.tables,
-            "columns": self.columns,
-            "filters": self.filters,
         }
 
     def create_content_hash(self) -> None:
@@ -59,11 +70,14 @@ class RowColumnSecurity:
     def prepare(self) -> None:
         """Validate role parameters, apply defaults, and compute content hash."""
         if not self.tables:
-            self.tables = ["*"]
-        if not self.columns:
-            self.columns = ["*"]
-        if not self.filters:
-            self.filters = ["*"]
+            self.tables = {"*": {"columns": ["*"], "filters": ["*"]}}
+
+        for table_name, table_def in self.tables.items():
+            if "columns" not in table_def:
+                table_def["columns"] = ["*"]
+            if "filters" not in table_def:
+                table_def["filters"] = ["*"]
+
         self.sort_all()
         self.create_content_hash()
 

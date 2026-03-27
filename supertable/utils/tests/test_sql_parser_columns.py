@@ -80,6 +80,15 @@ def _parse_tables(super_name: str, query: str) -> Dict[str, Tuple[str, str]]:
     return {t.alias: (t.super_name, t.simple_name) for t in p.get_table_tuples()}
 
 
+def _parse_physical(super_name: str, query: str) -> Dict[str, List[str]]:
+    """Return {simple_name: sorted_columns} from get_physical_tables().
+
+    CTE aliases are excluded and same-table aliases are merged.
+    """
+    p = SQLParser(super_name=super_name, query=query, dialect="duckdb")
+    return {t.simple_name: sorted(t.columns) for t in p.get_physical_tables()}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Test case definitions
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3898,6 +3907,394 @@ CASES.append({
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 68: get_physical_tables() — CTE filtering and alias merging
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These tests validate get_physical_tables() which:
+#   1. Excludes CTE aliases (they are not physical tables)
+#   2. Merges columns when the same table appears under multiple aliases
+#   3. Returns alias = simple_name (since per-alias distinction is gone)
+#
+# The expect_physical dict maps {simple_name: sorted_columns} — same
+# format as expect but keyed by physical table name, not alias.
+# ═══════════════════════════════════════════════════════════════════════════
+
+CASES.append({
+    "id": "physical_cte_001",
+    "desc": "Simple CTE — CTE alias excluded, only real table returned",
+    "super": "s",
+    "sql": """
+        WITH summary AS (
+            SELECT a, SUM(b) AS total FROM t GROUP BY a
+        )
+        SELECT a, total FROM summary ORDER BY total DESC
+    """,
+    # CTE 'summary' is filtered out. Only 't' remains.
+    # Columns from inside the CTE body are collected for 't'.
+    # However, with two "tables" (t + summary) in the parser's view,
+    # unqualified columns become ambiguous -> star semantics -> [].
+    "expect_physical": {"t": []},
+})
+
+CASES.append({
+    "id": "physical_cte_002",
+    "desc": "CTE referencing table, outer query joins CTE with real table",
+    "super": "s",
+    "sql": """
+        WITH recent AS (
+            SELECT o.order_id, o.amount, o.customer_id
+            FROM orders o
+            WHERE o.created_at > '2024-01-01'
+        )
+        SELECT r.order_id, r.amount, c.name
+        FROM recent r
+        INNER JOIN customers c ON r.customer_id = c.customer_id
+    """,
+    # CTE 'recent' excluded. Physical tables: orders, customers.
+    # orders columns come from the CTE body (qualified: order_id, amount, customer_id, created_at).
+    # customers columns from outer query (qualified: customer_id, name).
+    "expect_physical": {
+        "orders": sorted(["amount", "created_at", "customer_id", "order_id"]),
+        "customers": ["customer_id", "name"],
+    },
+})
+
+CASES.append({
+    "id": "physical_cte_003",
+    "desc": "Multi-CTE pipeline — all CTE aliases excluded, only leaf table remains",
+    "super": "dw",
+    "sql": """
+        WITH daily AS (
+            SELECT date, region, SUM(sales) AS daily_sales
+            FROM transactions
+            GROUP BY date, region
+        ),
+        weekly AS (
+            SELECT region, SUM(daily_sales) AS weekly_sales
+            FROM daily
+            GROUP BY region
+        )
+        SELECT region, weekly_sales
+        FROM weekly
+        ORDER BY weekly_sales DESC
+    """,
+    # CTEs 'daily' and 'weekly' excluded. Only 'transactions' remains.
+    # Multi-table ambiguity causes star semantics.
+    "expect_physical": {"transactions": []},
+})
+
+CASES.append({
+    "id": "physical_cte_004",
+    "desc": "CTE name same as physical table used elsewhere — CTE excluded, physical kept",
+    "super": "s",
+    "sql": """
+        WITH top_orders AS (
+            SELECT order_id FROM orders WHERE amount > 1000
+        )
+        SELECT o.order_id, o.status
+        FROM orders o
+        WHERE o.order_id IN (SELECT order_id FROM top_orders)
+    """,
+    # CTE 'top_orders' excluded. 'orders' appears in CTE body AND outer query.
+    # Both aliases ('orders' inside CTE, 'o' outside) point to same table -> merged.
+    "expect_physical": {"orders": []},
+})
+
+CASES.append({
+    "id": "physical_merge_001",
+    "desc": "Self-join — same table two aliases, columns merged",
+    "super": "s",
+    "sql": """
+        SELECT a.amount, b.status
+        FROM orders a
+        JOIN orders b ON a.parent_id = b.order_id
+    """,
+    # a: amount, parent_id
+    # b: status, order_id
+    # Merged: {amount, order_id, parent_id, status}
+    "expect_physical": {"orders": sorted(["amount", "order_id", "parent_id", "status"])},
+})
+
+CASES.append({
+    "id": "physical_merge_002",
+    "desc": "Self-join — one alias uses t.*, merged result is star",
+    "super": "s",
+    "sql": """
+        SELECT a.*, b.status
+        FROM orders a
+        JOIN orders b ON a.parent_id = b.order_id
+    """,
+    # a: [] (star). b: status, order_id.
+    # Star wins -> merged result is [].
+    "expect_physical": {"orders": []},
+})
+
+CASES.append({
+    "id": "physical_merge_003",
+    "desc": "Self-join — three aliases for same table, all columns merged",
+    "super": "s",
+    "sql": """
+        SELECT e.name, m.name AS manager_name, s.name AS skip_name
+        FROM employees e
+        JOIN employees m ON e.manager_id = m.id
+        JOIN employees s ON m.manager_id = s.id
+    """,
+    # e: name, manager_id
+    # m: name, id, manager_id
+    # s: name, id
+    # Merged: {id, manager_id, name}
+    "expect_physical": {"employees": sorted(["id", "manager_id", "name"])},
+})
+
+CASES.append({
+    "id": "physical_merge_004",
+    "desc": "Self-join with WHERE, GROUP BY, HAVING — all clauses contribute columns",
+    "super": "s",
+    "sql": """
+        SELECT a.region, COUNT(b.order_id) AS order_count
+        FROM orders a
+        JOIN orders b ON a.order_id = b.parent_id
+        WHERE a.status = 'completed' AND b.status = 'shipped'
+        GROUP BY a.region
+        HAVING COUNT(b.order_id) > 5
+    """,
+    # a: region, order_id, status
+    # b: order_id, parent_id, status
+    # Merged: {order_id, parent_id, region, status}
+    "expect_physical": {"orders": sorted(["order_id", "parent_id", "region", "status"])},
+})
+
+CASES.append({
+    "id": "physical_merge_005",
+    "desc": "Same table in main query and EXISTS subquery — merged",
+    "super": "s",
+    "sql": """
+        SELECT o.order_id, o.amount
+        FROM orders o
+        WHERE EXISTS (
+            SELECT 1 FROM orders o2
+            WHERE o2.customer_id = o.customer_id AND o2.amount > o.amount
+        )
+    """,
+    # o: order_id, amount, customer_id
+    # o2: customer_id, amount
+    # Merged: {amount, customer_id, order_id}
+    "expect_physical": {"orders": sorted(["amount", "customer_id", "order_id"])},
+})
+
+CASES.append({
+    "id": "physical_cte_join_001",
+    "desc": "CTE joined with two real tables — CTE excluded, real tables intact",
+    "super": "s",
+    "sql": """
+        WITH high_value AS (
+            SELECT o.order_id, o.customer_id
+            FROM orders o
+            WHERE o.amount > 500
+        )
+        SELECT h.order_id, c.name, p.method
+        FROM high_value h
+        JOIN customers c ON h.customer_id = c.customer_id
+        JOIN payments p ON h.order_id = p.order_id
+    """,
+    # CTE 'high_value' excluded.
+    # Physical: orders (from CTE body: order_id, customer_id, amount), customers, payments.
+    "expect_physical": {
+        "orders": sorted(["amount", "customer_id", "order_id"]),
+        "customers": ["customer_id", "name"],
+        "payments": ["method", "order_id"],
+    },
+})
+
+CASES.append({
+    "id": "physical_cte_join_002",
+    "desc": "CTE over JOIN — both inner tables merged, CTE excluded",
+    "super": "s",
+    "sql": """
+        WITH enriched AS (
+            SELECT o.order_id, o.amount, c.name
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.customer_id
+        )
+        SELECT order_id, amount, name
+        FROM enriched
+        ORDER BY amount DESC
+    """,
+    # CTE 'enriched' excluded.
+    # Physical: orders, customers (from CTE body).
+    "expect_physical": {
+        "orders": ["amount", "customer_id", "order_id"],
+        "customers": ["customer_id", "name"],
+    },
+})
+
+CASES.append({
+    "id": "physical_no_cte_001",
+    "desc": "Simple single table — get_physical_tables same as get_table_tuples",
+    "super": "s",
+    "sql": "SELECT a, b FROM t WHERE c > 10",
+    "expect_physical": {"t": sorted(["a", "b", "c"])},
+})
+
+CASES.append({
+    "id": "physical_no_cte_002",
+    "desc": "Two-table JOIN, no CTE — get_physical_tables returns both",
+    "super": "s",
+    "sql": """
+        SELECT o.order_id, c.name
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
+        WHERE o.status = 'active'
+    """,
+    "expect_physical": {
+        "orders": sorted(["customer_id", "order_id", "status"]),
+        "customers": sorted(["customer_id", "name"]),
+    },
+})
+
+CASES.append({
+    "id": "physical_no_cte_003",
+    "desc": "SELECT * — get_physical_tables returns star for all tables",
+    "super": "s",
+    "sql": "SELECT * FROM orders o JOIN customers c ON o.cid = c.id",
+    "expect_physical": {"orders": [], "customers": []},
+})
+
+CASES.append({
+    "id": "physical_window_merge_001",
+    "desc": "Self-join with window function — PARTITION BY and ORDER BY columns merged",
+    "super": "s",
+    "sql": """
+        SELECT
+            a.region,
+            b.order_id,
+            SUM(a.amount) OVER (PARTITION BY a.region ORDER BY a.created_at) AS running
+        FROM orders a
+        JOIN orders b ON a.parent_id = b.order_id
+        WHERE b.status = 'active'
+    """,
+    # a: region, amount, created_at, parent_id
+    # b: order_id, status
+    # Merged: {amount, created_at, order_id, parent_id, region, status}
+    "expect_physical": {
+        "orders": sorted(["amount", "created_at", "order_id", "parent_id", "region", "status"]),
+    },
+})
+
+CASES.append({
+    "id": "physical_subquery_001",
+    "desc": "Derived table (subquery in FROM) — subquery alias not in physical result",
+    "super": "s",
+    "sql": """
+        SELECT sub.a, sub.total
+        FROM (SELECT a, SUM(b) AS total FROM t GROUP BY a) sub
+        ORDER BY sub.total DESC
+    """,
+    # 'sub' is a derived table alias, not captured by _extract_tables as a table.
+    # Only 't' is a physical table. get_physical_tables returns 't'.
+    "expect_physical": {"t": sorted(["a", "b"])},
+})
+
+CASES.append({
+    "id": "physical_cte_recursive_ref_001",
+    "desc": "CTE referencing another CTE — both excluded, only leaf tables remain",
+    "super": "s",
+    "sql": """
+        WITH base AS (
+            SELECT o.order_id, o.amount, o.customer_id
+            FROM orders o
+        ),
+        enriched AS (
+            SELECT b.order_id, b.amount, c.name
+            FROM base b
+            JOIN customers c ON b.customer_id = c.customer_id
+        )
+        SELECT order_id, amount, name
+        FROM enriched
+        WHERE amount > 100
+    """,
+    # CTEs 'base' and 'enriched' excluded.
+    # Physical: orders (from base body: order_id, amount, customer_id),
+    #           customers (from enriched body: customer_id, name).
+    "expect_physical": {
+        "orders": sorted(["amount", "customer_id", "order_id"]),
+        "customers": ["customer_id", "name"],
+    },
+})
+
+CASES.append({
+    "id": "physical_cross_schema_merge_001",
+    "desc": "Cross-schema tables — different schemas keep separate physical entries",
+    "super": "default",
+    "sql": """
+        SELECT a.name, b.quantity
+        FROM catalog.brands a
+        JOIN sales.line_items b ON a.id = b.brand_id
+    """,
+    # Different schema + different table name — no merging possible.
+    "expect_physical": {
+        "brands": sorted(["id", "name"]),
+        "line_items": sorted(["brand_id", "quantity"]),
+    },
+})
+
+CASES.append({
+    "id": "physical_left_join_001",
+    "desc": "LEFT JOIN with filters on both sides — physical tables preserve all columns",
+    "super": "s",
+    "sql": """
+        SELECT
+            o.order_id, o.amount, o.status,
+            c.customer_id, c.name, c.region
+        FROM orders o
+        LEFT JOIN customers c ON o.customer_id = c.customer_id
+        WHERE o.status = 'completed' AND c.region = 'EU'
+    """,
+    "expect_physical": {
+        "orders": sorted(["amount", "customer_id", "order_id", "status"]),
+        "customers": sorted(["customer_id", "name", "region"]),
+    },
+})
+
+CASES.append({
+    "id": "physical_inner_join_001",
+    "desc": "INNER JOIN with range + multi-value filters — both tables physical",
+    "super": "s",
+    "sql": """
+        SELECT
+            o.order_id, o.amount, o.created_at,
+            c.customer_id, c.name, c.email, c.tier
+        FROM orders o
+        INNER JOIN customers c ON o.customer_id = c.customer_id
+        WHERE o.amount > 100 AND c.region IN ('EU', 'US')
+    """,
+    "expect_physical": {
+        "orders": sorted(["amount", "created_at", "customer_id", "order_id"]),
+        "customers": sorted(["customer_id", "email", "name", "region", "tier"]),
+    },
+})
+
+CASES.append({
+    "id": "physical_cte_with_window_001",
+    "desc": "CTE with window function — CTE excluded, window columns in physical table",
+    "super": "s",
+    "sql": """
+        WITH ranked AS (
+            SELECT o.order_id, o.amount, o.customer_id,
+                   ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.amount DESC) AS rn
+            FROM orders o
+        )
+        SELECT order_id, amount
+        FROM ranked
+        WHERE rn = 1
+    """,
+    # CTE 'ranked' excluded. Physical: orders.
+    # Qualified columns from CTE body resolve to orders.
+    "expect_physical": {"orders": sorted(["amount", "customer_id", "order_id"])},
+})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test runner
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -3914,6 +4311,7 @@ def run_tests() -> Tuple[int, int, List[str]]:
         expect_error = case.get("expect_error")
         expect_cols = case.get("expect")
         expect_tables = case.get("expect_tables")
+        expect_physical = case.get("expect_physical")
 
         try:
             if expect_error:
@@ -3954,6 +4352,18 @@ def run_tests() -> Tuple[int, int, List[str]]:
                     failed += 1
                     continue
 
+            # Validate physical tables if specified
+            if expect_physical is not None:
+                actual_physical = _parse_physical(super_name, sql)
+                if actual_physical != expect_physical:
+                    failures.append(
+                        f"  FAIL [{cid}]: Physical table mismatch — {desc}\n"
+                        f"       Expected: {expect_physical}\n"
+                        f"       Actual:   {actual_physical}"
+                    )
+                    failed += 1
+                    continue
+
             passed += 1
 
         except Exception as e:
@@ -3986,6 +4396,7 @@ try:
         expect_error = case.get("expect_error")
         expect_cols = case.get("expect")
         expect_tables = case.get("expect_tables")
+        expect_physical = case.get("expect_physical")
 
         if expect_error:
             with pytest.raises(expect_error):
@@ -4007,6 +4418,14 @@ try:
                 f"Table mismatch for [{case['id']}]: {case['desc']}\n"
                 f"  Expected: {expect_tables}\n"
                 f"  Actual:   {actual_tables}"
+            )
+
+        if expect_physical is not None:
+            actual_physical = _parse_physical(super_name, sql)
+            assert actual_physical == expect_physical, (
+                f"Physical table mismatch for [{case['id']}]: {case['desc']}\n"
+                f"  Expected: {expect_physical}\n"
+                f"  Actual:   {actual_physical}"
             )
 except ImportError:
     pass  # pytest not installed — standalone runner still works via __main__

@@ -6,7 +6,7 @@ from typing import List, Set
 from supertable.config.defaults import logger
 from supertable.super_table import SuperTable
 from supertable.redis_catalog import RedisCatalog
-from supertable.rbac.access_control import check_write_access
+from supertable.rbac.access_control import check_control_access
 
 
 class HistoryCleaner:
@@ -39,8 +39,8 @@ class HistoryCleaner:
           1) Legacy files possibly under the SuperTable folder (if any).
           2) All SimpleTables discovered via Redis leaf pointers.
         """
-        # RBAC
-        check_write_access(
+        # RBAC — history cleaning is a destructive (CONTROL) operation
+        check_control_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
             role_name=role_name,

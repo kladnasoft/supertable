@@ -11,6 +11,7 @@ import pandas as pd
 from supertable.storage.storage_factory import get_storage
 from supertable.engine.duckdb_transient import DuckDBExecutor
 from supertable.engine.data_estimator import DataEstimator
+from supertable.rbac.access_control import check_meta_access
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,7 @@ class MonitoringReader:
     def read(
         self,
         *,
+        role_name: str,
         from_ts_ms: Optional[int] = None,
         to_ts_ms: Optional[int] = None,
         limit: int = 1000,
@@ -193,6 +195,12 @@ class MonitoringReader:
 
         Default: last 24 hours.
         """
+        check_meta_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
         now = _now_ms()
         if to_ts_ms is None:
             to_ts_ms = now

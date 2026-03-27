@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
+from supertable.rbac.access_control import check_write_access, check_meta_access
 
 
 class SuperPipe:
@@ -45,8 +46,15 @@ class SuperPipe:
             """
             self.catalog.r.eval(lua, 1, lock_key, token)
 
-    def create(self, *, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
+    def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
                enabled: bool = True) -> str:
+        check_write_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=simple_name,
+        )
+
         def _op():
             # 1. Check for duplicate simple_name/overwrite_columns combo
             existing_pipes = self.catalog.list_pipe_metas(self.organization, self.super_name, self.staging_name)
@@ -81,8 +89,14 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
-    def set_enabled(self, pipe_name: str, enabled: bool) -> None:
+    def set_enabled(self, pipe_name: str, enabled: bool, role_name: str) -> None:
         """Updates the enabled status of a pipe in Redis."""
+        check_write_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
 
         def _op():
             meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
@@ -103,7 +117,14 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
-    def delete(self, pipe_name: str) -> bool:
+    def delete(self, pipe_name: str, role_name: str) -> bool:
+        check_write_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
+
         def _op():
             return self.catalog.delete_pipe_meta(
                 self.organization,
@@ -114,7 +135,13 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
-    def read(self, pipe_name: str) -> Dict[str, Any]:
+    def read(self, pipe_name: str, role_name: str) -> Dict[str, Any]:
+        check_meta_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
         meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
         if not meta:
             raise FileNotFoundError(f"Pipe '{pipe_name}' not found.")

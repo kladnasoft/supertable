@@ -78,13 +78,15 @@ class DataReader:
             dialect=engine.dialect,
         )
         tables = parser.get_table_tuples()
+        physical_tables = parser.get_physical_tables()
 
         # RBAC check — also returns per-alias column/row filter definitions
         rbac_views = restrict_read_access(
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            tables=tables
+            tables=tables,
+            physical_tables=physical_tables,
         )
 
         try:
