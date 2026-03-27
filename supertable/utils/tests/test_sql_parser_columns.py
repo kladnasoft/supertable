@@ -32,34 +32,36 @@ from __future__ import annotations
 
 import sys
 import os
-import types
 import traceback
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
-# Bootstrap: create minimal stubs so sql_parser can import without the full
-# supertable package tree.
+# Import SQLParser: use the real package when available (pytest inside the
+# project), fall back to standalone stubs when running outside the tree.
 # ---------------------------------------------------------------------------
-supertable = types.ModuleType("supertable")
-supertable.data_classes = types.ModuleType("supertable.data_classes")
-sys.modules["supertable"] = supertable
-sys.modules["supertable.data_classes"] = supertable.data_classes
+try:
+    from supertable.utils.sql_parser import SQLParser
+except ImportError:
+    import types
 
+    supertable = types.ModuleType("supertable")
+    supertable.data_classes = types.ModuleType("supertable.data_classes")
+    sys.modules["supertable"] = supertable
+    sys.modules["supertable.data_classes"] = supertable.data_classes
 
-@dataclass
-class TableDefinition:
-    super_name: str
-    simple_name: str
-    alias: str
-    columns: List[str] = field(default_factory=list)
+    @dataclass
+    class TableDefinition:
+        super_name: str
+        simple_name: str
+        alias: str
+        columns: List[str] = field(default_factory=list)
 
+    supertable.data_classes.TableDefinition = TableDefinition
 
-supertable.data_classes.TableDefinition = TableDefinition
-
-# Insert working directory so the local sql_parser.py is found
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sql_parser import SQLParser  # noqa: E402
+    # Insert working directory so the local sql_parser.py is found
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from sql_parser import SQLParser  # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -68,13 +70,13 @@ from sql_parser import SQLParser  # noqa: E402
 
 def _parse_columns(super_name: str, query: str) -> Dict[str, List[str]]:
     """Return {alias: sorted_columns} for every table in the query."""
-    p = SQLParser(super_name=super_name, query=query)
+    p = SQLParser(super_name=super_name, query=query, dialect="duckdb")
     return {t.alias: sorted(t.columns) for t in p.get_table_tuples()}
 
 
 def _parse_tables(super_name: str, query: str) -> Dict[str, Tuple[str, str]]:
     """Return {alias: (super_name, simple_name)} for every table."""
-    p = SQLParser(super_name=super_name, query=query)
+    p = SQLParser(super_name=super_name, query=query, dialect="duckdb")
     return {t.alias: (t.super_name, t.simple_name) for t in p.get_table_tuples()}
 
 

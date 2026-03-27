@@ -1,4 +1,4 @@
-# supertable/data_reader.py
+# route: supertable.data_reader
 
 from __future__ import annotations
 
@@ -46,8 +46,7 @@ class DataReader:
     def __init__(self, super_name: str, organization: str, query: str):
         self.super_name = super_name
         self.organization = organization
-        self.parser = SQLParser(super_name=super_name, query=query)
-        self.tables = self.parser.get_table_tuples()
+        self.query = query
 
         self.storage: StorageInterface = get_storage()
 
@@ -72,12 +71,20 @@ class DataReader:
         self.timer = Timer()
         self.plan_stats = PlanStats()
 
+        # Build parser with the correct dialect for the chosen engine.
+        parser = SQLParser(
+            super_name=self.super_name,
+            query=self.query,
+            dialect=engine.dialect,
+        )
+        tables = parser.get_table_tuples()
+
         # RBAC check before returning
         restrict_read_access(
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            tables=self.tables
+            tables=tables
         )
 
         try:
@@ -89,7 +96,7 @@ class DataReader:
                 super_name=self.super_name,
                 organization=self.organization,
                 current_meta_path="redis://meta/root",
-                query=self.parser.original_query,
+                query=parser.original_query,
             )
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
 
@@ -97,7 +104,7 @@ class DataReader:
             estimator = DataEstimator(
                 organization=self.organization,
                 storage=self.storage,
-                tables=self.tables
+                tables=tables
             )
             reflection = estimator.estimate()
 
@@ -106,7 +113,7 @@ class DataReader:
             # --- Dedup-on-read & tombstones: look up table configs and snapshot metadata ---
             try:
                 catalog = RedisCatalog()
-                for td in self.tables:
+                for td in tables:
                     tbl_cfg = catalog.get_table_config(
                         self.organization, td.super_name, td.simple_name,
                     )
@@ -152,7 +159,7 @@ class DataReader:
             result_df, engine_used = executor.execute(
                 engine=engine,
                 reflection=reflection,
-                parser=self.parser,
+                parser=parser,
                 query_manager=self.query_plan_manager,
                 timer=self.timer,
                 plan_stats=self.plan_stats,

@@ -1,4 +1,4 @@
-# path: supertable/reflection/execute.py
+# route: supertable.reflection.execute
 """
 Execute tab: SQL execution page, query API, and schema autocomplete API.
 """

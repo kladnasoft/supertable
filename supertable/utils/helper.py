@@ -1,9 +1,9 @@
+# route: supertable.utils.helper
 import hashlib
 import secrets
 import pandas as pd
 import pyarrow as pa
 
-from io import StringIO
 from datetime import datetime, timezone
 from dateutil import parser
 from typing import Any, Dict, List, Optional
@@ -76,7 +76,7 @@ def split_dataframe(df: pa.Table, chunk_size: int) -> List[pa.Table]:
     num_rows = df.num_rows
     num_chunks = (num_rows + chunk_size - 1) // chunk_size
     return [
-        df.slice(chunk_size * i, min(chunk_size * (i + 1), num_rows))
+        df.slice(chunk_size * i, chunk_size)
         for i in range(num_chunks)
     ]
 
@@ -105,10 +105,7 @@ def convert_csv_to_parquet(
     Note that the final return is still a single in-memory Table.
     """
     if chunksize is None:
-        # Simple read
-        with open(file_path, "r", encoding="utf-8") as file:
-            file_content = file.read()
-        df = pd.read_csv(StringIO(file_content))
+        df = pd.read_csv(file_path)
         return pa.Table.from_pandas(df)
     else:
         # Chunked read

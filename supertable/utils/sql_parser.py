@@ -12,7 +12,9 @@ class SQLParser:
     Minimal SQL parser for extracting table/column mappings.
 
     Input:
-        SQLParser(super_name: str, query: str)
+        SQLParser(super_name: str, query: str, dialect: str)
+
+    Supported dialects: "duckdb", "spark"
 
     Output:
         get_table_tuples() -> List[TableDefinition]
@@ -58,18 +60,25 @@ class SQLParser:
         - We do not record columns for non-Column expressions.
     """
 
-    def __init__(self, super_name: str, query: str):
+    SUPPORTED_DIALECTS = ("duckdb", "spark")
+
+    def __init__(self, super_name: str, query: str, dialect: str):
         if not super_name or not isinstance(super_name, str):
             raise ValueError("Parameter 'super_name' must be a non-empty string.")
 
         if not query or not isinstance(query, str):
             raise ValueError("Parameter 'query' must be a non-empty SQL string.")
 
+        if dialect not in self.SUPPORTED_DIALECTS:
+            raise ValueError(
+                f"Parameter 'dialect' must be one of {self.SUPPORTED_DIALECTS}, got '{dialect}'."
+            )
+
         self.default_super_name: str = super_name
         self.original_query: str = query
 
         # Internal parsed expression
-        self._parsed: exp.Expression = self._parse_query(query)
+        self._parsed: exp.Expression = self._parse_query(query, dialect)
 
         # alias -> (supertable, table)
         self._alias_to_table: Dict[str, Tuple[str, str]] = {}
@@ -94,7 +103,8 @@ class SQLParser:
 
             description = (err.get("description") or "").strip()
             if not description:
-                first_line = str(error).strip().splitlines()[0]
+                raw_lines = str(error).strip().splitlines()
+                first_line = raw_lines[0] if raw_lines else "Unknown parse error"
                 description = first_line.rstrip(".")
 
             line = err.get("line")
@@ -120,9 +130,9 @@ class SQLParser:
         return raw.splitlines()[0]
 
     @staticmethod
-    def _parse_query(query: str) -> exp.Expression:
+    def _parse_query(query: str, dialect: str) -> exp.Expression:
         try:
-            return sqlglot.parse_one(query)
+            return sqlglot.parse_one(query, read=dialect)
         except ParseError as e:
             message = SQLParser._build_parse_error_message(e)
             raise ValueError(f"Failed to parse SQL query: {message}") from None
