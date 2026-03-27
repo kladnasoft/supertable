@@ -1,3 +1,4 @@
+# route: supertable.storage.gcp_storage
 import io
 import json
 import fnmatch
@@ -30,6 +31,7 @@ class GCSStorage(StorageInterface):
         bucket: str,
         credentials_path: Optional[str] = None,
         client: Optional[storage.Client] = None,
+        base_prefix: str = "",
         **_: Any,
     ) -> None:
         """
@@ -41,6 +43,8 @@ class GCSStorage(StorageInterface):
             If provided, use this service account JSON
         client : Optional[storage.Client]
             Pre-initialized client (for testing/DI)
+        base_prefix : str
+            Optional prefix prepended to all keys
         """
         if client is not None:
             self.client = client
@@ -52,6 +56,7 @@ class GCSStorage(StorageInterface):
 
         self.bucket_name = bucket
         self.bucket = self.client.bucket(bucket)
+        self.base_prefix = base_prefix.strip("/") if base_prefix else ""
 
     # -------------------------
     # Factory
@@ -63,11 +68,13 @@ class GCSStorage(StorageInterface):
 
         Recognized env:
           - GCS_BUCKET / STORAGE_BUCKET (bucket name, default: 'supertable')
+          - SUPERTABLE_PREFIX (optional base prefix)
           - GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
           - GCP_SA_JSON (raw JSON string, alternative to file path)
           - GCP_PROJECT (optional project override)
         """
         bucket = os.getenv("GCS_BUCKET") or os.getenv("STORAGE_BUCKET") or "supertable"
+        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
         sa_json = os.getenv("GCP_SA_JSON", "")
         project = os.getenv("GCP_PROJECT", "") or None
@@ -84,7 +91,7 @@ class GCSStorage(StorageInterface):
             # Application Default Credentials (ADC)
             client = storage.Client(project=project)
 
-        return cls(bucket=bucket, client=client)
+        return cls(bucket=bucket, client=client, base_prefix=base_prefix)
 
     # -------------------------
     # Optional: DuckDB path / presign
@@ -92,18 +99,20 @@ class GCSStorage(StorageInterface):
     def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
         """Return a GCS path usable by DuckDB (gcs:// or https:// form)."""
         key = (key or "").lstrip("/")
+        full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
         prefer_httpfs = (
             prefer_httpfs if prefer_httpfs is not None
             else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
         )
         if prefer_httpfs:
-            return f"https://storage.googleapis.com/{self.bucket_name}/{key}"
-        return f"gcs://{self.bucket_name}/{key}"
+            return f"https://storage.googleapis.com/{self.bucket_name}/{full_key}"
+        return f"gcs://{self.bucket_name}/{full_key}"
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """Return a presigned (signed) GET URL for the object."""
         from datetime import timedelta
-        blob = self.bucket.blob(key.lstrip("/"))
+        full_key = self._with_base(key.lstrip("/"))
+        blob = self.bucket.blob(full_key)
         return blob.generate_signed_url(
             version="v4",
             expiration=timedelta(seconds=expiry_seconds),
@@ -137,6 +146,7 @@ class GCSStorage(StorageInterface):
         Reads and returns a JSON object.
         Raises FileNotFoundError if missing, ValueError if empty/invalid JSON.
         """
+        path = self._with_base(path)
         try:
             blob = self._get_blob_raise(path)
             data = blob.download_as_bytes()
@@ -152,6 +162,7 @@ class GCSStorage(StorageInterface):
             raise ValueError(f"Invalid JSON in {path}") from je
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        path = self._with_base(path)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         blob = self.bucket.blob(path)
         blob.upload_from_string(payload, content_type="application/json")
@@ -160,16 +171,17 @@ class GCSStorage(StorageInterface):
     # Existence / size / makedirs
     # -------------------------
     def exists(self, path: str) -> bool:
-        return self._blob_exists(path)
+        return self._blob_exists(self._with_base(path))
 
     def size(self, path: str) -> int:
+        path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
             raise FileNotFoundError(f"File not found: {path}")
         # size is populated on the Blob returned by get_blob
         return int(blob.size or 0)
 
-    def makedirs(self, path: str, exist_ok: bool = True) -> None:
+    def makedirs(self, path: str) -> None:
         """
         No-op for GCS, but if you want directory markers, uncomment below.
         """
@@ -188,6 +200,7 @@ class GCSStorage(StorageInterface):
         - apply fnmatch to the child name
         - return full keys (prefix + child)
         """
+        path = self._with_base(path)
         prefix = self._normalize_dir_prefix(path)
 
         # Use delimiter='/' to get immediate children (prefixes + items at this level)
@@ -228,25 +241,29 @@ class GCSStorage(StorageInterface):
     # -------------------------
     def delete(self, path: str) -> None:
         """
-        Delete single object or recursively delete a "directory" (prefix).
+        Delete single object if it exists, otherwise recursively delete a "directory" (prefix).
+        Raises FileNotFoundError if nothing exists at the path or under the prefix.
         """
-        if path.endswith("/"):
-            # recursive delete
-            prefix = self._normalize_dir_prefix(path)
-            blobs = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
-            for b in blobs:
-                b.delete()
+        path = self._with_base(path)
+        # Try exact object first
+        blob = self.bucket.get_blob(path)
+        if blob is not None:
+            blob.delete()
             return
 
-        # single object
-        blob = self.bucket.get_blob(path)
-        if blob is None:
-            # mimic local semantics: deleting nonexistent path is not fatal
-            return
-        blob.delete()
+        # Fall back to prefix recursive delete
+        prefix = self._normalize_dir_prefix(path)
+        to_delete = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
+
+        if not to_delete:
+            raise FileNotFoundError(f"File or folder not found: {path}")
+
+        for b in to_delete:
+            b.delete()
 
     def delete_prefix(self, path: str) -> None:
         """Explicit recursive delete for a prefix."""
+        path = self._with_base(path)
         prefix = self._normalize_dir_prefix(path) if path else path
         for blob in self.client.list_blobs(self.bucket_name, prefix=prefix):
             blob.delete()
@@ -259,6 +276,7 @@ class GCSStorage(StorageInterface):
         Build a nested dict mirroring keys. Leaf files -> None, folders -> dict.
         Potentially expensive for large buckets.
         """
+        path = self._with_base(path)
         root: Dict[str, Any] = {}
         prefix = self._normalize_dir_prefix(path) if path else path
 
@@ -284,6 +302,7 @@ class GCSStorage(StorageInterface):
     # Parquet
     # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        path = self._with_base(path)
         buf = io.BytesIO()
         pq.write_table(table, buf)
         data = buf.getvalue()
@@ -294,6 +313,7 @@ class GCSStorage(StorageInterface):
         """
         Reads and returns a PyArrow Table.
         """
+        path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
             raise FileNotFoundError(f"File not found: {path}")
@@ -305,14 +325,13 @@ class GCSStorage(StorageInterface):
     # -------------------------
     # Raw bytes / text
     # -------------------------
-    def write_bytes(self, path: str, data: bytes, content_type: Optional[str] = None) -> None:
+    def write_bytes(self, path: str, data: bytes) -> None:
+        path = self._with_base(path)
         blob = self.bucket.blob(path)
-        if content_type:
-            blob.upload_from_string(data, content_type=content_type)
-        else:
-            blob.upload_from_string(data)
+        blob.upload_from_string(data)
 
     def read_bytes(self, path: str) -> bytes:
+        path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
             raise FileNotFoundError(f"File not found: {path}")
@@ -325,5 +344,7 @@ class GCSStorage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        src_path = self._with_base(src_path)
+        dst_path = self._with_base(dst_path)
         src_blob = self._get_blob_raise(src_path)
         self.bucket.copy_blob(src_blob, self.bucket, new_name=dst_path)

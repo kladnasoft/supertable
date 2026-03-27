@@ -1,3 +1,4 @@
+# route: supertable.storage.storage_interface
 import abc
 from typing import Any, Dict, List, Optional
 import pyarrow as pa
@@ -7,6 +8,15 @@ class StorageInterface(abc.ABC):
     Abstract base class for a storage interface that can handle both local and
     cloud/object storage in a unified manner.
     """
+
+    base_prefix: str = ""
+
+    def _with_base(self, path: str) -> str:
+        """Prepend base_prefix to path if set. No-op when base_prefix is empty."""
+        path = path.strip("/")
+        if self.base_prefix:
+            return f"{self.base_prefix}/{path}" if path else self.base_prefix
+        return path
 
 
     @abc.abstractmethod

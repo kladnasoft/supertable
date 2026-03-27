@@ -1,3 +1,4 @@
+# route: supertable.storage.azure_storage
 import io
 import json
 import fnmatch
@@ -58,22 +59,22 @@ class AzureBlobStorage(StorageInterface):
         """
         Build AzureBlobStorage from environment variables.
 
-        Recognized env:
+        Recognized env (common names checked first, Azure-specific as fallback):
           - SUPERTABLE_HOME (abfss://container@account.dfs.../<prefix>)
-          - AZURE_CONTAINER (fallback container)
+          - STORAGE_BUCKET / AZURE_CONTAINER (container name)
+          - STORAGE_ENDPOINT_URL / AZURE_BLOB_ENDPOINT (blob endpoint)
+          - STORAGE_ACCESS_KEY / AZURE_STORAGE_KEY (account key)
           - SUPERTABLE_PREFIX (optional base prefix)
-          - AZURE_STORAGE_CONNECTION_STRING
-          - AZURE_STORAGE_ACCOUNT
-          - AZURE_BLOB_ENDPOINT
-          - AZURE_STORAGE_KEY
-          - AZURE_SAS_TOKEN
+          - AZURE_STORAGE_CONNECTION_STRING (Azure-only)
+          - AZURE_STORAGE_ACCOUNT (Azure-only)
+          - AZURE_SAS_TOKEN (Azure-only)
           - AZURE_AUTH_MODE (informational; if AAD and no secrets -> DefaultAzureCredential)
         """
         # Prefer ABFSS home if present
         st_home = os.getenv("SUPERTABLE_HOME", "")
         account = os.getenv("AZURE_STORAGE_ACCOUNT", "")
-        container = os.getenv("AZURE_CONTAINER", "")
-        endpoint = os.getenv("AZURE_BLOB_ENDPOINT", "")
+        container = os.getenv("STORAGE_BUCKET") or os.getenv("AZURE_CONTAINER") or ""
+        endpoint = os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("AZURE_BLOB_ENDPOINT") or ""
         base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
 
         if st_home.lower().startswith("abfss://"):
@@ -90,12 +91,12 @@ class AzureBlobStorage(StorageInterface):
                 pass
 
         conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-        key = os.getenv("AZURE_STORAGE_KEY", "")
+        key = os.getenv("STORAGE_ACCESS_KEY") or os.getenv("AZURE_STORAGE_KEY") or ""
         sas = os.getenv("AZURE_SAS_TOKEN", "")
 
         if not endpoint:
             if not account:
-                raise RuntimeError("Azure configuration requires AZURE_STORAGE_ACCOUNT or ABFSS SUPERTABLE_HOME")
+                raise RuntimeError("Azure configuration requires AZURE_STORAGE_ACCOUNT, STORAGE_ENDPOINT_URL, or ABFSS SUPERTABLE_HOME")
             endpoint = f"https://{account}.blob.core.windows.net"
 
         # Build BlobServiceClient with the best available credential
@@ -114,7 +115,7 @@ class AzureBlobStorage(StorageInterface):
                 svc = BlobServiceClient(account_url=endpoint, credential=DefaultAzureCredential())
 
         if not container:
-            raise RuntimeError("Azure configuration requires AZURE_CONTAINER (or abfss container in SUPERTABLE_HOME)")
+            raise RuntimeError("Azure configuration requires STORAGE_BUCKET / AZURE_CONTAINER (or abfss container in SUPERTABLE_HOME)")
 
         return cls(container_name=container, blob_service_client=svc, base_prefix=base_prefix)
 
@@ -284,6 +285,7 @@ class AzureBlobStorage(StorageInterface):
 
         children = self._one_level_children(path)
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
+        filtered.sort()
         return [path + c for c in filtered]
 
     # -------------------------
@@ -385,9 +387,6 @@ class AzureBlobStorage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
-        src_path = self._with_base(src_path)
-        dst_path = self._with_base(dst_path)
-        src = self.container.get_blob_client(src_path).url
-        dst = self.container.get_blob_client(dst_path)
-        poller = dst.start_copy_from_url(src)
-        dst.get_blob_properties()
+        """Copy blob via download→upload (synchronous, works with private containers)."""
+        data = self.read_bytes(src_path)
+        self.write_bytes(dst_path, data)

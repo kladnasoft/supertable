@@ -1,4 +1,4 @@
-# supertable/storage/minio_storage.py
+# route: supertable.storage.minio_storage
 
 import io
 import os
@@ -25,9 +25,10 @@ class MinioStorage(StorageInterface):
     Exposes endpoint/region/url_style/secure so upstream (DuckDB reader) can auto-configure.
     """
 
-    def __init__(self, bucket_name: str, client: Minio):
+    def __init__(self, bucket_name: str, client: Minio, base_prefix: str = ""):
         self.bucket_name = bucket_name
         self.client = client
+        self.base_prefix = base_prefix.strip("/") if base_prefix else ""
         self.endpoint_url: Optional[str] = None
         self.region: Optional[str] = None
         self.url_style: str = "path"  # DuckDB: 'path' | 'vhost'
@@ -109,6 +110,7 @@ class MinioStorage(StorageInterface):
         access_key = os.getenv("STORAGE_ACCESS_KEY")
         secret_key = os.getenv("STORAGE_SECRET_KEY")
         region = os.getenv("STORAGE_REGION") or None
+        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
         if not endpoint or not access_key or not secret_key:
             raise RuntimeError(
                 "MinIO environment incomplete. "
@@ -116,7 +118,7 @@ class MinioStorage(StorageInterface):
             )
 
         client = cls._build_client(endpoint, access_key, secret_key, region)
-        storage = cls(bucket_name=bucket, client=client)
+        storage = cls(bucket_name=bucket, client=client, base_prefix=base_prefix)
 
         parsed = urlparse(endpoint)
         storage.endpoint_url = endpoint
@@ -141,18 +143,20 @@ class MinioStorage(StorageInterface):
             else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
         )
         key = (key or "").lstrip("/")
+        full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
         if prefer_httpfs:
             parsed = urlparse(self.endpoint_url or "")
             host = parsed.netloc or parsed.path or ""
             scheme = parsed.scheme or ("https" if self.secure else "http")
-            return f"{scheme}://{host}/{self.bucket_name}/{key}"
-        return f"s3://{self.bucket_name}/{key}"
+            return f"{scheme}://{host}/{self.bucket_name}/{full_key}"
+        return f"s3://{self.bucket_name}/{full_key}"
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """Return a presigned GET URL: http(s)://host/bucket/key?...X-Amz-..."""
+        full_key = self._with_base(key.lstrip("/"))
         return self.client.presigned_get_object(
             self.bucket_name,
-            key.lstrip("/"),
+            full_key,
             expires=timedelta(seconds=expiry_seconds),
         )
 
@@ -201,6 +205,7 @@ class MinioStorage(StorageInterface):
     # ---------- JSON ----------
 
     def read_json(self, path: str) -> Dict[str, Any]:
+        path = self._with_base(path)
         try:
             data = self._get_object_safe(path)
         except S3Error as e:
@@ -217,6 +222,7 @@ class MinioStorage(StorageInterface):
             raise ValueError(f"Invalid JSON in {path}") from je
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        path = self._with_base(path)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         buf = io.BytesIO(payload)
         self.client.put_object(
@@ -230,9 +236,10 @@ class MinioStorage(StorageInterface):
     # ---------- existence / size / dirs ----------
 
     def exists(self, path: str) -> bool:
-        return self._object_exists(path)
+        return self._object_exists(self._with_base(path))
 
     def size(self, path: str) -> int:
+        path = self._with_base(path)
         try:
             stat = self.client.stat_object(self.bucket_name, path)
             return stat.size
@@ -248,15 +255,18 @@ class MinioStorage(StorageInterface):
     # ---------- listing ----------
 
     def list_files(self, path: str, pattern: str = "*") -> List[str]:
+        path = self._with_base(path)
         if path and not path.endswith("/"):
             path = path + "/"
         children = self._child_names_one_level(path)
         filtered_children = [c for c in children if fnmatch.fnmatch(c, pattern)]
+        filtered_children.sort()
         return [path + c for c in filtered_children]
 
     # ---------- delete ----------
 
     def delete(self, path: str) -> None:
+        path = self._with_base(path)
         if self._object_exists(path):
             self.client.remove_object(self.bucket_name, path)
             return
@@ -281,6 +291,7 @@ class MinioStorage(StorageInterface):
     # ---------- directory structure ----------
 
     def get_directory_structure(self, path: str) -> dict:
+        path = self._with_base(path)
         root: Dict[str, Any] = {}
         if path and not path.endswith("/"):
             path = path + "/"
@@ -301,6 +312,7 @@ class MinioStorage(StorageInterface):
     # ---------- parquet ----------
 
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        path = self._with_base(path)
         buf = io.BytesIO()
         pq.write_table(table, buf)
         length = buf.tell()
@@ -314,6 +326,7 @@ class MinioStorage(StorageInterface):
         )
 
     def read_parquet(self, path: str) -> pa.Table:
+        path = self._with_base(path)
         try:
             data = self._get_object_safe(path)
         except S3Error as e:
@@ -328,6 +341,7 @@ class MinioStorage(StorageInterface):
     # ---------- bytes / text / copy ----------
 
     def write_bytes(self, path: str, data: bytes) -> None:
+        path = self._with_base(path)
         buf = io.BytesIO(data)
         self.client.put_object(
             self.bucket_name,
@@ -338,6 +352,7 @@ class MinioStorage(StorageInterface):
         )
 
     def read_bytes(self, path: str) -> bytes:
+        path = self._with_base(path)
         try:
             return self._get_object_safe(path)
         except S3Error as e:
@@ -352,6 +367,8 @@ class MinioStorage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        src_path = self._with_base(src_path)
+        dst_path = self._with_base(dst_path)
         self.client.copy_object(
             bucket_name=self.bucket_name,
             object_name=dst_path,

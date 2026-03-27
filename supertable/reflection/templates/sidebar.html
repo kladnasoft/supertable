@@ -169,13 +169,6 @@
     text-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
   }
 
-  .logo-text-accent {
-    background: linear-gradient(to right, #f59e0b, #f97316);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
-
   /* ── Navigation ───────────────────────────────────────────────── */
 
   .sidebar-nav {
@@ -598,6 +591,164 @@
     pointer-events: none;
   }
 
+
+  .logo-core {
+    background: linear-gradient(to right, #0f766e, #14b8a6);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-left: 4px;
+  }
+
+  .logo-stack {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.02;
+  }
+
+  .logo-powered {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    color: #94a3b8;
+    text-transform: none;
+    margin-top: 3px;
+  }
+
+  .logo-text {
+    text-transform: none;
+    letter-spacing: 0.3px;
+    font-size: 19px;
+  }
+
+  .sidebar-module-switcher {
+    padding: 10px 15px 10px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+    background: rgba(255,255,255,0.92);
+    flex-shrink: 0;
+  }
+
+  .sidebar-collapsed .sidebar-module-switcher {
+    padding: 10px 8px;
+  }
+
+  .module-pills {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .module-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(0,0,0,0.06);
+    background: #fff;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 700;
+    text-decoration: none;
+    transition: all 0.18s ease;
+    box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+    user-select: none;
+  }
+
+  .module-pill:hover {
+    color: var(--primary-color);
+    border-color: rgba(28,150,202,0.22);
+    background: #f8fcff;
+    text-decoration: none;
+  }
+
+  .module-pill.active-core {
+    background: linear-gradient(180deg, rgba(20,184,166,0.16) 0%, rgba(20,184,166,0.08) 100%);
+    color: #0f766e;
+    border-color: rgba(20,184,166,0.28);
+    box-shadow: inset 0 0 0 1px rgba(20,184,166,0.08);
+  }
+
+  .module-pill.active-studio {
+    background: linear-gradient(180deg, rgba(28,150,202,0.14) 0%, rgba(28,150,202,0.06) 100%);
+    color: var(--primary-color);
+    border-color: rgba(28,150,202,0.24);
+    box-shadow: inset 0 0 0 1px rgba(28,150,202,0.08);
+  }
+
+  .module-pill.active-agents {
+    background: linear-gradient(180deg, rgba(99,102,241,0.16) 0%, rgba(99,102,241,0.07) 100%);
+    color: #4f46e5;
+    border-color: rgba(99,102,241,0.24);
+    box-shadow: inset 0 0 0 1px rgba(99,102,241,0.08);
+  }
+
+  .sidebar-collapsed .module-pills {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar-collapsed .module-pill {
+    padding: 7px 0;
+    font-size: 11px;
+  }
+
+  .sidebar-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 10px 6px;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 800;
+    color: #94a3b8;
+  }
+
+  .sidebar-section-title::after {
+    content: '';
+    height: 1px;
+    flex: 1;
+    background: linear-gradient(90deg, rgba(148,163,184,0.35), rgba(148,163,184,0));
+  }
+
+  .sidebar-collapsed .sidebar-section-title {
+    justify-content: center;
+    padding: 12px 0 4px;
+  }
+
+  .sidebar-collapsed .sidebar-section-title span {
+    display: none;
+  }
+
+  .sidebar-collapsed .sidebar-section-title::after {
+    display: none;
+  }
+
+  .nav-item-active {
+    background: rgba(28, 150, 202, 0.08);
+    color: var(--primary-color, #1c96ca);
+    box-shadow: inset 0 0 0 1px rgba(28,150,202,0.08);
+  }
+
+  .nav-item-active .nav-item-icon {
+    color: var(--primary-color, #1c96ca);
+  }
+
+  .nav-item-external::after {
+    content: '\f35d';
+    font-family: 'Font Awesome 6 Free';
+    font-weight: 900;
+    font-size: 10px;
+    margin-left: auto;
+    color: #94a3b8;
+  }
+
+  .sidebar-collapsed .nav-item-external::after {
+    display: none;
+  }
+
   /* ------------ MAIN CONTENT LAYOUT HELPERS (shared) ------------ */
 
   .content-container {
@@ -652,7 +803,7 @@
 </style>
 
 
-<!-- Shared sidebar for SuperTable Admin -->
+<!-- Shared sidebar for Data Island -->
 <div class="sidebar" id="sidebar">
   <div class="sidebar-logo" id="toggleSidebar">
     <span class="data-reflection-icon">
@@ -661,52 +812,20 @@
         <span class="data-grid"></span>
       </span>
     </span>
-    <span class="logo-text">Data Island <span class="logo-text-accent">Core</span></span>
+    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-core">Core</span></span><span class="logo-powered">Powered by SuperTable</span></span>
   </div>
 
-  <nav class="nav flex-column sidebar-nav">
 
-    <a href="/reflection/home" class="nav-item" id="link-home">
-      <i class="fas fa-house nav-item-icon"></i>
-      <span class="nav-item-label">Home</span>
-    </a>
+  <div class="sidebar-module-switcher">
+    <div class="module-pills">
+      <a href="#" class="module-pill active-core" data-module="core" id="module-core" title="Data Island Core">Core</a>
+      <a href="#" class="module-pill" data-module="studio" id="module-studio" title="Data Island Studio">Studio</a>
+      <a href="#" class="module-pill" data-module="agents" id="module-agents" title="Data Island Agents">Agents</a>
+    </div>
+  </div>
 
-    <a href="/reflection/execute" class="nav-item" id="link-execute">
-      <i class="fas fa-terminal nav-item-icon"></i>
-      <span class="nav-item-label">Execute SQL</span>
-    </a>
+  <nav class="nav flex-column sidebar-nav" id="moduleNav"></nav>
 
-    <a href="/reflection/tables" class="nav-item" id="link-tables">
-      <i class="fas fa-table nav-item-icon"></i>
-      <span class="nav-item-label">Tables</span>
-    </a>
-
-    <a href="/reflection/ingestion" class="nav-item" id="link-staging">
-      <i class="fas fa-layer-group nav-item-icon"></i>
-      <span class="nav-item-label">Ingestion</span>
-    </a>
-
-    <a href="/reflection/quality" class="nav-item" id="link-quality">
-      <i class="fas fa-heartbeat nav-item-icon"></i>
-      <span class="nav-item-label">Data Quality</span>
-    </a>
-
-    <a href="/reflection/monitoring" class="nav-item" id="link-monitoring">
-      <i class="fas fa-chart-line nav-item-icon"></i>
-      <span class="nav-item-label">Monitoring</span>
-    </a>
-
-    <a href="/reflection/engine" class="nav-item" id="link-engine">
-      <i class="fas fa-gear nav-item-icon"></i>
-      <span class="nav-item-label">Engine</span>
-    </a>
-
-    <a href="/reflection/security" class="nav-item" id="link-security">
-      <i class="fas fa-shield-halved nav-item-icon"></i>
-      <span class="nav-item-label">Security</span>
-    </a>
-
-  </nav>
 
   <!-- User context: toggle bar + collapsible panel -->
   <div class="sidebar-ctx" id="sidebarUserSection">
@@ -757,6 +876,65 @@
 
 </div>
 
+
+<script>
+(function () {
+  var MODULE_MENUS = {"core": [{"section": "Workspace"}, {"href": "/reflection/home", "id": "link-home", "icon": "fa-house", "label": "Home", "active": true}, {"section": "Data Operations"}, {"href": "/reflection/execute", "id": "link-execute", "icon": "fa-terminal", "label": "Execute SQL"}, {"href": "/reflection/tables", "id": "link-tables", "icon": "fa-table", "label": "Tables"}, {"href": "/reflection/ingestion", "id": "link-staging", "icon": "fa-layer-group", "label": "Ingestion"}, {"href": "/reflection/quality", "id": "link-quality", "icon": "fa-heartbeat", "label": "Data Quality"}, {"section": "Platform"}, {"href": "/reflection/monitoring", "id": "link-monitoring", "icon": "fa-chart-line", "label": "Monitoring"}, {"href": "/reflection/engine", "id": "link-engine", "icon": "fa-microchip", "label": "Engine"}, {"href": "/reflection/security", "id": "link-security", "icon": "fa-shield-halved", "label": "Security"}], "studio": [{"section": "Workspace"}, {"href": "/reflection/home", "id": "studio-home", "icon": "fa-house", "label": "Home"}, {"href": "/reflection/studio", "id": "link-studio", "icon": "fa-book", "label": "Studio", "active": true}, {"section": "Development"}, {"href": "/reflection/notebook", "id": "link-notebook", "icon": "fa-note-sticky", "label": "Notebook"}, {"href": "/reflection/jobs", "id": "link-jobs", "icon": "fa-clock", "label": "Jobs"}, {"href": "/reflection/vault", "id": "link-vault", "icon": "fa-vault", "label": "Vault"}, {"section": "Runtime"}, {"href": "/reflection/compute", "id": "link-compute", "icon": "fa-server", "label": "Compute"}, {"href": "/reflection/environments", "id": "link-environments", "icon": "fa-cubes", "label": "Environments"}, {"href": "/reflection/env", "id": "link-env", "icon": "fa-sliders", "label": "Env"}], "agents": [{"section": "Agents Cloud"}, {"href": "https://agents.dataisland.local/", "id": "agents-home", "icon": "fa-robot", "label": "Agents Home", "external": true, "active": true}, {"section": "Autonomy"}, {"href": "https://agents.dataisland.local/bi", "id": "agents-bi", "icon": "fa-chart-pie", "label": "Agentic BI", "external": true}, {"href": "https://agents.dataisland.local/steward", "id": "agents-steward", "icon": "fa-shield-heart", "label": "AI Data Steward", "external": true}, {"href": "https://agents.dataisland.local/pipelines", "id": "agents-pipelines", "icon": "fa-diagram-project", "label": "Pipeline Studio", "external": true}, {"section": "Operations"}, {"href": "https://agents.dataisland.local/runs", "id": "agents-runs", "icon": "fa-wave-square", "label": "Runs", "external": true}, {"href": "https://agents.dataisland.local/policies", "id": "agents-policies", "icon": "fa-scale-balanced", "label": "Policies", "external": true}]};
+  var navEl = document.getElementById('moduleNav');
+  var pills = document.querySelectorAll('.module-pill');
+
+  function renderModule(moduleName) {
+    if (!navEl || !MODULE_MENUS[moduleName]) return;
+    navEl.innerHTML = '';
+
+    MODULE_MENUS[moduleName].forEach(function(item) {
+      if (item.section) {
+        var sec = document.createElement('div');
+        sec.className = 'sidebar-section-title';
+        sec.innerHTML = '<span>' + item.section + '</span>';
+        navEl.appendChild(sec);
+        return;
+      }
+
+      var a = document.createElement('a');
+      a.href = item.href;
+      a.id = item.id;
+      a.className = 'nav-item' + (item.active ? ' nav-item-active' : '') + (item.external ? ' nav-item-external' : '');
+      if (item.external) {
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+      }
+      a.innerHTML = '<i class="fas ' + item.icon + ' nav-item-icon"></i>' +
+                    '<span class="nav-item-label">' + item.label + '</span>';
+      navEl.appendChild(a);
+    });
+
+    pills.forEach(function(pill) {
+      pill.classList.remove('active-core', 'active-studio', 'active-agents');
+      if (pill.dataset.module === moduleName) {
+        pill.classList.add('active-' + moduleName);
+      }
+    });
+
+    try { localStorage.setItem('di_active_module', moduleName); } catch (e) {}
+  }
+
+  pills.forEach(function(pill) {
+    pill.addEventListener('click', function(e) {
+      e.preventDefault();
+      renderModule(pill.dataset.module);
+    });
+  });
+
+  var initial = 'core';
+  try {
+    initial = localStorage.getItem('di_active_module') || 'core';
+  } catch (e) {}
+  renderModule(initial);
+})();
+</script>
+
+
 <!-- Nav group collapse/expand — accordion behaviour -->
 <script>
 (function () {
@@ -768,10 +946,15 @@
     'link-execute':    'navigation',
     'link-tables':     'navigation',
     'link-staging':    'navigation',
-    'link-quality':    'navigation',
+    'link-studio':     'navigation',
+    'link-jobs':       'navigation',
     'link-monitoring': 'navigation',
-    'link-engine':     'navigation',
-    'link-security':   'navigation',
+    'link-quality':    'navigation',
+    'link-vault':      'infrastructure',
+    'link-compute':    'infrastructure',
+    'link-security':   'access-control',
+    'link-users-page': 'access-control',
+    'link-rbac':       'access-control',
   };
 
   function openGroup(groupId, saveToStorage) {

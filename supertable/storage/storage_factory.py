@@ -1,3 +1,4 @@
+# route: supertable.storage.storage_factory
 """
 Dynamic storage factory with lazy imports and optional cloud dependencies.
 

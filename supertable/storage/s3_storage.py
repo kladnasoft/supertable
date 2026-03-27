@@ -1,3 +1,4 @@
+# route: supertable.storage.s3_storage
 import io
 import json
 import fnmatch
@@ -33,9 +34,11 @@ class S3Storage(StorageInterface):
             aws_access_key_id: Optional[str] = None,
             aws_secret_access_key: Optional[str] = None,
             aws_session_token: Optional[str] = None,
+            base_prefix: str = "",
             **_: Any,
     ):
         self.bucket_name = bucket_name
+        self.base_prefix = base_prefix.strip("/") if base_prefix else ""
         if endpoint_url and "://" not in endpoint_url:
             endpoint_url = "https://" + endpoint_url
         if endpoint_url:
@@ -85,6 +88,7 @@ class S3Storage(StorageInterface):
         access_key = os.getenv("STORAGE_ACCESS_KEY") or None
         secret_key = os.getenv("STORAGE_SECRET_KEY") or None
         session_token = os.getenv("STORAGE_SESSION_TOKEN") or None
+        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
 
         force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
         url_style = "path" if force_path_style else "vhost"
@@ -98,6 +102,7 @@ class S3Storage(StorageInterface):
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             aws_session_token=session_token,
+            base_prefix=base_prefix,
         )
 
     def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
@@ -106,20 +111,22 @@ class S3Storage(StorageInterface):
             else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
         )
         key = (key or "").lstrip("/")
+        full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
         if prefer_httpfs:
             parsed = urlparse(self.endpoint_url or "")
             host = parsed.netloc or parsed.path or ""
             scheme = parsed.scheme or ("https" if self.secure else "http")
             if self.url_style == "vhost":
-                return f"{scheme}://{self.bucket_name}.{host}/{key}"
-            return f"{scheme}://{host}/{self.bucket_name}/{key}"
-        return f"s3://{self.bucket_name}/{key}"
+                return f"{scheme}://{self.bucket_name}.{host}/{full_key}"
+            return f"{scheme}://{host}/{self.bucket_name}/{full_key}"
+        return f"s3://{self.bucket_name}/{full_key}"
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         self._ensure_bucket_region()
+        full_key = self._with_base(key.lstrip("/"))
         return self.client.generate_presigned_url(
             ClientMethod="get_object",
-            Params={"Bucket": self.bucket_name, "Key": key.lstrip("/")},
+            Params={"Bucket": self.bucket_name, "Key": full_key},
             ExpiresIn=expiry_seconds,
         )
 
@@ -435,6 +442,7 @@ class S3Storage(StorageInterface):
     # JSON
     # -------------------------
     def read_json(self, path: str) -> Dict[str, Any]:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         try:
             data = self._get_object_safe(path)
@@ -451,6 +459,7 @@ class S3Storage(StorageInterface):
             raise ValueError(f"Invalid JSON in {path}") from je
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self._call("put_object",
@@ -464,9 +473,10 @@ class S3Storage(StorageInterface):
     # Existence / size / makedirs
     # -------------------------
     def exists(self, path: str) -> bool:
-        return self._object_exists(path)
+        return self._object_exists(self._with_base(path))
 
     def size(self, path: str) -> int:
+        path = self._with_base(path)
         try:
             resp = self._call("head_object", Bucket=self.bucket_name, Key=path)
             return int(resp["ContentLength"])
@@ -487,6 +497,7 @@ class S3Storage(StorageInterface):
         """
         Local parity: one-level children under prefix `path`, fnmatch on child name.
         """
+        path = self._with_base(path)
         if path and not path.endswith("/"):
             path = path + "/"
 
@@ -494,12 +505,14 @@ class S3Storage(StorageInterface):
 
         children = self._list_common_prefixes_and_objects_one_level(path)
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
+        filtered.sort()
         return [path + c for c in filtered]
 
     # -------------------------
     # Delete
     # -------------------------
     def delete(self, path: str) -> None:
+        path = self._with_base(path)
         # exact object?
         if self._object_exists(path):
             self._call("delete_object", Bucket=self.bucket_name, Key=path)
@@ -540,6 +553,7 @@ class S3Storage(StorageInterface):
     # Directory structure
     # -------------------------
     def get_directory_structure(self, path: str) -> dict:
+        path = self._with_base(path)
         root: Dict[str, Any] = {}
         if path and not path.endswith("/"):
             path = path + "/"
@@ -570,6 +584,7 @@ class S3Storage(StorageInterface):
     # Parquet
     # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         buf = io.BytesIO()
         pq.write_table(table, buf)
@@ -582,6 +597,7 @@ class S3Storage(StorageInterface):
                    )
 
     def read_parquet(self, path: str) -> pa.Table:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         try:
             data = self._get_object_safe(path)
@@ -599,12 +615,14 @@ class S3Storage(StorageInterface):
     # Bytes / Text / Copy
     # -------------------------
     def write_bytes(self, path: str, data: bytes) -> None:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         self._call("put_object",
                    Bucket=self.bucket_name, Key=path, Body=data, ContentType="application/octet-stream"
                    )
 
     def read_bytes(self, path: str) -> bytes:
+        path = self._with_base(path)
         self._ensure_bucket_region()
         try:
             return self._get_object_safe(path)
@@ -621,6 +639,8 @@ class S3Storage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        src_path = self._with_base(src_path)
+        dst_path = self._with_base(dst_path)
         self._ensure_bucket_region()
         self._call("copy_object",
                    Bucket=self.bucket_name,

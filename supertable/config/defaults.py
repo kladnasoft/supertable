@@ -1,3 +1,4 @@
+# route: supertable.config.defaults
 import os
 import logging
 from dataclasses import dataclass
@@ -112,16 +113,21 @@ def refresh_defaults(env_file: str | None = None, prefer_system: bool = True) ->
     logger.info(f"Defaults refreshed. STORAGE_TYPE={default.STORAGE_TYPE}, LOG_LEVEL={default.LOG_LEVEL}")
 
 def print_config() -> None:
+    _MASKED_KEYS = frozenset({"STORAGE_SECRET_KEY", "STORAGE_ACCESS_KEY", "AZURE_STORAGE_KEY", "AZURE_SAS_TOKEN"})
     keys = [
-        "STORAGE_TYPE","SUPERTABLE_HOME",
-        "AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY",
-        "AWS_S3_ENDPOINT_URL","AWS_S3_FORCE_PATH_STYLE",
-        "REDIS_URL","LOG_LEVEL",
+        "STORAGE_TYPE", "SUPERTABLE_HOME",
+        "STORAGE_BUCKET", "STORAGE_REGION",
+        "STORAGE_ENDPOINT_URL", "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY",
+        "STORAGE_FORCE_PATH_STYLE", "STORAGE_SESSION_TOKEN",
+        "SUPERTABLE_DUCKDB_USE_HTTPFS", "SUPERTABLE_PREFIX",
+        "REDIS_URL", "LOG_LEVEL",
     ]
     logger.info("---- Effective SuperTable configuration ----")
     for k in keys:
         v = os.getenv(k)
-        if k == "AWS_SECRET_ACCESS_KEY" and v:
+        if v is None:
+            continue
+        if k in _MASKED_KEYS:
             v = "****" + v[-4:] if len(v) > 4 else "****"
         logger.info(f"{k} = {v}")
     logger.info(

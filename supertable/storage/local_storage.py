@@ -1,3 +1,4 @@
+# route: supertable.storage.local_storage
 import json
 import os
 import glob
@@ -123,7 +124,7 @@ class LocalStorage(StorageInterface):
         """
         if not os.path.isdir(path):
             return []
-        return glob.glob(os.path.join(path, pattern))
+        return sorted(glob.glob(os.path.join(path, pattern)))
 
     def delete(self, path: str) -> None:
         """
