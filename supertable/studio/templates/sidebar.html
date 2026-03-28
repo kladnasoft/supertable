@@ -1,0 +1,1161 @@
+<style>
+  /* ------------ SIDEBAR — Refined Light (Concept A) ------------ */
+
+  :root {
+    --sb-width: 280px;
+    --sb-collapsed-width: 80px;
+    --sb-transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* ── Sidebar container ────────────────────────────────────────── */
+
+  .sidebar {
+    width: var(--sb-width);
+    height: 100vh;
+    position: fixed;
+    left: 0;
+    top: 0;
+    background: linear-gradient(180deg, #ffffff 0%, #f5faff 100%);
+    box-shadow: 4px 0 15px rgba(0, 0, 0, 0.05);
+    display: flex;
+    flex-direction: column;
+    z-index: 1100;
+    transition: width var(--sb-transition);
+    overflow: hidden;
+  }
+
+  .sidebar-collapsed {
+    width: var(--sb-collapsed-width);
+  }
+
+  /* When collapsed, all children use same horizontal padding for alignment */
+  .sidebar-collapsed .sidebar-logo,
+  .sidebar-collapsed .sidebar-nav,
+  .sidebar-collapsed .profile-section {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  /* ── Logo area ────────────────────────────────────────────────── */
+
+  .sidebar-logo {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 20px 15px 20px 19px;
+    cursor: pointer;
+    background: white;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+    height: 80px;
+    flex-shrink: 0;
+    gap: 0px;
+    user-select: none;
+  }
+
+  .sidebar-collapsed .sidebar-logo {
+    justify-content: center;
+  }
+
+  /* ── Data Reflection animated cube ────────────────────────────── */
+
+  .data-reflection-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .data-cube {
+    width: 30px;
+    height: 30px;
+    background: var(--primary-color);
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                box-shadow 0.3s ease;
+    box-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
+  }
+
+  #toggleSidebar:hover .data-cube {
+    transform: rotate(90deg);
+    box-shadow: 0 4px 12px rgba(28, 150, 202, 0.5);
+  }
+
+  /* Shimmer sweep */
+  .data-cube::before {
+    content: '';
+    position: absolute;
+    width: 150%;
+    height: 40%;
+    background: linear-gradient(
+      90deg,
+      rgba(255,255,255,0) 0%,
+      rgba(255,255,255,0.7) 50%,
+      rgba(255,255,255,0) 100%
+    );
+    transform: translateX(-100%) rotate(45deg);
+    top: -10%;
+    left: -10%;
+    transition: transform 0.8s ease;
+  }
+
+  #toggleSidebar:hover .data-cube::before {
+    transform: translateX(100%) rotate(45deg);
+  }
+
+  /* Grid overlay */
+  .data-grid {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    background:
+      linear-gradient(0deg, rgba(0,0,0,0.1) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px);
+    background-size: 7px 7px;
+    opacity: 0.6;
+    transition: opacity 0.3s ease;
+  }
+
+  #toggleSidebar:hover .data-grid { opacity: 0.8; }
+
+  /* Inner reflection dot */
+  .reflection {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    background: rgba(255,255,255,0.8);
+    border-radius: 2px;
+    bottom: 5px;
+    right: 5px;
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    opacity: 0.7;
+  }
+
+  #toggleSidebar:hover .reflection {
+    opacity: 1;
+    transform: scale(1.3) translate(-2px, -2px);
+  }
+
+  /* ── Logo text ────────────────────────────────────────────────── */
+
+  .logo-text {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    white-space: nowrap;
+    opacity: 1;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    transform-origin: left center;
+  }
+
+  .sidebar-collapsed .logo-text {
+    opacity: 0;
+    width: 0;
+    transform: scale(0.8);
+    pointer-events: none;
+    overflow: hidden;
+  }
+
+  #toggleSidebar:hover .logo-text {
+    text-shadow: 0 2px 8px rgba(28, 150, 202, 0.3);
+  }
+
+  /* ── Navigation ───────────────────────────────────────────────── */
+
+  .sidebar-nav {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 4px 15px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--primary-light, #e6f4fa) transparent;
+    transition: padding var(--sb-transition);
+  }
+
+  .sidebar-collapsed .sidebar-nav {
+    padding-top: 4px;
+  }
+
+  .sidebar-nav::-webkit-scrollbar { width: 4px; }
+  .sidebar-nav::-webkit-scrollbar-thumb {
+    background-color: var(--primary-light, #e6f4fa);
+    border-radius: 4px;
+  }
+
+  /* ── Nav items — cloned from ctx-toggle pattern ─────────────── */
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+    padding: 10px 10px;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    transition: background 0.15s ease;
+    text-decoration: none;
+    color: var(--text-color, #2b2d42);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .nav-item:hover {
+    background: rgba(0, 0, 0, 0.03);
+    text-decoration: none;
+    color: var(--primary-color);
+  }
+
+  .nav-item-icon {
+    font-size: 16px;
+    color: #64748b;
+    flex-shrink: 0;
+    transition: color 0.15s ease;
+  }
+
+  .nav-item:hover .nav-item-icon {
+    color: var(--primary-color, #1c96ca);
+  }
+
+  .nav-item-label {
+    margin-left: 10px;
+    white-space: nowrap;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  /* Collapsed — exactly like .sidebar-collapsed .ctx-toggle */
+  .sidebar-collapsed .nav-item {
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .sidebar-collapsed .nav-item-label {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
+  .sidebar-collapsed .nav-item-icon {
+    font-size: 18px;
+  }
+
+  /* ── User context panel (bottom of sidebar) ──────────────────────── */
+
+  .sidebar-ctx {
+    padding: 0 15px 8px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    transition: padding var(--sb-transition);
+    border-top: 1px solid rgba(0, 0, 0, 0.05);
+  }
+
+  .sidebar-collapsed .sidebar-ctx {
+    padding: 0 0 8px;
+    align-items: center;
+  }
+
+  /* ── Toggle bar (always visible) ─────────────────────────────── */
+
+  .ctx-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 10px 10px;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .ctx-toggle:hover {
+    background: rgba(0, 0, 0, 0.03);
+  }
+
+  .ctx-toggle-icon {
+    font-size: 20px;
+    color: var(--primary-color, #1c96ca);
+    flex-shrink: 0;
+    transition: color 0.15s ease;
+  }
+
+  .ctx-toggle:hover .ctx-toggle-icon {
+    color: var(--secondary-color, #147ba3);
+  }
+
+  .ctx-toggle-arrow {
+    font-size: 10px;
+    color: var(--text-light, #8d99ae);
+    flex-shrink: 0;
+    transition: transform 0.25s ease, opacity 0.18s ease;
+  }
+
+  .ctx-toggle-arrow.collapsed {
+    transform: rotate(180deg);
+  }
+
+  .ctx-toggle-username {
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    padding-left: 10px;
+    min-width: 0;
+    text-align: left;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .ctx-toggle-username {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
+  /* ── Collapsed sidebar: toggle icon-only ─────────────────────── */
+
+  .sidebar-collapsed .ctx-toggle {
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .sidebar-collapsed .ctx-toggle-arrow {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+  }
+
+  .sidebar-collapsed .ctx-toggle-icon {
+    font-size: 22px;
+  }
+
+  /* ── Collapsible panel ───────────────────────────────────────── */
+
+  .ctx-panel {
+    overflow: hidden;
+    max-height: 300px;
+    opacity: 1;
+    transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+    padding: 2px 0 4px;
+  }
+
+  .ctx-panel.ctx-panel-hidden {
+    max-height: 0;
+    opacity: 0;
+    padding: 0;
+  }
+
+  .sidebar-collapsed .ctx-panel {
+    max-height: 0;
+    opacity: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+
+  /* Individual context row */
+  .ctx-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    transition: background 0.15s ease;
+    position: relative;
+    min-width: 0;
+  }
+
+  .ctx-row:hover {
+    background: rgba(0, 0, 0, 0.025);
+  }
+
+  /* Left icon */
+  .ctx-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    position: relative;
+  }
+
+  .ctx-icon-org,
+  .ctx-icon-user,
+  .ctx-icon-role {
+    background: var(--primary-light, #e6f4fa);
+    color: var(--primary-color, #1c96ca);
+  }
+
+  .ctx-value {
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.4;
+    min-width: 0;
+    flex: 1;
+  }
+
+  /* Divider */
+  .ctx-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,0,0,0.06) 20%, rgba(0,0,0,0.06) 80%, transparent);
+    margin: 4px 10px;
+  }
+
+  /* Role selector */
+  .ctx-role-selector {
+    padding: 4px 10px 2px;
+  }
+
+  .ctx-role-select {
+    width: 100%;
+    padding: 7px 28px 7px 10px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    background: #fff;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238d99ae' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+
+  .ctx-role-select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(28, 150, 202, 0.1);
+  }
+
+  .ctx-role-select:hover {
+    border-color: rgba(0, 0, 0, 0.15);
+  }
+
+  /* Logout */
+  .ctx-logout {
+    padding: 2px 10px 0;
+    transition: opacity 0.18s ease;
+  }
+
+  .ctx-logout-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 0;
+    border-radius: 6px;
+    border: 1px solid rgba(0, 0, 0, 0.05);
+    background: transparent;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-light);
+    transition: all 0.15s ease;
+    text-decoration: none;
+  }
+
+  .ctx-logout-btn:hover {
+    border-color: #fca5a5;
+    color: #dc2626;
+    background: #fef2f2;
+    text-decoration: none;
+  }
+
+  .ctx-logout-btn i { font-size: 11px; }
+
+  /* Collapsed tooltip on toggle icon */
+  .ctx-toggle .ctx-toggle-tooltip {
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: #0f172a;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 1200;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+
+  .ctx-toggle .ctx-toggle-tooltip::before {
+    content: '';
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    border: 5px solid transparent;
+    border-right-color: #0f172a;
+  }
+
+  .sidebar-collapsed .ctx-toggle:hover .ctx-toggle-tooltip {
+    opacity: 1;
+  }
+
+  /* ── kladna Soft branding (between nav and user profile) ──────── */
+
+  .profile-section {
+    padding: 10px 15px;
+    border-top: 1px solid rgba(0, 0, 0, 0.05);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+    background: white;
+    flex-shrink: 0;
+    transition: padding var(--sb-transition);
+  }
+
+  .sidebar-collapsed .profile-section {
+    padding: 10px 0;
+  }
+
+  .profile-section-inner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    color: var(--text-light);
+  }
+
+  .footer-logo-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-light);
+    text-decoration: none;
+    transition: color 0.2s ease;
+  }
+
+  .footer-logo-link:hover {
+    color: var(--primary-color);
+    text-decoration: none;
+  }
+
+  .footer-dna-icon i {
+    font-size: 14px;
+    transition: transform 0.4s ease;
+  }
+
+  .footer-logo-link:hover .footer-dna-icon i {
+    transform: rotate(180deg);
+  }
+
+  .footer-brand-text {
+    font-weight: 600;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .footer-brand-text {
+    opacity: 0;
+    width: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+
+  .logo-core {
+    background: linear-gradient(to right, #0f766e, #14b8a6);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-left: 4px;
+  }
+
+  .logo-stack {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.02;
+  }
+
+  .logo-powered {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    color: #94a3b8;
+    text-transform: none;
+    margin-top: 3px;
+  }
+
+  .logo-text {
+    text-transform: none;
+    letter-spacing: 0.3px;
+    font-size: 19px;
+  }
+
+  .sidebar-module-switcher {
+    padding: 10px 15px 10px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+    background: rgba(255,255,255,0.92);
+    flex-shrink: 0;
+  }
+
+  .sidebar-collapsed .sidebar-module-switcher {
+    padding: 10px 8px;
+  }
+
+  .module-pills {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .module-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(0,0,0,0.06);
+    background: #fff;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 700;
+    text-decoration: none;
+    transition: all 0.18s ease;
+    box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+    user-select: none;
+  }
+
+  .module-pill:hover {
+    color: var(--primary-color);
+    border-color: rgba(28,150,202,0.22);
+    background: #f8fcff;
+    text-decoration: none;
+  }
+
+  .module-pill.active-core {
+    background: linear-gradient(180deg, rgba(20,184,166,0.16) 0%, rgba(20,184,166,0.08) 100%);
+    color: #0f766e;
+    border-color: rgba(20,184,166,0.28);
+    box-shadow: inset 0 0 0 1px rgba(20,184,166,0.08);
+  }
+
+  .module-pill.active-studio {
+    background: linear-gradient(180deg, rgba(28,150,202,0.14) 0%, rgba(28,150,202,0.06) 100%);
+    color: var(--primary-color);
+    border-color: rgba(28,150,202,0.24);
+    box-shadow: inset 0 0 0 1px rgba(28,150,202,0.08);
+  }
+
+  .module-pill.active-agents {
+    background: linear-gradient(180deg, rgba(99,102,241,0.16) 0%, rgba(99,102,241,0.07) 100%);
+    color: #4f46e5;
+    border-color: rgba(99,102,241,0.24);
+    box-shadow: inset 0 0 0 1px rgba(99,102,241,0.08);
+  }
+
+  .sidebar-collapsed .module-pills {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar-collapsed .module-pill {
+    padding: 7px 0;
+    font-size: 11px;
+  }
+
+  .sidebar-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 10px 6px;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 800;
+    color: #94a3b8;
+  }
+
+  .sidebar-section-title::after {
+    content: '';
+    height: 1px;
+    flex: 1;
+    background: linear-gradient(90deg, rgba(148,163,184,0.35), rgba(148,163,184,0));
+  }
+
+  .sidebar-collapsed .sidebar-section-title {
+    justify-content: center;
+    padding: 12px 0 4px;
+  }
+
+  .sidebar-collapsed .sidebar-section-title span {
+    display: none;
+  }
+
+  .sidebar-collapsed .sidebar-section-title::after {
+    display: none;
+  }
+
+  .nav-item-active {
+    background: rgba(28, 150, 202, 0.08);
+    color: var(--primary-color, #1c96ca);
+    box-shadow: inset 0 0 0 1px rgba(28,150,202,0.08);
+  }
+
+  .nav-item-active .nav-item-icon {
+    color: var(--primary-color, #1c96ca);
+  }
+
+  .nav-item-external::after {
+    content: '\f35d';
+    font-family: 'Font Awesome 6 Free';
+    font-weight: 900;
+    font-size: 10px;
+    margin-left: auto;
+    color: #94a3b8;
+  }
+
+  .sidebar-collapsed .nav-item-external::after {
+    display: none;
+  }
+
+  /* ------------ MAIN CONTENT LAYOUT HELPERS (shared) ------------ */
+
+  .content-container {
+    margin-left: var(--sb-width);
+    min-height: 100vh;
+    background-color: #f3f6fb;
+    transition: margin-left var(--sb-transition);
+    padding-bottom: 40px;
+  }
+
+  .sidebar-collapsed ~ .content-container {
+    margin-left: var(--sb-collapsed-width);
+  }
+
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 24px;
+  }
+
+  .card {
+    background: var(--panel-bg, #ffffff);
+    border-radius: 16px;
+    box-shadow: var(--panel-shadow, 0 4px 12px rgba(15, 23, 42, 0.06));
+    border: 1px solid var(--panel-border, #e0e5f0);
+  }
+
+  .section { padding: 16px 20px; }
+  .muted { color: var(--text-light, #8d99ae); }
+  .text-xs { font-size: 11px; }
+  .text-sm { font-size: 12px; }
+
+  .header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .btn-ghost {
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid #d0d7e7;
+    background: transparent;
+    color: #475569;
+    cursor: pointer;
+    font-size: 12px;
+  }
+
+  .btn-ghost:hover { background: #e2e8f0; }
+</style>
+
+
+<!-- Shared sidebar for Data Island -->
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-logo" id="toggleSidebar">
+    <span class="data-reflection-icon">
+      <span class="data-cube">
+        <span class="reflection"></span>
+        <span class="data-grid"></span>
+      </span>
+    </span>
+    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-core">Core</span></span><span class="logo-powered">Powered by SuperTable</span></span>
+  </div>
+
+
+  <div class="sidebar-module-switcher">
+    <div class="module-pills">
+      <a href="#" class="module-pill active-core" data-module="core" id="module-core" title="Data Island Core">Core</a>
+      <a href="#" class="module-pill" data-module="studio" id="module-studio" title="Data Island Studio">Studio</a>
+      <a href="#" class="module-pill" data-module="agents" id="module-agents" title="Data Island Agents">Agents</a>
+    </div>
+  </div>
+
+  <nav class="nav flex-column sidebar-nav" id="moduleNav"></nav>
+
+
+  <!-- User context: toggle bar + collapsible panel -->
+  <div class="sidebar-ctx" id="sidebarUserSection">
+
+    <!-- Toggle bar — always visible -->
+    <button type="button" class="ctx-toggle" id="ctxToggleBtn" title="Account &amp; role settings">
+      <i class="fas fa-circle-user ctx-toggle-icon"></i>
+      <span class="ctx-toggle-username" id="ctxToggleUsername">—</span>
+      <i class="fas fa-chevron-up ctx-toggle-arrow" id="ctxToggleArrow"></i>
+    </button>
+
+    <!-- Collapsible panel -->
+    <div class="ctx-panel" id="ctxPanel">
+
+      <!-- Organization -->
+      <div class="ctx-row" title="Organization">
+        <div class="ctx-icon ctx-icon-org">
+          <i class="fas fa-building"></i>
+        </div>
+        <span class="ctx-value" id="ctxOrgValue">—</span>
+      </div>
+
+      <div class="ctx-divider"></div>
+
+      <!-- Logout — inside panel, collapses with it -->
+      <div class="ctx-logout">
+        <a href="/reflection/logout" class="ctx-logout-btn" title="Sign out">
+          <i class="fas fa-arrow-right-from-bracket"></i>
+          <span>Sign out</span>
+        </a>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- kladna Soft branding -->
+  <div class="profile-section">
+    <div class="profile-section-inner">
+      <a class="footer-logo-link" href="https://kladnasoft.com/kladnasoft/index/">
+        <span class="footer-dna-icon">
+          <i class="fas fa-dna"></i>
+        </span>
+        <span class="footer-brand-text">kladna Soft</span>
+      </a>
+    </div>
+  </div>
+
+</div>
+
+
+<script>
+(function () {
+  var MODULE_MENUS = {"core": [{"section": "Workspace"}, {"href": "/reflection/home", "id": "link-home", "icon": "fa-house", "label": "Home", "active": true}, {"section": "Data Operations"}, {"href": "/reflection/execute", "id": "link-execute", "icon": "fa-terminal", "label": "Execute SQL"}, {"href": "/reflection/tables", "id": "link-tables", "icon": "fa-table", "label": "Tables"}, {"href": "/reflection/ingestion", "id": "link-staging", "icon": "fa-layer-group", "label": "Ingestion"}, {"href": "/reflection/quality", "id": "link-quality", "icon": "fa-heartbeat", "label": "Data Quality"}, {"section": "Platform"}, {"href": "/reflection/monitoring", "id": "link-monitoring", "icon": "fa-chart-line", "label": "Monitoring"}, {"href": "/reflection/engine", "id": "link-engine", "icon": "fa-microchip", "label": "Engine"}, {"href": "/reflection/security", "id": "link-security", "icon": "fa-shield-halved", "label": "Security"}], "studio": [{"section": "Workspace"}, {"href": "/reflection/home", "id": "studio-home", "icon": "fa-house", "label": "Home"}, {"href": "/reflection/studio", "id": "link-studio", "icon": "fa-book", "label": "Studio", "active": true}, {"section": "Development"}, {"href": "/reflection/notebook", "id": "link-notebook", "icon": "fa-note-sticky", "label": "Notebook"}, {"href": "/reflection/jobs", "id": "link-jobs", "icon": "fa-clock", "label": "Jobs"}, {"href": "/reflection/vault", "id": "link-vault", "icon": "fa-vault", "label": "Vault"}, {"section": "Runtime"}, {"href": "/reflection/compute", "id": "link-compute", "icon": "fa-server", "label": "Compute"}, {"href": "/reflection/environments", "id": "link-environments", "icon": "fa-cubes", "label": "Environments"}, {"href": "/reflection/env", "id": "link-env", "icon": "fa-sliders", "label": "Env"}], "agents": [{"section": "Agents Cloud"}, {"href": "https://agents.dataisland.local/", "id": "agents-home", "icon": "fa-robot", "label": "Agents Home", "external": true, "active": true}, {"section": "Autonomy"}, {"href": "https://agents.dataisland.local/bi", "id": "agents-bi", "icon": "fa-chart-pie", "label": "Agentic BI", "external": true}, {"href": "https://agents.dataisland.local/steward", "id": "agents-steward", "icon": "fa-shield-heart", "label": "AI Data Steward", "external": true}, {"href": "https://agents.dataisland.local/pipelines", "id": "agents-pipelines", "icon": "fa-diagram-project", "label": "Pipeline Studio", "external": true}, {"section": "Operations"}, {"href": "https://agents.dataisland.local/runs", "id": "agents-runs", "icon": "fa-wave-square", "label": "Runs", "external": true}, {"href": "https://agents.dataisland.local/policies", "id": "agents-policies", "icon": "fa-scale-balanced", "label": "Policies", "external": true}]};
+  var navEl = document.getElementById('moduleNav');
+  var pills = document.querySelectorAll('.module-pill');
+
+  function renderModule(moduleName) {
+    if (!navEl || !MODULE_MENUS[moduleName]) return;
+    navEl.innerHTML = '';
+
+    MODULE_MENUS[moduleName].forEach(function(item) {
+      if (item.section) {
+        var sec = document.createElement('div');
+        sec.className = 'sidebar-section-title';
+        sec.innerHTML = '<span>' + item.section + '</span>';
+        navEl.appendChild(sec);
+        return;
+      }
+
+      var a = document.createElement('a');
+      a.href = item.href;
+      a.id = item.id;
+      a.className = 'nav-item' + (item.active ? ' nav-item-active' : '') + (item.external ? ' nav-item-external' : '');
+      if (item.external) {
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+      }
+      a.innerHTML = '<i class="fas ' + item.icon + ' nav-item-icon"></i>' +
+                    '<span class="nav-item-label">' + item.label + '</span>';
+      navEl.appendChild(a);
+    });
+
+    pills.forEach(function(pill) {
+      pill.classList.remove('active-core', 'active-studio', 'active-agents');
+      if (pill.dataset.module === moduleName) {
+        pill.classList.add('active-' + moduleName);
+      }
+    });
+
+    try { localStorage.setItem('di_active_module', moduleName); } catch (e) {}
+  }
+
+  pills.forEach(function(pill) {
+    pill.addEventListener('click', function(e) {
+      e.preventDefault();
+      renderModule(pill.dataset.module);
+    });
+  });
+
+  var initial = 'core';
+  try {
+    initial = localStorage.getItem('di_active_module') || 'core';
+  } catch (e) {}
+  renderModule(initial);
+})();
+</script>
+
+
+<!-- Nav group collapse/expand — accordion behaviour -->
+<script>
+(function () {
+  var STORAGE_KEY = 'st_nav_open_group';
+
+  // Map each link id → group id so we can auto-open the right group
+  var LINK_GROUP = {
+    'link-home':       'navigation',
+    'link-execute':    'navigation',
+    'link-tables':     'navigation',
+    'link-staging':    'navigation',
+    'link-studio':     'navigation',
+    'link-jobs':       'navigation',
+    'link-monitoring': 'navigation',
+    'link-quality':    'navigation',
+    'link-vault':      'infrastructure',
+    'link-compute':    'infrastructure',
+    'link-security':   'access-control',
+    'link-users-page': 'access-control',
+    'link-rbac':       'access-control',
+  };
+
+  function openGroup(groupId, saveToStorage) {
+    document.querySelectorAll('.sidebar-section').forEach(function (sec) {
+      var isTarget = sec.getAttribute('data-group') === groupId;
+      var linksEl  = document.getElementById('nav-group-' + sec.getAttribute('data-group'));
+      if (isTarget) {
+        sec.classList.add('section-open');
+        if (linksEl) linksEl.classList.remove('nav-group-collapsed');
+      } else {
+        sec.classList.remove('section-open');
+        if (linksEl) linksEl.classList.add('nav-group-collapsed');
+      }
+    });
+    if (saveToStorage) {
+      try { localStorage.setItem(STORAGE_KEY, groupId); } catch (e) {}
+    }
+  }
+
+  function initGroups() {
+    // Determine which group should be open:
+    // 1. The group containing the currently-active link
+    // 2. Otherwise, the group saved in localStorage
+    // 3. Otherwise, 'navigation'
+    var activeLink = document.querySelector('.sidebar-link.active');
+    var activeLinkId = activeLink ? activeLink.id : null;
+    var groupFromLink = activeLinkId ? LINK_GROUP[activeLinkId] : null;
+    var groupFromStorage;
+    try { groupFromStorage = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+
+    var openGroupId = groupFromLink || groupFromStorage || 'navigation';
+    openGroup(openGroupId, false);
+
+    // Wire up click handlers on each section header
+    document.querySelectorAll('.sidebar-section[data-group]').forEach(function (sec) {
+      sec.addEventListener('click', function () {
+        var gid = sec.getAttribute('data-group');
+        // If already open → keep open (no close-all behaviour; always one group open)
+        openGroup(gid, true);
+      });
+    });
+  }
+
+  // Run after DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initGroups);
+  } else {
+    initGroups();
+  }
+})();
+</script>
+
+<!-- Sidebar collapse/expand — shared across all pages -->
+<script>
+(function () {
+  var sidebar = document.getElementById("sidebar");
+  var toggle = document.getElementById("toggleSidebar");
+  if (!sidebar || !toggle) return;
+
+  // Restore persisted state immediately (before paint).
+  if (localStorage.getItem("st_sidebar_collapsed") === "true" ||
+      localStorage.getItem("sidebar-collapsed") === "true") {
+    sidebar.classList.add("sidebar-collapsed");
+  }
+
+  toggle.addEventListener("click", function () {
+    sidebar.classList.toggle("sidebar-collapsed");
+    var collapsed = sidebar.classList.contains("sidebar-collapsed");
+    localStorage.setItem("st_sidebar_collapsed", String(collapsed));
+    localStorage.setItem("sidebar-collapsed", String(collapsed));
+  });
+
+  // Flag so legacy per-page jQuery handlers can skip their own binding.
+  window.__st_sidebar_bound = true;
+
+  // ── Collapsible user-context panel ──────────────────────────────
+  var ctxToggle = document.getElementById("ctxToggleBtn");
+  var ctxPanel = document.getElementById("ctxPanel");
+  var ctxArrow = document.getElementById("ctxToggleArrow");
+
+  // Start collapsed
+  if (ctxPanel) ctxPanel.classList.add("ctx-panel-hidden");
+  if (ctxArrow) ctxArrow.classList.add("collapsed");
+
+  // Restore persisted state
+  if (localStorage.getItem("st_ctx_open") === "true") {
+    if (ctxPanel) ctxPanel.classList.remove("ctx-panel-hidden");
+    if (ctxArrow) ctxArrow.classList.remove("collapsed");
+  }
+
+  if (ctxToggle && ctxPanel) {
+    ctxToggle.addEventListener("click", function () {
+      var isHidden = ctxPanel.classList.toggle("ctx-panel-hidden");
+      if (ctxArrow) ctxArrow.classList.toggle("collapsed", isHidden);
+      localStorage.setItem("st_ctx_open", String(!isHidden));
+    });
+  }
+
+  // ── User context population ──────────────────────────────────
+  var username = {{ session_username|default("", true)|tojson }};
+  var org = {{ session_org|default("", true)|tojson }};
+  var userHash = {{ session_user_hash|default("", true)|tojson }};
+  var isSuperuser = {{ session_is_superuser|default(false, true)|tojson }};
+  var sessionRoleName = {{ session_role_name|default("", true)|tojson }};
+
+  // Store globally so selection.html and other scripts can read them
+  window.__st_username = username;
+  window.__st_org = org;
+  window.__st_user_hash = userHash;
+  window.__st_is_superuser = isSuperuser;
+  window.__st_role_name = sessionRoleName || localStorage.getItem("st_active_role") || "";
+
+  var orgValueEl = document.getElementById("ctxOrgValue");
+  var userValueEl = document.getElementById("ctxUserValue");
+  var roleValueEl = document.getElementById("ctxRoleValue");
+  var toggleUsernameEl = document.getElementById("ctxToggleUsername");
+
+  if (org && orgValueEl) {
+    orgValueEl.textContent = org;
+  }
+
+  if (username) {
+    if (userValueEl) userValueEl.textContent = username;
+    if (toggleUsernameEl) toggleUsernameEl.textContent = username;
+  }
+
+  var initialRole = sessionRoleName || localStorage.getItem("st_active_role") || "";
+  if (initialRole && roleValueEl) {
+    roleValueEl.textContent = initialRole;
+  }
+
+  // ── Role selector logic ──────────────────────────────────────
+  var roleSelect = document.getElementById("sbRoleSelect");
+  window.__st_active_role = localStorage.getItem("st_active_role") || "";
+
+  // Called by selection.html with already-fetched (or cached) role names.
+  // This function only populates the dropdown — no network calls.
+  window.__st_applyRoleNames = function (roleNames) {
+    if (!roleSelect) return;
+
+    if (!roleNames || !roleNames.length) {
+      roleSelect.innerHTML = '<option value="">No roles assigned</option>';
+      window.__st_active_role = "";
+      return;
+    }
+
+    roleSelect.innerHTML = "";
+    var savedRole = sessionRoleName || localStorage.getItem("st_active_role") || "";
+    var foundSaved = false;
+
+    for (var k = 0; k < roleNames.length; k++) {
+      var rname = roleNames[k];
+      var opt = document.createElement("option");
+      opt.value = rname;
+      opt.textContent = rname;
+      if (rname === savedRole) { opt.selected = true; foundSaved = true; }
+      roleSelect.appendChild(opt);
+    }
+
+    if (!foundSaved && roleSelect.options.length) {
+      roleSelect.options[0].selected = true;
+    }
+
+    window.__st_active_role = roleSelect.value;
+    localStorage.setItem("st_active_role", window.__st_active_role);
+    if (roleValueEl) roleValueEl.textContent = roleSelect.value || "—";
+  };
+
+  // On role change
+  if (roleSelect) {
+    roleSelect.addEventListener("change", function () {
+      window.__st_active_role = roleSelect.value;
+      window.__st_role_name = roleSelect.value;
+      localStorage.setItem("st_active_role", roleSelect.value);
+      // Update displayed role value
+      if (roleValueEl) roleValueEl.textContent = roleSelect.value || "—";
+      // Persist to server session
+      fetch("/reflection/set-role", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({role_name: roleSelect.value})
+      }).catch(function (e) { console.warn("Failed to persist role:", e); });
+      // Notify any listeners
+      try {
+        window.dispatchEvent(new CustomEvent("role-changed", {
+          detail: { role_name: roleSelect.value }
+        }));
+      } catch (e) {}
+    });
+  }
+
+  // Clear all cached data on logout
+  var logoutLink = document.querySelector('a[href="/reflection/logout"]');
+  if (logoutLink) {
+    logoutLink.addEventListener("click", function () {
+      try {
+        if (typeof window.__st_clearAllCaches === "function") {
+          window.__st_clearAllCaches();
+        }
+      } catch (e) {}
+    });
+  }
+})();
+</script>

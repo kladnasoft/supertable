@@ -1,4 +1,4 @@
-# supertable/mirroring/mirror_iceberg.py
+# route: supertable.mirroring.mirror_iceberg
 
 import os
 import uuid
@@ -21,9 +21,13 @@ def _stable_table_uuid(organization: str, super_name: str, table_name: str) -> s
 def _schema_fields_from_catalog(schema_any: Any) -> List[Dict[str, Any]]:
     """
     Expecting SuperTable's collect_schema output (usually a list of dicts).
+    Also handles dict-shaped schemas like {"fields": [...]}.
     We map minimally to Iceberg-ish fields. If unknown, we pass through name/type.
     """
     fields = []
+    # Unwrap dict-shaped schemas (e.g. {"fields": [...]})
+    if isinstance(schema_any, dict):
+        schema_any = schema_any.get("fields", [])
     if isinstance(schema_any, list):
         for idx, col in enumerate(schema_any):
             # col can be {"name": "...", "type": "..."} or similar
@@ -130,6 +134,7 @@ def write_iceberg_table(super_table, table_name: str, simple_snapshot: Dict[str,
 # - Iceberg spec: https://iceberg.apache.org/spec/
 #   (manifest list fields, manifest entry/data file fields, table metadata fields)
 
+import hashlib as _hashlib
 import json as _json
 import struct as _struct
 import uuid as _uuid
@@ -342,13 +347,17 @@ def _storage_path_to_uri(storage: Any, object_path: str) -> str:
     return object_path
 
 
-def _binary_copy_if_possible(storage: Any, src_path: str, dst_path: str) -> None:
+def _binary_copy_if_possible(storage: Any, src_path: str, dst_path: str) -> bool:
+    """Copy bytes, return True on success, False on failure.
+
+    Signature matches the Delta/Parquet writers for consistency.
+    """
     storage.makedirs(os.path.dirname(dst_path))
 
     if hasattr(storage, "copy"):
         try:
             storage.copy(src_path, dst_path)
-            return
+            return True
         except Exception as e:
             logger.warning(f"[mirror][iceberg] storage.copy failed ({src_path} -> {dst_path}): {e}")
 
@@ -357,11 +366,11 @@ def _binary_copy_if_possible(storage: Any, src_path: str, dst_path: str) -> None
     if callable(read_bytes) and callable(write_bytes):
         try:
             storage.write_bytes(dst_path, read_bytes(src_path))
-            return
+            return True
         except Exception as e:
             logger.warning(f"[mirror][iceberg] byte copy failed ({src_path} -> {dst_path}): {e}")
 
-    raise RuntimeError("storage does not support copy() or read_bytes/write_bytes for Iceberg mirroring")
+    return False
 
 
 def _read_json_if_exists(storage: Any, path: str) -> Optional[Dict[str, Any]]:
@@ -598,17 +607,20 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     sequence_number = last_seq + 1 if prior_last_seq else metadata_version
 
     # Copy data files into Iceberg table's data/ folder (immutable history friendly).
+    # Hash-prefix filenames to avoid collisions when multiple source paths share
+    # the same basename (e.g. auto-generated names like part-00000.parquet).
     copied_files: List[Tuple[str, str, Dict[str, Any]]] = []
     for r in resources:
         src = str(r.get("file", "")).strip()
         if not src:
             continue
         fname = src.split("/")[-1]
-        dst = os.path.join(data_dir, fname)
-        try:
-            _binary_copy_if_possible(storage, src, dst)
-        except Exception as e:
-            logger.warning(f"[mirror][iceberg] data copy failed ({src} -> {dst}): {e}")
+        h = _hashlib.md5(src.encode("utf-8")).hexdigest()[:8]
+        safe_fname = f"{h}_{fname}"
+        dst = os.path.join(data_dir, safe_fname)
+        ok = _binary_copy_if_possible(storage, src, dst)
+        if not ok:
+            logger.warning(f"[mirror][iceberg] data copy failed ({src} -> {dst})")
             # Still proceed by referencing the original file path as a fallback.
             dst = src
         copied_files.append((src, dst, r))
@@ -772,7 +784,8 @@ def write_iceberg_table(super_table, table_name: str, simple_snapshot: Dict[str,
     """
     try:
         _write_iceberg_standard(super_table, table_name, simple_snapshot)
+        return  # standard writer succeeded; its latest.json is authoritative
     except Exception as e:
         logger.warning(f"[mirror][iceberg] standard writer failed, falling back to iceberg-lite: {e}")
-    # Always write the legacy mirror for backward compatibility
+    # Fallback: write the legacy mirror only when the standard writer failed
     _write_iceberg_table_iceberg_lite(super_table, table_name, simple_snapshot)

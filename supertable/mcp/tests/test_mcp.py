@@ -649,8 +649,14 @@ class TestWebClientAuthTools:
         except ImportError:
             from web_client import _AUTH_TOOLS
 
-        expected = {"whoami", "list_supers", "list_tables", "describe_table",
-                    "get_table_stats", "get_super_meta", "query_sql", "sample_data"}
+        expected = {
+            "whoami", "list_supers", "list_tables", "describe_table",
+            "get_table_stats", "get_super_meta", "query_sql", "sample_data",
+            "submit_feedback", "store_annotation", "get_annotations",
+            "delete_annotation", "store_app_state", "get_app_state",
+            "delete_app_state", "profile_column", "validate_sql",
+            "search_columns", "data_freshness", "auto_discover", "store_catalog",
+        }
         assert expected == _AUTH_TOOLS
 
 
@@ -737,3 +743,306 @@ class TestConfigRequireToken:
         mod = _import_mcp()
         mod = importlib.reload(mod)
         assert mod.CFG.require_token is False
+
+
+# ---------------------------------------------------------------------------
+# 11. New helpers: _sql_escape_literal, _safe_column_id
+# ---------------------------------------------------------------------------
+
+class TestSqlEscapeLiteral:
+    def test_no_special_chars(self, mod):
+        assert mod._sql_escape_literal("hello") == "hello"
+
+    def test_doubles_single_quotes(self, mod):
+        assert mod._sql_escape_literal("it's") == "it''s"
+
+    def test_multiple_quotes(self, mod):
+        assert mod._sql_escape_literal("a'b'c") == "a''b''c"
+
+    def test_rejects_null_bytes(self, mod):
+        with pytest.raises(ValueError, match="Null bytes"):
+            mod._sql_escape_literal("evil\x00payload")
+
+    def test_empty_string(self, mod):
+        assert mod._sql_escape_literal("") == ""
+
+    def test_injection_attempt(self, mod):
+        injected = mod._sql_escape_literal("foo' OR 1=1 --")
+        assert injected == "foo'' OR 1=1 --"
+        # When placed in SQL: WHERE key = 'foo'' OR 1=1 --' — literal string, not injection
+
+
+class TestSafeColumnId:
+    def test_simple_column(self, mod):
+        assert mod._safe_column_id("order_id") == "order_id"
+
+    def test_strips_whitespace(self, mod):
+        assert mod._safe_column_id("  name  ") == "name"
+
+    def test_escapes_double_quotes(self, mod):
+        assert mod._safe_column_id('col"name') == 'col""name'
+
+    def test_rejects_empty(self, mod):
+        with pytest.raises(ValueError, match="must be a non-empty"):
+            mod._safe_column_id("")
+
+    def test_rejects_none(self, mod):
+        with pytest.raises(ValueError):
+            mod._safe_column_id(None)
+
+    def test_rejects_null_bytes(self, mod):
+        with pytest.raises(ValueError, match="null bytes"):
+            mod._safe_column_id("col\x00")
+
+    def test_rejects_too_long(self, mod):
+        with pytest.raises(ValueError, match="exceeds 256"):
+            mod._safe_column_id("x" * 257)
+
+
+# ---------------------------------------------------------------------------
+# 12. New tool: profile_column
+# ---------------------------------------------------------------------------
+
+class TestToolProfileColumn:
+    @pytest.mark.asyncio
+    async def test_success(self, mod, mock_backend):
+        # profile_column runs two queries: stats (8 cols) and top values (2 cols).
+        # Provide a mock that returns 2 columns so both queries succeed.
+        fake_query = MagicMock(return_value=(
+            ["value", "frequency"], [["Jasmin", 100], ["Oranum", 50]], [],
+        ))
+        with patch.object(mod, "data_query_sql", fake_query):
+            result = await mod.profile_column(
+                super_name="sup", organization="org", table="tbl",
+                column="amount", role=VALID_ROLE,
+            )
+        assert result["status"] == "OK"
+        assert result["table"] == "tbl"
+        assert result["column"] == "amount"
+        assert "profile" in result
+        assert "top_values" in result
+
+    @pytest.mark.asyncio
+    async def test_invalid_table_returns_error(self, mod, mock_backend):
+        result = await mod.profile_column(
+            super_name="sup", organization="org", table="evil/path",
+            column="col", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+    @pytest.mark.asyncio
+    async def test_empty_column_returns_error(self, mod, mock_backend):
+        result = await mod.profile_column(
+            super_name="sup", organization="org", table="tbl",
+            column="", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 13. New tool: validate_sql
+# ---------------------------------------------------------------------------
+
+class TestToolValidateSql:
+    @pytest.mark.asyncio
+    async def test_blocks_write_sql(self, mod, mock_backend):
+        result = await mod.validate_sql(
+            super_name="sup", organization="org",
+            sql="INSERT INTO t VALUES (1)", role=VALID_ROLE,
+        )
+        assert result["valid"] is False
+        assert result["phase"] == "read_only_check"
+
+    @pytest.mark.asyncio
+    async def test_invalid_org_returns_error(self, mod, mock_backend):
+        result = await mod.validate_sql(
+            super_name="sup", organization="evil/path",
+            sql="SELECT 1", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 14. New tool: search_columns
+# ---------------------------------------------------------------------------
+
+class TestToolSearchColumns:
+    @pytest.mark.asyncio
+    async def test_returns_matches(self, mod, mock_backend):
+        result = await mod.search_columns(
+            super_name="sup", organization="org",
+            pattern="col", role=VALID_ROLE,
+        )
+        assert result["status"] == "OK"
+        assert "matches" in result
+        assert "count" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_pattern_returns_error(self, mod, mock_backend):
+        result = await mod.search_columns(
+            super_name="sup", organization="org",
+            pattern="", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+    @pytest.mark.asyncio
+    async def test_invalid_org_returns_error(self, mod, mock_backend):
+        result = await mod.search_columns(
+            super_name="sup", organization="../evil",
+            pattern="id", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 15. New tool: delete_annotation
+# ---------------------------------------------------------------------------
+
+class TestToolDeleteAnnotation:
+    @pytest.mark.asyncio
+    async def test_no_match_returns_zero(self, mod, mock_backend):
+        # mock_backend returns data for query_sql but the annotation query
+        # will return rows; with status OK but empty rows → deleted=0
+        fake_query = MagicMock(return_value=(["category"], [], []))
+        with patch.object(mod, "data_query_sql", fake_query), \
+             patch.object(mod, "_ensure_imports"):
+            result = await mod.delete_annotation(
+                super_name="sup", organization="org",
+                category="sql", context="*", role=VALID_ROLE,
+            )
+        assert result["status"] == "OK"
+        assert result["deleted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_category_returns_error(self, mod, mock_backend):
+        result = await mod.delete_annotation(
+            super_name="sup", organization="org",
+            category="invalid_cat", context="*", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "category" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_empty_context_returns_error(self, mod, mock_backend):
+        result = await mod.delete_annotation(
+            super_name="sup", organization="org",
+            category="sql", context="", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "context" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# 16. New tool: delete_app_state
+# ---------------------------------------------------------------------------
+
+class TestToolDeleteAppState:
+    @pytest.mark.asyncio
+    async def test_invalid_namespace_returns_error(self, mod, mock_backend):
+        result = await mod.delete_app_state(
+            super_name="sup", organization="org",
+            namespace="invalid", key="k1", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "namespace" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_empty_key_returns_error(self, mod, mock_backend):
+        result = await mod.delete_app_state(
+            super_name="sup", organization="org",
+            namespace="widget", key="", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "key" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# 17. New tool: data_freshness
+# ---------------------------------------------------------------------------
+
+class TestToolDataFreshness:
+    @pytest.mark.asyncio
+    async def test_invalid_org_returns_error(self, mod, mock_backend):
+        result = await mod.data_freshness(
+            super_name="sup", organization="evil/org",
+            table="tbl", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 18. New tool: auto_discover
+# ---------------------------------------------------------------------------
+
+class TestToolAutoDiscover:
+    @pytest.mark.asyncio
+    async def test_success(self, mod, mock_backend):
+        result = await mod.auto_discover(
+            super_name="sup", organization="org", role=VALID_ROLE,
+        )
+        assert result["status"] == "OK"
+        assert "discoveries" in result
+        assert "tables_crawled" in result
+
+    @pytest.mark.asyncio
+    async def test_invalid_org_returns_error(self, mod, mock_backend):
+        result = await mod.auto_discover(
+            super_name="sup", organization="../evil",
+            role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 19. New tool: store_catalog
+# ---------------------------------------------------------------------------
+
+class TestToolStoreCatalog:
+    @pytest.mark.asyncio
+    async def test_empty_table_name_returns_error(self, mod, mock_backend):
+        result = await mod.store_catalog(
+            super_name="sup", organization="org",
+            table_name="", description="desc", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "table_name" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_empty_description_returns_error(self, mod, mock_backend):
+        result = await mod.store_catalog(
+            super_name="sup", organization="org",
+            table_name="orders", description="", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+        assert "description" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_org_returns_error(self, mod, mock_backend):
+        result = await mod.store_catalog(
+            super_name="sup", organization="evil/org",
+            table_name="orders", description="desc", role=VALID_ROLE,
+        )
+        assert result["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 20. Auth sync: all server auth tools match client AUTH_TOOLS
+# ---------------------------------------------------------------------------
+
+class TestAuthToolsSync:
+    def test_mcp_client_matches_web_client(self):
+        try:
+            from supertable.mcp.web_client import _AUTH_TOOLS as web_auth
+        except ImportError:
+            from web_client import _AUTH_TOOLS as web_auth
+
+        try:
+            from supertable.mcp.mcp_client import AUTH_TOOLS as cli_auth
+        except ImportError:
+            from mcp_client import AUTH_TOOLS as cli_auth
+
+        assert web_auth == cli_auth, (
+            f"AUTH_TOOLS drift:\n"
+            f"  web_client only: {web_auth - cli_auth}\n"
+            f"  mcp_client only: {cli_auth - web_auth}"
+        )

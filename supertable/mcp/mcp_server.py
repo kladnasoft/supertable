@@ -215,6 +215,34 @@ def _safe_id(x: str, field: str) -> str:
         raise ValueError(f"Invalid {field}: {x!r}")
     return x
 
+def _sql_escape_literal(value: str) -> str:
+    """Escape a value for safe inclusion in a SQL single-quoted string literal.
+
+    - Rejects null bytes (which would truncate the string in C-backed engines).
+    - Doubles single quotes (' → '') per the SQL standard.
+
+    This is defence-in-depth for internal queries that cannot use parameterized
+    statements because the downstream ``data_query_sql()`` API accepts raw SQL.
+    """
+    if "\x00" in value:
+        raise ValueError("Null bytes are not allowed in SQL literal values.")
+    return value.replace("'", "''")
+
+def _safe_column_id(col: str) -> str:
+    """Validate and return a column name safe for use in double-quoted SQL identifiers.
+
+    Rejects empty values and null bytes. Escapes embedded double quotes
+    (" → "") per the SQL standard for delimited identifiers.
+    """
+    if not isinstance(col, str) or not col.strip():
+        raise ValueError("Invalid column: must be a non-empty string.")
+    c = col.strip()
+    if "\x00" in c:
+        raise ValueError("Invalid column: null bytes not allowed.")
+    if len(c) > 256:
+        raise ValueError("Invalid column: exceeds 256 characters.")
+    return c.replace('"', '""')
+
 def _validate_role(r: str) -> str:
     """Validate a role identifier (role name or role ID)."""
     if not isinstance(r, str) or not r.strip():
@@ -509,11 +537,24 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
         if "__catalog__" in tables:
             # Always set the hint — even if the fetch fails the AI knows it exists.
             catalog_hint = (
-                "IMPORTANT: Before querying any table, you MUST read the 'catalog' "
-                "field in this response. It contains human-written descriptions of every "
-                "table in this SuperTable — what the data means, how it is structured, "
-                "and what questions it can answer. Use it as your primary reference for "
-                "understanding the dataset before writing any SQL."
+                "IMPORTANT — CATALOG INSTRUCTIONS:\n"
+                "The 'catalog' field contains one entry per table with human-written metadata. "
+                "You MUST read it IN FULL before writing any SQL.\n"
+                "\n"
+                "How to use the catalog:\n"
+                "1. Each entry describes a table. Look for fields like 'table_name' (or 'name' or 'table') "
+                "to identify which table the entry describes.\n"
+                "2. Look for a 'description' (or 'info', 'notes', 'summary') field — it explains "
+                "what the table contains and what business questions it answers.\n"
+                "3. If a 'columns' field exists, it lists available columns with types and meanings. "
+                "Use it to pick the right column names in your SQL — do NOT guess column names.\n"
+                "4. If 'joins' or 'relationships' fields exist, use them to determine how tables connect.\n"
+                "5. If 'example_queries' or 'examples' fields exist, use them as templates for your SQL.\n"
+                "6. If a 'filters' or 'scope' field exists, it describes default filtering rules.\n"
+                "\n"
+                "The catalog is the AUTHORITATIVE source for understanding this dataset. "
+                "Never query a table without consulting its catalog entry first. "
+                "If a table has no catalog entry, call describe_table before querying it."
             )
             try:
                 eng = _resolve_engine(None)
@@ -598,7 +639,7 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
                 def _fetch_annotations():
                     return _exec_query_sync(
                         sup, org,
-                        'SELECT * FROM "__annotations__" ORDER BY ts DESC LIMIT 200',
+                        'SELECT * FROM "__annotations__" WHERE ("status" IS NULL OR "status" != \'deleted\') ORDER BY ts DESC LIMIT 200',
                         limit_n, eng, r,
                     )
 
@@ -625,19 +666,38 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
             "\n"
             "1. CATALOG: The 'catalog' field describes every table — what it contains, "
             "its columns, known joins, filters and example questions. "
-            "Read it before writing any SQL. Never query a table without consulting it first.\n"
+            "Read it IN FULL before writing any SQL. Never query a table without consulting "
+            "its catalog entry first. Use column names from the catalog — do not guess. "
+            "If a table has no catalog entry, call describe_table before querying it.\n"
             "\n"
-            "2. ANNOTATIONS: The 'annotations' field contains user-defined rules and preferences. "
+            "2. QUERY PLANNING: Before writing any SQL, follow this planning sequence:\n"
+            "   a) IDENTIFY the tables and columns needed from the catalog.\n"
+            "   b) PROFILE filter columns: If the user mentions filter values (names, categories, "
+            "statuses, sites, types — anything used in WHERE/GROUP BY), call profile_column "
+            "to discover exact values, casing, and cardinality. Never guess enum values — "
+            "the user may type 'jasmin' but the data contains 'Jasmin' or 'jasmin.com'. "
+            "profile_column returns top values with frequencies so you can match correctly.\n"
+            "   c) CHECK annotations for any rules about this table or these columns.\n"
+            "   d) VALIDATE: Call validate_sql to verify tables exist, columns exist, "
+            "and RBAC allows the query — before spending a query_sql call.\n"
+            "   e) EXECUTE: Call query_sql with the validated, correctly-filtered query.\n"
+            "   f) VISUALIZE: Choose chart types based on the data shape and any "
+            "visualization annotations.\n"
+            "This sequence prevents wasted queries from wrong column names, wrong enum values, "
+            "or RBAC denials. Skip steps only when you are certain (e.g., you already profiled "
+            "that column earlier in the session).\n"
+            "\n"
+            "3. ANNOTATIONS: The 'annotations' field contains user-defined rules and preferences. "
             "These are HARD CONSTRAINTS. Each has a category and context. "
             "Apply global (*) annotations to every query. "
             "Apply table-specific annotations when that table is involved. "
             "NEVER ignore an annotation — they represent explicit user intent.\n"
             "\n"
-            "3. FEEDBACK: The 'feedback' field contains past user ratings on previous AI responses. "
+            "4. FEEDBACK: The 'feedback' field contains past user ratings on previous AI responses. "
             "Avoid patterns rated thumbs_down. Repeat patterns rated thumbs_up. "
             "If a comment field explains why, treat it as a hard constraint.\n"
             "\n"
-            "4. COLLECTING FEEDBACK: After every response you give, ask the user: "
+            "5. COLLECTING FEEDBACK: After every response you give, ask the user: "
             "'Was this helpful? Reply 👍 or 👎'. "
             "When the user replies 👍 or with positive words (yes, good, great, correct, perfect), "
             "call the submit_feedback tool with rating=thumbs_up, "
@@ -648,7 +708,7 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
             "call submit_feedback with rating=thumbs_down and include their words in the comment field. "
             "Never skip this step — every interaction should be logged.\n"
             "\n"
-            "5. MEMORY: Keep catalog, annotations, and feedback in memory for the full session. "
+            "6. MEMORY: Keep catalog, annotations, and feedback in memory for the full session. "
             "Do not re-call list_tables unless the user explicitly asks to refresh."
         ),
     }
@@ -1075,11 +1135,11 @@ async def get_annotations(
     r = _resolve_role(role)
     _ensure_imports()
 
-    ctx = (context or "").strip()
+    ctx = _sql_escape_literal((context or "").strip())
     if ctx:
-        sql = f'SELECT * FROM "__annotations__" WHERE "context" = \'{ctx}\' OR "context" = \'*\' ORDER BY ts DESC LIMIT 200'
+        sql = f'SELECT * FROM "__annotations__" WHERE ("context" = \'{ctx}\' OR "context" = \'*\') AND ("status" IS NULL OR "status" != \'deleted\') ORDER BY ts DESC LIMIT 200'
     else:
-        sql = 'SELECT * FROM "__annotations__" ORDER BY ts DESC LIMIT 200'
+        sql = 'SELECT * FROM "__annotations__" WHERE ("status" IS NULL OR "status" != \'deleted\') ORDER BY ts DESC LIMIT 200'
 
     eng = _resolve_engine(None)
 
@@ -1244,13 +1304,13 @@ async def get_app_state(
     r = _resolve_role(role)
     _ensure_imports()
 
-    ns = (namespace or "").strip().lower()
-    key_val = (key or "").strip()
+    ns = _sql_escape_literal((namespace or "").strip().lower())
+    key_val = _sql_escape_literal((key or "").strip())
 
     if key_val:
-        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' AND "key" = \'{key_val}\' ORDER BY ts DESC LIMIT 1'
+        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' AND "key" = \'{key_val}\' AND ("status" IS NULL OR "status" != \'deleted\') ORDER BY ts DESC LIMIT 1'
     else:
-        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' ORDER BY ts DESC LIMIT 200'
+        sql = f'SELECT * FROM "__app_state__" WHERE "namespace" = \'{ns}\' AND ("status" IS NULL OR "status" != \'deleted\') ORDER BY ts DESC LIMIT 200'
 
     eng = _resolve_engine(None)
 
@@ -1283,6 +1343,870 @@ async def get_app_state(
                 "count": 0,
                 "note": f"Could not read app state: {exc}",
             }
+
+
+# ---------- Column profiling ----------
+
+@mcp.tool()
+@log_tool
+async def profile_column(
+    super_name: str,
+    organization: str,
+    table: str,
+    column: str,
+    top_n: Optional[int] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Profile a single column: type, null%, distinct count, min, max, and top values.
+
+    Returns column statistics and the most frequent values in one call,
+    replacing multiple manual SQL queries the AI would otherwise need to
+    understand the data before writing a real query.
+
+    DuckDB derives most statistics from parquet metadata — this is fast.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        table:         Table name.
+        column:        Column name to profile.
+        top_n:         Number of top values to return (default 10, max 50).
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    tbl = _safe_id(table, "table")
+    col = _safe_column_id(column)
+    _check_token(auth_token)
+    r = _resolve_role(role)
+
+    top_limit = max(1, min(int(top_n or 10), 50))
+    eng = _resolve_engine(None)
+
+    stats_sql = (
+        f'SELECT '
+        f'typeof("{col}") AS col_type, '
+        f'COUNT(*) AS total_rows, '
+        f'COUNT("{col}") AS non_null_count, '
+        f'COUNT(*) - COUNT("{col}") AS null_count, '
+        f'ROUND(100.0 * (COUNT(*) - COUNT("{col}")) / GREATEST(COUNT(*), 1), 2) AS null_pct, '
+        f'COUNT(DISTINCT "{col}") AS distinct_count, '
+        f'MIN("{col}")::VARCHAR AS min_value, '
+        f'MAX("{col}")::VARCHAR AS max_value '
+        f'FROM "{tbl}"'
+    )
+
+    top_sql = (
+        f'SELECT "{col}"::VARCHAR AS value, COUNT(*) AS frequency '
+        f'FROM "{tbl}" '
+        f'WHERE "{col}" IS NOT NULL '
+        f'GROUP BY "{col}" '
+        f'ORDER BY frequency DESC '
+        f'LIMIT {top_limit}'
+    )
+
+    async with _get_limiter():
+        try:
+            def _work():
+                stats = _exec_query_sync(sup, org, stats_sql, 1, eng, r)
+                top = _exec_query_sync(sup, org, top_sql, top_limit, eng, r)
+                return stats, top
+            stats_result, top_result = await anyio.to_thread.run_sync(_work)
+
+            profile: Dict[str, Any] = {}
+            if stats_result.get("status") == "OK" and stats_result.get("rows"):
+                cols = stats_result["columns"]
+                row = stats_result["rows"][0]
+                profile = dict(zip(cols, row))
+
+            top_values: List[Dict[str, Any]] = []
+            if top_result.get("status") == "OK":
+                for row in top_result.get("rows", []):
+                    top_values.append({"value": row[0], "frequency": row[1]})
+
+            return {
+                "status": "OK",
+                "table": tbl,
+                "column": col,
+                "profile": profile,
+                "top_values": top_values,
+            }
+        except Exception as exc:
+            logger.exception("profile_column failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+
+
+# ---------- SQL validation (dry run) ----------
+
+@mcp.tool()
+@log_tool
+async def validate_sql(
+    super_name: str,
+    organization: str,
+    sql: str,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate a SQL query without executing it.
+
+    Checks: read-only compliance, SQL parsing, table existence, and RBAC
+    permissions. Returns a clear error if any check fails, so the AI can
+    fix the query before spending a real query_sql call.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        sql:           SQL query to validate.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+
+    try:
+        _read_only_sql(sql)
+    except ValueError as exc:
+        return {
+            "valid": False,
+            "status": "ERROR",
+            "error": str(exc),
+            "phase": "read_only_check",
+        }
+
+    _ensure_imports()
+
+    def _work():
+        # Parse SQL to extract table references
+        try:
+            from supertable.utils.sql_parser import SQLParser
+            parser = SQLParser(sql)
+            tables = parser.tables
+        except Exception as parse_exc:
+            return {
+                "valid": False,
+                "status": "ERROR",
+                "error": f"SQL parse error: {parse_exc}",
+                "phase": "sql_parse",
+            }
+
+        table_names = []
+        for t in tables:
+            sn = getattr(t, "simple_name", None) or getattr(t, "name", None) or ""
+            if sn:
+                table_names.append(sn)
+
+        # Check tables exist
+        reader = MetaReader(super_name=sup, organization=org)
+        available = list(reader.get_tables(role_name=r))
+        missing = [t for t in table_names if t not in available]
+        if missing:
+            return {
+                "valid": False,
+                "status": "ERROR",
+                "error": f"Tables not found: {missing}",
+                "phase": "table_check",
+                "available_tables": available,
+            }
+
+        # Check RBAC
+        try:
+            from supertable.rbac.access_control import restrict_read_access
+            physical_tables = {sn: sn for sn in table_names}
+            restrict_read_access(
+                super_name=sup,
+                organization=org,
+                role_name=r,
+                tables=tables,
+                physical_tables=physical_tables,
+            )
+        except PermissionError as perm_exc:
+            return {
+                "valid": False,
+                "status": "ERROR",
+                "error": str(perm_exc),
+                "phase": "rbac_check",
+            }
+        except Exception:
+            # RBAC import or call failed — skip gracefully, don't block validation
+            pass
+
+        return {
+            "valid": True,
+            "status": "OK",
+            "tables": table_names,
+            "phase": "all_checks_passed",
+        }
+
+    async with _get_limiter():
+        try:
+            return await anyio.to_thread.run_sync(_work)
+        except Exception as exc:
+            logger.exception("validate_sql failed: %s", exc)
+            return {
+                "valid": False,
+                "status": "ERROR",
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "phase": "unexpected_error",
+            }
+
+
+# ---------- Cross-table column search ----------
+
+@mcp.tool()
+@log_tool
+async def search_columns(
+    super_name: str,
+    organization: str,
+    pattern: str,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Search for columns matching a pattern across all tables.
+
+    Searches column names and types by case-insensitive substring match.
+    Replaces the need for multiple describe_table calls when the AI needs
+    to find which table has a date column, an ID column, etc.
+
+    System tables (__ prefix) are excluded from results.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        pattern:       Search string (matched against column name and type).
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    pat = (pattern or "").strip().lower()
+    if not pat:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": "pattern is required and must be non-empty.",
+        }
+
+    def _work():
+        reader = MetaReader(super_name=sup, organization=org)
+        tables = list(reader.get_tables(role_name=r))
+        matches: List[Dict[str, str]] = []
+        for tbl in tables:
+            if tbl.startswith("__") and tbl.endswith("__"):
+                continue
+            try:
+                schema = reader.get_table_schema(tbl, role_name=r)
+                if isinstance(schema, list):
+                    for col_info in schema:
+                        col_name = str(col_info.get("name") or col_info.get("column_name") or "")
+                        col_type = str(col_info.get("type") or col_info.get("data_type") or "")
+                        if pat in col_name.lower() or pat in col_type.lower():
+                            matches.append({"table": tbl, "column": col_name, "type": col_type})
+                elif isinstance(schema, dict):
+                    for col_name, col_type in schema.items():
+                        if pat in col_name.lower() or pat in str(col_type).lower():
+                            matches.append({"table": tbl, "column": col_name, "type": str(col_type)})
+            except Exception:
+                continue
+        return matches
+
+    async with _get_limiter():
+        try:
+            matches = await anyio.to_thread.run_sync(_work)
+            return {
+                "status": "OK",
+                "matches": matches,
+                "count": len(matches),
+                "pattern": pat,
+            }
+        except Exception as exc:
+            logger.exception("search_columns failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+
+
+# ---------- Annotation deletion ----------
+
+@mcp.tool()
+@log_tool
+async def delete_annotation(
+    super_name: str,
+    organization: str,
+    category: str,
+    context: str,
+    instruction_contains: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delete one or more annotations by marking them as deleted.
+
+    Finds annotations matching the given category and context, optionally
+    filtered by a substring in the instruction text, and writes tombstone
+    rows with status='deleted'. These are then excluded from all annotation
+    reads (list_tables eager load and get_annotations).
+
+    Args:
+        super_name:           SuperTable name.
+        organization:         Organization name.
+        category:             Annotation category: sql, terminology, visualization, scope, domain.
+        context:              Context to match (table name or "*" for global).
+        instruction_contains: Optional substring filter on instruction text.
+        role:                 RBAC role.
+        auth_token:           Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    valid_categories = {"sql", "terminology", "visualization", "scope", "domain"}
+    cat = (category or "").strip().lower()
+    if cat not in valid_categories:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": f"category must be one of: {sorted(valid_categories)}",
+        }
+
+    ctx = (context or "").strip()
+    if not ctx:
+        return {
+            "result": None,
+            "status": "ERROR",
+            "message": "context is required (table name or '*' for global).",
+        }
+
+    eng = _resolve_engine(None)
+    safe_cat = _sql_escape_literal(cat)
+    safe_ctx = _sql_escape_literal(ctx)
+
+    find_sql = (
+        f'SELECT * FROM "__annotations__" '
+        f'WHERE "category" = \'{safe_cat}\' AND "context" = \'{safe_ctx}\' '
+        f'AND ("status" IS NULL OR "status" != \'deleted\') '
+        f'ORDER BY ts DESC LIMIT 50'
+    )
+
+    async with _get_limiter():
+        try:
+            def _find():
+                return _exec_query_sync(sup, org, find_sql, 50, eng, r)
+            find_result = await anyio.to_thread.run_sync(_find)
+
+            if find_result.get("status") != "OK" or not find_result.get("rows"):
+                return {
+                    "status": "OK",
+                    "deleted": 0,
+                    "message": "No matching annotations found.",
+                }
+
+            cols = find_result.get("columns") or []
+            rows = find_result.get("rows") or []
+            items = [dict(zip(cols, row)) for row in rows]
+
+            needle = (instruction_contains or "").strip().lower()
+            if needle:
+                items = [i for i in items if needle in (i.get("instruction") or "").lower()]
+
+            if not items:
+                return {
+                    "status": "OK",
+                    "deleted": 0,
+                    "message": "No matching annotations found after instruction filter.",
+                }
+
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            tombstones = []
+            for item in items:
+                tombstones.append({
+                    "ts":          ts,
+                    "category":    item.get("category", cat),
+                    "context":     item.get("context", ctx),
+                    "instruction": item.get("instruction", ""),
+                    "role":        r,
+                    "status":      "deleted",
+                })
+
+            def _write():
+                import pyarrow as pa
+                batch = pa.RecordBatch.from_pylist(tombstones)
+                dw = DataWriter(super_name=sup, organization=org)
+                columns, rows, inserted, deleted = dw.write(
+                    role_name=r,
+                    simple_name="__annotations__",
+                    data=batch,
+                    overwrite_columns=["ts"],
+                )
+                return {"inserted": inserted}
+
+            write_result = await anyio.to_thread.run_sync(_write)
+            deleted_instructions = [i.get("instruction", "")[:100] for i in items]
+            logger.info(
+                "delete_annotation: category=%s context=%s deleted=%d",
+                cat, ctx, len(items),
+            )
+            return {
+                "status": "OK",
+                "deleted": len(items),
+                "inserted_tombstones": write_result.get("inserted"),
+                "deleted_instructions": deleted_instructions,
+                "message": f"Marked {len(items)} annotation(s) as deleted.",
+            }
+        except Exception as exc:
+            logger.exception("delete_annotation failed: %s", exc)
+            return {
+                "result": None,
+                "status": "ERROR",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+
+
+# ---------- App state deletion ----------
+
+@mcp.tool()
+@log_tool
+async def delete_app_state(
+    super_name: str,
+    organization: str,
+    namespace: str,
+    key: str,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delete an app state entry (widget, dashboard, saved query, etc.).
+
+    Marks the entry as deleted by writing a tombstone row with status='deleted'.
+    Subsequent get_app_state calls will exclude deleted entries.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        namespace:     Entity type: "chat" | "dashboard" | "widget" | "query" | "note"
+        key:           Key of the entry to delete.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    valid_namespaces = {"chat", "dashboard", "widget", "query", "note"}
+    ns = (namespace or "").strip().lower()
+    if ns not in valid_namespaces:
+        return {"result": None, "status": "ERROR", "message": f"namespace must be one of: {sorted(valid_namespaces)}"}
+
+    key_val = (key or "").strip()
+    if not key_val:
+        return {"result": None, "status": "ERROR", "message": "key is required."}
+
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    row = {"ts": ts, "namespace": ns, "key": key_val[:256], "value": "", "role": r, "status": "deleted"}
+
+    def _write():
+        import pyarrow as pa
+        batch = pa.RecordBatch.from_pylist([row])
+        dw = DataWriter(super_name=sup, organization=org)
+        columns, rows, inserted, deleted = dw.write(
+            role_name=r, simple_name="__app_state__", data=batch, overwrite_columns=["ts"],
+        )
+        return {"inserted": inserted}
+
+    async with _get_limiter():
+        try:
+            await anyio.to_thread.run_sync(_write)
+            logger.info("delete_app_state: namespace=%s key=%s", ns, key_val)
+            return {"status": "OK", "namespace": ns, "key": key_val, "message": "Marked entry as deleted."}
+        except Exception as exc:
+            logger.exception("delete_app_state failed: %s", exc)
+            return {"result": None, "status": "ERROR", "message": f"{exc.__class__.__name__}: {exc}"}
+
+
+# ---------- Data freshness (Redis metadata, no data scan) ----------
+
+@mcp.tool()
+@log_tool
+async def data_freshness(
+    super_name: str,
+    organization: str,
+    table: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return data freshness and size metadata from Redis — no data scanning.
+
+    Reads snapshot metadata directly from Redis leaf keys. Returns last
+    updated timestamp, snapshot version, and embedded payload stats (file
+    count, schema) when available.
+
+    If table is omitted, returns freshness for ALL tables in one call.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        table:         Optional table name. Empty = all tables.
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    def _extract_freshness(leaf: Dict[str, Any], table_name: str) -> Dict[str, Any]:
+        ts_ms = leaf.get("ts", 0)
+        version = leaf.get("version", -1)
+        result: Dict[str, Any] = {
+            "table": table_name,
+            "version": version,
+            "last_updated_ms": ts_ms,
+        }
+        if ts_ms:
+            import datetime
+            try:
+                result["last_updated"] = datetime.datetime.fromtimestamp(
+                    ts_ms / 1000.0, tz=datetime.timezone.utc
+                ).isoformat()
+                age_sec = (time.time() * 1000 - ts_ms) / 1000.0
+                if age_sec < 3600:
+                    result["age"] = f"{age_sec / 60:.1f} minutes ago"
+                elif age_sec < 86400:
+                    result["age"] = f"{age_sec / 3600:.1f} hours ago"
+                else:
+                    result["age"] = f"{age_sec / 86400:.1f} days ago"
+            except Exception:
+                pass
+
+        payload = leaf.get("payload")
+        if isinstance(payload, dict):
+            resources = payload.get("resources")
+            if isinstance(resources, list):
+                result["file_count"] = len(resources)
+                total_bytes = 0
+                for res in resources:
+                    if isinstance(res, dict):
+                        total_bytes += int(res.get("size", 0) or 0)
+                if total_bytes > 0:
+                    result["total_bytes"] = total_bytes
+                    if total_bytes < 1024 * 1024:
+                        result["size_human"] = f"{total_bytes / 1024:.1f} KB"
+                    elif total_bytes < 1024 * 1024 * 1024:
+                        result["size_human"] = f"{total_bytes / (1024 * 1024):.1f} MB"
+                    else:
+                        result["size_human"] = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+            schema = payload.get("schema")
+            if isinstance(schema, (list, dict)):
+                result["column_count"] = len(schema)
+
+        return result
+
+    def _work():
+        from supertable.redis_catalog import RedisCatalog
+        catalog = RedisCatalog()
+
+        tbl = (table or "").strip() if table else ""
+
+        if tbl:
+            leaf = catalog.get_leaf(org, sup, tbl)
+            if not leaf:
+                return {"status": "ERROR", "message": f"Table '{tbl}' not found in Redis catalog."}
+            return {"status": "OK", "tables": [_extract_freshness(leaf, tbl)]}
+
+        # All tables
+        items = list(catalog.scan_leaf_items(org, sup))
+        tables_out = []
+        for item in items:
+            simple = item.get("simple", "")
+            if simple.startswith("__") and simple.endswith("__"):
+                continue
+            tables_out.append(_extract_freshness(item, simple))
+
+        tables_out.sort(key=lambda x: x.get("last_updated_ms", 0), reverse=True)
+        return {"status": "OK", "tables": tables_out, "count": len(tables_out)}
+
+    async with _get_limiter():
+        try:
+            return await anyio.to_thread.run_sync(_work)
+        except Exception as exc:
+            logger.exception("data_freshness failed: %s", exc)
+            return {"result": None, "status": "ERROR", "message": f"{exc.__class__.__name__}: {exc}"}
+
+
+# ---------- Auto-discover (crawl all tables for catalog/annotation generation) ----------
+
+@mcp.tool()
+@log_tool
+async def auto_discover(
+    super_name: str,
+    organization: str,
+    max_tables: Optional[int] = None,
+    sample_rows: Optional[int] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Crawl all tables and collect schema, samples, and column profiles.
+
+    Returns structured metadata for every table so the AI can generate
+    catalog entries (via store_catalog) and annotations (via store_annotation).
+    System tables (__ prefix) are skipped.
+
+    Per table the tool collects:
+    - Column schema (name, type)
+    - Row count
+    - Sample rows (default 3)
+    - Per-column: null%, distinct count
+    - Detected patterns: date columns, low-cardinality (enum-like), ID columns
+
+    This is the bootstrap tool — call it once on a new SuperTable, then use
+    the returned data to write catalog and annotation entries.
+
+    Args:
+        super_name:    SuperTable name.
+        organization:  Organization name.
+        max_tables:    Max tables to crawl (default 30, max 50).
+        sample_rows:   Sample rows per table (default 3, max 10).
+        role:          RBAC role.
+        auth_token:    Auth token.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    max_tbl = max(1, min(int(max_tables or 30), 50))
+    n_sample = max(1, min(int(sample_rows or 3), 10))
+    eng = _resolve_engine(None)
+
+    def _work():
+        reader = MetaReader(super_name=sup, organization=org)
+        all_tables = list(reader.get_tables(role_name=r))
+        user_tables = [t for t in all_tables if not (t.startswith("__") and t.endswith("__"))]
+        tables_to_crawl = user_tables[:max_tbl]
+
+        discoveries: List[Dict[str, Any]] = []
+
+        for tbl in tables_to_crawl:
+            entry: Dict[str, Any] = {"table": tbl, "columns": [], "sample": [], "profiles": [], "patterns": []}
+
+            # 1. Schema
+            col_names: List[str] = []
+            col_types: Dict[str, str] = {}
+            try:
+                schema = reader.get_table_schema(tbl, role_name=r)
+                if isinstance(schema, list):
+                    entry["columns"] = schema
+                    col_names = [str(c.get("name") or c.get("column_name") or "") for c in schema]
+                    col_types = {str(c.get("name") or c.get("column_name") or ""): str(c.get("type") or c.get("data_type") or "") for c in schema}
+                elif isinstance(schema, dict):
+                    entry["columns"] = [{"name": k, "type": str(v)} for k, v in schema.items()]
+                    col_names = list(schema.keys())
+                    col_types = {k: str(v) for k, v in schema.items()}
+            except Exception as exc:
+                entry["schema_error"] = str(exc)
+
+            if not col_names:
+                discoveries.append(entry)
+                continue
+
+            # 2. Sample rows
+            try:
+                sample_sql = f'SELECT * FROM "{tbl}" LIMIT {n_sample}'
+                sample_result = _exec_query_sync(sup, org, sample_sql, n_sample, eng, r)
+                if sample_result.get("status") == "OK":
+                    cols = sample_result.get("columns") or []
+                    rows = sample_result.get("rows") or []
+                    entry["sample"] = [dict(zip(cols, row)) for row in rows]
+            except Exception:
+                pass
+
+            # 3. Row count + per-column stats (single aggregate query)
+            try:
+                stat_parts = ["COUNT(*) AS __row_count__"]
+                profiled_cols: List[str] = []
+                for col in col_names[:40]:
+                    safe_col = col.replace('"', '""')
+                    stat_parts.append(f'COUNT("{safe_col}") AS "nonnull_{safe_col}"')
+                    stat_parts.append(f'COUNT(DISTINCT "{safe_col}") AS "distinct_{safe_col}"')
+                    profiled_cols.append(col)
+
+                stats_sql = f'SELECT {", ".join(stat_parts)} FROM "{tbl}"'
+                stats_result = _exec_query_sync(sup, org, stats_sql, 1, eng, r)
+
+                if stats_result.get("status") == "OK" and stats_result.get("rows"):
+                    stat_cols = stats_result["columns"]
+                    stat_row = stats_result["rows"][0]
+                    stat_dict = dict(zip(stat_cols, stat_row))
+                    row_count = stat_dict.get("__row_count__", 0)
+                    entry["row_count"] = row_count
+
+                    profiles = []
+                    for col in profiled_cols:
+                        nonnull = stat_dict.get(f"nonnull_{col}", 0)
+                        distinct = stat_dict.get(f"distinct_{col}", 0)
+                        null_count = (row_count or 0) - (nonnull or 0)
+                        null_pct = round(100.0 * null_count / max(row_count, 1), 1)
+                        profiles.append({
+                            "column": col, "type": col_types.get(col, ""),
+                            "non_null": nonnull, "distinct": distinct, "null_pct": null_pct,
+                        })
+                    entry["profiles"] = profiles
+            except Exception:
+                pass
+
+            # 4. Detect patterns
+            patterns = []
+            for col in col_names:
+                ct = col_types.get(col, "").lower()
+                cl = col.lower()
+                if any(d in ct for d in ("date", "time", "timestamp")):
+                    patterns.append({"column": col, "pattern": "date_time", "note": "Time-series candidate"})
+                elif any(kw in cl for kw in ("_id", "_key", "_code", "_uuid", "id_")):
+                    patterns.append({"column": col, "pattern": "identifier", "note": "Likely join/FK column"})
+
+            # Detect low-cardinality columns from profiles
+            row_count = entry.get("row_count", 0)
+            for p in entry.get("profiles", []):
+                distinct = p.get("distinct", 0)
+                if isinstance(distinct, (int, float)) and 1 < distinct <= 50 and row_count > 100:
+                    patterns.append({
+                        "column": p["column"], "pattern": "low_cardinality",
+                        "note": f"{distinct} distinct values — enum-like, good for GROUP BY / filters",
+                    })
+
+            entry["patterns"] = patterns
+            discoveries.append(entry)
+
+        return {
+            "status": "OK",
+            "tables_crawled": len(discoveries),
+            "tables_total": len(user_tables),
+            "tables_skipped_system": len(all_tables) - len(user_tables),
+            "discoveries": discoveries,
+        }
+
+    async with _get_limiter():
+        try:
+            return await anyio.to_thread.run_sync(_work)
+        except Exception as exc:
+            logger.exception("auto_discover failed: %s", exc)
+            return {"result": None, "status": "ERROR", "message": f"{exc.__class__.__name__}: {exc}"}
+
+
+# ---------- Catalog store (write entries to __catalog__) ----------
+
+@mcp.tool()
+@log_tool
+async def store_catalog(
+    super_name: str,
+    organization: str,
+    table_name: str,
+    description: str,
+    columns: Optional[str] = None,
+    joins: Optional[str] = None,
+    example_queries: Optional[str] = None,
+    filters: Optional[str] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Write or update a catalog entry in the __catalog__ table.
+
+    Each call writes one row describing one table. The AI should call this
+    after auto_discover to populate the catalog with human-readable
+    descriptions, column documentation, join relationships, and example queries.
+
+    Args:
+        super_name:       SuperTable name.
+        organization:     Organization name.
+        table_name:       The table this catalog entry describes.
+        description:      Human-readable description of what the table contains.
+        columns:          Column documentation (free text or JSON string).
+        joins:            How this table joins to others (free text or JSON).
+        example_queries:  Example SQL queries (free text or JSON array).
+        filters:          Default filtering rules (free text).
+        role:             RBAC role.
+        auth_token:       Auth token.
+    """
+    import datetime
+
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    _check_token(auth_token)
+    r = _resolve_role(role)
+    _ensure_imports()
+
+    tbl = (table_name or "").strip()
+    if not tbl:
+        return {"result": None, "status": "ERROR", "message": "table_name is required."}
+
+    desc = (description or "").strip()
+    if not desc:
+        return {"result": None, "status": "ERROR", "message": "description is required."}
+
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    row: Dict[str, Any] = {
+        "ts":          ts,
+        "table_name":  tbl[:256],
+        "description": desc[:5000],
+        "role":        r,
+    }
+    if columns:
+        row["columns"] = (columns or "").strip()[:10000]
+    if joins:
+        row["joins"] = (joins or "").strip()[:5000]
+    if example_queries:
+        row["example_queries"] = (example_queries or "").strip()[:5000]
+    if filters:
+        row["filters"] = (filters or "").strip()[:2000]
+
+    def _write():
+        import pyarrow as pa
+        batch = pa.RecordBatch.from_pylist([row])
+        dw = DataWriter(super_name=sup, organization=org)
+        columns_out, rows_out, inserted, deleted = dw.write(
+            role_name=r, simple_name="__catalog__", data=batch, overwrite_columns=["ts"],
+        )
+        return {"inserted": inserted}
+
+    async with _get_limiter():
+        try:
+            write_result = await anyio.to_thread.run_sync(_write)
+            logger.info("store_catalog: table_name=%s inserted=%s", tbl, write_result.get("inserted"))
+            return {
+                "status": "OK",
+                "table_name": tbl,
+                "ts": ts,
+                "inserted": write_result.get("inserted"),
+                "message": f"Catalog entry for '{tbl}' stored.",
+            }
+        except Exception as exc:
+            logger.exception("store_catalog failed: %s", exc)
+            return {"result": None, "status": "ERROR", "message": f"{exc.__class__.__name__}: {exc}"}
+
+
 if __name__ == "__main__":
     try:
         transport = _normalize_transport_value(getattr(CFG, "transport", "stdio"))

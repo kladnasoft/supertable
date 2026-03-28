@@ -1,4 +1,4 @@
-# supertable/mirroring/mirror_parquet.py
+# route: supertable.mirroring.mirror_parquet
 """
 Parquet mirror (latest-only projection)
 
@@ -74,6 +74,9 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
 def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
     """
     Return set of already present co-located file relative names as 'files/<name>'.
+
+    Tries storage.ls -> storage.listdir -> storage.list_files (StorageInterface
+    canonical method) so that standard backends always succeed.
     """
     rels: Set[str] = set()
     try:
@@ -82,6 +85,9 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
             entries = storage.ls(table_files_dir) or []
         elif hasattr(storage, "listdir"):
             entries = ["/".join((table_files_dir.rstrip("/"), e)) for e in (storage.listdir(table_files_dir) or [])]
+        elif hasattr(storage, "list_files"):
+            # StorageInterface canonical listing method
+            entries = storage.list_files(table_files_dir, "*") or []
         for p in entries:
             fn = p.rstrip("/").split("/")[-1]
             if fn:
@@ -94,12 +100,20 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
 def _co_locate_or_reuse_path(storage, table_files_dir: str, catalog_file_path: str) -> str:
     """
     Copy parquet into table_files_dir, return the relative path 'files/<hash>_<basename>'.
+    Skips copy when the destination already exists from a prior mirror run.
     """
     base_name = catalog_file_path.rstrip("/").split("/")[-1]  # robust basename for URIs
     h = hashlib.md5(catalog_file_path.encode("utf-8")).hexdigest()[:8]
     rel_name = f"{h}_{base_name}"
     rel_path = "/".join(("files", rel_name))
     dst_path = os.path.join(table_files_dir, rel_name)
+    # Skip copy if destination already exists from a prior mirror run (perf)
+    if hasattr(storage, "exists"):
+        try:
+            if storage.exists(dst_path):
+                return rel_path
+        except Exception:
+            pass
     ok = _binary_copy_if_possible(storage, catalog_file_path, dst_path)
     if not ok:
         raise RuntimeError(f"Failed to copy data file into Parquet table dir: {catalog_file_path}")
@@ -139,8 +153,11 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
     # Files to remove = those present before but not now
     to_remove = sorted(list(prev_paths - current_set))
 
-    # If nothing changes, we’re done
-    if not to_remove and len(current_paths) == len(prev_paths):
+    # Newly added files = those in current set but not previously present
+    to_add = sorted(list(current_set - prev_paths))
+
+    # If nothing changes, we're done
+    if not to_remove and not to_add:
         logger.info(f"[mirror][parquet] no-op for '{table_name}' (no add/remove)")
         return
 

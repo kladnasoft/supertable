@@ -17,10 +17,12 @@ def test_web_app_legacy_mcp_mount_keeps_routes(tmp_path: Path, monkeypatch) -> N
     (pkg / "__init__.py").write_text("# mcp package\n", encoding="utf-8")
 
     source_dir = Path(__file__).resolve().parent
-    shutil.copy(source_dir / "web_app_v20260313_1610_add-simulation.py", pkg / "web_app.py")
-    shutil.copy(source_dir / "web_client.py", pkg / "web_client.py")
-    shutil.copy(source_dir / "web_tester.html", pkg / "web_tester.html")
-    shutil.copy(source_dir / "mcp_simulator.html", pkg / "mcp_simulator.html")
+    mcp_src_dir = source_dir.parent  # supertable/mcp/ (actual source, not tests/)
+
+    shutil.copy(mcp_src_dir / "web_app.py", pkg / "web_app.py")
+    shutil.copy(mcp_src_dir / "web_client.py", pkg / "web_client.py")
+    shutil.copy(mcp_src_dir / "web_tester.html", pkg / "web_tester.html")
+    shutil.copy(mcp_src_dir / "mcp_simulator.html", pkg / "mcp_simulator.html")
 
     (pkg / "mcp_server.py").write_text(
         textwrap.dedent(

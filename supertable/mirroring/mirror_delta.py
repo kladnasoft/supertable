@@ -1,4 +1,4 @@
-# supertable/mirroring/mirror_delta.py
+# route: supertable.mirroring.mirror_delta
 """
 Delta Lake mirror (spec-compliant, latest-only projection)
 
@@ -25,7 +25,7 @@ import json
 import os
 import hashlib
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from supertable.config.defaults import logger
 
@@ -386,6 +386,9 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
         elif hasattr(storage, "listdir"):
             # listdir should already return children of table_files_dir
             entries = ["/".join((table_files_dir.rstrip("/"), e)) for e in (storage.listdir(table_files_dir) or [])]
+        elif hasattr(storage, "list_files"):
+            # StorageInterface canonical listing method
+            entries = storage.list_files(table_files_dir, "*") or []
         for p in entries:
             # Normalize to filename and re-prefix with 'files/'
             fn = p.rstrip("/").split("/")[-1]

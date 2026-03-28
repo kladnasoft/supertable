@@ -382,7 +382,7 @@ def attach_execute_routes(
             except Exception:
                 from meta_reader import list_tables  # type: ignore
 
-            tables = list_tables(organization=organization, super_name=super_name)
+            tables = list_tables(organization=organization, super_name=super_name, role_name=role_name)
 
             MR = _get_meta_reader()
             mr = MR(organization=organization, super_name=super_name)

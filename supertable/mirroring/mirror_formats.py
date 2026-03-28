@@ -1,4 +1,4 @@
-# supertable/mirroring/mirror_formats.py
+# route: supertable.mirroring.mirror_formats
 
 import os
 from enum import Enum
@@ -105,6 +105,7 @@ class MirrorFormats:
         if "ICEBERG" in enabled:
             super_table.storage.makedirs(os.path.join(base, "iceberg", table_name, "metadata"))
             super_table.storage.makedirs(os.path.join(base, "iceberg", table_name, "manifests"))
+            super_table.storage.makedirs(os.path.join(base, "iceberg", table_name, "data"))
         if "PARQUET" in enabled:
             super_table.storage.makedirs(os.path.join(base, "parquet", table_name, "files"))
 

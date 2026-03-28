@@ -668,10 +668,12 @@ def attach_security_routes(
     def rbac_roles_list(
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         items = _list_roles(redis_client, org, sup)
@@ -682,10 +684,12 @@ def attach_security_routes(
         role_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         if not _ROLE_ID_RE.fullmatch(role_id or ""):
@@ -757,10 +761,12 @@ def attach_security_routes(
         role_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         deleted = _delete_role(redis_client, org, sup, role_id)
@@ -771,10 +777,12 @@ def attach_security_routes(
     def rbac_users_list(
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         items = _list_users_redis(redis_client, org, sup)
@@ -785,10 +793,12 @@ def attach_security_routes(
         user_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         doc = _get_user(redis_client, org, sup, user_id)
@@ -835,10 +845,12 @@ def attach_security_routes(
         user_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         deleted = _delete_user(redis_client, org, sup, user_id)
@@ -860,10 +872,12 @@ def attach_security_routes(
     def odata_endpoints_list(
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         items = _list_endpoints(redis_client, org, sup)
@@ -874,10 +888,12 @@ def attach_security_routes(
         endpoint_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         if not _ENDPOINT_ID_RE.fullmatch(endpoint_id or ""):
@@ -955,10 +971,12 @@ def attach_security_routes(
         endpoint_id: str,
         organization: str = Query(""),
         super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         _=Depends(admin_guard_api),
     ):
-        org = (organization or "").strip()
-        sup = (super_name or "").strip()
+        org = (organization or org or "").strip()
+        sup = (super_name or sup or "").strip()
         if not org or not sup:
             raise HTTPException(status_code=400, detail="organization and super_name are required")
         deleted = _delete_endpoint(redis_client, org, sup, endpoint_id)

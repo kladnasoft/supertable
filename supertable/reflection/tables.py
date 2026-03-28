@@ -273,7 +273,8 @@ def attach_tables_routes(
     @router.get("/reflection/supers")
     def api_list_supers(
         request: Request,
-        organization: str = Query(..., description="Organization identifier"),
+        organization: str = Query("", description="Organization identifier"),
+        org: str = Query(""),
         _: Any = Depends(admin_guard_api),
     ):
         # tables.html calls this on load; keep UX-friendly redirect to login if session expired
@@ -281,6 +282,10 @@ def attach_tables_routes(
             resp = RedirectResponse("/reflection/login", status_code=302)
             no_store(resp)
             return resp
+
+        organization = (organization or org or "").strip()
+        if not organization:
+            raise HTTPException(status_code=400, detail="organization is required")
 
         try:
             return {"ok": True, "organization": organization, "supers": list_supers(organization=organization)}
@@ -290,8 +295,10 @@ def attach_tables_routes(
     @router.get("/reflection/super")
     def api_get_super_meta(
         request: Request,
-        organization: str = Query(...),
-        super_name: str = Query(...),
+        organization: str = Query(""),
+        super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
@@ -299,6 +306,11 @@ def attach_tables_routes(
             resp = RedirectResponse("/reflection/login", status_code=302)
             no_store(resp)
             return resp
+
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
+        if not organization or not super_name:
+            raise HTTPException(status_code=400, detail="organization and super_name are required")
 
         role = _resolve_role(request, role_name, "")
 
@@ -341,13 +353,19 @@ def attach_tables_routes(
     @router.get("/reflection/schema")
     def api_get_table_schema(
         request: Request,
-        organization: str = Query(...),
-        super_name: str = Query(...),
+        organization: str = Query(""),
+        super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         table: str = Query(..., description="Table simple name"),
         role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Return schema for one table (by simple name)."""
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
+        if not organization or not super_name:
+            raise HTTPException(status_code=400, detail="organization and super_name are required")
         role = _resolve_role(request, role_name)
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
@@ -359,13 +377,19 @@ def attach_tables_routes(
     @router.get("/reflection/stats")
     def api_get_table_stats(
         request: Request,
-        organization: str = Query(...),
-        super_name: str = Query(...),
+        organization: str = Query(""),
+        super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         table: str = Query(..., description="Table simple name"),
         role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Return stats for one table (by simple name)."""
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
+        if not organization or not super_name:
+            raise HTTPException(status_code=400, detail="organization and super_name are required")
         role = _resolve_role(request, role_name)
         try:
             mr = MetaReader(organization=organization, super_name=super_name)
@@ -377,14 +401,18 @@ def attach_tables_routes(
     @router.delete("/reflection/table")
     def api_delete_table(
         request: Request,
-        organization: str = Query(..., description="Organization identifier"),
-        super_name: str = Query(..., description="SuperTable name"),
+        organization: str = Query("", description="Organization identifier"),
+        super_name: str = Query("", description="SuperTable name"),
+        org: str = Query(""),
+        sup: str = Query(""),
         table: str = Query(..., description="Simple table name"),
         role_name: str = Query("", alias="role_name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Delete a simple table (leaf) from Redis and its folder from storage (destructive)."""
 
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
         role = _resolve_role(request, role_name)
         simple = (table or "").strip()
         if not organization or not super_name or not simple or not role:
@@ -404,14 +432,18 @@ def attach_tables_routes(
     @router.get("/reflection/table/config")
     def api_get_table_config(
         request: Request,
-        organization: str = Query(...),
-        super_name: str = Query(...),
+        organization: str = Query(""),
+        super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         table: str = Query(..., description="Simple table name"),
         _: Any = Depends(admin_guard_api),
     ):
         """Return per-table configuration (limits, dedup, primary keys)."""
         if not is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
         simple = (table or "").strip()
         if not organization or not super_name or not simple:
             raise HTTPException(status_code=400, detail="organization, super_name and table are required")
@@ -424,8 +456,10 @@ def attach_tables_routes(
     @router.put("/reflection/table/config")
     def api_put_table_config(
         request: Request,
-        organization: str = Query(...),
-        super_name: str = Query(...),
+        organization: str = Query(""),
+        super_name: str = Query(""),
+        org: str = Query(""),
+        sup: str = Query(""),
         table: str = Query(..., description="Simple table name"),
         _: Any = Depends(admin_guard_api),
         body: Dict[str, Any] = None,
@@ -438,6 +472,8 @@ def attach_tables_routes(
         """
         if not is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        organization = (organization or org or "").strip()
+        super_name = (super_name or sup or "").strip()
         simple = (table or "").strip()
         if not organization or not super_name or not simple:
             raise HTTPException(status_code=400, detail="organization, super_name and table are required")

@@ -282,6 +282,18 @@ AUTH_TOOLS = {
     "query_sql",
     "sample_data",
     "submit_feedback",
+    "store_annotation",
+    "get_annotations",
+    "delete_annotation",
+    "store_app_state",
+    "get_app_state",
+    "delete_app_state",
+    "profile_column",
+    "validate_sql",
+    "search_columns",
+    "data_freshness",
+    "auto_discover",
+    "store_catalog",
 }
 
 def call_tool(

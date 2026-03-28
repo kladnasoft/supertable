@@ -1338,427 +1338,148 @@ def root_redirect():
     return resp
 
 
-# ------------------------------ Admin: tenants, mirrors, user/role detail ------
+# ------------------------------ Tables tab (extracted to tables.py) ------------------------------
 
-@router.get("/reflection/tenants")
-def api_tenants(_: Any = Depends(logged_in_guard_api)):
-    pairs = discover_pairs()
-    return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
-
-
-@router.get("/reflection/mirrors")
-def api_get_mirrors(
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "formats": []}
+try:
+    from .tables import attach_tables_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        fmts = catalog.get_mirrors(org, sup)
+        from supertable.reflection.tables import attach_tables_routes  # type: ignore
     except Exception:
-        fmts = []
-    return {"org": org, "sup": sup, "formats": fmts}
+        from tables import attach_tables_routes  # type: ignore
 
-
-@router.get("/reflection/user/{user_id}")
-def api_user_details(
-    user_id: str,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _=Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_user(org, sup, user_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"user_id": user_id, "data": obj}
-
-
-@router.get("/reflection/role/{role_id}")
-def api_role_details(
-    role_id: str,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _=Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_role(org, sup, role_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Role not found")
-    return {"role_id": role_id, "data": obj}
-
-
-# ------------------------------ Admin: .env configuration ----------------------
-
-_SENSITIVE_KEY_PARTS = (
-    "PASSWORD", "PASS", "SECRET", "TOKEN", "KEY",
-    "ACCESS_KEY", "CONNECTION_STRING", "API_KEY", "CLIENT_SECRET",
+attach_tables_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    list_users=list_users,
+    fmt_ts=_fmt_ts,
+    catalog=catalog,
+    admin_guard_api=admin_guard_api,
+    get_session=get_session,
 )
 
-_ENV_KEY_RE = re.compile(r"^[A-Z0-9_]+$")
+# ------------------------------ Execute tab (extracted to execute.py) ------------------------------
 
-
-def _env_file_path() -> Path:
-    here = Path(__file__).resolve()
-    reflection_dir = here.parent
-    pkg_dir = reflection_dir.parent
-    return (pkg_dir.parent / (settings.DOTENV_PATH or ".env")).resolve()
-
-
-def _is_sensitive_env_key(key: str) -> bool:
-    k = (key or "").upper()
-    return any(part in k for part in _SENSITIVE_KEY_PARTS)
-
-
-def _mask_secret(v: str) -> str:
-    if not v:
-        return ""
-    if len(v) <= 4:
-        return "****"
-    return "****" + v[-4:]
-
-
-@router.get("/reflection/env")
-def admin_env_get(_=Depends(admin_guard_api)):
-    if dotenv_values is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    found = env_path.exists() and env_path.is_file()
-    items: List[Dict[str, Any]] = []
-
-    if found:
-        values = dotenv_values(str(env_path)) or {}
-        for k, v in values.items():
-            val = "" if v is None else str(v)
-            is_sensitive = _is_sensitive_env_key(k)
-            items.append({
-                "key": k,
-                "value": _mask_secret(val) if is_sensitive else val,
-                "is_sensitive": is_sensitive,
-            })
-
-    return {"found": found, "path": str(env_path), "items": items}
-
-
-@router.post("/reflection/env")
-def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
-    if set_key is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    env_path.touch(exist_ok=True)
-
-    items = payload.get("items") or []
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="items must be a list")
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "").strip()
-        if not key or not _ENV_KEY_RE.fullmatch(key):
-            continue
-        value = item.get("value", "")
-        value_str = str(value)
-        if "\n" in value_str or "\r" in value_str:
-            raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
-        if len(value_str) > 8192:
-            raise HTTPException(status_code=400, detail=f"Value too long for {key}")
-        set_key(str(env_path), key, value_str, quote_mode="never")
-
-    return {"ok": True, "path": str(env_path)}
-
-
-# ------------------------------ Admin: auth tokens -----------------------------
-
-def _get_org_from_env_fallback() -> str:
-    return (settings.SUPERTABLE_ORGANIZATION or "").strip()
-
-
-def _catalog_list_tokens(org: str) -> List[Dict[str, Any]]:
-    if not org:
-        return []
+try:
+    from .execute import attach_execute_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        return catalog.list_auth_tokens(org)
+        from supertable.reflection.execute import attach_execute_routes  # type: ignore
     except Exception:
-        try:
-            raw = redis_client.hgetall(f"supertable:{org}:auth:tokens") or {}
-            out: List[Dict[str, Any]] = []
-            for token_id, meta_raw in raw.items():
-                try:
-                    meta = json.loads(meta_raw) if meta_raw else {}
-                except Exception:
-                    meta = {"value": meta_raw}
-                if isinstance(meta, dict):
-                    meta = dict(meta)
-                else:
-                    meta = {"value": meta}
-                meta.setdefault("token_id", token_id)
-                out.append(meta)
-            out.sort(key=lambda x: int(x.get("created_ms") or 0), reverse=True)
-            return out
-        except Exception:
-            return []
+        from execute import attach_execute_routes  # type: ignore
+
+attach_execute_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+)
 
 
-def _catalog_create_token(org: str, created_by: str, label: Optional[str]) -> Dict[str, Any]:
-    if not org:
-        raise HTTPException(status_code=400, detail="Missing organization")
+
+# ------------------------------ Ingestion (extracted to ingestion.py) ------------------------------
+
+try:
+    from .ingestion import attach_ingestion_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        return catalog.create_auth_token(org=org, created_by=created_by, label=label)
+        from supertable.reflection.ingestion import attach_ingestion_routes  # type: ignore
     except Exception:
-        token = secrets.token_urlsafe(24)
-        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        meta = {
-            "token_id": token_id,
-            "created_ms": int(time.time() * 1000),
-            "created_by": str(created_by or ""),
-            "label": (str(label).strip() if label is not None else ""),
-            "enabled": True,
-        }
-        try:
-            redis_client.hset(f"supertable:{org}:auth:tokens", token_id, json.dumps(meta))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Token creation failed: {e}")
-        return {"token": token, **meta}
+        from ingestion import attach_ingestion_routes  # type: ignore
 
+attach_ingestion_routes(
+    router,
+    templates=templates,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    is_superuser=is_superuser,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+    redis_client=redis_client,
+)
 
-def _catalog_delete_token(org: str, token_id: str) -> bool:
-    if not org or not token_id:
-        return False
+# ------------------------------ Admin (extracted to admin.py) ------------------------------
+
+try:
+    from .admin import attach_admin_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        return bool(catalog.delete_auth_token(org=org, token_id=token_id))
+        from supertable.reflection.admin import attach_admin_routes  # type: ignore
     except Exception:
-        try:
-            return bool(redis_client.hdel(f"supertable:{org}:auth:tokens", token_id))
-        except Exception:
-            return False
+        from admin import attach_admin_routes  # type: ignore
 
+try:
+    from dotenv import dotenv_values as _dotenv_values, set_key as _set_key
+except ImportError:
+    _dotenv_values = None  # type: ignore[assignment]
+    _set_key = None        # type: ignore[assignment]
 
-@router.get("/reflection/tokens")
-def api_list_tokens(request: Request, org: str = Query(None), _: Any = Depends(admin_guard_api)):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    tokens = _catalog_list_tokens(org_eff)
-    return {"ok": True, "organization": org_eff, "tokens": tokens}
+attach_admin_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    catalog=catalog,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    list_users=list_users,
+    fmt_ts=_fmt_ts,
+    logged_in_guard_api=logged_in_guard_api,
+    admin_guard_api=admin_guard_api,
+    dotenv_values=_dotenv_values,
+    set_key=_set_key,
+)
 
+# ------------------------------ RBAC (extracted to rbac.py) ------------------------------
 
-@router.post("/reflection/tokens")
-def api_create_token(request: Request, org: str = Query(None), label: str = Query(""), _: Any = Depends(admin_guard_api)):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    created = _catalog_create_token(org_eff, created_by="superuser", label=label)
-    return {"ok": True, "organization": org_eff, **created}
-
-
-@router.delete("/reflection/tokens/{token_id}")
-def api_delete_token(request: Request, token_id: str, org: str = Query(None), _: Any = Depends(admin_guard_api)):
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    org_eff = (org or _get_org_from_env_fallback()).strip()
-    ok = _catalog_delete_token(org_eff, token_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Token not found")
-    return {"ok": True, "organization": org_eff, "token_id": token_id}
-
-
-# ------------------------------ Admin page + SuperTable CRUD -------------------
-
-@router.get("/reflection/admin", response_class=HTMLResponse)
-def admin_page(request: Request, org: Optional[str] = Query(None), sup: Optional[str] = Query(None)):
-    if not _is_authorized(request):
-        resp = RedirectResponse("/reflection/login", status_code=302)
-        _no_store(resp)
-        return resp
-
-    provided = _get_provided_token(request) or ""
-
-    pairs = discover_pairs()
-    sel_org, sel_sup = resolve_pair(org, sup)
-
-    tenants = [{"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)} for o, s in pairs]
-
-    if not sel_org or not sel_sup:
-        ctx: Dict[str, Any] = {
-            "request": request,
-            "authorized": True,
-            "token": provided,
-            "tenants": tenants,
-            "sel_org": sel_org,
-            "sel_sup": sel_sup,
-            "has_tenant": False,
-        }
-        inject_session_into_ctx(ctx, request)
-        resp = templates.TemplateResponse("admin.html", ctx)
-        _no_store(resp)
-        return resp
-
+try:
+    from .rbac import attach_rbac_routes  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        root = catalog.get_root(sel_org, sel_sup) or {}
+        from supertable.reflection.rbac import attach_rbac_routes  # type: ignore
     except Exception:
-        root = {}
-    try:
-        mirrors = catalog.get_mirrors(sel_org, sel_sup) or []
-    except Exception:
-        mirrors = []
+        from rbac import attach_rbac_routes  # type: ignore
 
-    users = list_users(sel_org, sel_sup)
-    admin_roles = list_roles(sel_org, sel_sup)
-
-    ctx = {
-        "request": request,
-        "authorized": True,
-        "token": provided,
-        "tenants": tenants,
-        "sel_org": sel_org,
-        "sel_sup": sel_sup,
-        "has_tenant": True,
-        "root_version": int(root.get("version", -1)) if isinstance(root, dict) else -1,
-        "root_ts": _fmt_ts(int(root.get("ts", 0))) if isinstance(root, dict) else "\u2014",
-        "mirrors": mirrors,
-        "users": users,
-        "roles": admin_roles,
-    }
-    inject_session_into_ctx(ctx, request)
-    resp = templates.TemplateResponse("admin.html", ctx)
-    _no_store(resp)
-    return resp
-
-
-@router.post("/reflection/super")
-def api_create_super(
-    request: Request,
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    _: Any = Depends(admin_guard_api),
-):
-    from supertable.super_table import SuperTable
-    try:
-        st = SuperTable(organization=organization, super_name=super_name)
-        storage_label = getattr(getattr(st, "storage", None), "__class__", None)
-        storage_name = getattr(storage_label, "__name__", None) if storage_label else None
-        return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": storage_name}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
-
-
-@router.delete("/reflection/super")
-def api_delete_super(
-    request: Request,
-    organization: str = Query(..., description="Organization identifier"),
-    super_name: str = Query(..., description="SuperTable name"),
-    role_name: str = Query(""),
-    _: Any = Depends(admin_guard_api),
-):
-    """Delete a SuperTable from Redis and storage (destructive)."""
-    if not organization or not super_name:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-
-    role = (role_name or "").strip()
-
-    from supertable.super_table import SuperTable
-    try:
-        super_table = SuperTable(super_name=super_name, organization=organization)
-        super_table.delete(role_name=role)
-        return {"ok": True, "organization": organization, "name": super_name}
-    except Exception:
-        pass
-
-    from supertable.storage.storage_factory import get_storage
-    storage = get_storage()
-    base_dir = os.path.join(organization, super_name)
-
-    try:
-        if storage.exists(base_dir):
-            storage.delete(base_dir)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage delete failed: {e}")
-
-    deleted_keys = 0
-    try:
-        from supertable.redis_catalog import RedisCatalog
-        rc = RedisCatalog()
-        deleted_keys = rc.delete_super_table(organization, super_name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
-
-    return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
-
-
-# ------------------------------ Backward-compat route aliases ------------------
-
-def _add_reflection_alias_routes(_router: APIRouter) -> None:
-    """Add backward-compatible aliases under /reflection for legacy /admin and /api routes."""
-    try:
-        from fastapi.routing import APIRoute  # noqa: F401
-    except Exception:
-        return
-
-    existing = set()
-    for r in _router.routes:
-        try:
-            methods = tuple(sorted(getattr(r, "methods", None) or []))
-            existing.add((getattr(r, "path", None), methods))
-        except Exception:
-            continue
-
-    def _try_add_alias(path: str, methods: set, endpoint, name: str) -> None:
-        key = (path, tuple(sorted(methods or [])))
-        if key in existing:
-            return
-        _router.add_api_route(
-            path,
-            endpoint,
-            methods=list(methods or []),
-            name=name,
-            include_in_schema=False,
-        )
-        existing.add(key)
-
-    routes = list(_router.routes)
-    for r in routes:
-        if not hasattr(r, "path") or not hasattr(r, "endpoint"):
-            continue
-        path = str(getattr(r, "path") or "")
-        if not path:
-            continue
-        methods = set(getattr(r, "methods", None) or [])
-        endpoint = getattr(r, "endpoint")
-        name = str(getattr(r, "name", "") or "route")
-
-        if path == "/admin":
-            continue
-        if path.startswith("/admin"):
-            _try_add_alias(
-                "/reflection" + path[len("/admin"):],
-                methods, endpoint, name + "_reflection_alias",
-            )
-
-        if path == "/api":
-            continue
-        if path.startswith("/api"):
-            _try_add_alias(
-                "/reflection" + path[len("/api"):],
-                methods, endpoint, name + "_reflection_alias",
-            )
-
-
-_add_reflection_alias_routes(router)
-
+attach_rbac_routes(
+    router,
+    templates=templates,
+    settings=settings,
+    redis_client=redis_client,
+    is_authorized=_is_authorized,
+    no_store=_no_store,
+    get_provided_token=_get_provided_token,
+    discover_pairs=discover_pairs,
+    resolve_pair=resolve_pair,
+    inject_session_into_ctx=inject_session_into_ctx,
+    get_session=get_session,
+    admin_guard_api=admin_guard_api,
+)
 
 # ---------------------------------------------------------------------------
-# Import routes to register all module routes on the shared router.
+# Import not_common to register additional routes on the shared router.
 # This MUST be at the bottom so all common symbols are defined first.
 # ---------------------------------------------------------------------------
-from supertable.reflection import routes as _routes  # noqa: F401, E402
+from supertable.reflection import not_common as _not_common  # noqa: F401, E402
