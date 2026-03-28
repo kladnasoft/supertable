@@ -24,11 +24,15 @@ dynamic = ["dependencies"]
 dependencies = { file = ["requirements.txt"] }
 
 [project.optional-dependencies]
-s3    = ["boto3>=1.40.30", "redis>=6.4.0"]
-minio = ["minio>=7.2.15", "redis>=6.4.0"]
-azure = ["azure-storage-blob>=12.26.0", "redis>=6.4.0"]
-gcp   = ["google-cloud-storage>=3.1.0", "redis>=6.4.0"]
+# Storage backends (pick what you deploy on)
+s3    = ["boto3>=1.34,<2.0"]
+minio = ["minio>=7.2,<8.0"]
+azure = ["azure-storage-blob>=12.26.0"]
+gcp   = ["google-cloud-storage>=3.1.0"]
 all-cloud = ["supertable[s3,minio,azure,gcp]"]
+
+# Everything
+all = ["supertable[all-cloud]"]
 
 [project.urls]
 Homepage = "https://github.com/kladnasoft/supertable"
@@ -41,6 +45,12 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["supertable", "supertable.*"]
+exclude = [
+  "supertable.mcp",    "supertable.mcp.*",
+  "supertable.api",    "supertable.api.*",
+  "supertable.reflection", "supertable.reflection.*",
+  "supertable.odata",  "supertable.odata.*",
+]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"

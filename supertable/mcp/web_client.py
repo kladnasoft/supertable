@@ -65,7 +65,7 @@ class MCPWebClient:
     ) -> None:
         self.server_path = os.path.abspath(server_path or os.getenv("MCP_SERVER_PATH", _default_server_path()))
         self.python_exe = python_exe or sys.executable
-        self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", "")).strip()
+        self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "").strip()
         self.request_timeout = request_timeout if request_timeout is not None else self.DEFAULT_REQUEST_TIMEOUT
 
         self._proc: Optional[asyncio.subprocess.Process] = None

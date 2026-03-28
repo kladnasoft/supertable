@@ -16,30 +16,32 @@ Usage in application.py:
     app.add_middleware(RequestLoggingMiddleware, service="api")
 
 Environment:
+    SUPERTABLE_HOME           — root directory (default: ~/supertable)
     SUPERTABLE_LOG_LEVEL      — DEBUG / INFO / WARNING / ERROR  (default: INFO)
     SUPERTABLE_LOG_FORMAT     — json / text                     (default: json)
-    SUPERTABLE_LOG_FILE       — optional file path for log output
+    SUPERTABLE_LOG_FILE       — file path (default: {SUPERTABLE_HOME}/log/st.log)
+                                 Set to "none" to disable file logging.
     SUPERTABLE_CORRELATION_HEADER — header name for correlation ID
                                    (default: X-Correlation-ID)
 
-Analysis examples:
+Analysis examples (default log at ~/supertable/log/st.log):
     # All requests slower than 500ms
-    cat app.log | jq 'select(.duration_ms > 500)'
+    cat ~/supertable/log/st.log | jq 'select(.duration_ms > 500)'
 
     # All 5xx responses
-    cat app.log | jq 'select(.status >= 500)'
+    cat ~/supertable/log/st.log | jq 'select(.status >= 500)'
 
     # All proxy errors
-    cat app.log | jq 'select(.event == "proxy_error")'
+    cat ~/supertable/log/st.log | jq 'select(.event == "proxy_error")'
 
     # Request rate by endpoint (last hour)
-    cat app.log | jq -r 'select(.event == "request") | .path' | sort | uniq -c | sort -rn
+    cat ~/supertable/log/st.log | jq -r 'select(.event == "request") | .path' | sort | uniq -c | sort -rn
 
     # Slowest endpoints (p95)
-    cat app.log | jq 'select(.event == "request")' | jq -s 'group_by(.path) | map({path: .[0].path, count: length, p95_ms: (sort_by(.duration_ms) | .[length * 95 / 100].duration_ms)})'
+    cat ~/supertable/log/st.log | jq 'select(.event == "request")' | jq -s 'group_by(.path) | map({path: .[0].path, count: length, p95_ms: (sort_by(.duration_ms) | .[length * 95 / 100].duration_ms)})'
 
     # Trace a single request across UI and API
-    cat ui.log api.log | jq 'select(.correlation_id == "abc123")' | jq -s 'sort_by(.timestamp)'
+    cat ~/supertable/log/st.log | jq 'select(.correlation_id == "abc123")' | jq -s 'sort_by(.timestamp)'
 """
 from __future__ import annotations
 
@@ -261,11 +263,25 @@ def configure_logging(
         service:  Service identifier embedded in every log line (e.g. "api", "ui").
         level:    Log level override. Default from SUPERTABLE_LOG_LEVEL or INFO.
         fmt:      Format override. "json" or "text". Default from SUPERTABLE_LOG_FORMAT or "json".
-        log_file: Optional file path. Default from SUPERTABLE_LOG_FILE.
+        log_file: Optional file path. Default from SUPERTABLE_LOG_FILE or
+                  {SUPERTABLE_HOME}/log/st.log. Set to "none" to disable.
     """
     level = (level or os.getenv("SUPERTABLE_LOG_LEVEL", "INFO")).upper()
     fmt = (fmt or os.getenv("SUPERTABLE_LOG_FORMAT", "json")).lower()
-    log_file = log_file or os.getenv("SUPERTABLE_LOG_FILE")
+
+    # Log file path:
+    #   - Explicit parameter wins.
+    #   - Then SUPERTABLE_LOG_FILE env var.
+    #   - Then default: {SUPERTABLE_HOME}/log/st.log
+    #   - Set to "none" or "off" to disable file logging entirely.
+    if log_file is None:
+        log_file = os.getenv("SUPERTABLE_LOG_FILE")
+    if log_file is None:
+        # Lazy import to avoid import-time side effects from homedir
+        from supertable.config.homedir import get_app_home
+        log_file = os.path.join(get_app_home(), "log", "st.log")
+    if log_file.strip().lower() in ("none", "off", ""):
+        log_file = None
 
     # Choose formatter
     if fmt == "text":

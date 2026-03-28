@@ -1,13 +1,11 @@
-# -------- Core scientific stack (Python 3.11+ compatible) --------
-numpy>=1.26,<2.0
+# -------- Core data stack --------
+numpy>=1.26,<3.0
 pandas>=2.1,<2.3
 pyarrow>=16,<19
-
-# Timezone helpers
 pytz>=2023.3
 tzdata>=2023.3
 
-# -------- Engines / query / utils --------
+# -------- Engine / query / utils --------
 duckdb>=1.1,<2.0
 polars>=1.6,<2.0
 sqlglot>=26,<27
@@ -15,37 +13,5 @@ colorlog>=6.9,<7.0
 python-dotenv>=1.0,<2.0
 setuptools>=68
 
-# -------- Storage backends (Redis + MinIO as default) --------
+# -------- Catalog / locking --------
 redis>=5.0,<6.0
-minio>=7.2,<8.0
-boto3>=1.34,<2.0  # optional S3 compatibility
-
-# -------- Admin / Reflection API (FastAPI + Uvicorn + Jinja2) --------
-fastapi>=0.111,<0.117
-uvicorn[standard]>=0.30,<0.34
-jinja2>=3.1,<4.0
-aiofiles>=23.2,<24.0     # static files / templates convenience
-orjson>=3.9,<4.0         # faster JSON (optional but nice)
-httpx>=0.27,<1.0         # used by FastAPI TestClient and MCP HTTP transport
-
-# -------- Async / concurrency --------
-anyio>=4.4,<5.0          # used directly in mcp_server.py (explicit pin, not just transitive)
-
-# -------- MCP (Model Context Protocol) --------
-mcp>=1.1.0
-
-# -------- WebSocket server (notebook + spark_plug) --------
-websockets>=12.0,<14.0
-
-# -------- Spark Thrift Server (PyHive connects to HiveServer2) --------
-pyhive>=0.7,<1.0
-thrift>=0.16,<1.0
-pure-sasl>=0.6,<1.0     # pure-Python SASL (no C dependency)
-thrift-sasl>=0.4,<1.0
-
-# NOTE:
-# • Using uvicorn[standard] adds uvloop, httptools, watchfiles for better perf/dev.
-# • Ranges chosen to stay friendly with python:3.11-slim in Docker.
-# • You can drop boto3 if you only use MinIO with the MinIO client.
-# • pyhive + thrift + pure-sasl are only needed if using the Spark engine.
-#   They have no C dependencies (pure-sasl replaces the sasl C library).

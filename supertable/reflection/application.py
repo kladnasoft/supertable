@@ -55,7 +55,7 @@ _proxy_logger = logging.getLogger("supertable.ui.proxy")
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_BASE_URL = os.getenv("SUPERTABLE_API_URL", "http://localhost:8051").rstrip("/")
+API_BASE_URL = f"http://{os.getenv('SUPERTABLE_API_HOST', '0.0.0.0')}:{os.getenv('SUPERTABLE_API_PORT', '8050')}".rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Import infrastructure from common.py — NO endpoint handlers are imported.
@@ -682,8 +682,8 @@ async def proxy_api_prefix(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
-    port = int(os.getenv("SUPERTABLE_REFLECTION_PORT", "8050"))
+    host = os.getenv("SUPERTABLE_UI_HOST", "0.0.0.0")
+    port = int(os.getenv("SUPERTABLE_UI_PORT", "8051"))
     reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
 
     uvicorn.run(

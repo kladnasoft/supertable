@@ -138,9 +138,9 @@ def load_config(server_path: str, verbose: bool) -> Dict[str, Any]:
     cfg["wire"] = os.getenv("MCP_WIRE", json_cfg.get("wire", "ndjson"))
     cfg["org"] = os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", json_cfg.get("org", "")))
     cfg["super"] = os.getenv("SUPERTABLE_TEST_SUPER", json_cfg.get("super", ""))
-    cfg["user_hash"] = os.getenv("SUPERTABLE_ROLE", json_cfg.get("role", ""))
+    cfg["user_hash"] = json_cfg.get("role", "")
     # Default SQL now empty; if env provides something, we use it (and may fallback)
-    cfg["sql"] = os.getenv("SUPERTABLE_TEST_QUERY", json_cfg.get("sql", ""))
+    cfg["sql"] = json_cfg.get("sql", "")
     cfg["hash_files"] = paths["hash_files"]
 
     if verbose:
@@ -535,11 +535,11 @@ def main() -> None:
     parser.add_argument(
         "--role",
         dest="role",
-        default=os.getenv("SUPERTABLE_ROLE", ""),
+        default="",
     )
-    parser.add_argument("--token", dest="auth_token", default=os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", ""))
-    # Default SQL may be empty; if env gives SELECT 1, we will show it and then fallback
-    parser.add_argument("--sql", dest="sql", default=os.getenv("SUPERTABLE_TEST_QUERY", ""))
+    parser.add_argument("--token", dest="auth_token", default=(os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or ""))
+    # Default SQL may be empty; caller provides via --sql
+    parser.add_argument("--sql", dest="sql", default="")
     parser.add_argument("--engine", dest="engine", default=os.getenv("SUPERTABLE_TEST_ENGINE", ""))
     parser.add_argument("--timeout", dest="timeout", type=float, default=float(os.getenv("SUPERTABLE_TEST_TIMEOUT_SEC", "0") or 0))
     parser.add_argument("--list-tables", action="store_true", help="Call list_tables after list_supers")

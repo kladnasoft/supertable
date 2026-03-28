@@ -53,25 +53,27 @@ STORAGE_FORCE_PATH_STYLE=true
 
 # === Redis ===
 LOCKING_BACKEND=redis
+SUPERTABLE_REDIS_HOST=redis-master
+SUPERTABLE_REDIS_PORT=6379
+SUPERTABLE_REDIS_PASSWORD=change-me-strong-password
 SUPERTABLE_REDIS_DB=1
-SUPERTABLE_REDIS_DECODE_RESPONSES=true
 
-# === Reflection (Admin UI) ===
-SUPERTABLE_REFLECTION_PORT=8050
+# === Core ===
 SUPERTABLE_HOME=~/supertable
 SUPERTABLE_ORGANIZATION=my-org
-SUPERTABLE_SUPERTOKEN=change-me-strong-token
+SUPERTABLE_SUPERUSER_TOKEN=change-me-strong-token
 SUPERTABLE_LOGIN_MASK=1
 
 # === API ===
 SUPERTABLE_API_PORT=8090
 
+# === Reflection (Admin UI) ===
+SUPERTABLE_REFLECTION_PORT=8050
+
 # === MCP ===
 SUPERTABLE_MCP_TRANSPORT=streamable-http
 SUPERTABLE_MCP_PORT=8070
-SUPERTABLE_MCP_HTTP_PATH=/mcp
-SUPERTABLE_REQUIRE_TOKEN=0
-SUPERTABLE_MCP_AUTH_TOKEN=some-strong-random-string
+SUPERTABLE_MCP_TOKEN=some-strong-random-string
 
 # === DuckDB Engine ===
 SUPERTABLE_DUCKDB_PRESIGNED=1
@@ -238,6 +240,9 @@ STORAGE_FORCE_PATH_STYLE=true
 
 ```bash
 LOCKING_BACKEND=redis
+SUPERTABLE_REDIS_HOST=localhost
+SUPERTABLE_REDIS_PORT=6379
+SUPERTABLE_REDIS_PASSWORD=change-me-strong-password
 SUPERTABLE_REDIS_DB=1
 ```
 
@@ -249,7 +254,6 @@ SUPERTABLE_REDIS_SENTINEL=true
 SUPERTABLE_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
 SUPERTABLE_REDIS_SENTINEL_MASTER=mymaster
 SUPERTABLE_REDIS_SENTINEL_PASSWORD=your-sentinel-password
-SUPERTABLE_REDIS_SENTINEL_STRICT=true
 ```
 
 Start with sentinel profile: `cd infrastructure/redis && docker compose --profile sentinel up -d`
@@ -265,7 +269,7 @@ Start with sentinel profile: `cd infrastructure/redis && docker compose --profil
 | **Auth** |||
 | `SUPERTABLE_AUTH_MODE` | `api_key` | Auth mode: `api_key` or `bearer` |
 | `SUPERTABLE_API_KEY` | — | API key for authentication |
-| `SUPERTABLE_SUPERTOKEN` | — | Admin superuser token (required) |
+| `SUPERTABLE_SUPERUSER_TOKEN` | — | Admin superuser token (required) |
 | `SUPERTABLE_LOGIN_MASK` | `1` | Login modes: `1` = superuser only, `2` = users only, `3` = both |
 | **Storage** |||
 | `STORAGE_TYPE` | `MINIO` | Backend: `MINIO`, `S3`, `AZURE`, `GCS` |
@@ -276,15 +280,14 @@ Start with sentinel profile: `cd infrastructure/redis && docker compose --profil
 | `STORAGE_FORCE_PATH_STYLE` | `true` | Force path-style S3 URLs (required for MinIO) |
 | **Redis** |||
 | `LOCKING_BACKEND` | `redis` | Locking backend |
+| `SUPERTABLE_REDIS_HOST` | `localhost` | Redis host |
+| `SUPERTABLE_REDIS_PORT` | `6379` | Redis port |
 | `SUPERTABLE_REDIS_DB` | `0` | Redis database number |
-| `SUPERTABLE_REDIS_URL` | — | Full Redis URL (overrides host/port) |
+| `SUPERTABLE_REDIS_PASSWORD` | — | Redis password |
 | **MCP** |||
 | `SUPERTABLE_MCP_TRANSPORT` | `stdio` | Transport: `stdio` or `streamable-http` |
 | `SUPERTABLE_MCP_PORT` | `8070` | HTTP transport port |
-| `SUPERTABLE_MCP_HTTP_PATH` | `/mcp` | HTTP endpoint path |
-| `SUPERTABLE_MCP_AUTH_TOKEN` | — | MCP authentication token |
-| `SUPERTABLE_REQUIRE_TOKEN` | `1` | Require auth token |
-| `SUPERTABLE_REQUIRE_EXPLICIT_ROLE` | `1` | Require role in every tool call |
+| `SUPERTABLE_MCP_TOKEN` | — | MCP authentication token |
 | `SUPERTABLE_ALLOWED_ROLES` | — | Comma-separated allowed roles |
 | **DuckDB** |||
 | `SUPERTABLE_DUCKDB_PRESIGNED` | `1` | Use presigned URLs for object storage |
@@ -324,15 +327,13 @@ Start with sentinel profile: `cd infrastructure/redis && docker compose --profil
 
 1. **Set strong tokens:**
    ```bash
-   SUPERTABLE_SUPERTOKEN=<random-64-char-string>
+   SUPERTABLE_SUPERUSER_TOKEN=<random-64-char-string>
    SUPERTABLE_API_KEY=<random-64-char-string>
-   SUPERTABLE_MCP_AUTH_TOKEN=<random-64-char-string>
+   SUPERTABLE_MCP_TOKEN=<random-64-char-string>
    ```
 
-2. **Enable MCP authentication:**
+2. **Restrict MCP roles:**
    ```bash
-   SUPERTABLE_REQUIRE_TOKEN=1
-   SUPERTABLE_REQUIRE_EXPLICIT_ROLE=1
    SUPERTABLE_ALLOWED_ROLES=reader,writer
    ```
 
@@ -353,7 +354,7 @@ Start with sentinel profile: `cd infrastructure/redis && docker compose --profil
 docker logs supertable-reflection
 ```
 
-Common causes: missing `SUPERTABLE_ORGANIZATION` or `SUPERTABLE_SUPERTOKEN`, Redis/MinIO unreachable.
+Common causes: missing `SUPERTABLE_ORGANIZATION` or `SUPERTABLE_SUPERUSER_TOKEN`, Redis/MinIO unreachable.
 
 ### Cannot reach infrastructure
 

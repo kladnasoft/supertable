@@ -1,10 +1,10 @@
+# route: supertable.redis_connector
 from __future__ import annotations
 
 import os
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -21,18 +21,21 @@ class RedisOptions:
     Reads Redis connection options from environment variables.
 
     Supported:
-      - SUPERTABLE_REDIS_URL (e.g. redis://:pass@host:6379/0 or rediss://:pass@host:6380/1)
-      - or split vars: SUPERTABLE_REDIS_HOST, SUPERTABLE_REDIS_PORT, SUPERTABLE_REDIS_DB, SUPERTABLE_REDIS_PASSWORD
+      - SUPERTABLE_REDIS_HOST (default: localhost)
+      - SUPERTABLE_REDIS_PORT (default: 6379)
+      - SUPERTABLE_REDIS_DB (default: 0)
+      - SUPERTABLE_REDIS_PASSWORD
+      - SUPERTABLE_REDIS_SSL (default: false)
 
-    Optional:
-      - SUPERTABLE_REDIS_DECODE_RESPONSES (default: "false")
+    Hardcoded (not configurable):
+      - decode_responses is always True (all Redis data is JSON text)
+      - sentinel_strict is always True (no silent fallback to standalone Redis)
 
     Sentinel (optional):
       - SUPERTABLE_REDIS_SENTINEL (true/false)
       - SUPERTABLE_REDIS_SENTINELS="host1:26379,host2:26379"
       - SUPERTABLE_REDIS_SENTINEL_MASTER="mymaster"
       - SUPERTABLE_REDIS_SENTINEL_PASSWORD (optional; defaults to SUPERTABLE_REDIS_PASSWORD; also used as fallback for SUPERTABLE_REDIS_PASSWORD in Sentinel mode)
-      - SUPERTABLE_REDIS_SENTINEL_STRICT (true/false, default: false)  # if true, do not fall back when Sentinel is unavailable
     """
     host: str = field(init=False)
     port: int = field(init=False)
@@ -49,29 +52,16 @@ class RedisOptions:
     sentinel_strict: bool = field(init=False)
 
     def __post_init__(self):
-        url = os.getenv("SUPERTABLE_REDIS_URL")
-        if url:
-            u = urlparse(url)
-            host = u.hostname or "localhost"
-            port = u.port or 6379
-            # path like "/0"
-            db = int((u.path or "/0").lstrip("/") or 0)
-            password = u.password
-            use_ssl = (u.scheme.lower() == "rediss")
-        else:
-            host = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
-            port = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
-            db = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
-            password = os.getenv("SUPERTABLE_REDIS_PASSWORD")
-            use_ssl = False
-
-        decode = os.getenv("SUPERTABLE_REDIS_DECODE_RESPONSES", "false").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
+        host = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
+        port = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
+        db = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
+        password = os.getenv("SUPERTABLE_REDIS_PASSWORD")
+        use_ssl = os.getenv("SUPERTABLE_REDIS_SSL", "false").strip().lower() in (
+            "1", "true", "yes", "on",
         )
+
+        # All Redis data is JSON text — always decode responses to str.
+        decode = True
 
         # Sentinel mode configuration
         is_sentinel = os.getenv("SUPERTABLE_REDIS_SENTINEL", "false").strip().lower() in (
@@ -104,13 +94,8 @@ class RedisOptions:
         if is_sentinel and password is None and sentinel_password:
             password = sentinel_password
 
-        sentinel_strict = os.getenv("SUPERTABLE_REDIS_SENTINEL_STRICT", "false").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        )
+        # Never silently fall back to standalone Redis — fail loud in production.
+        sentinel_strict = True
 
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
@@ -128,12 +113,7 @@ class RedisOptions:
 
 def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
     opts = options or RedisOptions()
-    # Response decoding:
-    # If SUPERTABLE_REDIS_DECODE_RESPONSES=true, redis-py returns str instead of bytes.
-    # Some older call sites may assume bytes; callers should handle both bytes and str.
-    if opts.decode_responses:
-        logger.debug("[redis-connector] SUPERTABLE_REDIS_DECODE_RESPONSES=true; redis responses will be decoded to str")
-    decode_responses = bool(opts.decode_responses)
+    decode_responses = True
 
     # Decide between standard Redis and Sentinel-based Redis
     if opts.is_sentinel and opts.sentinel_hosts:

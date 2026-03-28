@@ -44,7 +44,7 @@ if _PROJECT_ROOT not in sys.path:
 
 # ---------- Logging ----------
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("SUPERTABLE_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(levelname)-8s - %(message)s",
@@ -300,15 +300,15 @@ class Config:
     max_limit: int = int(os.getenv("SUPERTABLE_MAX_LIMIT", "5000"))
     default_query_timeout_sec: float = float(os.getenv("SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC", "60"))
     max_concurrency: int = int(os.getenv("SUPERTABLE_MAX_CONCURRENCY", "6"))
-    require_explicit_role: bool = _env_bool("SUPERTABLE_REQUIRE_EXPLICIT_ROLE", True)
+    require_explicit_role: bool = True
     allowed_roles: Optional[Set[str]] = field(default_factory=lambda: _env_set("SUPERTABLE_ALLOWED_ROLES"))
     allow_sysadmin_default: bool = _env_bool("SUPERTABLE_ALLOW_SYSADMIN_DEFAULT", False)
-    require_token: bool = _env_bool("SUPERTABLE_REQUIRE_TOKEN", True)
-    shared_token: str = os.getenv("SUPERTABLE_MCP_AUTH_TOKEN", "")
+    require_token: bool = True
+    shared_token: str = (os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "")
     transport: str = _env_transport("SUPERTABLE_MCP_TRANSPORT", "stdio")
     http_host: str = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
     http_port: int = int(os.getenv("SUPERTABLE_MCP_PORT", "8000"))
-    http_path: str = os.getenv("SUPERTABLE_MCP_HTTP_PATH", "/mcp")
+    http_path: str = "/mcp"
 
 CFG = Config()
 
@@ -2219,7 +2219,7 @@ if __name__ == "__main__":
         )
         if CFG.require_token and not (CFG.shared_token or "").strip():
             raise RuntimeError(
-                "SUPERTABLE_MCP_AUTH_TOKEN must be set when SUPERTABLE_REQUIRE_TOKEN=1."
+                "SUPERTABLE_MCP_TOKEN must be set (token auth is always required)."
             )
 
         run_kwargs: Dict[str, Any] = {"transport": transport}

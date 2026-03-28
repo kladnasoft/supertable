@@ -54,9 +54,6 @@ from supertable.reflection.common import (
     is_superuser,
     list_users,
     list_roles,
-    read_user,
-    read_role,
-    get_user_roles,
 )
 
 
@@ -91,21 +88,13 @@ from supertable.reflection.ingestion import (
 
 # -- security helpers --
 from supertable.reflection.security import (
-    _ROLE_ID_RE as _SEC_ROLE_ID_RE,
-    _USER_ID_RE as _SEC_USER_ID_RE,
-    _ENDPOINT_ID_RE,
     _list_roles as _sec_list_roles,
     _get_role as _sec_get_role,
     _create_role as _sec_create_role,
     _update_role as _sec_update_role,
     _delete_role as _sec_delete_role,
     _list_users_redis,
-    _get_user as _sec_get_user,
-    _create_user as _sec_create_user,
-    _update_user as _sec_update_user,
-    _delete_user as _sec_delete_user,
     _list_endpoints,
-    _get_endpoint,
     _create_endpoint,
     _update_endpoint,
     _regenerate_endpoint_token,
@@ -279,38 +268,6 @@ _redis_delete_staging_cascade = _rh["redis_delete_staging_cascade"]
 # Common.py env helpers
 # ---------------------------------------------------------------------------
 
-try:
-    from dotenv import dotenv_values, set_key
-except ImportError:
-    dotenv_values = None  # type: ignore[assignment]
-    set_key = None        # type: ignore[assignment]
-
-_SENSITIVE_KEY_PARTS = (
-    "PASSWORD", "PASS", "SECRET", "TOKEN", "KEY",
-    "ACCESS_KEY", "CONNECTION_STRING", "API_KEY", "CLIENT_SECRET",
-)
-_ENV_KEY_RE = re.compile(r"^[A-Z0-9_]+$")
-
-
-def _env_file_path() -> Path:
-    here = Path(__file__).resolve()
-    # Navigate: supertable/api/api.py → supertable/ → parent
-    pkg_dir = here.parent.parent
-    return (pkg_dir.parent / (settings.DOTENV_PATH or ".env")).resolve()
-
-
-def _is_sensitive_env_key(key: str) -> bool:
-    k = (key or "").upper()
-    return any(part in k for part in _SENSITIVE_KEY_PARTS)
-
-
-def _mask_secret(v: str) -> str:
-    if not v:
-        return ""
-    if len(v) <= 4:
-        return "****"
-    return "****" + v[-4:]
-
 
 def _get_org_from_env_fallback() -> str:
     return (settings.SUPERTABLE_ORGANIZATION or "").strip()
@@ -452,18 +409,6 @@ def reflection_user_role_names(
 
 # ─────────────────── Sidebar role endpoints ───────────────────────────────
 
-@router.get("/reflection/users")
-def reflection_users(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    org_val, sup_val = resolve_pair(org, sup)
-    if not org_val or not sup_val:
-        return {"users": []}
-    return {"users": list_users(org_val, sup_val)}
-
 
 @router.get("/reflection/roles")
 def reflection_roles(
@@ -476,39 +421,6 @@ def reflection_roles(
     if not org_val or not sup_val:
         return {"roles": []}
     return {"roles": list_roles(org_val, sup_val)}
-
-
-@router.get("/reflection/user-roles")
-def reflection_user_roles(
-    request: Request,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    sess = get_session(request) or {}
-    username = (sess.get("username") or "").strip()
-    if not username:
-        return {"roles": [], "selected_role": ""}
-
-    org_val, sup_val = resolve_pair(org, sup)
-    if not org_val or not sup_val:
-        return {"roles": [], "selected_role": ""}
-
-    roles = get_user_roles(org_val, sup_val, username)
-    current_role = (sess.get("role_name") or "").strip()
-    role_names = [r.get("role_name") or r.get("role_id") or "" for r in roles]
-    if current_role not in role_names and role_names:
-        current_role = role_names[0]
-
-    sess_data = dict(sess)
-    sess_data["role_name"] = current_role
-    sess_data["roles"] = role_names
-    sess_data["super_name"] = sup_val
-
-    resp = JSONResponse({"roles": roles, "selected_role": current_role})
-    _set_session_cookie(resp, sess_data)
-    _no_store(resp)
-    return resp
 
 
 @router.post("/reflection/set-role")
@@ -525,116 +437,6 @@ def reflection_set_role(
     _set_session_cookie(resp, sess_data)
     _no_store(resp)
     return resp
-
-
-# ──────────────────── Tenants / Mirrors / Detail ──────────────────────────
-
-@router.get("/reflection/tenants")
-def api_tenants(_: Any = Depends(logged_in_guard_api)):
-    pairs = discover_pairs()
-    return {"tenants": [{"org": o, "sup": s} for o, s in pairs]}
-
-
-@router.get("/reflection/mirrors")
-def api_get_mirrors(
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "formats": []}
-    try:
-        fmts = catalog.get_mirrors(org, sup)
-    except Exception:
-        fmts = []
-    return {"org": org, "sup": sup, "formats": fmts}
-
-
-@router.get("/reflection/user/{user_id}")
-def api_user_details(
-    user_id: str,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _=Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_user(org, sup, user_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"user_id": user_id, "data": obj}
-
-
-@router.get("/reflection/role/{role_id}")
-def api_role_details(
-    role_id: str,
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _=Depends(admin_guard_api),
-):
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        raise HTTPException(404, "Tenant not found")
-    obj = read_role(org, sup, role_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Role not found")
-    return {"role_id": role_id, "data": obj}
-
-
-# ──────────────────── .env configuration ──────────────────────────────────
-
-@router.get("/reflection/env")
-def admin_env_get(_=Depends(admin_guard_api)):
-    if dotenv_values is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    found = env_path.exists() and env_path.is_file()
-    items: List[Dict[str, Any]] = []
-
-    if found:
-        values = dotenv_values(str(env_path)) or {}
-        for k, v in values.items():
-            val = "" if v is None else str(v)
-            is_sensitive = _is_sensitive_env_key(k)
-            items.append({
-                "key": k,
-                "value": _mask_secret(val) if is_sensitive else val,
-                "is_sensitive": is_sensitive,
-            })
-
-    return {"found": found, "path": str(env_path), "items": items}
-
-
-@router.post("/reflection/env")
-def admin_env_update(payload: Dict[str, Any] = Body(...), _=Depends(admin_guard_api)):
-    if set_key is None:
-        raise HTTPException(status_code=500, detail="python-dotenv is not installed")
-
-    env_path = _env_file_path()
-    env_path.touch(exist_ok=True)
-
-    items = payload.get("items") or []
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="items must be a list")
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "").strip()
-        if not key or not _ENV_KEY_RE.fullmatch(key):
-            continue
-        value = item.get("value", "")
-        value_str = str(value)
-        if "\n" in value_str or "\r" in value_str:
-            raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
-        if len(value_str) > 8192:
-            raise HTTPException(status_code=400, detail=f"Value too long for {key}")
-        set_key(str(env_path), key, value_str, quote_mode="never")
-
-    return {"ok": True, "path": str(env_path)}
 
 
 # ──────────────────── Auth tokens ─────────────────────────────────────────
@@ -1209,19 +1011,6 @@ def api_ingestion_list_tables(
     return {"ok": True, "tables": names}
 
 
-@router.get("/reflection/ingestion/staging/meta")
-def api_ingestion_get_staging_meta(
-    org: str = Query(...),
-    sup: str = Query(...),
-    staging_name: str = Query(...),
-    _: Any = Depends(logged_in_guard_api),
-):
-    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
-        raise HTTPException(status_code=400, detail="Invalid staging_name")
-    meta = _redis_get_staging_meta(org, sup, staging_name) or {}
-    return {"meta": meta}
-
-
 @router.get("/reflection/ingestion/staging/files")
 def api_ingestion_list_staging_files(
     org: str = Query(...),
@@ -1447,69 +1236,6 @@ def api_save_pipe(
     _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, pipe_def)
 
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "path": pipe_path}
-
-
-@router.post("/reflection/pipes/create")
-def api_create_pipe(
-    request: Request,
-    org: str = Query(...),
-    sup: str = Query(...),
-    staging_name: str = Query(...),
-    pipe_name: str = Query(...),
-    role_name: str = Query(""),
-    simple_name: str = Query(...),
-    overwrite_columns: Optional[str] = Query(None),
-    enabled: bool = Query(True),
-    _: Any = Depends(logged_in_guard_api),
-):
-    role = (role_name or "").strip()
-    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
-        raise HTTPException(status_code=400, detail="Invalid staging_name")
-    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
-        raise HTTPException(status_code=400, detail="Invalid pipe_name")
-
-    from supertable.super_pipe import SuperPipe
-
-    overwrite_cols = _parse_overwrite_columns(overwrite_columns)
-
-    try:
-        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
-        path = pipe.create(
-            pipe_name=pipe_name.strip(), user_hash=role.strip(),
-            simple_name=simple_name.strip(), overwrite_columns=overwrite_cols,
-            enabled=bool(enabled),
-        )
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except FileExistsError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Create pipe failed: {e}")
-
-    storage = get_storage()
-    names = _get_staging_names(storage, org, sup)
-    if staging_name not in names:
-        names = sorted(set(names + [staging_name]))
-        _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
-
-    pipes = _load_pipe_index(storage, org, sup)
-    pipes = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name.strip())]
-    pipes.append({
-        "pipe_name": pipe_name.strip(), "organization": org, "super_name": sup,
-        "staging_name": staging_name, "role_name": role.strip(), "simple_name": simple_name.strip(),
-        "overwrite_columns": overwrite_cols, "enabled": bool(enabled), "path": path, "updated_at_ns": time.time_ns(),
-    })
-    _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
-
-    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name.strip(), {
-        "pipe_name": pipe_name.strip(), "organization": org, "super_name": sup,
-        "staging_name": staging_name, "role_name": role.strip(), "simple_name": simple_name.strip(),
-        "overwrite_columns": overwrite_cols, "enabled": bool(enabled), "path": path,
-    })
-    _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
-    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip(), "path": path}
 
 
 @router.post("/reflection/pipes/delete")
@@ -1862,27 +1588,6 @@ def rbac_roles_list(
     return JSONResponse({"ok": True, "data": {"items": items}})
 
 
-@router.get("/reflection/rbac/roles/{role_id}")
-def rbac_role_get(
-    role_id: str,
-    organization: str = Query(""),
-    super_name: str = Query(""),
-    org: str = Query(""),
-    sup: str = Query(""),
-    _=Depends(admin_guard_api),
-):
-    org = (organization or org or "").strip()
-    sup = (super_name or sup or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    if not _SEC_ROLE_ID_RE.fullmatch(role_id or ""):
-        raise HTTPException(status_code=400, detail="invalid role_id")
-    doc = _sec_get_role(redis_client, org, sup, role_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="role not found")
-    return JSONResponse({"ok": True, "data": doc})
-
-
 @router.post("/reflection/rbac/roles")
 def rbac_role_create(
     payload: Dict[str, Any] = Body(...),
@@ -1977,88 +1682,6 @@ def rbac_users_list(
     return JSONResponse({"ok": True, "data": {"items": items}})
 
 
-@router.get("/reflection/rbac/users/{user_id}")
-def rbac_user_get(
-    user_id: str,
-    organization: str = Query(""),
-    super_name: str = Query(""),
-    org: str = Query(""),
-    sup: str = Query(""),
-    _=Depends(admin_guard_api),
-):
-    org = (organization or org or "").strip()
-    sup = (super_name or sup or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    doc = _sec_get_user(redis_client, org, sup, user_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="user not found")
-    return JSONResponse({"ok": True, "data": doc})
-
-
-@router.post("/reflection/rbac/users")
-def rbac_user_create(
-    payload: Dict[str, Any] = Body(...),
-    _=Depends(admin_guard_api),
-):
-    org = str(payload.get("organization") or "").strip()
-    sup = str(payload.get("super_name") or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    username = str(payload.get("username") or "").strip()
-    roles_raw = payload.get("roles") or []
-    roles = roles_raw if isinstance(roles_raw, list) else [str(roles_raw)]
-    doc = _sec_create_user(redis_client, org, sup, username=username, roles=roles)
-    return JSONResponse({"ok": True, "data": doc}, status_code=201)
-
-
-@router.put("/reflection/rbac/users/{user_id}")
-def rbac_user_update(
-    user_id: str,
-    payload: Dict[str, Any] = Body(...),
-    _=Depends(admin_guard_api),
-):
-    org = str(payload.get("organization") or "").strip()
-    sup = str(payload.get("super_name") or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    roles_raw = payload.get("roles")
-    roles = (roles_raw if isinstance(roles_raw, list) else [str(roles_raw)]) if roles_raw is not None else None
-    doc = _sec_update_user(
-        redis_client, org, sup, user_id,
-        username=str(payload["username"]) if "username" in payload else None,
-        roles=roles,
-    )
-    return JSONResponse({"ok": True, "data": doc})
-
-
-@router.delete("/reflection/rbac/users/{user_id}")
-def rbac_user_delete(
-    user_id: str,
-    organization: str = Query(""),
-    super_name: str = Query(""),
-    org: str = Query(""),
-    sup: str = Query(""),
-    _=Depends(admin_guard_api),
-):
-    org = (organization or org or "").strip()
-    sup = (super_name or sup or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    deleted = _sec_delete_user(redis_client, org, sup, user_id)
-    return JSONResponse({"ok": True, "data": {"deleted": deleted}})
-
-
-@router.delete("/reflection/rbac/views/{view_id}")
-def rbac_view_delete_stub(
-    view_id: str,
-    organization: str = Query(""),
-    super_name: str = Query(""),
-    _=Depends(admin_guard_api),
-):
-    raise HTTPException(status_code=410, detail="Views have been removed. Use roles instead.")
-
-
 # ── OData Endpoint CRUD ──
 
 @router.get("/reflection/odata/endpoints")
@@ -2075,27 +1698,6 @@ def odata_endpoints_list(
         raise HTTPException(status_code=400, detail="organization and super_name are required")
     items = _list_endpoints(redis_client, org, sup)
     return JSONResponse({"ok": True, "data": {"items": items}})
-
-
-@router.get("/reflection/odata/endpoints/{endpoint_id}")
-def odata_endpoint_get(
-    endpoint_id: str,
-    organization: str = Query(""),
-    super_name: str = Query(""),
-    org: str = Query(""),
-    sup: str = Query(""),
-    _=Depends(admin_guard_api),
-):
-    org = (organization or org or "").strip()
-    sup = (super_name or sup or "").strip()
-    if not org or not sup:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-    if not _ENDPOINT_ID_RE.fullmatch(endpoint_id or ""):
-        raise HTTPException(status_code=400, detail="invalid endpoint_id")
-    doc = _get_endpoint(redis_client, org, sup, endpoint_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="endpoint not found")
-    return JSONResponse({"ok": True, "data": doc})
 
 
 @router.post("/reflection/odata/endpoints")
@@ -2250,56 +1852,6 @@ def api_quality_latest(
     return {"ok": True, "latest": latest, "anomalies": anomalies}
 
 
-@router.get("/reflection/quality/column")
-def api_quality_column(
-    request: Request,
-    table: str = Query(...),
-    column: str = Query(...),
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    dqc = _get_dqc(request, org, sup)
-    col_data = dqc.get_latest_column(table, column)
-    return {"ok": True, "column": col_data}
-
-
-@router.get("/reflection/quality/config")
-def api_dq_get_config(
-    request: Request,
-    table: str = Query(...),
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(admin_guard_api),
-):
-    dqc = _get_dqc(request, org, sup)
-    effective = dqc.get_effective_config(table)
-    table_overrides = dqc.get_table_config(table)
-    return {
-        "ok": True,
-        "effective": effective,
-        "table_overrides": table_overrides,
-        "builtin_checks": BUILTIN_CHECKS,
-    }
-
-
-@router.put("/reflection/quality/config")
-def api_dq_set_config(
-    request: Request,
-    table: str = Query(...),
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    body: Dict[str, Any] = Body(None),
-    _: Any = Depends(admin_guard_api),
-):
-    if body is None:
-        body = {}
-    dqc = _get_dqc(request, org, sup)
-    sess = get_session(request) or {}
-    dqc.set_table_config(table, body, updated_by=sess.get("username", ""))
-    return {"ok": True}
-
-
 @router.get("/reflection/quality/global-config")
 def api_dq_get_global_config(
     request: Request,
@@ -2351,19 +1903,6 @@ def api_dq_set_schedule(
     dqc = _get_dqc(request, org, sup)
     dqc.set_schedule(body)
     return {"ok": True}
-
-
-@router.get("/reflection/quality/table-schedule")
-def api_dq_get_table_schedule(
-    request: Request,
-    table: str = Query(...),
-    org: Optional[str] = Query(None),
-    sup: Optional[str] = Query(None),
-    _: Any = Depends(admin_guard_api),
-):
-    dqc = _get_dqc(request, org, sup)
-    ts = dqc.get_table_schedule(table)
-    return {"ok": True, "table": table, "schedule": ts}
 
 
 @router.put("/reflection/quality/table-schedule")
@@ -2852,212 +2391,6 @@ def compute_test_connection(
             sock.close()
         except Exception:
             pass
-
-
-# ── Spark Thrift cluster management ──
-
-@router.get("/reflection/compute/spark/thrifts")
-def spark_thrifts_list(org: str, _: Any = Depends(logged_in_guard_api)):
-    org = str(org or "").strip()
-    if not org:
-        raise HTTPException(status_code=400, detail="org is required")
-    try:
-        cat = _compute_get_catalog()
-        clusters = cat.list_spark_clusters(org)
-        return {"ok": True, "clusters": clusters}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list Spark thrifts: {e}")
-
-
-@router.post("/reflection/compute/spark/thrifts")
-def spark_thrift_upsert(
-    payload: Dict[str, Any] = Body(...),
-    _: Any = Depends(admin_guard_api),
-):
-    org = str(payload.get("org") or "").strip()
-    cluster_id = str(payload.get("cluster_id") or "").strip()
-    name = str(payload.get("name") or "").strip()
-    thrift_host = str(payload.get("thrift_host") or "").strip()
-
-    if not org:
-        raise HTTPException(status_code=400, detail="org is required")
-    if not cluster_id:
-        raise HTTPException(status_code=400, detail="cluster_id is required")
-    if not name:
-        raise HTTPException(status_code=400, detail="name is required")
-    if not thrift_host:
-        raise HTTPException(status_code=400, detail="thrift_host is required")
-
-    thrift_port = 10000
-    try:
-        thrift_port = int(payload.get("thrift_port") or 10000)
-    except (ValueError, TypeError):
-        pass
-    if thrift_port < 1 or thrift_port > 65535:
-        thrift_port = 10000
-
-    status_val = str(payload.get("status") or "active").strip().lower()
-    if status_val not in ("active", "draining", "offline"):
-        status_val = "active"
-
-    min_bytes = max(0, int(payload.get("min_bytes") or 0))
-    max_bytes = max(0, int(payload.get("max_bytes") or 0))
-
-    config = {
-        "name": name, "thrift_host": thrift_host, "thrift_port": thrift_port,
-        "status": status_val, "min_bytes": min_bytes, "max_bytes": max_bytes,
-        "s3_enabled": bool(payload.get("s3_enabled", True)),
-    }
-    for field_name in ("auth", "username", "password"):
-        val = payload.get(field_name)
-        if val is not None:
-            config[field_name] = str(val)
-
-    try:
-        cat = _compute_get_catalog()
-        cat.register_spark_cluster(org, cluster_id, config)
-        return {"ok": True, "cluster_id": cluster_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to register thrift: {e}")
-
-
-@router.post("/reflection/compute/spark/thrifts/status")
-def spark_thrift_status_update(
-    payload: Dict[str, Any] = Body(...),
-    _: Any = Depends(admin_guard_api),
-):
-    org = str(payload.get("org") or "").strip()
-    cluster_id = str(payload.get("cluster_id") or "").strip()
-    status_val = str(payload.get("status") or "").strip().lower()
-
-    if not org or not cluster_id:
-        raise HTTPException(status_code=400, detail="org and cluster_id are required")
-    if status_val not in ("active", "draining", "offline"):
-        raise HTTPException(status_code=400, detail="status must be: active, draining, offline")
-
-    try:
-        cat = _compute_get_catalog()
-        ok = cat.update_spark_cluster_status(org, cluster_id, status_val)
-        if not ok:
-            raise HTTPException(status_code=404, detail="Cluster not found")
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update status: {e}")
-
-
-@router.delete("/reflection/compute/spark/thrifts/{cluster_id}")
-def spark_thrift_delete(cluster_id: str, org: str, _: Any = Depends(admin_guard_api)):
-    org = str(org or "").strip()
-    cluster_id = str(cluster_id or "").strip()
-    if not org or not cluster_id:
-        raise HTTPException(status_code=400, detail="org and cluster_id are required")
-    try:
-        cat = _compute_get_catalog()
-        ok = cat.deregister_spark_cluster(org, cluster_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="Cluster not found")
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to deregister thrift: {e}")
-
-
-# ── Spark Plug management ──
-
-@router.get("/reflection/compute/spark/plugs")
-def spark_plugs_list(org: str, _: Any = Depends(logged_in_guard_api)):
-    org = str(org or "").strip()
-    if not org:
-        raise HTTPException(status_code=400, detail="org is required")
-    try:
-        cat = _compute_get_catalog()
-        plugs = cat.list_spark_plugs(org)
-        return {"ok": True, "plugs": plugs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list Spark plugs: {e}")
-
-
-@router.post("/reflection/compute/spark/plugs")
-def spark_plug_upsert(
-    payload: Dict[str, Any] = Body(...),
-    _: Any = Depends(admin_guard_api),
-):
-    org = str(payload.get("org") or "").strip()
-    plug_id = str(payload.get("plug_id") or "").strip()
-    name = str(payload.get("name") or "").strip()
-
-    if not org:
-        raise HTTPException(status_code=400, detail="org is required")
-    if not plug_id:
-        raise HTTPException(status_code=400, detail="plug_id is required")
-    if not name:
-        raise HTTPException(status_code=400, detail="name is required")
-
-    status_val = str(payload.get("status") or "active").strip().lower()
-    if status_val not in ("active", "draining", "offline"):
-        status_val = "active"
-
-    config = {
-        "name": name,
-        "spark_master": str(payload.get("spark_master") or "spark://localhost:7077").strip(),
-        "ws_url": str(payload.get("ws_url") or "ws://localhost:8010/ws/spark").strip(),
-        "webui_url": str(payload.get("webui_url") or "").strip(),
-        "status": status_val,
-    }
-
-    try:
-        cat = _compute_get_catalog()
-        cat.register_spark_plug(org, plug_id, config)
-        return {"ok": True, "plug_id": plug_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to register plug: {e}")
-
-
-@router.post("/reflection/compute/spark/plugs/status")
-def spark_plug_status_update(
-    payload: Dict[str, Any] = Body(...),
-    _: Any = Depends(admin_guard_api),
-):
-    org = str(payload.get("org") or "").strip()
-    plug_id = str(payload.get("plug_id") or "").strip()
-    status_val = str(payload.get("status") or "").strip().lower()
-
-    if not org or not plug_id:
-        raise HTTPException(status_code=400, detail="org and plug_id are required")
-    if status_val not in ("active", "draining", "offline"):
-        raise HTTPException(status_code=400, detail="status must be: active, draining, offline")
-
-    try:
-        cat = _compute_get_catalog()
-        ok = cat.update_spark_plug_status(org, plug_id, status_val)
-        if not ok:
-            raise HTTPException(status_code=404, detail="Plug not found")
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update plug status: {e}")
-
-
-@router.delete("/reflection/compute/spark/plugs/{plug_id}")
-def spark_plug_delete(plug_id: str, org: str, _: Any = Depends(admin_guard_api)):
-    org = str(org or "").strip()
-    plug_id = str(plug_id or "").strip()
-    if not org or not plug_id:
-        raise HTTPException(status_code=400, detail="org and plug_id are required")
-    try:
-        cat = _compute_get_catalog()
-        ok = cat.deregister_spark_plug(org, plug_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="Plug not found")
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to deregister plug: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

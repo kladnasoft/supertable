@@ -1,4 +1,4 @@
-# supertable/engine/engine_common.py
+# route: supertable.engine.engine_common
 
 from __future__ import annotations
 
@@ -293,15 +293,17 @@ def configure_httpfs_and_s3(
         set_if_supported("enable_external_file_cache", "true")
         set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
         cache_dir_raw = os.getenv("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR", "").strip()
-        if cache_dir_raw:
-            # Expand ~ so DuckDB receives an absolute path.
-            cache_dir = os.path.expanduser(cache_dir_raw)
-            os.makedirs(cache_dir, exist_ok=True)
-            set_if_supported("external_file_cache_directory", f"'{cache_dir}'")
+        if not cache_dir_raw:
+            # Derive from SUPERTABLE_HOME — single env var controls all paths.
+            cache_dir_raw = os.path.join(get_app_home(), "duckdb_cache")
+        # Expand ~ so DuckDB receives an absolute path.
+        cache_dir = os.path.expanduser(cache_dir_raw)
+        os.makedirs(cache_dir, exist_ok=True)
+        set_if_supported("external_file_cache_directory", f"'{cache_dir}'")
         logger.info(
             "[duckdb.cache] external file cache enabled"
             + (f" size={cache_size}" if cache_size else "")
-            + (f", dir={cache_dir}" if cache_dir_raw else "")
+            + f", dir={cache_dir}"
         )
 
 

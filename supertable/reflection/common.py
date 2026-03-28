@@ -44,9 +44,9 @@ class Settings:
     def __init__(self) -> None:
         # SUPERTABLE_* — as requested
         self.SUPERTABLE_ORGANIZATION: str = os.getenv("SUPERTABLE_ORGANIZATION", "").strip()
-        self.SUPERTABLE_SUPERTOKEN: str = os.getenv("SUPERTABLE_SUPERTOKEN", "").strip()
-        # Expected user_hash for the superuser (must match the underlying SuperTable user registry)
-        self.SUPERTABLE_SUPERHASH: str = os.getenv("SUPERTABLE_SUPERHASH", "").strip()
+        self.SUPERTABLE_SUPERUSER_TOKEN: str = (
+            os.getenv("SUPERTABLE_SUPERUSER_TOKEN") or os.getenv("SUPERTABLE_SUPERTOKEN") or ""
+        ).strip()
         self.SUPERTABLE_SESSION_SECRET: str = os.getenv("SUPERTABLE_SESSION_SECRET", "").strip()
 
         self.SUPERTABLE_REDIS_URL: Optional[str] = os.getenv("SUPERTABLE_REDIS_URL")
@@ -63,8 +63,6 @@ class Settings:
         self.SUPERTABLE_REDIS_SENTINEL_MASTER: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_MASTER")
         self.SUPERTABLE_REDIS_SENTINEL_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_PASSWORD")
         self.SUPERTABLE_REDIS_SENTINEL_STRICT: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_STRICT")
-
-        self.SUPERTABLE_ADMIN_TOKEN: Optional[str] = os.getenv("SUPERTABLE_ADMIN_TOKEN")
 
         # 1 = only superuser can login, 2 = only regular users can login, 3 = both
         try:
@@ -92,156 +90,71 @@ if settings.SUPERTABLE_LOGIN_MASK not in (1, 2, 3):
     )
 
 
-def _required_token() -> str:
-    """Superuser token required for privileged admin actions."""
-    return (settings.SUPERTABLE_SUPERTOKEN or settings.SUPERTABLE_ADMIN_TOKEN or "").strip()
+# _required_token() — moved to supertable.api.session (imported above)
 
 _missing_envs: List[str] = []
 if not settings.SUPERTABLE_ORGANIZATION:
     _missing_envs.append("SUPERTABLE_ORGANIZATION")
-if not (settings.SUPERTABLE_SUPERTOKEN or "").strip():
-    _missing_envs.append("SUPERTABLE_SUPERTOKEN")
+if not (settings.SUPERTABLE_SUPERUSER_TOKEN or "").strip():
+    _missing_envs.append("SUPERTABLE_SUPERUSER_TOKEN")
 if _missing_envs:
     raise RuntimeError("Missing required environment variables: " + ", ".join(_missing_envs))
 
-if not re.fullmatch(r"[0-9a-fA-F]{16,128}", settings.SUPERTABLE_SUPERHASH or ""):
-    raise RuntimeError("Invalid SUPERTABLE_SUPERHASH (expected hex string)")
+# Derive superuser identity hash from organization name.
+# The superuser is always named "superuser" — hash = sha256("{org}:superuser").
+from supertable.api.session import (  # noqa: E402
+    derive_superuser_hash,
+    SUPERUSER_USERNAME,
+    _SESSION_COOKIE_NAME,
+    _ADMIN_COOKIE_NAME,
+    _SESSION_MAX_AGE_SECONDS,
+    _required_token,
+    _session_secret,
+    _b64url_encode,
+    _b64url_decode,
+    _sign_payload,
+    _encode_session,
+    _decode_session,
+    get_session,
+    _set_session_cookie,
+    _clear_session_cookie,
+    is_logged_in,
+    is_superuser,
+    _is_authorized,
+    _get_provided_token,
+    session_context,
+    inject_session_into_ctx,
+    _sha256_hex,
+    _user_hash,
+    logged_in_guard_api,
+    admin_guard_api,
+)
+import supertable.api.session as session  # noqa: E402
+
+settings.SUPERTABLE_SUPERHASH = derive_superuser_hash(settings.SUPERTABLE_ORGANIZATION)
+
+session.configure(
+    superuser_token=settings.SUPERTABLE_SUPERUSER_TOKEN,
+    session_secret=settings.SUPERTABLE_SESSION_SECRET,
+    secure_cookies=settings.SECURE_COOKIES,
+    superuser_hash=settings.SUPERTABLE_SUPERHASH,
+)
 
 
 
 
 
 
-# ------------------------------ Signed session cookie ------------------------------
-
-_SESSION_COOKIE_NAME = "st_session"
-_ADMIN_COOKIE_NAME = "st_admin_token"
-_SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600
-
-def _session_secret() -> bytes:
-    if settings.SUPERTABLE_SESSION_SECRET:
-        return settings.SUPERTABLE_SESSION_SECRET.encode("utf-8")
-    derived = hashlib.sha256(("st_session:" + _required_token()).encode("utf-8")).hexdigest()
-    return derived.encode("utf-8")
-
-
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
-
-
-def _sign_payload(payload: bytes) -> str:
-    sig = hmac.new(_session_secret(), payload, hashlib.sha256).digest()
-    return _b64url_encode(sig)
-
-
-def _encode_session(data: Dict[str, Any]) -> str:
-    payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return _b64url_encode(payload) + "." + _sign_payload(payload)
-
-
-def _decode_session(value: str) -> Optional[Dict[str, Any]]:
-    try:
-        if not value or "." not in value:
-            return None
-        b64_payload, b64_sig = value.split(".", 1)
-        payload = _b64url_decode(b64_payload)
-        expected = _sign_payload(payload)
-        if not hmac.compare_digest(expected, b64_sig):
-            return None
-        data = json.loads(payload.decode("utf-8"))
-        if not isinstance(data, dict):
-            return None
-        # Enforce server-side expiry in addition to cookie max-age.
-        exp = data.get("exp")
-        if exp is not None:
-            try:
-                if int(exp) < int(time.time()):
-                    return None
-            except Exception:
-                return None
-        return data
-    except Exception:
-        return None
-
-
-def get_session(request: Request) -> Optional[Dict[str, Any]]:
-    return _decode_session(request.cookies.get(_SESSION_COOKIE_NAME, ""))
-
-
-def _set_session_cookie(resp: Response, data: Dict[str, Any]) -> None:
-    # Ensure an expiry exists to prevent indefinite replay if the cookie is copied.
-    data = dict(data)
-    data.setdefault("exp", int(time.time()) + _SESSION_MAX_AGE_SECONDS)
-    resp.set_cookie(
-        _SESSION_COOKIE_NAME,
-        _encode_session(data),
-        httponly=True,
-        samesite="lax",
-        secure=settings.SECURE_COOKIES,
-        max_age=_SESSION_MAX_AGE_SECONDS,
-        path="/",
-    )
-
-
-def _clear_session_cookie(resp: Response) -> None:
-    resp.delete_cookie(_SESSION_COOKIE_NAME, path="/")
-
-
-def is_logged_in(request: Request) -> bool:
-    sess = get_session(request) or {}
-    return bool(sess.get("org") and sess.get("username") and sess.get("user_hash"))
-
-
-def is_superuser(request: Request) -> bool:
-    sess = get_session(request) or {}
-    if sess.get("is_superuser") is True:
-        return True
-    tok = (request.cookies.get(_ADMIN_COOKIE_NAME) or "").strip()
-    required = _required_token()
-    return bool(tok and required and hmac.compare_digest(tok, required))
-
-
-def session_context(request: Request) -> Dict[str, Any]:
-    """Return template-safe session values (always present keys)."""
-    sess = get_session(request) or {}
-    return {
-        "session_username": (sess.get("username") or "").strip(),
-        "session_org": (sess.get("org") or "").strip(),
-        "session_user_hash": (sess.get("user_hash") or "").strip(),
-        "session_is_superuser": bool(sess.get("is_superuser") is True) or is_superuser(request),
-        "session_logged_in": bool(sess.get("org") and sess.get("username") and sess.get("user_hash")),
-        "session_role_name": (sess.get("role_name") or "").strip(),
-        "session_roles": sess.get("roles") or [],
-    }
-
-
-def inject_session_into_ctx(ctx: Dict[str, Any], request: Request) -> Dict[str, Any]:
-    """Mutates and returns ctx with session_* keys for Jinja templates."""
-    try:
-        ctx.update(session_context(request))
-    except Exception:
-        # Never fail template rendering due to session issues
-        ctx.setdefault("session_username", "")
-        ctx.setdefault("session_org", "")
-        ctx.setdefault("session_user_hash", "")
-        ctx.setdefault("session_is_superuser", False)
-        ctx.setdefault("session_logged_in", False)
-        ctx.setdefault("session_role_name", "")
-        ctx.setdefault("session_roles", [])
-    return ctx
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _user_hash(org: str, username: str) -> str:
-    return _sha256_hex(f"{org}:{username}")
+# ------------------------------ Session & auth (supertable.api.session) ---------
+# Session cookie, auth checks, guards, and identity helpers are implemented in
+# supertable.api.session and imported above for backward compatibility.
+# Moved: _SESSION_COOKIE_NAME, _ADMIN_COOKIE_NAME, _SESSION_MAX_AGE_SECONDS,
+#   _session_secret, _b64url_encode, _b64url_decode, _sign_payload,
+#   _encode_session, _decode_session, get_session, _set_session_cookie,
+#   _clear_session_cookie, is_logged_in, is_superuser, session_context,
+#   inject_session_into_ctx, _sha256_hex, _user_hash,
+#   _is_authorized, _get_provided_token, logged_in_guard_api, admin_guard_api
+# ---------------------------------------------------------------------------
 
 
 def _now_ms() -> int:
@@ -689,16 +602,9 @@ def _escape(s: str) -> str:
     return html.escape(str(s or ""), quote=True)
 
 
-# ------------------------------ Auth helpers ------------------------------
-
-
-def _get_provided_token(request: Request) -> Optional[str]:
-    cookie = request.cookies.get(_ADMIN_COOKIE_NAME)
-    return cookie.strip() if isinstance(cookie, str) else None
-
-
-def _is_authorized(request: Request) -> bool:
-    return is_logged_in(request)
+# ------------------------------ Auth helpers (supertable.api.session) ------
+# _get_provided_token, _is_authorized — moved to session.py (imported above)
+# ---------------------------------------------------------------------------
 
 
 def _no_store(resp: Response):
@@ -736,17 +642,7 @@ def _render_login(request: Request, message: Optional[str] = None, clear_cookie:
     return resp
 
 
-def logged_in_guard_api(request: Request):
-    if _is_authorized(request):
-        return True
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def admin_guard_api(request: Request):
-    # Admin-only (superuser) guard for any privileged operations.
-    if _is_authorized(request) and is_superuser(request):
-        return True
-    raise HTTPException(status_code=403, detail="Forbidden")
+# logged_in_guard_api, admin_guard_api — moved to session.py (imported above)
 
 
 # ------------------------------ Users/Roles readers ------------------------------

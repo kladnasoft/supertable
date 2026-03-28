@@ -70,7 +70,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("SUPERTABLE_API_HOST", os.getenv("SUPERTABLE_HOST", "0.0.0.0"))
-    port = int(os.getenv("SUPERTABLE_API_PORT", "8051"))
+    port = int(os.getenv("SUPERTABLE_API_PORT", "8050"))
     reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
 
     uvicorn.run(

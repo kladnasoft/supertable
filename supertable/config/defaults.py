@@ -87,7 +87,7 @@ def _load_env(env_file: str | None, prefer_system: bool, force: bool = False) ->
 def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = True) -> Default:
     _load_env(env_file, prefer_system=prefer_system)
 
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = os.getenv("SUPERTABLE_LOG_LEVEL", "INFO").upper()
     if log_level not in _VALID_LOG_LEVELS:
         logger.warning(f"Invalid LOG_LEVEL={log_level!r}. Falling back to INFO.")
         log_level = "INFO"

@@ -1,5 +1,7 @@
+# route: supertable.api.auth
 from __future__ import annotations
 
+import hmac
 import os
 
 from fastapi import HTTPException, Request, status
@@ -47,8 +49,8 @@ def build_auth_dependency():
             return
 
         if cfg.mode == "api_key":
-            presented = request.headers.get(cfg.api_key_header_name, "")
-            if not presented or presented.strip() != cfg.api_key:
+            presented = (request.headers.get(cfg.api_key_header_name) or "").strip()
+            if not presented or not hmac.compare_digest(presented, cfg.api_key):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid or missing API key",
@@ -71,7 +73,7 @@ def build_auth_dependency():
             )
 
         token = auth[len(prefix):].strip()
-        if token != cfg.bearer_token:
+        if not token or not hmac.compare_digest(token, cfg.bearer_token):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid bearer token",

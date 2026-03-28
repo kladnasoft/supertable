@@ -22,8 +22,10 @@ RUN groupadd --gid 1001 supertable \
  && useradd --uid 1001 --gid 1001 --home "${HOME}" --shell /sbin/nologin --no-create-home supertable
 
 # Install Python deps first for layer caching
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Uses requirements-docker.txt (full server deps).
+# The lean requirements.txt is for PyPI only.
+COPY requirements-docker.txt ./requirements-docker.txt
+RUN pip install --no-cache-dir -r requirements-docker.txt
 
 # Bake common runtime dirs + DuckDB httpfs extension (offline-friendly).
 # 0755 dirs — only the supertable user needs write access at runtime.

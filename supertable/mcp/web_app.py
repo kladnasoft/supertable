@@ -78,7 +78,7 @@ def _read_html(filename: str) -> str:
 
 
 def _configured_tool_auth_token() -> str:
-    return (os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "").strip()
+    return (os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "").strip()
 
 
 
@@ -141,12 +141,12 @@ def _expected_gateway_token() -> str:
     """
     Token required to access the HTTP gateway + web API.
 
-    By default we use SUPERTABLE_SUPERTOKEN (same token you already use for the web UI),
+    By default we use SUPERTABLE_SUPERUSER_TOKEN (same token you already use for the web UI),
     and fall back to SUPERTABLE_MCP_HTTP_TOKEN for deployments that prefer a dedicated
     gateway secret.
     """
 
-    return (os.getenv("SUPERTABLE_SUPERTOKEN") or os.getenv("SUPERTABLE_MCP_HTTP_TOKEN") or "").strip()
+    return (os.getenv("SUPERTABLE_SUPERUSER_TOKEN") or os.getenv("SUPERTABLE_SUPERTOKEN") or os.getenv("SUPERTABLE_MCP_HTTP_TOKEN") or "").strip()
 
 
 def _require_gateway_auth(req: Request) -> None:
@@ -166,7 +166,7 @@ def _require_gateway_auth(req: Request) -> None:
     if not expected:
         raise HTTPException(
             status_code=500,
-            detail="SUPERTABLE_SUPERTOKEN (or SUPERTABLE_MCP_HTTP_TOKEN) must be set to protect the web gateway",
+            detail="SUPERTABLE_SUPERUSER_TOKEN (or SUPERTABLE_MCP_HTTP_TOKEN) must be set to protect the web gateway",
         )
 
     got = _parse_bearer(req.headers.get("authorization", ""))
@@ -248,7 +248,7 @@ async def mcp_http_gateway_v1(req: Request, payload: Dict[str, Any] = Body(...))
       - X-MCP-Auth-Token: <tool auth token>    (optional tool auth override)
 
     If X-MCP-Auth-Token is not provided, the server falls back to
-    SUPERTABLE_MCP_AUTH_TOKEN when forwarding ``tools/call`` requests.
+    SUPERTABLE_MCP_TOKEN when forwarding ``tools/call`` requests.
     """
 
     _require_gateway_auth(req)

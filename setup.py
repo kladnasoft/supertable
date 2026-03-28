@@ -27,7 +27,15 @@ setup(
     author_email="lkupas@kladnasoft.com",
     license="Super Table Public Use License (STPUL) v1.0",
     python_requires=">=3.10",
-    packages=find_packages(include=["supertable", "supertable.*"]),
+    packages=find_packages(
+        include=["supertable", "supertable.*"],
+        exclude=[
+            "supertable.mcp", "supertable.mcp.*",
+            "supertable.api", "supertable.api.*",
+            "supertable.reflection", "supertable.reflection.*",
+            "supertable.odata", "supertable.odata.*",
+        ],
+    ),
     include_package_data=True,
     install_requires=read_requirements(),
     classifiers=[
@@ -36,18 +44,22 @@ setup(
         "License :: Other/Proprietary License",
         "Operating System :: OS Independent",
     ],
-    # Optional cloud backends (each includes redis for locking)
     extras_require={
-        "s3": ["boto3>=1.34", "redis>=5.2.1"],
-        "minio": ["minio>=7.2", "redis>=5.2.1"],
-        "azure": ["azure-storage-blob>=12.24", "redis>=5.2.1"],
-        "gcp": ["google-cloud-storage>=3.1.0", "redis>=5.2.1"],
+        "s3": ["boto3>=1.34,<2.0"],
+        "minio": ["minio>=7.2,<8.0"],
+        "azure": ["azure-storage-blob>=12.26.0"],
+        "gcp": ["google-cloud-storage>=3.1.0"],
         "all-cloud": [
-            "boto3>=1.34",
-            "minio>=7.2",
-            "azure-storage-blob>=12.24",
+            "boto3>=1.34,<2.0",
+            "minio>=7.2,<8.0",
+            "azure-storage-blob>=12.26.0",
             "google-cloud-storage>=3.1.0",
-            "redis>=5.2.1",
+        ],
+        "all": [
+            "boto3>=1.34,<2.0",
+            "minio>=7.2,<8.0",
+            "azure-storage-blob>=12.26.0",
+            "google-cloud-storage>=3.1.0",
         ],
     },
     # ⚠️ This exposes the CLI: `supertable config ...`
