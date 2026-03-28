@@ -69,119 +69,28 @@ def _parse_ts_ms(value: Any) -> Optional[int]:
         return None
 
 
+
+# ---------------------------------------------------------------------------
+# Route attachment — no-op stub.
+# All endpoints previously registered here have moved to supertable.api.api.
+# This function is preserved so existing callers do not break.
+# ---------------------------------------------------------------------------
+
 def attach_monitoring_routes(
-    router: APIRouter,
+    router,
     *,
-    templates: Any,
-    redis_client: Any,
-    is_authorized: Callable[[Request], bool],
-    no_store: Callable[[Any], None],
-    get_provided_token: Callable[[Request], Optional[str]],
-    discover_pairs: Callable[[], List],
-    resolve_pair: Callable[[Optional[str], Optional[str]], Tuple[str, str]],
-    inject_session_into_ctx: Callable[[Dict[str, Any], Request], Any],
-    logged_in_guard_api: Any,
-) -> None:
-    """Attach monitoring page and API routes."""
-
-    @router.get("/reflection/monitoring", response_class=HTMLResponse)
-    def monitoring_page(
-        request: Request,
-        org: Optional[str] = Query(None),
-        sup: Optional[str] = Query(None),
-    ):
-        if not is_authorized(request):
-            resp = RedirectResponse("/reflection/login", status_code=302)
-            no_store(resp)
-            return resp
-
-        provided = get_provided_token(request) or ""
-        pairs = discover_pairs()
-        sel_org, sel_sup = resolve_pair(org, sup)
-        tenants = [
-            {"org": o, "sup": s, "selected": (o == sel_org and s == sel_sup)}
-            for o, s in pairs
-        ]
-
-        ctx: Dict[str, Any] = {
-            "request": request,
-            "authorized": True,
-            "token": provided,
-            "tenants": tenants,
-            "sel_org": sel_org,
-            "sel_sup": sel_sup,
-            "has_tenant": bool(sel_org and sel_sup),
-        }
-        inject_session_into_ctx(ctx, request)
-        resp = templates.TemplateResponse("monitoring.html", ctx)
-        no_store(resp)
-        return resp
-
-    @router.get("/reflection/monitoring/reads")
-    def monitoring_reads(
-        org: str = Query(""),
-        sup: str = Query(""),
-        from_ts: Optional[int] = Query(None),
-        to_ts: Optional[int] = Query(None),
-        limit: int = Query(500),
-        _=Depends(logged_in_guard_api),
-    ):
-        """
-        Return read (query execution) operations from monitoring.
-
-        Query params:
-          from_ts — epoch ms, inclusive lower bound
-          to_ts   — epoch ms, inclusive upper bound
-          limit   — max items returned (default 500)
-        """
-        org = (org or "").strip()
-        sup = (sup or "").strip()
-        if not org or not sup:
-            return JSONResponse({"ok": True, "items": []})
-
-        items = _read_monitoring_list(
-            redis_client, org, sup,
-            monitor_type="plans",
-            from_ts_ms=from_ts,
-            to_ts_ms=to_ts,
-            limit=limit,
-        )
-        return JSONResponse({"ok": True, "items": items})
-
-    @router.get("/reflection/monitoring/writes")
-    def monitoring_writes(
-        org: str = Query(""),
-        sup: str = Query(""),
-        from_ts: Optional[int] = Query(None),
-        to_ts: Optional[int] = Query(None),
-        limit: int = Query(500),
-        _=Depends(logged_in_guard_api),
-    ):
-        """
-        Return write operations from monitoring.
-
-        Reads from Redis list  monitor:{org}:{sup}:writes
-        Each item has 'recorded_at' as ISO 8601 string.
-
-        Query params:
-          from_ts — epoch ms, inclusive lower bound
-          to_ts   — epoch ms, inclusive upper bound
-          limit   — max items returned (default 500)
-        """
-        org = (org or "").strip()
-        sup = (sup or "").strip()
-        if not org or not sup:
-            return JSONResponse({"ok": True, "items": []})
-
-        items = _read_monitoring_list(
-            redis_client, org, sup,
-            monitor_type="writes",
-            from_ts_ms=from_ts,
-            to_ts_ms=to_ts,
-            limit=limit,
-            ts_fields=("recorded_at", "execution_time", "timestamp"),
-        )
-        return JSONResponse({"ok": True, "items": items})
+    templates,
+    redis_client,
+    is_authorized,
+    no_store,
+    get_provided_token,
+    discover_pairs,
+    resolve_pair,
+    inject_session_into_ctx,
+    logged_in_guard_api,
+):
+    """No-op — endpoints moved to supertable.api.api."""
+    pass
 
 
 def _read_monitoring_list(
