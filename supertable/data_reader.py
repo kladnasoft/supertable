@@ -22,7 +22,7 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
-from supertable.data_classes import TableDefinition, DedupViewDef, TombstoneDef
+from supertable.data_classes import DedupViewDef, TombstoneDef
 from supertable.redis_catalog import RedisCatalog
 
 

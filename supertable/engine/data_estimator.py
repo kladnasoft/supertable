@@ -14,14 +14,9 @@ from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
-from supertable.rbac.access_control import restrict_read_access
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
 from supertable.utils.sql_parser import TableDefinition
-
-
-def _lower_set(items: Iterable[str]) -> Set[str]:
-    return {str(x).lower() for x in items}
 
 
 from typing import Dict, List, Optional, Set, Tuple

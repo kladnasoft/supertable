@@ -89,21 +89,6 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
 # Scheduler thread
 # ──────────────────────────────────────────────────────────────────────
 
-def start_quality_scheduler() -> None:
-    """Start the background scheduler thread (called from application.py startup)."""
-    global _scheduler_thread
-    with _scheduler_lock:
-        if _scheduler_thread is not None and _scheduler_thread.is_alive():
-            logger.info("[dq-scheduler] Already running, skipping start")
-            return
-        _scheduler_thread = threading.Thread(
-            target=_scheduler_loop,
-            name="dq-scheduler",
-            daemon=True,
-        )
-        _scheduler_thread.start()
-        logger.info("[dq-scheduler] Started background quality scheduler")
-
 
 def _scheduler_loop() -> None:
     """Main loop — checks every 60s if any cron expression is due."""

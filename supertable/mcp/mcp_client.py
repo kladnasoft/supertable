@@ -332,13 +332,6 @@ def extract_structured_result(resp: Dict[str, Any]) -> Tuple[bool, Any]:
     return False, result
 
 
-def _unwrap_result_dict(payload: Any) -> Any:
-    """Many tools return {"result": {...}}. Normalize that to the inner dict."""
-    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
-        return payload["result"]
-    return payload
-
-
 def print_query_result(obj: Any) -> None:
     if not isinstance(obj, dict):
         print(obj, flush=True)

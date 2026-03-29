@@ -91,28 +91,6 @@ def _auth_tokens_key(org: str) -> str:
 
 
 # Deprecated key helpers — kept for reference, no longer used by RBAC code.
-def _users_key(org: str, sup: str) -> str:
-    return _rbac_user_meta_key(org, sup)
-
-
-def _roles_key(org: str, sup: str) -> str:
-    return _rbac_role_meta_key(org, sup)
-
-
-def _user_hash_key(org: str, sup: str, user_hash: str) -> str:
-    return _rbac_user_doc_key(org, sup, user_hash)
-
-
-def _role_hash_key(org: str, sup: str, role_hash: str) -> str:
-    return _rbac_role_doc_key(org, sup, role_hash)
-
-
-def _user_name_to_hash_key(org: str, sup: str) -> str:
-    return _rbac_username_to_id_key(org, sup)
-
-
-def _role_type_to_hash_key(org: str, sup: str, role_type: str) -> str:
-    return _rbac_role_type_index_key(org, sup, role_type)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,24 +107,7 @@ def _spark_plugs_key(org: str) -> str:
     return f"spark:{org}:plugs"
 
 
-def _compute_pools_key(org: str, sup: str) -> str:
-    """Key for unified compute pool state (org+sup scoped).
-
-    Pools of all kinds (in-process, spark-thrift, spark-plug, spark, kubernetes)
-    are stored together under one JSON blob keyed by tenant.
-    """
-    return f"supertable:reflection:compute:{org}__{sup}"
-
-
 # Deprecated: kept for backward compatibility / migration reference.
-def _spark_clusters_key() -> str:
-    """HASH: cluster_id → JSON cluster config (global, not org-scoped)."""
-    return "supertable:spark:clusters"
-
-
-def _spark_cluster_doc_key(cluster_id: str) -> str:
-    """HASH fields for a single cluster document."""
-    return f"supertable:spark:cluster:{cluster_id}"
 
 
 # --------------------------------------------------------------------------- #

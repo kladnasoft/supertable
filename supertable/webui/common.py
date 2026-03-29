@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import json
-import html
 from datetime import datetime, timezone, date
 from decimal import Decimal
 from typing import Dict, Iterator, List, Optional, Tuple, Set, Any
@@ -593,10 +592,6 @@ def _fmt_ts(ms: int) -> str:
         return str(ms)
 
 
-def _escape(s: str) -> str:
-    return html.escape(str(s or ""), quote=True)
-
-
 # ------------------------------ Auth helpers (supertable.api.session) ------
 # _get_provided_token, _is_authorized — moved to session.py (imported above)
 # ---------------------------------------------------------------------------
@@ -855,36 +850,6 @@ def _get_meta_reader(organization: str, super_name: str):
             pass
     _meta_reader_cache[key] = reader
     return reader
-
-# ------------------------------ Admin: .env configuration ----------------------
-
-_SENSITIVE_KEY_PARTS = (
-    "PASSWORD", "PASS", "SECRET", "TOKEN", "KEY",
-    "ACCESS_KEY", "CONNECTION_STRING", "API_KEY", "CLIENT_SECRET",
-)
-
-_ENV_KEY_RE = re.compile(r"^[A-Z0-9_]+$")
-
-
-def _env_file_path() -> Path:
-    here = Path(__file__).resolve()
-    reflection_dir = here.parent
-    pkg_dir = reflection_dir.parent
-    return (pkg_dir.parent / (settings.DOTENV_PATH or ".env")).resolve()
-
-
-def _is_sensitive_env_key(key: str) -> bool:
-    k = (key or "").upper()
-    return any(part in k for part in _SENSITIVE_KEY_PARTS)
-
-
-def _mask_secret(v: str) -> str:
-    if not v:
-        return ""
-    if len(v) <= 4:
-        return "****"
-    return "****" + v[-4:]
-
 
 # ------------------------------ Admin: auth tokens -----------------------------
 

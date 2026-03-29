@@ -302,26 +302,4 @@ def _delete_user(redis_client: Any, org: str, sup: str, user_id: str) -> bool:
 # Route attachment
 # ---------------------------------------------------------------------------
 
-def attach_rbac_routes(
-    router: APIRouter,
-    *,
-    templates: Any,
-    settings: Any,
-    redis_client: Any,
-    is_authorized: Callable[[Request], bool],
-    no_store: Callable[[Any], None],
-    get_provided_token: Callable[[Request], str],
-    discover_pairs: Callable[[], List[List[str]]],
-    resolve_pair: Callable[[Optional[str], Optional[str]], Any],
-    inject_session_into_ctx: Callable[[Dict[str, Any], Request], Dict[str, Any]],
-    get_session: Callable[[Request], Optional[Dict[str, Any]]],
-    admin_guard_api: Callable[..., Any],
-) -> None:
-    # ── All RBAC page and CRUD routes have moved to security.py ───────────
-    # This function is intentionally a no-op.  It is preserved so that
-    # callers (not_common.py) do not break.  The page route, role CRUD,
-    # user CRUD, and the /reflection/rbac redirect are now registered by
-    # attach_security_routes in supertable.reflection.security.
-    pass
-
 

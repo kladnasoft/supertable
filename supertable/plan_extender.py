@@ -6,8 +6,6 @@ from typing import Dict, Any, Tuple
 
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.engine.plan_stats import PlanStats
-from supertable.storage.storage_factory import get_storage
-from supertable.super_table import SuperTable
 from supertable.monitoring_writer import MonitoringWriter
 
 logger = logging.getLogger(__name__)

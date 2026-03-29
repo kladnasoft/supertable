@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import pyarrow as pa
@@ -34,15 +33,6 @@ def _resolve_super_name(super_table: Any) -> Optional[str]:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
-
-
-@dataclass(frozen=True)
-class StageInfo:
-    name: str
-    path: str
-    files_index_path: str
-    files: List[str]
-    file_count: int
 
 
 class Staging:

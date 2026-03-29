@@ -11,7 +11,3 @@ Provides:
   - Parquet-backed history (__data_quality__ table)
 """
 from __future__ import annotations
-
-from supertable.reflection.quality.routes import attach_quality_routes
-
-__all__ = ["attach_quality_routes"]

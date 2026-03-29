@@ -321,19 +321,3 @@ def _save(org: str, sup: str, data: Dict[str, Any]) -> None:
 # Route attachment — no-op stub.
 # All endpoints have moved to supertable.api.api.
 # ---------------------------------------------------------------------------
-
-def attach_compute_routes(
-    router: APIRouter,
-    *,
-    templates: Any,
-    is_authorized: Callable[[Request], bool],
-    no_store: Callable[[Any], None],
-    get_provided_token: Callable[[Request], Optional[str]],
-    discover_pairs: Callable[[], Sequence[Tuple[str, str]]],
-    resolve_pair: Callable[[Optional[str], Optional[str]], Tuple[Optional[str], Optional[str]]],
-    inject_session_into_ctx: Callable[[Dict[str, Any], Request], None],
-    logged_in_guard_api: Any,
-    admin_guard_api: Any,
-) -> None:
-    """No-op — endpoints moved to supertable.api.api."""
-    pass

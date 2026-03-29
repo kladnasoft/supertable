@@ -110,20 +110,3 @@ def _sanitize_for_json(obj: Any) -> Any:
 # All endpoints previously registered here have moved to supertable.api.api.
 # This function is preserved so existing callers do not break.
 # ---------------------------------------------------------------------------
-
-def attach_execute_routes(
-    router,
-    *,
-    templates,
-    is_authorized,
-    no_store,
-    get_provided_token,
-    discover_pairs,
-    resolve_pair,
-    inject_session_into_ctx,
-    get_session,
-    logged_in_guard_api,
-    admin_guard_api,
-):
-    """No-op — endpoints moved to supertable.api.api."""
-    pass

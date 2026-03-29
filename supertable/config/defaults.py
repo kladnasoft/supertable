@@ -1,5 +1,4 @@
 # route: supertable.config.defaults
-import os
 import logging
 from dataclasses import dataclass
 
@@ -42,12 +41,6 @@ class Default:
         logger.debug(f"Log level changed to {self.LOG_LEVEL}")
 
 
-def _parse_bool(val: str, default: bool = True) -> bool:
-    if val is None:
-        return default
-    return val.strip().lower() in ("1","true","yes","y","on")
-
-
 def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = True) -> Default:
     log_level = settings.SUPERTABLE_LOG_LEVEL
     if log_level not in _VALID_LOG_LEVELS:
@@ -67,35 +60,3 @@ def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = Tr
 
 # module-level default (backward compatibility)
 default = load_defaults_from_env(prefer_system=True)
-
-def refresh_defaults(env_file: str | None = None, prefer_system: bool = True) -> None:
-    global default
-    default = load_defaults_from_env(env_file=env_file, prefer_system=prefer_system)
-    logger.info(f"Defaults refreshed. STORAGE_TYPE={default.STORAGE_TYPE}, LOG_LEVEL={default.LOG_LEVEL}")
-
-def print_config() -> None:
-    _MASKED_KEYS = frozenset({"STORAGE_SECRET_KEY", "STORAGE_ACCESS_KEY", "AZURE_STORAGE_KEY", "AZURE_SAS_TOKEN"})
-    keys = [
-        "STORAGE_TYPE", "SUPERTABLE_HOME",
-        "STORAGE_BUCKET", "STORAGE_REGION",
-        "STORAGE_ENDPOINT_URL", "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY",
-        "STORAGE_FORCE_PATH_STYLE", "STORAGE_SESSION_TOKEN",
-        "SUPERTABLE_DUCKDB_USE_HTTPFS", "SUPERTABLE_PREFIX",
-        "REDIS_URL", "LOG_LEVEL",
-    ]
-    logger.info("---- Effective SuperTable configuration ----")
-    for k in keys:
-        v = getattr(settings, k, None)
-        if v is None or v == "":
-            continue
-        v = str(v)
-        if k in _MASKED_KEYS:
-            v = "****" + v[-4:] if len(v) > 4 else "****"
-        logger.info(f"{k} = {v}")
-    logger.info(
-        f"(defaults) STORAGE_TYPE={default.STORAGE_TYPE}, "
-        f"LOG_LEVEL={default.LOG_LEVEL}, "
-        f"IS_SHOW_TIMING={default.IS_SHOW_TIMING}, "
-        f"MAX_MEMORY_CHUNK_SIZE={default.MAX_MEMORY_CHUNK_SIZE}, "
-        f"MAX_OVERLAPPING_FILES={default.MAX_OVERLAPPING_FILES}"
-    )

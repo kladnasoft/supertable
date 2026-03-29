@@ -187,70 +187,6 @@ def list_supers(organization: str) -> List[str]:
     return sorted({s for s in supers if s})
 
 
-def _list_leaves(
-    org: Optional[str] = None,
-    sup: Optional[str] = None,
-    q: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 50,
-) -> Dict[str, Any]:
-    org, sup = resolve_pair(org, sup)
-    if not org or not sup:
-        return {"org": org, "sup": sup, "total": 0, "page": page, "page_size": page_size, "items": []}
-
-    items: List[Dict] = []
-    total = 0
-    ql = (q or "").lower()
-
-    scan_iter = None
-    if hasattr(catalog, "scan_leaf_items"):
-        try:
-            scan_iter = catalog.scan_leaf_items(org, sup, count=1000)
-        except Exception:
-            scan_iter = None
-
-    if scan_iter is None:
-        rc = RedisCatalog()
-        pattern = f"supertable:{org}:{sup}:meta:leaf:*"
-        cursor = 0
-        while True:
-            cursor, keys = rc.r.scan(cursor=cursor, match=pattern, count=1000)
-            for key in keys:
-                raw = rc.r.get(key)
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    continue
-                simple = (key if isinstance(key, str) else key.decode("utf-8")).rsplit("meta:leaf:", 1)[-1]
-                rec = {
-                    "simple": simple,
-                    "version": int(obj.get("version", -1)),
-                    "ts": int(obj.get("ts", 0)),
-                    "path": obj.get("path", ""),
-                }
-                if q and ql not in simple.lower():
-                    continue
-                total += 1
-                items.append(rec)
-            if cursor == 0:
-                break
-    else:
-        for item in scan_iter:
-            simple = item.get("simple", "")
-            if q and ql not in simple.lower():
-                continue
-            total += 1
-            items.append(item)
-
-    items.sort(key=lambda x: x.get("simple", ""))
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = items[start:end]
-    return {"org": org, "sup": sup, "total": total, "page": page, "page_size": page_size, "items": page_items}
-
-
 # ---------------------------------------------------------------------------
 # Ingestion: build redis helper closures bound to the shared redis_client
 # ---------------------------------------------------------------------------
@@ -1154,16 +1090,6 @@ def api_delete_staging(
 
     _redis_delete_staging_cascade(org, sup, staging_name)
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
-
-
-def _parse_overwrite_columns(raw: Optional[str]) -> List[str]:
-    if raw is None:
-        return ["day"]
-    s = (raw or "").strip()
-    if not s:
-        return []
-    cols = [c.strip() for c in s.split(",")]
-    return [c for c in cols if c]
 
 
 @router.post("/reflection/pipes/save")

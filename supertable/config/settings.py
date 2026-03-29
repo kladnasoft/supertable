@@ -53,11 +53,6 @@ def _env_str(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
 
-def _env_str_optional(name: str) -> Optional[str]:
-    v = (os.getenv(name) or "").strip()
-    return v if v else None
-
-
 def _env_int(name: str, default: int) -> int:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -174,7 +169,6 @@ class Settings:
     SUPERTABLE_SPARK_STATEMENT_TIMEOUT: int = 120  # SUPERTABLE_SPARK_STATEMENT_TIMEOUT
     SUPERTABLE_SPARK_CONNECT_TIMEOUT: int = 30     # SUPERTABLE_SPARK_CONNECT_TIMEOUT
     SUPERTABLE_SPARK_BATCH_SIZE: int = 50          # SUPERTABLE_SPARK_BATCH_SIZE
-    SPARK_MASTER_URL: str = "spark://localhost:7078"  # SPARK_MASTER_URL
 
     # ── Redis ────────────────────────────────────────────────────────
     SUPERTABLE_REDIS_URL: str = ""               # SUPERTABLE_REDIS_URL
@@ -255,20 +249,10 @@ class Settings:
 
     # ── Notebook / Python Worker ─────────────────────────────────────
     SUPERTABLE_NOTEBOOK_PORT: int = 8010         # SUPERTABLE_NOTEBOOK_PORT  (unified: 8010)
-    SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS: str = ""  # SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS
-    SUPERTABLE_NOTEBOOK_STATEFUL_WS: bool = True  # SUPERTABLE_NOTEBOOK_STATEFUL_WS
-    SUPERTABLE_NOTEBOOK_ALLOWED_IMPORTS: str = (   # SUPERTABLE_NOTEBOOK_ALLOWED_IMPORTS
-        "math,re,json,datetime,statistics,random,decimal,"
-        "collections,itertools,functools,typing,"
-        "pandas,pyarrow,numpy,supertable"
-    )
 
     # ── Meta Reader / Caching ────────────────────────────────────────
     SUPERTABLE_SUPER_META_CACHE_TTL_S: Optional[float] = None  # SUPERTABLE_SUPER_META_CACHE_TTL_S
 
-    # ── Vault / Encryption ───────────────────────────────────────────
-    SUPERTABLE_VAULT_FERNET_KEY: str = ""        # SUPERTABLE_VAULT_FERNET_KEY
-    SUPERTABLE_VAULT_MASTER_KEY: str = ""        # SUPERTABLE_VAULT_MASTER_KEY
 
     # ── Convenience properties ───────────────────────────────────────
 
@@ -342,16 +326,6 @@ def _build_settings() -> Settings:
         os.path.expanduser("~"), ".config"
     )
 
-    # Notebook allowed imports — also check legacy alias
-    notebook_imports = (
-        _env_str("SUPERTABLE_LAB_ALLOWED_IMPORTS")
-        or _env_str(
-            "SUPERTABLE_NOTEBOOK_ALLOWED_IMPORTS",
-            "math,re,json,datetime,statistics,random,decimal,"
-            "collections,itertools,functools,typing,"
-            "pandas,pyarrow,numpy,supertable",
-        )
-    )
 
     return Settings(
         # ── Core ─────────────────────────────────────────────────────
@@ -416,7 +390,6 @@ def _build_settings() -> Settings:
         SUPERTABLE_SPARK_STATEMENT_TIMEOUT=_env_int("SUPERTABLE_SPARK_STATEMENT_TIMEOUT", 120),
         SUPERTABLE_SPARK_CONNECT_TIMEOUT=_env_int("SUPERTABLE_SPARK_CONNECT_TIMEOUT", 30),
         SUPERTABLE_SPARK_BATCH_SIZE=_env_int("SUPERTABLE_SPARK_BATCH_SIZE", 50),
-        SPARK_MASTER_URL=_env_str("SPARK_MASTER_URL", "spark://localhost:7078"),
 
         # ── Redis ────────────────────────────────────────────────────
         SUPERTABLE_REDIS_URL=_env_str("SUPERTABLE_REDIS_URL"),
@@ -498,16 +471,10 @@ def _build_settings() -> Settings:
 
         # ── Notebook / Python Worker ─────────────────────────────────
         SUPERTABLE_NOTEBOOK_PORT=_env_int("SUPERTABLE_NOTEBOOK_PORT", 8010),
-        SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS=_env_str("SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS"),
-        SUPERTABLE_NOTEBOOK_STATEFUL_WS=_env_bool("SUPERTABLE_NOTEBOOK_STATEFUL_WS", True),
-        SUPERTABLE_NOTEBOOK_ALLOWED_IMPORTS=notebook_imports,
 
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
 
-        # ── Vault / Encryption ───────────────────────────────────────
-        SUPERTABLE_VAULT_FERNET_KEY=_env_str("SUPERTABLE_VAULT_FERNET_KEY"),
-        SUPERTABLE_VAULT_MASTER_KEY=_env_str("SUPERTABLE_VAULT_MASTER_KEY"),
     )
 
 

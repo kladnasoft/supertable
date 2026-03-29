@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 
 from supertable.config.defaults import logger
 from supertable.utils.helper import generate_hash_uid
-from supertable.utils.sql_parser import SQLParser
 
 try:
     from supertable.config.homedir import get_app_home

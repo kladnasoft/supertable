@@ -1277,21 +1277,6 @@ class TestBackwardCompatAliases(unittest.TestCase):
         self.assertNotIn(rid, self.um.get_user(u1)["roles"])
         self.assertNotIn(rid, self.um.get_user(u2)["roles"])
 
-    def test_deprecated_key_helpers_delegate(self):
-        """Old key helpers should return the same keys as new _rbac_ helpers."""
-        from supertable.redis_catalog import (
-            _users_key, _roles_key, _user_hash_key, _role_hash_key,
-            _user_name_to_hash_key, _role_type_to_hash_key,
-            _rbac_user_meta_key, _rbac_role_meta_key, _rbac_user_doc_key,
-            _rbac_role_doc_key, _rbac_username_to_id_key, _rbac_role_type_index_key,
-        )
-        self.assertEqual(_users_key("o", "s"), _rbac_user_meta_key("o", "s"))
-        self.assertEqual(_roles_key("o", "s"), _rbac_role_meta_key("o", "s"))
-        self.assertEqual(_user_hash_key("o", "s", "h"), _rbac_user_doc_key("o", "s", "h"))
-        self.assertEqual(_role_hash_key("o", "s", "h"), _rbac_role_doc_key("o", "s", "h"))
-        self.assertEqual(_user_name_to_hash_key("o", "s"), _rbac_username_to_id_key("o", "s"))
-        self.assertEqual(_role_type_to_hash_key("o", "s", "admin"), _rbac_role_type_index_key("o", "s", "admin"))
-
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  12. Empty state / edge cases                                              #

@@ -15,8 +15,6 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from supertable.storage.storage_factory import get_storage
-
 # Prefer installed package; fallback to local module for dev
 try:
     from supertable.meta_reader import MetaReader  # type: ignore
@@ -394,22 +392,3 @@ def _make_redis_helpers(redis_client: Any) -> Dict[str, Any]:
 # All endpoints previously registered here have moved to supertable.api.api.
 # This function is preserved so existing callers do not break.
 # ---------------------------------------------------------------------------
-
-def attach_ingestion_routes(
-    router,
-    *,
-    templates,
-    is_authorized,
-    no_store,
-    get_provided_token,
-    discover_pairs,
-    resolve_pair,
-    inject_session_into_ctx,
-    get_session,
-    is_superuser,
-    logged_in_guard_api,
-    admin_guard_api,
-    redis_client,
-):
-    """No-op — endpoints moved to supertable.api.api."""
-    pass

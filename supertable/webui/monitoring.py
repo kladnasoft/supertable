@@ -76,22 +76,6 @@ def _parse_ts_ms(value: Any) -> Optional[int]:
 # This function is preserved so existing callers do not break.
 # ---------------------------------------------------------------------------
 
-def attach_monitoring_routes(
-    router,
-    *,
-    templates,
-    redis_client,
-    is_authorized,
-    no_store,
-    get_provided_token,
-    discover_pairs,
-    resolve_pair,
-    inject_session_into_ctx,
-    logged_in_guard_api,
-):
-    """No-op — endpoints moved to supertable.api.api."""
-    pass
-
 
 def _read_monitoring_list(
     redis_client: Any,

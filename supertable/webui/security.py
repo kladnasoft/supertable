@@ -594,23 +594,3 @@ def verify_odata_bearer_token(redis_client: Any, token: str) -> Optional[Dict[st
 # All endpoints previously registered here have moved to supertable.api.api.
 # This function is preserved so existing callers do not break.
 # ---------------------------------------------------------------------------
-
-def attach_security_routes(
-    router,
-    *,
-    templates,
-    is_authorized,
-    no_store,
-    get_provided_token,
-    discover_pairs,
-    resolve_pair,
-    inject_session_into_ctx,
-    list_users,
-    list_roles,
-    redis_client=None,
-    settings=None,
-    get_session=None,
-    admin_guard_api=None,
-):
-    """No-op — endpoints moved to supertable.api.api."""
-    pass
