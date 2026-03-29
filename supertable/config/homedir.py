@@ -2,7 +2,7 @@ import os
 import sys
 
 from supertable.config.settings import settings
-from supertable.config.defaults import default, logger
+from supertable.config.defaults import logger
 
 # If this file is located in a subdirectory, adjust the path logic as needed.
 # Currently appending ".." from __file__ to add the project root directory

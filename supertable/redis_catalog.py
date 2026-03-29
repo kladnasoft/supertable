@@ -34,10 +34,6 @@ def _lock_key(org: str, sup: str, simple: str) -> str:
     return f"supertable:{org}:{sup}:lock:leaf:{simple}"
 
 
-def _stat_lock_key(org: str, sup: str) -> str:
-    # Dedicated lock for stats updates
-    return f"supertable:{org}:{sup}:lock:stat"
-
 
 def _mirrors_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:mirrors"
@@ -355,11 +351,6 @@ return 1
         """Compare-and-delete via Lua."""
         return self._locker.release(_lock_key(org, sup, simple), token)
 
-    def extend_simple_lock(self, org: str, sup: str, simple: str, token: str, ttl_ms: int) -> bool:
-        """Optionally extend TTL if token matches."""
-        return self._locker.extend(_lock_key(org, sup, simple), token, ttl_ms)
-
-    # ---- Stage lock (staging + pipe mutations) ----
 
     def acquire_stage_lock(
             self,
@@ -374,25 +365,9 @@ return 1
         """
         return self._locker.acquire(_stage_lock_key(org, sup, stage_name), ttl_s=ttl_s, timeout_s=timeout_s)
 
-    def release_stage_lock(self, org: str, sup: str, stage_name: str, token: str) -> bool:
-        """Release stage lock if token matches."""
-        return self._locker.release(_stage_lock_key(org, sup, stage_name), token)
 
-    def extend_stage_lock(self, org: str, sup: str, stage_name: str, token: str, ttl_ms: int) -> bool:
-        """Optionally extend stage lock TTL if token matches."""
-        return self._locker.extend(_stage_lock_key(org, sup, stage_name), token, ttl_ms)
 
-    # ---- Stats lock (for monitoring _stats.json updates) ----
 
-    def acquire_stat_lock(self, org: str, sup: str, ttl_s: int = 10, timeout_s: int = 10) -> Optional[str]:
-        """Acquire stat lock: supertable:{org}:{sup}:lock:stat"""
-        return self._locker.acquire(_stat_lock_key(org, sup), ttl_s=ttl_s, timeout_s=timeout_s)
-
-    def release_stat_lock(self, org: str, sup: str, token: str) -> bool:
-        """Release stat lock if token matches."""
-        return self._locker.release(_stat_lock_key(org, sup), token)
-
-    # ------------- Pointers (root/leaf) -------------
 
     def ensure_root(self, org: str, sup: str) -> None:
         """Initialize meta:root if missing with version=0."""
@@ -708,10 +683,6 @@ return 1
     def rbac_role_exists(self, org: str, sup: str, role_id: str) -> bool:
         return bool(self.r.exists(_rbac_role_doc_key(org, sup, role_id)))
 
-    def rbac_list_role_ids(self, org: str, sup: str) -> List[str]:
-        """Return all role_ids from the index SET."""
-        members = self.r.smembers(_rbac_role_index_key(org, sup))
-        return [self._decode_member(m) for m in (members or [])]
 
     def rbac_get_role_ids_by_type(self, org: str, sup: str, role_type: str) -> List[str]:
         """Return role_ids belonging to a specific role type."""
@@ -790,8 +761,6 @@ return 1
         pipe.execute()
         self._rbac_bump(_rbac_user_meta_key(org, sup))
 
-    def rbac_user_exists(self, org: str, sup: str, user_id: str) -> bool:
-        return bool(self.r.exists(_rbac_user_doc_key(org, sup, user_id)))
 
     def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
         """Look up a user_id from a username (case-insensitive)."""
@@ -1034,15 +1003,6 @@ return 1
             logger.error(f"[redis-catalog] upsert_staging_meta error: {e}")
             raise
 
-    def staging_exists(self, org: str, sup: str, staging_name: str) -> bool:
-        """Fast existence check for a staging (Redis-backed)."""
-        if not (org and sup and staging_name):
-            return False
-        try:
-            return bool(self.r.exists(_staging_key(org, sup, staging_name)))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] staging_exists error: {e}")
-            return False
 
     def get_staging_meta(self, org: str, sup: str, staging_name: str) -> Optional[Dict[str, Any]]:
         if not (org and sup and staging_name):
@@ -1166,51 +1126,6 @@ return 1
         except Exception:
             return None
 
-    def get_pipe_defs(self, org: str, sup: str, staging_name: str, pipe_name: str) -> List[Dict[str, Any]]:
-        """Read a pipe definition payload stored as a JSON **list** (spec).
-
-        Back-compat: if a dict is stored, it is returned as a single-item list.
-        """
-        if not (org and sup and staging_name and pipe_name):
-            return []
-        try:
-            raw = self.r.get(_pipe_key(org, sup, staging_name, pipe_name))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] get_pipe_defs error: {e}")
-            return []
-        if not raw:
-            return []
-        try:
-            obj = json.loads(raw)
-        except Exception:
-            return []
-        if isinstance(obj, list):
-            return [x for x in obj if isinstance(x, dict)]
-        if isinstance(obj, dict):
-            return [obj]
-        return []
-
-    def upsert_pipe_defs(
-            self,
-            org: str,
-            sup: str,
-            staging_name: str,
-            pipe_name: str,
-            defs: List[Dict[str, Any]],
-    ) -> bool:
-        """Store a pipe definition payload as a JSON **list** and index it for listing."""
-        if not (org and sup and staging_name and pipe_name):
-            return False
-        safe_defs = [d for d in (defs or []) if isinstance(d, dict)]
-        try:
-            with self.r.pipeline() as p:
-                p.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(safe_defs))
-                p.sadd(_pipes_meta_key(org, sup, staging_name), pipe_name)
-                p.execute()
-            return True
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] upsert_pipe_defs error: {e}")
-            raise
 
     def list_pipe_metas(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> List[Dict[str, Any]]:
         """List pipe metadata objects for a staging (back-compat).
@@ -1320,27 +1235,7 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] register_spark_cluster error: {e}")
 
-    def deregister_spark_cluster(self, org: str, cluster_id: str) -> bool:
-        """Remove a Spark Thrift cluster from the registry."""
-        if not org:
-            return False
-        try:
-            return bool(self.r.hdel(_spark_thrifts_key(org), cluster_id))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] deregister_spark_cluster error: {e}")
-            return False
 
-    def get_spark_cluster(self, org: str, cluster_id: str) -> Optional[Dict[str, Any]]:
-        """Return config for a specific Spark Thrift cluster."""
-        if not org:
-            return None
-        try:
-            raw = self.r.hget(_spark_thrifts_key(org), cluster_id)
-            if raw:
-                return json.loads(raw)
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] get_spark_cluster error: {e}")
-        return None
 
     def list_spark_clusters(self, org: str) -> List[Dict[str, Any]]:
         """Return all registered Spark Thrift clusters for an organization."""
@@ -1359,22 +1254,6 @@ return 1
             logger.error(f"[redis-catalog] list_spark_clusters error: {e}")
             return []
 
-    def update_spark_cluster_status(self, org: str, cluster_id: str, status: str) -> bool:
-        """Update only the status of a Spark Thrift cluster (active/draining/offline)."""
-        if not org:
-            return False
-        try:
-            raw = self.r.hget(_spark_thrifts_key(org), cluster_id)
-            if not raw:
-                return False
-            doc = json.loads(raw)
-            doc["status"] = status
-            doc["modified_ms"] = _now_ms()
-            self.r.hset(_spark_thrifts_key(org), cluster_id, json.dumps(doc, default=str))
-            return True
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] update_spark_cluster_status error: {e}")
-            return False
 
     def select_spark_cluster(self, org: str, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -1449,65 +1328,9 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] register_spark_plug error: {e}")
 
-    def deregister_spark_plug(self, org: str, plug_id: str) -> bool:
-        """Remove a Spark Plug from the registry."""
-        if not org:
-            return False
-        try:
-            return bool(self.r.hdel(_spark_plugs_key(org), plug_id))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] deregister_spark_plug error: {e}")
-            return False
 
-    def get_spark_plug(self, org: str, plug_id: str) -> Optional[Dict[str, Any]]:
-        """Return config for a specific Spark Plug."""
-        if not org:
-            return None
-        try:
-            raw = self.r.hget(_spark_plugs_key(org), plug_id)
-            if raw:
-                return json.loads(raw)
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] get_spark_plug error: {e}")
-        return None
 
-    def list_spark_plugs(self, org: str) -> List[Dict[str, Any]]:
-        """Return all registered Spark Plugs for an organization."""
-        if not org:
-            return []
-        try:
-            raw = self.r.hgetall(_spark_plugs_key(org))
-            plugs = []
-            for _pid, data in raw.items():
-                try:
-                    plugs.append(json.loads(data))
-                except json.JSONDecodeError:
-                    pass
-            return plugs
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] list_spark_plugs error: {e}")
-            return []
 
-    def update_spark_plug_status(self, org: str, plug_id: str, status: str) -> bool:
-        """Update only the status of a Spark Plug."""
-        if not org:
-            return False
-        try:
-            raw = self.r.hget(_spark_plugs_key(org), plug_id)
-            if not raw:
-                return False
-            doc = json.loads(raw)
-            doc["status"] = status
-            doc["modified_ms"] = _now_ms()
-            self.r.hset(_spark_plugs_key(org), plug_id, json.dumps(doc, default=str))
-            return True
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] update_spark_plug_status error: {e}")
-            return False
-
-    # ========================================================================= #
-    # Table configuration (dedup-on-read, primary keys, etc.)
-    # ========================================================================= #
 
     def set_table_config(
             self,

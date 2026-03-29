@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Shared symbols — all come from common.py (single source of truth)
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.common import (
+from supertable.server_common import (
     router,
     settings,
     redis_client,
@@ -64,14 +64,14 @@ from supertable.reflection.common import (
 # ---------------------------------------------------------------------------
 
 # -- execute helpers --
-from supertable.reflection.execute import (
+from supertable.services.execute import (
     _clean_sql_query,
     _apply_limit_safely,
     _sanitize_for_json,
 )
 
 # -- ingestion helpers --
-from supertable.reflection.ingestion import (
+from supertable.services.ingestion import (
     _STAGING_NAME_RE,
     _staging_base_dir,
     _staging_index_path,
@@ -89,7 +89,7 @@ from supertable.reflection.ingestion import (
 )
 
 # -- security helpers --
-from supertable.reflection.security import (
+from supertable.services.security import (
     _list_roles as _sec_list_roles,
     _get_role as _sec_get_role,
     _create_role as _sec_create_role,
@@ -104,7 +104,7 @@ from supertable.reflection.security import (
 )
 
 # -- monitoring helpers --
-from supertable.reflection.monitoring import _read_monitoring_list
+from supertable.services.monitoring import _read_monitoring_list
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +215,7 @@ def _get_org_from_env_fallback() -> str:
 # Token catalog helpers (imported from common.py's module scope)
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.common import (
+from supertable.server_common import (
     _catalog_list_tokens,
     _catalog_create_token,
     _catalog_delete_token,
@@ -223,10 +223,10 @@ from supertable.reflection.common import (
 
 
 # ---------------------------------------------------------------------------
-# MetaReader cache (imported from common.py)
+# MetaReader cache (imported from server_common.py)
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.common import _get_meta_reader as _common_get_meta_reader
+from supertable.server_common import _get_meta_reader as _common_get_meta_reader
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1712,7 +1712,7 @@ def odata_endpoint_delete(
 
 import threading
 
-from supertable.reflection.quality.config import DQConfig, BUILTIN_CHECKS
+from supertable.services.quality.config import DQConfig, BUILTIN_CHECKS
 
 
 def _get_dqc(request: Request, org: str = None, sup: str = None) -> DQConfig:
@@ -1949,7 +1949,7 @@ def api_dq_run_check(
 
     def _run():
         try:
-            from supertable.reflection.quality.scheduler import _run_quick_check, _run_deep_check
+            from supertable.services.quality.scheduler import _run_quick_check, _run_deep_check
             if mode == "deep":
                 _run_deep_check(redis_client, o, s, table, dqc)
             else:
@@ -1998,7 +1998,7 @@ def api_dq_run_all(
     dqc = DQConfig(redis_client, o, s)
 
     def _run_sequential():
-        from supertable.reflection.quality.scheduler import _run_quick_check, _run_deep_check
+        from supertable.services.quality.scheduler import _run_quick_check, _run_deep_check
         for tbl in tables:
             try:
                 logger.info(f"[dq-run-all] {mode} check: {tbl}")
@@ -2062,7 +2062,7 @@ def api_quality_history(
         logger.debug(f"[dq-history] Parquet query failed, trying Redis: {e}")
 
     try:
-        from supertable.reflection.quality.config import _dq_key
+        from supertable.services.quality.config import _dq_key
         from datetime import timedelta
 
         key = _dq_key(o, s, "history")
@@ -2097,7 +2097,7 @@ def api_quality_history(
 
 import socket
 
-from supertable.reflection.compute import (
+from supertable.services.compute import (
     _load as _compute_load,
     _save as _compute_save,
     _sanitize_item as _compute_sanitize_item,
@@ -2619,6 +2619,6 @@ def api_users_page_remove_role(
 #   Backward-compat route aliases
 # ═══════════════════════════════════════════════════════════════════════════
 
-from supertable.reflection.common import _add_reflection_alias_routes
+from supertable.server_common import _add_reflection_alias_routes
 
 _add_reflection_alias_routes(router)

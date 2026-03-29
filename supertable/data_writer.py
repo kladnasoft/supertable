@@ -514,7 +514,7 @@ class DataWriter:
         # pick it up on the next tick, respecting lock + cooldown rules.
         # Safe to call at any frequency — never blocks or fails the write.
         try:
-            from supertable.reflection.quality.scheduler import notify_ingest
+            from supertable.services.quality.scheduler import notify_ingest
             notify_ingest(
                 self.catalog.r,
                 self.super_table.organization,

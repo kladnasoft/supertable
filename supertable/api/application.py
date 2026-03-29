@@ -45,15 +45,15 @@ app = FastAPI(
 app.add_middleware(RequestLoggingMiddleware, service="api")
 
 # ---------------------------------------------------------------------------
-# Import common.py first (infrastructure: Settings, Redis, Catalog, router,
+# Import server_common first (infrastructure: Settings, Redis, Catalog, router,
 # session helpers, auth guards, etc.)
 # ---------------------------------------------------------------------------
-from supertable.reflection.common import router  # noqa: E402
+from supertable.server_common import router  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Import api.py to register ALL 82 JSON endpoints on the shared router.
 # This import has side effects — every @router.* decorator in api.py fires
-# and attaches the endpoint to the router instance created in common.py.
+# and attaches the endpoint to the router instance created in server_common.py.
 # ---------------------------------------------------------------------------
 from supertable.api import api as _api  # noqa: F401, E402
 

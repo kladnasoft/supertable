@@ -1,4 +1,4 @@
-# route: supertable.reflection.application
+# route: supertable.webui.application
 """
 SuperTable UI Server — template rendering + reverse proxy to API.
 
@@ -16,8 +16,8 @@ Architecture:
                  └── *    else      → reverse proxy to API      (httpx)
 
 Usage:
-    python -m supertable.reflection.application
-    uvicorn supertable.reflection.application:app --port 8050
+    python -m supertable.webui.application
+    uvicorn supertable.webui.application:app --port 8050
 
 Environment:
     SUPERTABLE_API_URL              — API server base URL  (default: http://localhost:8051)
@@ -59,18 +59,15 @@ _proxy_logger = logging.getLogger("supertable.ui.proxy")
 API_BASE_URL = f"http://{_cfg.effective_api_host}:{_cfg.SUPERTABLE_API_PORT}".rstrip("/")
 
 # ---------------------------------------------------------------------------
-# Import infrastructure from common.py — NO endpoint handlers are imported.
-# common.py no longer auto-imports api.py, so this is safe and lightweight.
+# Import shared server infrastructure from server_common.py
 # ---------------------------------------------------------------------------
 
-from supertable.reflection.common import (                  # noqa: E402
+from supertable.server_common import (                  # noqa: E402
     settings,
-    templates,
     catalog,
     _is_authorized,
     _no_store,
     _get_provided_token,
-    _render_login,
     _required_token,
     _set_session_cookie,
     _clear_session_cookie,
@@ -81,6 +78,12 @@ from supertable.reflection.common import (                  # noqa: E402
     inject_session_into_ctx,
     get_session,
 )
+
+# ---------------------------------------------------------------------------
+# Import WebUI-only code (templates, login rendering)
+# ---------------------------------------------------------------------------
+
+from supertable.webui.web_auth import templates, _render_login  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Proxy client — persistent httpx.AsyncClient for connection pooling
@@ -424,7 +427,7 @@ def quality_page(
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
 ):
-    from supertable.reflection.quality.config import BUILTIN_CHECKS
+    from supertable.services.quality.config import BUILTIN_CHECKS
 
     sel_org, sel_sup = resolve_pair(org, sup)
     ctx = _page_context(
@@ -464,7 +467,7 @@ def compute_page(
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
 ):
-    from supertable.reflection.compute import _notebook_port, _default_ws_url
+    from supertable.services.compute import _notebook_port, _default_ws_url
 
     ctx = _page_context(
         request, org, sup,
@@ -484,7 +487,7 @@ def users_page_html(
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
 ):
-    from supertable.reflection.common import list_users as _lu, list_roles as _lr
+    from supertable.server_common import list_users as _lu, list_roles as _lr
     import json as _json
 
     sel_org, sel_sup = resolve_pair(org, sup)
@@ -685,7 +688,7 @@ if __name__ == "__main__":
     reload_flag = _cfg.UVICORN_RELOAD
 
     uvicorn.run(
-        "supertable.reflection.application:app",
+        "supertable.webui.application:app",
         host=host,
         port=port,
         reload=reload_flag,

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Home</title>
+  <title>Data Island Core – Home</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -143,19 +143,19 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   </div>
   <div class="ctx-card">
     <div class="ctx-card-header"><i class="fas fa-rocket"></i> Quick Actions</div>
-    <div class="ctx-card-body">Write SQL, upload data, manage secrets, or monitor your compute pools.</div>
+    <div class="ctx-card-body">Write SQL, upload data, check quality, or monitor your platform health.</div>
     <div class="ctx-card-actions">
       <a class="btn-home btn-home-ghost" href="/reflection/execute"><i class="fas fa-terminal"></i> SQL</a>
       <a class="btn-home btn-home-ghost" href="/reflection/ingestion"><i class="fas fa-cloud-arrow-up"></i> Ingest</a>
-      <a class="btn-home btn-home-ghost" href="/reflection/vault"><i class="fas fa-vault"></i> Vault</a>
+      <a class="btn-home btn-home-ghost" href="/reflection/quality"><i class="fas fa-heartbeat"></i> Quality</a>
     </div>
   </div>
 </div>
 
 <!-- ── Hero ───────────────────────────────────────────── -->
 <div class="home-hero">
-  <h1>Welcome to Data Reflection</h1>
-  <p>Manage, query, and monitor your data with SQL execution, AI-powered analysis, encrypted secrets, and fine-grained access control — all in one platform.</p>
+  <h1>Welcome to Data Island Core</h1>
+  <p>Your operational command center for data. Query with SQL, ingest from any source, enforce security at the row level, and keep everything running with built-in quality checks and monitoring.</p>
   <div class="hero-actions">
     <a href="/reflection/execute" class="btn-hero btn-hero-primary">Launch SQL Editor <i class="fas fa-arrow-right"></i></a>
     <a href="#features" class="btn-hero btn-hero-secondary"><i class="fas fa-star"></i> Explore Features</a>
@@ -166,10 +166,10 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <div class="qs-section">
   <h2 class="section-heading"><i class="fas fa-bolt"></i> Quick Start Guide</h2>
   <div class="qs-grid">
-    <div class="qs-step"><div class="qs-num">1</div><div><h4>Upload Your Data</h4><p>Drag and drop CSV, JSON, or Parquet files into the Ingestion page with instant preview and staging.</p></div></div>
-    <div class="qs-step"><div class="qs-num">2</div><div><h4>Query Instantly</h4><p>Open the SQL Editor with syntax highlighting and run queries against any table in your SuperTable.</p></div></div>
-    <div class="qs-step"><div class="qs-num">3</div><div><h4>Secure Your Data</h4><p>Configure roles, users, and tokens in Security. Manage encrypted secrets in the Vault.</p></div></div>
-    <div class="qs-step"><div class="qs-num">4</div><div><h4>Scale with Compute</h4><p>Connect Spark SQL, Spark Clusters, or Python Workers to handle workloads of any size.</p></div></div>
+    <div class="qs-step"><div class="qs-num">1</div><div><h4>Bring Your Data In</h4><p>Drop CSV, JSON, or Parquet files into Ingestion. Schema detection is automatic — staging takes seconds.</p></div></div>
+    <div class="qs-step"><div class="qs-num">2</div><div><h4>Query Everything</h4><p>Open the SQL Editor. Full autocomplete, live results, and execution timings across every table.</p></div></div>
+    <div class="qs-step"><div class="qs-num">3</div><div><h4>Trust Your Data</h4><p>Enable Data Quality checks — anomaly detection, schema drift, and custom rules run on every ingest.</p></div></div>
+    <div class="qs-step"><div class="qs-num">4</div><div><h4>Lock It Down</h4><p>Set up roles with row and column-level security in Security. Every query respects RBAC automatically.</p></div></div>
   </div>
 </div>
 
@@ -178,59 +178,52 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <h2 class="section-heading"><i class="fas fa-star"></i> Platform Features</h2>
   <div class="feat-grid">
 
-    <div class="feat-card" style="--_accent:#1c96ca;">
-      <div class="feat-icon" style="background:linear-gradient(135deg,#1c96ca,#147ba3);box-shadow:0 2px 8px rgba(28,150,202,.2);"><i class="fas fa-table"></i></div>
-      <h3>Tables</h3>
-      <p class="feat-desc">Browse table schemas, check data quality scores, view column statistics, and manage settings — all in a 3-column command center layout.</p>
-      <a href="/reflection/tables" class="feat-link" style="color:#1c96ca;">Manage Tables <i class="fas fa-arrow-right"></i></a>
-    </div>
-
     <div class="feat-card" style="--_accent:#7c3aed;">
       <div class="feat-icon" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);box-shadow:0 2px 8px rgba(124,58,237,.2);"><i class="fas fa-terminal"></i></div>
       <h3>Execute SQL</h3>
-      <p class="feat-desc">Full SQL editor with syntax highlighting, autocomplete, paginated results, and execution timings. Click any table to query instantly.</p>
+      <p class="feat-desc">Full SQL editor with syntax highlighting, autocomplete, paginated results, chart visualizations, and execution timings. Click any table to query instantly.</p>
       <a href="/reflection/execute" class="feat-link" style="color:#7c3aed;">Open Editor <i class="fas fa-arrow-right"></i></a>
+    </div>
+
+    <div class="feat-card" style="--_accent:#1c96ca;">
+      <div class="feat-icon" style="background:linear-gradient(135deg,#1c96ca,#147ba3);box-shadow:0 2px 8px rgba(28,150,202,.2);"><i class="fas fa-table"></i></div>
+      <h3>Tables</h3>
+      <p class="feat-desc">Browse schemas, inspect column statistics, review data quality scores, and manage table-level settings — all in a command center layout.</p>
+      <a href="/reflection/tables" class="feat-link" style="color:#1c96ca;">Manage Tables <i class="fas fa-arrow-right"></i></a>
     </div>
 
     <div class="feat-card" style="--_accent:#059669;">
       <div class="feat-icon" style="background:linear-gradient(135deg,#059669,#047857);box-shadow:0 2px 8px rgba(5,150,105,.2);"><i class="fas fa-cloud-arrow-up"></i></div>
       <h3>Ingestion</h3>
-      <p class="feat-desc">Drag-and-drop file uploads with schema detection and instant preview. Manage staging areas and configure data pipes for automated flows.</p>
+      <p class="feat-desc">Drag-and-drop file uploads with automatic schema detection and instant preview. Manage staging areas and configure data pipes for continuous flows.</p>
       <a href="/reflection/ingestion" class="feat-link" style="color:#059669;">Import Data <i class="fas fa-arrow-right"></i></a>
     </div>
 
-    <div class="feat-card" style="--_accent:#d97706;">
-      <div class="feat-icon" style="background:linear-gradient(135deg,#d97706,#b45309);box-shadow:0 2px 8px rgba(217,119,6,.2);"><i class="fas fa-book"></i></div>
-      <h3>Studio</h3>
-      <p class="feat-desc">AI-powered query generation, data analysis, and natural language to SQL conversion. Docu Genie auto-creates a full semantic layer.</p>
-      <a href="/reflection/studio" class="feat-link" style="color:#d97706;">Open Studio <i class="fas fa-arrow-right"></i></a>
+    <div class="feat-card" style="--_accent:#e11d48;">
+      <div class="feat-icon" style="background:linear-gradient(135deg,#e11d48,#be123c);box-shadow:0 2px 8px rgba(225,29,72,.2);"><i class="fas fa-heartbeat"></i></div>
+      <h3>Data Quality</h3>
+      <p class="feat-desc">Automated profiling with anomaly detection, schema drift alerts, and custom validation rules. Quality scores are computed on every ingest — not after the fact.</p>
+      <a href="/reflection/quality" class="feat-link" style="color:#e11d48;">View Quality <i class="fas fa-arrow-right"></i></a>
     </div>
 
     <div class="feat-card" style="--_accent:#0891b2;">
-      <div class="feat-icon" style="background:linear-gradient(135deg,#0891b2,#0e7490);box-shadow:0 2px 8px rgba(8,145,178,.2);"><i class="fas fa-clock"></i></div>
-      <h3>Jobs</h3>
-      <p class="feat-desc">Monitor scheduled jobs, track execution history, review write-operation metrics, and visualize execution plans across your data platform.</p>
-      <a href="/reflection/jobs" class="feat-link" style="color:#0891b2;">View Jobs <i class="fas fa-arrow-right"></i></a>
+      <div class="feat-icon" style="background:linear-gradient(135deg,#0891b2,#0e7490);box-shadow:0 2px 8px rgba(8,145,178,.2);"><i class="fas fa-chart-line"></i></div>
+      <h3>Monitoring</h3>
+      <p class="feat-desc">Real-time visibility into reads, writes, and query performance. Track throughput, spot bottlenecks, and drill into execution history across every table.</p>
+      <a href="/reflection/monitoring" class="feat-link" style="color:#0891b2;">View Metrics <i class="fas fa-arrow-right"></i></a>
     </div>
 
-    <div class="feat-card" style="--_accent:#dc2626;">
-      <div class="feat-icon" style="background:linear-gradient(135deg,#dc2626,#b91c1c);box-shadow:0 2px 8px rgba(220,38,38,.2);"><i class="fas fa-vault"></i></div>
-      <h3>Vault</h3>
-      <p class="feat-desc">Encrypted environment variables with stage-based access (dev → prod). Rotatable export links and Fernet encryption for every secret.</p>
-      <a href="/reflection/vault" class="feat-link" style="color:#dc2626;">Manage Secrets <i class="fas fa-arrow-right"></i></a>
-    </div>
-
-    <div class="feat-card" style="--_accent:#4f46e5;">
-      <div class="feat-icon" style="background:linear-gradient(135deg,#4f46e5,#4338ca);box-shadow:0 2px 8px rgba(79,70,229,.2);"><i class="fas fa-server"></i></div>
-      <h3>Compute</h3>
-      <p class="feat-desc">Manage Spark SQL, Spark Cluster, and Python Worker pools. Live connection testing with health monitoring and cluster overview.</p>
-      <a href="/reflection/compute" class="feat-link" style="color:#4f46e5;">Configure Pools <i class="fas fa-arrow-right"></i></a>
+    <div class="feat-card" style="--_accent:#d97706;">
+      <div class="feat-icon" style="background:linear-gradient(135deg,#d97706,#b45309);box-shadow:0 2px 8px rgba(217,119,6,.2);"><i class="fas fa-microchip"></i></div>
+      <h3>Engine</h3>
+      <p class="feat-desc">Auto-routing between DuckDB and Spark based on data size. Tune memory limits, thread counts, and caching — per tenant, with live connection testing.</p>
+      <a href="/reflection/engine" class="feat-link" style="color:#d97706;">Configure Engine <i class="fas fa-arrow-right"></i></a>
     </div>
 
     <div class="feat-card" style="--_accent:#be185d;">
       <div class="feat-icon" style="background:linear-gradient(135deg,#be185d,#9d174d);box-shadow:0 2px 8px rgba(190,24,93,.2);"><i class="fas fa-shield-halved"></i></div>
       <h3>Security</h3>
-      <p class="feat-desc">Unified roles, users, and token management. Fine-grained RBAC with row/column-level security, role distribution, and user coverage.</p>
+      <p class="feat-desc">Unified roles, users, and token management. Fine-grained RBAC with row and column-level filtering — every query is scoped to the caller's permissions.</p>
       <a href="/reflection/security" class="feat-link" style="color:#be185d;">Manage Access <i class="fas fa-arrow-right"></i></a>
     </div>
 
@@ -304,8 +297,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 <!-- ── CTA ─────────────────────────────────────────────── -->
 <div class="cta-section">
-  <h3>Ready to Explore Your Data?</h3>
-  <p>Open the SQL Editor to start querying, or head to Ingestion to upload your first dataset.</p>
+  <h3>Your Data, Ready When You Are</h3>
+  <p>Open the SQL Editor to start exploring, or head to Ingestion to bring in your next dataset.</p>
   <a href="/reflection/execute" class="btn-hero btn-hero-primary">Launch SQL Editor <i class="fas fa-arrow-right"></i></a>
 </div>
 
@@ -319,7 +312,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if(!('IntersectionObserver' in window)){cards.forEach(function(c){c.classList.add('visible');});return;}
     var obs=new IntersectionObserver(function(entries){entries.forEach(function(entry){if(entry.isIntersecting){entry.target.style.transitionDelay=(entry.target.dataset.delay||'0')+'ms';entry.target.classList.add('visible');obs.unobserve(entry.target);}});},{threshold:0.08});
     cards.forEach(function(c,i){c.dataset.delay=String(i*70);c.style.transition='opacity 0.45s ease, transform 0.45s ease';obs.observe(c);});
-    var ln=document.getElementById("link-home");if(ln)ln.classList.add("active");
   });
 </script>
 </body>

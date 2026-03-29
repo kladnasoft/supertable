@@ -30,24 +30,3 @@ def has_permission(role_type: RoleType, permission: Permission) -> bool:
     """Check if a given role type has the specified permission."""
     allowed = ROLE_PERMISSIONS.get(role_type, set())
     return permission in allowed
-
-
-def get_role_permissions(role_name: Optional[str] = None) -> Optional[Dict[str, List[str]]]:
-    """Return role(s) and their permissions as ``{role_name: [perm, …]}``.
-
-    * If *role_name* is provided, returns that single role's permissions
-      or ``None`` if the role does not exist.
-    * If *role_name* is omitted / ``None``, returns all roles.
-    """
-    if role_name is not None:
-        try:
-            role_type = RoleType(role_name.lower())
-        except ValueError:
-            return None
-        perms = ROLE_PERMISSIONS.get(role_type, set())
-        return {role_type.value: sorted(p.name for p in perms)}
-
-    return {
-        rt.value: sorted(p.name for p in perms)
-        for rt, perms in ROLE_PERMISSIONS.items()
-    }

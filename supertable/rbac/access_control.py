@@ -118,23 +118,6 @@ def check_control_access(
     )
 
 
-def check_create_access(
-    super_name: str,
-    organization: str,
-    role_name: str,
-    table_name: str,
-) -> None:
-    """
-    Check whether *role_name* is allowed to CREATE *table_name*.
-
-    Raises ``PermissionError`` if the role lacks the necessary permission.
-    """
-    _check_operation_access(
-        super_name, organization, role_name, table_name,
-        Permission.CREATE, "create this table",
-    )
-
-
 def check_write_access(
     super_name: str,
     organization: str,
