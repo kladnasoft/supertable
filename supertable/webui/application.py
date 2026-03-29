@@ -86,6 +86,13 @@ from supertable.server_common import (                  # noqa: E402
 from supertable.webui.web_auth import templates, _render_login  # noqa: E402
 
 # ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+from supertable.audit import emit as _audit, EventCategory, Actions, Severity, Outcome, make_detail  # noqa: E402
+from supertable.audit.middleware import AuditMiddleware  # noqa: E402
+
+# ---------------------------------------------------------------------------
 # Proxy client — persistent httpx.AsyncClient for connection pooling
 # ---------------------------------------------------------------------------
 
@@ -120,6 +127,7 @@ app = FastAPI(
 )
 
 app.add_middleware(RequestLoggingMiddleware, service="ui")
+app.add_middleware(AuditMiddleware, server="webui")
 
 # Static files
 _STATIC_DIR = _cfg.SUPERTABLE_STATIC_DIR or str(Path(__file__).resolve().parent / "static")
@@ -242,6 +250,13 @@ def login_post(
         required = _required_token()
         provided = (supertoken or "").strip()
         if not provided or not required or not hmac.compare_digest(provided, required):
+            _audit(
+                category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_FAILURE,
+                organization=org, actor_ip=request.client.host if request.client else "",
+                actor_username="superuser", severity=Severity.WARNING,
+                outcome=Outcome.FAILURE, reason="invalid_superuser_token",
+                detail=make_detail(method="superuser"), server="webui",
+            )
             return _render_login(request, message="Invalid superuser token.", clear_cookie=True)
 
         username_eff = "superuser"
@@ -264,6 +279,12 @@ def login_post(
             "is_superuser": True,
         })
         _no_store(resp)
+        _audit(
+            category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_SUCCESS,
+            organization=org, actor_type="superuser", actor_id=user_hash_val,
+            actor_username="superuser", actor_ip=request.client.host if request.client else "",
+            severity=Severity.CRITICAL, detail=make_detail(method="superuser"), server="webui",
+        )
         return resp
 
     # Regular user: username + token
@@ -280,6 +301,13 @@ def login_post(
         ok = False
 
     if not ok:
+        _audit(
+            category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_FAILURE,
+            organization=org, actor_ip=request.client.host if request.client else "",
+            actor_username=username, severity=Severity.WARNING,
+            outcome=Outcome.FAILURE, reason="invalid_token",
+            detail=make_detail(method="token", username_attempted=username), server="webui",
+        )
         return _render_login(request, message="Invalid token.", clear_cookie=True)
 
     user_hash_val = _user_hash(org, username)
@@ -293,15 +321,31 @@ def login_post(
         "is_superuser": False,
     })
     _no_store(resp)
+    _audit(
+        category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_SUCCESS,
+        organization=org, actor_type="user", actor_id=user_hash_val,
+        actor_username=username, actor_ip=request.client.host if request.client else "",
+        severity=Severity.INFO, detail=make_detail(method="token"), server="webui",
+    )
     return resp
 
 
 @app.get("/reflection/logout")
 def logout(request: Request):
+    session = get_session(request)
+    org = settings.SUPERTABLE_ORGANIZATION
     resp = RedirectResponse("/reflection/login", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _no_store(resp)
+    _audit(
+        category=EventCategory.AUTHENTICATION, action=Actions.LOGOUT,
+        organization=org,
+        actor_username=session.get("username", "") if session else "",
+        actor_id=session.get("user_hash", "") if session else "",
+        actor_ip=request.client.host if request.client else "",
+        severity=Severity.INFO, server="webui",
+    )
     return resp
 
 
@@ -439,6 +483,23 @@ def quality_page(
     if ctx is None:
         return _redirect_to_login()
     resp = templates.TemplateResponse("quality.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+@app.get("/reflection/audit", response_class=HTMLResponse)
+def audit_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    ctx = _page_context(request, org, sup)
+    if ctx is None:
+        return _redirect_to_login()
+    # Restrict to superuser (and future auditor role)
+    if not ctx.get("session_is_superuser"):
+        return _redirect_to_login()
+    resp = templates.TemplateResponse("audit.html", ctx)
     _no_store(resp)
     return resp
 

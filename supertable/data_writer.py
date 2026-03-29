@@ -28,6 +28,7 @@ from supertable.processing import (
 from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
 from supertable.mirroring.mirror_formats import MirrorFormats
+from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
 
 
 def _safe_json(obj):
@@ -523,6 +524,24 @@ class DataWriter:
             )
         except Exception:
             pass  # Never fail a write due to quality scheduling
+
+        # ---------- AUDIT LOG ----------
+        try:
+            if result_tuple is not None:
+                _cols, _rows, _ins, _del = result_tuple
+                _audit_emit(
+                    category=EventCategory.DATA_MUTATION, action=Actions.DATA_WRITE,
+                    organization=self.super_table.organization,
+                    super_name=self.super_table.super_name,
+                    resource_type="table", resource_id=simple_name,
+                    detail=make_detail(
+                        table=simple_name, row_count=_rows, inserted=_ins, deleted=_del,
+                        duration_ms=round((time.time() - t0) * 1000),
+                        role_name=role_name, delete_only=delete_only,
+                    ),
+                )
+        except Exception:
+            pass  # Never fail a write due to audit
 
         return result_tuple
 

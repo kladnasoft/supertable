@@ -1,0 +1,381 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Data Island Core – Audit Log</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --primary-color:#1c96ca;--secondary-color:#147ba3;--dark-color:#1a1a2e;
+  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;--warn:#f59e0b;--warn-bg:#fffbeb;--error:#ef4444;--error-bg:#fef2f2;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;--font:'Inter',-apple-system,sans-serif;
+  --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow-x:hidden;}
+.content-container{margin-left:280px;min-height:100vh;background:var(--bg);transition:var(--transition);padding-bottom:40px;}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
+.wrap{max-width:1400px;margin:0 auto;padding:24px;}
+
+.page-header{display:flex;align-items:center;gap:12px;margin-bottom:24px;}
+.page-header h1{font-size:1.3rem;font-weight:700;color:var(--text);margin:0;}
+.page-header i{font-size:1.1rem;color:var(--primary);}
+
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:0 1px 3px rgba(15,23,42,.04);margin-bottom:20px;}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.card-title{font-size:14px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;}
+.card-title i{color:var(--primary);font-size:13px;}
+
+/* Filters bar */
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;align-items:center;}
+.filter-select,.filter-input,.filter-btn{padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font);background:var(--bg-card);color:var(--text);}
+.filter-select:focus,.filter-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(28,150,202,.12);}
+.filter-input{min-width:140px;}
+.filter-btn{cursor:pointer;background:var(--primary);color:#fff;border-color:var(--primary);font-weight:600;}
+.filter-btn:hover{background:var(--primary-dark);}
+.filter-btn-ghost{background:transparent;color:var(--text-sec);border-color:var(--border);}
+.filter-btn-ghost:hover{background:var(--bg-hover);}
+
+/* Event table */
+.event-table{width:100%;border-collapse:collapse;font-size:12px;}
+.event-table th{text-align:left;padding:8px 10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;font-size:10px;border-bottom:2px solid var(--border);position:sticky;top:0;background:var(--bg-card);z-index:1;}
+.event-table td{padding:7px 10px;border-bottom:1px solid var(--border-light);vertical-align:top;}
+.event-table tr:hover{background:var(--bg-hover);}
+.event-table tr.expanded{background:rgba(28,150,202,.04);}
+
+/* Severity badges */
+.sev{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;}
+.sev-info{background:var(--primary-light);color:var(--primary);}
+.sev-warning{background:var(--warn-bg);color:#92400e;}
+.sev-critical{background:var(--error-bg);color:#991b1b;}
+
+/* Outcome badges */
+.out{font-size:11px;font-weight:600;}
+.out-success{color:var(--success);}
+.out-failure{color:var(--error);}
+.out-denied{color:var(--warn);}
+
+/* Detail expansion */
+.detail-row{display:none;}
+.detail-row.show{display:table-row;}
+.detail-cell{padding:10px 10px 10px 40px;background:var(--bg-surface);border-bottom:1px solid var(--border);}
+.detail-json{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;background:var(--bg);padding:10px;border-radius:var(--radius-sm);border:1px solid var(--border-light);}
+
+/* Bottom panels grid */
+.bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
+@media(max-width:900px){.bottom-grid{grid-template-columns:1fr;}}
+
+/* Integrity badges */
+.chain-days{display:flex;gap:6px;margin-top:10px;}
+.chain-day{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;}
+.chain-ok{background:var(--success-bg);color:var(--success);}
+.chain-fail{background:var(--error-bg);color:var(--error);}
+.chain-pending{background:var(--bg-surface);color:var(--text-muted);border:1px dashed var(--border);}
+
+/* Event count */
+.event-count{font-size:12px;color:var(--text-muted);font-weight:500;}
+
+/* Scrollable table container */
+.table-scroll{max-height:55vh;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);}
+  </style>
+  <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
+</head>
+<body>
+{% include "sidebar.html" %}
+
+<div class="content-container">
+<div class="wrap">
+
+  <div class="page-header">
+    <i class="fas fa-scroll"></i>
+    <h1>Audit Log</h1>
+  </div>
+
+  <!-- ── Event Stream ─────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title"><i class="fas fa-stream"></i> Event stream</span>
+      <span class="event-count" id="eventCount"></span>
+    </div>
+
+    <div class="filters">
+      <select class="filter-select" id="fCategory">
+        <option value="">All categories</option>
+        <option value="authentication">Authentication</option>
+        <option value="authorization">Authorization</option>
+        <option value="data_access">Data access</option>
+        <option value="data_mutation">Data mutation</option>
+        <option value="rbac_change">RBAC change</option>
+        <option value="config_change">Config change</option>
+        <option value="token_management">Token mgmt</option>
+        <option value="system">System</option>
+        <option value="export">Export</option>
+        <option value="security_alert">Security alert</option>
+      </select>
+      <select class="filter-select" id="fSeverity">
+        <option value="">All severities</option>
+        <option value="info">Info</option>
+        <option value="warning">Warning</option>
+        <option value="critical">Critical</option>
+      </select>
+      <select class="filter-select" id="fOutcome">
+        <option value="">All outcomes</option>
+        <option value="success">Success</option>
+        <option value="failure">Failure</option>
+        <option value="denied">Denied</option>
+      </select>
+      <input class="filter-input" id="fActor" placeholder="Actor..." />
+      <input class="filter-input" id="fResource" placeholder="Resource..." />
+      <button class="filter-btn" onclick="loadEvents()"><i class="fas fa-search"></i> Search</button>
+      <button class="filter-btn filter-btn-ghost" onclick="resetFilters()"><i class="fas fa-times"></i> Clear</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);margin-left:auto;cursor:pointer;">
+        <input type="checkbox" id="autoRefresh" style="margin:0;"> Auto-refresh
+      </label>
+    </div>
+
+    <div class="table-scroll">
+      <table class="event-table">
+        <thead>
+          <tr>
+            <th style="width:145px">Timestamp</th>
+            <th style="width:68px">Severity</th>
+            <th style="width:120px">Category</th>
+            <th>Action</th>
+            <th>Actor</th>
+            <th>Resource</th>
+            <th style="width:65px">Outcome</th>
+          </tr>
+        </thead>
+        <tbody id="eventBody">
+          <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted);">Loading events...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Bottom panels ────────────────────────────────── -->
+  <div class="bottom-grid">
+
+    <!-- Integrity status -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-shield-halved"></i> Chain integrity</span>
+        <button class="filter-btn" onclick="verifyChain()" style="font-size:11px;padding:4px 10px;"><i class="fas fa-check-double"></i> Verify today</button>
+      </div>
+      <div id="chainStatus" style="font-size:12px;color:var(--text-sec);">
+        Chain verification checks that no audit events have been tampered with, deleted, or reordered. Click "Verify today" to run an integrity check.
+      </div>
+      <div class="chain-days" id="chainDays"></div>
+    </div>
+
+    <!-- Export -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-file-export"></i> Export</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <label style="font-size:12px;color:var(--text-sec);">From</label>
+        <input type="date" class="filter-input" id="exportFrom" />
+        <label style="font-size:12px;color:var(--text-sec);">To</label>
+        <input type="date" class="filter-input" id="exportTo" />
+        <select class="filter-select" id="exportFormat">
+          <option value="json">JSON lines</option>
+          <option value="csv">CSV</option>
+        </select>
+        <select class="filter-select" id="exportCriteria">
+          <option value="">All events</option>
+          <option value="CC6.1">SOC 2 — CC6.1 (Access security)</option>
+          <option value="CC6.2">SOC 2 — CC6.2 (Authorization)</option>
+          <option value="CC7.2">SOC 2 — CC7.2 (Anomaly detection)</option>
+          <option value="CC8.1">SOC 2 — CC8.1 (Change management)</option>
+        </select>
+        <button class="filter-btn" onclick="exportAudit()"><i class="fas fa-download"></i> Download</button>
+      </div>
+      <div id="exportStatus" style="margin-top:10px;font-size:11px;color:var(--text-muted);"></div>
+    </div>
+
+  </div>
+
+</div>
+</div>
+
+<script>
+(function() {
+  var org = {{ sel_org|default("", true)|tojson }};
+  var sup = {{ sel_sup|default("", true)|tojson }};
+  var autoTimer = null;
+
+  // Set default export dates (last 30 days)
+  var today = new Date();
+  var monthAgo = new Date(today);
+  monthAgo.setDate(today.getDate() - 30);
+  var toEl = document.getElementById('exportTo');
+  var fromEl = document.getElementById('exportFrom');
+  if (toEl) toEl.value = today.toISOString().slice(0, 10);
+  if (fromEl) fromEl.value = monthAgo.toISOString().slice(0, 10);
+
+  function fmtTs(ms) {
+    if (!ms) return '—';
+    var d = new Date(parseInt(ms));
+    return d.toLocaleString(undefined, {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+
+  function sevBadge(sev) {
+    var cls = sev === 'critical' ? 'sev-critical' : sev === 'warning' ? 'sev-warning' : 'sev-info';
+    return '<span class="sev ' + cls + '">' + sev + '</span>';
+  }
+
+  function outBadge(out) {
+    var cls = out === 'failure' ? 'out-failure' : out === 'denied' ? 'out-denied' : 'out-success';
+    return '<span class="out ' + cls + '">' + (out || 'success') + '</span>';
+  }
+
+  function escHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s || '';
+    return d.innerHTML;
+  }
+
+  window.loadEvents = function() {
+    var params = new URLSearchParams();
+    if (org) params.set('organization', org);
+    if (sup) params.set('super_name', sup);
+    var cat = document.getElementById('fCategory').value;
+    var sev = document.getElementById('fSeverity').value;
+    var out = document.getElementById('fOutcome').value;
+    var actor = document.getElementById('fActor').value.trim();
+    var res = document.getElementById('fResource').value.trim();
+    if (cat) params.set('category', cat);
+    if (sev) params.set('severity', sev);
+    if (out) params.set('outcome', out);
+    if (actor) params.set('actor_id', actor);
+    if (res) params.set('resource_id', res);
+    params.set('limit', '200');
+
+    fetch('/reflection/audit/events?' + params.toString())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var events = data.events || data.data || data || [];
+        if (!Array.isArray(events)) events = [];
+        renderEvents(events);
+      })
+      .catch(function(e) {
+        document.getElementById('eventBody').innerHTML =
+          '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--error);">Failed to load events: ' + escHtml(e.message) + '</td></tr>';
+      });
+  };
+
+  function renderEvents(events) {
+    var tbody = document.getElementById('eventBody');
+    var countEl = document.getElementById('eventCount');
+    if (countEl) countEl.textContent = events.length + ' events';
+
+    if (!events.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted);">No events found</td></tr>';
+      return;
+    }
+
+    var html = '';
+    for (var i = 0; i < events.length; i++) {
+      var e = events[i];
+      var rid = 'detail-' + i;
+      html += '<tr class="event-row" data-idx="' + i + '" style="cursor:pointer;" onclick="toggleDetail(\'' + rid + '\', this)">'
+        + '<td style="font-family:var(--mono);font-size:11px;">' + fmtTs(e.timestamp_ms) + '</td>'
+        + '<td>' + sevBadge(e.severity || 'info') + '</td>'
+        + '<td>' + escHtml(e.category) + '</td>'
+        + '<td style="font-weight:600;">' + escHtml(e.action) + '</td>'
+        + '<td>' + escHtml(e.actor_username || e.actor_id || '—') + '</td>'
+        + '<td>' + escHtml(e.resource_type ? (e.resource_type + (e.resource_id ? ':' + e.resource_id : '')) : '—') + '</td>'
+        + '<td>' + outBadge(e.outcome) + '</td>'
+        + '</tr>';
+      html += '<tr class="detail-row" id="' + rid + '"><td colspan="7" class="detail-cell">'
+        + '<div class="detail-json">' + escHtml(JSON.stringify(e, null, 2)) + '</div>'
+        + '</td></tr>';
+    }
+    tbody.innerHTML = html;
+  }
+
+  window.toggleDetail = function(id, row) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var showing = el.classList.toggle('show');
+    if (row) row.classList.toggle('expanded', showing);
+  };
+
+  window.resetFilters = function() {
+    document.getElementById('fCategory').value = '';
+    document.getElementById('fSeverity').value = '';
+    document.getElementById('fOutcome').value = '';
+    document.getElementById('fActor').value = '';
+    document.getElementById('fResource').value = '';
+    loadEvents();
+  };
+
+  window.verifyChain = function() {
+    var statusEl = document.getElementById('chainStatus');
+    statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verifying...';
+    var today = new Date().toISOString().slice(0, 10);
+    var params = new URLSearchParams({organization: org, date: today});
+    fetch('/reflection/audit/verify?' + params.toString())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.valid) {
+          statusEl.innerHTML = '<span style="color:var(--success);"><i class="fas fa-check-circle"></i> Chain integrity verified for ' + today + '</span>';
+        } else {
+          statusEl.innerHTML = '<span style="color:var(--error);"><i class="fas fa-exclamation-triangle"></i> Chain integrity FAILED for ' + today + '. ' + (data.gaps ? data.gaps.length + ' gap(s) detected.' : '') + '</span>';
+        }
+      })
+      .catch(function(e) {
+        statusEl.innerHTML = '<span style="color:var(--error);">Verification failed: ' + escHtml(e.message) + '</span>';
+      });
+  };
+
+  window.exportAudit = function() {
+    var from = document.getElementById('exportFrom').value;
+    var to = document.getElementById('exportTo').value;
+    var fmt = document.getElementById('exportFormat').value;
+    var criteria = document.getElementById('exportCriteria').value;
+    if (!from || !to) { alert('Please select a date range.'); return; }
+
+    var params = new URLSearchParams({
+      organization: org,
+      start: from,
+      end: to,
+      format: fmt,
+    });
+    if (criteria) params.set('criteria', criteria);
+
+    document.getElementById('exportStatus').textContent = 'Preparing export...';
+    window.location.href = '/reflection/audit/export?' + params.toString();
+    setTimeout(function() {
+      document.getElementById('exportStatus').textContent = 'Export download started.';
+    }, 1000);
+  };
+
+  // Auto-refresh toggle
+  document.getElementById('autoRefresh').addEventListener('change', function() {
+    if (this.checked) {
+      autoTimer = setInterval(loadEvents, 10000);
+    } else {
+      if (autoTimer) clearInterval(autoTimer);
+      autoTimer = null;
+    }
+  });
+
+  // Initial load
+  loadEvents();
+})();
+</script>
+</body>
+</html>

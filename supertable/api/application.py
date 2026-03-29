@@ -44,6 +44,9 @@ app = FastAPI(
 
 app.add_middleware(RequestLoggingMiddleware, service="api")
 
+from supertable.audit.middleware import AuditMiddleware  # noqa: E402
+app.add_middleware(AuditMiddleware, server="api")
+
 # ---------------------------------------------------------------------------
 # Import server_common first (infrastructure: Settings, Redis, Catalog, router,
 # session helpers, auth guards, etc.)

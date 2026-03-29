@@ -99,6 +99,13 @@ list_supers_fn = None
 list_tables_fn = None
 DataWriter = None
 
+# ---------- Audit ----------
+try:
+    from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, Outcome, make_detail
+    _audit_available = True
+except Exception:
+    _audit_available = False
+
 def _ensure_imports():
     global MetaReader, engine_enum, data_query_sql, list_supers_fn, list_tables_fn, DataWriter
     if MetaReader is None or engine_enum is None or data_query_sql is None or list_supers_fn is None or list_tables_fn is None:
@@ -372,8 +379,20 @@ def _check_token(auth_token: Optional[str]) -> None:
         return
     token = (auth_token or "").strip()
     if not token or not CFG.shared_token:
+        if _audit_available:
+            _audit_emit(
+                category=EventCategory.AUTHENTICATION, action=Actions.MCP_AUTH_FAILURE,
+                organization=settings.SUPERTABLE_ORGANIZATION, severity=Severity.WARNING,
+                outcome=Outcome.FAILURE, reason="missing_token", server="mcp",
+            )
         raise PermissionError("auth_token is required by server policy.")
     if not hmac.compare_digest(token, CFG.shared_token):
+        if _audit_available:
+            _audit_emit(
+                category=EventCategory.AUTHENTICATION, action=Actions.MCP_AUTH_FAILURE,
+                organization=settings.SUPERTABLE_ORGANIZATION, severity=Severity.WARNING,
+                outcome=Outcome.FAILURE, reason="invalid_token", server="mcp",
+            )
         raise PermissionError("auth_token invalid.")
 
 def _allowed_role(r: str) -> bool:
@@ -786,6 +805,22 @@ def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int,
     # Enforce limit here (in case downstream didn't)
     rows_limited = rows[:limit_n]
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    if _audit_available:
+        try:
+            _audit_emit(
+                category=EventCategory.DATA_ACCESS, action=Actions.QUERY_EXECUTE,
+                organization=organization, super_name=super_name,
+                resource_type="query", resource_id="",
+                detail=make_detail(
+                    sql_preview=sql[:200], row_count=len(rows_limited),
+                    engine=getattr(eng, "name", str(eng)),
+                    role_name=role_name, duration_ms=round(elapsed_ms),
+                ),
+                server="mcp",
+            )
+        except Exception:
+            pass
 
     return {
         "columns": list(columns),

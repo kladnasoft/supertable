@@ -55,13 +55,15 @@ supertable/
     __init__.py          — public API: get_audit_logger(), AuditEvent, EventCategory
     events.py            — AuditEvent dataclass, EventCategory enum, Severity enum
     logger.py            — AuditLogger class (queue + background writer)
-    chain.py             — hash-chain integrity (SHA-256 chaining)
-    writer_redis.py      — hot-tier writer (Redis Streams)
+    chain.py             — hash-chain integrity (per-instance SHA-256 + Merkle aggregation)
+    crypto.py            — Fernet encryption/decryption for sensitive detail fields
+    writer_redis.py      — hot-tier writer (Redis Streams + consumer group management)
     writer_parquet.py    — warm-tier writer (Parquet files via storage backend)
-    reader.py            — query interface for audit events
+    reader.py            — query interface for audit events (with decryption support)
     middleware.py        — FastAPI middleware for automatic request/response logging
     retention.py         — retention policy enforcement, legal holds
     export.py            — DORA/SOC 2 report export (JSON-lines, CSV)
+    consumers.py         — SIEM consumer group management API
 ```
 
 ### 3.2 Data flow
@@ -72,10 +74,12 @@ supertable/
                                                       
   api/api.py ──emit()──→  thread-safe queue           
   session.py ──emit()──→  ───────┬────────→  Redis Stream (hot, 24h TTL)
-  middleware ──emit()──→         │                     
-  rbac/ ──────emit()──→         │            ┌─→  Parquet (warm, configurable retention)
-  data_writer ─emit()─→         └──worker──→ ┤
-                                             └─→  Hash chain file (integrity proof)
+  middleware ──emit()──→         │              ├─→  [archival] consumer → Parquet writer
+  rbac/ ──────emit()──→         │              ├─→  [alerting] consumer → webhook
+  data_writer ─emit()─→         │              └─→  [splunk_prod] consumer → external SIEM
+  mcp_server ──emit()──→        │
+                                └──worker──→  Parquet (warm, 7-year retention)
+                                       └──→  Hash chain file (per-instance, daily Merkle)
 ```
 
 ### 3.3 Design principles
@@ -252,6 +256,7 @@ The `detail` field is a JSON string containing action-specific data. Each action
 {
   "sql_hash": "sha256_of_normalized_sql",
   "sql_preview": "SELECT ... FROM ... (first 200 chars)",
+  "sql_encrypted": "gAAAAABl... (Fernet-encrypted full SQL text)",
   "tables_accessed": ["orders", "customers"],
   "row_count": 1542,
   "duration_ms": 234,
@@ -261,7 +266,7 @@ The `detail` field is a JSON string containing action-specific data. Each action
 }
 ```
 
-The full SQL text is NOT stored in the audit log (it may contain sensitive data in WHERE clauses). Only a SHA-256 hash and a truncated preview are stored. If full SQL retention is needed, it is stored separately with its own encryption and access controls.
+The full SQL text is encrypted at rest using `SUPERTABLE_AUDIT_FERNET_KEY`. Only `auditor` and `superuser` roles can decrypt via the audit API. The `sql_preview` (first 200 chars, unencrypted) is always available for dashboard display. If `SUPERTABLE_AUDIT_FERNET_KEY` is empty, full SQL is stored in plaintext.
 
 ### 5.2 Data mutation detail
 
@@ -355,19 +360,20 @@ Each entry is a flat hash of the AuditEvent fields. Redis Streams provide automa
   year=2025/
     month=01/
       day=15/
-        audit_20250115_143022_a7b3c9.parquet    (batch file)
-        audit_20250115_150107_e2f4d1.parquet
+        audit_20250115_143022_api-host1-12345_a7b3c9.parquet
+        audit_20250115_143025_api-host2-67890_e2f4d1.parquet
+        audit_20250115_150107_api-host1-12345_c8d9e0.parquet
       day=16/
         ...
   _chain/
-    chain_20250115.json     (daily chain proof)
+    chain_20250115.json     (daily Merkle proof across all instances)
     chain_20250116.json
   _retention/
     policy.json             (retention config)
     holds.json              (legal hold records)
 ```
 
-Each Parquet file contains one batch of events (default: 1,000 events or 60 seconds, whichever comes first). Files are small and append-only — no compaction, no rewriting.
+Each Parquet file name includes the instance identifier (`hostname-PID`) and a UUID fragment to guarantee uniqueness across concurrent writers. Multiple server instances writing simultaneously produce separate files — no locking required. The reader merges all files in a partition by `timestamp_ms` ordering.
 
 **Schema**: Parquet schema mirrors AuditEvent fields exactly. All fields are strings except `timestamp_ms` (INT64) for efficient range scanning.
 
@@ -377,7 +383,7 @@ Each Parquet file contains one batch of events (default: 1,000 events or 60 seco
 
 **Purpose**: Detect tampering, deletions, or gaps in the audit trail.
 
-**Implementation**: Each batch of events written to Parquet is hash-chained. The chain works as follows:
+**Implementation**: Each server instance maintains its own SHA-256 chain. The chain works per-instance:
 
 ```
 batch_hash = SHA-256(sorted_event_ids + parquet_file_hash)
@@ -385,10 +391,24 @@ chain_hash = SHA-256(previous_chain_hash + batch_hash)
 ```
 
 The chain state is persisted in two places:
-1. **Redis**: `supertable:{org}:audit:chain_head` — the current chain hash (for fast append)
-2. **Storage**: `{org}/__audit__/_chain/chain_{date}.json` — daily chain proofs for verification
+1. **Redis**: `supertable:{org}:audit:chain_head:{instance_id}` — the current chain hash per instance
+2. **Storage**: `{org}/__audit__/_chain/chain_{date}.json` — daily Merkle proof aggregating all instances
 
-A daily verification job reads all Parquet files for the day, recomputes the chain, and compares against the stored proof. Mismatches trigger a `critical` severity `audit_gap` event.
+The daily Merkle proof format:
+
+```json
+{
+  "date": "2025-01-15",
+  "instances": {
+    "api-host1-12345": {"head": "sha256...", "batches": 42},
+    "api-host2-67890": {"head": "sha256...", "batches": 38}
+  },
+  "merkle_root": "sha256_of_sorted_instance_heads",
+  "total_events": 80000
+}
+```
+
+A daily verification job reads all Parquet files for the day, recomputes each instance chain independently, verifies the Merkle root, and compares against the stored proof. Mismatches trigger a `critical` severity `audit_gap` event. This design requires no cross-instance coordination — each instance writes independently, and integrity is verified after the fact.
 
 ### 6.4 Settings fields
 
@@ -401,12 +421,15 @@ SUPERTABLE_AUDIT_RETENTION_DAYS: int = 2555          # ~7 years (DORA minimum: 5
 SUPERTABLE_AUDIT_BATCH_SIZE: int = 1000              # Events per Parquet file
 SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC: int = 60        # Max seconds before flush
 SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS: int = 24    # Hot tier TTL
-SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN: int = 100000   # Max stream entries
+SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN: int = 100000   # Hard cap on stream entries
 SUPERTABLE_AUDIT_HASH_CHAIN: bool = True             # Enable tamper-evident chaining
-SUPERTABLE_AUDIT_LOG_QUERIES: bool = True            # Log SQL queries (detail: hash + preview)
-SUPERTABLE_AUDIT_LOG_READS: bool = False             # Log table reads (high volume — disabled by default)
+SUPERTABLE_AUDIT_LOG_QUERIES: bool = True            # Log SQL queries (detail: hash + encrypted full text)
+SUPERTABLE_AUDIT_LOG_READS: bool = True              # Log table reads (DORA-required: on by default)
 SUPERTABLE_AUDIT_ALERT_WEBHOOK: str = ""             # Webhook URL for critical alerts
 SUPERTABLE_AUDIT_LEGAL_HOLD: bool = False            # Suspend retention enforcement globally
+SUPERTABLE_AUDIT_FERNET_KEY: str = ""                # Fernet key for encrypting full SQL in audit events
+SUPERTABLE_AUDIT_SIEM_ENABLED: bool = True           # Allow external SIEM consumer groups
+SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS: int = 10        # Max external consumer groups
 ```
 
 ---
@@ -687,13 +710,58 @@ def export_soc2_evidence(
 ### 11.3 API endpoints
 
 ```
-GET  /reflection/audit/events       — query events (filters via query params)
-GET  /reflection/audit/export       — download events as JSON-lines or CSV
-GET  /reflection/audit/verify       — run chain integrity check for a date range
-GET  /reflection/audit/stats        — event counts by category, severity, day
+GET    /reflection/audit/events          — query events (superuser OR auditor)
+GET    /reflection/audit/export          — download as JSON-lines or CSV (superuser OR auditor)
+GET    /reflection/audit/verify          — chain integrity check (superuser OR auditor)
+GET    /reflection/audit/stats           — event counts by category/severity/day (superuser OR auditor)
+POST   /reflection/audit/consumers       — create SIEM consumer group (superuser only)
+GET    /reflection/audit/consumers       — list consumer groups + lag (superuser only)
+DELETE /reflection/audit/consumers/{name} — remove consumer group (superuser only)
 ```
 
-These endpoints require `superuser` or a dedicated `auditor` role. Access to audit endpoints is itself audited.
+These endpoints are themselves audited (`category=data_access`, `resource_type=audit_log`).
+
+### 11.4 Audit Log UI page
+
+**Route**: `GET /reflection/audit` — HTML page, rendered by `webui/application.py`
+**Template**: `webui/templates/audit.html`
+**Visibility**: Only visible to users with `superuser` or `auditor` role. The sidebar nav item is conditionally rendered based on session role.
+**Sidebar position**: Platform section, after Security. Icon: `fa-scroll`.
+
+**Layout — three panels, single page:**
+
+**Panel 1 — Event stream** (top, full width)
+Live-scrolling table of audit events. Columns: timestamp, severity (color badge), category, action, actor, resource, outcome. Fetches from `GET /reflection/audit/events` with query params.
+
+Filters (inline above the table):
+- Date range picker (default: last 24 hours)
+- Category dropdown (all categories from EventCategory enum)
+- Severity dropdown (info / warning / critical)
+- Actor text search (username or actor_id)
+- Resource text search (table name, role_id, etc.)
+- Outcome dropdown (success / failure / denied)
+
+Auto-refresh toggle (default: off). When on, polls every 10 seconds.
+
+Click any row to expand the `detail` JSON payload inline. If `sql_encrypted` is present and the user has decryption access, show a "Decrypt SQL" button that calls the API to decrypt on demand — the full SQL text is never sent to the browser until explicitly requested.
+
+**Panel 2 — Integrity status** (bottom left)
+Chain verification dashboard. Shows:
+- Today's status: green checkmark or red alert
+- Last 7 days: row of day badges (green/red/gray for not-yet-verified)
+- "Run verification" button → calls `GET /reflection/audit/verify` for a selected date
+- Last verification timestamp and result summary
+
+**Panel 3 — Export** (bottom right)
+- Date range picker (start/end)
+- Format selector: JSON-lines / CSV
+- Optional SOC 2 criterion filter (dropdown: CC6.1, CC7.2, etc.)
+- "Download" button → triggers `GET /reflection/audit/export` as file download
+- File size estimate shown before download
+
+**No charts, no dashboards, no analytics.** The page is for investigation and evidence collection. Monitoring and trend analysis belong in the external SIEM (which consumes via Redis Stream consumer groups).
+
+**Implementation**: The page follows the same pattern as other pages in `webui/application.py` — a route handler that builds template context and renders. All data is fetched client-side via `fetch()` calls to the audit API endpoints. No server-side data loading in the template context.
 
 ---
 
@@ -712,11 +780,11 @@ These endpoints require `superuser` or a dedicated `auditor` role. Access to aud
 
 | Deployment size | Events/day | Parquet/day | Annual storage |
 |---|---|---|---|
-| Small (1-5 users, light queries) | ~5,000 | ~0.25 MB | ~90 MB |
-| Medium (10-50 users, regular queries) | ~100,000 | ~5 MB | ~1.8 GB |
-| Large (100+ users, heavy queries) | ~1,000,000 | ~50 MB | ~18 GB |
+| Small (1-5 users, light queries) | ~25,000 | ~1.25 MB | ~450 MB |
+| Medium (10-50 users, regular queries) | ~500,000 | ~25 MB | ~9 GB |
+| Large (100+ users, heavy queries) | ~5,000,000 | ~250 MB | ~90 GB |
 
-With `AUDIT_LOG_READS=False` (default), read-heavy workloads don't inflate the audit log. Only mutations, auth events, and config changes are logged.
+With `AUDIT_LOG_READS=True` (default), all read operations are logged per DORA Art. 6(5). Operators outside DORA scope can set `AUDIT_LOG_READS=False` to reduce volume by 10-50x.
 
 ---
 
@@ -756,28 +824,195 @@ supertable/audit/tests/
 
 | Phase | Deliverables | Effort |
 |---|---|---|
-| **Phase 1 — Core** | `events.py`, `logger.py`, `chain.py`, `writer_redis.py`, settings fields, `__init__.py` | 3 days |
-| **Phase 2 — Storage** | `writer_parquet.py`, partitioning, batch flush logic | 2 days |
-| **Phase 3 — Middleware** | `middleware.py`, `audit_context()`, install in api + webui apps | 1 day |
-| **Phase 4 — Integration** | Wire emit() calls into all 15 files from section 8.1 | 3 days |
-| **Phase 5 — Query & export** | `reader.py`, `export.py`, API endpoints | 2 days |
-| **Phase 6 — Retention** | `retention.py`, legal hold, background scheduler | 1 day |
-| **Phase 7 — Alerting** | Webhook delivery, built-in alert rules | 1 day |
-| **Phase 8 — Tests** | Unit, integration, and compliance test suites | 3 days |
-| **Total** | | **~16 working days** |
+| **Phase 1 — Core** | `events.py`, `logger.py`, `chain.py` (with per-instance + Merkle), `writer_redis.py`, settings fields, `__init__.py` | 3 days |
+| **Phase 2 — Storage** | `writer_parquet.py`, partitioning, concurrency-safe file naming, batch flush logic | 2 days |
+| **Phase 3 — Encryption** | Fernet encryption for `sql_encrypted` field, key management, decrypt-on-read in reader | 1 day |
+| **Phase 4 — Middleware** | `middleware.py`, `audit_context()`, install in api + webui + mcp apps | 1 day |
+| **Phase 5 — Integration** | Wire emit() calls into all 15 files from section 8.1 | 3 days |
+| **Phase 6 — Auditor role** | New `auditor` role type in RBAC, permission checks on audit endpoints | 1 day |
+| **Phase 7 — Query & export** | `reader.py`, `export.py`, audit API endpoints | 2 days |
+| **Phase 8 — SIEM** | Consumer group management API, TTL-with-acknowledgement logic | 2 days |
+| **Phase 9 — UI** | `audit.html` template, page route in `webui/application.py`, sidebar integration (role-conditional) | 2 days |
+| **Phase 10 — Retention** | `retention.py`, legal hold, background scheduler | 1 day |
+| **Phase 11 — Alerting** | Webhook delivery, built-in alert rules | 1 day |
+| **Phase 12 — Tests** | Unit, integration, and compliance test suites | 3 days |
+| **Total** | | **~22 working days** |
 
 ---
 
-## 15. Open decisions
+## 15. Resolved decisions
 
-These items require human input before implementation:
+All decisions finalized. Implementation must follow these exactly.
 
-1. **Full SQL logging**: Should `detail.sql_preview` include the full SQL text (encrypted) or only a 200-char truncation + hash? Full text enables forensic replay but increases storage and may contain sensitive WHERE-clause values.
+### 15.1 Full SQL logging — INCLUDE FULL TEXT
 
-2. **Read-path auditing**: Should `AUDIT_LOG_READS` default to `True` for DORA-scoped deployments? This would increase event volume 10-50x but satisfies the strictest interpretation of Art. 6(5).
+The `detail` payload for `query_execute` includes the complete SQL text, encrypted at rest using the platform's Fernet key. The `sql_preview` field (200 chars, unencrypted) remains for quick dashboard display. The full text is stored in `detail.sql_encrypted` as a Fernet-encrypted string.
 
-3. **Auditor role**: Should there be a dedicated `auditor` RBAC role type that can read audit logs but cannot modify data or RBAC? Or should audit access be superuser-only?
+**Impact on section 5.1**: The query execution detail becomes:
 
-4. **Multi-region**: For deployments spanning multiple storage regions, should audit Parquet files be written to the same region as the data or to a dedicated audit region?
+```json
+{
+  "sql_hash": "sha256_of_normalized_sql",
+  "sql_preview": "SELECT ... FROM ... (first 200 chars)",
+  "sql_encrypted": "gAAAAABl... (Fernet-encrypted full SQL)",
+  "tables_accessed": ["orders", "customers"],
+  "row_count": 1542,
+  "duration_ms": 234,
+  "engine": "duckdb_lite",
+  "role_name": "analyst",
+  "rbac_filters_applied": true
+}
+```
 
-5. **External SIEM integration**: Should the Redis Stream support consumer groups for external SIEM tools (Splunk, Sentinel, ELK) to consume directly, or should export be the only external path?
+Decryption requires `SUPERTABLE_AUDIT_FERNET_KEY` (new setting). Only the `auditor` and `superuser` roles can decrypt via the audit API. The key must be distinct from any future vault encryption key — audit keys have different rotation and custody requirements.
+
+**New setting**: `SUPERTABLE_AUDIT_FERNET_KEY: str = ""` — Fernet key for encrypting sensitive audit fields. If empty, full SQL is stored in plaintext (acceptable for on-premise deployments without regulatory exposure).
+
+### 15.2 Read-path auditing — DEFAULT ON
+
+`SUPERTABLE_AUDIT_LOG_READS` defaults to `True`. Every `table_read`, `metadata_read`, and `schema_read` is logged.
+
+**Impact on section 6.4**: Default changes from `False` to `True`.
+
+**Impact on section 12**: Volume estimates increase. Updated estimates:
+
+| Deployment size | Events/day | Parquet/day | Annual storage |
+|---|---|---|---|
+| Small (1-5 users, light queries) | ~25,000 | ~1.25 MB | ~450 MB |
+| Medium (10-50 users, regular queries) | ~500,000 | ~25 MB | ~9 GB |
+| Large (100+ users, heavy queries) | ~5,000,000 | ~250 MB | ~90 GB |
+
+Operators who do not need DORA compliance can set `SUPERTABLE_AUDIT_LOG_READS=False` to reduce volume.
+
+### 15.3 Auditor role — YES, DEDICATED ROLE TYPE
+
+A new RBAC role type `auditor` is introduced alongside existing types (`superadmin`, `admin`, `viewer`, etc.). The `auditor` role:
+
+- **Can**: read audit events, run integrity verification, export audit reports, view audit statistics
+- **Cannot**: execute SQL queries, read/write data tables, modify RBAC roles or users, change configuration, create/delete tokens
+- **Cannot**: modify or delete audit events (no one can — append-only by design)
+
+**Impact on section 11.3**: Audit API endpoints accept both `superuser` and `auditor` roles:
+
+```
+GET  /reflection/audit/events       — requires: superuser OR auditor
+GET  /reflection/audit/export       — requires: superuser OR auditor
+GET  /reflection/audit/verify       — requires: superuser OR auditor
+GET  /reflection/audit/stats        — requires: superuser OR auditor
+```
+
+**Impact on section 4.4**: New actions added to the RBAC_CHANGE category:
+- `auditor_role_create` — auditor role provisioned
+- `auditor_role_revoke` — auditor role removed
+
+**Impact on RedisCatalog**: The `auditor` role type is registered in `_rbac_role_type_index_key` like any other role type. No schema changes needed — the existing RBAC infrastructure supports arbitrary role types.
+
+### 15.4 Storage region — SINGLE REGION, CONCURRENCY-SAFE
+
+All instances write to the same storage backend in the same region. Multiple API/WebUI/MCP server instances may run concurrently and write audit events simultaneously.
+
+**Concurrency strategy for Parquet writes**:
+
+Each Parquet file name includes the instance identifier and a UUID to guarantee uniqueness:
+
+```
+audit_{date}_{time}_{instance_id}_{uuid8}.parquet
+```
+
+Where `instance_id` is derived from `hostname + PID` (same pattern as monitoring_writer). Two instances writing at the same millisecond produce two different files — no conflict, no locking required. The reader merges all files in a partition by `timestamp_ms` ordering.
+
+**Concurrency strategy for hash chain**:
+
+The hash chain becomes per-instance. Each instance maintains its own chain head in Redis:
+
+```
+supertable:{org}:audit:chain_head:{instance_id}
+```
+
+The daily chain proof aggregates all instance chains into a single Merkle-style proof:
+
+```json
+{
+  "date": "2025-01-15",
+  "instances": {
+    "api-host1-12345": {"head": "sha256...", "batches": 42},
+    "api-host2-67890": {"head": "sha256...", "batches": 38}
+  },
+  "merkle_root": "sha256_of_sorted_instance_heads",
+  "total_events": 80000
+}
+```
+
+Verification checks each instance chain independently, then verifies the Merkle root. A gap in any instance chain is detected without requiring cross-instance coordination.
+
+**Impact on module structure**: `chain.py` adds `InstanceChain` class and `MerkleProof` aggregation. No changes to the writer interface — the instance_id is injected at `AuditLogger` construction time.
+
+### 15.5 External SIEM integration — CONSUMER GROUPS SUPPORTED
+
+The Redis Stream supports named consumer groups. External SIEM tools (Splunk, Sentinel, ELK, Datadog) can connect directly and consume events independently of the internal archival worker.
+
+**Implementation**:
+
+On first startup, the audit logger creates a default consumer group for the internal archival worker:
+
+```
+XGROUP CREATE supertable:{org}:audit:stream archival $ MKSTREAM
+```
+
+External tools register their own consumer groups via a management API:
+
+```
+POST /reflection/audit/consumers
+{
+  "group_name": "splunk_prod",
+  "start_from": "0"        // "0" = all history, "$" = new events only
+}
+```
+
+```
+GET  /reflection/audit/consumers          — list consumer groups + lag
+DELETE /reflection/audit/consumers/{name} — remove a consumer group
+```
+
+**Consumer group management endpoints** require `superuser` role (not `auditor` — managing SIEM integrations is an infrastructure task).
+
+**Impact on section 6.1**: Redis Stream TTL must account for slow consumers. The `XTRIM` policy changes from pure time-based to: trim events older than `SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS` **only if** all consumer groups have acknowledged them. If a consumer falls behind, events are retained until acknowledged or until `SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN` hard cap is reached (at which point unacknowledged events are trimmed and a `warning` is logged).
+
+**New settings**:
+
+```python
+SUPERTABLE_AUDIT_SIEM_ENABLED: bool = True             # Allow external consumer groups
+SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS: int = 10           # Max external consumer groups
+```
+
+**Impact on section 11.3**: New API endpoints added:
+
+```
+POST   /reflection/audit/consumers       — create consumer group (superuser only)
+GET    /reflection/audit/consumers       — list groups + lag (superuser only)
+DELETE /reflection/audit/consumers/{name} — remove group (superuser only)
+```
+
+---
+
+## 16. Updated settings (consolidated)
+
+All audit-related settings for `config/settings.py`:
+
+```python
+# ── Audit ────────────────────────────────────────────────
+SUPERTABLE_AUDIT_ENABLED: bool = True               # Master switch
+SUPERTABLE_AUDIT_RETENTION_DAYS: int = 2555          # ~7 years (DORA minimum: 5 years)
+SUPERTABLE_AUDIT_BATCH_SIZE: int = 1000              # Events per Parquet file
+SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC: int = 60        # Max seconds before flush
+SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS: int = 24    # Hot tier TTL
+SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN: int = 100000   # Hard cap on stream entries
+SUPERTABLE_AUDIT_HASH_CHAIN: bool = True             # Enable tamper-evident chaining
+SUPERTABLE_AUDIT_LOG_QUERIES: bool = True            # Log SQL queries
+SUPERTABLE_AUDIT_LOG_READS: bool = True              # Log table reads (DORA default: on)
+SUPERTABLE_AUDIT_ALERT_WEBHOOK: str = ""             # Webhook URL for critical alerts
+SUPERTABLE_AUDIT_LEGAL_HOLD: bool = False            # Suspend retention enforcement
+SUPERTABLE_AUDIT_FERNET_KEY: str = ""                # Fernet key for encrypting full SQL
+SUPERTABLE_AUDIT_SIEM_ENABLED: bool = True           # Allow external SIEM consumer groups
+SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS: int = 10        # Max external consumer groups
+```

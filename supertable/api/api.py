@@ -106,6 +106,9 @@ from supertable.services.security import (
 # -- monitoring helpers --
 from supertable.services.monitoring import _read_monitoring_list
 
+# -- audit --
+from supertable.audit import emit as _audit, EventCategory, Actions, Severity, Outcome, make_detail, audit_context
+
 
 # ---------------------------------------------------------------------------
 # Lazy-import helpers (formerly closures inside attach_execute_routes)
@@ -394,6 +397,12 @@ def api_create_token(request: Request, org: str = Query(None), label: str = Quer
         raise HTTPException(status_code=401, detail="Unauthorized")
     org_eff = (org or _get_org_from_env_fallback()).strip()
     created = _catalog_create_token(org_eff, created_by="superuser", label=label)
+    _audit(
+        category=EventCategory.TOKEN_MGMT, action=Actions.TOKEN_CREATE,
+        organization=org_eff, resource_type="token",
+        resource_id=created.get("token_id", ""), severity=Severity.WARNING,
+        detail=make_detail(label=label),
+    )
     return {"ok": True, "organization": org_eff, **created}
 
 
@@ -405,6 +414,11 @@ def api_delete_token(request: Request, token_id: str, org: str = Query(None), _:
     ok = _catalog_delete_token(org_eff, token_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Token not found")
+    _audit(
+        category=EventCategory.TOKEN_MGMT, action=Actions.TOKEN_DELETE,
+        organization=org_eff, resource_type="token",
+        resource_id=token_id, severity=Severity.WARNING,
+    )
     return {"ok": True, "organization": org_eff, "token_id": token_id}
 
 
@@ -422,6 +436,12 @@ def api_create_super(
         st = SuperTable(organization=organization, super_name=super_name)
         storage_label = getattr(getattr(st, "storage", None), "__class__", None)
         storage_name = getattr(storage_label, "__name__", None) if storage_label else None
+        _audit(
+            category=EventCategory.DATA_MUTATION, action=Actions.SUPERTABLE_CREATE,
+            organization=organization, super_name=super_name,
+            resource_type="supertable", resource_id=super_name,
+            severity=Severity.WARNING, detail=make_detail(storage=storage_name),
+        )
         return {"ok": True, "organization": st.organization, "name": st.super_name, "storage": storage_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
@@ -468,6 +488,12 @@ def api_delete_super(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Redis delete failed: {e}")
 
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.SUPERTABLE_DELETE,
+        organization=organization, super_name=super_name,
+        resource_type="supertable", resource_id=super_name,
+        severity=Severity.CRITICAL, detail=make_detail(deleted_redis_keys=deleted_keys),
+    )
     return {"ok": True, "organization": organization, "super_name": super_name, "deleted_redis_keys": deleted_keys}
 
 
@@ -582,6 +608,16 @@ def execute_api(
             "query_profile": getattr(getattr(dr, "query_plan_manager", None), "query_profile", None),
         }
 
+        _audit(
+            **audit_context(request), category=EventCategory.DATA_ACCESS,
+            action=Actions.QUERY_EXECUTE, organization=organization,
+            super_name=super_name, resource_type="query", resource_id="",
+            detail=make_detail(
+                sql_preview=q[:200], row_count=total_count, engine=engine_raw,
+                role_name=role_name,
+            ),
+        )
+
         return JSONResponse({
             "status": "ok", "message": None, "result": rows,
             "total_count": total_count, "meta": _sanitize_for_json(meta_payload),
@@ -591,6 +627,13 @@ def execute_api(
         raise
     except Exception as e:
         logger.exception("Execute SQL failed")
+        _audit(
+            **audit_context(request), category=EventCategory.DATA_ACCESS,
+            action=Actions.QUERY_EXECUTE, organization=organization,
+            super_name=super_name, resource_type="query", resource_id="",
+            outcome=Outcome.FAILURE, reason=str(e)[:500], severity=Severity.WARNING,
+            detail=make_detail(sql_preview=query[:200], engine=engine_raw, error=str(e)[:200]),
+        )
         return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
 
 
@@ -777,6 +820,12 @@ def api_delete_table(
     simple_table = SimpleTable(super_table=super_table, simple_name=simple)
     simple_table.delete(role_name=role)
 
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.TABLE_DELETE,
+        organization=organization, super_name=super_name,
+        resource_type="table", resource_id=simple,
+        severity=Severity.CRITICAL,
+    )
     return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
 
 
@@ -845,6 +894,12 @@ def api_put_table_config(
                 else:
                     merged[field] = body[field]
         catalog.set_table_config(organization, super_name, simple, merged)
+        _audit(
+            category=EventCategory.CONFIG_CHANGE, action=Actions.TABLE_CONFIG_CHANGE,
+            organization=organization, super_name=super_name,
+            resource_type="table", resource_id=simple, severity=Severity.WARNING,
+            detail=make_detail(before=existing, after=merged),
+        )
         return {"ok": True, "config": merged}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Set table config failed: {e}")
@@ -1052,6 +1107,11 @@ def api_create_staging(
         _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
 
     _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.STAGING_CREATE,
+        organization=org, super_name=sup, resource_type="staging",
+        resource_id=staging_name, severity=Severity.INFO,
+    )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
 
@@ -1089,6 +1149,11 @@ def api_delete_staging(
             _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes2, "updated_at_ns": time.time_ns()})
 
     _redis_delete_staging_cascade(org, sup, staging_name)
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.STAGING_DELETE,
+        organization=org, super_name=sup, resource_type="staging",
+        resource_id=staging_name, severity=Severity.WARNING,
+    )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
 
@@ -1163,6 +1228,12 @@ def api_save_pipe(
     _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
     _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, pipe_def)
 
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_CREATE,
+        organization=org, super_name=sup, resource_type="pipe",
+        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
+        detail=make_detail(staging=staging_name, pipe=pipe_name, enabled=pipe_def.get("enabled")),
+    )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "path": pipe_path}
 
 
@@ -1198,6 +1269,11 @@ def api_delete_pipe(
             _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes2, "updated_at_ns": time.time_ns()})
 
     _redis_delete_pipe_meta(org, sup, staging_name, pipe_name.strip())
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_DELETE,
+        organization=org, super_name=sup, resource_type="pipe",
+        resource_id=f"{staging_name}/{pipe_name.strip()}", severity=Severity.WARNING,
+    )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip()}
 
 
@@ -1234,6 +1310,11 @@ def api_enable_pipe(
     if isinstance(meta, dict):
         meta["enabled"] = True
     _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_ENABLE,
+        organization=org, super_name=sup, resource_type="pipe",
+        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
+    )
     return {"ok": True}
 
 
@@ -1270,6 +1351,11 @@ def api_disable_pipe(
     if isinstance(meta, dict):
         meta["enabled"] = False
     _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_DISABLE,
+        organization=org, super_name=sup, resource_type="pipe",
+        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
+    )
     return {"ok": True}
 
 
@@ -1415,6 +1501,15 @@ async def api_ingestion_load_upload(
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         rows_count = getattr(arrow_table, "num_rows", None)
+        _audit(
+            **audit_context(request), category=EventCategory.DATA_MUTATION,
+            action=Actions.FILE_UPLOAD, organization=org_eff, super_name=sup_eff,
+            resource_type="staging", resource_id=stg_eff, severity=Severity.INFO,
+            detail=make_detail(
+                mode="staging", staging=stg_eff, filename=file.filename or "",
+                rows=rows_count, file_type=ext, duration_ms=round(dt_ms),
+            ),
+        )
         return {
             "ok": True, "mode": "staging", "organization": org_eff, "super_name": sup_eff,
             "staging_name": stg_eff, "saved_file_name": saved, "rows": rows_count if rows_count is not None else 0,
@@ -1442,6 +1537,16 @@ async def api_ingestion_load_upload(
         raise HTTPException(status_code=500, detail=f"Write failed: {e}")
 
     dt_ms = (time.perf_counter() - t0) * 1000.0
+    _audit(
+        **audit_context(request), category=EventCategory.DATA_MUTATION,
+        action=Actions.FILE_UPLOAD, organization=org_eff, super_name=sup_eff,
+        resource_type="table", resource_id=table_eff, severity=Severity.INFO,
+        detail=make_detail(
+            mode="table", table=table_eff, filename=file.filename or "",
+            rows=rows_written, inserted=inserted, deleted=deleted,
+            file_type=ext, duration_ms=round(dt_ms),
+        ),
+    )
     return {
         "ok": True, "mode": "table", "organization": org_eff, "super_name": sup_eff,
         "table_name": table_eff, "rows": rows_written, "inserted": inserted, "deleted": deleted,
@@ -1543,6 +1648,12 @@ def rbac_role_create(
         tables=tables, columns=columns, filters=filters,
         source_query=source_query,
     )
+    _audit(
+        category=EventCategory.RBAC_CHANGE, action=Actions.ROLE_CREATE,
+        organization=org, super_name=sup, resource_type="role",
+        resource_id=doc.get("role_id", role_name), severity=Severity.WARNING,
+        detail=make_detail(role_name=role_name, role_type=role_type, tables=tables),
+    )
     return JSONResponse({"ok": True, "data": doc}, status_code=201)
 
 
@@ -1572,6 +1683,12 @@ def rbac_role_update(
         tables=tables, columns=columns, filters=filters,
         source_query=str(payload["source_query"]) if "source_query" in payload else None,
     )
+    _audit(
+        category=EventCategory.RBAC_CHANGE, action=Actions.ROLE_UPDATE,
+        organization=org, super_name=sup, resource_type="role",
+        resource_id=role_id, severity=Severity.WARNING,
+        detail=make_detail(role_name=payload.get("role_name", ""), role_type=payload.get("role", "")),
+    )
     return JSONResponse({"ok": True, "data": doc})
 
 
@@ -1589,6 +1706,11 @@ def rbac_role_delete(
     if not org or not sup:
         raise HTTPException(status_code=400, detail="organization and super_name are required")
     deleted = _sec_delete_role(redis_client, org, sup, role_id)
+    _audit(
+        category=EventCategory.RBAC_CHANGE, action=Actions.ROLE_DELETE,
+        organization=org, super_name=sup, resource_type="role",
+        resource_id=role_id, severity=Severity.CRITICAL,
+    )
     return JSONResponse({"ok": True, "data": {"deleted": deleted}})
 
 
@@ -2613,6 +2735,131 @@ def api_users_page_remove_role(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remove role failed: {e}")
     return {"ok": True, "user_id": user_id, "role_id": role_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   AUDIT LOG endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/reflection/audit/events")
+def audit_events(
+    request: Request,
+    organization: str = Query(""),
+    category: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    outcome: Optional[str] = Query(None),
+    actor_id: Optional[str] = Query(None),
+    resource_id: Optional[str] = Query(None),
+    correlation_id: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=5000),
+    _=Depends(admin_guard_api),
+):
+    """Query audit events. Requires superuser or auditor role."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit log access requires superuser")
+
+    org = (organization or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org:
+        return JSONResponse({"events": []})
+
+    from supertable.audit.reader import query_audit_log
+    events = query_audit_log(
+        org,
+        category=category,
+        severity=severity,
+        outcome=outcome,
+        actor_id=actor_id,
+        resource_id=resource_id,
+        correlation_id=correlation_id,
+        limit=limit,
+    )
+    return JSONResponse({"events": events, "count": len(events)})
+
+
+@router.get("/reflection/audit/verify")
+def audit_verify(
+    request: Request,
+    organization: str = Query(""),
+    date: str = Query(""),
+    _=Depends(admin_guard_api),
+):
+    """Verify hash chain integrity for a specific day."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit log access requires superuser")
+
+    org = (organization or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org or not date:
+        raise HTTPException(status_code=400, detail="organization and date required")
+
+    from supertable.audit.reader import verify_chain_integrity
+    result = verify_chain_integrity(org, date)
+    return JSONResponse(result)
+
+
+@router.get("/reflection/audit/export")
+def audit_export(
+    request: Request,
+    organization: str = Query(""),
+    start: str = Query(""),
+    end: str = Query(""),
+    format: str = Query("json"),
+    criteria: Optional[str] = Query(None),
+    _=Depends(admin_guard_api),
+):
+    """Export audit events as JSON-lines or CSV."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit log access requires superuser")
+
+    org = (organization or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org or not start or not end:
+        raise HTTPException(status_code=400, detail="organization, start and end dates required")
+
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        start_ms = int(_dt.strptime(start, "%Y-%m-%d").replace(tzinfo=_tz.utc).timestamp() * 1000)
+        end_ms = int(_dt.strptime(end, "%Y-%m-%d").replace(tzinfo=_tz.utc).timestamp() * 1000) + 86400000
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    if criteria:
+        from supertable.audit.export import export_soc2_evidence
+        data = export_soc2_evidence(org, criteria, start_ms, end_ms, format)
+    else:
+        from supertable.audit.reader import query_audit_log
+        from supertable.audit.export import export_events
+        events = query_audit_log(org, start_ms=start_ms, end_ms=end_ms, limit=50000)
+        data = export_events(events, format)
+
+    content_type = "text/csv" if format == "csv" else "application/x-ndjson"
+    ext = "csv" if format == "csv" else "jsonl"
+    filename = f"audit_{org}_{start}_{end}.{ext}"
+
+    from starlette.responses import Response as _Resp
+    return _Resp(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/reflection/audit/stats")
+def audit_stats(
+    request: Request,
+    organization: str = Query(""),
+    _=Depends(admin_guard_api),
+):
+    """Event counts by category and severity."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit log access requires superuser")
+
+    org = (organization or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org:
+        return JSONResponse({"stats": {}})
+
+    from supertable.audit.logger import get_audit_logger
+    audit_logger = get_audit_logger(org)
+    stats = getattr(audit_logger, "stats", {})
+    return JSONResponse({"ok": True, "stats": stats})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
