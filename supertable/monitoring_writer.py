@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import json
 import os
+
+from supertable.config.settings import settings
 import queue
 import threading
 import time
@@ -404,7 +406,7 @@ class _AsyncMonitoringLogger:
 # evicted (its daemon thread stops on the next loop iteration via _stop event).
 _MONITORS: Dict[str, MonitoringLogger] = {}
 _MONITORS_LOCK = threading.Lock()
-_MONITORS_MAX = int(os.getenv("SUPERTABLE_MONITOR_CACHE_MAX", "256"))
+_MONITORS_MAX = settings.SUPERTABLE_MONITOR_CACHE_MAX
 
 
 def _evict_oldest_monitor() -> None:
@@ -426,7 +428,7 @@ def _evict_oldest_monitor() -> None:
 
 
 def _monitoring_enabled() -> bool:
-    raw = os.getenv("SUPERTABLE_MONITORING_ENABLED", "true").strip().lower()
+    raw = str(settings.SUPERTABLE_MONITORING_ENABLED).lower()
     return raw in ("1", "true", "yes", "y", "on")
 
 

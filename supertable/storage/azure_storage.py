@@ -3,6 +3,8 @@ import io
 import json
 import fnmatch
 import os
+
+from supertable.config.settings import settings
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
@@ -71,11 +73,11 @@ class AzureBlobStorage(StorageInterface):
           - AZURE_AUTH_MODE (informational; if AAD and no secrets -> DefaultAzureCredential)
         """
         # Prefer ABFSS home if present
-        st_home = os.getenv("SUPERTABLE_HOME", "")
-        account = os.getenv("AZURE_STORAGE_ACCOUNT", "")
-        container = os.getenv("STORAGE_BUCKET") or os.getenv("AZURE_CONTAINER") or ""
-        endpoint = os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("AZURE_BLOB_ENDPOINT") or ""
-        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
+        st_home = settings.SUPERTABLE_HOME
+        account = settings.AZURE_STORAGE_ACCOUNT
+        container = settings.effective_storage_bucket
+        endpoint = settings.effective_storage_endpoint
+        base_prefix = settings.SUPERTABLE_PREFIX
 
         if st_home.lower().startswith("abfss://"):
             try:
@@ -90,9 +92,9 @@ class AzureBlobStorage(StorageInterface):
                 # keep going with explicit env
                 pass
 
-        conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-        key = os.getenv("STORAGE_ACCESS_KEY") or os.getenv("AZURE_STORAGE_KEY") or ""
-        sas = os.getenv("AZURE_SAS_TOKEN", "")
+        conn_str = settings.AZURE_STORAGE_CONNECTION_STRING
+        key = settings.effective_storage_access_key
+        sas = settings.AZURE_SAS_TOKEN
 
         if not endpoint:
             if not account:
@@ -128,7 +130,7 @@ class AzureBlobStorage(StorageInterface):
         full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
         prefer_httpfs = (
             prefer_httpfs if prefer_httpfs is not None
-            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+            else settings.SUPERTABLE_DUCKDB_USE_HTTPFS
         )
         if prefer_httpfs:
             account_url = self.svc.url.rstrip("/")

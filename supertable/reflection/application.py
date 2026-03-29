@@ -44,6 +44,7 @@ from fastapi.staticfiles import StaticFiles
 # ---------------------------------------------------------------------------
 # Structured logging — must be configured before any other import logs
 # ---------------------------------------------------------------------------
+from supertable.config.settings import settings as _cfg
 from supertable.logging import configure_logging, RequestLoggingMiddleware, CORRELATION_HEADER
 
 configure_logging(service="ui")
@@ -55,7 +56,7 @@ _proxy_logger = logging.getLogger("supertable.ui.proxy")
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_BASE_URL = f"http://{os.getenv('SUPERTABLE_API_HOST', '0.0.0.0')}:{os.getenv('SUPERTABLE_API_PORT', '8050')}".rstrip("/")
+API_BASE_URL = f"http://{_cfg.effective_api_host}:{_cfg.SUPERTABLE_API_PORT}".rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Import infrastructure from common.py — NO endpoint handlers are imported.
@@ -85,7 +86,7 @@ from supertable.reflection.common import (                  # noqa: E402
 # Proxy client — persistent httpx.AsyncClient for connection pooling
 # ---------------------------------------------------------------------------
 
-_PROXY_TIMEOUT = float(os.getenv("SUPERTABLE_PROXY_TIMEOUT", "60"))
+_PROXY_TIMEOUT = _cfg.SUPERTABLE_PROXY_TIMEOUT
 _http_client: Optional[httpx.AsyncClient] = None
 
 
@@ -118,10 +119,7 @@ app = FastAPI(
 app.add_middleware(RequestLoggingMiddleware, service="ui")
 
 # Static files
-_STATIC_DIR = os.getenv(
-    "SUPERTABLE_STATIC_DIR",
-    str(Path(__file__).resolve().parent / "static"),
-)
+_STATIC_DIR = _cfg.SUPERTABLE_STATIC_DIR or str(Path(__file__).resolve().parent / "static")
 if Path(_STATIC_DIR).is_dir():
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
@@ -682,9 +680,9 @@ async def proxy_api_prefix(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("SUPERTABLE_UI_HOST", "0.0.0.0")
-    port = int(os.getenv("SUPERTABLE_UI_PORT", "8051"))
-    reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
+    host = _cfg.SUPERTABLE_UI_HOST
+    port = _cfg.SUPERTABLE_UI_PORT
+    reload_flag = _cfg.UVICORN_RELOAD
 
     uvicorn.run(
         "supertable.reflection.application:app",

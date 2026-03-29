@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from supertable.config.settings import settings as _cfg
 import re
 import time
 import asyncio
@@ -735,7 +737,7 @@ def api_get_super_meta(
 
     role = _resolve_role(request, role_name, "")
 
-    debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS") or "").strip() == "1"
+    debug_timings = _cfg.SUPERTABLE_DEBUG_TIMINGS
     t0 = time.perf_counter()
     try:
         mr = MetaReader(organization=organization, super_name=super_name)

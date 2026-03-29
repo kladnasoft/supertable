@@ -63,7 +63,9 @@ from starlette.responses import Response
 # Constants
 # ---------------------------------------------------------------------------
 
-CORRELATION_HEADER = os.getenv("SUPERTABLE_CORRELATION_HEADER", "X-Correlation-ID")
+from supertable.config.settings import settings
+
+CORRELATION_HEADER = settings.SUPERTABLE_CORRELATION_HEADER
 
 # Fields to suppress from JSON output (security)
 _REDACT_HEADERS = frozenset({
@@ -164,8 +166,8 @@ class TextFormatter(logging.Formatter):
         # IDEs (PyCharm, VS Code) support ANSI but don't report isatty() — so we
         # default to ON and let users opt out explicitly.
         self._color = not (
-            os.getenv("NO_COLOR") is not None
-            or os.getenv("SUPERTABLE_LOG_COLOR", "").strip().lower() in ("0", "false", "no", "off")
+            settings.NO_COLOR
+            or settings.SUPERTABLE_LOG_COLOR.lower() in ("0", "false", "no", "off")
         )
 
     def _wrap(self, color: str, text: str) -> str:
@@ -266,8 +268,8 @@ def configure_logging(
         log_file: Optional file path. Default from SUPERTABLE_LOG_FILE or
                   {SUPERTABLE_HOME}/log/st.log. Set to "none" to disable.
     """
-    level = (level or os.getenv("SUPERTABLE_LOG_LEVEL", "INFO")).upper()
-    fmt = (fmt or os.getenv("SUPERTABLE_LOG_FORMAT", "json")).lower()
+    level = (level or settings.SUPERTABLE_LOG_LEVEL).upper()
+    fmt = (fmt or settings.SUPERTABLE_LOG_FORMAT).lower()
 
     # Log file path:
     #   - Explicit parameter wins.
@@ -275,7 +277,7 @@ def configure_logging(
     #   - Then default: {SUPERTABLE_HOME}/log/st.log
     #   - Set to "none" or "off" to disable file logging entirely.
     if log_file is None:
-        log_file = os.getenv("SUPERTABLE_LOG_FILE")
+        log_file = settings.SUPERTABLE_LOG_FILE or None
     if log_file is None:
         # Lazy import to avoid import-time side effects from homedir
         from supertable.config.homedir import get_app_home

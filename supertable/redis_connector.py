@@ -6,13 +6,12 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from dotenv import load_dotenv
 
 import redis
 from redis.sentinel import MasterNotFoundError, Sentinel
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 
-load_dotenv()
 
 
 @dataclass(frozen=True)
@@ -52,26 +51,18 @@ class RedisOptions:
     sentinel_strict: bool = field(init=False)
 
     def __post_init__(self):
-        host = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
-        port = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
-        db = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
-        password = os.getenv("SUPERTABLE_REDIS_PASSWORD")
-        use_ssl = os.getenv("SUPERTABLE_REDIS_SSL", "false").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        host = settings.SUPERTABLE_REDIS_HOST
+        port = settings.SUPERTABLE_REDIS_PORT
+        db = settings.SUPERTABLE_REDIS_DB
+        password = settings.SUPERTABLE_REDIS_PASSWORD or None
+        use_ssl = settings.SUPERTABLE_REDIS_SSL
 
         # All Redis data is JSON text — always decode responses to str.
         decode = True
 
         # Sentinel mode configuration
-        is_sentinel = os.getenv("SUPERTABLE_REDIS_SENTINEL", "false").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        )
-        sentinel_raw = os.getenv("SUPERTABLE_REDIS_SENTINELS", "").strip()
+        is_sentinel = settings.SUPERTABLE_REDIS_SENTINEL
+        sentinel_raw = settings.SUPERTABLE_REDIS_SENTINELS
         sentinels: List[tuple] = []
         if sentinel_raw:
             for part in sentinel_raw.split(","):
@@ -84,9 +75,9 @@ class RedisOptions:
                 except ValueError:
                     logger.warning(f"[redis-options] Invalid sentinel spec: {part}")
 
-        sentinel_master = os.getenv("SUPERTABLE_REDIS_SENTINEL_MASTER", "mymaster")
+        sentinel_master = settings.SUPERTABLE_REDIS_SENTINEL_MASTER
 
-        sentinel_password = os.getenv("SUPERTABLE_REDIS_SENTINEL_PASSWORD") or password
+        sentinel_password = settings.effective_redis_sentinel_password or None
 
         # In many deployments the Sentinel and Redis server share the same password.
         # Allow a single-password setup by reusing SUPERTABLE_REDIS_SENTINEL_PASSWORD

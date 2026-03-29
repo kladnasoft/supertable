@@ -13,6 +13,8 @@ import argparse
 import io
 import json
 import os
+
+from supertable.config.settings import settings
 import subprocess
 import sys
 from typing import Any, Dict, Optional, Tuple, List
@@ -94,7 +96,7 @@ def _find_upwards(start_dir: str, filenames: List[str]) -> List[str]:
 
 def _paths_candidates(server_path: str) -> Dict[str, List[str]]:
     home = os.path.expanduser("~")
-    xdg = os.getenv("XDG_CONFIG_HOME", os.path.join(home, ".config"))
+    xdg = settings.XDG_CONFIG_HOME or os.path.join(home, ".config")
     cfgdir = os.path.join(xdg, "supertable")
 
     env_names = [".env", ".env.local", "mcp.local.env"]
@@ -134,10 +136,10 @@ def load_config(server_path: str, verbose: bool) -> Dict[str, Any]:
         _load_env_file(p)
 
     cfg: Dict[str, Any] = {}
-    cfg["server_path"] = os.getenv("MCP_SERVER_PATH", json_cfg.get("server_path", server_path or "mcp_server.py"))
-    cfg["wire"] = os.getenv("MCP_WIRE", json_cfg.get("wire", "ndjson"))
-    cfg["org"] = os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", json_cfg.get("org", "")))
-    cfg["super"] = os.getenv("SUPERTABLE_TEST_SUPER", json_cfg.get("super", ""))
+    cfg["server_path"] = settings.MCP_SERVER_PATH or json_cfg.get("server_path", server_path or "mcp_server.py")
+    cfg["wire"] = settings.MCP_WIRE or json_cfg.get("wire", "ndjson")
+    cfg["org"] = settings.SUPERTABLE_ORGANIZATION or settings.SUPERTABLE_TEST_ORG or json_cfg.get("org", "")
+    cfg["super"] = settings.SUPERTABLE_TEST_SUPER or json_cfg.get("super", "")
     cfg["user_hash"] = json_cfg.get("role", "")
     # Default SQL now empty; if env provides something, we use it (and may fallback)
     cfg["sql"] = json_cfg.get("sql", "")
@@ -528,20 +530,20 @@ def safe_query_with_fallback(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local MCP stdio client")
-    parser.add_argument("--server", dest="server_path", default=os.getenv("MCP_SERVER_PATH", _DEFAULT_SERVER_PATH))
-    parser.add_argument("--wire", dest="wire", default=os.getenv("MCP_WIRE", "ndjson"), choices=["ndjson", "lsp"])
-    parser.add_argument("--org", dest="org", default=os.getenv("SUPERTABLE_ORGANIZATION", os.getenv("SUPERTABLE_TEST_ORG", "")))
-    parser.add_argument("--super", dest="super_name", default=os.getenv("SUPERTABLE_TEST_SUPER", ""))
+    parser.add_argument("--server", dest="server_path", default=settings.MCP_SERVER_PATH or _DEFAULT_SERVER_PATH)
+    parser.add_argument("--wire", dest="wire", default=settings.MCP_WIRE, choices=["ndjson", "lsp"])
+    parser.add_argument("--org", dest="org", default=settings.SUPERTABLE_ORGANIZATION or settings.SUPERTABLE_TEST_ORG)
+    parser.add_argument("--super", dest="super_name", default=settings.SUPERTABLE_TEST_SUPER)
     parser.add_argument(
         "--role",
         dest="role",
         default="",
     )
-    parser.add_argument("--token", dest="auth_token", default=(os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or ""))
+    parser.add_argument("--token", dest="auth_token", default=settings.SUPERTABLE_MCP_TOKEN)
     # Default SQL may be empty; caller provides via --sql
     parser.add_argument("--sql", dest="sql", default="")
-    parser.add_argument("--engine", dest="engine", default=os.getenv("SUPERTABLE_TEST_ENGINE", ""))
-    parser.add_argument("--timeout", dest="timeout", type=float, default=float(os.getenv("SUPERTABLE_TEST_TIMEOUT_SEC", "0") or 0))
+    parser.add_argument("--engine", dest="engine", default=settings.SUPERTABLE_TEST_ENGINE)
+    parser.add_argument("--timeout", dest="timeout", type=float, default=settings.SUPERTABLE_TEST_TIMEOUT_SEC)
     parser.add_argument("--list-tables", action="store_true", help="Call list_tables after list_supers")
     parser.add_argument("--describe", dest="describe_table", default="", help="Call describe_table for TABLE")
     parser.add_argument("--stats", dest="stats_table", default="", help="Call get_table_stats for TABLE")

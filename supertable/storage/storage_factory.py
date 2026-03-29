@@ -15,6 +15,7 @@ import importlib
 import os
 
 from supertable.config.defaults import default
+from supertable.config.settings import settings
 from supertable.storage.storage_interface import StorageInterface
 
 
@@ -42,7 +43,7 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
     """
     storage_type = (
         (kind or "").upper()
-        or (os.getenv("STORAGE_TYPE") or "").upper()
+        or settings.STORAGE_TYPE
         or (getattr(default, "STORAGE_TYPE", None) or "LOCAL").upper()
     )
 

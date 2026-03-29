@@ -2,6 +2,8 @@
 
 import io
 import os
+
+from supertable.config.settings import settings
 import re
 import json
 import fnmatch
@@ -105,12 +107,12 @@ class MinioStorage(StorageInterface):
 
     @classmethod
     def from_env(cls) -> "MinioStorage":
-        bucket = os.getenv("STORAGE_BUCKET") or "supertable"
-        endpoint = os.getenv("STORAGE_ENDPOINT_URL")
-        access_key = os.getenv("STORAGE_ACCESS_KEY")
-        secret_key = os.getenv("STORAGE_SECRET_KEY")
-        region = os.getenv("STORAGE_REGION") or None
-        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
+        bucket = settings.STORAGE_BUCKET
+        endpoint = settings.STORAGE_ENDPOINT_URL or None
+        access_key = settings.STORAGE_ACCESS_KEY or None
+        secret_key = settings.STORAGE_SECRET_KEY or None
+        region = settings.STORAGE_REGION or None
+        base_prefix = settings.SUPERTABLE_PREFIX
         if not endpoint or not access_key or not secret_key:
             raise RuntimeError(
                 "MinIO environment incomplete. "
@@ -129,7 +131,7 @@ class MinioStorage(StorageInterface):
         storage._access_key = access_key
         storage._secret_key = secret_key
 
-        force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
+        force_path_style = settings.STORAGE_FORCE_PATH_STYLE
         storage.url_style = "path" if force_path_style else "vhost"
 
         storage._ensure_bucket_exists(bucket, region)
@@ -140,7 +142,7 @@ class MinioStorage(StorageInterface):
     def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
         prefer_httpfs = (
             prefer_httpfs if prefer_httpfs is not None
-            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+            else settings.SUPERTABLE_DUCKDB_USE_HTTPFS
         )
         key = (key or "").lstrip("/")
         full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key

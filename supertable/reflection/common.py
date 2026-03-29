@@ -28,59 +28,54 @@ from redis.sentinel import MasterNotFoundError
 
 
 
-# Load environment variables from .env file (optional)
+# dotenv is loaded centrally by supertable.config.settings
 try:
-    from dotenv import load_dotenv, dotenv_values, set_key
-    load_dotenv()
+    from dotenv import dotenv_values, set_key
 except ImportError:
     dotenv_values = None  # type: ignore[assignment]
     set_key = None        # type: ignore[assignment]
-    pass
+
+from supertable.config.settings import settings as _cfg
 
 logger = logging.getLogger(__name__)
 # ------------------------------ Settings ------------------------------
 
 class Settings:
+    """Thin adapter that delegates to the central config.settings singleton.
+
+    Attributes that config.settings does not carry (e.g. TEMPLATES_DIR with
+    a path derived from __file__) are resolved here.
+    """
+
     def __init__(self) -> None:
-        # SUPERTABLE_* — as requested
-        self.SUPERTABLE_ORGANIZATION: str = os.getenv("SUPERTABLE_ORGANIZATION", "").strip()
-        self.SUPERTABLE_SUPERUSER_TOKEN: str = (
-            os.getenv("SUPERTABLE_SUPERUSER_TOKEN") or os.getenv("SUPERTABLE_SUPERTOKEN") or ""
-        ).strip()
-        self.SUPERTABLE_SESSION_SECRET: str = os.getenv("SUPERTABLE_SESSION_SECRET", "").strip()
+        self.SUPERTABLE_ORGANIZATION: str = _cfg.SUPERTABLE_ORGANIZATION
+        self.SUPERTABLE_SUPERUSER_TOKEN: str = _cfg.SUPERTABLE_SUPERUSER_TOKEN
+        self.SUPERTABLE_SESSION_SECRET: str = _cfg.SUPERTABLE_SESSION_SECRET
 
-        self.SUPERTABLE_REDIS_URL: Optional[str] = os.getenv("SUPERTABLE_REDIS_URL")
+        self.SUPERTABLE_REDIS_URL: Optional[str] = _cfg.SUPERTABLE_REDIS_URL or None
+        self.SUPERTABLE_REDIS_HOST: str = _cfg.SUPERTABLE_REDIS_HOST
+        self.SUPERTABLE_REDIS_PORT: int = _cfg.SUPERTABLE_REDIS_PORT
+        self.SUPERTABLE_REDIS_DB: int = _cfg.SUPERTABLE_REDIS_DB
+        self.SUPERTABLE_REDIS_PASSWORD: Optional[str] = _cfg.SUPERTABLE_REDIS_PASSWORD or None
+        self.SUPERTABLE_REDIS_USERNAME: Optional[str] = _cfg.SUPERTABLE_REDIS_USERNAME or None
 
-        self.SUPERTABLE_REDIS_HOST: str = os.getenv("SUPERTABLE_REDIS_HOST", "localhost")
-        self.SUPERTABLE_REDIS_PORT: int = int(os.getenv("SUPERTABLE_REDIS_PORT", "6379"))
-        self.SUPERTABLE_REDIS_DB: int = int(os.getenv("SUPERTABLE_REDIS_DB", "0"))
-        self.SUPERTABLE_REDIS_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_PASSWORD")
-        self.SUPERTABLE_REDIS_USERNAME: Optional[str] = os.getenv("SUPERTABLE_REDIS_USERNAME")
+        self.SUPERTABLE_REDIS_SENTINEL: Optional[str] = str(_cfg.SUPERTABLE_REDIS_SENTINEL) if _cfg.SUPERTABLE_REDIS_SENTINEL else None
+        self.SUPERTABLE_REDIS_SENTINELS: Optional[str] = _cfg.SUPERTABLE_REDIS_SENTINELS or None
+        self.SUPERTABLE_REDIS_SENTINEL_MASTER: Optional[str] = _cfg.SUPERTABLE_REDIS_SENTINEL_MASTER or None
+        self.SUPERTABLE_REDIS_SENTINEL_PASSWORD: Optional[str] = _cfg.SUPERTABLE_REDIS_SENTINEL_PASSWORD or None
+        self.SUPERTABLE_REDIS_SENTINEL_STRICT: Optional[str] = _cfg.SUPERTABLE_REDIS_SENTINEL_STRICT or None
 
-        # SENTINEL
-        self.SUPERTABLE_REDIS_SENTINEL: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL")
-        self.SUPERTABLE_REDIS_SENTINELS: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINELS")
-        self.SUPERTABLE_REDIS_SENTINEL_MASTER: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_MASTER")
-        self.SUPERTABLE_REDIS_SENTINEL_PASSWORD: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_PASSWORD")
-        self.SUPERTABLE_REDIS_SENTINEL_STRICT: Optional[str] = os.getenv("SUPERTABLE_REDIS_SENTINEL_STRICT")
+        self.SUPERTABLE_LOGIN_MASK: int = _cfg.SUPERTABLE_LOGIN_MASK
 
-        # 1 = only superuser can login, 2 = only regular users can login, 3 = both
-        try:
-            self.SUPERTABLE_LOGIN_MASK: int = int((os.getenv("SUPERTABLE_LOGIN_MASK", "1") or "1").strip())
-        except ValueError:
-            self.SUPERTABLE_LOGIN_MASK = 1
+        self.DOTENV_PATH: str = _cfg.DOTENV_PATH
 
-        self.DOTENV_PATH: str = os.getenv("DOTENV_PATH", ".env")
-
-        # IMPORTANT: keep templates in the original folder (parent of /reflection)
-        # This preserves behavior from before the move of this file.
-        self.TEMPLATES_DIR: str = os.getenv(
-            "TEMPLATES_DIR",
-            str(Path(__file__).resolve().parent.parent / "reflection/templates")
+        # TEMPLATES_DIR: use central setting if provided, otherwise derive from __file__
+        self.TEMPLATES_DIR: str = (
+            _cfg.TEMPLATES_DIR
+            or str(Path(__file__).resolve().parent.parent / "reflection/templates")
         )
 
-        # set to 1 in HTTPS environments
-        self.SECURE_COOKIES: bool = os.getenv("SECURE_COOKIES", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.SECURE_COOKIES: bool = _cfg.SECURE_COOKIES
 
 
 settings = Settings()

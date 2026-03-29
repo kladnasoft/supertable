@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+
+from supertable.config.settings import settings
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
-from dotenv import load_dotenv
-load_dotenv()
 
 _AUTH_TOOLS = {
     "whoami",
@@ -63,9 +63,9 @@ class MCPWebClient:
         auth_token: Optional[str] = None,
         request_timeout: Optional[float] = None,
     ) -> None:
-        self.server_path = os.path.abspath(server_path or os.getenv("MCP_SERVER_PATH", _default_server_path()))
+        self.server_path = os.path.abspath(server_path or settings.MCP_SERVER_PATH or _default_server_path())
         self.python_exe = python_exe or sys.executable
-        self.auth_token = (auth_token or os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "").strip()
+        self.auth_token = (auth_token or settings.SUPERTABLE_MCP_TOKEN).strip()
         self.request_timeout = request_timeout if request_timeout is not None else self.DEFAULT_REQUEST_TIMEOUT
 
         self._proc: Optional[asyncio.subprocess.Process] = None

@@ -28,10 +28,7 @@ import time
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Dict, List, Optional, Set, Tuple
-from dotenv import load_dotenv
-if "_SUPERTABLE_DOTENV_LOADED" not in os.environ:
-    load_dotenv()
-    os.environ["_SUPERTABLE_DOTENV_LOADED"] = "1"
+# dotenv is loaded centrally by supertable.config.settings
 
 # ---------- Import path: allow `from supertable.*` ----------
 # This file lives at `supertable/mcp/mcp_server.py`. When executed as a script,
@@ -42,9 +39,11 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from supertable.config.settings import settings  # noqa: E402
+
 # ---------- Logging ----------
 
-LOG_LEVEL = os.getenv("SUPERTABLE_LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = settings.SUPERTABLE_LOG_LEVEL
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(levelname)-8s - %(message)s",
@@ -295,19 +294,19 @@ def _summarize_rows(rows: List[List[Any]], head_n: int = 3) -> str:
 class Config:
     name: str = "supertable-mcp"
     version: str = "1.3.0"
-    default_engine: str = os.getenv("SUPERTABLE_DEFAULT_ENGINE", "AUTO")
-    default_limit: int = int(os.getenv("SUPERTABLE_DEFAULT_LIMIT", "200"))
-    max_limit: int = int(os.getenv("SUPERTABLE_MAX_LIMIT", "5000"))
-    default_query_timeout_sec: float = float(os.getenv("SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC", "60"))
-    max_concurrency: int = int(os.getenv("SUPERTABLE_MAX_CONCURRENCY", "6"))
+    default_engine: str = field(default_factory=lambda: settings.SUPERTABLE_DEFAULT_ENGINE)
+    default_limit: int = field(default_factory=lambda: settings.SUPERTABLE_DEFAULT_LIMIT)
+    max_limit: int = field(default_factory=lambda: settings.SUPERTABLE_MAX_LIMIT)
+    default_query_timeout_sec: float = field(default_factory=lambda: settings.SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC)
+    max_concurrency: int = field(default_factory=lambda: settings.SUPERTABLE_MAX_CONCURRENCY)
     require_explicit_role: bool = True
     allowed_roles: Optional[Set[str]] = field(default_factory=lambda: _env_set("SUPERTABLE_ALLOWED_ROLES"))
     allow_sysadmin_default: bool = _env_bool("SUPERTABLE_ALLOW_SYSADMIN_DEFAULT", False)
     require_token: bool = True
-    shared_token: str = (os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "")
+    shared_token: str = field(default_factory=lambda: settings.SUPERTABLE_MCP_TOKEN)
     transport: str = _env_transport("SUPERTABLE_MCP_TRANSPORT", "stdio")
-    http_host: str = os.getenv("SUPERTABLE_HOST", "0.0.0.0")
-    http_port: int = int(os.getenv("SUPERTABLE_MCP_PORT", "8000"))
+    http_host: str = field(default_factory=lambda: settings.SUPERTABLE_MCP_HOST)
+    http_port: int = field(default_factory=lambda: settings.SUPERTABLE_MCP_PORT)
     http_path: str = "/mcp"
 
 CFG = Config()
@@ -391,7 +390,7 @@ def _resolve_role(role: Optional[str]) -> str:
             raise PermissionError("role not permitted by server policy.")
         return r
     if not r:
-        r = (os.getenv("SUPERTABLE_ROLE") or "").strip()
+        r = settings.SUPERTABLE_ROLE
     if not r:
         raise PermissionError("role missing and no default configured.")
     return _validate_role(r)

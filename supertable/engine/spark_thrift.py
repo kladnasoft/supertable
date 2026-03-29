@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.data_classes import Reflection, RbacViewDef, DedupViewDef
@@ -43,7 +44,7 @@ def _spark_timeout_seconds() -> int:
     Default: 300 s (5 min).  Override with SUPERTABLE_SPARK_QUERY_TIMEOUT.
     """
     try:
-        return int(os.getenv("SUPERTABLE_SPARK_QUERY_TIMEOUT", "300"))
+        return settings.SUPERTABLE_SPARK_QUERY_TIMEOUT
     except (ValueError, TypeError):
         return 300
 
@@ -55,7 +56,7 @@ def _spark_statement_timeout_seconds() -> int:
     Applies to each CREATE VIEW / SET / user-query individually.
     """
     try:
-        return int(os.getenv("SUPERTABLE_SPARK_STATEMENT_TIMEOUT", "120"))
+        return settings.SUPERTABLE_SPARK_STATEMENT_TIMEOUT
     except (ValueError, TypeError):
         return 120
 
@@ -124,7 +125,7 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
         cursor.execute(sql)
         return intermediate_views
 
-    batch_size = int(os.getenv("SUPERTABLE_SPARK_BATCH_SIZE", "50"))
+    batch_size = settings.SUPERTABLE_SPARK_BATCH_SIZE
     batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
 
     all_batch_views: List[str] = []
@@ -545,7 +546,7 @@ class SparkThriftExecutor:
         # Socket timeout prevents the connection from hanging indefinitely
         # when the Thrift server is unreachable or overloaded.
         try:
-            socket_timeout = int(os.getenv("SUPERTABLE_SPARK_CONNECT_TIMEOUT", "30"))
+            socket_timeout = settings.SUPERTABLE_SPARK_CONNECT_TIMEOUT
         except (ValueError, TypeError):
             socket_timeout = 30
         connect_kwargs["configuration"] = {

@@ -1,4 +1,6 @@
 import os
+
+from supertable.config.settings import settings
 import logging
 import json
 import time
@@ -20,7 +22,7 @@ _SUPER_META_CACHE: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
 _SUPER_META_CACHE_LOCK = threading.Lock()
 
 def _super_meta_cache_ttl_s() -> float:
-    val = (os.getenv("SUPERTABLE_SUPER_META_CACHE_TTL_S", "") or "").strip()
+    val = settings.SUPERTABLE_SUPER_META_CACHE_TTL_S
     if not val:
         return 1.0
     try:
@@ -320,7 +322,7 @@ class MetaReader:
 
     def get_super_meta(self, role_name: str) -> Optional[Dict[str, Any]]:
 
-        debug_timings = (os.getenv("SUPERTABLE_DEBUG_TIMINGS", "") or "").lower() in ("1", "true", "yes", "on")
+        debug_timings = settings.SUPERTABLE_DEBUG_TIMINGS
         t0 = time.perf_counter()
 
         try:

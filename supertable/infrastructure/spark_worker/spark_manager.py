@@ -1,5 +1,7 @@
 import io
 import os
+
+from supertable.config.settings import settings
 import sys
 import threading
 import time
@@ -8,7 +10,7 @@ from contextlib import redirect_stdout
 
 # When running inside Docker on spark-network, use the service name.
 # When running on the host, use localhost:7078 (remapped port).
-SPARK_MASTER_URL = os.getenv("SPARK_MASTER_URL", "spark://localhost:7078")
+SPARK_MASTER_URL = settings.SPARK_MASTER_URL
 
 
 class SparkClusterManager:

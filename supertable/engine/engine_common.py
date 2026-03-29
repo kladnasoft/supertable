@@ -12,6 +12,7 @@ import sqlglot
 from sqlglot import exp
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
 
 
@@ -90,37 +91,32 @@ def normalize_endpoint_for_s3(ep: str) -> str:
 
 
 def detect_endpoint() -> Optional[str]:
-    env_single = os.getenv("STORAGE_ENDPOINT_URL")
-    if env_single:
-        return normalize_endpoint_for_s3(env_single)
+    if settings.STORAGE_ENDPOINT_URL:
+        return normalize_endpoint_for_s3(settings.STORAGE_ENDPOINT_URL)
     return None
 
 
 def detect_region() -> str:
-    return os.getenv("STORAGE_REGION") or "us-east-1"
+    return settings.STORAGE_REGION
 
 
 def detect_url_style() -> str:
-    if (os.getenv("STORAGE_FORCE_PATH_STYLE", "true") or "true").lower() in (
-            "1", "true", "yes", "on",
-    ):
-        return "path"
-    return "vhost"
+    return "path" if settings.STORAGE_FORCE_PATH_STYLE else "vhost"
 
 
 def detect_ssl() -> bool:
-    return os.getenv("STORAGE_USE_SSL", "").lower() in ("1", "true", "yes", "on")
+    return settings.STORAGE_USE_SSL
 
 
 def detect_creds():
-    ak = os.getenv("STORAGE_ACCESS_KEY")
-    sk = os.getenv("STORAGE_SECRET_KEY")
-    st = os.getenv("STORAGE_SESSION_TOKEN")
+    ak = settings.STORAGE_ACCESS_KEY or None
+    sk = settings.STORAGE_SECRET_KEY or None
+    st = settings.STORAGE_SESSION_TOKEN or None
     return ak, sk, st
 
 
 def detect_bucket() -> Optional[str]:
-    return os.getenv("STORAGE_BUCKET")
+    return settings.STORAGE_BUCKET or None
 
 
 # =========================================================
@@ -174,10 +170,7 @@ def _derive_thread_count(memory_limit_str: str, fallback: int = 2) -> int:
         return fallback
 
     cpu_count = _os.cpu_count() or fallback
-    try:
-        multiplier = int(_os.getenv("SUPERTABLE_DUCKDB_IO_MULTIPLIER", "3"))
-    except ValueError:
-        multiplier = 3
+    multiplier = settings.SUPERTABLE_DUCKDB_IO_MULTIPLIER
 
     io_threads = cpu_count * multiplier
     # Safety ceiling: never allocate fewer than ~400 MB per thread.
@@ -265,7 +258,7 @@ def configure_httpfs_and_s3(
     set_if_supported("s3_url_style", f"'{url_style}'")
     set_if_supported("s3_use_ssl", "TRUE" if use_ssl else "FALSE")
 
-    http_timeout_env = os.getenv("SUPERTABLE_DUCKDB_HTTP_TIMEOUT")
+    http_timeout_env = settings.SUPERTABLE_DUCKDB_HTTP_TIMEOUT
     if http_timeout_env:
         try:
             # DuckDB's http_timeout is in SECONDS (UBIGINT, default 30).
@@ -277,9 +270,7 @@ def configure_httpfs_and_s3(
 
     # HTTP metadata cache — caches parquet footer (schema + row-group stats)
     # across queries on the same persistent connection.
-    meta_cache_on = (
-            os.getenv("SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE", "1") or "1"
-    ).lower() in ("1", "true", "yes", "on")
+    meta_cache_on = settings.SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE
     set_if_supported(
         "enable_http_metadata_cache",
         "true" if meta_cache_on else "false",
@@ -288,11 +279,11 @@ def configure_httpfs_and_s3(
     # External file cache (DuckDB >= 1.3) — caches remote data blocks on local
     # disk so repeated queries do not re-download the same row groups.
     # Only enabled when SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE is set.
-    cache_size = os.getenv("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "").strip()
+    cache_size = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE
     if cache_size:
         set_if_supported("enable_external_file_cache", "true")
         set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
-        cache_dir_raw = os.getenv("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR", "").strip()
+        cache_dir_raw = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
         if not cache_dir_raw:
             # Derive from SUPERTABLE_HOME — single env var controls all paths.
             cache_dir_raw = os.path.join(get_app_home(), "duckdb_cache")
@@ -478,7 +469,7 @@ def create_reflection_view_with_presign_retry(
 
     Returns True if the presign fallback was used.
     """
-    materialize = os.getenv("SUPERTABLE_DUCKDB_MATERIALIZE", "view").lower().strip()
+    materialize = settings.SUPERTABLE_DUCKDB_MATERIALIZE
     if materialize == "table":
         return create_reflection_table_with_presign_retry(
             con, storage, view_name, files, columns, log_prefix
@@ -582,7 +573,7 @@ def init_connection(
     # Resolve memory limit.
     # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
     # The `memory_limit` argument is the caller's fallback when the env var is absent.
-    effective_memory_limit = os.getenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", memory_limit)
+    effective_memory_limit = settings.SUPERTABLE_DUCKDB_MEMORY_LIMIT or memory_limit
     con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
 
     # Absolute temp path is required for DuckDB to actually spill to disk.
@@ -614,7 +605,7 @@ def init_connection(
     # Otherwise derive from the effective memory limit using the IO-thread
     # formula: min(cpu * IO_MULTIPLIER, memory_mb // 400).
     # DuckDB uses synchronous IO — more threads = more parallel HTTP requests.
-    explicit_threads = os.getenv("SUPERTABLE_DUCKDB_THREADS", "").strip()
+    explicit_threads = settings.SUPERTABLE_DUCKDB_THREADS
     if explicit_threads:
         try:
             thread_count = int(explicit_threads)

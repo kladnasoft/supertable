@@ -3,6 +3,8 @@ import io
 import json
 import fnmatch
 import os
+
+from supertable.config.settings import settings
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -73,11 +75,11 @@ class GCSStorage(StorageInterface):
           - GCP_SA_JSON (raw JSON string, alternative to file path)
           - GCP_PROJECT (optional project override)
         """
-        bucket = os.getenv("GCS_BUCKET") or os.getenv("STORAGE_BUCKET") or "supertable"
-        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-        sa_json = os.getenv("GCP_SA_JSON", "")
-        project = os.getenv("GCP_PROJECT", "") or None
+        bucket = settings.effective_gcs_bucket
+        base_prefix = settings.SUPERTABLE_PREFIX
+        creds_path = settings.GOOGLE_APPLICATION_CREDENTIALS
+        sa_json = settings.GCP_SA_JSON
+        project = settings.GCP_PROJECT or None
 
         if creds_path and Path(creds_path).is_file():
             client = storage.Client.from_service_account_json(creds_path, project=project)
@@ -102,7 +104,7 @@ class GCSStorage(StorageInterface):
         full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key
         prefer_httpfs = (
             prefer_httpfs if prefer_httpfs is not None
-            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+            else settings.SUPERTABLE_DUCKDB_USE_HTTPFS
         )
         if prefer_httpfs:
             return f"https://storage.googleapis.com/{self.bucket_name}/{full_key}"

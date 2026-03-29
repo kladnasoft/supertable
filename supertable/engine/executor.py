@@ -18,6 +18,7 @@ from supertable.engine.duckdb_lite import DuckDBLite
 from supertable.engine.duckdb_pro import DuckDBPro
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 
 
 # Module-level singleton for the pro executor so the persistent
@@ -75,19 +76,17 @@ class Executor:
 
         # --- thresholds (env-configurable) ---
         try:
-            lite_max = int(os.getenv("SUPERTABLE_ENGINE_LITE_MAX_BYTES",
-                                     str(100 * 1024 * 1024)))
+            lite_max = settings.SUPERTABLE_ENGINE_LITE_MAX_BYTES
         except ValueError:
             lite_max = 100 * 1024 * 1024  # 100 MB
 
         try:
-            spark_min = int(os.getenv("SUPERTABLE_ENGINE_SPARK_MIN_BYTES",
-                                      str(10 * 1024 * 1024 * 1024)))
+            spark_min = settings.SUPERTABLE_ENGINE_SPARK_MIN_BYTES
         except ValueError:
             spark_min = 10 * 1024 * 1024 * 1024  # 10 GB
 
         try:
-            freshness_threshold_s = int(os.getenv("SUPERTABLE_ENGINE_FRESHNESS_SEC", "300"))
+            freshness_threshold_s = settings.SUPERTABLE_ENGINE_FRESHNESS_SEC
         except ValueError:
             freshness_threshold_s = 300  # 5 min
 

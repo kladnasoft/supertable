@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dotenv import load_dotenv
 import json
 import os
 import uuid
@@ -10,13 +9,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import iterate_in_threadpool
 
 from supertable.infrastructure.python_worker.resource_config import HIGH_TIER, LOW_TIER
+from supertable.config.settings import settings
 from supertable.infrastructure.python_worker.warm_pool_manager import WarmPoolManager
 
-load_dotenv()
 
 # Enable stateful websocket execution by default.
 # Set SUPERTABLE_NOTEBOOK_STATEFUL_WS=0 to fall back to legacy one-shot execution.
-STATEFUL_WS_ENABLED = os.getenv("SUPERTABLE_NOTEBOOK_STATEFUL_WS", "1").strip() != "0"
+STATEFUL_WS_ENABLED = settings.SUPERTABLE_NOTEBOOK_STATEFUL_WS
 
 
 @asynccontextmanager
@@ -117,13 +116,7 @@ if __name__ == "__main__":
     import uvicorn
 
     def _resolve_port() -> int:
-        raw = os.getenv("SUPERTABLE_NOTEBOOK_PORT", "").strip()
-        if not raw:
-            return 8000
-        try:
-            port = int(raw)
-        except ValueError:
-            return 8000
-        return port if 1 <= port <= 65535 else 8000
+        port = settings.SUPERTABLE_NOTEBOOK_PORT
+        return port if 1 <= port <= 65535 else 8010
 
     uvicorn.run(app, host="0.0.0.0", port=_resolve_port())

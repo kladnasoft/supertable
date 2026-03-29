@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+
+from supertable.config.settings import settings
 import shutil
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -23,7 +25,7 @@ KINDS = ("in-process", "spark", "spark-thrift", "spark-plug", "kubernetes")
 SIZES = ("small", "medium", "large")
 
 def _notebook_port() -> int:
-    raw = str(os.getenv("SUPERTABLE_NOTEBOOK_PORT", "8010") or "8010").strip()
+    raw = str(settings.SUPERTABLE_NOTEBOOK_PORT)
     try:
         port = int(raw)
     except Exception:
@@ -38,7 +40,7 @@ def _default_ws_url() -> str:
 
 
 def _redis_url() -> Optional[str]:
-    url = os.getenv("SUPERTABLE_REFLECTION_REDIS_URL") or os.getenv("SUPERTABLE_REDIS_URL") or os.getenv("REDIS_URL")
+    url = settings.effective_redis_url
     url = str(url or "").strip()
     return url or None
 
@@ -103,7 +105,7 @@ def _write_state(org: str, sup: str, data: Dict[str, Any]) -> bool:
 
 
 def _state_dir() -> Path:
-    base = Path(os.getenv("SUPERTABLE_REFLECTION_STATE_DIR", "/tmp/supertable_reflection"))
+    base = Path(settings.SUPERTABLE_REFLECTION_STATE_DIR)
     new_dir = base / "compute"
     old_dir = base / "compute"
     new_dir.mkdir(parents=True, exist_ok=True)

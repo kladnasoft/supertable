@@ -6,9 +6,11 @@ import os
 
 from fastapi import HTTPException, Request, status
 
+from supertable.config.settings import settings
+
 
 def _must_get_env(name: str) -> str:
-    v = os.getenv(name, "").strip()
+    v = getattr(settings, name, "")
     if not v:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
@@ -16,8 +18,8 @@ def _must_get_env(name: str) -> str:
 
 class AuthConfig:
     def __init__(self) -> None:
-        self.mode = os.getenv("SUPERTABLE_AUTH_MODE", "api_key").strip().lower()
-        self.api_key_header_name = os.getenv("SUPERTABLE_AUTH_HEADER_NAME", "X-API-Key").strip()
+        self.mode = settings.SUPERTABLE_AUTH_MODE
+        self.api_key_header_name = settings.SUPERTABLE_AUTH_HEADER_NAME
 
         if self.mode not in ("api_key", "bearer"):
             raise RuntimeError(

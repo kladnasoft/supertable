@@ -27,6 +27,7 @@ from fastapi import FastAPI
 # ---------------------------------------------------------------------------
 # Structured logging — must be configured before any other import logs
 # ---------------------------------------------------------------------------
+from supertable.config.settings import settings
 from supertable.logging import configure_logging, RequestLoggingMiddleware
 
 configure_logging(service="api")
@@ -69,9 +70,9 @@ app.include_router(router)
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("SUPERTABLE_API_HOST", os.getenv("SUPERTABLE_HOST", "0.0.0.0"))
-    port = int(os.getenv("SUPERTABLE_API_PORT", "8050"))
-    reload_flag = os.getenv("UVICORN_RELOAD", "0").strip().lower() in ("1", "true", "yes", "on")
+    host = settings.effective_api_host
+    port = settings.SUPERTABLE_API_PORT
+    reload_flag = settings.UVICORN_RELOAD
 
     uvicorn.run(
         "supertable.api.application:app",

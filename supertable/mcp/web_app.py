@@ -6,6 +6,8 @@ import contextlib
 import hmac
 import logging
 import os
+
+from supertable.config.settings import settings
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -78,13 +80,13 @@ def _read_html(filename: str) -> str:
 
 
 def _configured_tool_auth_token() -> str:
-    return (os.getenv("SUPERTABLE_MCP_TOKEN") or os.getenv("SUPERTABLE_MCP_AUTH_TOKEN") or "").strip()
+    return settings.SUPERTABLE_MCP_TOKEN
 
 
 
 
 def _allowed_hosts() -> list[str]:
-    raw = (os.getenv("SUPERTABLE_ALLOWED_HOSTS") or "*").strip()
+    raw = settings.SUPERTABLE_ALLOWED_HOSTS
     if not raw:
         return ["*"]
     hosts = [item.strip() for item in raw.split(",") if item.strip()]
@@ -146,7 +148,7 @@ def _expected_gateway_token() -> str:
     gateway secret.
     """
 
-    return (os.getenv("SUPERTABLE_SUPERUSER_TOKEN") or os.getenv("SUPERTABLE_SUPERTOKEN") or os.getenv("SUPERTABLE_MCP_HTTP_TOKEN") or "").strip()
+    return settings.SUPERTABLE_SUPERUSER_TOKEN or settings.SUPERTABLE_MCP_HTTP_TOKEN
 
 
 def _require_gateway_auth(req: Request) -> None:
@@ -186,15 +188,11 @@ def _require_gateway_auth(req: Request) -> None:
 
 async def _startup() -> None:
     global _client
-    if os.getenv("SUPERTABLE_MCP_WEB_DISABLE_SUBPROCESS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if settings.SUPERTABLE_MCP_WEB_DISABLE_SUBPROCESS:
         return
     if _client is None:
         _client = MCPWebClient(
-            server_path=os.getenv("MCP_SERVER_PATH"),
+            server_path=settings.MCP_SERVER_PATH or None,
             auth_token=_configured_tool_auth_token(),
         )
         await _client.start()

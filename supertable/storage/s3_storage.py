@@ -3,6 +3,8 @@ import io
 import json
 import fnmatch
 import os
+
+from supertable.config.settings import settings
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -82,15 +84,15 @@ class S3Storage(StorageInterface):
 
     @classmethod
     def from_env(cls) -> "S3Storage":
-        bucket = os.getenv("STORAGE_BUCKET") or "supertable"
-        region = os.getenv("STORAGE_REGION") or None
-        endpoint = os.getenv("STORAGE_ENDPOINT_URL") or None
-        access_key = os.getenv("STORAGE_ACCESS_KEY") or None
-        secret_key = os.getenv("STORAGE_SECRET_KEY") or None
-        session_token = os.getenv("STORAGE_SESSION_TOKEN") or None
-        base_prefix = os.getenv("SUPERTABLE_PREFIX", "")
+        bucket = settings.STORAGE_BUCKET
+        region = settings.STORAGE_REGION or None
+        endpoint = settings.STORAGE_ENDPOINT_URL or None
+        access_key = settings.STORAGE_ACCESS_KEY or None
+        secret_key = settings.STORAGE_SECRET_KEY or None
+        session_token = settings.STORAGE_SESSION_TOKEN or None
+        base_prefix = settings.SUPERTABLE_PREFIX
 
-        force_path_style = (os.getenv("STORAGE_FORCE_PATH_STYLE", "") or "").lower() in ("1", "true", "yes", "on")
+        force_path_style = settings.STORAGE_FORCE_PATH_STYLE
         url_style = "path" if force_path_style else "vhost"
 
         # Let __init__ handle endpoint normalisation, client creation, and secure detection
@@ -108,7 +110,7 @@ class S3Storage(StorageInterface):
     def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str:
         prefer_httpfs = (
             prefer_httpfs if prefer_httpfs is not None
-            else (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+            else settings.SUPERTABLE_DUCKDB_USE_HTTPFS
         )
         key = (key or "").lstrip("/")
         full_key = f"{self.base_prefix}/{key}" if self.base_prefix else key

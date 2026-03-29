@@ -8,6 +8,7 @@ from typing import Iterable, Set, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
@@ -180,8 +181,7 @@ class DataEstimator:
             return self._normalize_endpoint_for_s3(composed)
 
         # 2) Environment variable
-        env_single = os.getenv("STORAGE_ENDPOINT_URL")
-        if env_single:
+        if settings.STORAGE_ENDPOINT_URL:
             return self._normalize_endpoint_for_s3(env_single)
 
         return None
@@ -191,12 +191,12 @@ class DataEstimator:
             v = self._storage_attr(name)
             if v:
                 return v
-        return os.getenv("STORAGE_BUCKET")
+        return settings.STORAGE_BUCKET or None
 
     def _detect_ssl(self) -> bool:
         val = (
                 (str(getattr(self.storage, "secure", "")).lower() if hasattr(self.storage, "secure") else "")
-                or (os.getenv("STORAGE_USE_SSL", "") or "")
+                or str(settings.STORAGE_USE_SSL)
         ).lower()
         return val in ("1", "true", "yes", "on")
 
@@ -209,7 +209,7 @@ class DataEstimator:
             return key
 
         # 1) Presign first if requested
-        if (os.getenv("SUPERTABLE_DUCKDB_PRESIGNED", "") or "").lower() in ("1", "true", "yes", "on"):
+        if settings.SUPERTABLE_DUCKDB_PRESIGNED:
             presign_fn = getattr(self.storage, "presign", None)
             if callable(presign_fn):
                 try:
@@ -240,7 +240,7 @@ class DataEstimator:
         # 4) Construct URL from endpoint/bucket
         endpoint_raw = self._detect_endpoint()
         bucket = self._detect_bucket()
-        use_http = (os.getenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "") or "").lower() in ("1", "true", "yes", "on")
+        use_http = settings.SUPERTABLE_DUCKDB_USE_HTTPFS
         scheme = "https" if self._detect_ssl() else "http"
         key_norm = key.lstrip("/")
 

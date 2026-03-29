@@ -12,6 +12,7 @@ import duckdb
 import pandas as pd
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.data_classes import Reflection
@@ -95,7 +96,7 @@ class DuckDBPro:
         # Memory limit is shared with the transient executor via the single
         # SUPERTABLE_DUCKDB_MEMORY_LIMIT env var.  The "1GB" fallback is only
         # used when the env var is absent.
-        memory_limit = os.getenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", "1GB")
+        memory_limit = settings.SUPERTABLE_DUCKDB_MEMORY_LIMIT
         con = duckdb.connect()
         init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
         # httpfs (and both cache settings) are configured lazily on the first

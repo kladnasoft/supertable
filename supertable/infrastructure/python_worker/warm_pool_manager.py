@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import os
+
+from supertable.config.settings import settings
 import pickle
 import queue
 import re
@@ -74,7 +76,7 @@ class WarmPoolManager:
     # -----------------------
 
     def _session_ttl_seconds(self) -> int:
-        raw = os.getenv("SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS", "").strip()
+        raw = settings.SUPERTABLE_NOTEBOOK_SESSION_TTL_SECONDS
         if not raw:
             return 1800  # 30 minutes
         try:

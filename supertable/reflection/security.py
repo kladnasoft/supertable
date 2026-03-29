@@ -26,6 +26,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+
+from supertable.config.settings import settings
 import re
 import secrets
 import uuid
@@ -61,7 +63,7 @@ def _user_name_map_key(org: str, sup: str) -> str:
 # OData URL builder
 # ---------------------------------------------------------------------------
 
-_ODATA_BASE = os.getenv("SUPERTABLE_ODATA_BASE_URL", "/api/v1/reflection")
+_ODATA_BASE = settings.SUPERTABLE_ODATA_BASE_URL
 
 
 def _build_odata_url(org: str, sup: str, role_name: str) -> str:

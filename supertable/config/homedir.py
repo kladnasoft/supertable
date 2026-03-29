@@ -1,6 +1,7 @@
 import os
 import sys
 
+from supertable.config.settings import settings
 from supertable.config.defaults import default, logger
 
 # If this file is located in a subdirectory, adjust the path logic as needed.
@@ -19,7 +20,7 @@ def _resolve_app_home() -> str:
     if _resolved_home is not None:
         return _resolved_home
 
-    raw = os.getenv("SUPERTABLE_HOME", "~/supertable")
+    raw = settings.SUPERTABLE_HOME
     expanded = os.path.expanduser(raw)
     expanded = os.path.abspath(expanded)
 
