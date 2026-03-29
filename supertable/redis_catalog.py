@@ -180,6 +180,11 @@ def _table_config_key(org: str, sup: str, simple: str) -> str:
     return f"supertable:{org}:{sup}:meta:table_config:{simple}"
 
 
+def _engine_config_key(org: str, sup: str) -> str:
+    """DuckDB / engine runtime configuration (memory, threads, caches, thresholds)."""
+    return f"supertable:{org}:{sup}:config:engine"
+
+
 class RedisCatalog:
     """
     Redis-backed catalog for SuperTable:
@@ -1587,4 +1592,74 @@ return 1
                 return json.loads(raw)
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"[redis-catalog] get_table_config error: {e}")
+        return None
+
+    # ========================================================================= #
+    # Engine runtime configuration (DuckDB memory, threads, caches, thresholds)
+    # ========================================================================= #
+
+    # Canonical field names and their env-var counterparts.  Used by the
+    # resolver in engine_common to fall back to os.getenv when a field
+    # is absent from Redis.
+    ENGINE_CONFIG_FIELDS = {
+        "engine_lite_max_bytes":       "SUPERTABLE_ENGINE_LITE_MAX_BYTES",
+        "engine_spark_min_bytes":      "SUPERTABLE_ENGINE_SPARK_MIN_BYTES",
+        "engine_freshness_sec":        "SUPERTABLE_ENGINE_FRESHNESS_SEC",
+        "duckdb_memory_limit":         "SUPERTABLE_DUCKDB_MEMORY_LIMIT",
+        "duckdb_io_multiplier":        "SUPERTABLE_DUCKDB_IO_MULTIPLIER",
+        "duckdb_threads":              "SUPERTABLE_DUCKDB_THREADS",
+        "duckdb_http_timeout":         "SUPERTABLE_DUCKDB_HTTP_TIMEOUT",
+        "duckdb_external_cache_size":  "SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE",
+    }
+
+    def set_engine_config(
+            self,
+            org: str,
+            sup: str,
+            config: Dict[str, Any],
+    ) -> bool:
+        """Store engine runtime configuration (DuckDB + auto-pick thresholds).
+
+        The config dict is stored as a JSON string.  Only recognised fields
+        (see ENGINE_CONFIG_FIELDS) are persisted — unknown keys are silently
+        dropped to prevent injection of arbitrary settings.
+
+        Existing config is fully replaced (last-write-wins).
+        """
+        if not (org and sup):
+            return False
+        try:
+            # Whitelist recognised fields only.
+            doc = {
+                k: config[k]
+                for k in self.ENGINE_CONFIG_FIELDS
+                if k in config and config[k] is not None and str(config[k]).strip() != ""
+            }
+            doc["modified_ms"] = _now_ms()
+            self.r.set(
+                _engine_config_key(org, sup),
+                json.dumps(doc, default=str),
+            )
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] set_engine_config error: {e}")
+            return False
+
+    def get_engine_config(
+            self,
+            org: str,
+            sup: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve engine runtime configuration.
+
+        Returns None if no config has been stored for this tenant.
+        """
+        if not (org and sup):
+            return None
+        try:
+            raw = self.r.get(_engine_config_key(org, sup))
+            if raw:
+                return json.loads(raw)
+        except (redis.RedisError, json.JSONDecodeError) as e:
+            logger.error(f"[redis-catalog] get_engine_config error: {e}")
         return None

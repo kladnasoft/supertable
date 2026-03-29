@@ -2394,6 +2394,115 @@ def compute_test_connection(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#   ENGINE CONFIG endpoints (DuckDB runtime settings, stored in Redis)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default values mirror the hardcoded fallbacks in engine_common.py / executor.py.
+# These are returned when neither Redis nor env vars provide a value, so the
+# UI always shows something meaningful.
+_ENGINE_CONFIG_DEFAULTS: Dict[str, str] = {
+    "engine_lite_max_bytes":      str(100 * 1024 * 1024),        # 100 MB
+    "engine_spark_min_bytes":     str(10 * 1024 * 1024 * 1024),  # 10 GB
+    "engine_freshness_sec":       "300",                          # 5 min
+    "duckdb_memory_limit":        "1GB",
+    "duckdb_io_multiplier":       "3",
+    "duckdb_threads":             "",                             # auto-derived
+    "duckdb_http_timeout":        "30",
+    "duckdb_external_cache_size": "",                             # disabled
+}
+
+# Maps Redis field → env var name for env-fallback lookup.
+_ENGINE_CONFIG_ENV_MAP: Dict[str, str] = {
+    "engine_lite_max_bytes":      "SUPERTABLE_ENGINE_LITE_MAX_BYTES",
+    "engine_spark_min_bytes":     "SUPERTABLE_ENGINE_SPARK_MIN_BYTES",
+    "engine_freshness_sec":       "SUPERTABLE_ENGINE_FRESHNESS_SEC",
+    "duckdb_memory_limit":        "SUPERTABLE_DUCKDB_MEMORY_LIMIT",
+    "duckdb_io_multiplier":       "SUPERTABLE_DUCKDB_IO_MULTIPLIER",
+    "duckdb_threads":             "SUPERTABLE_DUCKDB_THREADS",
+    "duckdb_http_timeout":        "SUPERTABLE_DUCKDB_HTTP_TIMEOUT",
+    "duckdb_external_cache_size": "SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE",
+}
+
+
+def _resolve_engine_config(org: str, sup: str) -> Dict[str, Any]:
+    """Build effective engine config: Redis → env var → hardcoded default.
+
+    Returns a dict with ``value`` (effective), ``source`` (redis/env/default),
+    and ``env_var`` for each field so the UI can show provenance.
+    """
+    cat = _compute_get_catalog()
+    redis_cfg = cat.get_engine_config(org, sup) or {}
+    result: Dict[str, Any] = {}
+
+    for field, env_var in _ENGINE_CONFIG_ENV_MAP.items():
+        redis_val = redis_cfg.get(field)
+        env_val = os.getenv(env_var, "").strip()
+        default_val = _ENGINE_CONFIG_DEFAULTS.get(field, "")
+
+        if redis_val is not None and str(redis_val).strip() != "":
+            value = str(redis_val).strip()
+            source = "redis"
+        elif env_val:
+            value = env_val
+            source = "env"
+        else:
+            value = default_val
+            source = "default"
+
+        result[field] = {
+            "value": value,
+            "source": source,
+            "env_var": env_var,
+            "default": default_val,
+        }
+
+    result["modified_ms"] = redis_cfg.get("modified_ms")
+    return result
+
+
+@router.get("/reflection/engine-config")
+def engine_config_get(
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    """Return effective engine configuration with source provenance."""
+    o, s = resolve_pair(org, sup)
+    if not o or not s:
+        raise HTTPException(status_code=400, detail="org/sup required")
+    return {"ok": True, "config": _resolve_engine_config(o, s)}
+
+
+@router.post("/reflection/engine-config")
+def engine_config_set(
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Persist engine configuration to Redis.
+
+    Only whitelisted fields are accepted (see RedisCatalog.ENGINE_CONFIG_FIELDS).
+    Empty strings clear the field (falls back to env / default at read time).
+
+    NOTE: changes take effect on the **next** DuckDB connection init — existing
+    persistent connections (DuckDB Pro singleton) are not reconfigured.
+    """
+    org = str(payload.get("org") or "").strip()
+    sup = str(payload.get("sup") or "").strip()
+    if not org or not sup:
+        raise HTTPException(status_code=400, detail="org/sup required")
+
+    config = payload.get("config") or {}
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="config must be an object")
+
+    cat = _compute_get_catalog()
+    ok = cat.set_engine_config(org, sup, config)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save engine config")
+    return {"ok": True, "config": _resolve_engine_config(org, sup)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #   USERS PAGE endpoints (user management via UserManager/RoleManager)
 # ═══════════════════════════════════════════════════════════════════════════
 
