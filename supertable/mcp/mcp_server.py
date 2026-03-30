@@ -548,6 +548,30 @@ def _resolve_role_for_user(
         )
     return r
 
+def _get_write_identity(auth_token: Optional[str]) -> dict:
+    """Extract caller identity from auth_token for data lineage.
+
+    Returns {"username": ..., "auth_type": ...}.  Never raises — returns
+    empty strings on failure.  Only called by write tools.
+    """
+    token = (auth_token or "").strip()
+    if not token:
+        return {"username": "", "auth_type": "anonymous"}
+    if CFG.shared_token and hmac.compare_digest(token, CFG.shared_token):
+        return {"username": "superuser", "auth_type": "mcp_shared"}
+    try:
+        from supertable.redis_catalog import RedisCatalog
+        cat = RedisCatalog()
+        meta = cat.validate_auth_token_full(org=settings.SUPERTABLE_ORGANIZATION, token=token)
+        if meta:
+            return {
+                "username": str(meta.get("username") or ""),
+                "auth_type": "user_token",
+            }
+    except Exception:
+        pass
+    return {"username": "", "auth_type": "unknown"}
+
 def _resolve_engine(engine_name: Optional[str]):
     name = (engine_name or CFG.default_engine or "AUTO").upper()
     try:
@@ -955,6 +979,64 @@ async def get_super_meta(super_name: str, organization: str, role: Optional[str]
         meta = await anyio.to_thread.run_sync(_work)
     return {"result": meta}
 
+
+@mcp.tool()
+@log_tool
+async def get_table_lineage(
+    super_name: str,
+    organization: str,
+    table: str,
+    limit: Optional[int] = None,
+    role: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the data lineage timeline for a table.
+
+    Walks the snapshot version history (newest-first) and returns the
+    provenance metadata recorded at each write — who wrote the data,
+    from where, and how.
+
+    Args:
+        super_name:   SuperTable name.
+        organization: Organization name.
+        table:        Table (simple) name.
+        limit:        Max number of versions to return (default 50).
+        role:         RBAC role name.
+        auth_token:   Auth token.
+
+    Returns:
+        result.timeline — list of version entries with lineage dicts.
+    """
+    org = _safe_id(organization, "organization")
+    sup = _safe_id(super_name, "super_name")
+    tbl = _safe_id(table, "table")
+    r = _auth(auth_token, role)
+    max_versions = min(limit or 50, 500)
+
+    def _work():
+        from supertable.services.time_travel import list_snapshot_versions
+        versions = list_snapshot_versions(org, sup, tbl, limit=max_versions)
+        timeline = []
+        for v in versions:
+            lin = v.get("lineage") or {}
+            timeline.append({
+                "version": v.get("version"),
+                "last_updated_ms": v.get("last_updated_ms"),
+                "resource_count": v.get("resource_count"),
+                "total_rows": v.get("total_rows"),
+                "source_type": lin.get("source_type", ""),
+                "username": lin.get("username", ""),
+                "filename": lin.get("filename", ""),
+                "delete_only": lin.get("delete_only", False),
+                "lineage": lin,
+            })
+        return timeline
+
+    async with _get_limiter():
+        timeline = await anyio.to_thread.run_sync(_work)
+    return {"result": {"table": tbl, "timeline": timeline, "count": len(timeline)}}
+
+
 def _exec_query_sync(super_name: str, organization: str, sql: str, limit_n: int, eng: Any, role_name: str) -> Dict[str, Any]:
     """
     Runs the module-level query_sql and enforces `limit` server-side (slice rows)
@@ -1182,6 +1264,7 @@ async def submit_feedback(
             simple_name="__feedback__",
             data=batch,
             overwrite_columns=["ts"],  # ts is unique per entry; never overwrite existing rows
+            lineage={"source_type": "mcp_submit_feedback", **_get_write_identity(auth_token)},
         )
         return {"columns": columns, "inserted": inserted, "deleted": deleted}
 
@@ -1283,6 +1366,7 @@ async def store_annotation(
             simple_name="__annotations__",
             data=batch,
             overwrite_columns=["ts"],
+            lineage={"source_type": "mcp_store_annotation", "category": category, "context": context_val, **_get_write_identity(auth_token)},
         )
         return {"columns": columns, "inserted": inserted, "deleted": deleted}
 
@@ -1447,6 +1531,7 @@ async def store_app_state(
             simple_name="__app_state__",
             data=batch,
             overwrite_columns=["ts"],
+            lineage={"source_type": "mcp_store_app_state", **_get_write_identity(auth_token)},
         )
         return {"columns": columns, "inserted": inserted, "deleted": deleted}
 
@@ -1947,6 +2032,7 @@ async def delete_annotation(
                     simple_name="__annotations__",
                     data=batch,
                     overwrite_columns=["ts"],
+                    lineage={"source_type": "mcp_delete_annotation", **_get_write_identity(auth_token)},
                 )
                 return {"inserted": inserted}
 
@@ -2022,6 +2108,7 @@ async def delete_app_state(
         dw = DataWriter(super_name=sup, organization=org)
         columns, rows, inserted, deleted = dw.write(
             role_name=r, simple_name="__app_state__", data=batch, overwrite_columns=["ts"],
+            lineage={"source_type": "mcp_delete_app_state", **_get_write_identity(auth_token)},
         )
         return {"inserted": inserted}
 
@@ -2378,6 +2465,7 @@ async def store_catalog(
         dw = DataWriter(super_name=sup, organization=org)
         columns_out, rows_out, inserted, deleted = dw.write(
             role_name=r, simple_name="__catalog__", data=batch, overwrite_columns=["ts"],
+            lineage={"source_type": "mcp_store_catalog", **_get_write_identity(auth_token)},
         )
         return {"inserted": inserted}
 

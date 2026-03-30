@@ -71,6 +71,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div class="tab-bar" id="tabBar">
     <button class="tab-btn active" data-pane="gc"><i class="fas fa-broom"></i> Garbage Collection</button>
     <button class="tab-btn" data-pane="timetravel"><i class="fas fa-clock-rotate-left"></i> Snapshot History</button>
+    <button class="tab-btn" data-pane="lineage"><i class="fas fa-route"></i> Data Lineage</button>
     <button class="tab-btn" data-pane="legalhold"><i class="fas fa-gavel"></i> Legal Hold</button>
     <button class="tab-btn" data-pane="health"><i class="fas fa-heartbeat"></i> Health Check</button>
   </div>
@@ -101,6 +102,17 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       <div class="pagination" id="ttPag"></div>
     </div>
     <div id="ttDetail" style="display:none;margin-top:12px;"></div>
+  </div></div>
+
+  <div class="pane" id="pane-lineage"><div class="card">
+    <div class="card-title"><i class="fas fa-route" style="color:var(--primary);"></i> Data Lineage</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Track who wrote what data, from where, and how — for every version of a table.</p>
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+      <div><div class="field-label">Table</div><select class="field-select" id="linTable"><option value="">Loading…</option></select></div>
+      <button class="btn-sm btn-primary" id="btnLinLoad"><i class="fas fa-route"></i> Load Lineage</button>
+    </div>
+    <div class="result-box" id="linResult"></div>
+    <div id="linTimeline" style="display:none;margin-top:16px;"></div>
   </div></div>
 
   <div class="pane" id="pane-legalhold"><div class="card">
@@ -135,7 +147,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   function show(id,cls,h){var e=document.getElementById(id);e.className="result-box "+cls;e.innerHTML=h;e.style.display="block";}
 
   // ── Table dropdowns ──
-  async function loadTables(){var c=C();if(!c.org||!c.sup)return;try{var d=await G("/reflection/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name=superadmin");var t=(d&&d.tables)||[];["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(!s)return;s.innerHTML='<option value="">— Select table —</option>';t.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;s.appendChild(o);});});}catch(e){["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(s)s.innerHTML='<option value="">Error loading</option>';});}}
+  async function loadTables(){var c=C();if(!c.org||!c.sup)return;try{var d=await G("/reflection/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name=superadmin");var t=(d&&d.tables)||[];["gcTable","ttTable","linTable"].forEach(function(id){var s=document.getElementById(id);if(!s)return;s.innerHTML='<option value="">— Select table —</option>';t.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;s.appendChild(o);});});}catch(e){["gcTable","ttTable","linTable"].forEach(function(id){var s=document.getElementById(id);if(s)s.innerHTML='<option value="">Error loading</option>';});}}
 
   // ── GC ──
   var gcD=null;
@@ -158,6 +170,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   // ── Health ──
   document.getElementById("btnHealth").addEventListener("click",async function(){show("healthResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running…');document.getElementById("healthChecks").style.display="none";try{var d=await G("/healthz/deep");var ok=d.status==="ok";show("healthResult",ok?"result-ok":"result-err",ok?'<i class="fas fa-check-circle"></i> All systems operational.':'<i class="fas fa-exclamation-triangle"></i> Degraded.');var ch=d.checks||{};var h='<div class="card" style="margin-top:0;">';Object.keys(ch).forEach(function(n){var c=ch[n];var o=c.status==="ok";h+='<div class="stat-row"><span class="label"><i class="fas fa-'+(o?"check-circle":"times-circle")+'" style="color:var('+(o?"--success":"--error")+');margin-right:6px;"></i>'+esc(n)+'</span><span class="val" style="color:var('+(o?"--success":"--error")+');">'+esc(c.status)+(c.backend?" · "+esc(c.backend):"")+(c.error?" · "+esc(c.error):"")+'</span></div>';});h+='</div>';document.getElementById("healthChecks").innerHTML=h;document.getElementById("healthChecks").style.display="block";}catch(e){show("healthResult","result-err","Failed: "+esc(e.message));}});
+
+  // ── Lineage ──
+  document.getElementById("btnLinLoad").addEventListener("click",async function(){var t=(document.getElementById("linTable").value||"").trim();if(!t){alert("Select a table.");return;}var c=C();show("linResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Loading lineage…');document.getElementById("linTimeline").style.display="none";try{var d=await G("/reflection/table/lineage?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t)+"&limit=200");var tl=d.timeline||[];if(!tl.length){show("linResult","result-warn","No lineage data found. Lineage is recorded on new writes only.");return;}show("linResult","result-ok",tl.length+" version(s) with lineage.");var h='<div style="position:relative;padding-left:24px;">';tl.forEach(function(v,i){var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";var lin=v.lineage||{};var src=lin.source_type||"unknown";var isDelete=!!lin.delete_only;var dotColor=isDelete?"var(--error)":src.indexOf("mcp")===0?"var(--primary)":"var(--success)";var icon=isDelete?"fa-trash":src==="api_upload"?"fa-upload":src.indexOf("mcp")===0?"fa-robot":"fa-pen";var user=lin.username||lin.role_name||"—";var fname=lin.filename||"";var details=[];if(fname)details.push(fname);if(lin.incoming_rows)details.push(lin.incoming_rows+" rows");if(lin.overwrite_columns&&lin.overwrite_columns.length)details.push("keys: "+lin.overwrite_columns.join(", "));h+='<div style="position:relative;padding:12px 0 12px 20px;border-left:2px solid var(--border);margin-left:6px;">';h+='<div style="position:absolute;left:-7px;top:16px;width:14px;height:14px;border-radius:50%;background:'+dotColor+';border:2px solid var(--bg-card);"></div>';h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">';h+='<span style="font-weight:700;font-family:var(--mono);font-size:12px;">v'+v.version+'</span>';h+='<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-surface);border:1px solid var(--border-light);color:var(--text-sec);"><i class="fas '+icon+'" style="margin-right:3px;"></i>'+esc(src)+'</span>';h+='<span style="font-size:10px;color:var(--text-muted);">by '+esc(user)+'</span>';h+='</div>';h+='<div style="font-size:11px;color:var(--text-sec);">'+esc(ts)+(v.resource_count?' · '+v.resource_count+' files':'')+(v.total_rows?' · '+v.total_rows.toLocaleString()+' rows':'')+'</div>';if(details.length)h+='<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">'+esc(details.join(" · "))+'</div>';h+='</div>';});h+='</div>';document.getElementById("linTimeline").innerHTML=h;document.getElementById("linTimeline").style.display="block";}catch(e){show("linResult","result-err",esc(e.message));}});
 
   loadTables();refHold();
 })();

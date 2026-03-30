@@ -214,10 +214,13 @@ def session_context(request: Request) -> Dict[str, Any]:
     """Return template-safe session values (always present keys)."""
     sess = get_session(request) or {}
     is_su = bool(sess.get("is_superuser") is True) or is_superuser(request)
-    role_name = (sess.get("role_name") or "").strip().lower()
+    role_name = (sess.get("role_name") or "").strip()
+    # Superuser sessions always resolve to superadmin
+    if not role_name and is_su:
+        role_name = "superadmin"
     roles_list = sess.get("roles") or []
     # Admin = superuser OR role_name is "admin" or "superadmin"
-    is_admin = is_su or role_name in ("admin", "superadmin") or any(
+    is_admin = is_su or role_name.lower() in ("admin", "superadmin") or any(
         str(r).strip().lower() in ("admin", "superadmin") for r in roles_list
     )
     return {
@@ -227,7 +230,7 @@ def session_context(request: Request) -> Dict[str, Any]:
         "session_is_superuser": is_su,
         "session_is_admin": is_admin,
         "session_logged_in": bool(sess.get("org") and sess.get("username") and sess.get("user_hash")),
-        "session_role_name": (sess.get("role_name") or "").strip(),
+        "session_role_name": role_name,
         "session_roles": roles_list,
     }
 

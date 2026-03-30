@@ -291,6 +291,8 @@ def login_post(
             "username": username_eff,
             "user_hash": user_hash_val,
             "is_superuser": True,
+            "role_name": "superadmin",
+            "roles": ["superadmin"],
         })
         _no_store(resp)
         _audit(
