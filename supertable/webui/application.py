@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Form, Query, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -211,6 +211,20 @@ async def healthz():
             return Response(content=r.text, media_type="text/plain")
     except Exception as e:
         return Response(content=f"api-unreachable: {e}", media_type="text/plain")
+
+
+@app.get("/healthz/deep")
+async def healthz_deep():
+    """Proxy deep health check to API server."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{API_BASE_URL}/healthz/deep")
+            return Response(content=r.text, media_type=r.headers.get("content-type", "application/json"))
+    except Exception as e:
+        return JSONResponse(
+            {"status": "degraded", "checks": {"api": {"status": "fail", "error": str(e)}}},
+            status_code=503,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -544,8 +558,8 @@ def audit_page(
     ctx = _page_context(request, org, sup)
     if ctx is None:
         return _redirect_to_login()
-    # Restrict to superuser (and future auditor role)
-    if not ctx.get("session_is_superuser"):
+    # Restrict to superuser or admin role
+    if not ctx.get("session_is_superuser") and not ctx.get("session_is_admin"):
         return _redirect_to_login()
     resp = templates.TemplateResponse("audit.html", ctx)
     _no_store(resp)
@@ -561,7 +575,7 @@ def platform_page(
     ctx = _page_context(request, org, sup)
     if ctx is None:
         return _redirect_to_login()
-    if not ctx.get("session_is_superuser"):
+    if not ctx.get("session_is_superuser") and not ctx.get("session_is_admin"):
         return _redirect_to_login()
     resp = templates.TemplateResponse("platform.html", ctx)
     _no_store(resp)

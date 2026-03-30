@@ -13,7 +13,6 @@
   <style>
 :root{
   --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
-  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
   --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
   --border:#e0e5f0;--border-light:#f1f5f9;
   --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
@@ -35,21 +34,19 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;}
 .card-title{font-size:14px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
 .field-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-sec);margin-bottom:4px;}
-.field-input{width:100%;max-width:400px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;}
-.field-input:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
+.field-select{width:100%;max-width:300px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;background:var(--bg-card);}
+.field-select:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
 .btn-sm{padding:6px 14px;font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-card);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:var(--transition);}
 .btn-sm:hover{border-color:var(--primary);color:var(--primary);}
 .btn-primary{background:var(--primary);color:#fff;border-color:var(--primary);}
 .btn-primary:hover{background:var(--primary-dark);color:#fff;}
 .btn-danger{background:var(--error);color:#fff;border-color:var(--error);}
-.btn-danger:hover{background:#dc2626;}
 .result-box{padding:12px 16px;border-radius:var(--radius-sm);font-size:12px;margin-top:12px;display:none;}
 .result-ok{background:var(--success-bg);border:1px solid rgba(16,185,129,.2);color:#065f46;}
 .result-err{background:var(--error-bg);border:1px solid rgba(239,68,68,.2);color:#991b1b;}
 .result-warn{background:var(--warn-bg);border:1px solid rgba(245,158,11,.2);color:#92400e;}
 .stat-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-light);font-size:12px;}
-.stat-row .label{color:var(--text-sec);}
-.stat-row .val{font-weight:600;font-family:var(--mono);}
+.stat-row .label{color:var(--text-sec);}.stat-row .val{font-weight:600;font-family:var(--mono);}
 .file-list{max-height:300px;overflow-y:auto;font-family:var(--mono);font-size:11px;}
 .file-item{padding:4px 8px;border-bottom:1px solid var(--border-light);word-break:break-all;}
 .version-row{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid var(--border-light);cursor:pointer;transition:var(--transition);}
@@ -58,18 +55,19 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .hold-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:700;}
 .hold-active{background:var(--error-bg);color:var(--error);border:1px solid rgba(239,68,68,.25);}
 .hold-inactive{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.25);}
-.pane{display:none;}
-.pane.active{display:block;}
+.pane{display:none;}.pane.active{display:block;}
+.pagination{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;}
+.pg-info{color:var(--text-muted);font-family:var(--mono);font-size:11px;}
+.search-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;}
+.search-bar input{max-width:240px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font);outline:none;}
+.search-bar input:focus{border-color:var(--primary);}
   </style>
 </head>
 <body>
 {% include "sidebar.html" %}
 <div class="content-container">
 <div class="wrap">
-  <div class="page-hdr">
-    <div class="page-title"><i class="fas fa-toolbox" style="color:var(--primary);"></i> Platform Tools</div>
-  </div>
-
+  <div class="page-hdr"><div class="page-title"><i class="fas fa-toolbox" style="color:var(--primary);"></i> Platform Tools</div></div>
   <div class="tab-bar" id="tabBar">
     <button class="tab-btn active" data-pane="gc"><i class="fas fa-broom"></i> Garbage Collection</button>
     <button class="tab-btn" data-pane="timetravel"><i class="fas fa-clock-rotate-left"></i> Snapshot History</button>
@@ -77,229 +75,91 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <button class="tab-btn" data-pane="health"><i class="fas fa-heartbeat"></i> Health Check</button>
   </div>
 
-  <!-- ════════════ GC ════════════ -->
-  <div class="pane active" id="pane-gc">
-    <div class="card">
-      <div class="card-title"><i class="fas fa-broom" style="color:var(--primary);"></i> Garbage Collection</div>
-      <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Scan and delete orphaned Parquet files that are no longer referenced by the current snapshot. Safe to run — acquires a per-table lock.</p>
-      <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
-        <div><div class="field-label">Table name</div><input class="field-input" id="gcTable" placeholder="e.g. orders" style="max-width:240px;"/></div>
-        <button class="btn-sm btn-primary" id="btnGcPreview"><i class="fas fa-search"></i> Preview</button>
-        <button class="btn-sm btn-danger" id="btnGcClean" style="display:none;"><i class="fas fa-trash"></i> Delete Orphaned Files</button>
-      </div>
-      <div class="result-box" id="gcResult"></div>
-      <div id="gcFiles" style="display:none;margin-top:12px;">
-        <div class="field-label" style="margin-bottom:6px;">Orphaned files</div>
-        <div class="file-list" id="gcFileList"></div>
-      </div>
+  <div class="pane active" id="pane-gc"><div class="card">
+    <div class="card-title"><i class="fas fa-broom" style="color:var(--primary);"></i> Garbage Collection</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Scan and delete orphaned Parquet files no longer referenced by the current snapshot.</p>
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+      <div><div class="field-label">Table</div><select class="field-select" id="gcTable"><option value="">Loading…</option></select></div>
+      <button class="btn-sm btn-primary" id="btnGcPreview"><i class="fas fa-search"></i> Preview</button>
+      <button class="btn-sm btn-danger" id="btnGcClean" style="display:none;"><i class="fas fa-trash"></i> Delete Orphans</button>
     </div>
-  </div>
+    <div class="result-box" id="gcResult"></div>
+    <div id="gcFiles" style="display:none;margin-top:12px;"><div class="field-label" style="margin-bottom:6px;">Orphaned files</div><div class="file-list" id="gcFileList"></div></div>
+  </div></div>
 
-  <!-- ════════════ TIME TRAVEL ════════════ -->
-  <div class="pane" id="pane-timetravel">
-    <div class="card">
-      <div class="card-title"><i class="fas fa-clock-rotate-left" style="color:var(--primary);"></i> Snapshot History</div>
-      <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Browse version history for any table. Each write produces a new snapshot — this shows the linked list.</p>
-      <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
-        <div><div class="field-label">Table name</div><input class="field-input" id="ttTable" placeholder="e.g. orders" style="max-width:240px;"/></div>
-        <button class="btn-sm btn-primary" id="btnTtLoad"><i class="fas fa-search"></i> Load History</button>
-      </div>
-      <div class="result-box" id="ttResult"></div>
-      <div id="ttVersions" style="display:none;margin-top:12px;"></div>
-      <div id="ttDetail" style="display:none;margin-top:12px;"></div>
+  <div class="pane" id="pane-timetravel"><div class="card">
+    <div class="card-title"><i class="fas fa-clock-rotate-left" style="color:var(--primary);"></i> Snapshot History</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Browse version history for any table.</p>
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+      <div><div class="field-label">Table</div><select class="field-select" id="ttTable"><option value="">Loading…</option></select></div>
+      <button class="btn-sm btn-primary" id="btnTtLoad"><i class="fas fa-search"></i> Load History</button>
     </div>
-  </div>
-
-  <!-- ════════════ LEGAL HOLD ════════════ -->
-  <div class="pane" id="pane-legalhold">
-    <div class="card">
-      <div class="card-title"><i class="fas fa-gavel" style="color:var(--primary);"></i> Audit Legal Hold</div>
-      <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">When legal hold is active, no audit data is deleted by retention cleanup — regardless of the retention period. Use this during investigations or compliance audits.</p>
-      <div id="holdStatus" style="margin-bottom:16px;"><span class="hold-badge hold-inactive"><i class="fas fa-spinner fa-spin"></i> Checking…</span></div>
-      <div style="display:flex;gap:10px;">
-        <button class="btn-sm btn-danger" id="btnHoldActivate"><i class="fas fa-lock"></i> Activate Legal Hold</button>
-        <button class="btn-sm" id="btnHoldDeactivate"><i class="fas fa-lock-open"></i> Deactivate Legal Hold</button>
-        <button class="btn-sm" id="btnRetentionRun" style="margin-left:auto;"><i class="fas fa-calendar-minus"></i> Run Retention Now</button>
-      </div>
-      <div class="result-box" id="holdResult"></div>
+    <div class="result-box" id="ttResult"></div>
+    <div id="ttWrap" style="display:none;margin-top:12px;">
+      <div class="search-bar"><i class="fas fa-search" style="color:var(--text-muted);font-size:11px;"></i><input id="ttSearch" placeholder="Filter by version…"/><span class="pg-info" id="ttPageInfo"></span></div>
+      <div id="ttVersions"></div>
+      <div class="pagination" id="ttPag"></div>
     </div>
-  </div>
+    <div id="ttDetail" style="display:none;margin-top:12px;"></div>
+  </div></div>
 
-  <!-- ════════════ HEALTH ════════════ -->
-  <div class="pane" id="pane-health">
-    <div class="card">
-      <div class="card-title"><i class="fas fa-heartbeat" style="color:var(--primary);"></i> Deep Health Check</div>
-      <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Verifies Redis, storage backend, and DuckDB are operational. This is what load balancers should use for readiness probes.</p>
-      <button class="btn-sm btn-primary" id="btnHealthRun"><i class="fas fa-stethoscope"></i> Run Health Check</button>
-      <div class="result-box" id="healthResult"></div>
-      <div id="healthChecks" style="display:none;margin-top:12px;"></div>
+  <div class="pane" id="pane-legalhold"><div class="card">
+    <div class="card-title"><i class="fas fa-gavel" style="color:var(--primary);"></i> Audit Legal Hold</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">When active, no audit data is deleted by retention cleanup.</p>
+    <div id="holdStatus" style="margin-bottom:16px;"><span class="hold-badge hold-inactive"><i class="fas fa-spinner fa-spin"></i> Checking…</span></div>
+    <div style="display:flex;gap:10px;">
+      <button class="btn-sm btn-danger" id="btnHoldOn"><i class="fas fa-lock"></i> Activate</button>
+      <button class="btn-sm" id="btnHoldOff"><i class="fas fa-lock-open"></i> Deactivate</button>
+      <button class="btn-sm" id="btnRetRun" style="margin-left:auto;"><i class="fas fa-calendar-minus"></i> Run Retention Now</button>
     </div>
-  </div>
+    <div class="result-box" id="holdResult"></div>
+  </div></div>
 
-</div>
-</div>
+  <div class="pane" id="pane-health"><div class="card">
+    <div class="card-title"><i class="fas fa-heartbeat" style="color:var(--primary);"></i> Deep Health Check</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Verifies Redis, storage, and DuckDB.</p>
+    <button class="btn-sm btn-primary" id="btnHealth"><i class="fas fa-stethoscope"></i> Run</button>
+    <div class="result-box" id="healthResult"></div>
+    <div id="healthChecks" style="display:none;margin-top:12px;"></div>
+  </div></div>
+</div></div>
 
 <script>
 (function(){
   function esc(s){var d=document.createElement("div");d.textContent=String(s||"");return d.innerHTML;}
   function enc(s){return encodeURIComponent(s);}
+  document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){document.querySelectorAll(".tab-btn").forEach(function(x){x.classList.remove("active");});document.querySelectorAll(".pane").forEach(function(x){x.classList.remove("active");});b.classList.add("active");var p=document.getElementById("pane-"+b.getAttribute("data-pane"));if(p)p.classList.add("active");});});
+  function C(){return{org:"{{ sel_org }}",sup:"{{ sel_sup }}"};}
+  async function G(u){var r=await fetch(u,{credentials:"same-origin"});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.message))||t||r.status);return j;}
+  async function P(u,b){var r=await fetch(u,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.message))||t||r.status);return j;}
+  function show(id,cls,h){var e=document.getElementById(id);e.className="result-box "+cls;e.innerHTML=h;e.style.display="block";}
 
-  // ── Tab switching ──
-  document.querySelectorAll(".tab-btn").forEach(function(btn){
-    btn.addEventListener("click",function(){
-      document.querySelectorAll(".tab-btn").forEach(function(b){b.classList.remove("active");});
-      document.querySelectorAll(".pane").forEach(function(p){p.classList.remove("active");});
-      btn.classList.add("active");
-      var pane=document.getElementById("pane-"+btn.getAttribute("data-pane"));
-      if(pane)pane.classList.add("active");
-    });
-  });
+  // ── Table dropdowns ──
+  async function loadTables(){var c=C();if(!c.org||!c.sup)return;try{var d=await G("/reflection/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name=superadmin");var t=(d&&d.tables)||[];["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(!s)return;s.innerHTML='<option value="">— Select table —</option>';t.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;s.appendChild(o);});});}catch(e){["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(s)s.innerHTML='<option value="">Error loading</option>';});}}
 
-  // ── Context ──
-  function getOrgSup(){
-    // Read from sidebar or data attributes
-    var sel=document.getElementById("pairSel");
-    var org="{{ sel_org }}",sup="{{ sel_sup }}";
-    return{org:org,sup:sup};
-  }
-  async function apiGet(url){var r=await fetch(url,{credentials:"same-origin"});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.message))||t||r.status);return j;}
-  async function apiPost(url,body){var r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.message))||t||r.status);return j;}
+  // ── GC ──
+  var gcD=null;
+  document.getElementById("btnGcPreview").addEventListener("click",async function(){var t=(document.getElementById("gcTable").value||"").trim();if(!t){alert("Select a table.");return;}var c=C();show("gcResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Scanning…');document.getElementById("gcFiles").style.display="none";document.getElementById("btnGcClean").style.display="none";try{var d=await G("/reflection/gc/preview?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t));gcD=d;var n=(d.orphaned_data_files||[]).length+(d.orphaned_snapshot_files||[]).length;if(!n){show("gcResult","result-ok",'<i class="fas fa-check-circle"></i> Clean — no orphans.');return;}show("gcResult","result-warn",'<i class="fas fa-exclamation-triangle"></i> '+n+' orphaned files. Live: '+d.live_file_count);var l=document.getElementById("gcFileList");l.innerHTML="";(d.orphaned_data_files||[]).forEach(function(f){l.innerHTML+='<div class="file-item">'+esc(f)+'</div>';});(d.orphaned_snapshot_files||[]).forEach(function(f){l.innerHTML+='<div class="file-item" style="color:var(--text-muted);">'+esc(f)+'</div>';});document.getElementById("gcFiles").style.display="block";document.getElementById("btnGcClean").style.display="inline-flex";}catch(e){show("gcResult","result-err",esc(e.message));}});
+  document.getElementById("btnGcClean").addEventListener("click",async function(){var t=(document.getElementById("gcTable").value||"").trim();if(!t)return;var n=gcD?((gcD.orphaned_data_files||[]).length+(gcD.orphaned_snapshot_files||[]).length):0;if(!confirm("Delete "+n+" orphaned files?"))return;var c=C();show("gcResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Deleting…');try{var d=await P("/reflection/gc/clean",{organization:c.org,super_name:c.sup,table_name:t,role_name:"superadmin"});show("gcResult","result-ok",'<i class="fas fa-check-circle"></i> Deleted '+(d.deleted_data_files+d.deleted_snapshot_files)+' files.');document.getElementById("gcFiles").style.display="none";document.getElementById("btnGcClean").style.display="none";}catch(e){show("gcResult","result-err",esc(e.message));}});
 
-  function showResult(id,cls,html){var el=document.getElementById(id);el.className="result-box "+cls;el.innerHTML=html;el.style.display="block";}
+  // ── Time travel (search + pagination) ──
+  var ttA=[],ttF=[],ttP=0,ttPP=50,ttT="";
+  function ttRender(){var q=(document.getElementById("ttSearch").value||"").trim();ttF=q?ttA.filter(function(v){return String(v.version).indexOf(q)>=0;}):ttA.slice();ttP=0;ttPage();}
+  function ttPage(){var s=ttP*ttPP,e=s+ttPP,pg=ttF.slice(s,e),tp=Math.ceil(ttF.length/ttPP)||1;document.getElementById("ttPageInfo").textContent=ttF.length+" versions · page "+(ttP+1)+"/"+tp;var h="";pg.forEach(function(v,i){var gi=s+i;var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";h+='<div class="version-row" data-gi="'+gi+'"><div style="font-weight:700;font-family:var(--mono);min-width:50px;">v'+v.version+'</div><div style="flex:1;"><div style="font-size:12px;">'+v.resource_count+' files · '+v.total_rows.toLocaleString()+' rows</div><div style="font-size:10px;color:var(--text-muted);">'+ts+'</div></div></div>';});document.getElementById("ttVersions").innerHTML=h;document.querySelectorAll(".version-row").forEach(function(r){r.addEventListener("click",function(){ttSel(parseInt(r.getAttribute("data-gi")));});});var ph="";if(ttP>0)ph+='<button class="btn-sm" id="ttPrev"><i class="fas fa-chevron-left"></i></button>';ph+='<span class="pg-info">'+(ttP+1)+"/"+tp+'</span>';if(e<ttF.length)ph+='<button class="btn-sm" id="ttNext"><i class="fas fa-chevron-right"></i></button>';document.getElementById("ttPag").innerHTML=ph;var pv=document.getElementById("ttPrev"),nx=document.getElementById("ttNext");if(pv)pv.onclick=function(){ttP--;ttPage();};if(nx)nx.onclick=function(){ttP++;ttPage();};}
+  document.getElementById("ttSearch").addEventListener("input",ttRender);
+  document.getElementById("btnTtLoad").addEventListener("click",async function(){var t=(document.getElementById("ttTable").value||"").trim();if(!t){alert("Select a table.");return;}ttT=t;ttA=[];ttF=[];ttP=0;var c=C();show("ttResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Loading…');document.getElementById("ttWrap").style.display="none";document.getElementById("ttDetail").style.display="none";document.getElementById("ttSearch").value="";try{var d=await G("/reflection/table/snapshot-history?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t)+"&limit=500");ttA=d.versions||[];if(!ttA.length){show("ttResult","result-warn",'No history found.');return;}show("ttResult","result-ok",ttA.length+' version(s).');ttF=ttA.slice();document.getElementById("ttWrap").style.display="block";ttPage();}catch(e){show("ttResult","result-err",esc(e.message));}});
+  async function ttSel(gi){var v=ttF[gi];if(!v)return;document.querySelectorAll(".version-row").forEach(function(r){r.classList.toggle("active",parseInt(r.getAttribute("data-gi"))===gi);});var c=C();var det=document.getElementById("ttDetail");det.style.display="block";det.innerHTML='<div style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading v'+v.version+'…</div>';try{var d=await G("/reflection/table/snapshot?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(ttT)+"&version="+v.version);var sn=d.snapshot||{};var sa=sn.schema||[];if(typeof sa==="string"){try{sa=JSON.parse(sa);}catch(e){sa=[];}}if(!Array.isArray(sa))sa=[];var names=sa.map(function(s){return(typeof s==="string")?s:(s&&s.name)||"";}).filter(Boolean);var res=sn.resources||[];var tr=res.reduce(function(a,r){return a+(r.rows||0);},0);var h='<div class="card" style="margin-top:0;"><div class="card-title">v'+sn.snapshot_version+'</div>';h+='<div class="stat-row"><span class="label">Updated</span><span class="val">'+(sn.last_updated_ms?new Date(sn.last_updated_ms).toLocaleString():"—")+'</span></div>';h+='<div class="stat-row"><span class="label">Files</span><span class="val">'+res.length+'</span></div>';h+='<div class="stat-row"><span class="label">Total rows</span><span class="val">'+tr.toLocaleString()+'</span></div>';if(names.length)h+='<div class="stat-row"><span class="label">Schema ('+names.length+')</span><span class="val" style="font-size:10px;word-break:break-all;">'+esc(names.join(", "))+'</span></div>';h+='<div class="field-label" style="margin-top:12px;margin-bottom:4px;">Files</div><div class="file-list">';res.forEach(function(r){h+='<div class="file-item">'+esc(r.file||"")+'<span style="color:var(--text-muted);margin-left:8px;">'+(r.rows||0).toLocaleString()+' rows</span></div>';});h+='</div></div>';det.innerHTML=h;}catch(e){det.innerHTML='<div class="result-box result-err" style="display:block;">'+esc(e.message)+'</div>';}}
 
-  // ════════ GC ════════
-  var gcPreviewData=null;
-  document.getElementById("btnGcPreview").addEventListener("click",async function(){
-    var table=(document.getElementById("gcTable").value||"").trim();if(!table){alert("Enter a table name.");return;}
-    var c=getOrgSup();
-    showResult("gcResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Scanning…');
-    document.getElementById("gcFiles").style.display="none";document.getElementById("btnGcClean").style.display="none";
-    try{
-      var d=await apiGet("/reflection/gc/preview?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(table));
-      gcPreviewData=d;
-      var orphaned=(d.orphaned_data_files||[]).length+(d.orphaned_snapshot_files||[]).length;
-      if(orphaned===0){showResult("gcResult","result-ok",'<i class="fas fa-check-circle"></i> No orphaned files found. Table is clean.');return;}
-      showResult("gcResult","result-warn",'<i class="fas fa-exclamation-triangle"></i> Found <strong>'+orphaned+'</strong> orphaned files ('+(d.orphaned_data_files||[]).length+' data + '+(d.orphaned_snapshot_files||[]).length+' snapshots). Live files: '+d.live_file_count);
-      var listEl=document.getElementById("gcFileList");listEl.innerHTML="";
-      (d.orphaned_data_files||[]).forEach(function(f){listEl.innerHTML+='<div class="file-item">'+esc(f)+'</div>';});
-      (d.orphaned_snapshot_files||[]).forEach(function(f){listEl.innerHTML+='<div class="file-item" style="color:var(--text-muted);">'+esc(f)+' <span style="font-size:10px;">(snapshot)</span></div>';});
-      document.getElementById("gcFiles").style.display="block";document.getElementById("btnGcClean").style.display="inline-flex";
-    }catch(e){showResult("gcResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
-  document.getElementById("btnGcClean").addEventListener("click",async function(){
-    var table=(document.getElementById("gcTable").value||"").trim();if(!table)return;
-    var count=(gcPreviewData?((gcPreviewData.orphaned_data_files||[]).length+(gcPreviewData.orphaned_snapshot_files||[]).length):0);
-    if(!confirm("Delete "+count+" orphaned files from \""+table+"\"?\n\nThis cannot be undone."))return;
-    var c=getOrgSup();
-    showResult("gcResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Deleting…');
-    try{
-      var d=await apiPost("/reflection/gc/clean",{organization:c.org,super_name:c.sup,table_name:table,role_name:"superadmin"});
-      var total=d.deleted_data_files+d.deleted_snapshot_files;
-      showResult("gcResult","result-ok",'<i class="fas fa-check-circle"></i> Deleted <strong>'+total+'</strong> files ('+d.deleted_data_files+' data + '+d.deleted_snapshot_files+' snapshots).'+(d.errors&&d.errors.length?' <span style="color:var(--error);">'+d.errors.length+' errors.</span>':''));
-      document.getElementById("gcFiles").style.display="none";document.getElementById("btnGcClean").style.display="none";
-    }catch(e){showResult("gcResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
+  // ── Legal hold ──
+  async function refHold(){var c=C();try{var d=await G("/reflection/audit/legal-hold?organization="+enc(c.org));var a=!!d.legal_hold_active;document.getElementById("holdStatus").innerHTML=a?'<span class="hold-badge hold-active"><i class="fas fa-lock"></i> ACTIVE</span>':'<span class="hold-badge hold-inactive"><i class="fas fa-lock-open"></i> Inactive</span>';document.getElementById("btnHoldOn").style.display=a?"none":"inline-flex";document.getElementById("btnHoldOff").style.display=a?"inline-flex":"none";}catch(e){document.getElementById("holdStatus").innerHTML='<span style="color:var(--error);font-size:12px;">'+esc(e.message)+'</span>';}}
+  document.getElementById("btnHoldOn").addEventListener("click",async function(){if(!confirm("Activate legal hold?"))return;var c=C();try{await P("/reflection/audit/legal-hold",{organization:c.org,enabled:true});show("holdResult","result-ok","Activated.");refHold();}catch(e){show("holdResult","result-err",esc(e.message));}});
+  document.getElementById("btnHoldOff").addEventListener("click",async function(){if(!confirm("Deactivate legal hold?"))return;var c=C();try{await P("/reflection/audit/legal-hold",{organization:c.org,enabled:false});show("holdResult","result-ok","Deactivated.");refHold();}catch(e){show("holdResult","result-err",esc(e.message));}});
+  document.getElementById("btnRetRun").addEventListener("click",async function(){if(!confirm("Run retention now?"))return;var c=C();show("holdResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running…');try{var d=await P("/reflection/audit/retention/run",{organization:c.org});if(d.skipped_legal_hold){show("holdResult","result-warn","Skipped — legal hold active.");return;}show("holdResult","result-ok","Deleted "+d.deleted_partitions+" partition(s). Cutoff: "+esc(d.cutoff_date||"—"));}catch(e){show("holdResult","result-err",esc(e.message));}});
 
-  // ════════ TIME TRAVEL ════════
-  document.getElementById("btnTtLoad").addEventListener("click",async function(){
-    var table=(document.getElementById("ttTable").value||"").trim();if(!table){alert("Enter a table name.");return;}
-    var c=getOrgSup();
-    showResult("ttResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Loading history…');
-    document.getElementById("ttVersions").style.display="none";document.getElementById("ttDetail").style.display="none";
-    try{
-      var d=await apiGet("/reflection/table/snapshot-history?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(table)+"&limit=100");
-      var versions=d.versions||[];
-      if(!versions.length){showResult("ttResult","result-warn",'<i class="fas fa-info-circle"></i> No snapshot history found for this table.');return;}
-      showResult("ttResult","result-ok",'<i class="fas fa-check-circle"></i> '+versions.length+' version(s) found.');
-      var html='<div class="field-label" style="margin-bottom:6px;">Versions (newest first)</div>';
-      versions.forEach(function(v,i){
-        var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";
-        html+='<div class="version-row" data-idx="'+i+'" onclick="loadVersion('+i+')"><div style="font-weight:700;font-family:var(--mono);min-width:40px;">v'+v.version+'</div><div style="flex:1;"><div style="font-size:12px;">'+v.resource_count+' files · '+v.total_rows.toLocaleString()+' rows</div><div style="font-size:10px;color:var(--text-muted);">'+ts+'</div></div></div>';
-      });
-      document.getElementById("ttVersions").innerHTML=html;document.getElementById("ttVersions").style.display="block";
-      window._ttVersions=versions;window._ttTable=table;
-    }catch(e){showResult("ttResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
-  window.loadVersion=async function(idx){
-    var v=window._ttVersions[idx];if(!v)return;
-    document.querySelectorAll(".version-row").forEach(function(r){r.classList.remove("active");});
-    var rows=document.querySelectorAll(".version-row");if(rows[idx])rows[idx].classList.add("active");
-    var c=getOrgSup();
-    var detail=document.getElementById("ttDetail");detail.style.display="block";detail.innerHTML='<div style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading snapshot v'+v.version+'…</div>';
-    try{
-      var d=await apiGet("/reflection/table/snapshot?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(window._ttTable)+"&version="+v.version);
-      var snap=d.snapshot||{};
-      var schema=(snap.schema||[]).map(function(s){return s.name||s;}).join(", ");
-      var resources=snap.resources||[];
-      var html='<div class="card" style="margin-top:0;"><div class="card-title">Snapshot v'+snap.snapshot_version+'</div>';
-      html+='<div class="stat-row"><span class="label">Version</span><span class="val">'+snap.snapshot_version+'</span></div>';
-      html+='<div class="stat-row"><span class="label">Updated</span><span class="val">'+(snap.last_updated_ms?new Date(snap.last_updated_ms).toLocaleString():"—")+'</span></div>';
-      html+='<div class="stat-row"><span class="label">Files</span><span class="val">'+resources.length+'</span></div>';
-      html+='<div class="stat-row"><span class="label">Total rows</span><span class="val">'+resources.reduce(function(a,r){return a+(r.rows||0);},0).toLocaleString()+'</span></div>';
-      if(schema)html+='<div class="stat-row"><span class="label">Schema</span><span class="val" style="font-size:10px;word-break:break-all;">'+esc(schema)+'</span></div>';
-      html+='<div class="field-label" style="margin-top:12px;margin-bottom:4px;">Data files</div><div class="file-list">';
-      resources.forEach(function(r){html+='<div class="file-item">'+esc(r.file||"")+'<span style="color:var(--text-muted);margin-left:8px;">'+((r.rows||0)).toLocaleString()+' rows</span></div>';});
-      html+='</div></div>';
-      detail.innerHTML=html;
-    }catch(e){detail.innerHTML='<div class="result-box result-err" style="display:block;"><i class="fas fa-times-circle"></i> '+esc(e.message)+'</div>';}
-  };
+  // ── Health ──
+  document.getElementById("btnHealth").addEventListener("click",async function(){show("healthResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running…');document.getElementById("healthChecks").style.display="none";try{var d=await G("/healthz/deep");var ok=d.status==="ok";show("healthResult",ok?"result-ok":"result-err",ok?'<i class="fas fa-check-circle"></i> All systems operational.':'<i class="fas fa-exclamation-triangle"></i> Degraded.');var ch=d.checks||{};var h='<div class="card" style="margin-top:0;">';Object.keys(ch).forEach(function(n){var c=ch[n];var o=c.status==="ok";h+='<div class="stat-row"><span class="label"><i class="fas fa-'+(o?"check-circle":"times-circle")+'" style="color:var('+(o?"--success":"--error")+');margin-right:6px;"></i>'+esc(n)+'</span><span class="val" style="color:var('+(o?"--success":"--error")+');">'+esc(c.status)+(c.backend?" · "+esc(c.backend):"")+(c.error?" · "+esc(c.error):"")+'</span></div>';});h+='</div>';document.getElementById("healthChecks").innerHTML=h;document.getElementById("healthChecks").style.display="block";}catch(e){show("healthResult","result-err","Failed: "+esc(e.message));}});
 
-  // ════════ LEGAL HOLD ════════
-  async function refreshHold(){
-    var c=getOrgSup();
-    try{
-      var d=await apiGet("/reflection/audit/legal-hold?organization="+enc(c.org));
-      var active=!!d.legal_hold_active;
-      document.getElementById("holdStatus").innerHTML=active
-        ?'<span class="hold-badge hold-active"><i class="fas fa-lock"></i> Legal Hold is ACTIVE — no audit data will be deleted</span>'
-        :'<span class="hold-badge hold-inactive"><i class="fas fa-lock-open"></i> Legal Hold is inactive — normal retention applies</span>';
-      document.getElementById("btnHoldActivate").style.display=active?"none":"inline-flex";
-      document.getElementById("btnHoldDeactivate").style.display=active?"inline-flex":"none";
-    }catch(e){document.getElementById("holdStatus").innerHTML='<span style="color:var(--error);font-size:12px;">'+esc(e.message)+'</span>';}
-  }
-  document.getElementById("btnHoldActivate").addEventListener("click",async function(){
-    if(!confirm("Activate legal hold?\n\nAll audit retention cleanup will be suspended until deactivated."))return;
-    var c=getOrgSup();
-    try{await apiPost("/reflection/audit/legal-hold",{organization:c.org,enabled:true});showResult("holdResult","result-ok",'<i class="fas fa-check-circle"></i> Legal hold activated.');refreshHold();}catch(e){showResult("holdResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
-  document.getElementById("btnHoldDeactivate").addEventListener("click",async function(){
-    if(!confirm("Deactivate legal hold?\n\nAudit retention cleanup will resume on the next run."))return;
-    var c=getOrgSup();
-    try{await apiPost("/reflection/audit/legal-hold",{organization:c.org,enabled:false});showResult("holdResult","result-ok",'<i class="fas fa-check-circle"></i> Legal hold deactivated.');refreshHold();}catch(e){showResult("holdResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
-  document.getElementById("btnRetentionRun").addEventListener("click",async function(){
-    if(!confirm("Run audit retention now?\n\nPartitions older than the retention period will be permanently deleted."))return;
-    var c=getOrgSup();
-    showResult("holdResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running retention…');
-    try{var d=await apiPost("/reflection/audit/retention/run",{organization:c.org});
-      if(d.skipped_legal_hold){showResult("holdResult","result-warn",'<i class="fas fa-info-circle"></i> Skipped — legal hold is active.');return;}
-      showResult("holdResult","result-ok",'<i class="fas fa-check-circle"></i> Retention complete. Deleted '+d.deleted_partitions+' partition(s). Cutoff: '+esc(d.cutoff_date||"—")+'.'+(d.errors&&d.errors.length?' <span style="color:var(--error);">'+d.errors.length+' errors.</span>':''));
-    }catch(e){showResult("holdResult","result-err",'<i class="fas fa-times-circle"></i> '+esc(e.message));}
-  });
-
-  // ════════ HEALTH CHECK ════════
-  document.getElementById("btnHealthRun").addEventListener("click",async function(){
-    showResult("healthResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running health check…');
-    document.getElementById("healthChecks").style.display="none";
-    try{
-      var d=await apiGet("/healthz/deep");
-      var allOk=d.status==="ok";
-      showResult("healthResult",allOk?"result-ok":"result-err",
-        allOk?'<i class="fas fa-check-circle"></i> All systems operational.'
-             :'<i class="fas fa-exclamation-triangle"></i> Service is degraded — one or more checks failed.');
-      var checks=d.checks||{};
-      var html='<div class="card" style="margin-top:0;">';
-      Object.keys(checks).forEach(function(name){
-        var c=checks[name];var ok=c.status==="ok";
-        html+='<div class="stat-row"><span class="label"><i class="fas fa-'+(ok?"check-circle":"times-circle")+'" style="color:var(-'+(ok?"-success":"-error")+');margin-right:6px;"></i>'+esc(name)+'</span><span class="val" style="color:var(-'+(ok?"-success":"-error")+');">'+esc(c.status)+(c.backend?" · "+esc(c.backend):"")+(c.error?" · "+esc(c.error):"")+'</span></div>';
-      });
-      html+='</div>';
-      document.getElementById("healthChecks").innerHTML=html;document.getElementById("healthChecks").style.display="block";
-    }catch(e){showResult("healthResult","result-err",'<i class="fas fa-times-circle"></i> Health check failed: '+esc(e.message));}
-  });
-
-  // ── Init ──
-  refreshHold();
+  loadTables();refHold();
 })();
 </script>
 </body>

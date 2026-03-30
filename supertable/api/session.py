@@ -213,14 +213,22 @@ def _get_provided_token(request: Request) -> Optional[str]:
 def session_context(request: Request) -> Dict[str, Any]:
     """Return template-safe session values (always present keys)."""
     sess = get_session(request) or {}
+    is_su = bool(sess.get("is_superuser") is True) or is_superuser(request)
+    role_name = (sess.get("role_name") or "").strip().lower()
+    roles_list = sess.get("roles") or []
+    # Admin = superuser OR role_name is "admin" or "superadmin"
+    is_admin = is_su or role_name in ("admin", "superadmin") or any(
+        str(r).strip().lower() in ("admin", "superadmin") for r in roles_list
+    )
     return {
         "session_username": (sess.get("username") or "").strip(),
         "session_org": (sess.get("org") or "").strip(),
         "session_user_hash": (sess.get("user_hash") or "").strip(),
-        "session_is_superuser": bool(sess.get("is_superuser") is True) or is_superuser(request),
+        "session_is_superuser": is_su,
+        "session_is_admin": is_admin,
         "session_logged_in": bool(sess.get("org") and sess.get("username") and sess.get("user_hash")),
         "session_role_name": (sess.get("role_name") or "").strip(),
-        "session_roles": sess.get("roles") or [],
+        "session_roles": roles_list,
     }
 
 
@@ -234,6 +242,7 @@ def inject_session_into_ctx(ctx: Dict[str, Any], request: Request) -> Dict[str, 
         ctx.setdefault("session_org", "")
         ctx.setdefault("session_user_hash", "")
         ctx.setdefault("session_is_superuser", False)
+        ctx.setdefault("session_is_admin", False)
         ctx.setdefault("session_logged_in", False)
         ctx.setdefault("session_role_name", "")
         ctx.setdefault("session_roles", [])

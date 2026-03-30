@@ -76,9 +76,9 @@ def _apply_filters(
         if end_ms and ts and ts > end_ms:
             continue
         filtered.append(event)
-        if len(filtered) >= limit:
-            break
-    return filtered
+    # Sort by timestamp descending (newest first) then apply limit
+    filtered.sort(key=lambda e: int(e.get("timestamp_ms", 0) or 0), reverse=True)
+    return filtered[:limit]
 
 
 # ---------------------------------------------------------------------------

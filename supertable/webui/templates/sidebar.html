@@ -816,7 +816,7 @@
   if (!navEl) return;
 
   var currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
-  var canViewAudit = {{ session_is_superuser|default(false, true)|tojson }};
+  var canViewAudit = {{ session_is_admin|default(false, true)|tojson }};
 
   NAV_ITEMS.forEach(function(item) {
     if (item.section) {
