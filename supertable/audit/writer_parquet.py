@@ -251,30 +251,97 @@ class ParquetAuditWriter:
         partition = f"{_audit_base(org)}/year={year}/month={month:02d}/day={day:02d}"
         try:
             storage = self._get_storage()
-            files = storage.list_files(partition)
+            files = storage.list_files(partition, "*.parquet")
             return [f for f in files if f.endswith(".parquet")]
         except Exception as e:
             logger.warning("[audit-parquet] list_partition_files failed: %s", e)
             return []
 
     def list_partitions(self, org: str) -> List[str]:
-        """List all day-level partition paths for an organization."""
+        """List all day-level partition paths for an organization.
+
+        Traverses the year=/month=/day= directory hierarchy using
+        list_files at each level (works on all storage backends).
+        """
         base = _audit_base(org)
+        partitions = []
         try:
             storage = self._get_storage()
-            # List year dirs, then month dirs, then day dirs
-            partitions = []
-            for year_dir in storage.list_dirs(base):
-                if not year_dir.startswith("year="):
-                    continue
-                for month_dir in storage.list_dirs(f"{base}/{year_dir}"):
-                    if not month_dir.startswith("month="):
-                        continue
-                    for day_dir in storage.list_dirs(f"{base}/{year_dir}/{month_dir}"):
-                        if not day_dir.startswith("day="):
-                            continue
-                        partitions.append(f"{base}/{year_dir}/{month_dir}/{day_dir}")
+            year_entries = storage.list_files(base, "year=*")
+            for year_path in year_entries:
+                month_entries = storage.list_files(year_path, "month=*")
+                for month_path in month_entries:
+                    day_entries = storage.list_files(month_path, "day=*")
+                    for day_path in day_entries:
+                        partitions.append(day_path)
             return sorted(partitions)
         except Exception as e:
             logger.warning("[audit-parquet] list_partitions failed: %s", e)
             return []
+
+    def read_batch_events(
+        self,
+        org: str,
+        year: int,
+        month: int,
+        day: int,
+    ) -> List[Dict[str, Any]]:
+        """Read all audit events from Parquet files for a specific day.
+
+        Returns a list of dicts, one per Parquet file (batch), containing:
+          - file_path: storage path
+          - file_hash: SHA-256 of the raw file bytes
+          - events: list of event dicts from that file
+          - chain_hash: the chain_hash stamped on events in this batch
+          - instance_id: the server instance that wrote this batch
+          - event_ids: sorted list of event IDs in this batch
+          - min_timestamp_ms: earliest event timestamp
+        """
+        if pa is None or pq is None:
+            return []
+
+        files = self.list_partition_files(org, year, month, day)
+        if not files:
+            return []
+
+        storage = self._get_storage()
+        batches: List[Dict[str, Any]] = []
+
+        for file_path in sorted(files):
+            try:
+                raw_bytes = storage.read_bytes(file_path)
+                file_hash = compute_file_hash(raw_bytes)
+
+                buf = io.BytesIO(raw_bytes)
+                table = pq.read_table(buf)
+                rows = table.to_pydict()
+
+                num_rows = table.num_rows
+                if num_rows == 0:
+                    continue
+
+                events = []
+                for i in range(num_rows):
+                    event = {col: rows[col][i] for col in rows}
+                    events.append(event)
+
+                # All events in a batch share the same chain_hash and instance_id
+                chain_hash = events[0].get("chain_hash", "")
+                instance_id = events[0].get("instance_id", "")
+                event_ids = sorted(str(e.get("event_id", "")) for e in events)
+                timestamps = [int(e.get("timestamp_ms", 0)) for e in events]
+
+                batches.append({
+                    "file_path": file_path,
+                    "file_hash": file_hash,
+                    "chain_hash": chain_hash,
+                    "instance_id": instance_id,
+                    "event_ids": event_ids,
+                    "event_count": num_rows,
+                    "events": events,
+                    "min_timestamp_ms": min(timestamps) if timestamps else 0,
+                })
+            except Exception as e:
+                logger.warning("[audit-parquet] read_batch_events failed for %s: %s", file_path, e)
+
+        return batches

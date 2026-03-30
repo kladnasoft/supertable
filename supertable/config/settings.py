@@ -249,6 +249,10 @@ class Settings:
     SUPERTABLE_MONITORING_ENABLED: bool = True    # SUPERTABLE_MONITORING_ENABLED
     SUPERTABLE_MONITOR_CACHE_MAX: int = 256      # SUPERTABLE_MONITOR_CACHE_MAX
 
+    # ── Rate Limiting ────────────────────────────────────────────────
+    SUPERTABLE_API_RATE_LIMIT_ENABLED: bool = False  # SUPERTABLE_API_RATE_LIMIT_ENABLED
+    SUPERTABLE_API_RATE_LIMIT_RPM: int = 300         # SUPERTABLE_API_RATE_LIMIT_RPM (requests per minute)
+
     # ── Notebook / Python Worker ─────────────────────────────────────
     SUPERTABLE_NOTEBOOK_PORT: int = 8010         # SUPERTABLE_NOTEBOOK_PORT  (unified: 8010)
 
@@ -488,6 +492,10 @@ def _build_settings() -> Settings:
         # ── Monitoring ───────────────────────────────────────────────
         SUPERTABLE_MONITORING_ENABLED=_env_bool("SUPERTABLE_MONITORING_ENABLED", True),
         SUPERTABLE_MONITOR_CACHE_MAX=_env_int("SUPERTABLE_MONITOR_CACHE_MAX", 256),
+
+        # ── Rate Limiting ────────────────────────────────────────────
+        SUPERTABLE_API_RATE_LIMIT_ENABLED=_env_bool("SUPERTABLE_API_RATE_LIMIT_ENABLED", False),
+        SUPERTABLE_API_RATE_LIMIT_RPM=_env_int("SUPERTABLE_API_RATE_LIMIT_RPM", 300),
 
         # ── Notebook / Python Worker ─────────────────────────────────
         SUPERTABLE_NOTEBOOK_PORT=_env_int("SUPERTABLE_NOTEBOOK_PORT", 8010),

@@ -47,6 +47,11 @@ app.add_middleware(RequestLoggingMiddleware, service="api")
 from supertable.audit.middleware import AuditMiddleware  # noqa: E402
 app.add_middleware(AuditMiddleware, server="api")
 
+# Rate limiting (opt-in via SUPERTABLE_API_RATE_LIMIT_ENABLED)
+if settings.SUPERTABLE_API_RATE_LIMIT_ENABLED:
+    from supertable.services.rate_limit import RateLimitMiddleware  # noqa: E402
+    app.add_middleware(RateLimitMiddleware, rpm=settings.SUPERTABLE_API_RATE_LIMIT_RPM)
+
 # ---------------------------------------------------------------------------
 # Import server_common first (infrastructure: Settings, Redis, Catalog, router,
 # session helpers, auth guards, etc.)

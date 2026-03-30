@@ -323,7 +323,63 @@ class AuditLogger:
                     event.resource_id,
                 )
 
-                # TODO Phase 11: Send to alert webhook here.
+                if self._config.alert_webhook:
+                    self._fire_webhook(event)
+
+    # ── Alert webhook ─────────────────────────────────────
+
+    def _fire_webhook(self, event: AuditEvent) -> None:
+        """POST a critical event to the configured alert webhook.
+
+        Fire-and-forget: runs in a daemon thread so it never blocks
+        the batch writer.  Timeouts are aggressive (5s connect, 10s total)
+        to prevent webhook latency from stalling the audit pipeline.
+        """
+        url = self._config.alert_webhook
+        if not url:
+            return
+
+        payload = {
+            "event_id": event.event_id,
+            "timestamp_ms": event.timestamp_ms,
+            "organization": self._org,
+            "category": event.category,
+            "action": event.action,
+            "severity": event.severity,
+            "actor_id": event.actor_id,
+            "actor_username": event.actor_username,
+            "resource_type": event.resource_type,
+            "resource_id": event.resource_id,
+            "outcome": event.outcome,
+            "detail": event.detail,
+            "instance_id": event.instance_id,
+        }
+
+        def _send():
+            try:
+                import httpx
+                with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                    resp = client.post(
+                        url,
+                        json=payload,
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "SuperTable-Audit/1.0"},
+                    )
+                    if resp.status_code >= 400:
+                        logger.warning(
+                            "[audit-webhook] POST %s returned %d",
+                            url, resp.status_code,
+                        )
+            except ImportError:
+                logger.warning("[audit-webhook] httpx not installed — webhook disabled")
+            except Exception as e:
+                logger.warning("[audit-webhook] POST %s failed: %s", url, e)
+
+        try:
+            t = threading.Thread(target=_send, daemon=True, name="audit-webhook")
+            t.start()
+        except Exception as e:
+            logger.warning("[audit-webhook] Thread start failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

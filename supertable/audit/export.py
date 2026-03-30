@@ -82,28 +82,104 @@ def export_soc2_evidence(
 ) -> bytes:
     """Export audit events relevant to a specific SOC 2 criterion.
 
-    TODO Phase 7: filter by category/action based on criterion mapping.
+    Maps each SOC 2 Trust Services Criterion to specific event categories
+    and actions.  CC7.3 (incident response) spans all categories.
+
+    Supported criteria: CC6.1, CC6.2, CC6.3, CC7.1, CC7.2, CC7.3,
+    CC8.1, PI1.3, A1.2.
     """
-    # Map SOC 2 criteria to event categories
-    criteria_map: Dict[str, Optional[str]] = {
-        "CC6.1": "authentication",
-        "CC6.2": "authorization",
-        "CC6.3": "rbac_change",
-        "CC7.1": "system",
-        "CC7.2": "security_alert",
-        "CC7.3": None,  # all categories (incident response)
-        "CC8.1": "config_change",
-        "PI1.3": "data_mutation",
-        "A1.2": "system",
+    # Map SOC 2 criteria to (category, [actions]) tuples.
+    # None category means "all categories" for that criterion.
+    # Empty actions list means "all actions within the category".
+    criteria_map: Dict[str, Dict[str, Any]] = {
+        "CC6.1": {
+            "category": "authentication",
+            "actions": [],  # all auth events
+        },
+        "CC6.2": {
+            "category": "authorization",
+            "actions": [],
+        },
+        "CC6.3": {
+            "category": "rbac_change",
+            "actions": [],
+        },
+        "CC7.1": {
+            "category": "system",
+            "actions": [],
+        },
+        "CC7.2": {
+            "categories": ["security_alert", "authentication"],
+            "actions": [
+                "brute_force_detected",
+                "privilege_escalation",
+                "unusual_access_pattern",
+                "login_failure",
+                "token_auth_failure",
+                "mcp_auth_failure",
+            ],
+        },
+        "CC7.3": {
+            "category": None,  # all categories — incident response
+            "actions": [],
+        },
+        "CC8.1": {
+            "category": "config_change",
+            "actions": [],
+        },
+        "PI1.3": {
+            "category": "data_mutation",
+            "actions": [],
+        },
+        "A1.2": {
+            "categories": ["system", "config_change"],
+            "actions": [
+                "service_start",
+                "service_stop",
+                "health_check_failure",
+                "retention_execute",
+                "legal_hold_change",
+                "engine_config_change",
+            ],
+        },
     }
-    category = criteria_map.get(criteria)
+
+    spec = criteria_map.get(criteria, {"category": None, "actions": []})
+    category_filter = spec.get("category")
+    action_filter_set = set(spec.get("actions", []))
+    multi_categories = set(spec.get("categories", []))
 
     from supertable.audit.reader import query_audit_log
-    events = query_audit_log(
-        organization,
-        start_ms=period_start_ms,
-        end_ms=period_end_ms,
-        category=category,
-        limit=50000,
-    )
+
+    if multi_categories:
+        # Criteria spanning multiple categories: query each separately, merge
+        all_events: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        for cat in multi_categories:
+            cat_events = query_audit_log(
+                organization,
+                start_ms=period_start_ms,
+                end_ms=period_end_ms,
+                category=cat,
+                limit=50000,
+            )
+            for ev in cat_events:
+                eid = ev.get("event_id", "")
+                if eid not in seen_ids:
+                    seen_ids.add(eid)
+                    all_events.append(ev)
+        events = all_events
+    else:
+        events = query_audit_log(
+            organization,
+            start_ms=period_start_ms,
+            end_ms=period_end_ms,
+            category=category_filter,
+            limit=50000,
+        )
+
+    # Apply action-level filtering if the criterion specifies specific actions
+    if action_filter_set:
+        events = [e for e in events if e.get("action", "") in action_filter_set]
+
     return export_events(events, output_format)

@@ -2926,6 +2926,163 @@ def audit_stats(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#   Garbage Collection
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/reflection/gc/preview")
+def api_gc_preview(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    table: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    """Preview orphaned files for a table (dry run)."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup or not table:
+        raise HTTPException(status_code=400, detail="org, sup, and table are required")
+
+    from supertable.services.gc import preview_obsolete_files
+    result = preview_obsolete_files(sel_org, sel_sup, table.strip())
+    return JSONResponse({"ok": True, **result})
+
+
+@router.post("/reflection/gc/clean")
+def api_gc_clean(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Delete orphaned files for a table."""
+    sel_org = str(payload.get("organization") or "").strip()
+    sel_sup = str(payload.get("super_name") or "").strip()
+    table = str(payload.get("table_name") or "").strip()
+    role = str(payload.get("role_name") or "superadmin").strip()
+
+    if not sel_org or not sel_sup or not table:
+        raise HTTPException(status_code=400, detail="organization, super_name, and table_name are required")
+
+    from supertable.services.gc import clean_obsolete_files
+    result = clean_obsolete_files(sel_org, sel_sup, table, role)
+
+    status_code = 200 if not result.get("errors") else 207
+    return JSONResponse({"ok": True, **result}, status_code=status_code)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   Snapshot History / Time-Travel
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/reflection/table/snapshot-history")
+def api_snapshot_history(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    table: str = Query(""),
+    limit: int = Query(50, ge=1, le=500),
+    _: Any = Depends(admin_guard_api),
+):
+    """List snapshot versions for a table (newest first)."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup or not table:
+        raise HTTPException(status_code=400, detail="org, sup, and table are required")
+
+    from supertable.services.time_travel import list_snapshot_versions
+    versions = list_snapshot_versions(sel_org, sel_sup, table.strip(), limit=limit)
+    return JSONResponse({"ok": True, "table": table.strip(), "versions": versions, "count": len(versions)})
+
+
+@router.get("/reflection/table/snapshot")
+def api_get_snapshot(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    table: str = Query(""),
+    version: int = Query(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Retrieve a specific snapshot version for a table."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup or not table:
+        raise HTTPException(status_code=400, detail="org, sup, and table are required")
+
+    from supertable.services.time_travel import get_snapshot_at_version
+    snapshot = get_snapshot_at_version(sel_org, sel_sup, table.strip(), version)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"Version {version} not found for table '{table}'")
+
+    return JSONResponse({"ok": True, "table": table.strip(), "version": version, "snapshot": snapshot})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   Audit Retention & Legal Hold
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/reflection/audit/retention/run")
+def api_audit_retention_run(
+    request: Request,
+    payload: Dict[str, Any] = Body({}),
+    _: Any = Depends(admin_guard_api),
+):
+    """Trigger audit retention cleanup (delete partitions older than retention period)."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit retention requires superuser")
+
+    org = str(payload.get("organization") or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    from supertable.audit.retention import enforce_retention
+    result = enforce_retention(org)
+    return JSONResponse({"ok": True, **result})
+
+
+@router.get("/reflection/audit/legal-hold")
+def api_audit_legal_hold_status(
+    request: Request,
+    organization: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    """Check if legal hold is active."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit legal hold requires superuser")
+
+    org = (organization or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    if not org:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    from supertable.audit.retention import is_legal_hold_active
+    active = is_legal_hold_active(org)
+    return JSONResponse({"ok": True, "legal_hold_active": active, "organization": org})
+
+
+@router.post("/reflection/audit/legal-hold")
+def api_audit_legal_hold_set(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Activate or deactivate legal hold."""
+    if not is_superuser(request):
+        raise HTTPException(status_code=403, detail="Audit legal hold requires superuser")
+
+    org = str(payload.get("organization") or settings.SUPERTABLE_ORGANIZATION or "").strip()
+    enabled = bool(payload.get("enabled", True))
+
+    if not org:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    from supertable.audit.retention import set_legal_hold
+    result = set_legal_hold(enabled, organization=org)
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return JSONResponse(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #   Backward-compat route aliases
 # ═══════════════════════════════════════════════════════════════════════════
 

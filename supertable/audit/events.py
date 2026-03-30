@@ -286,6 +286,17 @@ class Actions:
     ODATA_ACCESS = "odata_access"
     AUDIT_EXPORT = "audit_export"
 
+    # Retention & legal hold
+    RETENTION_EXECUTE = "retention_execute"
+    LEGAL_HOLD_CHANGE = "legal_hold_change"
+
+    # Garbage collection
+    GC_EXECUTE = "gc_execute"
+    GC_PREVIEW = "gc_preview"
+
+    # Snapshot history
+    SNAPSHOT_HISTORY_READ = "snapshot_history_read"
+
     # Security alerts
     BRUTE_FORCE_DETECTED = "brute_force_detected"
     PRIVILEGE_ESCALATION = "privilege_escalation"
