@@ -1,389 +1,242 @@
-# SuperTable – Docker Image
+# SuperTable
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: STPUL](https://img.shields.io/badge/license-STPUL-blue)
 
-This image bundles multiple services controlled by the `SERVICE` env var or convenience commands:
+**SuperTable — The simplest data warehouse & cataloging system.**
 
-| Service | Command | Default Port | Description |
-|---------|---------|--------------|-------------|
-| **Reflection** | `reflection-server` | 8050 | Admin UI + REST API |
-| **API** | `api-server` | 8090 | Supertable REST API |
-| **MCP** | `mcp-server` | 8099 (web) + 8070 (HTTP) | MCP stdio + streamable-http + web tester |
-| **MCP-HTTP** | `mcp-http-server` | 8070 | Dedicated MCP over streamable-http |
-| **Notebook** | `notebook-server` | 8000 | Notebook WebSocket server |
-| **Spark** | `spark-server` | 8010 | Spark plug WebSocket server |
-
-> **Runtime:** Redis (catalog/locks) + MinIO/S3/Azure/GCS object backends via DuckDB httpfs
+A data warehouse and cataloging platform that stores structured data on object storage, manages metadata in Redis, and queries everything through DuckDB. This image includes four services: WebUI (admin interface), REST API, OData feed server, and MCP server (AI tool integration).
 
 ---
 
-## Quick Start
-
-### 1. Start infrastructure (Redis + MinIO)
-
-Infrastructure runs as separate compose stacks:
+## Step 1 — Configure
 
 ```bash
-cd infrastructure/redis && docker compose up -d
-cd infrastructure/minio && docker compose up -d
+git clone https://github.com/kladnasoft/supertable.git
+cd supertable
+cp .env.example .env
 ```
 
-All services communicate via the shared `supertable-net` Docker network.
-
-### 2. Create a `.env` file
+Edit `.env` and set at minimum:
 
 ```bash
-# === Logging ===
-LOG_LEVEL=INFO
-
-# === Authentication ===
-SUPERTABLE_AUTH_MODE=api_key
-SUPERTABLE_API_KEY=change-me-super-secret
-SUPERTABLE_AUTH_HEADER_NAME=X-API-Key
-
-# === Storage (MinIO) ===
-STORAGE_TYPE=MINIO
-STORAGE_REGION=eu-central-1
-STORAGE_ENDPOINT_URL=http://minio:9000
-STORAGE_ACCESS_KEY=minioadmin
-STORAGE_SECRET_KEY=minioadmin123!
-STORAGE_BUCKET=supertable
-STORAGE_FORCE_PATH_STYLE=true
-
-# === Redis ===
-LOCKING_BACKEND=redis
-SUPERTABLE_REDIS_HOST=redis-master
-SUPERTABLE_REDIS_PORT=6379
-SUPERTABLE_REDIS_PASSWORD=change-me-strong-password
-SUPERTABLE_REDIS_DB=1
-
-# === Core ===
-SUPERTABLE_HOME=~/supertable
-SUPERTABLE_ORGANIZATION=my-org
-SUPERTABLE_SUPERUSER_TOKEN=change-me-strong-token
-SUPERTABLE_LOGIN_MASK=1
-
-# === API ===
-SUPERTABLE_API_PORT=8090
-
-# === Reflection (Admin UI) ===
-SUPERTABLE_REFLECTION_PORT=8050
-
-# === MCP ===
-SUPERTABLE_MCP_TRANSPORT=streamable-http
-SUPERTABLE_MCP_PORT=8070
-SUPERTABLE_MCP_TOKEN=some-strong-random-string
-
-# === DuckDB Engine ===
-SUPERTABLE_DUCKDB_PRESIGNED=1
-SUPERTABLE_DUCKDB_THREADS=4
-SUPERTABLE_DUCKDB_EXTERNAL_THREADS=2
-SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60
+SUPERTABLE_SUPERUSER_TOKEN=changeme        # Admin login token
+SUPERTABLE_ORGANIZATION=my-org             # Tenant name
 ```
 
-### 3. Run with Docker Compose (recommended)
+The defaults for storage (MinIO) and Redis work with the `infra` profile out of the box.
 
-Use profiles to start individual services:
+---
+
+## Step 2 — Start infrastructure
 
 ```bash
-# Admin UI
-docker compose --profile reflection up -d
-
-# REST API
-docker compose --profile api up -d
-
-# MCP server (stdio + streamable-http + web tester)
-docker compose --profile mcp up -d
-
-# Multiple services at once
-docker compose --profile reflection --profile api --profile mcp up -d
-
-# Add HTTPS to any profile
-docker compose --profile mcp --profile https up -d
+docker compose --profile infra up -d
 ```
 
-### 4. Or run standalone containers
+This starts Redis (`:6379`) and MinIO (`:9000`, console `:9001`), creates the default `supertable` bucket, and establishes the `supertable-net` Docker network.
+
+Verify:
 
 ```bash
-# Reflection UI
-docker run -d --name supertable-reflection \
-  --network supertable-net \
-  --env-file .env \
+docker compose --profile infra ps
+# redis, minio, minio-init should all be healthy/exited
+```
+
+---
+
+## Step 3 — Start the WebUI
+
+```bash
+docker compose --profile infra --profile webui up -d
+```
+
+Open [http://localhost:8050](http://localhost:8050) and log in with your `SUPERTABLE_SUPERUSER_TOKEN`.
+
+The WebUI renders the admin interface and proxies all data operations to the API server internally.
+
+---
+
+## Step 4 — Add services (optional)
+
+Each service is an independent profile. Add as needed:
+
+```bash
+# REST API (standalone, for external tools and scripts)
+docker compose --profile infra --profile webui --profile api up -d
+
+# OData feed server (for Excel, Power BI)
+docker compose --profile infra --profile webui --profile odata up -d
+
+# MCP server (for Claude Desktop, Cursor, and other AI tools)
+docker compose --profile infra --profile webui --profile mcp up -d
+
+# Everything at once
+docker compose --profile infra --profile webui --profile api --profile odata --profile mcp up -d
+```
+
+---
+
+## Step 5 — Add HTTPS (optional)
+
+```bash
+docker compose --profile infra --profile webui --profile https up -d
+```
+
+Uses a Caddy TLS sidecar with self-signed certificates. Trust the CA once:
+
+```bash
+docker compose --profile https exec caddy-https caddy trust
+```
+
+---
+
+## Profiles
+
+| Profile | Service | Port | Description |
+|---|---|---|---|
+| `infra` | Redis + MinIO | 6379, 9000, 9001 | Infrastructure (required) |
+| `webui` | Admin UI + API proxy | 8050 | Browser admin interface |
+| `api` | REST API | 8051 | Standalone JSON API |
+| `odata` | OData 4.0 feed server | 8052 | Excel / Power BI feeds |
+| `mcp` | MCP server | 8070, 8099 | AI tool integration |
+| `mcp-http` | MCP over HTTPS | 8070 | MCP with Caddy TLS |
+| `https` | TLS sidecar | 8443, 8451, 8452, 8470 | Caddy HTTPS for all services |
+
+### HTTPS port map
+
+| HTTPS port | Routes to |
+|---|---|
+| 8443 | WebUI (:8050) |
+| 8451 | API (:8051) |
+| 8452 | OData (:8052) |
+| 8470 | MCP web tester (:8099) |
+| 9443 | MinIO S3 API (:9000) |
+
+---
+
+## Standalone container
+
+Run a single service without Docker Compose:
+
+```bash
+docker run -d --name supertable-webui \
+  -e SUPERTABLE_SUPERUSER_TOKEN=changeme \
+  -e SUPERTABLE_ORGANIZATION=my-org \
+  -e STORAGE_TYPE=MINIO \
+  -e STORAGE_ENDPOINT_URL=http://minio:9000 \
+  -e STORAGE_ACCESS_KEY=minioadmin \
+  -e STORAGE_SECRET_KEY=minioadmin123! \
+  -e STORAGE_BUCKET=supertable \
+  -e SUPERTABLE_REDIS_HOST=redis \
+  -e SERVICE=webui \
   -p 8050:8050 \
-  kladnasoft/supertable:latest reflection-server
+  kladnasoft/supertable:latest
+```
 
-# REST API
-docker run -d --name supertable-api \
-  --network supertable-net \
-  --env-file .env \
-  -p 8090:8090 \
-  kladnasoft/supertable:latest api-server
+Available `SERVICE` values: `webui`, `api`, `odata`, `mcp`, `mcp-http`.
+
+Convenience wrappers are also available:
+
+```bash
+docker run -d kladnasoft/supertable:latest webui-server
+docker run -d kladnasoft/supertable:latest api-server
+docker run -d kladnasoft/supertable:latest odata-server
+docker run -d kladnasoft/supertable:latest mcp-server
 ```
 
 ---
 
-## Docker Compose Profiles
+## Environment variables
 
-| Profile | Service | Ports | Description |
-|---------|---------|-------|-------------|
-| `reflection` | `supertable-reflection` | 8050 | Admin UI + REST API |
-| `api` | `supertable-api` | 8090 | REST API |
-| `mcp` | `supertable-mcp` | 8099, 8070 | MCP stdio + streamable-http + web tester |
-| `mcp-http` | `supertable-mcp-http` + `caddy-mcp` | 8070 (HTTPS) | Dedicated MCP HTTP with TLS via Caddy |
-| `notebook` | `supertable-notebook` | 8000 | Notebook WebSocket server |
-| `spark` | `supertable-spark` | 8010 | Spark plug WebSocket server |
-| `https` | `caddy-https` | 8443, 8470, 8490, 9443 | Universal TLS sidecar (combinable with any profile) |
+### Required
 
-### HTTPS Ports (when using `--profile https`)
+| Variable | Description |
+|---|---|
+| `SUPERTABLE_SUPERUSER_TOKEN` | Admin login token |
+| `SUPERTABLE_ORGANIZATION` | Tenant name |
 
-| Port | Routes to | URL |
-|------|-----------|-----|
-| 8443 | Reflection :8050 | `https://host:8443` |
-| 8470 | MCP + web + simulation | `https://host:8470/mcp`, `/web`, `/simulation` |
-| 8490 | API :8090 | `https://host:8490` |
-| 9443 | MinIO S3 :9000 | `https://host:9443` |
-
-One-time CA trust: `docker compose --profile https exec caddy-https caddy trust`
-
----
-
-## Services
-
-### MCP Server
-
-The `mcp` profile starts a combined server that exposes:
-
-- **stdio** transport (foreground process for Claude Desktop / IDE hosts)
-- **Streamable HTTP** on port 8070 (`http://localhost:8070/mcp`)
-- **Web tester UI** on port 8099 (`http://localhost:8099`)
-
-```bash
-docker compose --profile mcp up -d
-```
-
-For Claude Desktop remote connections with TLS:
-
-```bash
-docker compose --profile mcp --profile https up -d
-# Endpoint: https://localhost:8470/mcp
-```
-
-### MCP-HTTP (dedicated)
-
-Legacy profile for a dedicated HTTP-only MCP server with Caddy TLS sidecar:
-
-```bash
-docker compose --profile mcp-http up -d
-# Endpoint: https://localhost:8070/mcp
-```
-
-Port 8000 (internal) is NOT exposed to the host — traffic flows through Caddy only.
-
-### Notebook
-
-```bash
-docker compose --profile notebook up -d
-```
-
-Mount notebooks for persistence:
-```bash
-docker run -d --network supertable-net --env-file .env \
-  -v ./notebooks:/app/notebooks \
-  -p 8000:8000 \
-  kladnasoft/supertable:latest notebook-server
-```
-
----
-
-## Storage Backends
-
-### MinIO (default)
-
-```bash
-STORAGE_TYPE=MINIO
-STORAGE_ENDPOINT_URL=http://minio:9000
-STORAGE_ACCESS_KEY=minioadmin
-STORAGE_SECRET_KEY=minioadmin123!
-STORAGE_BUCKET=supertable
-STORAGE_FORCE_PATH_STYLE=true
-```
-
-> Inside Docker, use the service hostname `minio`. From the host, use `http://localhost:9000`.
-
-### AWS S3
-
-```bash
-STORAGE_TYPE=S3
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
-AWS_DEFAULT_REGION=eu-central-1
-STORAGE_BUCKET=my-s3-bucket
-```
-
-### S3-Compatible (Backblaze, Wasabi, etc.)
-
-```bash
-STORAGE_TYPE=MINIO
-STORAGE_ENDPOINT_URL=https://s3.us-west-001.backblazeb2.com
-STORAGE_ACCESS_KEY=your-key
-STORAGE_SECRET_KEY=your-secret
-STORAGE_BUCKET=my-bucket
-STORAGE_FORCE_PATH_STYLE=true
-```
-
----
-
-## Redis Configuration
-
-### Standalone
-
-```bash
-LOCKING_BACKEND=redis
-SUPERTABLE_REDIS_HOST=localhost
-SUPERTABLE_REDIS_PORT=6379
-SUPERTABLE_REDIS_PASSWORD=change-me-strong-password
-SUPERTABLE_REDIS_DB=1
-```
-
-### Sentinel (HA)
-
-```bash
-LOCKING_BACKEND=redis
-SUPERTABLE_REDIS_SENTINEL=true
-SUPERTABLE_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
-SUPERTABLE_REDIS_SENTINEL_MASTER=mymaster
-SUPERTABLE_REDIS_SENTINEL_PASSWORD=your-sentinel-password
-```
-
-Start with sentinel profile: `cd infrastructure/redis && docker compose --profile sentinel up -d`
-
----
-
-## Environment Variables
+### Storage — MinIO (default)
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `SERVICE` | `reflection` | Service to run: `reflection`, `api`, `mcp`, `mcp-http`, `notebook`, `spark` |
-| `LOG_LEVEL` | `INFO` | Logging level |
-| **Auth** |||
-| `SUPERTABLE_AUTH_MODE` | `api_key` | Auth mode: `api_key` or `bearer` |
-| `SUPERTABLE_API_KEY` | — | API key for authentication |
-| `SUPERTABLE_SUPERUSER_TOKEN` | — | Admin superuser token (required) |
-| `SUPERTABLE_LOGIN_MASK` | `1` | Login modes: `1` = superuser only, `2` = users only, `3` = both |
-| **Storage** |||
-| `STORAGE_TYPE` | `MINIO` | Backend: `MINIO`, `S3`, `AZURE`, `GCS` |
-| `STORAGE_ENDPOINT_URL` | — | S3/MinIO endpoint URL |
+|---|---|---|
+| `STORAGE_TYPE` | `MINIO` | Storage backend |
+| `STORAGE_ENDPOINT_URL` | `http://minio:9000` | MinIO endpoint |
+| `STORAGE_ACCESS_KEY` | `minioadmin` | Access key |
+| `STORAGE_SECRET_KEY` | `minioadmin123!` | Secret key |
 | `STORAGE_BUCKET` | `supertable` | Bucket name |
-| `STORAGE_ACCESS_KEY` | — | Access key |
-| `STORAGE_SECRET_KEY` | — | Secret key |
-| `STORAGE_FORCE_PATH_STYLE` | `true` | Force path-style S3 URLs (required for MinIO) |
-| **Redis** |||
-| `LOCKING_BACKEND` | `redis` | Locking backend |
-| `SUPERTABLE_REDIS_HOST` | `localhost` | Redis host |
+| `STORAGE_FORCE_PATH_STYLE` | `true` | Path-style access |
+
+### Storage — Amazon S3
+
+| Variable | Description |
+|---|---|
+| `STORAGE_TYPE` | Set to `S3` |
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `AWS_DEFAULT_REGION` | AWS region |
+| `STORAGE_BUCKET` | S3 bucket name |
+
+### Storage — Azure Blob
+
+| Variable | Description |
+|---|---|
+| `STORAGE_TYPE` | Set to `AZURE` |
+| `AZURE_STORAGE_CONNECTION_STRING` | Connection string (or use managed identity) |
+| `AZURE_CONTAINER` | Container name |
+
+### Storage — GCP Cloud Storage
+
+| Variable | Description |
+|---|---|
+| `STORAGE_TYPE` | Set to `GCP` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON |
+| `GCS_BUCKET` | Bucket name |
+
+### Redis
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUPERTABLE_REDIS_HOST` | `redis` | Redis hostname |
 | `SUPERTABLE_REDIS_PORT` | `6379` | Redis port |
-| `SUPERTABLE_REDIS_DB` | `0` | Redis database number |
-| `SUPERTABLE_REDIS_PASSWORD` | — | Redis password |
-| **MCP** |||
-| `SUPERTABLE_MCP_TRANSPORT` | `stdio` | Transport: `stdio` or `streamable-http` |
-| `SUPERTABLE_MCP_PORT` | `8070` | HTTP transport port |
-| `SUPERTABLE_MCP_TOKEN` | — | MCP authentication token |
-| `SUPERTABLE_ALLOWED_ROLES` | — | Comma-separated allowed roles |
-| **DuckDB** |||
-| `SUPERTABLE_DUCKDB_PRESIGNED` | `1` | Use presigned URLs for object storage |
-| `SUPERTABLE_DUCKDB_THREADS` | `4` | DuckDB worker threads |
-| `SUPERTABLE_DUCKDB_EXTERNAL_THREADS` | `2` | External threads for I/O |
-| `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` | `60` | HTTP timeout for DuckDB httpfs |
-| **Ports** |||
-| `SUPERTABLE_REFLECTION_PORT` | `8050` | Reflection UI port |
-| `SUPERTABLE_API_PORT` | `8090` | REST API port |
-| `SUPERTABLE_NOTEBOOK_PORT` | `8000` | Notebook server port |
+| `SUPERTABLE_REDIS_PASSWORD` | (empty) | Redis auth password |
+| `SUPERTABLE_REDIS_SENTINEL` | `false` | Enable Sentinel HA |
+| `SUPERTABLE_REDIS_SENTINELS` | (empty) | Sentinel addresses (`host1:port,host2:port`) |
+
+### Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUPERTABLE_UI_PORT` | `8050` | WebUI listen port |
+| `SUPERTABLE_API_PORT` | `8051` | API listen port |
+| `SUPERTABLE_ODATA_PORT` | `8052` | OData listen port |
+| `SUPERTABLE_SESSION_SECRET` | (empty) | Cookie signing key (set in production) |
+| `SUPERTABLE_MCP_TOKEN` | (empty) | MCP shared secret |
+| `SUPERTABLE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `SUPERTABLE_LOG_FORMAT` | `json` | `json` or `text` |
 
 ---
 
-## Volumes
+## Health check
 
-| Path | Description |
-|------|-------------|
-| `/app/notebooks` | Notebook files (mount for persistence) |
-| `/app/.env` | Environment file (mount read-only) |
-| `/home/supertable/.duckdb/extensions` | DuckDB extensions (pre-baked with httpfs) |
-
----
-
-## Health Checks
-
-| Service | Endpoint | Port |
-|---------|----------|------|
-| Reflection | `GET /health` | 8050 |
-| API | `GET /health` | 8090 |
-| MCP Web | `GET /health` | 8099 |
-| MCP HTTP | `GET /health` | 8070 |
-| Notebook | `GET /health` | 8000 |
-
----
-
-## Security
-
-1. **Set strong tokens:**
-   ```bash
-   SUPERTABLE_SUPERUSER_TOKEN=<random-64-char-string>
-   SUPERTABLE_API_KEY=<random-64-char-string>
-   SUPERTABLE_MCP_TOKEN=<random-64-char-string>
-   ```
-
-2. **Restrict MCP roles:**
-   ```bash
-   SUPERTABLE_ALLOWED_ROLES=reader,writer
-   ```
-
-3. **Use Redis password in production:**
-   ```bash
-   SUPERTABLE_REDIS_PASSWORD=<strong-password>
-   ```
-
-4. **Non-root container:** Runs as user `supertable` (uid 1001).
-
----
-
-## Troubleshooting
-
-### Container exits immediately
+All services expose `/healthz` which returns `ok` when Redis is reachable.
 
 ```bash
-docker logs supertable-reflection
-```
-
-Common causes: missing `SUPERTABLE_ORGANIZATION` or `SUPERTABLE_SUPERUSER_TOKEN`, Redis/MinIO unreachable.
-
-### Cannot reach infrastructure
-
-Ensure services are on `supertable-net`:
-
-```bash
-docker network inspect supertable-net
-```
-
-For host-mode development:
-
-```bash
-docker run ... \
-  -e STORAGE_ENDPOINT_URL=http://host.docker.internal:9000 \
-  -e REDIS_HOST=host.docker.internal \
-  --add-host=host.docker.internal:host-gateway \
-  kladnasoft/supertable:latest reflection-server
-```
-
-### Permission denied on mounted volumes
-
-```bash
-sudo chown -R 1001:1001 ./notebooks
+curl http://localhost:8050/healthz
 ```
 
 ---
 
 ## Links
 
-- **Source**: [github.com/kladnasoft](https://github.com/kladnasoft)
-- **Website**: [kladnasoft.com](https://kladnasoft.com/kladnasoft/index/)
-- **License**: Supertable Proprietary Use License (STPUL)
+- **GitHub**: [github.com/kladnasoft/supertable](https://github.com/kladnasoft/supertable)
+- **PyPI**: [pypi.org/project/supertable](https://pypi.org/project/supertable/)
+- **Documentation**: [github.com/kladnasoft/supertable/tree/master/docs](https://github.com/kladnasoft/supertable/tree/master/docs)
+
+---
+
+## License
+
+Super Table Public Use License (STPUL) v1.0
+
+Copyright © Kladna Soft Kft. All rights reserved.

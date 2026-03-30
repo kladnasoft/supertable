@@ -22,32 +22,40 @@ mkdir -p "${DUCKDB_EXTENSION_DIRECTORY}" "${HOME}/supertable"
 HOST="${HOST:-0.0.0.0}"
 
 # ---------------------------------------------------------------------------
-# reflection — Supertable admin REST + UI (supertable.reflection.application)
-#              Default port: 8050  (SUPERTABLE_REFLECTION_PORT)
+# webui — Supertable admin UI + API proxy (supertable.webui.application)
+#          Default port: 8050  (SUPERTABLE_UI_PORT)
 # ---------------------------------------------------------------------------
-_run_reflection() {
-  PORT="${SUPERTABLE_REFLECTION_PORT:-8050}"
-  exec python -u -m supertable.reflection.application
+_run_webui() {
+  PORT="${SUPERTABLE_UI_PORT:-8050}"
+  exec python -u -m supertable.webui.application
 }
 
 # ---------------------------------------------------------------------------
 # api — Supertable REST API (supertable.api.application)
-#        Default port: 8090  (SUPERTABLE_API_PORT)
+#        Default port: 8051  (SUPERTABLE_API_PORT)
 # ---------------------------------------------------------------------------
-_run_api_rest() {
-  PORT="${SUPERTABLE_API_PORT:-8090}"
+_run_api() {
+  PORT="${SUPERTABLE_API_PORT:-8051}"
   exec python -u -m supertable.api.application
 }
 
 # ---------------------------------------------------------------------------
-# mcp — MCP stdio server (foreground) + MCP web tester UI (background, :8099)
+# odata — Supertable OData 4.0 feed server (supertable.odata.application)
+#          Default port: 8052  (SUPERTABLE_ODATA_PORT)
+# ---------------------------------------------------------------------------
+_run_odata() {
+  PORT="${SUPERTABLE_ODATA_PORT:-8052}"
+  exec python -u -m supertable.odata.application
+}
+
+# ---------------------------------------------------------------------------
+# mcp — MCP stdio server (foreground) + HTTP + web tester (background)
 # ---------------------------------------------------------------------------
 _run_mcp_stdio() {
   exec python -u /app/supertable/mcp/mcp_server.py
 }
 
 _run_mcp_http_bg() {
-  # MCP server over streamable-http in background (:8070)
   SUPERTABLE_MCP_TRANSPORT=streamable-http   SUPERTABLE_MCP_PORT="${SUPERTABLE_MCP_PORT:-8070}"   python -u /app/supertable/mcp/mcp_server.py >> /tmp/mcp_http.log 2>&1 &
   MCP_HTTP_PID=$!
   echo "MCP streamable-http server started (PID $MCP_HTTP_PID) on port ${SUPERTABLE_MCP_PORT:-8070}"
@@ -58,7 +66,7 @@ _start_mcp_web_bg() {
 }
 
 # ---------------------------------------------------------------------------
-# mcp-http — MCP server over streamable-http transport (:8000)
+# mcp-http — MCP server over streamable-http transport
 # ---------------------------------------------------------------------------
 _run_mcp_http() {
   export SUPERTABLE_MCP_TRANSPORT=streamable-http
@@ -66,48 +74,37 @@ _run_mcp_http() {
 }
 
 # ---------------------------------------------------------------------------
-# notebook — Supertable notebook WebSocket server (supertable.notebook.ws_server)
-#            Default port: 8000  (SUPERTABLE_NOTEBOOK_PORT)
-# ---------------------------------------------------------------------------
-_run_notebook() {
-  exec python -u /app/supertable/notebook/ws_server.py
-}
-
-# ---------------------------------------------------------------------------
-# spark — Spark plug WebSocket server (supertable.spark_plug.ws_server)
-#         Default port: 8010  (hardcoded in ws_server.py)
-# ---------------------------------------------------------------------------
-_run_spark() {
-  exec python -u /app/supertable/spark_plug/ws_server.py
-}
-
-# ---------------------------------------------------------------------------
 # SERVICE dispatch
 # ---------------------------------------------------------------------------
-SERVICE="${SERVICE:-reflection}"
+SERVICE="${SERVICE:-webui}"
 
 case "$SERVICE" in
 
-  reflection)
-    # Supertable admin reflection UI + REST API  →  :8050
-    _run_reflection
+  webui|reflection)
+    # Supertable admin UI + API proxy  →  :8050
+    # "reflection" accepted for backward compatibility
+    _run_webui
     ;;
 
   api)
-    # Supertable REST API  →  :8090
-    _run_api_rest
+    # Supertable REST API  →  :8051
+    _run_api
+    ;;
+
+  odata)
+    # Supertable OData 4.0 feed server  →  :8052
+    _run_odata
     ;;
 
   mcp)
     # Starts three processes:
-    #   1. MCP streamable-http server  →  :8070  (for Claude Desktop / remote clients)
-    #   2. MCP web tester UI           →  :8099  (browser dev tool)
-    #   3. MCP stdio server            →  foreground (for stdio MCP clients)
+    #   1. MCP streamable-http server  →  :8070
+    #   2. MCP web tester UI           →  :8099
+    #   3. MCP stdio server            →  foreground
 
     _run_mcp_http_bg
     HTTP_PID=$MCP_HTTP_PID
 
-    # Give the http server 3 seconds to start before checking it is alive.
     sleep 3
     if ! kill -0 "$HTTP_PID" 2>/dev/null; then
       echo "ERROR: MCP http server failed to start. Log:" >&2
@@ -119,7 +116,6 @@ case "$SERVICE" in
     _start_mcp_web_bg
     WEB_PID=$!
 
-    # Give web server 3 seconds to start.
     sleep 3
     if ! kill -0 "$WEB_PID" 2>/dev/null; then
       echo "ERROR: MCP web UI failed to start." >&2
@@ -131,23 +127,13 @@ case "$SERVICE" in
     ;;
 
   mcp-http)
-    # MCP server over streamable-http  →  :8000  (for remote/HTTP MCP clients)
+    # MCP server over streamable-http  →  :8000
     _run_mcp_http
-    ;;
-
-  notebook)
-    # Supertable notebook WebSocket server  →  :${SUPERTABLE_NOTEBOOK_PORT:-8000}
-    _run_notebook
-    ;;
-
-  spark)
-    # Spark plug WebSocket server  →  :8010
-    _run_spark
     ;;
 
   *)
     echo "Unknown SERVICE=$SERVICE" >&2
-    echo "Valid values: reflection | api | mcp | mcp-http | notebook | spark" >&2
+    echo "Valid values: webui | api | odata | mcp | mcp-http" >&2
     exit 64
     ;;
 esac

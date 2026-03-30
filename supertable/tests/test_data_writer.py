@@ -1014,7 +1014,7 @@ class TestWriteMonitoring:
         dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
 
         mock_get_mon.assert_called_once_with(
-            super_name="s", organization="o", monitor_type="stats",
+            super_name="s", organization="o", monitor_type="writes",
         )
         mock_mon.log_metric.assert_called_once()
         payload = mock_mon.log_metric.call_args[0][0]

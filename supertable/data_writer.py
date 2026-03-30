@@ -504,7 +504,7 @@ class DataWriter:
                 with MonitoringWriter(
                     super_name=self.super_table.super_name,
                     organization=self.super_table.organization,
-                    monitor_type="stats",
+                    monitor_type="writes",
                 ) as monitor:
                     monitor.log_metric(stats_payload)
         except Exception as me:

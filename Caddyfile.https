@@ -7,16 +7,25 @@
 #     -subj "/CN=supertable" \
 #     -addext "subjectAltName=IP:192.168.168.130,IP:127.0.0.1,DNS:localhost"
 
+# WebUI — :8443 → :8050
 :8443 {
 	tls /certs/cert.pem /certs/key.pem
-	reverse_proxy supertable-reflection:8050
+	reverse_proxy supertable-webui:8050
 }
 
-# Single HTTPS origin for the MCP web app:
-#   /mcp         Streamable HTTP
-#   /web         Web tester
-#   /simulation  Claude-like simulator
-#   /simulator   Backward-compatible alias
+# API — :8451 → :8051
+:8451 {
+	tls /certs/cert.pem /certs/key.pem
+	reverse_proxy supertable-api:8051
+}
+
+# OData — :8452 → :8052
+:8452 {
+	tls /certs/cert.pem /certs/key.pem
+	reverse_proxy supertable-odata:8052
+}
+
+# MCP — :8470 → :8099 (web tester, streamable-http, simulation)
 :8470 {
 	tls /certs/cert.pem /certs/key.pem
 
@@ -36,7 +45,8 @@
 	header Access-Control-Expose-Headers "Mcp-Session-Id"
 }
 
-:8490 {
+# MinIO S3 API — :9443 → minio:9000
+:9443 {
 	tls /certs/cert.pem /certs/key.pem
-	reverse_proxy supertable-api:8090
+	reverse_proxy minio:9000
 }

@@ -104,7 +104,8 @@ from supertable.services.security import (
 )
 
 # -- monitoring helpers --
-from supertable.services.monitoring import _read_monitoring_list
+from supertable.services.monitoring import _read_monitoring_list, compute_monitoring_summary
+from supertable.monitoring_writer import MonitoringWriter
 
 # -- audit --
 from supertable.audit import emit as _audit, EventCategory, Actions, Severity, Outcome, make_detail, audit_context
@@ -1510,6 +1511,28 @@ async def api_ingestion_load_upload(
                 rows=rows_count, file_type=ext, duration_ms=round(dt_ms),
             ),
         )
+        # Staging uploads bypass DataWriter, so emit a monitoring metric directly.
+        try:
+            with MonitoringWriter(
+                organization=org_eff, super_name=sup_eff, monitor_type="writes",
+            ) as mon:
+                mon.log_metric({
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "upload",
+                    "mode": "staging",
+                    "table_name": "",
+                    "staging_name": stg_eff,
+                    "file_name": file.filename or "",
+                    "file_type": ext or "unknown",
+                    "incoming_rows": rows_count if rows_count is not None else 0,
+                    "inserted": rows_count if rows_count is not None else 0,
+                    "deleted": 0,
+                    "duration": round(dt_ms / 1000.0, 6),
+                    "role_name": role_eff,
+                    "username": (sess or {}).get("username", ""),
+                })
+        except Exception:
+            pass  # Never fail an upload due to monitoring
         return {
             "ok": True, "mode": "staging", "organization": org_eff, "super_name": sup_eff,
             "staging_name": stg_eff, "saved_file_name": saved, "rows": rows_count if rows_count is not None else 0,
@@ -1599,6 +1622,46 @@ def monitoring_writes(
         ts_fields=("recorded_at", "execution_time", "timestamp"),
     )
     return JSONResponse({"ok": True, "items": items})
+
+
+@router.get("/reflection/monitoring/mcp")
+def monitoring_mcp(
+    org: str = Query(""),
+    sup: str = Query(""),
+    from_ts: Optional[int] = Query(None),
+    to_ts: Optional[int] = Query(None),
+    limit: int = Query(500),
+    _=Depends(logged_in_guard_api),
+):
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "items": []})
+
+    items = _read_monitoring_list(
+        redis_client, org, sup,
+        monitor_type="mcp", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=limit,
+    )
+    return JSONResponse({"ok": True, "items": items})
+
+
+@router.get("/reflection/monitoring/summary")
+def monitoring_summary(
+    org: str = Query(""),
+    sup: str = Query(""),
+    window_hours: int = Query(24),
+    _=Depends(logged_in_guard_api),
+):
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "summary": {}})
+
+    window_hours = max(1, min(window_hours, 168))  # Clamp to 1h–7d
+    summary = compute_monitoring_summary(
+        redis_client, org, sup, window_hours=window_hours,
+    )
+    return JSONResponse({"ok": True, "summary": summary})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -153,6 +153,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="section-node" data-section="reads"><span class="sicon" style="background:rgba(28,150,202,.08);color:var(--primary);"><i class="fas fa-book-open"></i></span> Reads<span class="scount" id="countReads">0</span></div>
     <div class="bar-sep"></div>
     <div class="section-node" data-section="writes"><span class="sicon" style="background:rgba(5,150,105,.08);color:var(--success);"><i class="fas fa-pen-to-square"></i></span> Writes<span class="scount" id="countWrites">0</span></div>
+    <div class="bar-sep"></div>
+    <div class="section-node" data-section="mcp"><span class="sicon" style="background:rgba(124,58,237,.08);color:#7c3aed;"><i class="fas fa-robot"></i></span> MCP<span class="scount" id="countMcp">0</span></div>
     <div class="date-pills">
       <button class="date-pill" data-range="today">Today</button>
       <button class="date-pill active" data-range="7d">7 days</button>
@@ -212,6 +214,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     </div>
   </div>
 
+  <!-- MCP 3-col -->
+  <div id="viewMcp" class="cc-cols hidden">
+    <div class="panel-left">
+      <div class="panel-hdr"><span class="panel-title">MCP Tool Calls</span><span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);" id="mcpLeftCount"></span></div>
+      <div class="swrap"><i class="fas fa-search"></i><input id="mcpSearch" placeholder="Search tools…"/></div>
+      <div class="list-area" id="mcpList"></div>
+    </div>
+    <div class="cc-center">
+      <div class="detail-header"><div><div class="detail-title"><i class="fas fa-robot" style="color:#7c3aed;"></i> <span id="mcpDetailName">—</span></div><div class="detail-meta" id="mcpDetailMeta"></div></div></div>
+      <div class="detail-area" id="mcpDetailArea"><div id="mcpDetailContent"></div><div id="mcpDetailEmpty" class="detail-empty"><i class="fas fa-robot"></i><div style="font-size:14px;font-weight:600;">Select a tool call</div><div style="font-size:12px;">Click from the list to view MCP tool invocation details.</div></div></div>
+    </div>
+    <div class="panel-right">
+      <div class="stat-card"><div class="stat-card-title"><i class="fas fa-chart-bar" style="color:#7c3aed;"></i> MCP Stats</div><div id="mcpRightStats"></div></div>
+      <div class="stat-card"><div class="stat-card-title"><i class="fas fa-wrench" style="color:var(--primary);"></i> Top Tools</div><div id="mcpRightTools"></div></div>
+    </div>
+  </div>
+
 </div>
 {% else %}
 <div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view Monitoring</div><div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i><select onchange="ccOnSuperChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div></div>
@@ -236,7 +255,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   function fmtRows(n){if(n===undefined||n===null)return"—";var v=Number(n);return isNaN(v)?"—":v.toLocaleString();}
 
   // State
-  var section="summary",dateRange="7d",allReads=[],allWrites=[],selectedRead=null,selectedWrite=null,readSearchQ="",writeSearchQ="";
+  var section="summary",dateRange="7d",allReads=[],allWrites=[],allMcp=[],selectedRead=null,selectedWrite=null,selectedMcp=null,readSearchQ="",writeSearchQ="",mcpSearchQ="";
 
   // Section switching
   document.querySelectorAll(".section-node").forEach(function(n){n.addEventListener("click",function(){section=n.dataset.section;selectedRead=null;selectedWrite=null;renderSection();});});
@@ -247,9 +266,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     document.getElementById("viewSummary").classList.toggle("hidden",section!=="summary");
     document.getElementById("viewReads").classList.toggle("hidden",section!=="reads");
     document.getElementById("viewWrites").classList.toggle("hidden",section!=="writes");
+    document.getElementById("viewMcp").classList.toggle("hidden",section!=="mcp");
     if(section==="summary")renderSummary();
     if(section==="reads"){renderReadList();renderReadDetail();}
     if(section==="writes"){renderWriteList();renderWriteDetail();}
+    if(section==="mcp"){renderMcpList();renderMcpDetail();}
   }
 
   // Date range → epoch ms
@@ -263,20 +284,24 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   }
   function filteredReads(){var items=allReads;var q=(readSearchQ||"").trim().toLowerCase();if(q)items=items.filter(function(it){return(it.sql||it.query||"").toLowerCase().indexOf(q)>=0||(it.table_name||"").toLowerCase().indexOf(q)>=0||(it.engine||"").toLowerCase().indexOf(q)>=0;});return items;}
   function filteredWrites(){var items=allWrites;var q=(writeSearchQ||"").trim().toLowerCase();if(q)items=items.filter(function(it){return(it.table_name||"").toLowerCase().indexOf(q)>=0||(it.file_name||"").toLowerCase().indexOf(q)>=0;});return items;}
+  function filteredMcp(){var items=allMcp;var q=(mcpSearchQ||"").trim().toLowerCase();if(q)items=items.filter(function(it){return(it.tool||"").toLowerCase().indexOf(q)>=0||(it.role||"").toLowerCase().indexOf(q)>=0||(it.status||"").toLowerCase().indexOf(q)>=0;});return items;}
 
   // =========== SUMMARY ===========
   function renderSummary(){
-    var reads=allReads,writes=allWrites;
-    var errors=0,totalDur=0,durN=0,totalReadRows=0,totalWriteRows=0;
+    var reads=allReads,writes=allWrites,mcp=allMcp;
+    var errors=0,totalDur=0,durN=0,totalReadRows=0,totalWriteRows=0,mcpErrors=0;
     reads.forEach(function(it){if(it.status==="error"||it.error)errors++;var d=Number(it.duration||it.execution_duration||it.total_duration);if(!isNaN(d)&&d>0){totalDur+=d;durN++;}totalReadRows+=Number(it.rows_returned||it.row_count||0);});
     writes.forEach(function(it){if(it.error)errors++;var d=Number(it.duration);if(!isNaN(d)&&d>0){totalDur+=d;durN++;}totalWriteRows+=Number(it.inserted||0);});
+    mcp.forEach(function(it){if(it.status==="error")mcpErrors++;var d=Number(it.duration_ms||0)/1000;if(!isNaN(d)&&d>0){totalDur+=d;durN++;}});
+    errors+=mcpErrors;
+    var totalOps=reads.length+writes.length+mcp.length;
     document.getElementById("summaryGrid").innerHTML=
       '<div class="summary-tile"><div class="sicon" style="background:var(--primary-light);color:var(--primary);"><i class="fas fa-book-open"></i></div><div><div class="snum">'+reads.length+'</div><div class="slabel">Reads</div></div></div>'+
       '<div class="summary-tile"><div class="sicon" style="background:var(--success-bg);color:var(--success);"><i class="fas fa-pen-to-square"></i></div><div><div class="snum">'+writes.length+'</div><div class="slabel">Writes</div></div></div>'+
+      '<div class="summary-tile"><div class="sicon" style="background:rgba(124,58,237,.08);color:#7c3aed;"><i class="fas fa-robot"></i></div><div><div class="snum">'+mcp.length+'</div><div class="slabel">MCP Calls</div></div></div>'+
       '<div class="summary-tile"><div class="sicon" style="background:var(--error-bg);color:var(--error);"><i class="fas fa-triangle-exclamation"></i></div><div><div class="snum">'+errors+'</div><div class="slabel">Errors</div></div></div>'+
       '<div class="summary-tile"><div class="sicon" style="background:var(--warn-bg);color:var(--warn);"><i class="fas fa-gauge-high"></i></div><div><div class="snum">'+fmtDur(durN?totalDur/durN:0)+'</div><div class="slabel">Avg Duration</div></div></div>'+
-      '<div class="summary-tile"><div class="sicon" style="background:rgba(124,58,237,.08);color:#7c3aed;"><i class="fas fa-arrow-up-right-dots"></i></div><div><div class="snum">'+fmtRows(totalReadRows+totalWriteRows)+'</div><div class="slabel">Total Rows</div></div></div>'+
-      '<div class="summary-tile"><div class="sicon" style="background:rgba(8,145,178,.08);color:#0891b2;"><i class="fas fa-percentage"></i></div><div><div class="snum">'+(reads.length+writes.length>0?Math.round((1-errors/(reads.length+writes.length))*100):0)+'%</div><div class="slabel">Success Rate</div></div></div>';
+      '<div class="summary-tile"><div class="sicon" style="background:rgba(8,145,178,.08);color:#0891b2;"><i class="fas fa-percentage"></i></div><div><div class="snum">'+(totalOps>0?Math.round((1-errors/totalOps)*100):0)+'%</div><div class="slabel">Success Rate</div></div></div>';
     // Top tables
     var tbl={};reads.concat(writes).forEach(function(it){var t=it.table_name||it.target_table;if(t)tbl[t]=(tbl[t]||0)+1;});
     var sorted=Object.keys(tbl).sort(function(a,b){return tbl[b]-tbl[a];}).slice(0,8);
@@ -414,13 +439,62 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     document.getElementById("writeRightTables").innerHTML=th||'<div style="font-size:11px;color:var(--text-muted);">—</div>';
   }
 
+  // =========== MCP ===========
+  function renderMcpList(){
+    var wrap=document.getElementById("mcpList"),cnt=document.getElementById("mcpLeftCount");
+    var items=filteredMcp();if(cnt)cnt.textContent="("+items.length+")";
+    document.getElementById("countMcp").textContent=String(items.length);
+    wrap.innerHTML="";
+    items.forEach(function(it,i){
+      var ok=it.status!=="error";
+      var name=it.tool||"unknown";
+      var ts=it.recorded_at;
+      var dur=it.duration_ms;
+      var div=document.createElement("div");div.className="list-item"+(selectedMcp===i?" active":"")+" fade-in";div.style.animationDelay=(i*.02)+"s";
+      div.innerHTML='<div class="licon" style="background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.15);color:#7c3aed;"><i class="fas fa-robot"></i></div><div class="lmeta"><div class="lname">'+esc(name)+'</div><div class="linfo">'+esc(timeAgo(ts))+(dur!==undefined?" · "+esc(fmtMs(dur)):"")+'</div></div><span class="status-dot '+(ok?"ok":"err")+'"></span>';
+      div.onclick=function(){selectedMcp=i;renderMcpList();renderMcpDetail();};wrap.appendChild(div);
+    });
+  }
+  function renderMcpDetail(){
+    var items=filteredMcp();var content=document.getElementById("mcpDetailContent"),empty=document.getElementById("mcpDetailEmpty"),nameEl=document.getElementById("mcpDetailName"),metaEl=document.getElementById("mcpDetailMeta");
+    if(selectedMcp===null||selectedMcp>=items.length){if(content)content.innerHTML="";if(empty)empty.style.display="flex";if(nameEl)nameEl.textContent="—";if(metaEl)metaEl.textContent="";return;}
+    if(empty)empty.style.display="none";var it=items[selectedMcp];
+    var name=it.tool||"unknown";var ts=it.recorded_at;
+    var ok=it.status!=="error";
+    if(nameEl)nameEl.textContent=name;if(metaEl)metaEl.textContent=fmtDate(ts);
+    var h='<div class="config-grid">';
+    h+='<div class="config-card"><div class="cl">Status</div><div class="cv" style="color:'+(ok?"var(--success)":"var(--error)")+';"><i class="fas '+(ok?"fa-check-circle":"fa-times-circle")+'"></i> '+(ok?"Success":"Error")+'</div></div>';
+    h+='<div class="config-card"><div class="cl">Duration</div><div class="cv">'+esc(fmtMs(it.duration_ms))+'</div></div>';
+    h+='<div class="config-card"><div class="cl">Tool</div><div class="cv">'+esc(it.tool||"—")+'</div></div>';
+    if(it.role)h+='<div class="config-card"><div class="cl">Role</div><div class="cv">'+esc(it.role)+'</div></div>';
+    if(it.result_rows!==undefined&&it.result_rows>0)h+='<div class="config-card"><div class="cl">Result Rows</div><div class="cv">'+esc(fmtRows(it.result_rows))+'</div></div>';
+    h+='</div>';
+    if(content)content.innerHTML=h;
+  }
+  function renderMcpRight(){
+    var items=filteredMcp();var totalDur=0,durN=0,errors=0,maxDur=0;
+    items.forEach(function(it){var d=Number(it.duration_ms||0);if(!isNaN(d)&&d>0){totalDur+=d;durN++;if(d>maxDur)maxDur=d;}if(it.status==="error")errors++;});
+    document.getElementById("mcpRightStats").innerHTML=
+      '<div class="stat-row"><span class="label">Calls</span><span class="val">'+items.length+'</span></div>'+
+      '<div class="stat-row"><span class="label">Errors</span><span class="val" style="color:var(--error);">'+errors+'</span></div>'+
+      '<div class="stat-row"><span class="label">Avg duration</span><span class="val">'+fmtMs(durN?totalDur/durN:0)+'</span></div>'+
+      '<div class="stat-row"><span class="label">Max duration</span><span class="val" style="color:var(--warn);">'+fmtMs(maxDur)+'</span></div>';
+    var tools={};items.forEach(function(it){var t=it.tool||"unknown";tools[t]=(tools[t]||0)+1;});
+    var tsorted=Object.keys(tools).sort(function(a,b){return tools[b]-tools[a];}).slice(0,8);
+    var maxT=tsorted.length?tools[tsorted[0]]:1;
+    var th="";tsorted.forEach(function(t){th+='<div class="dist-row"><span class="dist-label" style="color:#7c3aed;" title="'+esc(t)+'">'+esc(t.length>12?t.slice(0,12)+"…":t)+'</span><div class="dist-bar"><div class="fill" style="width:'+Math.round(tools[t]/maxT*100)+'%;background:#7c3aed;"></div></div><span class="dist-count">'+tools[t]+'</span></div>';});
+    document.getElementById("mcpRightTools").innerHTML=th||'<div style="font-size:11px;color:var(--text-muted);">—</div>';
+  }
+
   // =========== DATA ===========
   async function loadReads(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/reads?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadReads:",url);try{var d=await getJSON(url);allReads=(d&&d.items)?d.items:[];console.log("[monitoring] reads loaded:",allReads.length);}catch(e){console.error("[monitoring] reads error:",e);allReads=[];}}
   async function loadWrites(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/writes?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadWrites:",url);try{var d=await getJSON(url);allWrites=(d&&d.items)?d.items:[];console.log("[monitoring] writes loaded:",allWrites.length);}catch(e){console.error("[monitoring] writes error:",e);allWrites=[];}}
-  async function refreshAll(){selectedRead=null;selectedWrite=null;await Promise.all([loadReads(),loadWrites()]);renderSection();renderReadRight();renderWriteRight();}
+  async function loadMcp(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/mcp?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadMcp:",url);try{var d=await getJSON(url);allMcp=(d&&d.items)?d.items:[];console.log("[monitoring] mcp loaded:",allMcp.length);}catch(e){console.error("[monitoring] mcp error:",e);allMcp=[];}}
+  async function refreshAll(){selectedRead=null;selectedWrite=null;selectedMcp=null;await Promise.all([loadReads(),loadWrites(),loadMcp()]);renderSection();renderReadRight();renderWriteRight();renderMcpRight();}
 
   document.getElementById("readSearch").addEventListener("input",function(ev){readSearchQ=ev.target.value;renderReadList();});
   document.getElementById("writeSearch").addEventListener("input",function(ev){writeSearchQ=ev.target.value;renderWriteList();});
+  document.getElementById("mcpSearch").addEventListener("input",function(ev){mcpSearchQ=ev.target.value;renderMcpList();});
   document.getElementById("btnRefresh").addEventListener("click",function(){refreshAll();});
 
   renderSection();

@@ -425,6 +425,30 @@ def _resolve_engine(engine_name: Optional[str]):
     return name  # fallback (string)
 
 # ---------- Logging decorator ----------
+def _emit_mcp_metric(fn: str, kwargs: dict, dt_ms: float, status: str, result_rows: int = 0) -> None:
+    """Best-effort MCP tool metric emission.  Never raises."""
+    try:
+        org = kwargs.get("organization", "")
+        sup = kwargs.get("super_name", "")
+        if not org or not sup:
+            return
+        from datetime import datetime, timezone
+        from supertable.monitoring_writer import MonitoringWriter
+        with MonitoringWriter(
+            organization=org, super_name=sup, monitor_type="mcp",
+        ) as mon:
+            mon.log_metric({
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "tool": fn,
+                "status": status,
+                "duration_ms": round(dt_ms, 2),
+                "role": kwargs.get("role", ""),
+                "result_rows": result_rows,
+            })
+    except Exception:
+        pass
+
+
 def log_tool(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -444,9 +468,11 @@ def log_tool(func):
             dt = (time.perf_counter() - t0) * 1000.0
 
             summary = ""
+            result_rows = 0
             if isinstance(out, dict):
                 r = out.get("result", out)
                 if isinstance(r, dict) and {"columns", "rows"} <= r.keys():
+                    result_rows = len(r.get("rows", []))
                     summary = f"columns={len(r['columns'])} {_summarize_rows(r['rows'])} status={r.get('status')}"
                 else:
                     try:
@@ -455,9 +481,12 @@ def log_tool(func):
                         keys = []
                     summary = f"keys={keys}"
             logger.info("← tool %s response (%0.2f ms) %s", fn, dt, summary)
+            _emit_mcp_metric(fn, kwargs, dt, "ok", result_rows)
             return out
         except Exception as exc:
+            dt = (time.perf_counter() - t0) * 1000.0 if "t0" in locals() else 0.0
             logger.exception("✖ tool %s error: %s", fn, exc)
+            _emit_mcp_metric(fn, kwargs, dt, "error")
             # Return consistent error envelope for all tools.
             # query_sql has a richer envelope; other tools use a simpler shape.
             if fn == "query_sql":

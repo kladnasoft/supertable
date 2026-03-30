@@ -187,7 +187,7 @@ class Settings:
 
     # ── API Server ───────────────────────────────────────────────────
     SUPERTABLE_API_HOST: str = ""                # SUPERTABLE_API_HOST  (falls back to SUPERTABLE_HOST)
-    SUPERTABLE_API_PORT: int = 8050              # SUPERTABLE_API_PORT
+    SUPERTABLE_API_PORT: int = 8051              # SUPERTABLE_API_PORT
     UVICORN_RELOAD: bool = False                 # UVICORN_RELOAD
     SUPERTABLE_PROXY_TIMEOUT: float = 60.0       # SUPERTABLE_PROXY_TIMEOUT
 
@@ -229,9 +229,11 @@ class Settings:
 
     # ── Reflection UI ────────────────────────────────────────────────
     SUPERTABLE_UI_HOST: str = "0.0.0.0"          # SUPERTABLE_UI_HOST
-    SUPERTABLE_UI_PORT: int = 8051               # SUPERTABLE_UI_PORT
+    SUPERTABLE_UI_PORT: int = 8050               # SUPERTABLE_UI_PORT
     SUPERTABLE_STATIC_DIR: str = ""              # SUPERTABLE_STATIC_DIR
     SUPERTABLE_ODATA_BASE_URL: str = "/api/v1/reflection"  # SUPERTABLE_ODATA_BASE_URL
+    SUPERTABLE_ODATA_HOST: str = "0.0.0.0"               # SUPERTABLE_ODATA_HOST
+    SUPERTABLE_ODATA_PORT: int = 8052                     # SUPERTABLE_ODATA_PORT
     SUPERTABLE_REFLECTION_STATE_DIR: str = "/tmp/supertable_reflection"  # SUPERTABLE_REFLECTION_STATE_DIR
     TEMPLATES_DIR: str = ""                      # TEMPLATES_DIR
 
@@ -425,7 +427,7 @@ def _build_settings() -> Settings:
 
         # ── API Server ───────────────────────────────────────────────
         SUPERTABLE_API_HOST=api_host,
-        SUPERTABLE_API_PORT=_env_int("SUPERTABLE_API_PORT", 8050),
+        SUPERTABLE_API_PORT=_env_int("SUPERTABLE_API_PORT", 8051),
         UVICORN_RELOAD=_env_bool("UVICORN_RELOAD", False),
         SUPERTABLE_PROXY_TIMEOUT=_env_float("SUPERTABLE_PROXY_TIMEOUT", 60.0),
 
@@ -467,9 +469,11 @@ def _build_settings() -> Settings:
 
         # ── Reflection UI ────────────────────────────────────────────
         SUPERTABLE_UI_HOST=_env_str("SUPERTABLE_UI_HOST", "0.0.0.0"),
-        SUPERTABLE_UI_PORT=_env_int("SUPERTABLE_UI_PORT", 8051),
+        SUPERTABLE_UI_PORT=_env_int("SUPERTABLE_UI_PORT", 8050),
         SUPERTABLE_STATIC_DIR=_env_str("SUPERTABLE_STATIC_DIR"),
         SUPERTABLE_ODATA_BASE_URL=_env_str("SUPERTABLE_ODATA_BASE_URL", "/api/v1/reflection"),
+        SUPERTABLE_ODATA_HOST=_env_str("SUPERTABLE_ODATA_HOST") or "0.0.0.0",
+        SUPERTABLE_ODATA_PORT=_env_int("SUPERTABLE_ODATA_PORT", 8052),
         SUPERTABLE_REFLECTION_STATE_DIR=_env_str("SUPERTABLE_REFLECTION_STATE_DIR", "/tmp/supertable_reflection"),
         TEMPLATES_DIR=_env_str("TEMPLATES_DIR"),
 

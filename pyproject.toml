@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "supertable"
 version = "1.9.5"
 description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
-readme = "README.md"
+readme = "PYPI.md"
 requires-python = ">=3.10"
 license = { text = "Super Table Public Use License (STPUL) v1.0" }
 authors = [{ name = "Levente Kupas", email = "lkupas@kladnasoft.com" }]
@@ -48,7 +48,7 @@ include = ["supertable", "supertable.*"]
 exclude = [
   "supertable.mcp",    "supertable.mcp.*",
   "supertable.api",    "supertable.api.*",
-  "supertable.reflection", "supertable.reflection.*",
+  "supertable.webui",  "supertable.webui.*",
   "supertable.odata",  "supertable.odata.*",
 ]
 

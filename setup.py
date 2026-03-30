@@ -32,7 +32,7 @@ setup(
         exclude=[
             "supertable.mcp", "supertable.mcp.*",
             "supertable.api", "supertable.api.*",
-            "supertable.reflection", "supertable.reflection.*",
+            "supertable.webui", "supertable.webui.*",
             "supertable.odata", "supertable.odata.*",
         ],
     ),
@@ -62,7 +62,6 @@ setup(
             "google-cloud-storage>=3.1.0",
         ],
     },
-    # ⚠️ This exposes the CLI: `supertable config ...`
     entry_points={
         "console_scripts": [
             "supertable=supertable.config.cli:main",
