@@ -3,7 +3,7 @@
 SuperTable UI Server — template rendering + reverse proxy to API.
 
 Serves HTML pages (Jinja2 templates), static files, and login/session
-management locally.  All JSON API calls (/reflection/*, /api/*) are
+management locally.  All JSON API calls (/api/v1/*) are
 reverse-proxied to the API server via httpx.
 
 Architecture:
@@ -176,7 +176,7 @@ def _page_context(
 
 
 def _redirect_to_login() -> RedirectResponse:
-    resp = RedirectResponse("/reflection/login", status_code=302)
+    resp = RedirectResponse("/ui/login", status_code=302)
     _no_store(resp)
     return resp
 
@@ -187,14 +187,14 @@ def _redirect_to_login() -> RedirectResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def root_redirect():
-    resp = RedirectResponse("/reflection/login", status_code=302)
+    resp = RedirectResponse("/ui/login", status_code=302)
     _no_store(resp)
     return resp
 
 
-@app.get("/reflection", include_in_schema=False)
+@app.get("/ui", include_in_schema=False)
 async def reflection_root_redirect() -> RedirectResponse:
-    return RedirectResponse(url="/reflection/home", status_code=302)
+    return RedirectResponse(url="/ui/home", status_code=302)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -207,7 +207,7 @@ async def healthz():
     """Proxy health check to API server."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{API_BASE_URL}/healthz")
+            r = await client.get(f"{API_BASE_URL}/api/v1/health")
             return Response(content=r.text, media_type="text/plain")
     except Exception as e:
         return Response(content=f"api-unreachable: {e}", media_type="text/plain")
@@ -218,7 +218,7 @@ async def healthz_deep():
     """Proxy deep health check to API server."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{API_BASE_URL}/healthz/deep")
+            r = await client.get(f"{API_BASE_URL}/api/v1/health/deep")
             return Response(content=r.text, media_type=r.headers.get("content-type", "application/json"))
     except Exception as e:
         return JSONResponse(
@@ -231,12 +231,12 @@ async def healthz_deep():
 #   Auth — handled locally (session cookies, NOT proxied)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.get("/reflection/login", response_class=HTMLResponse)
+@app.get("/ui/login", response_class=HTMLResponse)
 def login_page(request: Request):
     return _render_login(request, message=None, clear_cookie=True)
 
 
-@app.post("/reflection/login")
+@app.post("/ui/login")
 def login_post(
     request: Request,
     mode: str = Form("user"),
@@ -276,7 +276,7 @@ def login_post(
         username_eff = "superuser"
         user_hash_val = settings.SUPERTABLE_SUPERHASH
 
-        resp = RedirectResponse(url="/reflection/home", status_code=302)
+        resp = RedirectResponse(url="/ui/home", status_code=302)
         resp.set_cookie(
             _ADMIN_COOKIE_NAME,
             provided,
@@ -373,7 +373,7 @@ def login_post(
         except Exception as e:
             logger.warning("[login] Role resolution failed for user %s: %s", username, e)
 
-    resp = RedirectResponse(url="/reflection/home", status_code=302)
+    resp = RedirectResponse(url="/ui/home", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _set_session_cookie(resp, {
@@ -394,11 +394,11 @@ def login_post(
     return resp
 
 
-@app.get("/reflection/logout")
+@app.get("/ui/logout")
 def logout(request: Request):
     session = get_session(request)
     org = settings.SUPERTABLE_ORGANIZATION
-    resp = RedirectResponse("/reflection/login", status_code=302)
+    resp = RedirectResponse("/ui/login", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
     _no_store(resp)
@@ -417,7 +417,7 @@ def logout(request: Request):
 #   Page routes — template rendering only, NO business logic
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.get("/reflection/home", response_class=HTMLResponse)
+@app.get("/ui/home", response_class=HTMLResponse)
 def home_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -433,7 +433,7 @@ def home_page(
     return resp
 
 
-@app.get("/reflection/tables", response_class=HTMLResponse)
+@app.get("/ui/tables", response_class=HTMLResponse)
 def tables_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -453,7 +453,7 @@ def tables_page(
     return resp
 
 
-@app.get("/reflection/execute", response_class=HTMLResponse)
+@app.get("/ui/execute", response_class=HTMLResponse)
 def execute_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -473,7 +473,7 @@ def execute_page(
     return resp
 
 
-@app.get("/reflection/ingestion", response_class=HTMLResponse)
+@app.get("/ui/ingestion", response_class=HTMLResponse)
 def ingestion_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -487,7 +487,7 @@ def ingestion_page(
     return resp
 
 
-@app.get("/reflection/engine", response_class=HTMLResponse)
+@app.get("/ui/engine", response_class=HTMLResponse)
 def engine_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -501,7 +501,7 @@ def engine_page(
     return resp
 
 
-@app.get("/reflection/monitoring", response_class=HTMLResponse)
+@app.get("/ui/monitoring", response_class=HTMLResponse)
 def monitoring_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -515,7 +515,7 @@ def monitoring_page(
     return resp
 
 
-@app.get("/reflection/security", response_class=HTMLResponse)
+@app.get("/ui/security", response_class=HTMLResponse)
 def security_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -529,7 +529,7 @@ def security_page(
     return resp
 
 
-@app.get("/reflection/quality", response_class=HTMLResponse)
+@app.get("/ui/quality", response_class=HTMLResponse)
 def quality_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -551,7 +551,7 @@ def quality_page(
     return resp
 
 
-@app.get("/reflection/audit", response_class=HTMLResponse)
+@app.get("/ui/audit", response_class=HTMLResponse)
 def audit_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -568,7 +568,7 @@ def audit_page(
     return resp
 
 
-@app.get("/reflection/platform", response_class=HTMLResponse)
+@app.get("/ui/platform", response_class=HTMLResponse)
 def platform_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -584,7 +584,7 @@ def platform_page(
     return resp
 
 
-@app.get("/reflection/admin", response_class=HTMLResponse)
+@app.get("/ui/admin", response_class=HTMLResponse)
 def admin_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -602,7 +602,7 @@ def admin_page(
     return resp
 
 
-@app.get("/reflection/compute", response_class=HTMLResponse)
+@app.get("/ui/compute", response_class=HTMLResponse)
 def compute_page(
     request: Request,
     org: Optional[str] = Query(None),
@@ -622,7 +622,7 @@ def compute_page(
     return resp
 
 
-@app.get("/reflection/users-page", response_class=HTMLResponse)
+@app.get("/ui/users", response_class=HTMLResponse)
 def users_page_html(
     request: Request,
     org: Optional[str] = Query(None),
@@ -664,13 +664,13 @@ def users_page_html(
     return resp
 
 
-@app.get("/reflection/rbac", response_class=HTMLResponse)
+@app.get("/ui/rbac", response_class=HTMLResponse)
 def rbac_redirect(
     request: Request,
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
 ):
-    url = "/reflection/security"
+    url = "/ui/security"
     params = []
     if org:
         params.append(f"org={org}")
@@ -793,27 +793,17 @@ async def _proxy_request(request: Request, url: str) -> Response:
 
 
 @app.api_route(
-    "/reflection/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    include_in_schema=False,
-)
-async def proxy_reflection(request: Request, path: str):
-    """Reverse-proxy any /reflection/* request not matched by a page route.
-
-    This catches all JSON API calls (execute, schema, rbac, monitoring,
-    quality, ingestion, etc.) and forwards them to the API server,
-    preserving method, query params, headers, cookies, and request body.
-    """
-    return await _proxy_request(request, f"/reflection/{path}")
-
-
-@app.api_route(
     "/api/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     include_in_schema=False,
 )
-async def proxy_api_prefix(request: Request, path: str):
-    """Proxy /api/* requests (OData, etc.) to the API server."""
+async def proxy_api(request: Request, path: str):
+    """Reverse-proxy all /api/* requests to the API server.
+
+    This catches all JSON API calls (/api/v1/query/execute, /api/v1/rbac/roles,
+    /api/v1/monitoring/*, etc.) and forwards them to the API server,
+    preserving method, query params, headers, cookies, and request body.
+    """
     return await _proxy_request(request, f"/api/{path}")
 
 

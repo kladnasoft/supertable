@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Data Quality</title>
+  <title>Data Island Core – Data Quality</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -16,7 +16,7 @@
    ═══════════════════════════════════════════════════════════════ */
 :root {
   --primary: #1c96ca; --primary-light: #e6f4fa; --primary-dark: #147ba3;
-  --primary-color: #1c96ca;
+  --primary-color: #1c96ca; --secondary-color: #147ba3; --dark-color: #1a1a2e;
   --success: #10b981; --success-bg: #ecfdf5;
   --error: #ef4444; --error-bg: #fef2f2;
   --warning: #f59e0b; --warning-bg: #fffbeb;
@@ -762,7 +762,7 @@ function dqOnTenantChange(val) {
   if (!val) return;
   var parts = val.split('/');
   if (parts.length < 2) return;
-  var url = new URL('/reflection/quality', window.location.origin);
+  var url = new URL('/ui/quality', window.location.origin);
   url.searchParams.set('org', parts[0].trim());
   url.searchParams.set('sup', parts.slice(1).join('/').trim());
   window.location.href = url.toString();
@@ -886,7 +886,7 @@ function dqUpdateIntelPanel() {
 }
 
 function dqUpdateScheduleIntel() {
-  dqApi('/reflection/quality/schedule').then(function(data) {
+  dqApi('/api/v1/quality/schedule').then(function(data) {
     var container = document.getElementById('dqIntelSchedule');
     if (!data.ok) {
       container.innerHTML = '<div style="font-size:11px;color:var(--text-muted);">Unable to load</div>';
@@ -941,8 +941,8 @@ function dqUpdateFilterCounts() {
 
 function dqLoadOverview() {
   Promise.all([
-    dqApi('/reflection/quality/overview'),
-    dqApi('/reflection/quality/tables')
+    dqApi('/api/v1/quality/overview'),
+    dqApi('/api/v1/quality/tables')
   ]).then(function(results) {
     var overviewData = results[0];
     var tablesData = results[1];
@@ -1108,11 +1108,11 @@ function dqFilterOverview() {
 function dqGoPage(p) { _dqOverviewPage = p; dqFilterOverview(); }
 
 function dqOpenTable(tableName) {
-  window.location.href = '/reflection/tables?table=' + encodeURIComponent(tableName) + '&tab=quality';
+  window.location.href = '/ui/tables?table=' + encodeURIComponent(tableName) + '&tab=quality';
 }
 
 function dqRunTableNow(tableName, mode) {
-  dqApi('/reflection/quality/run?table=' + encodeURIComponent(tableName) + '&mode=' + (mode || 'quick'), { method: 'POST' })
+  dqApi('/api/v1/quality/run?table=' + encodeURIComponent(tableName) + '&mode=' + (mode || 'quick'), { method: 'POST' })
     .then(function(data) {
       if (data.ok) {
         dqToast((mode || 'quick') + ' check started for ' + tableName);
@@ -1152,7 +1152,7 @@ function dqPopulateTableSelects() {
 // ═══════════════════════════════════════════════════════════════
 
 function dqLoadRules() {
-  dqApi('/reflection/quality/rules').then(function(data) {
+  dqApi('/api/v1/quality/rules').then(function(data) {
     var body = document.getElementById('dqRulesBody');
     var countEl = document.getElementById('dqRuleCount');
     var rules = (data.ok && data.rules) ? data.rules : [];
@@ -1230,7 +1230,7 @@ function dqOnRuleTableChange() {
   }
 
   colSel.innerHTML = '<option value="">Loading…</option>';
-  fetch('/reflection/schema?organization=' + encodeURIComponent(DQ_ORG) +
+  fetch('/api/v1/tables/schema?organization=' + encodeURIComponent(DQ_ORG) +
     '&super_name=' + encodeURIComponent(DQ_SUP) +
     '&table=' + encodeURIComponent(table) + '&role_name=superadmin')
     .then(function(r) { return r.json(); })
@@ -1297,7 +1297,7 @@ function dqFreshnessColChanged() {
 }
 
 function dqEditRule(ruleId) {
-  dqApi('/reflection/quality/rules').then(function(data) {
+  dqApi('/api/v1/quality/rules').then(function(data) {
     var rules = (data.ok && data.rules) ? data.rules : [];
     var rule = rules.find(function(r) { return r.rule_id === ruleId; });
     if (!rule) return;
@@ -1321,7 +1321,7 @@ function dqEditRule(ruleId) {
         if (setCol) colSel.value = setCol;
       } else {
         colSel.innerHTML = '<option value="">Loading…</option>';
-        fetch('/reflection/schema?organization=' + encodeURIComponent(DQ_ORG) +
+        fetch('/api/v1/tables/schema?organization=' + encodeURIComponent(DQ_ORG) +
           '&super_name=' + encodeURIComponent(DQ_SUP) +
           '&table=' + encodeURIComponent(tableName) + '&role_name=superadmin')
           .then(function(r) { return r.json(); })
@@ -1391,13 +1391,13 @@ function dqSaveRule() {
   }
 
   if (editId) {
-    dqApi('/reflection/quality/rules?rule_id=' + encodeURIComponent(editId), {
+    dqApi('/api/v1/quality/rules?rule_id=' + encodeURIComponent(editId), {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(rule),
     }).then(function() { dqToggleAddRule(); dqLoadRules(); dqToast('Rule updated'); });
   } else {
-    dqApi('/reflection/quality/rules', {
+    dqApi('/api/v1/quality/rules', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(rule),
@@ -1407,7 +1407,7 @@ function dqSaveRule() {
 
 function dqDeleteRule(ruleId) {
   if (!confirm('Delete this rule?')) return;
-  dqApi('/reflection/quality/rules?rule_id=' + encodeURIComponent(ruleId), { method: 'DELETE' })
+  dqApi('/api/v1/quality/rules?rule_id=' + encodeURIComponent(ruleId), { method: 'DELETE' })
     .then(function() { dqLoadRules(); dqToast('Rule deleted'); });
 }
 
@@ -1416,7 +1416,7 @@ function dqDeleteRule(ruleId) {
 // ═══════════════════════════════════════════════════════════════
 
 function dqLoadChecks() {
-  dqApi('/reflection/quality/global-config').then(function(data) {
+  dqApi('/api/v1/quality/config').then(function(data) {
     if (!data.ok) return;
     _dqGlobalConfig = data.config;
     var checks = data.builtin_checks;
@@ -1477,7 +1477,7 @@ function dqSaveGlobalConfig() {
   });
   var config = _dqGlobalConfig || {};
   config.checks = checks;
-  dqApi('/reflection/quality/global-config', {
+  dqApi('/api/v1/quality/config', {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(config),
@@ -1541,9 +1541,9 @@ document.querySelectorAll('#schedQuickPreset, #schedDeepPreset, #schedCustomPres
 
 function dqLoadSchedule() {
   Promise.all([
-    dqApi('/reflection/quality/schedule'),
-    dqApi('/reflection/quality/table-schedules'),
-    dqApi('/reflection/quality/tables')
+    dqApi('/api/v1/quality/schedule'),
+    dqApi('/api/v1/quality/table-schedules'),
+    dqApi('/api/v1/quality/tables')
   ]).then(function(results) {
     var sData = results[0];
     if (sData.ok) {
@@ -1663,7 +1663,7 @@ function dqSaveTableSchedule() {
     sched.custom_enabled = false;
   }
 
-  dqApi('/reflection/quality/table-schedule?table=' + encodeURIComponent(table), {
+  dqApi('/api/v1/quality/table-schedule?table=' + encodeURIComponent(table), {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(sched),
@@ -1680,7 +1680,7 @@ function dqSaveTableSchedule() {
 
 function dqDeleteOverride(tableName) {
   if (!confirm('Remove override for "' + tableName + '"? It will revert to the global schedule.')) return;
-  dqApi('/reflection/quality/table-schedule?table=' + encodeURIComponent(tableName), { method: 'DELETE' })
+  dqApi('/api/v1/quality/table-schedule?table=' + encodeURIComponent(tableName), { method: 'DELETE' })
     .then(function(data) {
       if (data.ok) {
         delete _dqScheduleOverrides[tableName];
@@ -1695,7 +1695,7 @@ function dqSaveSchedule() {
   var quickCron = _getCron('schedQuickPreset', 'schedQuickCron');
   var deepCron = _getCron('schedDeepPreset', 'schedDeepCron');
   var customCron = _getCron('schedCustomPreset', 'schedCustomCron');
-  dqApi('/reflection/quality/schedule', {
+  dqApi('/api/v1/quality/schedule', {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
@@ -1719,7 +1719,7 @@ function dqSaveSchedule() {
 
 function dqRunAllNow(mode) {
   if (!confirm('Run ' + mode + ' check on ALL tables now?')) return;
-  dqApi('/reflection/quality/run-all?mode=' + mode, { method: 'POST' }).then(function(data) {
+  dqApi('/api/v1/quality/run-all?mode=' + mode, { method: 'POST' }).then(function(data) {
     if (!data.ok) { dqToast('Failed: ' + (data.detail || 'unknown error')); return; }
     dqToast(mode + ' check started on ' + (data.count || 0) + ' tables');
     var refreshCount = 0;
@@ -1760,7 +1760,7 @@ window.dqLoadHistory = function() {
   var chart = document.getElementById('dqHistoryChart');
   chart.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:300px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin" style="margin-right:8px;"></i> Loading history…</div>';
 
-  dqApi('/reflection/quality/history?' + params).then(function(data) {
+  dqApi('/api/v1/quality/history?' + params).then(function(data) {
     var rows = (data.ok && data.rows) ? data.rows : [];
     _dqHistoryData = rows;
 
@@ -1970,7 +1970,7 @@ if (DQ_ORG && DQ_SUP) {
   dqLoadSchedule();
 
   // Fetch available roles for the role selector
-  fetch('/reflection/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))
+  fetch('/api/v1/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var roles = Array.isArray(data) ? data : (data && Array.isArray(data.roles)) ? data.roles : [];

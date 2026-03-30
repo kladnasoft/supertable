@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Tables</title>
+  <title>Data Island Core – Tables</title>
 
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -443,7 +443,7 @@
       }
 
       var role = getActiveRole();
-      var metaUrl = '/reflection/super?organization=' + encodeURIComponent(ORGANIZATION) +
+      var metaUrl = '/api/v1/supertables/meta?organization=' + encodeURIComponent(ORGANIZATION) +
                     '&super_name=' + encodeURIComponent(currentSuper) +
                     (role ? '&role_name=' + encodeURIComponent(role) : '');
 
@@ -549,7 +549,7 @@
       try {
         var sup = currentSuper || '';
         var role = getActiveRole();
-        var data = await api(META_BASE + '/reflection/schema?organization=' + encodeURIComponent(ORGANIZATION) +
+        var data = await api(META_BASE + '/api/v1/tables/schema?organization=' + encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) + '&table=' + encodeURIComponent(tableName) +
           '&role_name=' + encodeURIComponent(role));
 
@@ -655,7 +655,7 @@
       var sql = 'SELECT ' + selectParts.join(',\n  ') + '\nFROM ' + fqn;
 
       try {
-        var data = await api('/reflection/execute', {
+        var data = await api('/api/v1/query/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -809,7 +809,7 @@
 
       try {
         var sup = currentSuper || '';
-        var resp = await fetch('/reflection/quality/run?table=' + encodeURIComponent(tableName) +
+        var resp = await fetch('/api/v1/quality/run?table=' + encodeURIComponent(tableName) +
           '&mode=quick&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup),
           { method: 'POST' });
         var data = await resp.json();
@@ -826,7 +826,7 @@
         var pollTimer = setInterval(async function() {
           attempts++;
           try {
-            var r = await fetch('/reflection/quality/latest?table=' + encodeURIComponent(tableName) +
+            var r = await fetch('/api/v1/quality/latest?table=' + encodeURIComponent(tableName) +
               '&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup))
               .then(function(r) { return r.json(); });
 
@@ -864,7 +864,7 @@
 
       try {
         var sup = currentSuper || '';
-        var data = await fetch('/reflection/quality/latest?table=' + encodeURIComponent(tableName) +
+        var data = await fetch('/api/v1/quality/latest?table=' + encodeURIComponent(tableName) +
           '&org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(sup))
           .then(function(r) { return r.json(); });
 
@@ -969,7 +969,7 @@
       try {
         var sup = currentSuper || '';
         var role = getActiveRole();
-        var data = await api(META_BASE + '/reflection/stats?organization=' + encodeURIComponent(ORGANIZATION) +
+        var data = await api(META_BASE + '/api/v1/tables/stats?organization=' + encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) + '&table=' + encodeURIComponent(tableName) +
           '&role_name=' + encodeURIComponent(role));
 
@@ -1018,7 +1018,7 @@
       if (!panel) return;
       try {
         var sup = currentSuper || '';
-        var data = await api(META_BASE + '/reflection/table/config?organization=' + encodeURIComponent(ORGANIZATION) +
+        var data = await api(META_BASE + '/api/v1/tables/config?organization=' + encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) + '&table=' + encodeURIComponent(tableName));
         var cfg = (data && data.config) ? data.config : {};
         var chunkMB = cfg.max_memory_chunk_size ? (cfg.max_memory_chunk_size / (1024 * 1024)).toFixed(0) : '';
@@ -1065,7 +1065,7 @@
       }
 
       try {
-        await api(META_BASE + '/reflection/table/config?organization=' + encodeURIComponent(ORGANIZATION) +
+        await api(META_BASE + '/api/v1/tables/config?organization=' + encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) + '&table=' + encodeURIComponent(tableName), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -1151,7 +1151,7 @@
         loadTenantSuper(sup);
       }
     }
-    // selection.html fetches /reflection/super; reuse that payload to render the tables without a second request.
+    // selection.html fetches /api/v1/supertables/meta; reuse that payload to render the tables without a second request.
     window.onSuperMetaLoaded = function (org, superName, superMeta) {
       try {
     currentSuper = superName || null;
@@ -1418,7 +1418,7 @@
       renderTables(superName, []);
 
             api(
-        META_BASE + '/reflection/super?organization=' +
+        META_BASE + '/api/v1/supertables/meta?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(superName) +
         '&role_name=' + encodeURIComponent(getActiveRole())
@@ -1474,7 +1474,7 @@
       }
 
       api(
-        META_BASE + '/reflection/super?organization=' +
+        META_BASE + '/api/v1/supertables/meta?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(currentSuper) +
         '&role_name=' + encodeURIComponent(getActiveRole())
@@ -1515,7 +1515,7 @@
       if (!selEl) return;
       if (labelEl) labelEl.textContent = 'Loading SuperTables...';
 
-      api(META_BASE + '/reflection/supers?organization=' + encodeURIComponent(ORGANIZATION))
+      api(META_BASE + '/api/v1/supertables?organization=' + encodeURIComponent(ORGANIZATION))
         .then(data => {
           const supers = (data && Array.isArray(data.supers)) ? data.supers : [];
           selEl.innerHTML = '';
@@ -1629,7 +1629,7 @@ async function openSchema(simple) {
 
       try {
         const data = await api(
-          META_BASE + '/reflection/schema?organization=' +
+          META_BASE + '/api/v1/tables/schema?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup || '') +
           '&table=' + encodeURIComponent(simple) +
@@ -1977,7 +1977,7 @@ async function openSchema(simple) {
 
       try {
         const data = await api(
-          META_BASE + '/reflection/stats?organization=' +
+          META_BASE + '/api/v1/tables/stats?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple) +
@@ -2114,7 +2114,7 @@ async function openSchema(simple) {
     function goExecuteWithLeaf(simple) {
       const sel = document.getElementById('pairSel');
       const sup = sel && sel.value ? sel.value : currentSuper;
-      const url = new URL('/reflection/execute', window.location.origin);
+      const url = new URL('/ui/execute', window.location.origin);
       url.searchParams.set('org', ORGANIZATION);
       if (sup) url.searchParams.set('sup', sup);
       url.searchParams.set('leaf', simple);
@@ -2139,7 +2139,7 @@ async function openSchema(simple) {
 
       try {
         const data = await api(
-          META_BASE + '/reflection/table/config?organization=' +
+          META_BASE + '/api/v1/tables/config?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup || '') +
           '&table=' + encodeURIComponent(simple)
@@ -2207,7 +2207,7 @@ async function openSchema(simple) {
 
       try {
         await api(
-          META_BASE + '/reflection/table/config?organization=' +
+          META_BASE + '/api/v1/tables/config?organization=' +
           encodeURIComponent(ORGANIZATION) +
           '&super_name=' + encodeURIComponent(sup) +
           '&table=' + encodeURIComponent(simple),
@@ -2237,7 +2237,7 @@ function deleteTable(simple) {
       if (typed !== simple) return;
 
       api(
-        META_BASE + '/reflection/table?organization=' +
+        META_BASE + '/api/v1/tables?organization=' +
         encodeURIComponent(ORGANIZATION) +
         '&super_name=' + encodeURIComponent(sup) +
         '&table=' + encodeURIComponent(simple) +
@@ -2391,7 +2391,7 @@ function deleteTable(simple) {
       if (!val) return;
       var parts = val.split('/');
       if (parts.length < 2) return;
-      var url = new URL('/reflection/tables', window.location.origin);
+      var url = new URL('/ui/tables', window.location.origin);
       url.searchParams.set('org', parts[0].trim());
       url.searchParams.set('sup', parts.slice(1).join('/').trim());
       window.location.href = url.toString();
@@ -2422,7 +2422,7 @@ function deleteTable(simple) {
       }
       var safetyTimer = setTimeout(function() { fireOnce(null); }, 3000);
       var role = getActiveRole();
-      var metaUrl = '/reflection/super?organization=' + encodeURIComponent(ORGANIZATION) +
+      var metaUrl = '/api/v1/supertables/meta?organization=' + encodeURIComponent(ORGANIZATION) +
                     '&super_name=' + encodeURIComponent(currentSuper) +
                     (role ? '&role_name=' + encodeURIComponent(role) : '');
       api(metaUrl).then(function(data) {
@@ -2444,7 +2444,7 @@ function deleteTable(simple) {
     // Fetch available roles
     (function() {
       if (!ORGANIZATION || !currentSuper) return;
-      api('/reflection/rbac/roles?org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(currentSuper))
+      api('/api/v1/rbac/roles?org=' + encodeURIComponent(ORGANIZATION) + '&sup=' + encodeURIComponent(currentSuper))
         .then(function(data) {
           var roles = Array.isArray(data) ? data : (data && Array.isArray(data.roles)) ? data.roles : [];
           var sel = document.getElementById('ccRoleSel');

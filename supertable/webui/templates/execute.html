@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Execute SQL</title>
+  <title>Data Island Core – Execute SQL</title>
 
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -592,8 +592,8 @@
     // Track whether sessions were restored from sessionStorage
     var __sessionsRestoredFromCache = false;
 
-    // Called by selection.html after /reflection/super meta is loaded.
-    // Single source of truth — no duplicate /reflection/super calls from this page.
+    // Called by selection.html after /api/v1/supertables/meta meta is loaded.
+    // Single source of truth — no duplicate /api/v1/supertables/meta calls from this page.
     window.onSuperMetaLoaded = function (org, superName, superMeta) {
       try {
         if (superName) currentSuper = superName;
@@ -1733,7 +1733,7 @@ let html = '';
       try { sessionStorage.removeItem(_schemaCacheKey()); } catch (e) {}
     }
 
-    // loadSchema: fetches table+column schemas from /reflection/schema
+    // loadSchema: fetches table+column schemas from /api/v1/tables/schema
     // and caches in sessionStorage. Populates window.__hintTables for IntelliSense.
     async function loadSchema(forceRefresh) {
       const { organization, superName } = getTenant();
@@ -1752,9 +1752,9 @@ let html = '';
         }
       }
 
-      console.log('[execute] fetching /reflection/schema from server');
+      console.log('[execute] fetching /api/v1/tables/schema from server');
       try {
-        var data = await api('/reflection/schema', {
+        var data = await api('/api/v1/tables/schema', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2043,7 +2043,7 @@ let html = '';
       }
 
       try {
-        const data = await api('/reflection/execute', {
+        const data = await api('/api/v1/query/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: abortController.signal,
@@ -2592,7 +2592,7 @@ let html = '';
       }
 
       if (manage) {
-        const url = new URL('/reflection/security', window.location.origin);
+        const url = new URL('/ui/security', window.location.origin);
         url.searchParams.set('org', organization);
         url.searchParams.set('sup', superName);
         manage.href = url.toString();
@@ -2652,7 +2652,7 @@ let html = '';
       if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>&nbsp;Saving…'; }
 
       try {
-        await api('/reflection/rbac/roles', {
+        await api('/api/v1/rbac/roles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -4440,7 +4440,7 @@ $(document).ready(function(){
     // ═══════════════════════════════════════════════════════════════
     // SUPERTABLE SELECTOR — replaces selection.html
     // Sets the globals that the rest of the JS depends on, loads
-    // metadata from /reflection/super, and calls onSuperMetaLoaded().
+    // metadata from /api/v1/supertables/meta, and calls onSuperMetaLoaded().
     // ═══════════════════════════════════════════════════════════════
 
     // Set globals that selection.html used to provide
@@ -4489,7 +4489,7 @@ $(document).ready(function(){
     // Fetch available roles from RBAC endpoint and populate the dropdown
     (function() {
       if (!ORGANIZATION || !currentSuper) return;
-      api('/reflection/rbac/roles?org=' + encodeURIComponent(ORGANIZATION) +
+      api('/api/v1/rbac/roles?org=' + encodeURIComponent(ORGANIZATION) +
           '&sup=' + encodeURIComponent(currentSuper))
         .then(function(data) {
           var roles = [];
@@ -4537,7 +4537,7 @@ $(document).ready(function(){
       if (parts.length < 2) return;
       var org = parts[0].trim();
       var sup = parts.slice(1).join('/').trim();
-      var url = new URL('/reflection/execute', window.location.origin);
+      var url = new URL('/ui/execute', window.location.origin);
       url.searchParams.set('org', org);
       url.searchParams.set('sup', sup);
       window.location.href = url.toString();
@@ -4561,7 +4561,7 @@ $(document).ready(function(){
       // Safety net: if meta fetch takes too long or fails silently, fire after 2s
       var safetyTimer = setTimeout(function() { fireOnce(null); }, 2000);
 
-      var metaUrl = '/reflection/super?org=' + encodeURIComponent(ORGANIZATION) +
+      var metaUrl = '/api/v1/supertables/meta?org=' + encodeURIComponent(ORGANIZATION) +
                     '&sup=' + encodeURIComponent(currentSuper);
       api(metaUrl).then(function(data) {
         clearTimeout(safetyTimer);

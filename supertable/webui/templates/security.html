@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Security</title>
+  <title>Data Island Core – Security</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -509,9 +509,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   function renderAll(){renderSectionBar();renderList();renderDetail();renderRight();}
 
   // Data loading
-  async function loadRoles(){var c=ctx();try{var d=await apiGet("/reflection/rbac/roles?organization="+enc(c.org)+"&super_name="+enc(c.sup));allRoles=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allRoles=[];toast("Roles: "+e.message);}}
-  async function loadUsers(){var c=ctx();try{var d=await apiGet("/reflection/users-page/list?org="+enc(c.org)+"&sup="+enc(c.sup));allUsers=d.users||[];var r2=d.roles||[];if(r2.length&&!allRoles.length)allRoles=r2;}catch(e){try{var d2=await apiGet("/reflection/rbac/users?organization="+enc(c.org)+"&super_name="+enc(c.sup));allUsers=(d2&&d2.data&&d2.data.items)?d2.data.items:[];}catch(e2){allUsers=[];toast("Users: "+e2.message);}}}
-  async function loadEndpoints(){var c=ctx();try{var d=await apiGet("/reflection/odata/endpoints?organization="+enc(c.org)+"&super_name="+enc(c.sup));allEndpoints=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allEndpoints=[];}}
+  async function loadRoles(){var c=ctx();try{var d=await apiGet("/api/v1/rbac/roles?organization="+enc(c.org)+"&super_name="+enc(c.sup));allRoles=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allRoles=[];toast("Roles: "+e.message);}}
+  async function loadUsers(){var c=ctx();try{var d=await apiGet("/api/v1/rbac/users/list?org="+enc(c.org)+"&sup="+enc(c.sup));allUsers=d.users||[];var r2=d.roles||[];if(r2.length&&!allRoles.length)allRoles=r2;}catch(e){try{var d2=await apiGet("/api/v1/rbac/users?organization="+enc(c.org)+"&super_name="+enc(c.sup));allUsers=(d2&&d2.data&&d2.data.items)?d2.data.items:[];}catch(e2){allUsers=[];toast("Users: "+e2.message);}}}
+  async function loadEndpoints(){var c=ctx();try{var d=await apiGet("/api/v1/odata/endpoints?organization="+enc(c.org)+"&super_name="+enc(c.sup));allEndpoints=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allEndpoints=[];}}
   async function refreshAll(){await loadRoles();await loadUsers();await loadEndpoints();renderAll();}
 
   // CRUD: Roles
@@ -525,12 +525,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var filtersRaw=(document.getElementById("edRoleFilters").value||"*").trim();var filters;
     if(filtersRaw==="*")filters=["*"];else{try{filters=JSON.parse(filtersRaw);}catch(e){filters=filtersRaw.split(",").map(function(s){return s.trim();}).filter(Boolean);}}
     try{
-      if(!editRoleId)await apiPost("/reflection/rbac/roles",{organization:c.org,super_name:c.sup,role_name:name,role:role,tables:tables,columns:columns,filters:filters});
-      else await apiPut("/reflection/rbac/roles/"+enc(editRoleId),{organization:c.org,super_name:c.sup,role_name:name,role:role,tables:tables,columns:columns,filters:filters});
+      if(!editRoleId)await apiPost("/api/v1/rbac/roles",{organization:c.org,super_name:c.sup,role_name:name,role:role,tables:tables,columns:columns,filters:filters});
+      else await apiPut("/api/v1/rbac/roles/"+enc(editRoleId),{organization:c.org,super_name:c.sup,role_name:name,role:role,tables:tables,columns:columns,filters:filters});
       hideModal("modalRole");toast(editRoleId?"Saved":"Created");await refreshAll();
     }catch(e){document.getElementById("edRoleError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
-  async function deleteRole(rid){if(!confirm("Delete this role?"))return;var c=ctx();try{await apiDel("/reflection/rbac/roles/"+enc(rid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
+  async function deleteRole(rid){if(!confirm("Delete this role?"))return;var c=ctx();try{await apiDel("/api/v1/rbac/roles/"+enc(rid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
 
   // CRUD: Users
   var _usernameRe=/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -543,7 +543,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var sc=document.querySelector(".role-type-card.selected");if(!sc){document.getElementById("edUserError").innerHTML='<div class="flash-error">Select a role type.</div>';return;}
     var roleType=sc.getAttribute("data-role");var c=ctx();
     try{
-      var res=await apiPost("/reflection/users-page/create",{username:username,display_name:displayName,role_type:roleType,org:c.org,sup:c.sup});
+      var res=await apiPost("/api/v1/rbac/users/create",{username:username,display_name:displayName,role_type:roleType,org:c.org,sup:c.sup});
       hideModal("modalUser");
       if(res.token){document.getElementById("utokUsername").textContent=username;document.getElementById("utokPlaintext").textContent=res.token;showModal("modalUserTokenResult");}
       else{toast("Created");}
@@ -574,21 +574,21 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var c=ctx();var supLow=(c.sup||"").toLowerCase();
     return !!u.is_superuser || uname===supLow || uname==="superuser" || uname==="superadmin";
   }
-  async function deleteUser(uid,name){if(!confirm('Delete user "'+name+'"? Their login token will also be revoked.'))return;var c=ctx();try{await apiDel("/reflection/users-page/user/"+enc(uid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
-  window.removeUserRole=async function(uid,rid){var c=ctx();try{await apiDel("/reflection/users-page/user/"+enc(uid)+"/role/"+enc(rid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));await refreshAll();renderDetail();}catch(e){toast("Remove role failed: "+e.message);}};
+  async function deleteUser(uid,name){if(!confirm('Delete user "'+name+'"? Their login token will also be revoked.'))return;var c=ctx();try{await apiDel("/api/v1/rbac/users/"+enc(uid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
+  window.removeUserRole=async function(uid,rid){var c=ctx();try{await apiDel("/api/v1/rbac/users/"+enc(uid)+"/roles/"+enc(rid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));await refreshAll();renderDetail();}catch(e){toast("Remove role failed: "+e.message);}};
   window.openAddRoleModal=function(uid){addRoleTargetUid=uid;var user=allUsers.find(function(u){return(u.user_id||u.hash||u.id)===uid;});var currentRoles=safeList(user?user.roles:[]);var list=document.getElementById("rolePickerList");list.innerHTML="";document.getElementById("addRoleError").innerHTML="";
     allRoles.forEach(function(role){var rid=role.role_id||role.hash||role.id||"";var already=currentRoles.indexOf(rid)>=0;var item=document.createElement("div");item.className="role-picker-item"+(already?" already":"");item.innerHTML='<div>'+roleBadgeHtml(role.role)+' <span style="font-size:11px;color:var(--text-muted);margin-left:4px;">'+esc((role.role_name||rid).slice(0,20))+'</span></div><span style="font-size:10px;color:var(--text-muted);">'+(already?"assigned":"")+'</span>';
       if(!already)item.onclick=function(){addUserRole(rid);};list.appendChild(item);});
     showModal("modalAddRole");
   };
-  async function addUserRole(roleId){var c=ctx();try{await apiPost("/reflection/users-page/user/"+enc(addRoleTargetUid)+"/role",{org:c.org,sup:c.sup,role_id:roleId});hideModal("modalAddRole");await refreshAll();renderDetail();}catch(e){document.getElementById("addRoleError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}}
+  async function addUserRole(roleId){var c=ctx();try{await apiPost("/api/v1/rbac/users/"+enc(addRoleTargetUid)+"/roles",{org:c.org,sup:c.sup,role_id:roleId});hideModal("modalAddRole");await refreshAll();renderDetail();}catch(e){document.getElementById("addRoleError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}}
 
   // Regenerate user token
   window.regenerateUserToken=async function(uid){
     if(!confirm("Regenerate login token? The old token will stop working immediately."))return;
     var c=ctx();
     try{
-      var res=await apiPost("/reflection/users-page/user/"+enc(uid)+"/regenerate-token",{org:c.org,sup:c.sup});
+      var res=await apiPost("/api/v1/rbac/users/"+enc(uid)+"/regenerate-token",{org:c.org,sup:c.sup});
       document.getElementById("utokUsername").textContent=res.username||"";
       document.getElementById("utokPlaintext").textContent=res.token||"";
       showModal("modalUserTokenResult");
@@ -610,7 +610,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if(!roleVal){document.getElementById("edEpError").innerHTML='<div class="flash-error">Select a role.</div>';return;}
     var parts=roleVal.split("|");var roleId=parts[0]||"";var roleName=parts[1]||"";var c=ctx();
     try{
-      var res=await apiPost("/reflection/odata/endpoints",{organization:c.org,super_name:c.sup,label:label,role_id:roleId,role_name:roleName});
+      var res=await apiPost("/api/v1/odata/endpoints",{organization:c.org,super_name:c.sup,label:label,role_id:roleId,role_name:roleName});
       hideModal("modalEndpoint");
       document.getElementById("epTokPlaintext").textContent=(res&&res.token)||"";
       document.getElementById("epTokUrl").textContent=(res&&res.data&&res.data.odata_url)?window.location.origin+(res.data.odata_url):"";
@@ -618,9 +618,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       await loadEndpoints();renderAll();
     }catch(e){document.getElementById("edEpError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
-  async function toggleEndpoint(eid,enable){var c=ctx();try{await apiPut("/reflection/odata/endpoints/"+enc(eid),{organization:c.org,super_name:c.sup,enabled:enable});toast(enable?"Enabled":"Disabled");await loadEndpoints();renderAll();}catch(e){toast("Failed: "+e.message);}}
-  async function regenerateEndpointToken(eid){if(!confirm("Regenerate token? The old token will stop working immediately."))return;var c=ctx();try{var res=await apiPost("/reflection/odata/endpoints/"+enc(eid)+"/regenerate",{organization:c.org,super_name:c.sup});document.getElementById("epTokPlaintext").textContent=(res&&res.token)||"";document.getElementById("epTokUrl").textContent=(res&&res.data&&res.data.odata_url)?window.location.origin+(res.data.odata_url):"";showModal("modalEndpointToken");await loadEndpoints();renderAll();}catch(e){toast("Regenerate failed: "+e.message);}}
-  async function deleteEndpoint(eid){if(!confirm("Delete this OData endpoint?"))return;var c=ctx();try{await apiDel("/reflection/odata/endpoints/"+enc(eid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await loadEndpoints();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
+  async function toggleEndpoint(eid,enable){var c=ctx();try{await apiPut("/api/v1/odata/endpoints/"+enc(eid),{organization:c.org,super_name:c.sup,enabled:enable});toast(enable?"Enabled":"Disabled");await loadEndpoints();renderAll();}catch(e){toast("Failed: "+e.message);}}
+  async function regenerateEndpointToken(eid){if(!confirm("Regenerate token? The old token will stop working immediately."))return;var c=ctx();try{var res=await apiPost("/api/v1/odata/endpoints/"+enc(eid)+"/regenerate",{organization:c.org,super_name:c.sup});document.getElementById("epTokPlaintext").textContent=(res&&res.token)||"";document.getElementById("epTokUrl").textContent=(res&&res.data&&res.data.odata_url)?window.location.origin+(res.data.odata_url):"";showModal("modalEndpointToken");await loadEndpoints();renderAll();}catch(e){toast("Regenerate failed: "+e.message);}}
+  async function deleteEndpoint(eid){if(!confirm("Delete this OData endpoint?"))return;var c=ctx();try{await apiDel("/api/v1/odata/endpoints/"+enc(eid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await loadEndpoints();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
 
   // New button
   document.getElementById("btnNew").addEventListener("click",function(){if(section==="roles")openNewRole();else if(section==="users")openNewUser();else if(section==="odata")openNewEndpoint();});

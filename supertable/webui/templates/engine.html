@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – SQL Engine</title>
+  <title>Data Island Core – SQL Engine</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -320,7 +320,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var c=ctx();connStatus[p.id]="testing";updateDot(p.id,"testing");
     try{
       var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:p.thrift_host||"",thrift_port:p.thrift_port||10000};
-      var js=await postJSON("/reflection/compute/test-connection",payload);
+      var js=await postJSON("/api/v1/compute/test-connection",payload);
       connStatus[p.id]=js&&js.ok?"ok":"fail";
     }catch(e){connStatus[p.id]="fail";}
     updateDot(p.id,connStatus[p.id]);
@@ -376,17 +376,17 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       '<div style="margin-top:6px;font-size:10px;color:var(--text-muted);">All engines are tested on load. Click <i class="fas fa-plug-circle-check"></i> to re-test.</div>';
   }
 
-  // ---- Data (reuses /reflection/compute/* endpoints, filters to spark-thrift) ----
+  // ---- Data (reuses /api/v1/compute/pools/* endpoints, filters to spark-thrift) ----
   async function loadPools(){
     var c=ctx();
-    var js=await getJSON("/reflection/compute/list?org="+enc(c.org)+"&sup="+enc(c.sup));
+    var js=await getJSON("/api/v1/compute/pools?org="+enc(c.org)+"&sup="+enc(c.sup));
     var all=js&&js.data&&Array.isArray(js.data.items)?js.data.items:[];
     pools=all.filter(function(p){return p.kind==="spark-thrift";});
     if(selectedPool){var found=pools.find(function(p){return p.id===selectedPool.id;});selectedPool=found||null;}
     renderPoolList();renderDetail();renderRight();testAllPools();
   }
-  async function upsertPool(pool){var c=ctx();await postJSON("/reflection/compute/upsert",{org:c.org,sup:c.sup,item:pool});await loadPools();}
-  async function deletePool(pool){var c=ctx();if(!confirm("Delete engine '"+pool.name+"'?"))return;await del("/reflection/compute/"+enc(pool.id)+"?org="+enc(c.org)+"&sup="+enc(c.sup));if(selectedPool&&selectedPool.id===pool.id)selectedPool=null;delete connStatus[pool.id];await loadPools();toast("Deleted");}
+  async function upsertPool(pool){var c=ctx();await postJSON("/api/v1/compute/upsert",{org:c.org,sup:c.sup,item:pool});await loadPools();}
+  async function deletePool(pool){var c=ctx();if(!confirm("Delete engine '"+pool.name+"'?"))return;await del("/api/v1/compute/pools/"+enc(pool.id)+"?org="+enc(c.org)+"&sup="+enc(c.sup));if(selectedPool&&selectedPool.id===pool.id)selectedPool=null;delete connStatus[pool.id];await loadPools();toast("Deleted");}
 
   // ---- SQL Modal ----
   var sqlEditId=null;
@@ -405,7 +405,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.getElementById("btnSqlTest").addEventListener("click",function(e){
     e.preventDefault();var btn=document.getElementById("btnSqlTest");if(btn)btn.disabled=true;showTest("testing","Testing...");
     var c=ctx();var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:(document.getElementById("sqlHost").value||"").trim(),thrift_port:parseInt(document.getElementById("sqlPort").value||"10000",10)||10000};
-    postJSON("/reflection/compute/test-connection",payload).then(function(js){showTest(js&&js.ok?"success":"fail",(js&&js.message)||"Done");}).catch(function(err){showTest("fail",err.message||"Failed");}).finally(function(){if(btn)btn.disabled=false;});
+    postJSON("/api/v1/compute/test-connection",payload).then(function(js){showTest(js&&js.ok?"success":"fail",(js&&js.message)||"Done");}).catch(function(err){showTest("fail",err.message||"Failed");}).finally(function(){if(btn)btn.disabled=false;});
   });
   document.getElementById("modalSql").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalSql"))sqlModalHide();});
 
@@ -462,7 +462,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   async function loadDuckdbConfig(){
     var c=ctx();if(!c.org||!c.sup)return;
     try{
-      var js=await getJSON("/reflection/engine-config?org="+enc(c.org)+"&sup="+enc(c.sup));
+      var js=await getJSON("/api/v1/engine/config?org="+enc(c.org)+"&sup="+enc(c.sup));
       duckdbCfg=js&&js.config?js.config:null;
     }catch(e){duckdbCfg=null;}
     renderDuckdbConfig();
@@ -493,7 +493,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var c=ctx();
     var errEl=document.getElementById("dcError");
     try{
-      var js=await postJSON("/reflection/engine-config",{org:c.org,sup:c.sup,config:configObj});
+      var js=await postJSON("/api/v1/engine/config",{org:c.org,sup:c.sup,config:configObj});
       duckdbCfg=js&&js.config?js.config:duckdbCfg;
       renderDuckdbConfig();
       closeDuckdbModal();

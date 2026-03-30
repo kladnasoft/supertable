@@ -605,11 +605,12 @@
 
 
   .logo-edition {
-    color: #94a3b8;
+    color: #475569;
     background: none;
     -webkit-background-clip: unset;
     background-clip: unset;
     margin-left: 4px;
+    font-weight: 800;
   }
 
   .logo-stack {
@@ -752,7 +753,7 @@
         <span class="data-grid"></span>
       </span>
     </span>
-    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-edition">Core</span></span><span class="logo-powered">Powered by SuperTable</span></span>
+    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-edition">Core</span></span></span>
   </div>
 
 
@@ -784,7 +785,7 @@
 
       <!-- Logout — inside panel, collapses with it -->
       <div class="ctx-logout">
-        <a href="/reflection/logout" class="ctx-logout-btn" title="Sign out">
+        <a href="/ui/logout" class="ctx-logout-btn" title="Sign out">
           <i class="fas fa-arrow-right-from-bracket"></i>
           <span>Sign out</span>
         </a>
@@ -811,7 +812,7 @@
 
 <script>
 (function () {
-  var NAV_ITEMS = [{"href": "/reflection/home", "id": "link-home", "icon": "fa-house", "label": "Home"}, {"section": "Data Operations"}, {"href": "/reflection/execute", "id": "link-execute", "icon": "fa-terminal", "label": "Execute SQL"}, {"href": "/reflection/tables", "id": "link-tables", "icon": "fa-table", "label": "Tables"}, {"href": "/reflection/ingestion", "id": "link-staging", "icon": "fa-layer-group", "label": "Ingestion"}, {"href": "/reflection/quality", "id": "link-quality", "icon": "fa-heartbeat", "label": "Data Quality"}, {"section": "Platform"}, {"href": "/reflection/monitoring", "id": "link-monitoring", "icon": "fa-chart-line", "label": "Monitoring"}, {"href": "/reflection/engine", "id": "link-engine", "icon": "fa-microchip", "label": "Engine"}, {"href": "/reflection/platform", "id": "link-platform", "icon": "fa-toolbox", "label": "Platform Tools", "requireAudit": true}, {"href": "/reflection/security", "id": "link-security", "icon": "fa-shield-halved", "label": "Security"}, {"href": "/reflection/audit", "id": "link-audit", "icon": "fa-scroll", "label": "Audit Log", "requireAudit": true}];
+  var NAV_ITEMS = [{"href": "/ui/home", "id": "link-home", "icon": "fa-house", "label": "Home"}, {"section": "Data Operations"}, {"href": "/ui/execute", "id": "link-execute", "icon": "fa-terminal", "label": "Execute SQL"}, {"href": "/ui/tables", "id": "link-tables", "icon": "fa-table", "label": "Tables"}, {"href": "/ui/ingestion", "id": "link-staging", "icon": "fa-layer-group", "label": "Ingestion"}, {"href": "/ui/quality", "id": "link-quality", "icon": "fa-heartbeat", "label": "Data Quality"}, {"section": "Platform"}, {"href": "/ui/monitoring", "id": "link-monitoring", "icon": "fa-chart-line", "label": "Monitoring"}, {"href": "/ui/engine", "id": "link-engine", "icon": "fa-microchip", "label": "Engine"}, {"href": "/ui/platform", "id": "link-platform", "icon": "fa-toolbox", "label": "Platform Tools", "requireAudit": true}, {"href": "/ui/security", "id": "link-security", "icon": "fa-shield-halved", "label": "Security"}, {"href": "/ui/audit", "id": "link-audit", "icon": "fa-scroll", "label": "Audit Log", "requireAudit": true}];
   var navEl = document.getElementById('moduleNav');
   if (!navEl) return;
 
@@ -1042,7 +1043,7 @@
       // Update displayed role value
       if (roleValueEl) roleValueEl.textContent = roleSelect.value || "—";
       // Persist to server session
-      fetch("/reflection/set-role", {
+      fetch("/api/v1/session/role", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({role_name: roleSelect.value})
@@ -1057,7 +1058,7 @@
   }
 
   // Clear all cached data on logout
-  var logoutLink = document.querySelector('a[href="/reflection/logout"]');
+  var logoutLink = document.querySelector('a[href="/ui/logout"]');
   if (logoutLink) {
     logoutLink.addEventListener("click", function () {
       try {

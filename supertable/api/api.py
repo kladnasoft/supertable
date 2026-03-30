@@ -264,7 +264,7 @@ from supertable.server_common import _get_meta_reader as _common_get_meta_reader
 
 # ───────────────────────────── Root / Health ──────────────────────────────
 
-@router.get("/healthz", response_class=PlainTextResponse)
+@router.get("/api/v1/health", response_class=PlainTextResponse)
 def healthz():
     """Shallow health check — Redis ping only. Use /healthz/deep for full check."""
     try:
@@ -274,7 +274,7 @@ def healthz():
         return f"error: {e}"
 
 
-@router.get("/healthz/deep")
+@router.get("/api/v1/health/deep")
 def healthz_deep():
     """Deep health check — verifies Redis, storage, and DuckDB can fulfill their contracts.
 
@@ -336,47 +336,10 @@ def healthz_deep():
 
 # ─────────────────────────── Auth / Login ─────────────────────────────────
 
-@router.get("/reflection/super-meta")
-def reflection_super_meta(
-    request: Request,
-    organization: str = Query(...),
-    super_name: str = Query(...),
-    role_name: Optional[str] = Query(None),
-    _: Any = Depends(logged_in_guard_api),
-):
-    t0 = time.perf_counter()
-    organization = organization.strip()
-    super_name = super_name.strip()
-    if not organization or not super_name:
-        raise HTTPException(status_code=400, detail="organization and super_name are required")
-
-    resolved_role = (role_name or "").strip()
-    if not resolved_role:
-        sess = get_session(request) or {}
-        resolved_role = (sess.get("role_name") or "").strip()
-
-    try:
-        t1 = time.perf_counter()
-        meta_reader = _common_get_meta_reader(organization, super_name)
-        t2 = time.perf_counter()
-        result = meta_reader.get_super_meta(resolved_role)
-        t3 = time.perf_counter()
-    except Exception as e:
-        logger.warning("MetaReader.get_super_meta failed (%s/%s): %s", organization, super_name, e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    resp = JSONResponse({"meta": result})
-    _no_store(resp)
-    t4 = time.perf_counter()
-    logger.debug(
-        "super-meta %s/%s timings: total=%.1fms | meta_reader=%.1fms | get_super_meta=%.1fms | response=%.1fms",
-        organization, super_name,
-        (t4 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000, (t4 - t3) * 1000,
-    )
-    return resp
+# NOTE: Former super-meta endpoint merged into GET /api/v1/supertables/meta below.
 
 
-@router.get("/reflection/user-role-names")
+@router.get("/api/v1/session/role-names")
 def reflection_user_role_names(
     request: Request,
     org: Optional[str] = Query(None),
@@ -435,7 +398,7 @@ def reflection_user_role_names(
 # ─────────────────── Sidebar role endpoints ───────────────────────────────
 
 
-@router.get("/reflection/roles")
+@router.get("/api/v1/session/roles")
 def reflection_roles(
     request: Request,
     org: Optional[str] = Query(None),
@@ -448,7 +411,7 @@ def reflection_roles(
     return {"roles": list_roles(org_val, sup_val)}
 
 
-@router.post("/reflection/set-role")
+@router.post("/api/v1/session/role")
 def reflection_set_role(
     request: Request,
     body: Dict[str, Any] = Body(...),
@@ -466,7 +429,7 @@ def reflection_set_role(
 
 # ──────────────────── Auth tokens ─────────────────────────────────────────
 
-@router.get("/reflection/tokens")
+@router.get("/api/v1/tokens")
 def api_list_tokens(request: Request, org: str = Query(None), _: Any = Depends(admin_guard_api)):
     if not _is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -475,7 +438,7 @@ def api_list_tokens(request: Request, org: str = Query(None), _: Any = Depends(a
     return {"ok": True, "organization": org_eff, "tokens": tokens}
 
 
-@router.post("/reflection/tokens")
+@router.post("/api/v1/tokens")
 def api_create_token(request: Request, org: str = Query(None), label: str = Query(""), _: Any = Depends(admin_guard_api)):
     if not _is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -490,7 +453,7 @@ def api_create_token(request: Request, org: str = Query(None), label: str = Quer
     return {"ok": True, "organization": org_eff, **created}
 
 
-@router.delete("/reflection/tokens/{token_id}")
+@router.delete("/api/v1/tokens/{token_id}")
 def api_delete_token(request: Request, token_id: str, org: str = Query(None), _: Any = Depends(admin_guard_api)):
     if not _is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -508,7 +471,7 @@ def api_delete_token(request: Request, token_id: str, org: str = Query(None), _:
 
 # ──────────────────── Admin page + SuperTable CRUD ────────────────────────
 
-@router.post("/reflection/super")
+@router.post("/api/v1/supertables")
 def api_create_super(
     request: Request,
     organization: str = Query(...),
@@ -531,7 +494,7 @@ def api_create_super(
         raise HTTPException(status_code=500, detail=f"SuperTable creation failed: {e}")
 
 
-@router.delete("/reflection/super")
+@router.delete("/api/v1/supertables")
 def api_delete_super(
     request: Request,
     organization: str = Query(..., description="Organization identifier"),
@@ -585,7 +548,7 @@ def api_delete_super(
 #   EXECUTE (SQL query) endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.post("/reflection/execute")
+@router.post("/api/v1/query/execute")
 def execute_api(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -721,7 +684,7 @@ def execute_api(
         return JSONResponse({"status": "error", "message": f"Execution failed: {e}", "result": []}, status_code=500)
 
 
-@router.post("/reflection/schema")
+@router.post("/api/v1/tables/schemas")
 def schema_api(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -766,7 +729,7 @@ def schema_api(
 #   TABLES endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.get("/reflection/supers")
+@router.get("/api/v1/supertables")
 def api_list_supers(
     request: Request,
     organization: str = Query("", description="Organization identifier"),
@@ -783,7 +746,7 @@ def api_list_supers(
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
 
-@router.get("/reflection/super")
+@router.get("/api/v1/supertables/meta")
 def api_get_super_meta(
     request: Request,
     organization: str = Query(""),
@@ -803,35 +766,36 @@ def api_get_super_meta(
     debug_timings = _cfg.SUPERTABLE_DEBUG_TIMINGS
     t0 = time.perf_counter()
     try:
-        mr = MetaReader(organization=organization, super_name=super_name)
+        mr = _common_get_meta_reader(organization, super_name)
         t1 = time.perf_counter()
         meta = mr.get_super_meta(role)
         t2 = time.perf_counter()
 
         payload = {"ok": True, "meta": meta}
-        if not debug_timings:
-            return payload
 
         mr_ms = (t1 - t0) * 1000.0
         get_ms = (t2 - t1) * 1000.0
         total_ms = (t2 - t0) * 1000.0
 
-        client_host = getattr(getattr(request, "client", None), "host", None) or "-"
-        logger.info(
-            "[timing][reflection/super] total_ms=%.2f mr_ms=%.2f get_super_meta_ms=%.2f org=%s super=%s role_name=%s client=%s",
-            total_ms, mr_ms, get_ms, organization, super_name, (role or "")[:12], client_host,
-        )
+        if debug_timings:
+            client_host = getattr(getattr(request, "client", None), "host", None) or "-"
+            logger.info(
+                "[timing][supertables/meta] total_ms=%.2f mr_ms=%.2f get_super_meta_ms=%.2f org=%s super=%s role_name=%s client=%s",
+                total_ms, mr_ms, get_ms, organization, super_name, (role or "")[:12], client_host,
+            )
 
         resp = JSONResponse(payload)
-        resp.headers["Server-Timing"] = (
-            f"meta_reader;dur={mr_ms:.2f},get_super_meta;dur={get_ms:.2f},total;dur={total_ms:.2f}"
-        )
+        _no_store(resp)
+        if debug_timings:
+            resp.headers["Server-Timing"] = (
+                f"meta_reader;dur={mr_ms:.2f},get_super_meta;dur={get_ms:.2f},total;dur={total_ms:.2f}"
+            )
         return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get super meta failed: {e}")
 
 
-@router.get("/reflection/schema")
+@router.get("/api/v1/tables/schema")
 def api_get_table_schema(
     request: Request,
     organization: str = Query(""),
@@ -855,7 +819,7 @@ def api_get_table_schema(
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
 
 
-@router.get("/reflection/stats")
+@router.get("/api/v1/tables/stats")
 def api_get_table_stats(
     request: Request,
     organization: str = Query(""),
@@ -879,7 +843,7 @@ def api_get_table_stats(
         raise HTTPException(status_code=500, detail=f"Get table stats failed: {e}")
 
 
-@router.delete("/reflection/table")
+@router.delete("/api/v1/tables")
 def api_delete_table(
     request: Request,
     organization: str = Query("", description="Organization identifier"),
@@ -913,7 +877,7 @@ def api_delete_table(
     return {"ok": True, "organization": organization, "super_name": super_name, "table": simple}
 
 
-@router.get("/reflection/table/config")
+@router.get("/api/v1/tables/config")
 def api_get_table_config(
     request: Request,
     organization: str = Query(""),
@@ -937,7 +901,7 @@ def api_get_table_config(
         raise HTTPException(status_code=500, detail=f"Get table config failed: {e}")
 
 
-@router.put("/reflection/table/config")
+@router.put("/api/v1/tables/config")
 def api_put_table_config(
     request: Request,
     organization: str = Query(""),
@@ -997,7 +961,7 @@ def api_put_table_config(
 #   INGESTION endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.get("/reflection/ingestion/recent-writes")
+@router.get("/api/v1/ingestion/recent-writes")
 def api_ingestion_recent_writes(
     org: str = Query(...),
     sup: str = Query(...),
@@ -1027,7 +991,7 @@ def api_ingestion_recent_writes(
     return {"ok": True, "items": items}
 
 
-@router.get("/reflection/ingestion/stagings")
+@router.get("/api/v1/ingestion/stagings")
 def api_ingestion_list_stagings(
     org: str = Query(...),
     sup: str = Query(...),
@@ -1037,7 +1001,7 @@ def api_ingestion_list_stagings(
     return {"staging_names": names}
 
 
-@router.get("/reflection/ingestion/tables")
+@router.get("/api/v1/ingestion/tables")
 def api_ingestion_list_tables(
     request: Request,
     org: Optional[str] = Query(None),
@@ -1088,7 +1052,7 @@ def api_ingestion_list_tables(
     return {"ok": True, "tables": names}
 
 
-@router.get("/reflection/ingestion/staging/files")
+@router.get("/api/v1/ingestion/stagings/files")
 def api_ingestion_list_staging_files(
     org: str = Query(...),
     sup: str = Query(...),
@@ -1116,7 +1080,7 @@ def api_ingestion_list_staging_files(
     return {"items": items, "total": total, "offset": offset, "limit": limit}
 
 
-@router.get("/reflection/ingestion/pipes")
+@router.get("/api/v1/ingestion/pipes")
 def api_ingestion_list_pipes(
     org: str = Query(...),
     sup: str = Query(...),
@@ -1148,7 +1112,7 @@ def api_ingestion_list_pipes(
     return {"items": items}
 
 
-@router.get("/reflection/ingestion/pipe/meta")
+@router.get("/api/v1/ingestion/pipes/meta")
 def api_ingestion_get_pipe_meta(
     org: str = Query(...),
     sup: str = Query(...),
@@ -1164,7 +1128,7 @@ def api_ingestion_get_pipe_meta(
     return {"meta": meta}
 
 
-@router.post("/reflection/staging/create")
+@router.post("/api/v1/ingestion/stagings/create")
 def api_create_staging(
     request: Request,
     org: str = Query(...),
@@ -1199,7 +1163,7 @@ def api_create_staging(
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
 
-@router.post("/reflection/staging/delete")
+@router.post("/api/v1/ingestion/stagings/delete")
 def api_delete_staging(
     request: Request,
     org: str = Query(...),
@@ -1241,7 +1205,7 @@ def api_delete_staging(
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
 
-@router.post("/reflection/pipes/save")
+@router.post("/api/v1/ingestion/pipes/save")
 def api_save_pipe(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -1321,7 +1285,7 @@ def api_save_pipe(
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "path": pipe_path}
 
 
-@router.post("/reflection/pipes/delete")
+@router.post("/api/v1/ingestion/pipes/delete")
 def api_delete_pipe(
     request: Request,
     org: str = Query(...),
@@ -1361,7 +1325,7 @@ def api_delete_pipe(
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip()}
 
 
-@router.post("/reflection/pipes/enable")
+@router.post("/api/v1/ingestion/pipes/enable")
 def api_enable_pipe(
     request: Request,
     org: str = Query(...),
@@ -1402,7 +1366,7 @@ def api_enable_pipe(
     return {"ok": True}
 
 
-@router.post("/reflection/pipes/disable")
+@router.post("/api/v1/ingestion/pipes/disable")
 def api_disable_pipe(
     request: Request,
     org: str = Query(...),
@@ -1443,7 +1407,7 @@ def api_disable_pipe(
     return {"ok": True}
 
 
-@router.post("/reflection/ingestion/load/upload")
+@router.post("/api/v1/ingestion/upload")
 async def api_ingestion_load_upload(
     request: Request,
     org: str = Form(...),
@@ -1680,7 +1644,7 @@ async def api_ingestion_load_upload(
 #   FILE COLUMN EXTRACTION (for ingestion delete mode)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.post("/reflection/ingestion/file-columns")
+@router.post("/api/v1/ingestion/file-columns")
 async def api_file_columns(
     request: Request,
     file: UploadFile = File(...),
@@ -1747,7 +1711,7 @@ async def api_file_columns(
 #   MONITORING endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.get("/reflection/monitoring/reads")
+@router.get("/api/v1/monitoring/reads")
 def monitoring_reads(
     org: str = Query(""),
     sup: str = Query(""),
@@ -1768,7 +1732,7 @@ def monitoring_reads(
     return JSONResponse({"ok": True, "items": items})
 
 
-@router.get("/reflection/monitoring/writes")
+@router.get("/api/v1/monitoring/writes")
 def monitoring_writes(
     org: str = Query(""),
     sup: str = Query(""),
@@ -1790,7 +1754,7 @@ def monitoring_writes(
     return JSONResponse({"ok": True, "items": items})
 
 
-@router.get("/reflection/monitoring/mcp")
+@router.get("/api/v1/monitoring/mcp")
 def monitoring_mcp(
     org: str = Query(""),
     sup: str = Query(""),
@@ -1811,7 +1775,7 @@ def monitoring_mcp(
     return JSONResponse({"ok": True, "items": items})
 
 
-@router.get("/reflection/monitoring/summary")
+@router.get("/api/v1/monitoring/summary")
 def monitoring_summary(
     org: str = Query(""),
     sup: str = Query(""),
@@ -1834,7 +1798,7 @@ def monitoring_summary(
 #   SECURITY endpoints (page + RBAC CRUD + OData endpoints)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.get("/reflection/rbac/roles")
+@router.get("/api/v1/rbac/roles")
 def rbac_roles_list(
     organization: str = Query(""),
     super_name: str = Query(""),
@@ -1850,7 +1814,7 @@ def rbac_roles_list(
     return JSONResponse({"ok": True, "data": {"items": items}})
 
 
-@router.post("/reflection/rbac/roles")
+@router.post("/api/v1/rbac/roles")
 def rbac_role_create(
     payload: Dict[str, Any] = Body(...),
     _=Depends(admin_guard_api),
@@ -1886,7 +1850,7 @@ def rbac_role_create(
     return JSONResponse({"ok": True, "data": doc}, status_code=201)
 
 
-@router.put("/reflection/rbac/roles/{role_id}")
+@router.put("/api/v1/rbac/roles/{role_id}")
 def rbac_role_update(
     role_id: str,
     payload: Dict[str, Any] = Body(...),
@@ -1921,7 +1885,7 @@ def rbac_role_update(
     return JSONResponse({"ok": True, "data": doc})
 
 
-@router.delete("/reflection/rbac/roles/{role_id}")
+@router.delete("/api/v1/rbac/roles/{role_id}")
 def rbac_role_delete(
     role_id: str,
     organization: str = Query(""),
@@ -1945,7 +1909,7 @@ def rbac_role_delete(
 
 # ── User CRUD ──
 
-@router.get("/reflection/rbac/users")
+@router.get("/api/v1/rbac/users")
 def rbac_users_list(
     organization: str = Query(""),
     super_name: str = Query(""),
@@ -1963,7 +1927,7 @@ def rbac_users_list(
 
 # ── OData Endpoint CRUD ──
 
-@router.get("/reflection/odata/endpoints")
+@router.get("/api/v1/odata/endpoints")
 def odata_endpoints_list(
     organization: str = Query(""),
     super_name: str = Query(""),
@@ -1979,7 +1943,7 @@ def odata_endpoints_list(
     return JSONResponse({"ok": True, "data": {"items": items}})
 
 
-@router.post("/reflection/odata/endpoints")
+@router.post("/api/v1/odata/endpoints")
 def odata_endpoint_create(
     payload: Dict[str, Any] = Body(...),
     _=Depends(admin_guard_api),
@@ -2006,7 +1970,7 @@ def odata_endpoint_create(
     return JSONResponse({"ok": True, "data": doc, "token": token}, status_code=201)
 
 
-@router.put("/reflection/odata/endpoints/{endpoint_id}")
+@router.put("/api/v1/odata/endpoints/{endpoint_id}")
 def odata_endpoint_update(
     endpoint_id: str,
     payload: Dict[str, Any] = Body(...),
@@ -2025,7 +1989,7 @@ def odata_endpoint_update(
     return JSONResponse({"ok": True, "data": doc})
 
 
-@router.post("/reflection/odata/endpoints/{endpoint_id}/regenerate")
+@router.post("/api/v1/odata/endpoints/{endpoint_id}/regenerate")
 def odata_endpoint_regenerate(
     endpoint_id: str,
     payload: Dict[str, Any] = Body(...),
@@ -2040,7 +2004,7 @@ def odata_endpoint_regenerate(
     return JSONResponse({"ok": True, "data": doc, "token": token})
 
 
-@router.delete("/reflection/odata/endpoints/{endpoint_id}")
+@router.delete("/api/v1/odata/endpoints/{endpoint_id}")
 def odata_endpoint_delete(
     endpoint_id: str,
     organization: str = Query(""),
@@ -2077,7 +2041,7 @@ def _dq_resolve(org: str = None, sup: str = None):
     return resolve_pair(org, sup)
 
 
-@router.get("/reflection/quality/overview")
+@router.get("/api/v1/quality/overview")
 def api_quality_overview(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2089,7 +2053,7 @@ def api_quality_overview(
     return {"ok": True, "tables": all_latest}
 
 
-@router.get("/reflection/quality/tables")
+@router.get("/api/v1/quality/tables")
 def api_quality_tables(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2117,7 +2081,7 @@ def api_quality_tables(
     return {"ok": True, "tables": sorted(set(tables))}
 
 
-@router.get("/reflection/quality/latest")
+@router.get("/api/v1/quality/latest")
 def api_quality_latest(
     request: Request,
     table: str = Query(...),
@@ -2131,7 +2095,7 @@ def api_quality_latest(
     return {"ok": True, "latest": latest, "anomalies": anomalies}
 
 
-@router.get("/reflection/quality/global-config")
+@router.get("/api/v1/quality/config")
 def api_dq_get_global_config(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2142,7 +2106,7 @@ def api_dq_get_global_config(
     return {"ok": True, "config": dqc.get_global_config(), "builtin_checks": BUILTIN_CHECKS}
 
 
-@router.put("/reflection/quality/global-config")
+@router.put("/api/v1/quality/config")
 def api_dq_set_global_config(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2158,7 +2122,7 @@ def api_dq_set_global_config(
     return {"ok": True}
 
 
-@router.get("/reflection/quality/schedule")
+@router.get("/api/v1/quality/schedule")
 def api_dq_get_schedule(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2169,7 +2133,7 @@ def api_dq_get_schedule(
     return {"ok": True, "schedule": dqc.get_schedule()}
 
 
-@router.put("/reflection/quality/schedule")
+@router.put("/api/v1/quality/schedule")
 def api_dq_set_schedule(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2184,7 +2148,7 @@ def api_dq_set_schedule(
     return {"ok": True}
 
 
-@router.put("/reflection/quality/table-schedule")
+@router.put("/api/v1/quality/table-schedule")
 def api_dq_set_table_schedule(
     request: Request,
     table: str = Query(...),
@@ -2200,7 +2164,7 @@ def api_dq_set_table_schedule(
     return {"ok": True}
 
 
-@router.delete("/reflection/quality/table-schedule")
+@router.delete("/api/v1/quality/table-schedule")
 def api_dq_delete_table_schedule(
     request: Request,
     table: str = Query(...),
@@ -2213,7 +2177,7 @@ def api_dq_delete_table_schedule(
     return {"ok": True}
 
 
-@router.get("/reflection/quality/table-schedules")
+@router.get("/api/v1/quality/table-schedules")
 def api_dq_get_all_table_schedules(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2225,7 +2189,7 @@ def api_dq_get_all_table_schedules(
     return {"ok": True, "overrides": overrides}
 
 
-@router.get("/reflection/quality/rules")
+@router.get("/api/v1/quality/rules")
 def api_dq_list_rules(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2236,7 +2200,7 @@ def api_dq_list_rules(
     return {"ok": True, "rules": dqc.list_rules()}
 
 
-@router.post("/reflection/quality/rules")
+@router.post("/api/v1/quality/rules")
 def api_dq_create_rule(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2252,7 +2216,7 @@ def api_dq_create_rule(
     return {"ok": True, "rule": rule}
 
 
-@router.put("/reflection/quality/rules")
+@router.put("/api/v1/quality/rules")
 def api_dq_update_rule(
     request: Request,
     rule_id: str = Query(...),
@@ -2270,7 +2234,7 @@ def api_dq_update_rule(
     return {"ok": True, "rule": updated}
 
 
-@router.delete("/reflection/quality/rules")
+@router.delete("/api/v1/quality/rules")
 def api_dq_delete_rule(
     request: Request,
     rule_id: str = Query(...),
@@ -2283,7 +2247,7 @@ def api_dq_delete_rule(
     return {"ok": True}
 
 
-@router.post("/reflection/quality/run")
+@router.post("/api/v1/quality/run")
 def api_dq_run_check(
     request: Request,
     table: str = Query(...),
@@ -2314,7 +2278,7 @@ def api_dq_run_check(
     return {"ok": True, "message": f"{mode} check started for {table}"}
 
 
-@router.post("/reflection/quality/run-all")
+@router.post("/api/v1/quality/run-all")
 def api_dq_run_all(
     request: Request,
     mode: str = Query("quick"),
@@ -2366,7 +2330,7 @@ def api_dq_run_all(
     return {"ok": True, "message": f"{mode} check started on {len(tables)} tables (sequential)", "count": len(tables)}
 
 
-@router.get("/reflection/quality/history")
+@router.get("/api/v1/quality/history")
 def api_quality_history(
     request: Request,
     table: Optional[str] = Query(None),
@@ -2501,7 +2465,7 @@ def _compute_sync_pool_to_catalog(org: str, pool: Dict[str, Any]) -> None:
             pass
 
 
-@router.get("/reflection/compute/list")
+@router.get("/api/v1/compute/pools")
 def compute_pools_list(org: str, sup: str, _: Any = Depends(logged_in_guard_api)):
     org = str(org or "").strip()
     sup = str(sup or "").strip()
@@ -2510,7 +2474,7 @@ def compute_pools_list(org: str, sup: str, _: Any = Depends(logged_in_guard_api)
     return {"ok": True, "data": _compute_load(org, sup), "kinds": list(_COMPUTE_KINDS), "sizes": list(_COMPUTE_SIZES)}
 
 
-@router.post("/reflection/compute/upsert")
+@router.post("/api/v1/compute/upsert")
 def compute_pools_upsert(payload: Dict[str, Any] = Body(...), _: Any = Depends(logged_in_guard_api)):
     org = str(payload.get("org") or "").strip()
     sup = str(payload.get("sup") or "").strip()
@@ -2556,7 +2520,7 @@ def compute_pools_upsert(payload: Dict[str, Any] = Body(...), _: Any = Depends(l
     return {"ok": True, "id": item_id}
 
 
-@router.delete("/reflection/compute/{pool_id}")
+@router.delete("/api/v1/compute/pools/{pool_id}")
 def compute_pools_delete(pool_id: str, org: str, sup: str, _: Any = Depends(logged_in_guard_api)):
     org = str(org or "").strip()
     sup = str(sup or "").strip()
@@ -2577,7 +2541,7 @@ def compute_pools_delete(pool_id: str, org: str, sup: str, _: Any = Depends(logg
     return {"ok": True}
 
 
-@router.post("/reflection/compute/test-connection")
+@router.post("/api/v1/compute/test-connection")
 def compute_test_connection(
     payload: Dict[str, Any] = Body(...),
     _: Any = Depends(logged_in_guard_api),
@@ -2739,7 +2703,7 @@ def _resolve_engine_config(org: str, sup: str) -> Dict[str, Any]:
     return result
 
 
-@router.get("/reflection/engine-config")
+@router.get("/api/v1/engine/config")
 def engine_config_get(
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
@@ -2752,7 +2716,7 @@ def engine_config_get(
     return {"ok": True, "config": _resolve_engine_config(o, s)}
 
 
-@router.post("/reflection/engine-config")
+@router.post("/api/v1/engine/config")
 def engine_config_set(
     payload: Dict[str, Any] = Body(...),
     _: Any = Depends(admin_guard_api),
@@ -2825,7 +2789,7 @@ def _users_normalize_user(u: Dict[str, Any]) -> Dict[str, Any]:
     return u
 
 
-@router.get("/reflection/users-page/list")
+@router.get("/api/v1/rbac/users/list")
 def api_users_page_list(
     request: Request,
     org: Optional[str] = Query(None),
@@ -2841,7 +2805,7 @@ def api_users_page_list(
     return {"ok": True, "users": users_raw, "roles": roles_data}
 
 
-@router.post("/reflection/users-page/create")
+@router.post("/api/v1/rbac/users/create")
 def api_users_page_create(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -2920,7 +2884,7 @@ def api_users_page_create(
             "token": plaintext_token, "token_id": token_id}
 
 
-@router.delete("/reflection/users-page/user/{user_id}")
+@router.delete("/api/v1/rbac/users/{user_id}")
 def api_users_page_delete(
     request: Request,
     user_id: str,
@@ -2967,7 +2931,7 @@ def api_users_page_delete(
     return {"ok": True, "user_id": user_id}
 
 
-@router.post("/reflection/users-page/user/{user_id}/role")
+@router.post("/api/v1/rbac/users/{user_id}/roles")
 def api_users_page_add_role(
     request: Request,
     user_id: str,
@@ -2990,7 +2954,7 @@ def api_users_page_add_role(
     return {"ok": True, "user_id": user_id, "role_id": role_id}
 
 
-@router.delete("/reflection/users-page/user/{user_id}/role/{role_id}")
+@router.delete("/api/v1/rbac/users/{user_id}/roles/{role_id}")
 def api_users_page_remove_role(
     request: Request,
     user_id: str,
@@ -3007,7 +2971,7 @@ def api_users_page_remove_role(
     return {"ok": True, "user_id": user_id, "role_id": role_id}
 
 
-@router.post("/reflection/users-page/user/{user_id}/regenerate-token")
+@router.post("/api/v1/rbac/users/{user_id}/regenerate-token")
 def api_users_page_regenerate_token(
     request: Request,
     user_id: str,
@@ -3080,7 +3044,7 @@ def api_users_page_regenerate_token(
 #   AUDIT LOG endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.get("/reflection/audit/events")
+@router.get("/api/v1/audit/events")
 def audit_events(
     request: Request,
     organization: str = Query(""),
@@ -3115,7 +3079,7 @@ def audit_events(
     return JSONResponse({"events": events, "count": len(events)})
 
 
-@router.get("/reflection/audit/verify")
+@router.get("/api/v1/audit/verify")
 def audit_verify(
     request: Request,
     organization: str = Query(""),
@@ -3135,7 +3099,7 @@ def audit_verify(
     return JSONResponse(result)
 
 
-@router.get("/reflection/audit/export")
+@router.get("/api/v1/audit/export")
 def audit_export(
     request: Request,
     organization: str = Query(""),
@@ -3181,7 +3145,7 @@ def audit_export(
     )
 
 
-@router.get("/reflection/audit/stats")
+@router.get("/api/v1/audit/stats")
 def audit_stats(
     request: Request,
     organization: str = Query(""),
@@ -3206,7 +3170,7 @@ def audit_stats(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@router.get("/reflection/gc/preview")
+@router.get("/api/v1/gc/preview")
 def api_gc_preview(
     request: Request,
     org: Optional[str] = Query(None),
@@ -3224,7 +3188,7 @@ def api_gc_preview(
     return JSONResponse({"ok": True, **result})
 
 
-@router.post("/reflection/gc/clean")
+@router.post("/api/v1/gc/clean")
 def api_gc_clean(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -3251,7 +3215,7 @@ def api_gc_clean(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@router.get("/reflection/table/snapshot-history")
+@router.get("/api/v1/tables/snapshot-history")
 def api_snapshot_history(
     request: Request,
     org: Optional[str] = Query(None),
@@ -3270,7 +3234,7 @@ def api_snapshot_history(
     return JSONResponse({"ok": True, "table": table.strip(), "versions": versions, "count": len(versions)})
 
 
-@router.get("/reflection/table/snapshot")
+@router.get("/api/v1/tables/snapshot")
 def api_get_snapshot(
     request: Request,
     org: Optional[str] = Query(None),
@@ -3292,7 +3256,7 @@ def api_get_snapshot(
     return JSONResponse({"ok": True, "table": table.strip(), "version": version, "snapshot": snapshot})
 
 
-@router.get("/reflection/table/lineage")
+@router.get("/api/v1/tables/lineage")
 def api_table_lineage(
     request: Request,
     org: Optional[str] = Query(None),
@@ -3337,7 +3301,7 @@ def api_table_lineage(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@router.post("/reflection/audit/retention/run")
+@router.post("/api/v1/audit/retention/run")
 def api_audit_retention_run(
     request: Request,
     payload: Dict[str, Any] = Body({}),
@@ -3356,7 +3320,7 @@ def api_audit_retention_run(
     return JSONResponse({"ok": True, **result})
 
 
-@router.get("/reflection/audit/legal-hold")
+@router.get("/api/v1/audit/legal-hold")
 def api_audit_legal_hold_status(
     request: Request,
     organization: str = Query(""),
@@ -3375,7 +3339,7 @@ def api_audit_legal_hold_status(
     return JSONResponse({"ok": True, "legal_hold_active": active, "organization": org})
 
 
-@router.post("/reflection/audit/legal-hold")
+@router.post("/api/v1/audit/legal-hold")
 def api_audit_legal_hold_set(
     request: Request,
     payload: Dict[str, Any] = Body(...),
@@ -3398,10 +3362,3 @@ def api_audit_legal_hold_set(
     return JSONResponse(result)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#   Backward-compat route aliases
-# ═══════════════════════════════════════════════════════════════════════════
-
-from supertable.server_common import _add_reflection_alias_routes
-
-_add_reflection_alias_routes(router)

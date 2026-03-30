@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SuperTable – Monitoring</title>
+  <title>Data Island Core – Monitoring</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -487,9 +487,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   }
 
   // =========== DATA ===========
-  async function loadReads(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/reads?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadReads:",url);try{var d=await getJSON(url);allReads=(d&&d.items)?d.items:[];console.log("[monitoring] reads loaded:",allReads.length);}catch(e){console.error("[monitoring] reads error:",e);allReads=[];}}
-  async function loadWrites(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/writes?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadWrites:",url);try{var d=await getJSON(url);allWrites=(d&&d.items)?d.items:[];console.log("[monitoring] writes loaded:",allWrites.length);}catch(e){console.error("[monitoring] writes error:",e);allWrites=[];}}
-  async function loadMcp(){var c=ctx();var b=dateRangeBounds();var url="/reflection/monitoring/mcp?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadMcp:",url);try{var d=await getJSON(url);allMcp=(d&&d.items)?d.items:[];console.log("[monitoring] mcp loaded:",allMcp.length);}catch(e){console.error("[monitoring] mcp error:",e);allMcp=[];}}
+  async function loadReads(){var c=ctx();var b=dateRangeBounds();var url="/api/v1/monitoring/reads?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadReads:",url);try{var d=await getJSON(url);allReads=(d&&d.items)?d.items:[];console.log("[monitoring] reads loaded:",allReads.length);}catch(e){console.error("[monitoring] reads error:",e);allReads=[];}}
+  async function loadWrites(){var c=ctx();var b=dateRangeBounds();var url="/api/v1/monitoring/writes?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadWrites:",url);try{var d=await getJSON(url);allWrites=(d&&d.items)?d.items:[];console.log("[monitoring] writes loaded:",allWrites.length);}catch(e){console.error("[monitoring] writes error:",e);allWrites=[];}}
+  async function loadMcp(){var c=ctx();var b=dateRangeBounds();var url="/api/v1/monitoring/mcp?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit=500";if(b.from_ts)url+="&from_ts="+b.from_ts;if(b.to_ts)url+="&to_ts="+b.to_ts;console.log("[monitoring] loadMcp:",url);try{var d=await getJSON(url);allMcp=(d&&d.items)?d.items:[];console.log("[monitoring] mcp loaded:",allMcp.length);}catch(e){console.error("[monitoring] mcp error:",e);allMcp=[];}}
   async function refreshAll(){selectedRead=null;selectedWrite=null;selectedMcp=null;await Promise.all([loadReads(),loadWrites(),loadMcp()]);renderSection();renderReadRight();renderWriteRight();renderMcpRight();}
 
   document.getElementById("readSearch").addEventListener("input",function(ev){readSearchQ=ev.target.value;renderReadList();});

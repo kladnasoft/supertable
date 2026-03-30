@@ -263,7 +263,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if (res) params.set('resource_id', res);
     params.set('limit', '200');
 
-    fetch('/reflection/audit/events?' + params.toString())
+    fetch('/api/v1/audit/events?' + params.toString())
       .then(function(r) { return r.json(); })
       .then(function(data) {
         var events = data.events || data.data || data || [];
@@ -327,7 +327,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verifying...';
     var today = new Date().toISOString().slice(0, 10);
     var params = new URLSearchParams({organization: org, date: today});
-    fetch('/reflection/audit/verify?' + params.toString())
+    fetch('/api/v1/audit/verify?' + params.toString())
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.valid) {
@@ -357,7 +357,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if (criteria) params.set('criteria', criteria);
 
     document.getElementById('exportStatus').textContent = 'Preparing export...';
-    window.location.href = '/reflection/audit/export?' + params.toString();
+    window.location.href = '/api/v1/audit/export?' + params.toString();
     setTimeout(function() {
       document.getElementById('exportStatus').textContent = 'Export download started.';
     }, 1000);

@@ -261,8 +261,8 @@
             }
 
             if (supers === null || supers === undefined) {
-                console.log("[selection] fetching /reflection/supers from server");
-                const resp = await fetch("/reflection/supers?organization=" + encodeURIComponent(ORG_NAME));
+                console.log("[selection] fetching /api/v1/supertables from server");
+                const resp = await fetch("/api/v1/supertables?organization=" + encodeURIComponent(ORG_NAME));
                 if (!resp.ok) throw new Error("Failed to load supers: " + resp.status);
                 const data = await resp.json();
                 supers = (data && data.supers) || [];
@@ -329,7 +329,7 @@
                 params.set("role_name", roleName);
             }
 
-            const resp = await fetch("/reflection/super-meta?" + params.toString());
+            const resp = await fetch("/api/v1/supertables/meta?" + params.toString());
             if (!resp.ok) throw new Error("Failed to load super meta: " + resp.status);
             const data = await resp.json();
             const superMeta = data && data.meta && data.meta.super;
@@ -358,10 +358,10 @@
         }
 
         if (roleNames === null || roleNames === undefined) {
-            console.log("[selection] fetching /reflection/user-role-names from server");
+            console.log("[selection] fetching /api/v1/session/role-names from server");
             try {
                 var resp = await fetch(
-                    "/reflection/user-role-names?org=" + encodeURIComponent(orgName) +
+                    "/api/v1/session/role-names?org=" + encodeURIComponent(orgName) +
                     "&sup=" + encodeURIComponent(superName)
                 );
                 if (!resp.ok) throw new Error("User roles fetch failed: " + resp.status);
@@ -497,7 +497,7 @@
 
             try {
                 if (mode === "create") {
-                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}`;
+                    const url = `/api/v1/supertables/meta?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(name)}`;
                     const res = await fetch(url, { method: "POST" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Create failed");
@@ -507,7 +507,7 @@
                     const selected = (selectedName || "").trim();
                     if (!selected) { err.textContent = "Select a SuperTable first."; err.style.display = ""; return; }
                     if (name !== selected) { err.textContent = "Type the selected SuperTable name exactly to confirm deletion."; err.style.display = ""; return; }
-                    const url = `/reflection/super?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(window.__st_user_hash || "")}`;
+                    const url = `/api/v1/supertables/meta?organization=${encodeURIComponent(ORG_NAME)}&super_name=${encodeURIComponent(selected)}&user_hash=${encodeURIComponent(window.__st_user_hash || "")}`;
                     const res = await fetch(url, { method: "DELETE" });
                     const js = await res.json();
                     if (!js || !js.ok) throw new Error((js && js.detail) || "Delete failed");
