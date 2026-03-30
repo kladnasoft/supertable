@@ -373,12 +373,32 @@ def _get_limiter() -> "anyio.CapacityLimiter":
 
 
 # ---------- Auth helpers ----------
-def _check_token(auth_token: Optional[str]) -> None:
-    """Optional shared-secret auth between client and server (stdio)."""
-    if not CFG.require_token:
-        return
+
+def _allowed_role(r: str) -> bool:
+    return CFG.allowed_roles is None or r in CFG.allowed_roles
+
+
+def _auth(auth_token: Optional[str], role: Optional[str] = None) -> str:
+    """Authenticate the caller and resolve the effective RBAC role.
+
+    Accepts two types of credentials via ``auth_token``:
+
+    1. **Shared MCP token** (``SUPERTABLE_MCP_TOKEN``) — superadmin access.
+       Any role is accepted; the caller is treated as superuser.
+    2. **Per-user token** — looked up from the org auth-token registry via
+       ``RedisCatalog.validate_auth_token_full()``.  The requested ``role``
+       must be among the user's assigned roles (resolved from the user doc).
+
+    Returns the validated role name string used by all downstream RBAC checks.
+    Raises ``PermissionError`` on any auth failure.
+    """
     token = (auth_token or "").strip()
-    if not token or not CFG.shared_token:
+
+    # Dev/test bypass: when require_token is disabled, skip auth entirely
+    if not CFG.require_token:
+        return _resolve_role_internal(role)
+
+    if not token:
         if _audit_available:
             _audit_emit(
                 category=EventCategory.AUTHENTICATION, action=Actions.MCP_AUTH_FAILURE,
@@ -386,20 +406,51 @@ def _check_token(auth_token: Optional[str]) -> None:
                 outcome=Outcome.FAILURE, reason="missing_token", server="mcp",
             )
         raise PermissionError("auth_token is required by server policy.")
-    if not hmac.compare_digest(token, CFG.shared_token):
+
+    # --- Path 1: shared MCP token (superadmin) ---
+    if CFG.shared_token and hmac.compare_digest(token, CFG.shared_token):
+        return _resolve_role_internal(role)
+
+    # --- Path 2: per-user token ---
+    org = settings.SUPERTABLE_ORGANIZATION
+    token_meta = None
+    try:
+        from supertable.redis_catalog import RedisCatalog
+        catalog = RedisCatalog()
+        token_meta = catalog.validate_auth_token_full(org=org, token=token)
+    except Exception as e:
+        logger.warning("[mcp-auth] Token lookup failed: %s", e)
+
+    if not token_meta:
         if _audit_available:
             _audit_emit(
                 category=EventCategory.AUTHENTICATION, action=Actions.MCP_AUTH_FAILURE,
-                organization=settings.SUPERTABLE_ORGANIZATION, severity=Severity.WARNING,
+                organization=org, severity=Severity.WARNING,
                 outcome=Outcome.FAILURE, reason="invalid_token", server="mcp",
             )
         raise PermissionError("auth_token invalid.")
 
-def _allowed_role(r: str) -> bool:
-    return CFG.allowed_roles is None or r in CFG.allowed_roles
+    username = str(token_meta.get("username") or "").strip()
+    user_id = str(token_meta.get("user_id") or "").strip()
 
-def _resolve_role(role: Optional[str]) -> str:
-    """Resolve and validate a role identifier."""
+    if _audit_available:
+        _audit_emit(
+            category=EventCategory.AUTHENTICATION, action=Actions.MCP_AUTH_SUCCESS,
+            organization=org, severity=Severity.INFO,
+            outcome=Outcome.SUCCESS, actor_username=username,
+            actor_id=user_id, server="mcp",
+        )
+
+    # Resolve the effective role for this user
+    r = _resolve_role_for_user(role, org, user_id, username)
+    return r
+
+
+def _resolve_role_internal(role: Optional[str]) -> str:
+    """Resolve role for superadmin callers (shared MCP token).
+
+    Same logic as the original _resolve_role — superadmin can use any role.
+    """
     r = (role or "").strip()
     if CFG.require_explicit_role:
         if not r:
@@ -413,6 +464,89 @@ def _resolve_role(role: Optional[str]) -> str:
     if not r:
         raise PermissionError("role missing and no default configured.")
     return _validate_role(r)
+
+
+def _resolve_role_for_user(
+    role: Optional[str],
+    org: str,
+    user_id: str,
+    username: str,
+) -> str:
+    """Resolve and validate the role for a per-user token caller.
+
+    If ``role`` is provided, validates that it is among the user's assigned
+    roles.  If ``role`` is omitted, uses the user's first assigned role as
+    the default.
+
+    The user's assigned role IDs are looked up from the user doc, then each
+    role ID is resolved to a role name via the role doc.
+    """
+    # Find the user's SuperTable — scan all supers for the org
+    try:
+        from supertable.redis_catalog import RedisCatalog
+        catalog = RedisCatalog()
+    except Exception as e:
+        raise PermissionError(f"Cannot resolve user roles: {e}")
+
+    # Discover supers for this org to find where the user lives
+    user_role_names: list = []
+    try:
+        from supertable.server_common import discover_pairs
+        pairs = discover_pairs()
+        for pair in pairs:
+            p_org = pair.get("org", "")
+            p_sup = pair.get("sup", "")
+            if p_org != org:
+                continue
+            # Try to find the user in this super
+            user_key = f"supertable:{org}:{p_sup}:rbac:users:doc:{user_id}"
+            try:
+                raw = catalog.r.hgetall(user_key)
+                if not raw:
+                    continue
+            except Exception:
+                continue
+            # Found the user — extract role IDs
+            roles_raw = raw.get("roles") or raw.get(b"roles") or "[]"
+            if isinstance(roles_raw, bytes):
+                roles_raw = roles_raw.decode("utf-8")
+            import json
+            try:
+                role_ids = json.loads(roles_raw) if isinstance(roles_raw, str) else []
+            except Exception:
+                role_ids = []
+            # Resolve role IDs to role names
+            for rid in role_ids:
+                rid_str = str(rid).strip()
+                if not rid_str:
+                    continue
+                role_doc_key = f"supertable:{org}:{p_sup}:rbac:roles:doc:{rid_str}"
+                try:
+                    rname = catalog.r.hget(role_doc_key, "role_name")
+                    if rname:
+                        rn = rname if isinstance(rname, str) else rname.decode("utf-8")
+                        user_role_names.append(rn)
+                except Exception:
+                    pass
+            break  # Found the user, no need to scan further
+    except Exception as e:
+        logger.warning("[mcp-auth] Role lookup failed for user %s: %s", username, e)
+
+    if not user_role_names:
+        raise PermissionError(f"User '{username}' has no assigned roles.")
+
+    r = (role or "").strip()
+    if not r:
+        # No role specified — use the user's first role
+        return _validate_role(user_role_names[0])
+
+    r = _validate_role(r)
+    if r not in user_role_names:
+        raise PermissionError(
+            f"Role '{r}' is not assigned to user '{username}'. "
+            f"Available: {', '.join(user_role_names)}"
+        )
+    return r
 
 def _resolve_engine(engine_name: Optional[str]):
     name = (engine_name or CFG.default_engine or "AUTO").upper()
@@ -536,16 +670,28 @@ async def info() -> Dict[str, Any]:
 @mcp.tool()
 @log_tool
 async def whoami(role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
-    _check_token(auth_token)
-    r = _resolve_role(role)
-    return {"result": {"role": r}}
+    r = _auth(auth_token, role)
+    identity = {"role": r, "auth_type": "mcp_shared", "username": "superuser"}
+    # Identify per-user tokens
+    token = (auth_token or "").strip()
+    if token and CFG.shared_token and not hmac.compare_digest(token, CFG.shared_token):
+        try:
+            from supertable.redis_catalog import RedisCatalog
+            cat = RedisCatalog()
+            meta = cat.validate_auth_token_full(org=settings.SUPERTABLE_ORGANIZATION, token=token)
+            if meta:
+                identity["auth_type"] = "user_token"
+                identity["username"] = str(meta.get("username") or "")
+                identity["user_id"] = str(meta.get("user_id") or "")
+        except Exception:
+            pass
+    return {"result": identity}
 
 @mcp.tool()
 @log_tool
 async def list_supers(organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
-    _check_token(auth_token)
-    _resolve_role(role)
+    _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
@@ -564,8 +710,7 @@ async def list_supers(organization: str, role: Optional[str] = None, auth_token:
 async def list_tables(super_name: str, organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
@@ -766,8 +911,7 @@ async def describe_table(super_name: str, organization: str, table: str, role: O
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
@@ -784,8 +928,7 @@ async def get_table_stats(super_name: str, organization: str, table: str, role: 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
@@ -801,8 +944,7 @@ async def get_table_stats(super_name: str, organization: str, table: str, role: 
 async def get_super_meta(super_name: str, organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
@@ -877,8 +1019,7 @@ async def query_sql(
 ) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _read_only_sql(sql)
 
     limit_n = _clamp_limit(limit, CFG.default_limit, CFG.max_limit)
@@ -946,8 +1087,7 @@ async def sample_data(
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
 
     limit_n = _clamp_limit(limit, 10, CFG.max_limit)
     eng = _resolve_engine(None)
@@ -1006,8 +1146,7 @@ async def submit_feedback(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     valid_ratings = {"thumbs_up", "thumbs_down", "neutral"}
@@ -1104,8 +1243,7 @@ async def store_annotation(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     valid_categories = {"sql", "terminology", "visualization", "scope", "domain"}
@@ -1194,8 +1332,7 @@ async def get_annotations(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     ctx = _sql_escape_literal((context or "").strip())
@@ -1270,8 +1407,7 @@ async def store_app_state(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     valid_namespaces = {"chat", "dashboard", "widget", "query", "note"}
@@ -1363,8 +1499,7 @@ async def get_app_state(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     ns = _sql_escape_literal((namespace or "").strip().lower())
@@ -1442,8 +1577,7 @@ async def profile_column(
     sup = _safe_id(super_name, "super_name")
     tbl = _safe_id(table, "table")
     col = _safe_column_id(column)
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
 
     top_limit = max(1, min(int(top_n or 10), 50))
     eng = _resolve_engine(None)
@@ -1531,8 +1665,7 @@ async def validate_sql(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
 
     try:
         _read_only_sql(sql)
@@ -1649,8 +1782,7 @@ async def search_columns(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     pat = (pattern or "").strip().lower()
@@ -1735,8 +1867,7 @@ async def delete_annotation(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     valid_categories = {"sql", "terminology", "visualization", "scope", "domain"}
@@ -1870,8 +2001,7 @@ async def delete_app_state(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     valid_namespaces = {"chat", "dashboard", "widget", "query", "note"}
@@ -1933,8 +2063,7 @@ async def data_freshness(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     def _extract_freshness(leaf: Dict[str, Any], table_name: str) -> Dict[str, Any]:
@@ -2055,8 +2184,7 @@ async def auto_discover(
     """
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     max_tbl = max(1, min(int(max_tables or 30), 50))
@@ -2216,8 +2344,7 @@ async def store_catalog(
 
     org = _safe_id(organization, "organization")
     sup = _safe_id(super_name, "super_name")
-    _check_token(auth_token)
-    r = _resolve_role(role)
+    r = _auth(auth_token, role)
     _ensure_imports()
 
     tbl = (table_name or "").strip()

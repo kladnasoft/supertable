@@ -101,6 +101,7 @@ from supertable.services.security import (
     _update_endpoint,
     _regenerate_endpoint_token,
     _delete_endpoint,
+    validate_username,
 )
 
 # -- monitoring helpers --
@@ -244,11 +245,72 @@ from supertable.server_common import _get_meta_reader as _common_get_meta_reader
 
 @router.get("/healthz", response_class=PlainTextResponse)
 def healthz():
+    """Shallow health check — Redis ping only. Use /healthz/deep for full check."""
     try:
         pong = redis_client.ping()
         return "ok" if pong else "not-ok"
     except Exception as e:
         return f"error: {e}"
+
+
+@router.get("/healthz/deep")
+def healthz_deep():
+    """Deep health check — verifies Redis, storage, and DuckDB can fulfill their contracts.
+
+    Returns 200 with component status if all pass, 503 if any fail.
+    Suitable for readiness probes in Kubernetes / ECS / load balancers.
+    """
+    checks = {}
+    all_ok = True
+
+    # 1. Redis: ping
+    try:
+        pong = redis_client.ping()
+        checks["redis"] = {"status": "ok"} if pong else {"status": "fail", "error": "ping returned false"}
+        if not pong:
+            all_ok = False
+    except Exception as e:
+        checks["redis"] = {"status": "fail", "error": str(e)}
+        all_ok = False
+
+    # 2. Storage: write + read + delete a probe file
+    try:
+        from supertable.storage.storage_factory import get_storage
+        storage = get_storage()
+        probe_path = "__healthz__/probe.txt"
+        probe_data = f"healthz-{time.time()}"
+        storage.write_text(probe_path, probe_data)
+        readback = storage.read_text(probe_path)
+        if readback.strip() == probe_data:
+            checks["storage"] = {"status": "ok", "backend": type(storage).__name__}
+        else:
+            checks["storage"] = {"status": "fail", "error": "read-back mismatch"}
+            all_ok = False
+        try:
+            storage.delete(probe_path)
+        except Exception:
+            pass
+    except Exception as e:
+        checks["storage"] = {"status": "fail", "error": str(e)}
+        all_ok = False
+
+    # 3. DuckDB: run a trivial query
+    try:
+        import duckdb
+        conn = duckdb.connect(":memory:")
+        result = conn.execute("SELECT 1 AS healthz").fetchone()
+        conn.close()
+        if result and result[0] == 1:
+            checks["duckdb"] = {"status": "ok"}
+        else:
+            checks["duckdb"] = {"status": "fail", "error": "unexpected result"}
+            all_ok = False
+    except Exception as e:
+        checks["duckdb"] = {"status": "fail", "error": str(e)}
+        all_ok = False
+
+    status_code = 200 if all_ok else 503
+    return JSONResponse({"status": "ok" if all_ok else "degraded", "checks": checks}, status_code=status_code)
 
 
 # ─────────────────────────── Auth / Login ─────────────────────────────────
@@ -1370,6 +1432,7 @@ async def api_ingestion_load_upload(
     table_name: Optional[str] = Form(None),
     staging_name: Optional[str] = Form(None),
     overwrite_columns: Optional[str] = Form(None),
+    delete_only: Optional[str] = Form(None),
     file: UploadFile = File(...),
     _: Any = Depends(logged_in_guard_api),
 ):
@@ -1545,6 +1608,8 @@ async def api_ingestion_load_upload(
         raw = str(overwrite_columns)
         overwrite_cols = [c.strip() for c in re.split(r"[\n,]+", raw) if c.strip()]
 
+    is_delete = str(delete_only or "").strip().lower() in ("1", "true", "yes")
+
     try:
         from supertable.data_writer import DataWriter
     except Exception as e:
@@ -1552,7 +1617,7 @@ async def api_ingestion_load_upload(
 
     def _do_write() -> Any:
         dw = DataWriter(super_name=sup_eff, organization=org_eff)
-        return dw.write(role_name=role_eff, simple_name=table_eff, data=arrow_table, overwrite_columns=overwrite_cols)
+        return dw.write(role_name=role_eff, simple_name=table_eff, data=arrow_table, overwrite_columns=overwrite_cols, delete_only=is_delete)
 
     try:
         cols, rows_written, inserted, deleted = await asyncio.to_thread(_do_write)
@@ -1562,19 +1627,88 @@ async def api_ingestion_load_upload(
     dt_ms = (time.perf_counter() - t0) * 1000.0
     _audit(
         **audit_context(request), category=EventCategory.DATA_MUTATION,
-        action=Actions.FILE_UPLOAD, organization=org_eff, super_name=sup_eff,
-        resource_type="table", resource_id=table_eff, severity=Severity.INFO,
+        action=Actions.DATA_DELETE if is_delete else Actions.FILE_UPLOAD,
+        organization=org_eff, super_name=sup_eff,
+        resource_type="table", resource_id=table_eff, severity=Severity.WARNING if is_delete else Severity.INFO,
         detail=make_detail(
             mode="table", table=table_eff, filename=file.filename or "",
             rows=rows_written, inserted=inserted, deleted=deleted,
-            file_type=ext, duration_ms=round(dt_ms),
+            file_type=ext, duration_ms=round(dt_ms), delete_only=is_delete,
         ),
     )
     return {
         "ok": True, "mode": "table", "organization": org_eff, "super_name": sup_eff,
         "table_name": table_eff, "rows": rows_written, "inserted": inserted, "deleted": deleted,
+        "delete_only": is_delete,
         "file_type": ext or "unknown", "job_uuid": job_uuid, "server_duration_ms": dt_ms,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   FILE COLUMN EXTRACTION (for ingestion delete mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/reflection/ingestion/file-columns")
+async def api_file_columns(
+    request: Request,
+    file: UploadFile = File(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Extract column names from an uploaded file without loading all data.
+
+    Used by the ingestion UI to show delete criteria columns for Parquet
+    files (where client-side preview is not possible).  Reads only schema
+    metadata, not the full dataset.
+    """
+    filename = (file.filename or "upload").strip()
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    def _extract(upload: UploadFile) -> List[str]:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}" if ext else "")
+        tmp_path = tmp.name
+        try:
+            with tmp:
+                while True:
+                    chunk = upload.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+
+            import pyarrow.parquet as pq_mod
+            import pyarrow.csv as pa_csv_mod
+            import pyarrow.json as pa_json_mod
+
+            if ext in ("parquet", "pq"):
+                schema = pq_mod.read_schema(tmp_path)
+                return schema.names
+            elif ext in ("csv", "tsv"):
+                delimiter = "\t" if ext == "tsv" else ","
+                # Read just the first row to get headers
+                read_opts = pa_csv_mod.ReadOptions(autogenerate_column_names=False)
+                parse_opts = pa_csv_mod.ParseOptions(delimiter=delimiter)
+                tbl = pa_csv_mod.read_csv(tmp_path, read_options=read_opts, parse_options=parse_opts)
+                return tbl.column_names
+            elif ext in ("json", "jsonl", "ndjson"):
+                tbl = pa_json_mod.read_json(tmp_path)
+                return tbl.column_names
+            else:
+                return []
+        finally:
+            try:
+                upload.file.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    try:
+        columns = await asyncio.to_thread(_extract, file)
+    except Exception as e:
+        return JSONResponse({"ok": False, "columns": [], "error": str(e)}, status_code=400)
+
+    return {"ok": True, "columns": columns, "file_type": ext, "file_name": filename}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2682,8 +2816,9 @@ def api_users_page_create(
     _: Any = Depends(admin_guard_api),
 ):
     username = str(payload.get("username") or "").strip()
-    if not username:
-        raise HTTPException(status_code=400, detail="username is required")
+    validate_username(username)  # raises HTTPException if invalid
+
+    display_name = str(payload.get("display_name") or "").strip()
 
     role_type = str(payload.get("role_type") or "").strip().lower()
     if role_type not in _VALID_ROLE_TYPES_USERS:
@@ -2694,8 +2829,8 @@ def api_users_page_create(
     if not org or not sup:
         raise HTTPException(status_code=400, detail="org and sup are required")
 
-    if username.lower() == sup.lower():
-        raise HTTPException(status_code=403, detail="The superuser account cannot be created from the UI.")
+    if username.lower() == sup.lower() or username.lower() in ("superuser", "superadmin"):
+        raise HTTPException(status_code=403, detail="Reserved system account names cannot be used.")
 
     if role_type == "superadmin":
         raise HTTPException(status_code=403, detail="The superadmin role cannot be assigned from the UI.")
@@ -2722,7 +2857,35 @@ def api_users_page_create(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"User creation failed: {e}")
 
-    return {"ok": True, "user_id": user_id, "username": username, "role_id": role_id}
+    # Auto-create a linked auth token for this user
+    plaintext_token = ""
+    token_id = ""
+    try:
+        token_result = _catalog_create_token(
+            org, created_by="superuser",
+            label=f"user:{username}",
+            username=username, user_id=str(user_id),
+        )
+        plaintext_token = token_result.get("token", "")
+        token_id = token_result.get("token_id", "")
+        # Store token_id on the user document for linkage
+        try:
+            doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{user_id}"
+            redis_client.hset(doc_key, "token_id", token_id)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("[users-page] Token creation failed for user %s: %s", username, e)
+
+    _audit(
+        category=EventCategory.RBAC_CHANGE, action=Actions.USER_CREATE,
+        organization=org, super_name=sup, resource_type="user",
+        resource_id=str(user_id), severity=Severity.WARNING,
+        detail=make_detail(username=username, role_type=role_type),
+    )
+
+    return {"ok": True, "user_id": user_id, "username": username, "role_id": role_id,
+            "token": plaintext_token, "token_id": token_id}
 
 
 @router.delete("/reflection/users-page/user/{user_id}")
@@ -2741,15 +2904,27 @@ def api_users_page_delete(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not verify user identity before deletion: {e}")
 
-    superuser_ids: set = {
-        str(u.get("user_id") or u.get("hash") or "").strip()
-        for u in all_users
-        if str(u.get("username") or u.get("name") or "").strip().lower() == s.lower()
-    }
-    superuser_ids.discard("")
+    # Protect system accounts: superuser (username == sup), "superuser", "superadmin"
+    _PROTECTED_NAMES = {"superuser", "superadmin"}
+    protected_ids: set = set()
+    for u in all_users:
+        uname = str(u.get("username") or u.get("name") or "").strip().lower()
+        uid = str(u.get("user_id") or u.get("hash") or "").strip()
+        if uid and (uname == s.lower() or uname in _PROTECTED_NAMES):
+            protected_ids.add(uid)
 
-    if user_id in superuser_ids:
-        raise HTTPException(status_code=403, detail="The superuser account cannot be deleted from the UI.")
+    if user_id in protected_ids:
+        raise HTTPException(status_code=403, detail="System accounts (superuser, superadmin) cannot be deleted.")
+
+    # Delete the linked auth token (if any) before deleting the user
+    try:
+        doc_key = f"supertable:{o}:{s}:rbac:users:doc:{user_id}"
+        token_id = redis_client.hget(doc_key, "token_id")
+        if token_id:
+            tid = token_id if isinstance(token_id, str) else token_id.decode("utf-8")
+            _catalog_delete_token(o, tid)
+    except Exception as e:
+        logger.warning("[users-page] Token cleanup failed for user %s: %s", user_id, e)
 
     try:
         um.delete_user(user_id)
@@ -2798,6 +2973,75 @@ def api_users_page_remove_role(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Remove role failed: {e}")
     return {"ok": True, "user_id": user_id, "role_id": role_id}
+
+
+@router.post("/reflection/users-page/user/{user_id}/regenerate-token")
+def api_users_page_regenerate_token(
+    request: Request,
+    user_id: str,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Regenerate the login token for a user. Old token stops working immediately."""
+    org = str(payload.get("org") or "").strip()
+    sup = str(payload.get("sup") or "").strip()
+    if not org or not sup:
+        raise HTTPException(status_code=400, detail="org and sup are required")
+
+    # Look up the user to get their username and current token_id
+    doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{user_id}"
+    try:
+        raw = redis_client.hgetall(doc_key)
+        if not raw:
+            raise HTTPException(status_code=404, detail="User not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis error: {e}")
+
+    username = ""
+    old_token_id = ""
+    for k, v in raw.items():
+        kk = k if isinstance(k, str) else k.decode("utf-8")
+        vv = v if isinstance(v, str) else v.decode("utf-8")
+        if kk == "username":
+            username = vv
+        elif kk == "token_id":
+            old_token_id = vv
+
+    if not username:
+        raise HTTPException(status_code=400, detail="User has no username")
+
+    # Delete old token
+    if old_token_id:
+        try:
+            _catalog_delete_token(org, old_token_id)
+        except Exception:
+            pass
+
+    # Create new token linked to this user
+    token_result = _catalog_create_token(
+        org, created_by="superuser",
+        label=f"user:{username}",
+        username=username, user_id=user_id,
+    )
+    new_token_id = token_result.get("token_id", "")
+
+    # Update user doc with new token_id
+    try:
+        redis_client.hset(doc_key, "token_id", new_token_id)
+    except Exception:
+        pass
+
+    _audit(
+        category=EventCategory.TOKEN_MGMT, action=Actions.TOKEN_REGENERATE,
+        organization=org, super_name=sup, resource_type="user_token",
+        resource_id=user_id, severity=Severity.WARNING,
+        detail=make_detail(username=username, old_token_id=old_token_id[:16] + "..." if old_token_id else ""),
+    )
+
+    return {"ok": True, "user_id": user_id, "username": username,
+            "token": token_result.get("token", ""), "token_id": new_token_id}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

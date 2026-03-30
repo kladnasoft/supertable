@@ -275,6 +275,7 @@ class Actions:
     # Token management
     TOKEN_CREATE = "token_create"
     TOKEN_DELETE = "token_delete"
+    TOKEN_REGENERATE = "token_regenerate"
 
     # System
     SERVICE_START = "service_start"

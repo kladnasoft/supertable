@@ -851,11 +851,11 @@ def _catalog_list_tokens(org: str) -> List[Dict[str, Any]]:
             return []
 
 
-def _catalog_create_token(org: str, created_by: str, label: Optional[str]) -> Dict[str, Any]:
+def _catalog_create_token(org: str, created_by: str, label: Optional[str], username: str = "", user_id: str = "") -> Dict[str, Any]:
     if not org:
         raise HTTPException(status_code=400, detail="Missing organization")
     try:
-        return catalog.create_auth_token(org=org, created_by=created_by, label=label)
+        return catalog.create_auth_token(org=org, created_by=created_by, label=label, username=username, user_id=user_id)
     except Exception:
         token = secrets.token_urlsafe(24)
         token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -865,6 +865,8 @@ def _catalog_create_token(org: str, created_by: str, label: Optional[str]) -> Di
             "created_by": str(created_by or ""),
             "label": (str(label).strip() if label is not None else ""),
             "enabled": True,
+            "username": str(username or ""),
+            "user_id": str(user_id or ""),
         }
         try:
             redis_client.hset(f"supertable:{org}:auth:tokens", token_id, json.dumps(meta))

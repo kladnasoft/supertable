@@ -223,6 +223,28 @@ def _delete_role(redis_client: Any, org: str, sup: str, role_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _USER_ID_RE = re.compile(r"^[a-f0-9]{32,64}$")
+_VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def validate_username(username: str) -> str:
+    """Validate and return a safe username string.
+
+    Rules:
+      - 1–64 characters
+      - Starts with alphanumeric
+      - Only alphanumeric, dots, underscores, hyphens
+      - Case-preserved but uniqueness is case-insensitive
+    """
+    nm = (username or "").strip()
+    if not nm:
+        raise HTTPException(status_code=400, detail="username is required")
+    if not _VALID_USERNAME_RE.fullmatch(nm):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 1-64 characters, start with a letter or digit, "
+                   "and contain only letters, digits, dots, underscores, or hyphens."
+        )
+    return nm
 
 
 def _decode_user(raw: Dict, user_id: str) -> Dict[str, Any]:
@@ -266,12 +288,9 @@ def _create_user(
     *,
     username: str,
     roles: List[str],
+    display_name: str = "",
 ) -> Dict[str, Any]:
-    nm = (username or "").strip()
-    if not nm:
-        raise HTTPException(status_code=400, detail="username is required")
-    if len(nm) > 120:
-        raise HTTPException(status_code=400, detail="username is too long")
+    nm = validate_username(username)
 
     # Prevent duplicate usernames
     existing_id = redis_client.hget(_user_name_map_key(org, sup), nm.lower())
@@ -282,6 +301,7 @@ def _create_user(
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     mapping = {
         "username": nm,
+        "display_name": (display_name or "").strip(),
         "roles": json.dumps([str(r) for r in (roles or [])]),
         "created_at": now,
         "updated_at": now,
@@ -300,6 +320,7 @@ def _update_user(
     *,
     username: Optional[str] = None,
     roles: Optional[List[str]] = None,
+    display_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not _USER_ID_RE.fullmatch(user_id or ""):
         raise HTTPException(status_code=400, detail="invalid user_id")
@@ -309,9 +330,7 @@ def _update_user(
 
     mapping: Dict[str, str] = {}
     if username is not None:
-        nm = (username or "").strip()
-        if not nm:
-            raise HTTPException(status_code=400, detail="username is required")
+        nm = validate_username(username)
         # Update name map: remove old, add new
         existing = _get_user(redis_client, org, sup, user_id)
         old_nm = (existing or {}).get("username", "")
@@ -321,6 +340,8 @@ def _update_user(
         mapping["username"] = nm
     if roles is not None:
         mapping["roles"] = json.dumps([str(r) for r in roles])
+    if display_name is not None:
+        mapping["display_name"] = display_name.strip()
 
     mapping["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     redis_client.hset(doc_key, mapping=mapping)

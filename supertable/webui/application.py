@@ -295,12 +295,14 @@ def login_post(
     if not provided_token:
         return _render_login(request, message="Token is required.", clear_cookie=True)
 
+    # Validate token and check username linkage
+    token_meta = None
     try:
-        ok = bool(catalog.validate_auth_token(org=org, token=provided_token))
+        token_meta = catalog.validate_auth_token_full(org=org, token=provided_token)
     except Exception:
-        ok = False
+        token_meta = None
 
-    if not ok:
+    if not token_meta:
         _audit(
             category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_FAILURE,
             organization=org, actor_ip=request.client.host if request.client else "",
@@ -310,7 +312,51 @@ def login_post(
         )
         return _render_login(request, message="Invalid token.", clear_cookie=True)
 
+    # Enforce username-token linkage: the token must be linked to this username.
+    token_username = str(token_meta.get("username") or "").strip()
+    if not token_username or token_username.lower() != username.lower():
+        _audit(
+            category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_FAILURE,
+            organization=org, actor_ip=request.client.host if request.client else "",
+            actor_username=username, severity=Severity.WARNING,
+            outcome=Outcome.FAILURE, reason="username_token_mismatch",
+            detail=make_detail(method="token", username_attempted=username), server="webui",
+        )
+        return _render_login(request, message="Invalid token.", clear_cookie=True)
+
     user_hash_val = _user_hash(org, username)
+
+    # Resolve the user's role_name from Redis so the session carries RBAC identity.
+    # Walk (org, sup) pairs to find the user doc, extract role_ids, resolve first role_name.
+    role_name = ""
+    role_names_list = []
+    user_id = str(token_meta.get("user_id") or "").strip()
+    if user_id:
+        try:
+            for p_org, p_sup in discover_pairs():
+                if p_org != org:
+                    continue
+                user_doc_key = f"supertable:{org}:{p_sup}:rbac:users:doc:{user_id}"
+                raw_roles = catalog.r.hget(user_doc_key, "roles")
+                if not raw_roles:
+                    continue
+                import json as _json_mod
+                roles_str = raw_roles if isinstance(raw_roles, str) else raw_roles.decode("utf-8")
+                role_ids = _json_mod.loads(roles_str) if roles_str else []
+                for rid in role_ids:
+                    rid_s = str(rid).strip()
+                    if not rid_s:
+                        continue
+                    rn_raw = catalog.r.hget(f"supertable:{org}:{p_sup}:rbac:roles:doc:{rid_s}", "role_name")
+                    if rn_raw:
+                        rn = rn_raw if isinstance(rn_raw, str) else rn_raw.decode("utf-8")
+                        role_names_list.append(rn)
+                if role_names_list:
+                    role_name = role_names_list[0]
+                    break
+        except Exception as e:
+            logger.warning("[login] Role resolution failed for user %s: %s", username, e)
+
     resp = RedirectResponse(url="/reflection/home", status_code=302)
     resp.delete_cookie(_ADMIN_COOKIE_NAME, path="/")
     _clear_session_cookie(resp)
@@ -319,6 +365,8 @@ def login_post(
         "username": username,
         "user_hash": user_hash_val,
         "is_superuser": False,
+        "role_name": role_name,
+        "roles": role_names_list,
     })
     _no_store(resp)
     _audit(
@@ -500,6 +548,22 @@ def audit_page(
     if not ctx.get("session_is_superuser"):
         return _redirect_to_login()
     resp = templates.TemplateResponse("audit.html", ctx)
+    _no_store(resp)
+    return resp
+
+
+@app.get("/reflection/platform", response_class=HTMLResponse)
+def platform_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    ctx = _page_context(request, org, sup)
+    if ctx is None:
+        return _redirect_to_login()
+    if not ctx.get("session_is_superuser"):
+        return _redirect_to_login()
+    resp = templates.TemplateResponse("platform.html", ctx)
     _no_store(resp)
     return resp
 

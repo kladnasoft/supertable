@@ -184,8 +184,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="section-sep"></div>
     <div class="section-node" data-section="users"><span class="sicon" style="background:rgba(124,58,237,.08);color:var(--purple);"><i class="fas fa-users"></i></span> Users<span class="scount" id="countUsers">0</span></div>
     <div class="section-sep"></div>
-    <div class="section-node" data-section="tokens"><span class="sicon" style="background:rgba(217,119,6,.08);color:var(--amber);"><i class="fas fa-key"></i></span> Tokens<span class="scount" id="countTokens">0</span></div>
-    <div class="section-sep"></div>
     <div class="section-node" data-section="odata"><span class="sicon" style="background:rgba(16,185,129,.08);color:var(--success);"><i class="fas fa-plug"></i></span> OData<span class="scount" id="countEndpoints">0</span></div>
     <div style="flex:1;"></div>
     <button class="btn-accent" id="btnNew"><i class="fas fa-plus"></i> <span id="btnNewLabel">New Role</span></button>
@@ -221,7 +219,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <div class="stat-card-title"><i class="fas fa-chart-bar" style="color:var(--primary);"></i> Security Overview</div>
         <div class="stat-row"><span class="label">Roles</span><span class="val" id="rightRoles">—</span></div>
         <div class="stat-row"><span class="label">Users</span><span class="val" id="rightUsers">—</span></div>
-        <div class="stat-row"><span class="label">Tokens</span><span class="val" id="rightTokens">—</span></div>
       </div>
       <div class="stat-card">
         <div class="stat-card-title"><i class="fas fa-shield-halved" style="color:var(--purple);"></i> Role Distribution</div>
@@ -261,7 +258,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 <div class="modal-backdrop" id="modalUser"><div class="modal-card">
   <div class="modal-head"><div class="modal-title" id="modalUserTitle">Create User</div><button class="btn-sm" onclick="hideModal('modalUser')"><i class="fas fa-times"></i></button></div>
-  <div class="editor-field"><label>Username</label><input id="edUserName" placeholder="e.g. alice"/></div>
+  <div class="editor-field"><label>Username (login ID)</label><input id="edUserName" placeholder="e.g. alice" autocomplete="off"/><div class="hint">Letters, digits, dots, underscores, hyphens. No spaces.</div></div>
+  <div class="editor-field"><label>Display Name (optional)</label><input id="edDisplayName" placeholder="e.g. Alice Johnson" autocomplete="off"/></div>
   <div class="editor-field"><label>Role Type</label>
     <div class="role-type-grid">
       <div class="role-type-card" data-role="admin" onclick="selectRoleType(this)"><div class="rtn">Admin</div><div class="rtd">Full control</div></div>
@@ -274,20 +272,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div class="modal-foot"><button class="btn-sm" onclick="hideModal('modalUser')">Cancel</button><button class="btn-sm btn-primary" id="btnSaveUser">Create User</button></div>
 </div></div>
 
-<div class="modal-backdrop" id="modalToken"><div class="modal-card">
-  <div class="modal-head"><div class="modal-title">Create Login Token</div><button class="btn-sm" onclick="hideModal('modalToken')"><i class="fas fa-times"></i></button></div>
-  <div class="editor-field"><label>Label (optional)</label><input id="edTokenLabel" placeholder="e.g. dev, shared, CI"/></div>
-  <div style="font-size:11px;color:var(--text-muted);">The plaintext token will be shown once after creation.</div>
-  <div id="edTokenError"></div>
-  <div class="modal-foot"><button class="btn-sm" onclick="hideModal('modalToken')">Cancel</button><button class="btn-sm btn-primary" id="btnSaveToken">Create Token</button></div>
-</div></div>
-
-<div class="modal-backdrop" id="modalTokenResult"><div class="modal-card">
-  <div class="modal-head"><div class="modal-title"><i class="fas fa-check-circle" style="color:var(--success);"></i> Token Created</div><button class="btn-sm" onclick="hideModal('modalTokenResult')"><i class="fas fa-times"></i></button></div>
-  <div class="flash-ok" style="margin-bottom:10px;">Copy this token now — it will <strong>not</strong> be shown again.</div>
-  <div class="editor-field"><label>Token (plaintext)</label><div id="tokPlaintext" style="font-family:var(--mono);font-size:12px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);word-break:break-all;"></div></div>
-  <div class="editor-field"><label>Token ID (sha256)</label><div id="tokId" style="font-family:var(--mono);font-size:10px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);word-break:break-all;color:var(--text-muted);"></div></div>
-  <div class="modal-foot"><button class="btn-sm btn-primary" onclick="hideModal('modalTokenResult')">Done</button></div>
+<div class="modal-backdrop" id="modalUserTokenResult"><div class="modal-card">
+  <div class="modal-head"><div class="modal-title"><i class="fas fa-check-circle" style="color:var(--success);"></i> Access Token</div><button class="btn-sm" onclick="hideModal('modalUserTokenResult')"><i class="fas fa-times"></i></button></div>
+  <div class="flash-ok" style="margin-bottom:10px;">Copy this token now — it will <strong>not</strong> be shown again.<br/>The user will log in with their <strong>username</strong> + this <strong>token</strong>.</div>
+  <div class="editor-field"><label>Username</label><div id="utokUsername" style="font-family:var(--mono);font-size:13px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);font-weight:600;"></div></div>
+  <div class="editor-field"><label>Access Token</label><div style="display:flex;align-items:center;gap:8px;"><div id="utokPlaintext" style="flex:1;font-family:var(--mono);font-size:12px;padding:8px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);word-break:break-all;user-select:all;"></div><button class="btn-sm" id="btnCopyToken"><i class="fas fa-copy"></i> Copy</button></div></div>
+  <div class="modal-foot"><button class="btn-sm btn-primary" onclick="hideModal('modalUserTokenResult')">Done</button></div>
 </div></div>
 
 <div class="modal-backdrop" id="modalAddRole"><div class="modal-card">
@@ -339,7 +329,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   window.selectRoleType=function(card){document.querySelectorAll(".role-type-card").forEach(function(c){c.classList.remove("selected");});card.classList.add("selected");};
 
   // State
-  var section="roles",allRoles=[],allUsers=[],allTokens=[],allEndpoints=[],selected=null,searchQ="",addRoleTargetUid="";
+  var section="roles",allRoles=[],allUsers=[],allEndpoints=[],selected=null,searchQ="",addRoleTargetUid="";
 
   function fmtDate(ms){if(!ms)return"—";try{return new Date(Number(ms)).toLocaleString();}catch(e){return"—";}}
   function safeList(v){if(!v)return[];if(Array.isArray(v))return v;try{var p=JSON.parse(v);return Array.isArray(p)?p:[p];}catch(e){return v?[v]:[];}}
@@ -351,9 +341,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.querySelectorAll(".section-node").forEach(function(n){n.addEventListener("click",function(){section=n.dataset.section;selected=null;renderSectionBar();renderAll();});});
   function renderSectionBar(){
     document.querySelectorAll(".section-node").forEach(function(n){n.classList.toggle("active",n.dataset.section===section);});
-    var lbl={roles:"New Role",users:"Create User",tokens:"Create Token",odata:"New Endpoint"};
+    var lbl={roles:"New Role",users:"Create User",odata:"New Endpoint"};
     document.getElementById("btnNewLabel").textContent=lbl[section]||"New";
-    document.getElementById("leftTitle").textContent={roles:"Roles",users:"Users",tokens:"Tokens",odata:"OData Endpoints"}[section]||"Items";
+    document.getElementById("leftTitle").textContent={roles:"Roles",users:"Users",odata:"OData Endpoints"}[section]||"Items";
     document.getElementById("countEndpoints").textContent=String(allEndpoints.length);
   }
 
@@ -381,14 +371,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         var roles=safeList(u.roles);var rhtml="";roles.slice(0,3).forEach(function(rid){var ro=findRole(rid);rhtml+=roleBadgeHtml(ro?ro.role:"");});
         div.innerHTML='<div class="licon" style="background:rgba(124,58,237,.08);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-user"></i></div><div class="lmeta"><div class="lname">'+esc(u.username||u.name||"—")+'</div><div class="linfo">'+rhtml+(roles.length>3?" +"+(roles.length-3):"")+"</div></div>";
         div.onclick=function(){selected=uid;renderList();renderDetail();};wrap.appendChild(div);
-      });
-    }else if(section==="tokens"){
-      document.getElementById("countTokens").textContent=String(allTokens.length);
-      if(!allTokens.length){if(empty)empty.style.display="block";return;}if(empty)empty.style.display="none";
-      allTokens.forEach(function(t,i){
-        var tid=t.token_id||"";var div=document.createElement("div");div.className="list-item"+(selected&&selected===tid?" active":"")+" fade-in";div.style.animationDelay=(i*.02)+"s";
-        div.innerHTML='<div class="licon" style="background:rgba(217,119,6,.08);border-color:rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-key"></i></div><div class="lmeta"><div class="lname">'+esc(t.label||"Unlabeled")+'</div><div class="linfo">'+esc(tid.length>16?tid.slice(0,8)+"…"+tid.slice(-6):tid)+"</div></div>";
-        div.onclick=function(){selected=tid;renderList();renderDetail();};wrap.appendChild(div);
       });
     }else if(section==="odata"){
       document.getElementById("countEndpoints").textContent=String(allEndpoints.length);
@@ -424,26 +406,25 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         '</div>';
     }else if(section==="users"){
       var u=allUsers.find(function(x){return(x.user_id||x.hash||x.id)===selected;});if(!u){content.innerHTML="";return;}
-      if(nameEl)nameEl.textContent=u.username||u.name||"—";if(metaEl)metaEl.textContent="ID: "+esc(selected);
-      var isSu=!!u.is_superuser;
-      if(actions)actions.innerHTML=(isSu?'':'<button class="btn-sm btn-danger" id="dDel"><i class="fas fa-trash"></i> Delete</button>');
-      if(!isSu&&document.getElementById("dDel"))document.getElementById("dDel").onclick=function(){deleteUser(selected,u.username||u.name);};
+      var dispName=u.display_name||"";
+      if(nameEl)nameEl.textContent=dispName||u.username||u.name||"—";if(metaEl)metaEl.textContent="ID: "+esc(selected);
+      var isProtected=_isProtectedUser(u);
+      if(actions)actions.innerHTML=(isProtected?'<span style="font-size:10px;color:var(--text-muted);"><i class="fas fa-lock"></i> System account</span>':'<button class="btn-sm btn-danger" id="dDel"><i class="fas fa-trash"></i> Delete</button>');
+      if(!isProtected&&document.getElementById("dDel"))document.getElementById("dDel").onclick=function(){deleteUser(selected,u.username||u.name);};
       var roles=safeList(u.roles);var rhtml='<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">';
       roles.forEach(function(rid){var ro=findRole(rid);var rl=ro?(ro.role||""):"";rhtml+='<span class="role-badge rb-'+esc(rl.toLowerCase())+'">'+esc(rl||rid.slice(0,8))+' <button style="border:none;background:transparent;cursor:pointer;color:inherit;opacity:.6;font-size:11px;" onclick="removeUserRole(\''+esc(selected)+'\',\''+esc(rid)+'\')">&times;</button></span>';});
       rhtml+='<button class="btn-sm" style="padding:2px 8px;font-size:10px;" onclick="openAddRoleModal(\''+esc(selected)+'\')"><i class="fas fa-plus"></i> add</button></div>';
+      var tokenIdShort=u.token_id?(u.token_id.slice(0,8)+"…"+u.token_id.slice(-6)):"—";
+      var tokenHtml='<div style="display:flex;align-items:center;gap:8px;"><span style="font-family:var(--mono);font-size:11px;">'+esc(tokenIdShort)+'</span>';
+      if(!isProtected)tokenHtml+=' <button class="btn-sm" style="padding:2px 8px;font-size:10px;" onclick="regenerateUserToken(\''+esc(selected)+'\')"><i class="fas fa-rotate"></i> Regenerate</button>';
+      tokenHtml+='</div>';
       content.innerHTML='<div class="config-grid">'+
-        '<div class="config-card"><div class="cl">Username</div><div class="cv">'+esc(u.username||u.name||"—")+(isSu?' <span class="role-badge rb-superadmin">system</span>':'')+'</div></div>'+
+        '<div class="config-card"><div class="cl">Username</div><div class="cv">'+esc(u.username||u.name||"—")+(isProtected?' <span class="role-badge rb-superadmin">system</span>':'')+'</div></div>'+
+        (dispName?'<div class="config-card"><div class="cl">Display Name</div><div class="cv">'+esc(dispName)+'</div></div>':'')+
         '<div class="config-card"><div class="cl">Created</div><div class="cv">'+esc(fmtDate(u.created_ms))+'</div></div>'+
-        '<div class="config-card full"><div class="cl">Assigned Roles</div><div class="cv">'+rhtml+'</div></div></div>';
-    }else if(section==="tokens"){
-      var t=allTokens.find(function(x){return x.token_id===selected;});if(!t){content.innerHTML="";return;}
-      if(nameEl)nameEl.textContent=t.label||"Unlabeled";if(metaEl)metaEl.textContent="Token ID: "+esc(selected);
-      if(actions)actions.innerHTML='<button class="btn-sm btn-danger" id="dDel"><i class="fas fa-trash"></i> Delete</button>';
-      document.getElementById("dDel").onclick=function(){deleteToken(selected);};
-      content.innerHTML='<div class="config-grid">'+
-        '<div class="config-card"><div class="cl">Label</div><div class="cv">'+esc(t.label||"—")+'</div></div>'+
-        '<div class="config-card"><div class="cl">Created</div><div class="cv">'+esc(fmtDate(t.created_ms))+'</div></div>'+
-        '<div class="config-card full"><div class="cl">Token ID (sha256)</div><div class="cv" style="font-size:11px;word-break:break-all;">'+esc(t.token_id||"—")+'</div></div></div>';
+        '<div class="config-card full"><div class="cl">Assigned Roles</div><div class="cv">'+rhtml+'</div></div>'+
+        (isProtected?'':'<div class="config-card full"><div class="cl"><i class="fas fa-key" style="color:var(--amber);margin-right:4px;"></i>Login Token</div><div class="cv">'+tokenHtml+'</div></div>')+
+        '</div>';
     }else if(section==="odata"){
       var ep=allEndpoints.find(function(x){return x.endpoint_id===selected;});if(!ep){content.innerHTML="";return;}
       if(nameEl)nameEl.textContent=ep.label||"—";if(metaEl)metaEl.textContent="Endpoint: "+esc(selected.slice(0,12))+"…";
@@ -503,7 +484,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   function renderRight(){
     document.getElementById("rightRoles").textContent=String(allRoles.length);
     document.getElementById("rightUsers").textContent=String(allUsers.length);
-    document.getElementById("rightTokens").textContent=String(allTokens.length);
     // Role distribution
     var dist={superadmin:0,admin:0,writer:0,reader:0,meta:0};
     allRoles.forEach(function(r){var t=(r.role||"").toLowerCase();if(dist[t]!==undefined)dist[t]++;else dist.meta++;});
@@ -531,9 +511,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   // Data loading
   async function loadRoles(){var c=ctx();try{var d=await apiGet("/reflection/rbac/roles?organization="+enc(c.org)+"&super_name="+enc(c.sup));allRoles=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allRoles=[];toast("Roles: "+e.message);}}
   async function loadUsers(){var c=ctx();try{var d=await apiGet("/reflection/users-page/list?org="+enc(c.org)+"&sup="+enc(c.sup));allUsers=d.users||[];var r2=d.roles||[];if(r2.length&&!allRoles.length)allRoles=r2;}catch(e){try{var d2=await apiGet("/reflection/rbac/users?organization="+enc(c.org)+"&super_name="+enc(c.sup));allUsers=(d2&&d2.data&&d2.data.items)?d2.data.items:[];}catch(e2){allUsers=[];toast("Users: "+e2.message);}}}
-  async function loadTokens(){var c=ctx();try{var d=await apiGet("/reflection/tokens?org="+enc(c.org));allTokens=(d&&d.tokens)?d.tokens:[];}catch(e){allTokens=[];}}
   async function loadEndpoints(){var c=ctx();try{var d=await apiGet("/reflection/odata/endpoints?organization="+enc(c.org)+"&super_name="+enc(c.sup));allEndpoints=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allEndpoints=[];}}
-  async function refreshAll(){await loadRoles();await loadUsers();await loadTokens();await loadEndpoints();renderAll();}
+  async function refreshAll(){await loadRoles();await loadUsers();await loadEndpoints();renderAll();}
 
   // CRUD: Roles
   var editRoleId=null;
@@ -554,14 +533,48 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   async function deleteRole(rid){if(!confirm("Delete this role?"))return;var c=ctx();try{await apiDel("/reflection/rbac/roles/"+enc(rid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
 
   // CRUD: Users
-  function openNewUser(){document.getElementById("modalUserTitle").textContent="Create User";document.getElementById("edUserName").value="";document.querySelectorAll(".role-type-card").forEach(function(c){c.classList.remove("selected");});var def=document.querySelector('.role-type-card[data-role="reader"]');if(def)def.classList.add("selected");document.getElementById("edUserError").innerHTML="";showModal("modalUser");}
+  var _usernameRe=/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+  function openNewUser(){document.getElementById("modalUserTitle").textContent="Create User";document.getElementById("edUserName").value="";document.getElementById("edDisplayName").value="";document.querySelectorAll(".role-type-card").forEach(function(c){c.classList.remove("selected");});var def=document.querySelector('.role-type-card[data-role="reader"]');if(def)def.classList.add("selected");document.getElementById("edUserError").innerHTML="";showModal("modalUser");}
   document.getElementById("btnSaveUser").addEventListener("click",async function(){
-    var username=(document.getElementById("edUserName").value||"").trim();if(!username){document.getElementById("edUserError").innerHTML='<div class="flash-error">Username is required.</div>';return;}
+    var username=(document.getElementById("edUserName").value||"").trim();
+    if(!username){document.getElementById("edUserError").innerHTML='<div class="flash-error">Username is required.</div>';return;}
+    if(!_usernameRe.test(username)){document.getElementById("edUserError").innerHTML='<div class="flash-error">Username must start with a letter or digit and contain only letters, digits, dots, underscores, or hyphens (max 64 chars).</div>';return;}
+    var displayName=(document.getElementById("edDisplayName").value||"").trim();
     var sc=document.querySelector(".role-type-card.selected");if(!sc){document.getElementById("edUserError").innerHTML='<div class="flash-error">Select a role type.</div>';return;}
     var roleType=sc.getAttribute("data-role");var c=ctx();
-    try{await apiPost("/reflection/users-page/create",{username:username,role_type:roleType,org:c.org,sup:c.sup});hideModal("modalUser");toast("Created");await refreshAll();}catch(e){document.getElementById("edUserError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+    try{
+      var res=await apiPost("/reflection/users-page/create",{username:username,display_name:displayName,role_type:roleType,org:c.org,sup:c.sup});
+      hideModal("modalUser");
+      if(res.token){document.getElementById("utokUsername").textContent=username;document.getElementById("utokPlaintext").textContent=res.token;showModal("modalUserTokenResult");}
+      else{toast("Created");}
+      await refreshAll();
+    }catch(e){document.getElementById("edUserError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
-  async function deleteUser(uid,name){if(!confirm('Delete user "'+name+'"?'))return;var c=ctx();try{await apiDel("/reflection/users-page/user/"+enc(uid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
+
+  // Copy token to clipboard (used by modalUserTokenResult)
+  document.getElementById("btnCopyToken").addEventListener("click",function(){
+    var text=document.getElementById("utokPlaintext").textContent||"";
+    var btn=this;
+    navigator.clipboard.writeText(text).then(function(){
+      btn.innerHTML='<i class="fas fa-check"></i> Copied';
+      setTimeout(function(){btn.innerHTML='<i class="fas fa-copy"></i> Copy';},1500);
+    }).catch(function(){
+      // Fallback: select text for manual copy
+      var el=document.getElementById("utokPlaintext");
+      var range=document.createRange();range.selectNodeContents(el);
+      var sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);
+      btn.innerHTML='<i class="fas fa-check"></i> Selected — Ctrl+C';
+      setTimeout(function(){btn.innerHTML='<i class="fas fa-copy"></i> Copy';},2000);
+    });
+  });
+
+  function _isProtectedUser(u){
+    // Superuser account (username matches sup name) and superadmin accounts cannot be deleted
+    var uname=(u.username||u.name||"").toLowerCase();
+    var c=ctx();var supLow=(c.sup||"").toLowerCase();
+    return !!u.is_superuser || uname===supLow || uname==="superuser" || uname==="superadmin";
+  }
+  async function deleteUser(uid,name){if(!confirm('Delete user "'+name+'"? Their login token will also be revoked.'))return;var c=ctx();try{await apiDel("/reflection/users-page/user/"+enc(uid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));selected=null;toast("Deleted");await refreshAll();}catch(e){toast("Delete failed: "+e.message);}}
   window.removeUserRole=async function(uid,rid){var c=ctx();try{await apiDel("/reflection/users-page/user/"+enc(uid)+"/role/"+enc(rid)+"?org="+enc(c.org)+"&sup="+enc(c.sup));await refreshAll();renderDetail();}catch(e){toast("Remove role failed: "+e.message);}};
   window.openAddRoleModal=function(uid){addRoleTargetUid=uid;var user=allUsers.find(function(u){return(u.user_id||u.hash||u.id)===uid;});var currentRoles=safeList(user?user.roles:[]);var list=document.getElementById("rolePickerList");list.innerHTML="";document.getElementById("addRoleError").innerHTML="";
     allRoles.forEach(function(role){var rid=role.role_id||role.hash||role.id||"";var already=currentRoles.indexOf(rid)>=0;var item=document.createElement("div");item.className="role-picker-item"+(already?" already":"");item.innerHTML='<div>'+roleBadgeHtml(role.role)+' <span style="font-size:11px;color:var(--text-muted);margin-left:4px;">'+esc((role.role_name||rid).slice(0,20))+'</span></div><span style="font-size:10px;color:var(--text-muted);">'+(already?"assigned":"")+'</span>';
@@ -570,13 +583,18 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   };
   async function addUserRole(roleId){var c=ctx();try{await apiPost("/reflection/users-page/user/"+enc(addRoleTargetUid)+"/role",{org:c.org,sup:c.sup,role_id:roleId});hideModal("modalAddRole");await refreshAll();renderDetail();}catch(e){document.getElementById("addRoleError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}}
 
-  // CRUD: Tokens
-  function openNewToken(){document.getElementById("edTokenLabel").value="";document.getElementById("edTokenError").innerHTML="";showModal("modalToken");}
-  document.getElementById("btnSaveToken").addEventListener("click",async function(){
-    var label=(document.getElementById("edTokenLabel").value||"").trim();var c=ctx();
-    try{var res=await apiPost("/reflection/tokens?org="+enc(c.org)+"&label="+enc(label));hideModal("modalToken");document.getElementById("tokPlaintext").textContent=res.token||"";document.getElementById("tokId").textContent=res.token_id||"";showModal("modalTokenResult");await loadTokens();renderAll();}catch(e){document.getElementById("edTokenError").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
-  });
-  async function deleteToken(tid){if(!confirm("Delete this token?"))return;var c=ctx();try{await apiDel("/reflection/tokens/"+enc(tid)+"?org="+enc(c.org));selected=null;toast("Deleted");await loadTokens();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
+  // Regenerate user token
+  window.regenerateUserToken=async function(uid){
+    if(!confirm("Regenerate login token? The old token will stop working immediately."))return;
+    var c=ctx();
+    try{
+      var res=await apiPost("/reflection/users-page/user/"+enc(uid)+"/regenerate-token",{org:c.org,sup:c.sup});
+      document.getElementById("utokUsername").textContent=res.username||"";
+      document.getElementById("utokPlaintext").textContent=res.token||"";
+      showModal("modalUserTokenResult");
+      await refreshAll();renderDetail();
+    }catch(e){toast("Regenerate failed: "+e.message);}
+  };
 
   // CRUD: OData Endpoints
   function openNewEndpoint(){
@@ -605,14 +623,14 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   async function deleteEndpoint(eid){if(!confirm("Delete this OData endpoint?"))return;var c=ctx();try{await apiDel("/reflection/odata/endpoints/"+enc(eid)+"?organization="+enc(c.org)+"&super_name="+enc(c.sup));selected=null;toast("Deleted");await loadEndpoints();renderAll();}catch(e){toast("Delete failed: "+e.message);}}
 
   // New button
-  document.getElementById("btnNew").addEventListener("click",function(){if(section==="roles")openNewRole();else if(section==="users")openNewUser();else if(section==="odata")openNewEndpoint();else openNewToken();});
+  document.getElementById("btnNew").addEventListener("click",function(){if(section==="roles")openNewRole();else if(section==="users")openNewUser();else if(section==="odata")openNewEndpoint();});
   document.getElementById("btnRefresh").addEventListener("click",function(){refreshAll().catch(function(e){toast(e.message);});});
   document.getElementById("listSearch").addEventListener("input",function(ev){searchQ=ev.target.value||"";renderList();});
 
   // Escape
-  document.addEventListener("keydown",function(ev){if(ev.key!=="Escape")return;["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el&&el.style.display==="flex")el.style.display="none";});});
+  document.addEventListener("keydown",function(ev){if(ev.key!=="Escape")return;["modalRole","modalUser","modalUserTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el&&el.style.display==="flex")el.style.display="none";});});
   // Backdrop click
-  ["modalRole","modalUser","modalToken","modalTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener("click",function(ev){if(ev.target===el)el.style.display="none";});});
+  ["modalRole","modalUser","modalUserTokenResult","modalAddRole","modalEndpoint","modalEndpointToken"].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener("click",function(ev){if(ev.target===el)el.style.display="none";});});
 
   renderSectionBar();
   var _ctx=ctx();if(_ctx.org&&_ctx.sup)refreshAll();

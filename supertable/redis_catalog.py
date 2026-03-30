@@ -830,10 +830,14 @@ return 1
             created_by: str,
             label: Optional[str] = None,
             enabled: bool = True,
+            username: str = "",
+            user_id: str = "",
     ) -> Dict[str, Any]:
         """Create a new auth token.
 
         The plaintext token is returned ONLY once. Redis stores only token_id (sha256(token)).
+        When ``username`` is provided, the token is linked to that user and
+        login validation can enforce the username-token binding.
         """
         token = secrets.token_urlsafe(24)
         token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -843,6 +847,8 @@ return 1
             "created_by": str(created_by or ""),
             "label": (str(label).strip() if label is not None else ""),
             "enabled": bool(enabled),
+            "username": str(username or ""),
+            "user_id": str(user_id or ""),
         }
         try:
             self.r.hset(_auth_tokens_key(org), token_id, json.dumps(meta))
@@ -871,6 +877,27 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] validate_auth_token error: {e}")
             return False
+
+    def validate_auth_token_full(self, org: str, token: str) -> Optional[Dict[str, Any]]:
+        """Validate a plaintext auth token and return its metadata.
+
+        Returns the token metadata dict (including ``username``, ``user_id``)
+        if valid, or None if invalid / not found.
+        """
+        if not token:
+            return None
+        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            raw = self.r.hget(_auth_tokens_key(org), token_id)
+            if not raw:
+                return None
+            raw_str = raw if isinstance(raw, str) else raw.decode("utf-8")
+            return json.loads(raw_str)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] validate_auth_token_full error: {e}")
+            return None
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     # ------------- Listings via SCAN -------------
 
