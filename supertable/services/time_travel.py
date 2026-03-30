@@ -99,6 +99,7 @@ def list_snapshot_versions(
             "last_updated_ms": int(current_data.get("last_updated_ms", 0)),
             "resource_count": len(resources),
             "total_rows": total_rows,
+            "lineage": current_data.get("lineage") or {},
         })
 
         # Walk to previous snapshot

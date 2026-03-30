@@ -228,13 +228,17 @@ class SimpleTable:
         data = self.storage.read_json(path)
         return data, path
 
-    def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None):
+    def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None, lineage=None):
         """
         Build and write a new heavy snapshot on storage.
         Returns: (snapshot_dict, snapshot_path)
 
         If last_snapshot and last_snapshot_path are provided, skips the redundant
         snapshot read (caller already holds the data under lock).
+
+        Args:
+            lineage: Optional dict of data provenance metadata.  Stored in the
+                snapshot JSON so historical versions carry their origin.
         """
         if last_snapshot is not None and last_snapshot_path is not None:
             last_simple_table = last_snapshot
@@ -262,6 +266,10 @@ class SimpleTable:
             last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
         except Exception:
             pass
+
+        # Data lineage — record provenance of this write
+        if lineage and isinstance(lineage, dict):
+            last_simple_table["lineage"] = lineage
 
         # Write new heavy snapshot file
         new_simple_path = os.path.join(self.snapshot_dir, generate_filename(alias=self.identity))

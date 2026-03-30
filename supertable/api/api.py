@@ -1610,6 +1610,17 @@ async def api_ingestion_load_upload(
 
     is_delete = str(delete_only or "").strip().lower() in ("1", "true", "yes")
 
+    # Build data lineage metadata
+    upload_lineage = {
+        "source_type": "api_upload",
+        "filename": file.filename or "",
+        "file_type": ext or "unknown",
+        "username": (sess or {}).get("username", ""),
+        "role_name": role_eff,
+        "delete_only": is_delete,
+        "overwrite_columns": overwrite_cols,
+    }
+
     try:
         from supertable.data_writer import DataWriter
     except Exception as e:
@@ -1617,7 +1628,7 @@ async def api_ingestion_load_upload(
 
     def _do_write() -> Any:
         dw = DataWriter(super_name=sup_eff, organization=org_eff)
-        return dw.write(role_name=role_eff, simple_name=table_eff, data=arrow_table, overwrite_columns=overwrite_cols, delete_only=is_delete)
+        return dw.write(role_name=role_eff, simple_name=table_eff, data=arrow_table, overwrite_columns=overwrite_cols, delete_only=is_delete, lineage=upload_lineage)
 
     try:
         cols, rows_written, inserted, deleted = await asyncio.to_thread(_do_write)

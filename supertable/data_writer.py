@@ -381,10 +381,24 @@ class DataWriter:
                     mark("process")
 
                 # --- Update snapshot on storage -----------------------------------
+                # Build effective lineage — auto-generate if caller didn't provide
+                eff_lineage = lineage if lineage and isinstance(lineage, dict) else {}
+                if not eff_lineage:
+                    eff_lineage = {
+                        "source_type": "delete" if delete_only else "write",
+                        "role_name": role_name,
+                        "overwrite_columns": overwrite_columns or [],
+                        "delete_only": delete_only,
+                        "incoming_rows": incoming_rows,
+                        "incoming_columns": incoming_columns,
+                        "write_id": qid,
+                    }
+
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
                     new_resources, sunset_files, dataframe,
                     last_snapshot=last_simple_table,
                     last_snapshot_path=last_simple_table_path,
+                    lineage=eff_lineage,
                 )
                 mark("update_simple")
 
