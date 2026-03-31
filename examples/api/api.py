@@ -582,41 +582,37 @@ def api_supertables_clone(
     source = str(payload.get("source") or "").strip()
     target = str(payload.get("target") or "").strip()
     clone_type = str(payload.get("clone_type") or "readonly").strip().lower()
+    at_timestamp = payload.get("at_timestamp")  # optional: epoch-ms for time travel
 
     if not organization or not source or not target:
         raise HTTPException(status_code=400, detail="organization, source, and target are required")
     if source == target:
         raise HTTPException(status_code=400, detail="source and target must be different")
-    if clone_type not in ("readonly", "full"):
-        raise HTTPException(status_code=400, detail="clone_type must be 'readonly' or 'full'")
+    if clone_type not in ("readonly", "writable"):
+        raise HTTPException(status_code=400, detail="clone_type must be 'readonly' or 'writable'")
 
-    from supertable.services.supertable_manager import clone_readonly, clone_full
+    at_ts = int(at_timestamp) if at_timestamp is not None else None
+
+    from supertable.services.supertable_manager import clone_supertable
     try:
-        if clone_type == "readonly":
-            result = clone_readonly(organization, source, target)
-            _audit(
-                category=EventCategory.DATA_MUTATION,
-                action=Actions.SUPERTABLE_CLONE_READONLY,
-                organization=organization, super_name=target,
-                resource_type="supertable", resource_id=target,
-                severity=Severity.WARNING,
-                detail=make_detail(source=source, target=target, tables_cloned=result.get("tables_cloned", 0)),
-            )
-        else:
-            result = clone_full(organization, source, target)
-            _audit(
-                category=EventCategory.DATA_MUTATION,
-                action=Actions.SUPERTABLE_CLONE_FULL,
-                organization=organization, super_name=target,
-                resource_type="supertable", resource_id=target,
-                severity=Severity.CRITICAL,
-                detail=make_detail(
-                    source=source, target=target,
-                    tables_cloned=result.get("tables_cloned", 0),
-                    files_copied=result.get("files_copied", 0),
-                    roles_cloned=result.get("roles_cloned", 0),
-                ),
-            )
+        result = clone_supertable(
+            organization, source, target,
+            read_only=(clone_type == "readonly"),
+            at_timestamp=at_ts,
+        )
+        action = Actions.SUPERTABLE_CLONE_READONLY if clone_type == "readonly" else Actions.SUPERTABLE_CLONE_WRITABLE
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=action,
+            organization=organization, super_name=target,
+            resource_type="supertable", resource_id=target,
+            severity=Severity.WARNING,
+            detail=make_detail(
+                source=source, target=target, clone_type=clone_type,
+                tables_cloned=result.get("tables_cloned", 0),
+                at_timestamp=at_ts,
+            ),
+        )
         return JSONResponse(result, status_code=201)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -625,6 +621,53 @@ def api_supertables_clone(
     except Exception as e:
         logger.exception("SuperTable clone failed")
         raise HTTPException(status_code=500, detail=f"Clone failed: {e}")
+
+
+@router.post("/api/v1/supertables/clone-table")
+def api_supertables_clone_table(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Clone a single table between supertables (zero-copy, with optional time travel)."""
+    organization = str(payload.get("organization") or "").strip()
+    source_sup = str(payload.get("source_sup") or "").strip()
+    target_sup = str(payload.get("target_sup") or "").strip()
+    table_name = str(payload.get("table") or "").strip()
+    at_version = payload.get("at_version")
+    at_timestamp = payload.get("at_timestamp")
+
+    if not organization or not source_sup or not target_sup or not table_name:
+        raise HTTPException(status_code=400, detail="organization, source_sup, target_sup, and table are required")
+
+    at_v = int(at_version) if at_version is not None else None
+    at_ts = int(at_timestamp) if at_timestamp is not None else None
+
+    from supertable.services.supertable_manager import clone_table
+    try:
+        result = clone_table(
+            organization, source_sup, target_sup, table_name,
+            at_version=at_v, at_timestamp=at_ts,
+        )
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=Actions.TABLE_CLONE,
+            organization=organization, super_name=target_sup,
+            resource_type="table", resource_id=table_name,
+            severity=Severity.WARNING,
+            detail=make_detail(
+                source_sup=source_sup, target_sup=target_sup,
+                table=table_name, at_version=at_v, at_timestamp=at_ts,
+            ),
+        )
+        return JSONResponse(result, status_code=201)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("Table clone failed")
+        raise HTTPException(status_code=500, detail=f"Table clone failed: {e}")
 
 
 @router.put("/api/v1/supertables/read-only")

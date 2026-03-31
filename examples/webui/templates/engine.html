@@ -1,0 +1,533 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Data Island Core – SQL Engine</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --primary-color:#1c96ca;--secondary-color:#147ba3;--dark-color:#1a1a2e;
+  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;--warn:#f59e0b;--warn-bg:#fffbeb;--error:#ef4444;--error-bg:#fef2f2;
+  --amber:#d97706;--amber-bg:rgba(217,119,6,.06);--purple:#7c3aed;--purple-bg:rgba(124,58,237,.06);--green:#059669;--green-bg:rgba(5,150,105,.06);
+  --mono:'IBM Plex Mono',ui-monospace,monospace;--font:'Inter',-apple-system,sans-serif;
+  --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow:hidden;}
+.content-container{margin-left:280px;height:100vh;display:flex;flex-direction:column;overflow:hidden;transition:var(--transition);background:var(--bg);}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
+
+.cc-topbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:46px;}
+.topbar-sep{width:1px;height:20px;background:var(--border);flex-shrink:0;}
+.super-sel{display:flex;align-items:center;gap:6px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0 4px 0 10px;font-size:13px;font-weight:600;}
+.super-sel select{border:none;background:transparent;color:var(--text);font-weight:600;font-size:13px;font-family:var(--font);padding:6px 4px;outline:none;cursor:pointer;min-width:120px;}
+.role-pill{display:flex;align-items:center;gap:5px;background:#ecfdf5;border:1px solid rgba(16,185,129,.25);border-radius:999px;padding:4px 10px;}
+.role-pill label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#059669;margin:0;}
+.role-pill select{font-size:11px;font-weight:600;color:#059669;background:transparent;border:none;outline:none;cursor:pointer;font-family:var(--font);}
+
+.page-title-bar{display:flex;align-items:center;gap:10px;padding:10px 20px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;}
+.page-title-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.2);color:var(--amber);}
+.page-title-text{font-size:15px;font-weight:700;color:var(--text);}
+.page-title-sub{font-size:11px;color:var(--text-muted);margin-left:2px;}
+
+.cc-cols{flex:1;display:flex;overflow:hidden;min-height:0;}
+
+.panel-left{width:340px;min-width:340px;border-right:1px solid var(--border);background:var(--bg-card);display:flex;flex-direction:column;flex-shrink:0;}
+.panel-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border-light);flex-shrink:0;}
+.panel-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);}
+.swrap{position:relative;flex-shrink:0;padding:8px 10px;}
+.swrap i{position:absolute;left:20px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--text-muted);pointer-events:none;}
+.swrap input{width:100%;padding:6px 10px 6px 28px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;background:var(--bg-surface);font-family:var(--font);outline:none;}
+.swrap input:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
+.pool-list{flex:1;overflow-y:auto;padding:0 8px 8px;}
+.pool-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--radius-sm);cursor:pointer;transition:var(--transition);margin-bottom:2px;border:1px solid transparent;}
+.pool-item:hover{background:var(--bg-hover);border-color:var(--border);}
+.pool-item.active{background:var(--primary-light);border-color:var(--primary);}
+.pool-item .picon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;border:1px solid;background:rgba(217,119,6,.08);border-color:rgba(217,119,6,.2);color:var(--amber);}
+.pool-item .pmeta{min-width:0;flex:1;}
+.pool-item .pname{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pool-item .pinfo{font-size:10px;color:var(--text-muted);font-family:var(--mono);margin-top:1px;display:flex;align-items:center;gap:6px;}
+.pool-item .pright{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.pool-item .ptest-btn{border:none;background:transparent;color:var(--text-muted);cursor:pointer;font-size:10px;padding:3px 5px;border-radius:4px;transition:var(--transition);}
+.pool-item .ptest-btn:hover{color:var(--primary);background:var(--primary-light);}
+.pool-item .ptest-btn:disabled{opacity:.4;cursor:not-allowed;}
+.conn-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;border:1px solid rgba(0,0,0,.06);}
+.conn-dot.ok{background:var(--success);box-shadow:0 0 6px rgba(16,185,129,.35);}
+.conn-dot.fail{background:var(--error);box-shadow:0 0 6px rgba(239,68,68,.35);}
+.conn-dot.unknown{background:var(--border);}.conn-dot.testing{background:var(--primary);animation:pulse 1s infinite;}
+@keyframes pulse{0%,100%{opacity:.5;}50%{opacity:1;}}
+
+.cc-center{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden;}
+.detail-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+.detail-title{font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;}
+.detail-meta{font-size:10px;color:var(--text-muted);font-family:var(--mono);}
+.detail-area{flex:1;overflow:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px;}
+.detail-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:12px;color:var(--text-muted);}
+.detail-empty i{font-size:40px;opacity:.3;}
+
+.config-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.config-card{background:var(--bg-surface);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:12px;}
+.config-card .cl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-bottom:4px;}
+.config-card .cv{font-size:13px;font-weight:600;font-family:var(--mono);}
+.config-card.full{grid-column:1/-1;}
+
+.status-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;border:1px solid;}
+.status-badge.active{color:var(--green);border-color:rgba(5,150,105,.25);background:var(--green-bg);}
+.status-badge.draining{color:var(--amber);border-color:rgba(217,119,6,.25);background:var(--amber-bg);}
+.status-badge.offline{color:var(--error);border-color:rgba(239,68,68,.25);background:var(--error-bg);}
+
+.panel-right{width:280px;min-width:280px;border-left:1px solid var(--border);background:var(--bg-card);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto;}
+.stat-card{padding:14px;border-bottom:1px solid var(--border-light);}
+.stat-card-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:8px;display:flex;align-items:center;gap:6px;}
+.stat-row{display:flex;justify-content:space-between;padding:3px 0;font-size:12px;}
+.stat-row .label{color:var(--text-sec);}.stat-row .val{font-weight:600;font-family:var(--mono);}
+
+.btn-sm{padding:5px 10px;border-radius:var(--radius-sm);background:transparent;border:1px solid var(--border);color:var(--text-sec);font-weight:500;cursor:pointer;font-size:12px;transition:var(--transition);display:inline-flex;align-items:center;gap:4px;font-family:var(--font);white-space:nowrap;}
+.btn-sm:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light);}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary);}
+.btn-primary:hover{background:var(--primary-dark);border-color:var(--primary-dark);}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;}
+.btn-accent{background:var(--primary);color:#fff;border-color:var(--primary);font-weight:700;padding:8px 18px;font-size:13px;border-radius:8px;box-shadow:0 2px 8px rgba(28,150,202,.25);}
+.btn-accent:hover{background:var(--primary-dark);border-color:var(--primary-dark);box-shadow:0 4px 14px rgba(28,150,202,.35);}
+.btn-danger{border-color:var(--error);color:var(--error);}.btn-danger:hover{background:var(--error-bg);}
+.btn-test{border-color:var(--green);color:var(--green);}.btn-test:hover{background:var(--green-bg);}
+.btn-test:disabled{opacity:.5;cursor:not-allowed;}
+
+.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.4);display:none;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(2px);}
+.modal-card{width:580px;max-width:92vw;max-height:85vh;overflow-y:auto;background:#fff;border-radius:var(--radius);box-shadow:0 20px 60px rgba(15,23,42,.18);padding:20px;border:1px solid var(--border);border-left:4px solid var(--amber);}
+.modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px;}
+.modal-title-wrap{display:flex;align-items:flex-start;gap:10px;}
+.modal-icon{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:14px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.2);color:var(--amber);}
+.modal-title{font-size:15px;font-weight:700;line-height:1.1;}.modal-sub{margin-top:3px;color:var(--text-sec);font-size:12px;}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.field{border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;background:var(--bg-card);}
+.form-label{font-size:11px;font-weight:700;color:var(--text);margin-bottom:5px;display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.form-help{font-weight:500;font-size:10px;color:var(--text-muted);}
+.field .form-control,.field .form-select{border-radius:4px;border:1px solid var(--border);box-shadow:none!important;font-size:13px;}
+.field .form-control:focus,.field .form-select:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light)!important;outline:none;}
+.modal-footer{display:flex;justify-content:space-between;align-items:center;margin-top:14px;gap:10px;flex-wrap:wrap;}
+.modal-footer .left{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.test-result{font-size:11px;font-weight:700;padding:4px 8px;border-radius:6px;display:none;align-items:center;gap:5px;}
+.test-result.success{display:inline-flex;color:var(--green);background:var(--green-bg);border:1px solid rgba(5,150,105,.25);}
+.test-result.fail{display:inline-flex;color:var(--error);background:var(--error-bg);border:1px solid rgba(239,68,68,.25);}
+.test-result.testing{display:inline-flex;color:var(--primary);background:var(--primary-light);border:1px solid rgba(28,150,202,.25);}
+.error{color:var(--error);font-weight:700;font-size:12px;}
+
+.cfg-row{display:flex;justify-content:space-between;align-items:baseline;padding:4px 0;font-size:12px;gap:6px;}
+.cfg-row .label{color:var(--text-sec);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+.cfg-row .val{font-weight:600;font-family:var(--mono);white-space:nowrap;display:flex;align-items:center;gap:4px;}
+.src-badge{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 4px;border-radius:3px;line-height:1.4;flex-shrink:0;}
+.src-badge.redis{background:rgba(28,150,202,.1);color:var(--primary);border:1px solid rgba(28,150,202,.2);}
+.src-badge.env{background:rgba(217,119,6,.08);color:var(--amber);border:1px solid rgba(217,119,6,.2);}
+.src-badge.default{background:var(--bg-surface);color:var(--text-muted);border:1px solid var(--border-light);}
+.cfg-section-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);padding:6px 0 2px;border-bottom:1px solid var(--border-light);margin-bottom:2px;}
+.duckdb-hdr{display:flex;align-items:center;justify-content:space-between;gap:6px;}
+.btn-edit-cfg{border:none;background:transparent;color:var(--text-muted);cursor:pointer;font-size:10px;padding:2px 5px;border-radius:4px;transition:var(--transition);}
+.btn-edit-cfg:hover{color:var(--primary);background:var(--primary-light);}
+
+::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}.fade-in{animation:fadeIn .3s ease forwards;}
+.toast{position:fixed;right:18px;top:16px;z-index:9999;background:var(--text);color:#fff;border-radius:8px;padding:10px 16px;font-size:12px;font-weight:600;box-shadow:0 10px 25px rgba(0,0,0,.2);display:none;font-family:var(--font);}
+#pairSel{display:none;}
+  </style>
+  <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
+</head>
+<body>
+{% include "sidebar.html" %}
+<div class="content-container">
+{% if has_tenant %}
+<select id="pairSel">{% for t in tenants %}<option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>{% endfor %}</select>
+<div id="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
+
+  <header class="cc-topbar">
+    <div class="super-sel"><i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i><select id="ccSuperSel" onchange="engOnSuperChange(this.value)">{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div>
+    <div class="topbar-sep"></div>
+    <div class="role-pill"><i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i><label>Role</label><select id="ccRoleSel"><option value="superadmin" selected>superadmin</option></select></div>
+    <div style="flex:1;"></div>
+    <span style="font-size:11px;color:var(--text-muted);">SQL Engine</span>
+  </header>
+
+  <div class="page-title-bar">
+    <div class="page-title-icon"><i class="fas fa-bolt"></i></div>
+    <span class="page-title-text">SQL Engines</span>
+    <span class="page-title-sub">Spark Thrift JDBC/ODBC connections</span>
+    <div style="flex:1;"></div>
+    <button class="btn-accent" id="btnNewEngine"><i class="fas fa-plus"></i> New SQL Engine</button>
+  </div>
+
+  <div class="cc-cols">
+    <div class="panel-left">
+      <div class="panel-hdr">
+        <span class="panel-title">SQL Engines <span id="poolTotal" style="color:var(--text-sec);font-weight:600;"></span></span>
+        <button class="btn-sm" style="padding:3px 6px;font-size:11px;" id="btnRefresh" title="Refresh"><i class="fas fa-rotate"></i></button>
+      </div>
+      <div class="swrap"><i class="fas fa-search"></i><input id="poolSearch" placeholder="Search engines…"/></div>
+      <div class="pool-list" id="poolList"></div>
+      <div id="poolEmpty" style="display:none;padding:14px;color:var(--text-muted);font-size:12px;text-align:center;">No SQL engines configured.</div>
+    </div>
+
+    <div class="cc-center">
+      <div class="detail-header" id="detailHeader">
+        <div>
+          <div class="detail-title" id="detailTitle"><i class="fas fa-bolt" style="color:var(--amber);"></i> <span id="detailName">—</span></div>
+          <div class="detail-meta" id="detailMeta"></div>
+        </div>
+        <div style="display:flex;gap:6px;" id="detailActions"></div>
+      </div>
+      <div class="detail-area" id="detailArea">
+        <div id="detailContent"></div>
+        <div id="detailEmpty" class="detail-empty"><i class="fas fa-bolt"></i><div style="font-size:14px;font-weight:600;">Select a SQL Engine</div><div style="font-size:12px;">Click an engine from the list to view its configuration.</div></div>
+      </div>
+    </div>
+
+    <div class="panel-right">
+      <div class="stat-card">
+        <div class="stat-card-title"><i class="fas fa-bolt" style="color:var(--amber);"></i> Engine Overview</div>
+        <div class="stat-row"><span class="label">Total engines</span><span class="val" id="rightTotal">—</span></div>
+        <div class="stat-row"><span class="label">Active</span><span class="val" style="color:var(--success);" id="rightActive">—</span></div>
+        <div class="stat-row"><span class="label">Draining</span><span class="val" style="color:var(--warn);" id="rightDraining">—</span></div>
+        <div class="stat-row"><span class="label">Offline</span><span class="val" style="color:var(--error);" id="rightOffline">—</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-title"><i class="fas fa-circle-check" style="color:var(--success);"></i> Connectivity</div>
+        <div id="rightHealth"></div>
+      </div>
+      <div class="stat-card" id="duckdbConfigCard">
+        <div class="duckdb-hdr">
+          <div class="stat-card-title" style="margin-bottom:0;"><i class="fas fa-database" style="color:var(--purple);"></i> DuckDB Config</div>
+          <button class="btn-edit-cfg" id="btnEditDuckdbCfg" title="Edit configuration"><i class="fas fa-pen"></i></button>
+        </div>
+        <div id="duckdbConfigBody" style="margin-top:8px;">
+          <div style="font-size:11px;color:var(--text-muted);padding:8px 0;">Loading…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% else %}
+<div style="padding:40px;text-align:center;">
+  <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to manage SQL Engines</div>
+  <div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i><select onchange="engOnSuperChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div>
+</div>
+{% endif %}
+</div>
+
+<!-- SQL Engine Modal -->
+<div class="modal-backdrop" id="modalSql"><div class="modal-card">
+  <div class="modal-head"><div class="modal-title-wrap"><div class="modal-icon"><i class="fas fa-bolt"></i></div><div><div class="modal-title" id="sqlModalTitle">New SQL Engine</div><div class="modal-sub">Connect to a Spark Thrift server for SQL execution.</div></div></div><button class="btn-sm" id="btnSqlClose"><i class="fas fa-times"></i></button></div>
+  <div class="grid">
+    <div class="field"><div class="form-label"><span>Engine name</span></div><input class="form-control form-control-sm" id="sqlName" placeholder="e.g. Production Spark SQL"/></div>
+    <div class="field"><div class="form-label"><span>Status</span></div><select class="form-select form-select-sm" id="sqlStatus" style="font-family:var(--mono);"><option value="active">active</option><option value="draining">draining</option><option value="offline">offline</option></select></div>
+    <div class="field"><div class="form-label"><span>Thrift host</span><span class="form-help" style="font-family:var(--mono);">hostname / IP</span></div><input class="form-control form-control-sm" id="sqlHost" placeholder="e.g. 192.168.168.130" style="font-family:var(--mono);"/></div>
+    <div class="field"><div class="form-label"><span>Thrift port</span><span class="form-help" style="font-family:var(--mono);">default 10000</span></div><input class="form-control form-control-sm" id="sqlPort" type="number" min="1" max="65535" value="10000" style="font-family:var(--mono);"/></div>
+    <div class="field"><div class="form-label"><span>Min size (MB)</span></div><input class="form-control form-control-sm" id="sqlMinMB" type="number" min="0" step="0.1" value="0" style="font-family:var(--mono);"/></div>
+    <div class="field"><div class="form-label"><span>Max size (MB)</span></div><input class="form-control form-control-sm" id="sqlMaxMB" type="number" min="0" step="0.1" value="0" style="font-family:var(--mono);"/></div>
+  </div>
+  <div class="modal-footer"><div class="left"><button class="btn-sm btn-test" id="btnSqlTest"><i class="fas fa-plug-circle-check"></i> Test</button><span class="test-result" id="sqlTestResult"></span><span class="error" id="sqlError" style="display:none;"></span></div><div style="display:flex;gap:6px;"><button class="btn-sm" id="btnSqlCancel">Cancel</button><button class="btn-sm btn-primary" id="btnSqlSave"><i class="fas fa-save"></i> Save</button></div></div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+
+<!-- DuckDB Config Modal -->
+<div class="modal-backdrop" id="modalDuckdb"><div class="modal-card" style="border-left-color:var(--purple);width:620px;">
+  <div class="modal-head"><div class="modal-title-wrap"><div class="modal-icon" style="background:rgba(124,58,237,.1);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-database"></i></div><div><div class="modal-title">DuckDB Engine Configuration</div><div class="modal-sub">Runtime settings stored in Redis. Empty fields fall back to env vars or defaults.</div></div></div><button class="btn-sm" id="btnDuckdbClose"><i class="fas fa-times"></i></button></div>
+
+  <div style="margin-bottom:8px;"><div class="cfg-section-title" style="font-size:10px;padding:0 0 6px;">Engine Auto-Pick Thresholds</div></div>
+  <div class="grid">
+    <div class="field"><div class="form-label"><span>Lite max bytes</span><span class="form-help" id="dcHintLite"></span></div><input class="form-control form-control-sm" id="dcLiteMax" type="number" min="0" style="font-family:var(--mono);" placeholder="104857600"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Upper bound (bytes) for DuckDB Lite in AUTO mode</div></div>
+    <div class="field"><div class="form-label"><span>Spark min bytes</span><span class="form-help" id="dcHintSpark"></span></div><input class="form-control form-control-sm" id="dcSparkMin" type="number" min="0" style="font-family:var(--mono);" placeholder="10737418240"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Lower bound (bytes) for Spark in AUTO mode</div></div>
+    <div class="field"><div class="form-label"><span>Freshness (sec)</span><span class="form-help" id="dcHintFresh"></span></div><input class="form-control form-control-sm" id="dcFreshness" type="number" min="0" style="font-family:var(--mono);" placeholder="300"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Seconds until data is considered "stable" for Pro caching</div></div>
+  </div>
+
+  <div style="margin:12px 0 8px;"><div class="cfg-section-title" style="font-size:10px;padding:0 0 6px;">DuckDB Connection</div></div>
+  <div class="grid">
+    <div class="field"><div class="form-label"><span>Memory limit</span><span class="form-help" id="dcHintMem"></span></div><input class="form-control form-control-sm" id="dcMemory" style="font-family:var(--mono);" placeholder="1GB"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">DuckDB PRAGMA memory_limit (e.g. 8GB, 512MB)</div></div>
+    <div class="field"><div class="form-label"><span>IO multiplier</span><span class="form-help" id="dcHintIO"></span></div><input class="form-control form-control-sm" id="dcIOMult" type="number" min="1" max="20" style="font-family:var(--mono);" placeholder="3"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">CPU cores × multiplier = IO threads (default 3)</div></div>
+    <div class="field"><div class="form-label"><span>Threads</span><span class="form-help" id="dcHintThreads"></span></div><input class="form-control form-control-sm" id="dcThreads" type="number" min="0" style="font-family:var(--mono);" placeholder="auto"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Explicit thread count (empty = auto-derived)</div></div>
+    <div class="field"><div class="form-label"><span>HTTP timeout (sec)</span><span class="form-help" id="dcHintHTTP"></span></div><input class="form-control form-control-sm" id="dcHttpTimeout" type="number" min="1" style="font-family:var(--mono);" placeholder="30"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">DuckDB http_timeout for S3/HTTP reads</div></div>
+    <div class="field" style="grid-column:1/-1;"><div class="form-label"><span>External cache size</span><span class="form-help" id="dcHintCache"></span></div><input class="form-control form-control-sm" id="dcCacheSize" style="font-family:var(--mono);" placeholder="e.g. 50GB (empty = disabled)"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Disk-level data block cache (DuckDB ≥ 1.3). Leave empty to disable.</div></div>
+  </div>
+
+  <div class="modal-footer">
+    <div class="left"><span class="error" id="dcError" style="display:none;"></span></div>
+    <div style="display:flex;gap:6px;">
+      <button class="btn-sm" id="btnDuckdbReset" style="color:var(--error);border-color:rgba(239,68,68,.3);" title="Clear all Redis overrides"><i class="fas fa-rotate-left"></i> Reset to Defaults</button>
+      <button class="btn-sm" id="btnDuckdbCancel">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnDuckdbSave" style="background:var(--purple);border-color:var(--purple);"><i class="fas fa-save"></i> Save</button>
+    </div>
+  </div>
+</div></div>
+
+<script>
+(function(){
+  var ln=document.getElementById("link-engine");if(ln)ln.classList.add("active");
+  function enc(v){return encodeURIComponent(v||"");}
+  function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}
+  function toast(msg){var el=document.getElementById("toast");if(!el)return;el.textContent=String(msg||"");el.style.display="block";clearTimeout(toast._t);toast._t=setTimeout(function(){el.style.display="none";},1800);}
+  function root(){return document.getElementById("root");}
+  function ctx(){var r=root();return{org:r?(r.dataset.org||""):"",sup:r?(r.dataset.sup||""):""};}
+  async function getJSON(url){var r=await fetch(url,{credentials:"same-origin"});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.error))||t||"Request failed: "+r.status);return j;}
+  async function postJSON(url,obj){var r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj||{}),credentials:"same-origin"});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.error))||t||"Request failed: "+r.status);return j;}
+  async function del(url){var r=await fetch(url,{method:"DELETE",credentials:"same-origin"});var t=await r.text();var j;try{j=JSON.parse(t);}catch(e){}if(!r.ok)throw new Error((j&&(j.detail||j.error))||t||"Request failed: "+r.status);return j;}
+
+  window.engOnSuperChange=function(val){if(!val)return;var p=val.split("/");if(p.length<2)return;var org=p[0].trim(),sup=p[1].trim();if(!org||!sup)return;var r=root();if(r){r.dataset.org=org;r.dataset.sup=sup;}selectedPool=null;connStatus={};loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();};
+
+  var pools=[],selectedPool=null,searchQ="",connStatus={};
+
+  function filteredPools(){var items=pools;var q=(searchQ||"").trim().toLowerCase();if(q)items=items.filter(function(p){return(p.name||"").toLowerCase().indexOf(q)>=0||(p.thrift_host||"").toLowerCase().indexOf(q)>=0;});return items;}
+
+  // ---- Pool list ----
+  function renderPoolList(){
+    var wrap=document.getElementById("poolList"),empty=document.getElementById("poolEmpty"),total=document.getElementById("poolTotal");
+    if(!wrap)return;var items=filteredPools();
+    if(total)total.textContent="("+items.length+")";
+    wrap.innerHTML="";if(empty)empty.style.display=items.length?"none":"block";
+    items.forEach(function(p,i){
+      var cs=connStatus[p.id]||"unknown";
+      var div=document.createElement("div");
+      div.className="pool-item"+(selectedPool&&selectedPool.id===p.id?" active":"")+" fade-in";
+      div.style.animationDelay=(i*0.03)+"s";
+      div.innerHTML='<div class="picon"><i class="fas fa-bolt"></i></div>'+
+        '<div class="pmeta"><div class="pname">'+esc(p.name||"Engine")+'</div>'+
+        '<div class="pinfo">'+esc(p.thrift_host||"—")+':'+esc(String(p.thrift_port||10000))+'</div></div>'+
+        '<div class="pright">'+
+        '<button class="ptest-btn" data-pool-id="'+esc(p.id)+'" title="Test connection"><i class="fas fa-plug-circle-check"></i></button>'+
+        '<span class="conn-dot '+cs+'" data-dot-id="'+esc(p.id)+'" title="'+esc(cs)+'"></span>'+
+        '</div>';
+      div.querySelector(".pmeta").addEventListener("click",function(){selectPool(p);});
+      div.querySelector(".picon").addEventListener("click",function(){selectPool(p);});
+      div.querySelector(".ptest-btn").addEventListener("click",function(ev){ev.stopPropagation();testPoolInline(p);});
+      wrap.appendChild(div);
+    });
+  }
+
+  function selectPool(p){selectedPool=p;renderPoolList();renderDetail();}
+
+  // ---- Test ----
+  async function testPoolInline(p){
+    var c=ctx();connStatus[p.id]="testing";updateDot(p.id,"testing");
+    try{
+      var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:p.thrift_host||"",thrift_port:p.thrift_port||10000};
+      var js=await postJSON("/api/v1/compute/test-connection",payload);
+      connStatus[p.id]=js&&js.ok?"ok":"fail";
+    }catch(e){connStatus[p.id]="fail";}
+    updateDot(p.id,connStatus[p.id]);
+    renderRight();
+  }
+  function updateDot(poolId,status){document.querySelectorAll('[data-dot-id="'+poolId+'"]').forEach(function(d){d.className="conn-dot "+status;d.title=status;});}
+  function testAllPools(){pools.forEach(function(p){testPoolInline(p);});}
+
+  // ---- Detail ----
+  function renderDetail(){
+    var content=document.getElementById("detailContent"),empty=document.getElementById("detailEmpty"),nameEl=document.getElementById("detailName"),metaEl=document.getElementById("detailMeta"),actions=document.getElementById("detailActions");
+    if(!selectedPool){if(content)content.innerHTML="";if(empty)empty.style.display="flex";if(nameEl)nameEl.textContent="—";if(metaEl)metaEl.textContent="";if(actions)actions.innerHTML="";return;}
+    var p=selectedPool;if(empty)empty.style.display="none";
+    if(nameEl)nameEl.textContent=p.name||"Engine";
+    if(metaEl)metaEl.textContent="ID: "+(p.id||"—");
+
+    var btns='<button class="btn-sm btn-test" id="detailTest"><i class="fas fa-plug-circle-check"></i> Test</button>';
+    btns+='<button class="btn-sm" id="detailEdit"><i class="fas fa-pen"></i> Edit</button>';
+    btns+='<button class="btn-sm btn-danger" id="detailDelete"><i class="fas fa-trash"></i> Delete</button>';
+    if(actions)actions.innerHTML=btns;
+    document.getElementById("detailTest").addEventListener("click",function(){testPoolInline(p);toast("Testing "+p.name+"…");});
+    document.getElementById("detailEdit").addEventListener("click",function(){openSqlModal(p);});
+    document.getElementById("detailDelete").addEventListener("click",function(){deletePool(p);});
+
+    var cs=connStatus[p.id]||"unknown";
+    var html='<div class="config-grid">';
+    html+='<div class="config-card full"><div class="cl">Connection</div><div class="cv" style="display:flex;align-items:center;gap:8px;"><span class="conn-dot '+cs+'" data-dot-id="'+esc(p.id)+'"></span> '+(cs==="ok"?"Connected":cs==="fail"?"Failed":cs==="testing"?"Testing…":"Not tested")+"</div></div>";
+    html+='<div class="config-card"><div class="cl">Status</div><div class="cv"><span class="conn-dot '+(p.status||"active")+'" style="display:inline-block;margin-right:6px;width:8px;height:8px;border-radius:50%;background:'+(p.status==="active"?"var(--success)":p.status==="draining"?"var(--warn)":"var(--error)")+';"></span>'+esc(p.status||"active")+"</div></div>";
+    html+='<div class="config-card"><div class="cl">Thrift Host</div><div class="cv">'+esc(p.thrift_host||"—")+"</div></div>";
+    html+='<div class="config-card"><div class="cl">Thrift Port</div><div class="cv">'+esc(String(p.thrift_port||10000))+"</div></div>";
+    html+='<div class="config-card"><div class="cl">Min Size</div><div class="cv">'+(p.min_bytes?((p.min_bytes/1e6).toFixed(1)+" MB"):"—")+"</div></div>";
+    html+='<div class="config-card"><div class="cl">Max Size</div><div class="cv">'+(p.max_bytes?((p.max_bytes/1e6).toFixed(1)+" MB"):"unlimited")+"</div></div>";
+    html+="</div>";
+    if(content)content.innerHTML=html;
+  }
+
+  // ---- Right panel ----
+  function renderRight(){
+    var total=pools.length,active=0,draining=0,offline=0,tested=0,ok=0;
+    pools.forEach(function(p){if((p.status||"active")==="active")active++;else if(p.status==="draining")draining++;else offline++;var cs=connStatus[p.id];if(cs==="ok"||cs==="fail")tested++;if(cs==="ok")ok++;});
+    document.getElementById("rightTotal").textContent=String(total);
+    document.getElementById("rightActive").textContent=String(active);
+    document.getElementById("rightDraining").textContent=String(draining);
+    document.getElementById("rightOffline").textContent=String(offline);
+
+    var pct=tested?Math.round(ok/tested*100):0;
+    var color=pct>=80?"var(--success)":pct>=50?"var(--warn)":"var(--error)";
+    if(!tested)color="var(--text-muted)";
+    document.getElementById("rightHealth").innerHTML=
+      '<div class="stat-row"><span class="label">Tested</span><span class="val">'+tested+'/'+total+'</span></div>'+
+      '<div class="stat-row"><span class="label">Reachable</span><span class="val" style="color:'+color+';">'+ok+'/'+tested+'</span></div>'+
+      '<div style="height:6px;border-radius:3px;background:var(--bg-surface);margin-top:6px;overflow:hidden;border:1px solid var(--border-light);"><div style="height:100%;border-radius:3px;width:'+(tested?pct:0)+'%;background:'+color+';transition:width .6s;"></div></div>'+
+      '<div style="margin-top:6px;font-size:10px;color:var(--text-muted);">All engines are tested on load. Click <i class="fas fa-plug-circle-check"></i> to re-test.</div>';
+  }
+
+  // ---- Data (reuses /api/v1/compute/pools/* endpoints, filters to spark-thrift) ----
+  async function loadPools(){
+    var c=ctx();
+    var js=await getJSON("/api/v1/compute/pools?org="+enc(c.org)+"&sup="+enc(c.sup));
+    var all=js&&js.data&&Array.isArray(js.data.items)?js.data.items:[];
+    pools=all.filter(function(p){return p.kind==="spark-thrift";});
+    if(selectedPool){var found=pools.find(function(p){return p.id===selectedPool.id;});selectedPool=found||null;}
+    renderPoolList();renderDetail();renderRight();testAllPools();
+  }
+  async function upsertPool(pool){var c=ctx();await postJSON("/api/v1/compute/upsert",{org:c.org,sup:c.sup,item:pool});await loadPools();}
+  async function deletePool(pool){var c=ctx();if(!confirm("Delete engine '"+pool.name+"'?"))return;await del("/api/v1/compute/pools/"+enc(pool.id)+"?org="+enc(c.org)+"&sup="+enc(c.sup));if(selectedPool&&selectedPool.id===pool.id)selectedPool=null;delete connStatus[pool.id];await loadPools();toast("Deleted");}
+
+  // ---- SQL Modal ----
+  var sqlEditId=null;
+  function sqlModalShow(){document.getElementById("modalSql").style.display="flex";setTimeout(function(){try{document.getElementById("sqlName").focus();}catch(e){}},0);}
+  function sqlModalHide(){document.getElementById("modalSql").style.display="none";sqlEditId=null;clrTest();clrErr();}
+  function openSqlModal(existing){var isEdit=Boolean(existing&&existing.id);sqlEditId=isEdit?existing.id:null;document.getElementById("sqlModalTitle").textContent=isEdit?"Edit SQL Engine":"New SQL Engine";document.getElementById("sqlName").value=(existing&&existing.name)||"";document.getElementById("sqlStatus").value=(existing&&existing.status)||"active";document.getElementById("sqlHost").value=(existing&&existing.thrift_host)||"";document.getElementById("sqlPort").value=String((existing&&existing.thrift_port)||10000);document.getElementById("sqlMinMB").value=String(((existing&&existing.min_bytes)||0)/1000000);document.getElementById("sqlMaxMB").value=String(((existing&&existing.max_bytes)||0)/1000000);clrTest();clrErr();sqlModalShow();}
+  function collectSql(){var name=(document.getElementById("sqlName").value||"").trim();if(!name)throw new Error("Engine name is required.");var host=(document.getElementById("sqlHost").value||"").trim();if(!host)throw new Error("Thrift host is required.");return{id:sqlEditId||"",name:name,kind:"spark-thrift",thrift_host:host,thrift_port:parseInt(document.getElementById("sqlPort").value||"10000",10)||10000,status:document.getElementById("sqlStatus").value||"active",s3_enabled:true,s3_endpoint:"",min_bytes:Math.max(0,Math.round(parseFloat(document.getElementById("sqlMinMB").value||"0")*1000000)||0),max_bytes:Math.max(0,Math.round(parseFloat(document.getElementById("sqlMaxMB").value||"0")*1000000)||0),is_default:false,size:"small",max_concurrency:1,has_internet:false,ws_url:""};}
+  function clrTest(){var el=document.getElementById("sqlTestResult");if(el){el.className="test-result";el.style.display="none";el.textContent="";}}
+  function showTest(status,msg){var el=document.getElementById("sqlTestResult");if(!el)return;el.className="test-result "+status;el.style.display="inline-flex";var icon=status==="success"?"fa-check-circle":status==="fail"?"fa-times-circle":"fa-spinner fa-spin";el.innerHTML='<i class="fas '+icon+'"></i> '+esc(msg);}
+  function clrErr(){var el=document.getElementById("sqlError");if(el){el.style.display="none";el.textContent="";}}
+  function showErr(msg){var el=document.getElementById("sqlError");if(el){el.textContent=msg;el.style.display="";}}
+
+  document.getElementById("btnSqlClose").addEventListener("click",function(e){e.preventDefault();sqlModalHide();});
+  document.getElementById("btnSqlCancel").addEventListener("click",function(e){e.preventDefault();sqlModalHide();});
+  document.getElementById("btnSqlSave").addEventListener("click",function(e){e.preventDefault();try{var p=collectSql();upsertPool(p).then(function(){sqlModalHide();toast(sqlEditId?"Saved":"Created");}).catch(function(err){showErr(err.message);});}catch(err){showErr(err.message);}});
+  document.getElementById("btnSqlTest").addEventListener("click",function(e){
+    e.preventDefault();var btn=document.getElementById("btnSqlTest");if(btn)btn.disabled=true;showTest("testing","Testing...");
+    var c=ctx();var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:(document.getElementById("sqlHost").value||"").trim(),thrift_port:parseInt(document.getElementById("sqlPort").value||"10000",10)||10000};
+    postJSON("/api/v1/compute/test-connection",payload).then(function(js){showTest(js&&js.ok?"success":"fail",(js&&js.message)||"Done");}).catch(function(err){showTest("fail",err.message||"Failed");}).finally(function(){if(btn)btn.disabled=false;});
+  });
+  document.getElementById("modalSql").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalSql"))sqlModalHide();});
+
+  document.getElementById("btnNewEngine").addEventListener("click",function(){openSqlModal(null);});
+  document.getElementById("poolSearch").addEventListener("input",function(ev){searchQ=ev.target.value||"";renderPoolList();});
+  document.getElementById("btnRefresh").addEventListener("click",function(){connStatus={};loadPools().catch(function(e){toast(e.message);});});
+
+  document.addEventListener("keydown",function(ev){if(ev.key==="Escape"){var el=document.getElementById("modalSql");if(el&&el.style.display==="flex")el.style.display="none";var el2=document.getElementById("modalDuckdb");if(el2&&el2.style.display==="flex")el2.style.display="none";}});
+
+  // ==== DuckDB Config ====
+  var duckdbCfg=null;
+
+  // Field definitions: id → {redis key, human label, format fn}
+  var DC_FIELDS=[
+    {key:"engine_lite_max_bytes",  input:"dcLiteMax",     label:"Lite max",    hint:"dcHintLite",    fmt:function(v){return v?fmtBytes(v):"—";}},
+    {key:"engine_spark_min_bytes", input:"dcSparkMin",    label:"Spark min",   hint:"dcHintSpark",   fmt:function(v){return v?fmtBytes(v):"—";}},
+    {key:"engine_freshness_sec",   input:"dcFreshness",   label:"Freshness",   hint:"dcHintFresh",   fmt:function(v){return v?(v+"s"):"—";}},
+    {key:"duckdb_memory_limit",    input:"dcMemory",      label:"Memory",      hint:"dcHintMem",     fmt:function(v){return v||"—";}},
+    {key:"duckdb_io_multiplier",   input:"dcIOMult",      label:"IO mult",     hint:"dcHintIO",      fmt:function(v){return v?("×"+v):"—";}},
+    {key:"duckdb_threads",         input:"dcThreads",     label:"Threads",     hint:"dcHintThreads", fmt:function(v){return v||"auto";}},
+    {key:"duckdb_http_timeout",    input:"dcHttpTimeout", label:"HTTP timeout",hint:"dcHintHTTP",    fmt:function(v){return v?(v+"s"):"—";}},
+    {key:"duckdb_external_cache_size",input:"dcCacheSize",label:"Disk cache",  hint:"dcHintCache",   fmt:function(v){return v||"off";}}
+  ];
+
+  function fmtBytes(v){
+    var n=parseInt(v,10);if(!n||isNaN(n))return String(v);
+    if(n>=1073741824)return (n/1073741824).toFixed(1).replace(/\.0$/,"")+" GB";
+    if(n>=1048576)return (n/1048576).toFixed(1).replace(/\.0$/,"")+" MB";
+    if(n>=1024)return (n/1024).toFixed(0)+" KB";
+    return n+" B";
+  }
+
+  function srcBadge(s){return '<span class="src-badge '+esc(s)+'">'+esc(s)+'</span>';}
+
+  function renderDuckdbConfig(){
+    var body=document.getElementById("duckdbConfigBody");
+    if(!body)return;
+    if(!duckdbCfg){body.innerHTML='<div style="font-size:11px;color:var(--text-muted);padding:4px 0;">Not loaded</div>';return;}
+    var html='<div class="cfg-section-title">Auto-Pick</div>';
+    DC_FIELDS.forEach(function(f,i){
+      if(i===3)html+='<div class="cfg-section-title" style="margin-top:4px;">Connection</div>';
+      var c=duckdbCfg[f.key]||{};
+      var val=c.value||"";
+      var src=c.source||"default";
+      html+='<div class="cfg-row"><span class="label">'+esc(f.label)+'</span><span class="val">'+esc(f.fmt(val))+' '+srcBadge(src)+'</span></div>';
+    });
+    if(duckdbCfg.modified_ms){
+      var d=new Date(duckdbCfg.modified_ms);
+      html+='<div style="margin-top:8px;font-size:9px;color:var(--text-muted);border-top:1px solid var(--border-light);padding-top:4px;">Last saved: '+d.toLocaleString()+'</div>';
+    }
+    body.innerHTML=html;
+  }
+
+  async function loadDuckdbConfig(){
+    var c=ctx();if(!c.org||!c.sup)return;
+    try{
+      var js=await getJSON("/api/v1/engine/config?org="+enc(c.org)+"&sup="+enc(c.sup));
+      duckdbCfg=js&&js.config?js.config:null;
+    }catch(e){duckdbCfg=null;}
+    renderDuckdbConfig();
+  }
+
+  function openDuckdbModal(){
+    // Populate inputs from current config
+    DC_FIELDS.forEach(function(f){
+      var el=document.getElementById(f.input);if(!el)return;
+      var c=duckdbCfg&&duckdbCfg[f.key]?duckdbCfg[f.key]:{};
+      // Show the Redis value if present; otherwise leave empty (placeholder shows default)
+      el.value=(c.source==="redis")?c.value:"";
+      // Show hint: current source
+      var hintEl=document.getElementById(f.hint);
+      if(hintEl){
+        if(c.source==="env")hintEl.textContent="env: "+c.value;
+        else if(c.source==="default"&&c.default)hintEl.textContent="default: "+c.default;
+        else hintEl.textContent="";
+      }
+    });
+    var errEl=document.getElementById("dcError");if(errEl){errEl.style.display="none";errEl.textContent="";}
+    document.getElementById("modalDuckdb").style.display="flex";
+  }
+
+  function closeDuckdbModal(){document.getElementById("modalDuckdb").style.display="none";}
+
+  async function saveDuckdbConfig(configObj){
+    var c=ctx();
+    var errEl=document.getElementById("dcError");
+    try{
+      var js=await postJSON("/api/v1/engine/config",{org:c.org,sup:c.sup,config:configObj});
+      duckdbCfg=js&&js.config?js.config:duckdbCfg;
+      renderDuckdbConfig();
+      closeDuckdbModal();
+      toast("DuckDB config saved");
+    }catch(e){
+      if(errEl){errEl.textContent=e.message;errEl.style.display="";}
+    }
+  }
+
+  document.getElementById("btnEditDuckdbCfg").addEventListener("click",function(){openDuckdbModal();});
+  document.getElementById("btnDuckdbClose").addEventListener("click",function(e){e.preventDefault();closeDuckdbModal();});
+  document.getElementById("btnDuckdbCancel").addEventListener("click",function(e){e.preventDefault();closeDuckdbModal();});
+  document.getElementById("modalDuckdb").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalDuckdb"))closeDuckdbModal();});
+
+  document.getElementById("btnDuckdbSave").addEventListener("click",function(e){
+    e.preventDefault();
+    var cfg={};
+    DC_FIELDS.forEach(function(f){
+      var el=document.getElementById(f.input);if(!el)return;
+      var v=(el.value||"").trim();
+      if(v)cfg[f.key]=v;
+      // omit empty → clears Redis field, falls back to env/default
+    });
+    saveDuckdbConfig(cfg);
+  });
+
+  document.getElementById("btnDuckdbReset").addEventListener("click",function(e){
+    e.preventDefault();
+    if(!confirm("Clear all Redis overrides? Settings will fall back to environment variables or defaults."))return;
+    saveDuckdbConfig({});
+  });
+
+  var _ctx=ctx();if(_ctx.org&&_ctx.sup){loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();}
+})();
+</script>
+</body>
+</html>
