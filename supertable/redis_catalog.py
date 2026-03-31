@@ -275,6 +275,12 @@ for _, uid in ipairs(user_ids) do
     end
 end
 
+-- Clean up role_name → role_id mapping atomically
+local role_name_lower = ARGV[5]
+if role_name_lower and role_name_lower ~= '' then
+    redis.call('HDEL', KEYS[6], role_name_lower)
+end
+
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], role_id)
 redis.call('SREM', KEYS[3], role_id)
@@ -407,7 +413,16 @@ return 1
             return False
 
     def leaf_exists(self, org: str, sup: str, simple: str) -> bool:
-        """Check existence of meta:leaf key for a simple table."""
+        """Check existence of meta:leaf key for a simple table (replica-aware)."""
+        info = self._resolve_replica_info(org, sup)
+        if info:
+            source, allowed = info
+            if allowed and simple not in allowed:
+                return False
+            return self._leaf_exists_raw(org, source, simple)
+        return self._leaf_exists_raw(org, sup, simple)
+
+    def _leaf_exists_raw(self, org: str, sup: str, simple: str) -> bool:
         try:
             return bool(self.r.exists(_leaf_key(org, sup, simple)))
         except redis.RedisError as e:
@@ -477,13 +492,58 @@ return 1
             logger.error(f"[redis-catalog] root_bump error: {e}")
             raise
 
+    # ------------- Replica resolution ------------------------------------
+
+    def _resolve_replica_info(self, org: str, sup: str) -> Optional[tuple]:
+        """If *sup* is a replica clone, return (source_name, allowed_tables).
+
+        Returns None for non-replicas.  Never follows chains (if source
+        is itself a replica, we stop — one level only).
+        Single get_root() call — avoids redundant Redis reads.
+        """
+        try:
+            root = self.get_root(org, sup)
+            if root and root.get("clone_type") == "replica":
+                source = root.get("cloned_from", "")
+                if source and source != sup:
+                    tables = root.get("replica_tables")
+                    allowed = tables if isinstance(tables, list) and tables else None
+                    return (source, allowed)
+        except Exception:
+            pass
+        return None
+
+    # Keep backward-compatible wrappers for gc.py and other callers
+    def _resolve_replica_source(self, org: str, sup: str) -> Optional[str]:
+        info = self._resolve_replica_info(org, sup)
+        return info[0] if info else None
+
+    # ------------- Leaf access (with replica resolution) ------------------
+
     def get_leaf(self, org: str, sup: str, simple: str) -> Optional[Dict]:
+        info = self._resolve_replica_info(org, sup)
+        if info:
+            source, allowed = info
+            if allowed and simple not in allowed:
+                return None
+            return self._get_leaf_raw(org, source, simple)
+        return self._get_leaf_raw(org, sup, simple)
+
+    def _get_leaf_raw(self, org: str, sup: str, simple: str) -> Optional[Dict]:
         try:
             raw = self.r.get(_leaf_key(org, sup, simple))
             return json.loads(raw) if raw else None
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_leaf error: {e}")
             return None
+
+    def delete_leaf(self, org: str, sup: str, simple: str) -> bool:
+        """Delete a leaf pointer (used when unlinking shared tables)."""
+        try:
+            return bool(self.r.delete(_leaf_key(org, sup, simple)))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_leaf error: {e}")
+            return False
 
     def set_leaf_path_cas(self, org: str, sup: str, simple: str, path: str, now_ms: Optional[int] = None) -> int:
         try:
@@ -589,13 +649,19 @@ return 1
         return m if isinstance(m, str) else m.decode("utf-8")
 
     def get_users(self, org: str, sup: str) -> List[Dict[str, Any]]:
-        """Get all users for organization (reads from SET index, not SCAN)."""
+        """Get all users for organization (pipeline batch, not N+1 reads)."""
         users: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(_rbac_user_index_key(org, sup))
-            for uid_raw in (members or []):
-                uid = self._decode_member(uid_raw)
-                raw = self.r.hgetall(_rbac_user_doc_key(org, sup, uid))
+            if not members:
+                return users
+            uids = [self._decode_member(m) for m in members]
+            # Pipeline: batch HGETALL for all user docs
+            with self.r.pipeline() as pipe:
+                for uid in uids:
+                    pipe.hgetall(_rbac_user_doc_key(org, sup, uid))
+                results = pipe.execute()
+            for raw in results:
                 if raw:
                     data: Dict[str, Any] = dict(raw)
                     if "roles" in data:
@@ -609,13 +675,19 @@ return 1
         return users
 
     def get_roles(self, org: str, sup: str) -> List[Dict[str, Any]]:
-        """Get all roles for organization (reads from SET index, not SCAN)."""
+        """Get all roles for organization (pipeline batch, not N+1 reads)."""
         roles: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(_rbac_role_index_key(org, sup))
-            for rid_raw in (members or []):
-                rid = self._decode_member(rid_raw)
-                raw = self.r.hgetall(_rbac_role_doc_key(org, sup, rid))
+            if not members:
+                return roles
+            rids = [self._decode_member(m) for m in members]
+            # Pipeline: batch HGETALL for all role docs
+            with self.r.pipeline() as pipe:
+                for rid in rids:
+                    pipe.hgetall(_rbac_role_doc_key(org, sup, rid))
+                results = pipe.execute()
+            for raw in results:
                 if raw:
                     data: Dict[str, Any] = dict(raw)
                     for field in ("tables", "columns", "filters"):
@@ -720,7 +792,7 @@ return 1
         self._rbac_bump(_rbac_role_meta_key(org, sup))
 
     def rbac_delete_role(self, org: str, sup: str, role_id: str) -> bool:
-        """Atomically delete a role and strip it from every user's role list."""
+        """Atomically delete a role, strip from users, and clean name→id mapping."""
         key = _rbac_role_doc_key(org, sup, role_id)
         if not self.r.exists(key):
             return False
@@ -737,14 +809,11 @@ return 1
                 _rbac_role_type_index_key(org, sup, role_type),
                 _rbac_role_meta_key(org, sup),
                 _rbac_user_index_key(org, sup),
+                _rbac_rolename_to_id_key(org, sup),
             ],
-            args=[role_id, str(_now_ms()), org, sup],
+            args=[role_id, str(_now_ms()), org, sup, role_name.lower() if role_name else ""],
         )
-        if int(result or 0) == 1:
-            if role_name:
-                self.r.hdel(_rbac_rolename_to_id_key(org, sup), role_name.lower())
-            return True
-        return False
+        return int(result or 0) == 1
 
     def rbac_role_exists(self, org: str, sup: str, role_id: str) -> bool:
         return bool(self.r.exists(_rbac_role_doc_key(org, sup, role_id)))
@@ -793,13 +862,18 @@ return 1
         pipe.execute()
         self._rbac_bump(_rbac_user_meta_key(org, sup))
 
-    def rbac_update_user(self, org: str, sup: str, user_id: str, fields: Dict[str, str]) -> None:
-        """Update specific fields of an existing user in-place."""
+    def rbac_update_user(self, org: str, sup: str, user_id: str, fields: Dict[str, Any]) -> None:
+        """Update specific fields of an existing user in-place.
+
+        Values are serialized the same way as ``rbac_create_user`` — callers
+        should pass raw Python objects, not pre-encoded JSON.
+        """
         key = _rbac_user_doc_key(org, sup, user_id)
         if not self.r.exists(key):
             raise ValueError(f"User {user_id} does not exist")
         fields["modified_ms"] = str(_now_ms())
-        self.r.hset(key, mapping=fields)
+        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
+        self.r.hset(key, mapping=redis_data)
         self._rbac_bump(_rbac_user_meta_key(org, sup))
 
     def rbac_rename_user(self, org: str, sup: str, user_id: str, old_username: str, new_username: str) -> None:
@@ -968,14 +1042,23 @@ return 1
     # ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:*"""
-        pattern = f"supertable:{org}:{sup}:meta:leaf:*"
+        """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:* (replica-aware)."""
+        info = self._resolve_replica_info(org, sup)
+        effective_sup = info[0] if info else sup
+        allowed = info[1] if info else None
+
+        pattern = f"supertable:{org}:{effective_sup}:meta:leaf:*"
         cursor = 0
         try:
             while True:
                 cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
                 for k in keys:
-                    yield k if isinstance(k, str) else k.decode('utf-8')
+                    ks = k if isinstance(k, str) else k.decode('utf-8')
+                    if allowed:
+                        simple = ks.rsplit("meta:leaf:", 1)[-1]
+                        if simple not in allowed:
+                            continue
+                    yield ks
                 if cursor == 0:
                     break
         except redis.RedisError as e:

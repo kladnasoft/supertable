@@ -143,32 +143,20 @@ class MetaReader:
 
 
     def _get_all_tables(self) -> List[str]:
-        """
-        Get all tables for this super table by scanning Redis keys.
-        """
+        """Get all tables for this super table via catalog (replica-aware)."""
         try:
-            # Pattern to match all leaf pointers for this organization/super
-            pattern = f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:*"
-
             tables = []
             seen = set()
-            cursor = 0
-            while True:
-                cursor, keys = self.catalog.r.scan(cursor=cursor, match=pattern, count=1000)
-                for key in keys:
-                    # Handle both bytes and string keys
-                    if isinstance(key, bytes):
-                        key_str = key.decode('utf-8')
-                    else:
-                        key_str = str(key)
-
-                    # Extract table name from key: supertable:org:super:meta:leaf:table_name
-                    table_name = key_str.split(':')[-1]
-                    if table_name and table_name not in seen:
-                        seen.add(table_name)
-                        tables.append(table_name)
-                if cursor == 0:
-                    break
+            for key in self.catalog.scan_leaf_keys(
+                self.super_table.organization,
+                self.super_table.super_name,
+                count=1000,
+            ):
+                key_str = key if isinstance(key, str) else key.decode('utf-8')
+                table_name = key_str.rsplit("meta:leaf:", 1)[-1]
+                if table_name and table_name not in seen:
+                    seen.add(table_name)
+                    tables.append(table_name)
             return tables
         except Exception as e:
             logger.error(f"Error getting tables from Redis: {e}")

@@ -22,7 +22,7 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
-from supertable.data_classes import DedupViewDef, TombstoneDef
+from supertable.data_classes import DedupViewDef, TombstoneDef, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 
 
@@ -136,6 +136,7 @@ class DataReader:
                             )
 
                     # Tombstone filtering: read from snapshot payload in Redis leaf
+                    payload = None
                     try:
                         leaf = catalog.get_leaf(
                             self.organization, td.super_name, td.simple_name,
@@ -153,6 +154,28 @@ class DataReader:
                                     )
                     except Exception as te:
                         logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))
+
+                    # Linked-share row filter: the provider may have set a
+                    # row_filter on the share.  Inject it as a synthetic RBAC
+                    # WHERE clause so the executor enforces it automatically.
+                    try:
+                        if isinstance(payload, dict):
+                            share_row_filter = payload.get("_row_filter")
+                            if share_row_filter and isinstance(share_row_filter, str):
+                                existing_rbac = reflection.rbac_views.get(td.alias)
+                                if existing_rbac:
+                                    # Merge: AND the share filter with existing RBAC filter
+                                    if existing_rbac.where_clause:
+                                        existing_rbac.where_clause = f"({existing_rbac.where_clause}) AND ({share_row_filter})"
+                                    else:
+                                        existing_rbac.where_clause = share_row_filter
+                                else:
+                                    reflection.rbac_views[td.alias] = RbacViewDef(
+                                        allowed_columns=["*"],
+                                        where_clause=share_row_filter,
+                                    )
+                    except Exception as rf_err:
+                        logger.debug(self._lp(f"[share-filter] row filter injection failed for {td.alias}: {rf_err}"))
 
             except Exception as e:
                 logger.warning(self._lp(f"[dedup] config lookup failed, skipping dedup: {e}"))

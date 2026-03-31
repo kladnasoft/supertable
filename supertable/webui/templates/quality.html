@@ -236,7 +236,6 @@
 .section-title { font-size: 14px; font-weight: 700; color: var(--text-color); }
 .section-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 ::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--panel-border);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
-#pairSel{display:none;}
 </style>
 <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
 </head>
@@ -244,13 +243,9 @@
 {% include "sidebar.html" %}
 <div class="content-container">
 {% if selected_org and selected_sup %}
-<select id="pairSel">{% for t in tenants %}<option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>{% endfor %}</select>
 
 <!-- ═══ TOP BAR ═══ -->
 <header class="cc-topbar">
-  <div class="super-sel"><i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i><select onchange="dqOnTenantChange(this.value)">{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div>
-  <div class="topbar-sep"></div>
-  <div class="role-pill"><i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i><label>Role</label><select id="dqRoleSel"><option value="superadmin" selected>superadmin</option></select></div>
   <div style="flex:1;"></div>
   <span style="font-size:11px;color:var(--text-muted);" id="dqTopSummary"></span>
   <div class="topbar-sep"></div>
@@ -722,7 +717,7 @@
 </div><!-- /cc-cols -->
 
 {% else %}
-<div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view Data Quality</div><div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i><select onchange="dqOnTenantChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div></div>
+<div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable from the sidebar</div></div>
 {% endif %}
 </div><!-- /content-container -->
 
@@ -1988,6 +1983,17 @@ if (DQ_ORG && DQ_SUP) {
       });
     }).catch(function() {});
 }
+</script>
+
+<script>
+window.addEventListener("supertable-changed", function(e) {
+  var d = (e && e.detail) || {};
+  if (!d.org || !d.sup) return;
+  var url = new URL('/ui/quality', window.location.origin);
+  url.searchParams.set('org', d.org);
+  url.searchParams.set('sup', d.sup);
+  window.location.href = url.toString();
+});
 </script>
 
 </body>

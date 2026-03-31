@@ -47,6 +47,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;}
 .badge-active{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
 .badge-linked{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
+.badge-healthy{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
+.badge-expiring{background:var(--warn-bg);color:#d97706;border:1px solid rgba(245,158,11,.2);}
+.badge-expired{background:var(--error-bg);color:var(--error);border:1px solid rgba(239,68,68,.2);}
 .empty{text-align:center;padding:30px;color:var(--text-muted);font-size:12px;}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9999;justify-content:center;align-items:center;}
 .modal-overlay.active{display:flex;}
@@ -101,14 +104,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div id="linksList"></div>
   {% else %}
     <div style="padding:40px;text-align:center;">
-      <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view linked shares</div>
-      <div style="display:inline-flex;align-items:center;gap:8px;">
-        <i class="fas fa-cube" style="color:var(--primary);"></i>
-        <select onchange="if(this.value)window.location.href='/ui/sharing?org='+this.value.split('/')[0]+'&sup='+this.value.split('/')[1]" style="min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);">
-          <option value="">— Select —</option>
-          {% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}
-        </select>
-      </div>
+      <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable from the sidebar to view linked shares</div>
     </div>
   {% endif %}
   </div>
@@ -117,13 +113,28 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 <!-- Create Share Modal -->
 <div class="modal-overlay" id="modalCreateShare">
-  <div class="modal-box">
+  <div class="modal-box" style="width:580px;">
     <div class="modal-title"><i class="fas fa-share-from-square" style="color:var(--primary);"></i> Create share</div>
     <div id="csErr"></div>
     <div class="field-group"><div class="field-label">SuperTable</div><select class="field-select" id="csSuper"></select></div>
     <div class="field-group"><div class="field-label">Tables to share</div><select class="field-select" id="csTables" multiple style="height:100px;"></select><div class="field-hint">Hold Ctrl/Cmd to select multiple tables.</div></div>
     <div class="field-group"><div class="field-label">Grantee organization</div><input class="field-input" id="csGrantee" placeholder="partner-org" autocomplete="off"/></div>
     <div class="field-group"><div class="field-label">Label (optional)</div><input class="field-input" id="csLabel" placeholder="Q4 sales data for Partner Inc" autocomplete="off"/></div>
+    <div class="field-group">
+      <div class="field-label">Column filter (optional)</div>
+      <input class="field-input" id="csColumns" placeholder='e.g. orders:id,amount,date  customers:name,email' autocomplete="off"/>
+      <div class="field-hint">Format: table:col1,col2  table2:col1,col2. Leave empty for all columns.</div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Row filter (optional)</div>
+      <input class="field-input" id="csRowFilter" placeholder='e.g. orders:region = &#39;EU&#39;  customers:active = true' autocomplete="off"/>
+      <div class="field-hint">Format: table:SQL WHERE predicate. Leave empty for all rows.</div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Point-in-time (optional)</div>
+      <input class="field-input" id="csTimestamp" type="datetime-local" style="max-width:260px;"/>
+      <div class="field-hint">Leave empty for live data. Set a date to share a frozen snapshot.</div>
+    </div>
     <div class="modal-actions">
       <button class="btn-sm" onclick="hide('modalCreateShare')">Cancel</button>
       <button class="btn-sm btn-primary" id="btnCreateShare"><i class="fas fa-share"></i> Create</button>
@@ -166,6 +177,24 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   </div>
 </div>
 
+<!-- Materialize Modal -->
+<div class="modal-overlay" id="modalMaterialize">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-download" style="color:var(--primary);"></i> Materialize linked share</div>
+    <div id="matErr"></div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:12px;">Download all shared data into a new local SuperTable. This creates an independent copy — changes to the source will not be reflected.</p>
+    <input type="hidden" id="matLinkId"/>
+    <div class="field-group"><div class="field-label">Target SuperTable name</div><input class="field-input" id="matTarget" placeholder="imported-data" autocomplete="off"/></div>
+    <div id="matProgress" style="display:none;padding:12px;background:var(--bg-surface);border-radius:var(--radius-sm);margin-top:8px;">
+      <div style="font-size:12px;font-weight:600;color:var(--text);"><i class="fas fa-spinner fa-spin" style="color:var(--primary);"></i> Downloading data…</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalMaterialize')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnMaterialize"><i class="fas fa-download"></i> Materialize</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -197,11 +226,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var p=document.getElementById("pane-"+b.getAttribute("data-pane"));if(p)p.classList.add("active");
   });});
 
-  // ── Provider: list shares ──
+  // ── Provider: list shares (with dashboard stats) ──
   async function loadShares(){
     var el=document.getElementById("sharesList");
     try{
-      var d=await api("GET","/api/v1/shares?organization="+enc(ORG));
+      var d=await api("GET","/api/v1/shares/dashboard?organization="+enc(ORG));
       var shares=d.shares||[];
       if(!shares.length){el.innerHTML='<div class="empty"><i class="fas fa-share-nodes"></i> No outgoing shares yet.</div>';return;}
       var h="";
@@ -213,6 +242,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         h+='<span><i class="fas fa-table"></i> '+(s.tables||[]).join(", ")+'</span>';
         h+='<span><i class="fas fa-calendar"></i> '+fmtDate(s.created_ms)+'</span>';
         if(s.label)h+='<span><i class="fas fa-tag"></i> '+esc(s.label)+'</span>';
+        if(s.access_count_7d)h+='<span><i class="fas fa-chart-bar"></i> '+s.access_count_7d+' accesses (7d)</span>';
+        if(s.last_accessed_ms)h+='<span><i class="fas fa-eye"></i> Last: '+fmtDate(s.last_accessed_ms)+'</span>';
+        if(s.at_timestamp)h+='<span><i class="fas fa-clock-rotate-left"></i> Pinned: '+fmtDate(s.at_timestamp)+'</span>';
         h+='</div></div>';
         h+='<div class="card-actions">';
         h+='<span class="badge badge-active"><i class="fas fa-check-circle"></i> Active</span>';
@@ -234,6 +266,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     document.getElementById("csErr").innerHTML="";
     document.getElementById("csGrantee").value="";
     document.getElementById("csLabel").value="";
+    document.getElementById("csColumns").value="";
+    document.getElementById("csRowFilter").value="";
+    document.getElementById("csTimestamp").value="";
     var sel=document.getElementById("csSuper");
     sel.innerHTML="";
     try{
@@ -252,6 +287,27 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       (d.tables||[]).forEach(function(t){sel.innerHTML+='<option value="'+esc(t)+'">'+esc(t)+'</option>';});
     }catch(e){}
   }
+  // Parse "table:col1,col2  table2:col3" into {table:[col1,col2], table2:[col3]}
+  function parseFilterStr(str){
+    if(!str||!str.trim())return null;
+    var result={};
+    str.trim().split(/\s{2,}/).forEach(function(part){
+      var idx=part.indexOf(":");
+      if(idx>0){
+        var key=part.substring(0,idx).trim();
+        var val=part.substring(idx+1).trim();
+        if(key&&val)result[key]=val;
+      }
+    });
+    return Object.keys(result).length?result:null;
+  }
+  function parseColumnsStr(str){
+    var raw=parseFilterStr(str);
+    if(!raw)return null;
+    var result={};
+    for(var k in raw){result[k]=raw[k].split(",").map(function(c){return c.trim();}).filter(Boolean);}
+    return result;
+  }
   document.getElementById("btnCreateShare").addEventListener("click",async function(){
     var sup=document.getElementById("csSuper").value;
     var tablesEl=document.getElementById("csTables");
@@ -259,10 +315,16 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var grantee=document.getElementById("csGrantee").value.trim();
     var label=document.getElementById("csLabel").value.trim();
     if(!sup||!tables.length||!grantee){document.getElementById("csErr").innerHTML='<div class="flash-error">SuperTable, at least one table, and grantee org are required.</div>';return;}
+    var body={organization:ORG,super_name:sup,tables:tables,grantee_org:grantee,label:label};
+    var cols=parseColumnsStr(document.getElementById("csColumns").value);
+    if(cols)body.columns=cols;
+    var rf=parseFilterStr(document.getElementById("csRowFilter").value);
+    if(rf)body.row_filter=rf;
+    var tsVal=document.getElementById("csTimestamp").value;
+    if(tsVal)body.at_timestamp=new Date(tsVal).getTime();
     try{
-      var result=await api("POST","/api/v1/shares",{organization:ORG,super_name:sup,tables:tables,grantee_org:grantee,label:label});
+      var result=await api("POST","/api/v1/shares",body);
       hide("modalCreateShare");
-      // Show success modal with token
       var baseUrl=window.location.origin+"/api/v1/shares/"+enc(result.share_id)+"/manifest?organization="+enc(ORG);
       document.getElementById("scManifestUrl").textContent=baseUrl;
       document.getElementById("scTokenVal").textContent=result.token;
@@ -275,7 +337,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     navigator.clipboard.writeText(val).then(function(){toast("Token copied",true);});
   };
 
-  // ── Consumer: list linked shares ──
+  // ── Consumer: list linked shares (with health status) ──
   async function loadLinks(){
     var el=document.getElementById("linksList");
     if(!el||!SUP)return;
@@ -286,6 +348,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       var h="";
       links.forEach(function(l){
         var tables=(l.cached_tables||[]).join(", ")||"—";
+        var statusBadge="";
+        if(l.status==="healthy")statusBadge='<span class="badge badge-healthy"><i class="fas fa-heart-pulse"></i> Healthy</span>';
+        else if(l.status==="expiring_soon")statusBadge='<span class="badge badge-expiring"><i class="fas fa-clock"></i> Expiring soon</span>';
+        else if(l.status==="expired")statusBadge='<span class="badge badge-expired"><i class="fas fa-triangle-exclamation"></i> Expired</span>';
+        else statusBadge='<span class="badge badge-linked"><i class="fas fa-link"></i> Linked</span>';
+
         h+='<div class="card"><div class="card-row">';
         h+='<div><div class="card-name">'+esc(l.label||l.link_id)+'</div>';
         h+='<div class="card-meta">';
@@ -293,10 +361,16 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         h+='<span><i class="fas fa-table"></i> '+esc(tables)+'</span>';
         h+='<span><i class="fas fa-rows"></i> '+(l.cached_total_rows||0).toLocaleString()+' rows</span>';
         h+='<span><i class="fas fa-clock"></i> Refreshed: '+fmtDate(l.last_refreshed_ms)+'</span>';
+        if(l.presign_expires_in_s>0){
+          var hrs=Math.floor(l.presign_expires_in_s/3600);
+          var mins=Math.floor((l.presign_expires_in_s%3600)/60);
+          h+='<span><i class="fas fa-hourglass-half"></i> Expires in: '+hrs+'h '+mins+'m</span>';
+        }
         h+='</div></div>';
         h+='<div class="card-actions">';
-        h+='<span class="badge badge-linked"><i class="fas fa-link"></i> Linked</span>';
+        h+=statusBadge;
         h+='<button class="btn-sm" onclick="refreshLink(\''+esc(l.link_id)+'\')"><i class="fas fa-rotate"></i> Refresh</button>';
+        h+='<button class="btn-sm" onclick="openMaterialize(\''+esc(l.link_id)+'\')"><i class="fas fa-download"></i> Materialize</button>';
         h+='<button class="btn-sm" onclick="unlinkShare(\''+esc(l.link_id)+'\')" style="color:var(--error);border-color:rgba(239,68,68,.3);"><i class="fas fa-link-slash"></i> Unlink</button>';
         h+='</div></div></div>';
       });
@@ -313,6 +387,34 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     try{await api("DELETE","/api/v1/linked-shares/"+enc(linkId)+"?org="+enc(ORG)+"&sup="+enc(SUP));toast("Unlinked",true);loadLinks();}
     catch(e){toast(e.message,false);}
   };
+
+  // ── Consumer: materialize linked share ──
+  window.openMaterialize=function(linkId){
+    document.getElementById("matLinkId").value=linkId;
+    document.getElementById("matTarget").value="";
+    document.getElementById("matErr").innerHTML="";
+    document.getElementById("matProgress").style.display="none";
+    document.getElementById("btnMaterialize").disabled=false;
+    document.getElementById("modalMaterialize").classList.add("active");
+    document.getElementById("matTarget").focus();
+  };
+  document.getElementById("btnMaterialize").addEventListener("click",async function(){
+    var linkId=document.getElementById("matLinkId").value;
+    var target=document.getElementById("matTarget").value.trim();
+    if(!target){document.getElementById("matErr").innerHTML='<div class="flash-error">Target name is required.</div>';return;}
+    document.getElementById("matErr").innerHTML="";
+    document.getElementById("matProgress").style.display="block";
+    document.getElementById("btnMaterialize").disabled=true;
+    try{
+      var r=await api("POST","/api/v1/linked-shares/"+enc(linkId)+"/materialize",{organization:ORG,super_name:SUP,target_super_name:target});
+      hide("modalMaterialize");
+      toast("Materialized → "+target+" ("+r.tables_imported+" tables, "+r.files_downloaded+" files)",true);
+    }catch(e){
+      document.getElementById("matProgress").style.display="none";
+      document.getElementById("btnMaterialize").disabled=false;
+      document.getElementById("matErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';
+    }
+  });
 
   // ── Consumer: link share ──
   window.openLinkShare=function(){
@@ -338,7 +440,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.querySelectorAll(".modal-overlay").forEach(function(m){m.addEventListener("click",function(e){if(e.target===m)m.classList.remove("active");});});
 
   loadShares();loadLinks();
+
+  // Auto-refresh expiring shares on page load (fire-and-forget)
+  if(SUP){
+    try{fetch("/api/v1/linked-shares/refresh-all?org="+enc(ORG)+"&sup="+enc(SUP),{method:"POST",credentials:"same-origin"});}
+    catch(e){}
+  }
 })();
+</script>
+<script>
+window.addEventListener("supertable-changed", function(e) {
+  var d = (e && e.detail) || {};
+  if (!d.org || !d.sup) return;
+  var url = new URL('/ui/sharing', window.location.origin);
+  url.searchParams.set('org', d.org);
+  url.searchParams.set('sup', d.sup);
+  window.location.href = url.toString();
+});
 </script>
 </body>
 </html>

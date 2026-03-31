@@ -48,6 +48,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .badge-active{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
 .badge-readonly{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
 .badge-clone{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
+.badge-replica{background:rgba(245,158,11,.08);color:#d97706;border:1px solid rgba(245,158,11,.2);}
 /* Divergence bar */
 .div-bar{height:4px;border-radius:2px;background:var(--border-light);margin-top:8px;overflow:hidden;}
 .div-fill{height:100%;border-radius:2px;transition:width .3s;}
@@ -71,6 +72,27 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .toast{position:fixed;bottom:24px;right:24px;padding:10px 20px;border-radius:var(--radius-sm);font-size:12px;font-weight:600;z-index:99999;opacity:0;transition:opacity .3s;pointer-events:none;}
 .toast.show{opacity:1;}.toast-ok{background:var(--success);color:#fff;}.toast-err{background:var(--error);color:#fff;}
 .field-hint{font-size:11px;color:var(--text-muted);margin-top:4px;}
+/* Clone modal extras */
+.clone-section{border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:14px;background:var(--bg-surface);}
+.clone-section-hdr{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;font-size:12px;font-weight:700;color:var(--text-sec);}
+.clone-section-hdr i{font-size:10px;color:var(--text-muted);transition:transform .2s;}
+.clone-section-hdr.open i{transform:rotate(180deg);}
+.clone-section-body{display:none;margin-top:8px;}
+.clone-section-hdr.open+.clone-section-body{display:block;}
+.check-list{max-height:150px;overflow-y:auto;border:1px solid var(--border-light);border-radius:var(--radius-sm);background:var(--bg-card);}
+.check-item{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;border-bottom:1px solid var(--border-light);cursor:pointer;}
+.check-item:last-child{border-bottom:none;}
+.check-item:hover{background:var(--bg-surface);}
+.check-item input{accent-color:var(--primary);cursor:pointer;}
+.check-item-label{flex:1;font-weight:600;color:var(--text);}
+.check-item-meta{font-size:10px;color:var(--text-muted);}
+.check-all{font-size:11px;font-weight:600;color:var(--primary);cursor:pointer;margin-bottom:4px;display:inline-block;}
+.version-list{max-height:180px;overflow-y:auto;border:1px solid var(--border-light);border-radius:var(--radius-sm);background:var(--bg-card);margin-top:6px;}
+.version-item{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:11px;border-bottom:1px solid var(--border-light);cursor:pointer;transition:background .1s;}
+.version-item:hover{background:var(--primary-light);}
+.version-item.selected{background:var(--primary-light);font-weight:700;}
+.version-item:last-child{border-bottom:none;}
+.version-badge{background:var(--primary-light);color:var(--primary);padding:1px 6px;border-radius:4px;font-weight:700;font-size:10px;}
   </style>
 </head>
 <body>
@@ -80,6 +102,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div class="page-hdr">
     <div class="page-title"><i class="fas fa-cubes" style="color:var(--primary);"></i> SuperTables</div>
     <div style="display:flex;gap:8px;">
+      <button class="btn-sm" onclick="openAcceptPub()"><i class="fas fa-download"></i> Accept publication</button>
       <button class="btn-sm" onclick="openCloneTable()"><i class="fas fa-table"></i> Clone table</button>
       <button class="btn-sm btn-primary" onclick="showCreate()"><i class="fas fa-plus"></i> Create</button>
     </div>
@@ -105,7 +128,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 <!-- Clone SuperTable Modal -->
 <div class="modal-overlay" id="modalClone">
-  <div class="modal-box">
+  <div class="modal-box" style="width:580px;">
     <div class="modal-title"><i class="fas fa-clone" style="color:var(--primary);"></i> Clone SuperTable</div>
     <div id="cloneErr"></div>
     <div class="field-group"><div class="field-label">Source</div><input class="field-input" id="cloneSource" readonly style="background:var(--bg-surface);"/></div>
@@ -114,15 +137,60 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       <div class="field-label">Clone type</div>
       <div class="toggle-row" id="cloneTypeRow">
         <div class="toggle-opt selected" data-val="writable" onclick="selType(this)"><i class="fas fa-pen"></i> Writable</div>
-        <div class="toggle-opt" data-val="readonly" onclick="selType(this)"><i class="fas fa-lock"></i> Read-only</div>
+        <div class="toggle-opt" data-val="readonly" onclick="selType(this)"><i class="fas fa-lock"></i> Snapshot</div>
+        <div class="toggle-opt" data-val="replica" onclick="selType(this)"><i class="fas fa-link"></i> Replica</div>
       </div>
       <div class="field-hint" id="cloneHint">Zero-copy clone. New writes go to the clone's own storage (copy-on-write).</div>
     </div>
-    <div class="field-group">
-      <div class="field-label">Time travel (optional)</div>
-      <input class="field-input" id="cloneTimestamp" type="datetime-local" style="max-width:260px;"/>
-      <div class="field-hint">Leave empty for latest data. Set a date to clone data as it was at that point.</div>
+
+    <!-- Tables picker (partial clone) -->
+    <div class="clone-section">
+      <div class="clone-section-hdr" id="cloneTablesHdr" onclick="toggleSection(this)">
+        <span><i class="fas fa-table" style="margin-right:4px;"></i> Tables — <span id="cloneTablesCount">All</span></span>
+        <i class="fas fa-chevron-down"></i>
+      </div>
+      <div class="clone-section-body" id="cloneTablesBody">
+        <span class="check-all" onclick="cloneTablesToggleAll()">Select all / none</span>
+        <div class="check-list" id="cloneTablesList"><div style="padding:8px;color:var(--text-muted);font-size:11px;">Loading…</div></div>
+      </div>
     </div>
+
+    <!-- Time travel -->
+    <div class="clone-section">
+      <div class="clone-section-hdr" id="cloneTTHdr" onclick="toggleSection(this)">
+        <span><i class="fas fa-clock-rotate-left" style="margin-right:4px;"></i> Time travel — <span id="cloneTTStatus">Latest</span></span>
+        <i class="fas fa-chevron-down"></i>
+      </div>
+      <div class="clone-section-body" id="cloneTTBody">
+        <input class="field-input" id="cloneTimestamp" type="datetime-local" style="max-width:260px;"/>
+        <div class="field-hint">Leave empty for latest data. Set a date to clone data as it was at that point.</div>
+      </div>
+    </div>
+
+    <!-- RBAC inheritance -->
+    <div class="clone-section">
+      <div class="clone-section-hdr" id="cloneRbacHdr" onclick="toggleSection(this)">
+        <span><i class="fas fa-shield-halved" style="margin-right:4px;"></i> RBAC — <span id="cloneRbacStatus">No inheritance</span></span>
+        <i class="fas fa-chevron-down"></i>
+      </div>
+      <div class="clone-section-body" id="cloneRbacBody">
+        <div style="margin-bottom:8px;">
+          <label style="font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+            <input type="checkbox" id="cloneInheritRbac" onchange="cloneRbacToggle()"/> Copy roles from source
+          </label>
+        </div>
+        <div id="cloneRolesWrap" style="display:none;">
+          <span class="check-all" onclick="cloneRolesToggleAll()">Select all / none</span>
+          <div class="check-list" id="cloneRolesList"><div style="padding:8px;color:var(--text-muted);font-size:11px;">Loading…</div></div>
+          <div style="margin-top:8px;">
+            <label style="font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+              <input type="checkbox" id="cloneInheritUsers"/> Also copy user assignments
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="modal-actions">
       <button class="btn-sm" onclick="hide('modalClone')">Cancel</button>
       <button class="btn-sm btn-primary" id="btnClone"><i class="fas fa-clone"></i> Clone</button>
@@ -140,8 +208,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="field-group"><div class="field-label">Target SuperTable</div><select class="field-select" id="ctTargetSup"></select></div>
     <div class="field-group">
       <div class="field-label">Time travel (optional)</div>
-      <input class="field-input" id="ctVersion" type="number" placeholder="Version number" style="max-width:180px;"/>
-      <div class="field-hint">Leave empty for latest. Enter a snapshot version number for time travel.</div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <input class="field-input" id="ctVersion" type="number" placeholder="Version #" style="max-width:120px;"/>
+        <button class="btn-sm" type="button" id="ctBrowseBtn" onclick="ctBrowseVersions()"><i class="fas fa-list"></i> Browse</button>
+      </div>
+      <div class="version-list" id="ctVersionList" style="display:none;"></div>
+      <div class="field-hint">Leave empty for latest. Select a version from the browser or type a version number.</div>
     </div>
     <div class="modal-actions">
       <button class="btn-sm" onclick="hide('modalCloneTable')">Cancel</button>
@@ -166,6 +238,67 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Publish Modal -->
+<div class="modal-overlay" id="modalPublish">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-upload" style="color:var(--primary);"></i> Publish SuperTable</div>
+    <div id="pubErr"></div>
+    <div class="field-group"><div class="field-label">Source</div><input class="field-input" id="pubSource" readonly style="background:var(--bg-surface);"/></div>
+    <div class="field-group"><div class="field-label">Label (optional)</div><input class="field-input" id="pubLabel" placeholder="e.g. Q1 2025 dataset" autocomplete="off"/></div>
+    <!-- Result (shown after creation) -->
+    <div id="pubResult" style="display:none;">
+      <div style="background:var(--success-bg);border:1px solid rgba(16,185,129,.2);border-radius:var(--radius-sm);padding:12px;margin-top:12px;">
+        <div style="font-size:12px;font-weight:700;color:var(--success);margin-bottom:8px;"><i class="fas fa-check-circle"></i> Published</div>
+        <div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Send this manifest URL and bearer token to the consumer. The token is shown only once.</div>
+        <div class="field-group" style="margin-top:8px;margin-bottom:8px;">
+          <div class="field-label">Manifest URL</div>
+          <input class="field-input" id="pubManifestUrl" readonly style="background:var(--bg-surface);font-family:var(--mono);font-size:11px;"/>
+        </div>
+        <div class="field-group" style="margin-bottom:0;">
+          <div class="field-label">Bearer token</div>
+          <input class="field-input" id="pubToken" readonly style="background:var(--bg-surface);font-family:var(--mono);font-size:11px;"/>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalPublish')">Close</button>
+      <button class="btn-sm btn-primary" id="btnPublish"><i class="fas fa-upload"></i> Publish</button>
+    </div>
+  </div>
+</div>
+
+<!-- Accept Publication Modal -->
+<div class="modal-overlay" id="modalAcceptPub">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-download" style="color:var(--primary);"></i> Accept Publication</div>
+    <div id="acceptErr"></div>
+    <div class="field-group">
+      <div class="field-label">Manifest URL</div>
+      <input class="field-input" id="acceptUrl" placeholder="https://provider.example.com/api/v1/publications/pub_.../manifest?organization=..." autocomplete="off"/>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Bearer token</div>
+      <input class="field-input" id="acceptToken" type="password" placeholder="Paste the token from the provider" autocomplete="off"/>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Target SuperTable name</div>
+      <input class="field-input" id="acceptTarget" placeholder="imported-dataset" autocomplete="off"/>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Label (optional)</div>
+      <input class="field-input" id="acceptLabel" placeholder="e.g. Partner Q1 data" autocomplete="off"/>
+    </div>
+    <div id="acceptProgress" style="display:none;padding:12px;background:var(--bg-surface);border-radius:var(--radius-sm);margin-top:8px;">
+      <div style="font-size:12px;font-weight:600;color:var(--text);"><i class="fas fa-spinner fa-spin" style="color:var(--primary);"></i> Downloading data from provider…</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">This may take a while for large datasets.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalAcceptPub')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnAcceptPub"><i class="fas fa-download"></i> Accept &amp; Download</button>
+    </div>
+  </div>
+</div>
 
 <script>
 (function(){
@@ -203,9 +336,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var h="";
     items.forEach(function(it){
       var badges="";
-      if(it.read_only)badges+='<span class="badge badge-readonly"><i class="fas fa-lock"></i> Read-only</span>';
+      var isReplica = it.clone_type === "replica";
+      if(isReplica) badges+='<span class="badge badge-replica"><i class="fas fa-link"></i> Live replica of '+esc(it.cloned_from)+'</span>';
+      else if(it.read_only) badges+='<span class="badge badge-readonly"><i class="fas fa-lock"></i> Read-only</span>';
       else badges+='<span class="badge badge-active"><i class="fas fa-check-circle"></i> Active</span>';
-      if(it.cloned_from){
+      if(it.cloned_from && !isReplica){
         var lbl=it.clone_type==="writable"?"Writable clone":"Snapshot clone";
         badges+=' <span class="badge badge-clone"><i class="fas fa-clone"></i> '+lbl+" of "+esc(it.cloned_from)+"</span>";
       }
@@ -219,8 +354,17 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       if(it.divergence)h+=divBar(it.divergence);
       h+='<div class="st-card-actions" style="margin-top:12px;">';
       h+='<button class="btn-sm" onclick="openClone(\''+esc(it.name)+'\')"><i class="fas fa-clone"></i> Clone</button>';
-      if(!it.read_only)h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',true)"><i class="fas fa-lock"></i> Lock</button>';
-      else h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',false)"><i class="fas fa-lock-open"></i> Unlock</button>';
+      if(isReplica){
+        h+='<button class="btn-sm" onclick="doPromote(\''+esc(it.name)+'\')"><i class="fas fa-arrow-up-right-from-square"></i> Promote</button>';
+      } else if(!it.read_only){
+        h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',true)"><i class="fas fa-lock"></i> Lock</button>';
+      } else {
+        h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',false)"><i class="fas fa-lock-open"></i> Unlock</button>';
+      }
+      if(it.cloned_from){
+        h+='<button class="btn-sm" onclick="doDetach(\''+esc(it.name)+'\')"><i class="fas fa-unlink"></i> Detach</button>';
+      }
+      h+='<button class="btn-sm" onclick="openPublish(\''+esc(it.name)+'\')"><i class="fas fa-upload"></i> Publish</button>';
       h+='<button class="btn-sm" onclick="openDelete(\''+esc(it.name)+'\')" style="color:var(--error);border-color:rgba(239,68,68,.3);"><i class="fas fa-trash"></i></button>';
       h+='</div></div>';
     });
@@ -242,22 +386,117 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     catch(e){document.getElementById("createErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
 
-  // Clone SuperTable
-  window.openClone=function(name){
-    document.getElementById("cloneSource").value=name;document.getElementById("cloneTarget").value="";
-    document.getElementById("cloneErr").innerHTML="";document.getElementById("cloneTimestamp").value="";
+  // ═══ Shared helpers ═══
+
+  window.toggleSection=function(hdr){hdr.classList.toggle("open");};
+
+  function fmtDate(ms){if(!ms)return"—";try{return new Date(ms).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});}catch(e){return"—";}}
+  function fmtRows(n){if(!n&&n!==0)return"";return Number(n).toLocaleString()+" rows";}
+
+  // ═══ Clone SuperTable ═══
+
+  var _cloneTables=[];
+  var _cloneRoles=[];
+
+  window.openClone=async function(name){
+    document.getElementById("cloneSource").value=name;
+    document.getElementById("cloneTarget").value="";
+    document.getElementById("cloneErr").innerHTML="";
+    document.getElementById("cloneTimestamp").value="";
+    document.getElementById("cloneInheritRbac").checked=false;
+    document.getElementById("cloneInheritUsers").checked=false;
+    document.getElementById("cloneRolesWrap").style.display="none";
+    document.getElementById("cloneTablesCount").textContent="All";
+    document.getElementById("cloneTTStatus").textContent="Latest";
+    document.getElementById("cloneRbacStatus").textContent="No inheritance";
     cloneType="writable";
     document.querySelectorAll("#cloneTypeRow .toggle-opt").forEach(function(o){o.classList.toggle("selected",o.getAttribute("data-val")==="writable");});
     document.getElementById("cloneHint").textContent="Zero-copy clone. New writes go to the clone's own storage (copy-on-write).";
-    document.getElementById("modalClone").classList.add("active");document.getElementById("cloneTarget").focus();
+    // Collapse all sections
+    document.querySelectorAll("#modalClone .clone-section-hdr").forEach(function(h){h.classList.remove("open");});
+    // Load tables
+    _cloneTables=[];
+    document.getElementById("cloneTablesList").innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">Loading…</div>';
+    // Load roles
+    _cloneRoles=[];
+    document.getElementById("cloneRolesList").innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">Loading…</div>';
+
+    document.getElementById("modalClone").classList.add("active");
+    document.getElementById("cloneTarget").focus();
+
+    // Fetch tables
+    try{
+      var d=await api("GET","/api/v1/ingestion/tables?org="+enc(ORG)+"&sup="+enc(name)+"&role_name=superadmin");
+      _cloneTables=(d&&d.tables)||[];
+    }catch(e){_cloneTables=[];}
+    var tl=document.getElementById("cloneTablesList");
+    if(!_cloneTables.length){tl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">No tables found</div>';
+    }else{
+      tl.innerHTML="";
+      _cloneTables.forEach(function(t){
+        tl.innerHTML+='<label class="check-item"><input type="checkbox" checked value="'+esc(t)+'"/><span class="check-item-label">'+esc(t)+'</span></label>';
+      });
+    }
+    updateCloneTablesCount();
+
+    // Fetch roles
+    try{
+      var rd=await api("GET","/api/v1/supertables/roles?organization="+enc(ORG)+"&super_name="+enc(name));
+      _cloneRoles=(rd&&rd.roles)||[];
+    }catch(e){_cloneRoles=[];}
+    var rl=document.getElementById("cloneRolesList");
+    if(!_cloneRoles.length){rl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">No roles found</div>';
+    }else{
+      rl.innerHTML="";
+      _cloneRoles.forEach(function(r){
+        if(r.role_name==="superadmin")return;
+        rl.innerHTML+='<label class="check-item"><input type="checkbox" checked value="'+esc(r.role_name)+'"/><span class="check-item-label">'+esc(r.role_name)+'</span><span class="check-item-meta">'+esc(r.role_type)+" · "+r.table_count+" tables</span></label>";
+      });
+      if(!rl.innerHTML)rl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">Only superadmin (auto-created)</div>';
+    }
   };
+
+  function updateCloneTablesCount(){
+    var checked=document.querySelectorAll("#cloneTablesList input[type=checkbox]:checked").length;
+    var total=document.querySelectorAll("#cloneTablesList input[type=checkbox]").length;
+    document.getElementById("cloneTablesCount").textContent=(checked===total||total===0)?"All":checked+"/"+total;
+  }
+
+  window.cloneTablesToggleAll=function(){
+    var boxes=document.querySelectorAll("#cloneTablesList input[type=checkbox]");
+    var allChecked=Array.from(boxes).every(function(b){return b.checked;});
+    boxes.forEach(function(b){b.checked=!allChecked;});
+    updateCloneTablesCount();
+  };
+
+  window.cloneRbacToggle=function(){
+    var on=document.getElementById("cloneInheritRbac").checked;
+    document.getElementById("cloneRolesWrap").style.display=on?"block":"none";
+    document.getElementById("cloneRbacStatus").textContent=on?"Inherit roles":"No inheritance";
+  };
+
+  window.cloneRolesToggleAll=function(){
+    var boxes=document.querySelectorAll("#cloneRolesList input[type=checkbox]");
+    var allChecked=Array.from(boxes).every(function(b){return b.checked;});
+    boxes.forEach(function(b){b.checked=!allChecked;});
+  };
+
+  // Listen for timestamp changes
+  document.getElementById("cloneTimestamp").addEventListener("change",function(){
+    document.getElementById("cloneTTStatus").textContent=this.value?fmtDate(new Date(this.value).getTime()):"Latest";
+  });
+
   window.selType=function(el){
     cloneType=el.getAttribute("data-val");
     document.querySelectorAll("#cloneTypeRow .toggle-opt").forEach(function(o){o.classList.toggle("selected",o.getAttribute("data-val")===cloneType);});
-    document.getElementById("cloneHint").textContent=cloneType==="writable"
-      ?"Zero-copy clone. New writes go to the clone's own storage (copy-on-write)."
-      :"Zero-copy snapshot. All writes to this clone are blocked.";
+    var hints={
+      writable:"Zero-copy clone. New writes go to the clone's own storage (copy-on-write).",
+      readonly:"Zero-copy frozen snapshot. All writes to this clone are blocked.",
+      replica:"Live read-only mirror. Always shows the source's latest data. No storage overhead."
+    };
+    document.getElementById("cloneHint").textContent=hints[cloneType]||"";
   };
+
   document.getElementById("btnClone").addEventListener("click",async function(){
     var source=document.getElementById("cloneSource").value.trim();
     var target=document.getElementById("cloneTarget").value.trim();
@@ -265,13 +504,31 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var body={organization:ORG,source:source,target:target,clone_type:cloneType};
     var tsVal=document.getElementById("cloneTimestamp").value;
     if(tsVal)body.at_timestamp=new Date(tsVal).getTime();
+    // Partial clone: collect unchecked tables
+    var allBoxes=document.querySelectorAll("#cloneTablesList input[type=checkbox]");
+    var checked=document.querySelectorAll("#cloneTablesList input[type=checkbox]:checked");
+    if(allBoxes.length>0 && checked.length<allBoxes.length){
+      body.tables=Array.from(checked).map(function(b){return b.value;});
+    }
+    // RBAC inheritance
+    if(document.getElementById("cloneInheritRbac").checked){
+      body.inherit_rbac=true;
+      var roleBoxes=document.querySelectorAll("#cloneRolesList input[type=checkbox]:checked");
+      var allRoleBoxes=document.querySelectorAll("#cloneRolesList input[type=checkbox]");
+      if(roleBoxes.length<allRoleBoxes.length){
+        body.inherit_roles=Array.from(roleBoxes).map(function(b){return b.value;});
+      }
+      if(document.getElementById("cloneInheritUsers").checked)body.inherit_users=true;
+    }
     try{await api("POST","/api/v1/supertables/clone",body);hide("modalClone");toast("Cloned "+source+" → "+target,true);load();}
     catch(e){document.getElementById("cloneErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
 
-  // Clone Table
+  // ═══ Clone Table ═══
+
   window.openCloneTable=function(){
     document.getElementById("ctErr").innerHTML="";document.getElementById("ctVersion").value="";
+    document.getElementById("ctVersionList").style.display="none";
     var selSrc=document.getElementById("ctSourceSup"),selTgt=document.getElementById("ctTargetSup");
     selSrc.innerHTML="";selTgt.innerHTML="";
     items.forEach(function(it){
@@ -282,7 +539,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     document.getElementById("modalCloneTable").classList.add("active");
     loadTablesForClone();
   };
-  document.getElementById("ctSourceSup").addEventListener("change",loadTablesForClone);
+  document.getElementById("ctSourceSup").addEventListener("change",function(){loadTablesForClone();document.getElementById("ctVersionList").style.display="none";});
+  document.getElementById("ctTable").addEventListener("change",function(){document.getElementById("ctVersionList").style.display="none";});
+
   async function loadTablesForClone(){
     var sup=document.getElementById("ctSourceSup").value;if(!sup)return;
     try{
@@ -292,6 +551,33 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       tables.forEach(function(t){sel.innerHTML+='<option value="'+esc(t)+'">'+esc(t)+'</option>';});
     }catch(e){document.getElementById("ctTable").innerHTML='<option value="">Error loading</option>';}
   }
+
+  window.ctBrowseVersions=async function(){
+    var sup=document.getElementById("ctSourceSup").value;
+    var table=document.getElementById("ctTable").value;
+    if(!sup||!table){document.getElementById("ctErr").innerHTML='<div class="flash-error">Select source and table first.</div>';return;}
+    var vl=document.getElementById("ctVersionList");
+    vl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">Loading…</div>';
+    vl.style.display="block";
+    try{
+      var d=await api("GET","/api/v1/tables/snapshot-history?org="+enc(ORG)+"&sup="+enc(sup)+"&table="+enc(table)+"&limit=30");
+      var versions=(d&&d.versions)||[];
+      if(!versions.length){vl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">No version history</div>';return;}
+      vl.innerHTML="";
+      versions.forEach(function(v){
+        var el=document.createElement("div");
+        el.className="version-item";
+        el.innerHTML='<span class="version-badge">v'+v.version+'</span> <span>'+fmtDate(v.last_updated_ms)+'</span> <span style="color:var(--text-muted);">'+v.resource_count+' files · '+fmtRows(v.total_rows)+'</span>';
+        el.addEventListener("click",function(){
+          document.getElementById("ctVersion").value=v.version;
+          vl.querySelectorAll(".version-item").forEach(function(i){i.classList.remove("selected");});
+          el.classList.add("selected");
+        });
+        vl.appendChild(el);
+      });
+    }catch(e){vl.innerHTML='<div style="padding:8px;color:var(--text-muted);font-size:11px;">Failed to load</div>';}
+  };
+
   document.getElementById("btnCloneTable").addEventListener("click",async function(){
     var sourceSup=document.getElementById("ctSourceSup").value;
     var table=document.getElementById("ctTable").value;
@@ -312,6 +598,20 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     catch(e){toast(e.message,false);}
   };
 
+  // Promote replica to writable
+  window.doPromote=async function(name){
+    if(!confirm("Promote "+name+" from replica to writable?\n\nThis materializes the current data into the clone's own storage and allows writes. The replica will no longer track the source."))return;
+    try{var r=await api("POST","/api/v1/supertables/promote",{organization:ORG,super_name:name});toast("Promoted "+name+" — "+r.tables_materialized+" tables materialized",true);load();}
+    catch(e){toast("Promote failed: "+e.message,false);}
+  };
+
+  // Detach clone (hard copy shared files)
+  window.doDetach=async function(name){
+    if(!confirm("Detach "+name+"?\n\nThis copies all shared files to the clone's own storage, making it fully independent. This may take a while for large datasets."))return;
+    try{var r=await api("POST","/api/v1/supertables/detach",{organization:ORG,super_name:name});toast("Detached "+name+" — "+r.files_copied+" files copied",true);load();}
+    catch(e){toast("Detach failed: "+e.message,false);}
+  };
+
   // Delete
   window.openDelete=function(name){
     document.getElementById("deleteTarget").value=name;document.getElementById("deleteConfirm").value="";
@@ -328,6 +628,72 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   // Modal close on overlay click
   document.querySelectorAll(".modal-overlay").forEach(function(m){m.addEventListener("click",function(e){if(e.target===m)m.classList.remove("active");});});
+
+  // ═══ Publish ═══
+
+  window.openPublish=function(name){
+    document.getElementById("pubSource").value=name;
+    document.getElementById("pubLabel").value="";
+    document.getElementById("pubErr").innerHTML="";
+    document.getElementById("pubResult").style.display="none";
+    document.getElementById("btnPublish").style.display="";
+    document.getElementById("modalPublish").classList.add("active");
+  };
+
+  document.getElementById("btnPublish").addEventListener("click",async function(){
+    var source=document.getElementById("pubSource").value.trim();
+    if(!source)return;
+    var label=document.getElementById("pubLabel").value.trim();
+    document.getElementById("pubErr").innerHTML="";
+    try{
+      var r=await api("POST","/api/v1/publications",{organization:ORG,super_name:source,label:label});
+      var pubId=r.publication_id||"";
+      var baseUrl=window.location.origin+"/api/v1/publications/"+enc(pubId)+"/manifest?organization="+enc(ORG);
+      document.getElementById("pubManifestUrl").value=baseUrl;
+      document.getElementById("pubToken").value=r.token||"";
+      document.getElementById("pubResult").style.display="block";
+      document.getElementById("btnPublish").style.display="none";
+    }catch(e){
+      document.getElementById("pubErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';
+    }
+  });
+
+  // ═══ Accept Publication ═══
+
+  window.openAcceptPub=function(){
+    document.getElementById("acceptUrl").value="";
+    document.getElementById("acceptToken").value="";
+    document.getElementById("acceptTarget").value="";
+    document.getElementById("acceptLabel").value="";
+    document.getElementById("acceptErr").innerHTML="";
+    document.getElementById("acceptProgress").style.display="none";
+    document.getElementById("btnAcceptPub").disabled=false;
+    document.getElementById("modalAcceptPub").classList.add("active");
+    document.getElementById("acceptUrl").focus();
+  };
+
+  document.getElementById("btnAcceptPub").addEventListener("click",async function(){
+    var url=document.getElementById("acceptUrl").value.trim();
+    var token=document.getElementById("acceptToken").value.trim();
+    var target=document.getElementById("acceptTarget").value.trim();
+    var label=document.getElementById("acceptLabel").value.trim();
+    if(!url||!token||!target){document.getElementById("acceptErr").innerHTML='<div class="flash-error">Manifest URL, token, and target name are all required.</div>';return;}
+    document.getElementById("acceptErr").innerHTML="";
+    document.getElementById("acceptProgress").style.display="block";
+    document.getElementById("btnAcceptPub").disabled=true;
+    try{
+      var r=await api("POST","/api/v1/publications/accept",{organization:ORG,target_super_name:target,manifest_url:url,bearer_token:token,label:label});
+      hide("modalAcceptPub");
+      var msg="Imported "+target+" — "+r.tables_imported+" tables, "+r.files_downloaded+" files";
+      if(r.errors&&r.errors.length)msg+=" ("+r.errors.length+" errors)";
+      toast(msg,true);
+      load();
+    }catch(e){
+      document.getElementById("acceptProgress").style.display="none";
+      document.getElementById("btnAcceptPub").disabled=false;
+      document.getElementById("acceptErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';
+    }
+  });
 
   load();
 })();

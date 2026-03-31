@@ -33,8 +33,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .wrap{max-width:1320px;margin:0 auto;padding:24px;}
 
 /* Context cards */
-.ctx-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-bottom:28px;}
-@media(max-width:992px){.ctx-grid{grid-template-columns:1fr;}}
+.ctx-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:28px;}
+@media(max-width:992px){.ctx-grid{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:640px){.ctx-grid{grid-template-columns:1fr;}}
 .ctx-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow-sm);display:flex;flex-direction:column;transition:box-shadow .2s,transform .2s;}
 .ctx-card:hover{box-shadow:var(--shadow-md);transform:translateY(-1px);}
 .ctx-card-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:13px;font-weight:700;color:var(--text);letter-spacing:.01em;}
@@ -119,7 +120,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .cta-section{text-align:center;padding:36px 20px;}
 .cta-section h3{font-size:1.5rem;font-weight:800;color:var(--primary);margin:0 0 10px;letter-spacing:-.01em;}
 .cta-section p{color:var(--text-muted);margin:0 0 20px;font-size:14px;}
-#pairSel{display:none;}
   </style>
   <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
 </head>
@@ -129,26 +129,27 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <div class="content-container">
 <div class="wrap">
 
-<!-- ── Context Cards ──────────────────────────────────── -->
-<div class="ctx-grid">
+<!-- ── Quick Actions ────────────────────────────────── -->
+<div class="ctx-grid" style="grid-template-columns: repeat(4, 1fr);">
   <div class="ctx-card">
-    <div class="ctx-card-header"><i class="fas fa-building"></i> Current Tenant</div>
-    <div class="ctx-card-body">Organization: <span class="mono">{{ sel_org|default("—", true) }}</span><br/>SuperTable: <span class="mono">{{ sel_sup|default("—", true) }}</span></div>
-    <div class="ctx-card-actions"><a class="btn-home btn-home-solid" href="/ui/tables"><i class="fas fa-table"></i> Tables</a></div>
+    <div class="ctx-card-header"><i class="fas fa-terminal"></i> SQL Editor</div>
+    <div class="ctx-card-body">Write and execute SQL queries across all your tables.</div>
+    <div class="ctx-card-actions"><a class="btn-home btn-home-solid" href="/ui/execute"><i class="fas fa-play"></i> Launch</a></div>
   </div>
   <div class="ctx-card">
-    <div class="ctx-card-header"><i class="fas fa-user"></i> Session</div>
-    <div class="ctx-card-body">User: <span class="mono">{{ session_username|default("—", true) }}</span><br/>Role: <span class="mono">{{ session_role_name|default("—", true) }}</span></div>
-    <div class="ctx-card-actions"><a class="btn-home btn-home-outline" href="/ui/security"><i class="fas fa-shield-halved"></i> Security</a></div>
+    <div class="ctx-card-header"><i class="fas fa-table"></i> Tables</div>
+    <div class="ctx-card-body">Browse table schemas, data quality stats, and row counts.</div>
+    <div class="ctx-card-actions"><a class="btn-home btn-home-outline" href="/ui/tables"><i class="fas fa-eye"></i> Browse</a></div>
   </div>
   <div class="ctx-card">
-    <div class="ctx-card-header"><i class="fas fa-rocket"></i> Quick Actions</div>
-    <div class="ctx-card-body">Write SQL, upload data, check quality, or monitor your platform health.</div>
-    <div class="ctx-card-actions">
-      <a class="btn-home btn-home-ghost" href="/ui/execute"><i class="fas fa-terminal"></i> SQL</a>
-      <a class="btn-home btn-home-ghost" href="/ui/ingestion"><i class="fas fa-cloud-arrow-up"></i> Ingest</a>
-      <a class="btn-home btn-home-ghost" href="/ui/quality"><i class="fas fa-heartbeat"></i> Quality</a>
-    </div>
+    <div class="ctx-card-header"><i class="fas fa-cloud-arrow-up"></i> Ingestion</div>
+    <div class="ctx-card-body">Upload CSV, JSON, or Parquet files. Manage staging areas and pipes.</div>
+    <div class="ctx-card-actions"><a class="btn-home btn-home-ghost" href="/ui/ingestion"><i class="fas fa-upload"></i> Ingest</a></div>
+  </div>
+  <div class="ctx-card">
+    <div class="ctx-card-header"><i class="fas fa-heartbeat"></i> Data Quality</div>
+    <div class="ctx-card-body">Monitor data quality rules, run checks, and review results.</div>
+    <div class="ctx-card-actions"><a class="btn-home btn-home-ghost" href="/ui/quality"><i class="fas fa-check-circle"></i> Review</a></div>
   </div>
 </div>
 

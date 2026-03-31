@@ -17,6 +17,9 @@ Safety guarantees:
   - Old snapshot JSON files are also candidates for cleanup: only
     the current snapshot is kept; all previous snapshot files are
     marked for deletion.
+  - Clone protection: files referenced by any clone's snapshot are
+    excluded from orphan detection — even if they appear unreferenced
+    by the source's current snapshot.
   - The ``preview`` function never deletes — it returns the list
     so operators can review before committing.
   - Every cleanup is audited via a GC_EXECUTE event.
@@ -30,6 +33,61 @@ import os
 from typing import Any, Dict, List, Set
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Clone protection — collect file references held by clones
+# ---------------------------------------------------------------------------
+
+def _collect_clone_referenced_files(
+    organization: str,
+    super_name: str,
+    simple_name: str,
+) -> Set[str]:
+    """Return parquet file paths that any clone still references for this table.
+
+    Scans all SuperTables cloned from *super_name* and collects file paths
+    from their snapshot manifests.  Replica clones are skipped because they
+    hold no independent file references (they read through to the source).
+    """
+    from supertable.redis_catalog import RedisCatalog
+    from supertable.storage.storage_factory import get_storage
+    from supertable.services.supertable_manager import find_clones
+
+    referenced: Set[str] = set()
+    try:
+        catalog = RedisCatalog()
+        storage = get_storage()
+        clones = find_clones(organization, super_name)
+
+        for clone_name in clones:
+            root = catalog.get_root(organization, clone_name)
+            if not root:
+                continue
+            # Replicas have no leaf pointers — they read from source. Skip.
+            if root.get("clone_type") == "replica":
+                continue
+
+            leaf = catalog.get_leaf(organization, clone_name, simple_name)
+            if not leaf:
+                continue
+            payload = leaf.get("payload") if isinstance(leaf, dict) else None
+            if not isinstance(payload, dict):
+                path = leaf.get("path", "")
+                if path:
+                    try:
+                        payload = storage.read_json(path)
+                    except Exception:
+                        continue
+            if isinstance(payload, dict):
+                for res in payload.get("resources", []):
+                    f = res.get("file", "")
+                    if f:
+                        referenced.add(f)
+    except Exception as e:
+        logger.warning("[gc] clone reference scan failed (safe — no files will be deleted): %s", e)
+
+    return referenced
 
 
 def preview_obsolete_files(
@@ -70,6 +128,13 @@ def preview_obsolete_files(
         result["error"] = "Table not found or has no snapshot"
         return result
 
+    # Skip virtual share leaves — they have no local data files
+    leaf_payload = leaf.get("payload") if isinstance(leaf, dict) else None
+    if isinstance(leaf_payload, dict) and leaf_payload.get("_linked_share"):
+        result["skipped"] = True
+        result["reason"] = "Virtual share leaf (no local data files)"
+        return result
+
     current_path = leaf["path"]
     result["current_snapshot_path"] = current_path
 
@@ -95,6 +160,11 @@ def preview_obsolete_files(
             live_files.add(f)
     result["live_file_count"] = len(live_files)
 
+    # Clone protection: files referenced by clones are NOT orphaned
+    clone_protected = _collect_clone_referenced_files(organization, super_name, simple_name)
+    protected_files = live_files | clone_protected
+    result["clone_protected_file_count"] = len(clone_protected)
+
     # Scan data directory for actual files on storage
     data_dir = os.path.join(
         organization, super_name, "tables", simple_name, "data",
@@ -105,7 +175,7 @@ def preview_obsolete_files(
         storage_files = []
 
     for file_path in storage_files:
-        if file_path not in live_files:
+        if file_path not in protected_files:
             result["orphaned_data_files"].append(file_path)
 
     # Scan snapshot directory for old snapshot JSON files

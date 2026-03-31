@@ -255,7 +255,10 @@ class Actions:
     SUPERTABLE_DELETE = "supertable_delete"
     SUPERTABLE_CLONE_READONLY = "supertable_clone_readonly"
     SUPERTABLE_CLONE_WRITABLE = "supertable_clone_writable"
+    SUPERTABLE_CLONE_REPLICA = "supertable_clone_replica"
     SUPERTABLE_TOGGLE_READONLY = "supertable_toggle_readonly"
+    SUPERTABLE_PROMOTE = "supertable_promote"
+    SUPERTABLE_DETACH = "supertable_detach"
     TABLE_CLONE = "table_clone"
 
     # Data sharing
@@ -264,6 +267,10 @@ class Actions:
     SHARE_MANIFEST_ACCESS = "share_manifest_access"
     SHARE_LINK = "share_link"
     SHARE_UNLINK = "share_unlink"
+    SHARE_MATERIALIZE = "share_materialize"
+    PUBLICATION_CREATE = "publication_create"
+    PUBLICATION_REVOKE = "publication_revoke"
+    PUBLICATION_ACCEPT = "publication_accept"
 
     # RBAC changes
     ROLE_CREATE = "role_create"

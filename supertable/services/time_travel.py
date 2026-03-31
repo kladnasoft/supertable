@@ -62,6 +62,11 @@ def list_snapshot_versions(
         return []
 
     current_path = leaf["path"]
+
+    # Virtual share leaves have no local snapshot history
+    if current_path.startswith("__linked_share__/"):
+        return []
+
     # Try to use the cached payload first
     current_data = leaf.get("payload") if isinstance(leaf, dict) else None
     if not isinstance(current_data, dict) or not isinstance(current_data.get("resources"), list):

@@ -189,8 +189,6 @@ def _get_redis_items(pattern: str) -> List[str]:
                     items.append(key.decode("utf-8"))
                 else:
                     items.append(str(key))
-                if cursor == 0:
-                    break
             if cursor == 0:
                 break
         return items
@@ -211,6 +209,43 @@ def list_supers(organization: str) -> List[str]:
         if len(parts) >= 3:
             supers.append(parts[2])
     return sorted({s for s in supers if s})
+
+
+def list_supers_with_flags(organization: str) -> List[Dict[str, Any]]:
+    """Return supers with read_only flag from root meta."""
+    organization = (organization or "").strip()
+    if not organization:
+        return []
+    rc = RedisCatalog()
+    pattern = f"supertable:{organization}:*:meta:root"
+    items = _get_redis_items(pattern)
+    seen: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        parts = str(item).split(":")
+        if len(parts) < 3:
+            continue
+        sup_name = parts[2]
+        if sup_name in seen:
+            continue
+        read_only = False
+        clone_type = None
+        cloned_from = None
+        try:
+            raw = rc.r.get(item)
+            if raw:
+                root = json.loads(raw)
+                read_only = bool(root.get("read_only"))
+                clone_type = root.get("clone_type")
+                cloned_from = root.get("cloned_from")
+        except Exception:
+            pass
+        seen[sup_name] = {
+            "name": sup_name,
+            "read_only": read_only,
+            "clone_type": clone_type,
+            "cloned_from": cloned_from,
+        }
+    return sorted(seen.values(), key=lambda x: x["name"])
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +288,34 @@ from supertable.server_common import (
 # ---------------------------------------------------------------------------
 
 from supertable.server_common import _get_meta_reader as _common_get_meta_reader
+
+
+# ---------------------------------------------------------------------------
+# Simple Redis-backed rate limiter for mutation endpoints
+# ---------------------------------------------------------------------------
+
+def _check_rate_limit(request: Request, action: str, max_per_minute: int = 30) -> None:
+    """Raise HTTP 429 if the caller exceeds the per-minute rate limit.
+
+    Key is scoped per session + action to prevent abuse from a single admin.
+    Lightweight: single INCR + conditional EXPIRE, no Lua scripts.
+    """
+    try:
+        session_id = ""
+        if hasattr(request, "cookies"):
+            session_id = request.cookies.get("session_id", "")
+        if not session_id:
+            session_id = request.client.host if request.client else "unknown"
+        rate_key = f"supertable:ratelimit:{session_id}:{action}"
+        count = redis_client.incr(rate_key)
+        if count == 1:
+            redis_client.expire(rate_key, 60)
+        if count > max_per_minute:
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded for {action}. Max {max_per_minute}/minute.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Never block on rate limiter failures
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -583,27 +646,41 @@ def api_supertables_clone(
     target = str(payload.get("target") or "").strip()
     clone_type = str(payload.get("clone_type") or "readonly").strip().lower()
     at_timestamp = payload.get("at_timestamp")  # optional: epoch-ms for time travel
+    tables = payload.get("tables")  # optional: list of table names for partial clone
+    inherit_rbac = bool(payload.get("inherit_rbac"))
+    inherit_roles = payload.get("inherit_roles")  # optional: list of role names
+    inherit_users = bool(payload.get("inherit_users"))
 
     if not organization or not source or not target:
         raise HTTPException(status_code=400, detail="organization, source, and target are required")
     if source == target:
         raise HTTPException(status_code=400, detail="source and target must be different")
-    if clone_type not in ("readonly", "writable"):
-        raise HTTPException(status_code=400, detail="clone_type must be 'readonly' or 'writable'")
+    if clone_type not in ("readonly", "writable", "replica"):
+        raise HTTPException(status_code=400, detail="clone_type must be 'readonly', 'writable', or 'replica'")
 
     at_ts = int(at_timestamp) if at_timestamp is not None else None
+    table_list = list(tables) if isinstance(tables, list) else None
+    role_list = list(inherit_roles) if isinstance(inherit_roles, list) else None
 
     from supertable.services.supertable_manager import clone_supertable
     try:
         result = clone_supertable(
             organization, source, target,
-            read_only=(clone_type == "readonly"),
+            clone_type=clone_type,
             at_timestamp=at_ts,
+            tables=table_list,
+            inherit_rbac=inherit_rbac,
+            inherit_roles=role_list,
+            inherit_users=inherit_users,
         )
-        action = Actions.SUPERTABLE_CLONE_READONLY if clone_type == "readonly" else Actions.SUPERTABLE_CLONE_WRITABLE
+        action_map = {
+            "readonly": Actions.SUPERTABLE_CLONE_READONLY,
+            "writable": Actions.SUPERTABLE_CLONE_WRITABLE,
+            "replica": Actions.SUPERTABLE_CLONE_REPLICA,
+        }
         _audit(
             category=EventCategory.DATA_MUTATION,
-            action=action,
+            action=action_map.get(clone_type, Actions.SUPERTABLE_CLONE_READONLY),
             organization=organization, super_name=target,
             resource_type="supertable", resource_id=target,
             severity=Severity.WARNING,
@@ -611,6 +688,7 @@ def api_supertables_clone(
                 source=source, target=target, clone_type=clone_type,
                 tables_cloned=result.get("tables_cloned", 0),
                 at_timestamp=at_ts,
+                tables=table_list,
             ),
         )
         return JSONResponse(result, status_code=201)
@@ -621,6 +699,121 @@ def api_supertables_clone(
     except Exception as e:
         logger.exception("SuperTable clone failed")
         raise HTTPException(status_code=500, detail=f"Clone failed: {e}")
+
+
+@router.post("/api/v1/supertables/promote")
+def api_supertables_promote(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Promote a replica clone to a writable SuperTable.
+
+    Materializes the source's current leaf pointers into the replica's
+    own namespace, then flips clone_type to 'writable' and read_only to false.
+    """
+    organization = str(payload.get("organization") or "").strip()
+    super_name = str(payload.get("super_name") or "").strip()
+
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+    from supertable.services.supertable_manager import promote_replica
+    try:
+        result = promote_replica(organization, super_name)
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=Actions.SUPERTABLE_PROMOTE,
+            organization=organization, super_name=super_name,
+            resource_type="supertable", resource_id=super_name,
+            severity=Severity.WARNING,
+            detail=make_detail(
+                source=result.get("source", ""),
+                tables_materialized=result.get("tables_materialized", 0),
+            ),
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Promote replica failed")
+        raise HTTPException(status_code=500, detail=f"Promote failed: {e}")
+
+
+@router.post("/api/v1/supertables/detach")
+def api_supertables_detach(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Detach a clone by hard-copying shared files, making it fully independent.
+
+    For replicas, this first promotes (materializes leaves), then copies
+    all shared Parquet files to the clone's own storage path.
+    """
+    organization = str(payload.get("organization") or "").strip()
+    super_name = str(payload.get("super_name") or "").strip()
+
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+    from supertable.services.supertable_manager import detach_clone
+    try:
+        result = detach_clone(organization, super_name)
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=Actions.SUPERTABLE_DETACH,
+            organization=organization, super_name=super_name,
+            resource_type="supertable", resource_id=super_name,
+            severity=Severity.CRITICAL,
+            detail=make_detail(
+                source=result.get("source", ""),
+                files_copied=result.get("files_copied", 0),
+                bytes_copied=result.get("bytes_copied", 0),
+            ),
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Detach clone failed")
+        raise HTTPException(status_code=500, detail=f"Detach failed: {e}")
+
+
+@router.get("/api/v1/supertables/roles")
+def api_supertables_roles(
+    request: Request,
+    organization: str = Query(""),
+    super_name: str = Query(""),
+    org: str = Query(""),
+    sup: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    """List role names for a SuperTable (used by clone UI RBAC picker)."""
+    organization = (organization or org or "").strip()
+    super_name = (super_name or sup or "").strip()
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+    try:
+        from supertable.rbac.role_manager import RoleManager
+        rm = RoleManager(super_name=super_name, organization=organization)
+        roles = rm.list_roles()
+        role_names = []
+        for r in roles:
+            rn = r.get("role_name", "")
+            if rn:
+                role_names.append({
+                    "role_name": rn,
+                    "role_type": r.get("role", ""),
+                    "table_count": len(r.get("tables", {})),
+                })
+        return {"ok": True, "roles": role_names}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"List roles failed: {e}")
 
 
 @router.post("/api/v1/supertables/clone-table")
@@ -730,15 +923,26 @@ def api_shares_create(
     tables = payload.get("tables") or []
     grantee_org = str(payload.get("grantee_org") or "").strip()
     label = str(payload.get("label") or "").strip()
+    columns = payload.get("columns")  # optional: {table: [col1, col2]}
+    row_filter = payload.get("row_filter")  # optional: {table: "WHERE clause"}
+    at_timestamp = payload.get("at_timestamp")  # optional: epoch-ms for point-in-time
 
     if not organization or not super_name or not tables or not grantee_org:
         raise HTTPException(status_code=400, detail="organization, super_name, tables, and grantee_org are required")
     if not isinstance(tables, list):
         raise HTTPException(status_code=400, detail="tables must be a list")
 
+    col_dict = dict(columns) if isinstance(columns, dict) else None
+    filter_dict = dict(row_filter) if isinstance(row_filter, dict) else None
+    at_ts = int(at_timestamp) if at_timestamp is not None else None
+
     from supertable.services.sharing import create_share
     try:
-        result = create_share(organization, super_name, tables, grantee_org, created_by="superuser", label=label)
+        result = create_share(
+            organization, super_name, tables, grantee_org,
+            created_by="superuser", label=label,
+            columns=col_dict, row_filter=filter_dict, at_timestamp=at_ts,
+        )
         _audit(
             category=EventCategory.CONFIG_CHANGE, action=Actions.SHARE_CREATE,
             organization=organization, super_name=super_name,
@@ -915,6 +1119,259 @@ def api_linked_shares_refresh(
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
+
+
+@router.post("/api/v1/linked-shares/{link_id}/materialize")
+def api_linked_shares_materialize(
+    request: Request,
+    link_id: str,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Download all data from a linked share into a new local SuperTable."""
+    organization = str(payload.get("organization") or "").strip()
+    super_name = str(payload.get("super_name") or "").strip()
+    target = str(payload.get("target_super_name") or "").strip()
+
+    if not organization or not super_name or not target:
+        raise HTTPException(status_code=400, detail="organization, super_name, and target_super_name are required")
+
+    from supertable.services.sharing import materialize_linked_share
+    try:
+        result = materialize_linked_share(organization, super_name, link_id, target)
+        try:
+            _audit(
+                category=EventCategory.DATA_MUTATION,
+                action=Actions.SHARE_MATERIALIZE,
+                organization=organization, super_name=target,
+                resource_type="linked_share", resource_id=link_id,
+                severity=Severity.WARNING,
+                detail=make_detail(
+                    target=target,
+                    tables_imported=result.get("tables_imported", 0),
+                    files_downloaded=result.get("files_downloaded", 0),
+                ),
+            )
+        except Exception:
+            pass
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("Materialize linked share failed")
+        raise HTTPException(status_code=500, detail=f"Materialize failed: {e}")
+
+
+@router.get("/api/v1/shares/dashboard")
+def api_shares_dashboard(
+    request: Request,
+    organization: str = Query(""),
+    org: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    """Provider share dashboard with access stats from audit stream."""
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+    from supertable.services.sharing import get_share_dashboard
+    try:
+        return {"ok": True, "shares": get_share_dashboard(organization)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dashboard failed: {e}")
+
+
+@router.post("/api/v1/linked-shares/refresh-all")
+def api_linked_shares_refresh_all(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    """Auto-refresh all linked shares that are close to expiry."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        raise HTTPException(status_code=400, detail="org and sup are required")
+    from supertable.services.sharing import refresh_expiring_shares
+    try:
+        return refresh_expiring_shares(sel_org, sel_sup)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refresh-all failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   PUBLICATIONS — cross-organization clone (publish + accept)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/api/v1/publications")
+def api_publications_list(
+    request: Request,
+    organization: str = Query(""),
+    org: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+    from supertable.services.publication import list_publications
+    return {"ok": True, "publications": list_publications(organization)}
+
+
+@router.post("/api/v1/publications")
+def api_publications_create(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Publish a SuperTable (or table subset) for cross-org cloning."""
+    organization = str(payload.get("organization") or "").strip()
+    super_name = str(payload.get("super_name") or "").strip()
+    tables = payload.get("tables")
+    label = str(payload.get("label") or "").strip()
+
+    if not organization or not super_name:
+        raise HTTPException(status_code=400, detail="organization and super_name are required")
+
+    table_list = list(tables) if isinstance(tables, list) else None
+
+    from supertable.services.publication import create_publication
+    try:
+        result = create_publication(
+            organization, super_name,
+            tables=table_list, label=label, created_by="superuser",
+        )
+        try:
+            _audit(
+                category=EventCategory.DATA_MUTATION,
+                action=Actions.PUBLICATION_CREATE,
+                organization=organization, super_name=super_name,
+                resource_type="publication", resource_id=result.get("publication_id", ""),
+                severity=Severity.WARNING,
+                detail=make_detail(
+                    tables=result.get("tables", []),
+                    table_count=result.get("table_count", 0),
+                ),
+            )
+        except Exception:
+            pass
+        return JSONResponse(result, status_code=201)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Create publication failed")
+        raise HTTPException(status_code=500, detail=f"Create publication failed: {e}")
+
+
+@router.delete("/api/v1/publications/{publication_id}")
+def api_publications_revoke(
+    request: Request,
+    publication_id: str,
+    organization: str = Query(""),
+    org: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    from supertable.services.publication import revoke_publication
+    try:
+        result = revoke_publication(organization, publication_id)
+        try:
+            _audit(
+                category=EventCategory.DATA_MUTATION,
+                action=Actions.PUBLICATION_REVOKE,
+                organization=organization,
+                resource_type="publication", resource_id=publication_id,
+                severity=Severity.WARNING,
+            )
+        except Exception:
+            pass
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Revoke failed: {e}")
+
+
+@router.get("/api/v1/publications/{publication_id}/manifest")
+def api_publications_manifest(
+    request: Request,
+    publication_id: str,
+    organization: str = Query(""),
+    org: str = Query(""),
+):
+    """Public manifest endpoint — authenticated by bearer token."""
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    bearer_token = auth_header[7:].strip()
+
+    from supertable.services.publication import get_publication_manifest
+    try:
+        manifest = get_publication_manifest(organization, publication_id, bearer_token)
+        return JSONResponse(manifest)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Manifest generation failed: {e}")
+
+
+@router.post("/api/v1/publications/accept")
+def api_publications_accept(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Accept a publication — download all data into a new local SuperTable."""
+    organization = str(payload.get("organization") or "").strip()
+    target_name = str(payload.get("target_super_name") or "").strip()
+    manifest_url = str(payload.get("manifest_url") or "").strip()
+    bearer_token = str(payload.get("bearer_token") or "").strip()
+    label = str(payload.get("label") or "").strip()
+
+    if not organization or not target_name or not manifest_url or not bearer_token:
+        raise HTTPException(status_code=400, detail="organization, target_super_name, manifest_url, and bearer_token are required")
+
+    from supertable.services.publication import accept_publication
+    try:
+        result = accept_publication(
+            organization, target_name, manifest_url, bearer_token, label=label,
+        )
+        try:
+            _audit(
+                category=EventCategory.DATA_MUTATION,
+                action=Actions.PUBLICATION_ACCEPT,
+                organization=organization, super_name=target_name,
+                resource_type="publication", resource_id=target_name,
+                severity=Severity.CRITICAL,
+                detail=make_detail(
+                    provider_org=result.get("provider_org", ""),
+                    provider_super=result.get("provider_super", ""),
+                    tables_imported=result.get("tables_imported", 0),
+                    files_downloaded=result.get("files_downloaded", 0),
+                    bytes_downloaded=result.get("bytes_downloaded", 0),
+                ),
+            )
+        except Exception:
+            pass
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.exception("Accept publication failed")
+        raise HTTPException(status_code=500, detail=f"Accept failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1114,7 +1571,13 @@ def api_list_supers(
         raise HTTPException(status_code=400, detail="organization is required")
 
     try:
-        return {"ok": True, "organization": organization, "supers": list_supers(organization=organization)}
+        items = list_supers_with_flags(organization=organization)
+        return {
+            "ok": True,
+            "organization": organization,
+            "supers": [i["name"] for i in items],
+            "items": items,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"List supers failed: {e}")
 
@@ -2189,9 +2652,11 @@ def rbac_roles_list(
 
 @router.post("/api/v1/rbac/roles")
 def rbac_role_create(
+    request: Request,
     payload: Dict[str, Any] = Body(...),
     _=Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "role_create")
     org = str(payload.get("organization") or "").strip()
     sup = str(payload.get("super_name") or "").strip()
     if not org or not sup:
@@ -2225,10 +2690,12 @@ def rbac_role_create(
 
 @router.put("/api/v1/rbac/roles/{role_id}")
 def rbac_role_update(
+    request: Request,
     role_id: str,
     payload: Dict[str, Any] = Body(...),
     _=Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "role_update")
     org = str(payload.get("organization") or "").strip()
     sup = str(payload.get("super_name") or "").strip()
     if not org or not sup:
@@ -2260,6 +2727,7 @@ def rbac_role_update(
 
 @router.delete("/api/v1/rbac/roles/{role_id}")
 def rbac_role_delete(
+    request: Request,
     role_id: str,
     organization: str = Query(""),
     super_name: str = Query(""),
@@ -2267,6 +2735,7 @@ def rbac_role_delete(
     sup: str = Query(""),
     _=Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "role_delete")
     org = (organization or org or "").strip()
     sup = (super_name or sup or "").strip()
     if not org or not sup:
@@ -3184,6 +3653,7 @@ def api_users_page_create(
     payload: Dict[str, Any] = Body(...),
     _: Any = Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "user_create")
     username = str(payload.get("username") or "").strip()
     validate_username(username)  # raises HTTPException if invalid
 
@@ -3213,7 +3683,7 @@ def api_users_page_create(
     else:
         role_id = rm.create_role({
             "role": role_type, "role_name": role_type,
-            "tables": ["*"], "columns": ["*"], "filters": ["*"],
+            "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
         })
 
     if not role_id:
@@ -3265,6 +3735,7 @@ def api_users_page_delete(
     sup: Optional[str] = Query(None),
     _: Any = Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "user_delete")
     o, s = _users_resolve_or_raise(org, sup)
     um = _users_user_manager(o, s)
 
@@ -3311,6 +3782,7 @@ def api_users_page_add_role(
     payload: Dict[str, Any] = Body(...),
     _: Any = Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "user_role_change")
     org = str(payload.get("org") or "").strip()
     sup = str(payload.get("sup") or "").strip()
     role_id = str(payload.get("role_id") or "").strip()
@@ -3336,6 +3808,7 @@ def api_users_page_remove_role(
     sup: Optional[str] = Query(None),
     _: Any = Depends(admin_guard_api),
 ):
+    _check_rate_limit(request, "user_role_change")
     o, s = _users_resolve_or_raise(org, sup)
     try:
         catalog.rbac_remove_role_from_user(o, s, user_id, role_id)
@@ -3352,6 +3825,7 @@ def api_users_page_regenerate_token(
     _: Any = Depends(admin_guard_api),
 ):
     """Regenerate the login token for a user. Old token stops working immediately."""
+    _check_rate_limit(request, "token_regenerate", max_per_minute=10)
     org = str(payload.get("org") or "").strip()
     sup = str(payload.get("sup") or "").strip()
     if not org or not sup:

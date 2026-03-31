@@ -3503,28 +3503,7 @@ $(document).ready(function(){
 
     <!-- ═══ TOP BAR ═══ -->
     <header class="cc-topbar">
-      <!-- Inline SuperTable selector -->
-      <div class="cc-super-selector">
-        <i class="fas fa-cube super-icon"></i>
-        <select id="pairSel" onchange="ccOnSuperChange(this.value)">
-          {% for t in tenants %}
-          <option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>
-          {% endfor %}
-        </select>
-      </div>
 
-      <div class="topbar-sep"></div>
-
-      <!-- Role selector -->
-      <div class="cc-role-pill">
-        <i class="fas fa-shield-halved"></i>
-        <label for="ccRoleSel">Role</label>
-        <select id="ccRoleSel" title="Select role" onchange="ccOnRoleChange(this.value)">
-          <option value="superadmin" selected>superadmin</option>
-        </select>
-      </div>
-
-      <div class="topbar-sep"></div>
 
       <div class="engine-pill">
         <i class="fas fa-microchip"></i>
@@ -3777,21 +3756,12 @@ $(document).ready(function(){
     </div>
 
     {% else %}
-    <!-- No tenant selected — inline selector -->
+    <!-- No tenant selected -->
     <div style="padding: 60px 40px; text-align: center;">
       <div style="margin: 0 auto; max-width: 400px;">
-        <i class="fas fa-cube" style="font-size: 36px; color: var(--primary-color); opacity: 0.5; margin-bottom: 16px;"></i>
-        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">Select a SuperTable</h3>
-        <p style="color: var(--text-muted); margin-bottom: 20px;">Choose an organization and SuperTable to start querying.</p>
-        <div class="cc-super-selector" style="justify-content: center; margin: 0 auto; max-width: 300px;">
-          <i class="fas fa-cube super-icon"></i>
-          <select id="pairSelFallback" onchange="ccOnSuperChange(this.value)" style="min-width: 200px;">
-            <option value="">— Select —</option>
-            {% for t in tenants %}
-            <option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>
-            {% endfor %}
-          </select>
-        </div>
+        <i class="fas fa-terminal" style="font-size: 36px; color: var(--primary-color); opacity: 0.5; margin-bottom: 16px;"></i>
+        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">No SuperTable selected</h3>
+        <p style="color: var(--text-muted);">Choose a workspace from the sidebar to start querying.</p>
       </div>
     </div>
     {% endif %}
@@ -4578,5 +4548,15 @@ $(document).ready(function(){
     })();
 
   </script>
+<script>
+window.addEventListener("supertable-changed", function(e) {
+  var d = (e && e.detail) || {};
+  if (!d.org || !d.sup) return;
+  var url = new URL('/ui/execute', window.location.origin);
+  url.searchParams.set('org', d.org);
+  url.searchParams.set('sup', d.sup);
+  window.location.href = url.toString();
+});
+</script>
 </body>
 </html>

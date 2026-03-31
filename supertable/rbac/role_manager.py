@@ -7,6 +7,32 @@ from supertable.rbac.row_column_security import RowColumnSecurity
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
 
+try:
+    from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
+    _audit_available = True
+except ImportError:
+    _audit_available = False
+
+
+def _audit_rbac(organization: str, super_name: str, action, resource_id: str,
+                severity=None, **detail_kwargs) -> None:
+    """Emit an RBAC audit event.  Never raises."""
+    if not _audit_available:
+        return
+    try:
+        _audit_emit(
+            category=EventCategory.RBAC_CHANGE,
+            action=action,
+            organization=organization,
+            super_name=super_name,
+            resource_type="role",
+            resource_id=resource_id,
+            severity=severity or Severity.WARNING,
+            detail=make_detail(**detail_kwargs),
+        )
+    except Exception:
+        pass
+
 
 class RoleManager:
     """
@@ -32,10 +58,21 @@ class RoleManager:
     # ── bootstrap ───────────────────────────────────────────────────── #
 
     def _init_role_storage(self) -> None:
-        """Ensure meta key exists and create the default superadmin role."""
-        self._catalog.rbac_init_role_meta(self.organization, self.super_name)
+        """Ensure meta key exists and create the default superadmin role.
 
-        if not self._catalog.rbac_get_superadmin_role_id(self.organization, self.super_name):
+        Fast path: if the meta key already exists AND a superadmin role
+        is present, skip entirely.  This avoids 2-3 Redis calls per
+        RoleManager instantiation in the common case.
+        """
+        org, sup = self.organization, self.super_name
+        # Fast path: meta key exists → roles are initialized
+        if self._catalog.r.exists(f"supertable:{org}:{sup}:rbac:roles:meta"):
+            if self._catalog.rbac_get_superadmin_role_id(org, sup):
+                return
+
+        self._catalog.rbac_init_role_meta(org, sup)
+
+        if not self._catalog.rbac_get_superadmin_role_id(org, sup):
             lock_token = self._catalog.acquire_simple_lock(
                 self.organization, self.super_name, "roles_init", ttl_s=10, timeout_s=30,
             )
@@ -57,6 +94,8 @@ class RoleManager:
                     )
 
     # ── CRUD ────────────────────────────────────────────────────────── #
+
+    _SAFE_ROLE_NAME_RE = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_\- ]{0,126}$")
 
     def create_role(self, data: dict) -> str:
         """
@@ -80,6 +119,14 @@ class RoleManager:
         """
         org, sup = self.organization, self.super_name
         role_name = data.get("role_name")
+
+        # Validate role_name format
+        if role_name and not self._SAFE_ROLE_NAME_RE.fullmatch(role_name):
+            raise ValueError(
+                f"Invalid role_name: {role_name!r}. Must be 1-127 characters, "
+                "start with a letter or underscore, contain only letters, digits, "
+                "underscores, hyphens, and spaces."
+            )
 
         # If role_name given, check uniqueness (idempotent: return existing)
         if role_name:
@@ -107,11 +154,30 @@ class RoleManager:
         Update a role's content in-place.  Returns the new content_hash.
 
         Only the fields present in ``data`` are changed.
-        ``role_id`` remains stable.
+        ``role_id`` remains stable.  If ``role_name`` is being changed,
+        validates format and checks uniqueness.
         """
-        existing = self._catalog.get_role_details(self.organization, self.super_name, role_id)
+        org, sup = self.organization, self.super_name
+        existing = self._catalog.get_role_details(org, sup, role_id)
         if not existing:
             raise ValueError(f"Role {role_id} does not exist")
+
+        # Handle role_name rename
+        new_name = data.get("role_name")
+        old_name = existing.get("role_name", "")
+        if new_name is not None and new_name != old_name:
+            # Validate format
+            if new_name and not self._SAFE_ROLE_NAME_RE.fullmatch(new_name):
+                raise ValueError(
+                    f"Invalid role_name: {new_name!r}. Must be 1-127 characters, "
+                    "start with a letter or underscore, contain only letters, digits, "
+                    "underscores, hyphens, and spaces."
+                )
+            # Check uniqueness
+            if new_name:
+                conflicting_id = self._catalog.rbac_get_role_id_by_name(org, sup, new_name)
+                if conflicting_id and conflicting_id != role_id:
+                    raise ValueError(f"Role name '{new_name}' is already taken by role {conflicting_id}")
 
         default_tables = {"*": {"columns": ["*"], "filters": ["*"]}}
 
@@ -126,17 +192,41 @@ class RoleManager:
         update_fields = rcs.to_json()
         update_fields["content_hash"] = rcs.content_hash
 
-        self._catalog.rbac_update_role(self.organization, self.super_name, role_id, update_fields)
+        # If role_name changed, update the name_to_id mapping
+        if new_name is not None and new_name != old_name:
+            update_fields["role_name"] = new_name
+            name_key = f"supertable:{org}:{sup}:rbac:roles:name_to_id"
+            pipe = self._catalog.r.pipeline()
+            if old_name:
+                pipe.hdel(name_key, old_name.lower())
+            if new_name:
+                pipe.hset(name_key, new_name.lower(), role_id)
+            pipe.execute()
+
+        self._catalog.rbac_update_role(org, sup, role_id, update_fields)
         logger.debug(f"Role updated: {role_id}")
+
+        _audit_rbac(org, sup, Actions.ROLE_UPDATE, role_id,
+                     role_name=new_name or old_name, role_type=merged.get("role", ""))
+
         return rcs.content_hash
 
     def delete_role(self, role_id: str) -> bool:
         """
         Delete a role and atomically strip it from all users.
+
+        The superadmin role cannot be deleted.
         """
-        result = self._catalog.rbac_delete_role(self.organization, self.super_name, role_id)
+        org, sup = self.organization, self.super_name
+        existing = self._catalog.get_role_details(org, sup, role_id)
+        if existing and existing.get("role") == "superadmin":
+            raise ValueError("The superadmin role cannot be deleted.")
+        role_name = existing.get("role_name", "") if existing else ""
+        result = self._catalog.rbac_delete_role(org, sup, role_id)
         if result:
             logger.debug(f"Role deleted: {role_id}")
+            _audit_rbac(org, sup, Actions.ROLE_DELETE, role_id,
+                         severity=Severity.CRITICAL, role_name=role_name)
         return result
 
     def get_role(self, role_id: str) -> Dict:

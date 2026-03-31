@@ -715,19 +715,39 @@ async def whoami(role: Optional[str] = None, auth_token: Optional[str] = None) -
 @log_tool
 async def list_supers(organization: str, role: Optional[str] = None, auth_token: Optional[str] = None) -> Dict[str, Any]:
     org = _safe_id(organization, "organization")
-    _auth(auth_token, role)
+    resolved_role = _auth(auth_token, role)
     _ensure_imports()
 
     def _work():
-        return list_supers_fn(org)
+        names = list_supers_fn(org, resolved_role)
+        # Enrich with read_only flag from root meta
+        from supertable.redis_catalog import RedisCatalog as _RC
+        import json as _json
+        rc = _RC()
+        items = []
+        for name in names:
+            read_only = False
+            clone_type = None
+            cloned_from = None
+            try:
+                raw = rc.r.get(f"supertable:{org}:{name}:meta:root")
+                if raw:
+                    root = _json.loads(raw)
+                    read_only = bool(root.get("read_only"))
+                    clone_type = root.get("clone_type")
+                    cloned_from = root.get("cloned_from")
+            except Exception:
+                pass
+            items.append({"name": name, "read_only": read_only, "clone_type": clone_type, "cloned_from": cloned_from})
+        return items
 
     async with _get_limiter():
         try:
-            supers = await anyio.to_thread.run_sync(_work)
+            items = await anyio.to_thread.run_sync(_work)
         except Exception as e:
             logger.exception("list_supers failed: %s", e)
-            supers = []
-    return {"result": supers}
+            items = []
+    return {"result": [i["name"] for i in items], "items": items}
 
 @mcp.tool()
 @log_tool
@@ -743,6 +763,31 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
 
     async with _get_limiter():
         tables = await anyio.to_thread.run_sync(_work)
+
+        # Enrich tables with source info (local vs linked share)
+        def _enrich():
+            from supertable.redis_catalog import RedisCatalog as _RC
+            rc = _RC()
+            details = []
+            for t in tables:
+                info = {"name": t, "source": "local"}
+                try:
+                    leaf = rc._get_leaf_raw(org, sup, t)
+                    if leaf:
+                        p = leaf.get("payload") if isinstance(leaf, dict) else None
+                        if isinstance(p, dict) and p.get("_linked_share"):
+                            info["source"] = "linked_share"
+                            info["provider_org"] = p.get("_provider_org", "")
+                            info["link_id"] = p.get("_linked_share", "")
+                except Exception:
+                    pass
+                details.append(info)
+            return details
+
+        try:
+            table_details = await anyio.to_thread.run_sync(_enrich)
+        except Exception:
+            table_details = [{"name": t, "source": "local"} for t in tables]
 
         # ── __catalog__ lookup ──────────────────────────────────────────────────
         # If a __catalog__ table exists, fetch ALL its rows regardless of schema
@@ -871,6 +916,7 @@ async def list_tables(super_name: str, organization: str, role: Optional[str] = 
 
     return {
         "result": tables,
+        "table_details": table_details,
         "catalog": catalog,
         "catalog_hint": catalog_hint,
         "feedback": feedback,

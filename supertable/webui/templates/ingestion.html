@@ -233,7 +233,6 @@ html, body {
 .fade-in { animation: fadeIn .3s ease forwards; }
 
 /* Hidden compat elements */
-#pairSel { display: none; }
   </style>
 
   <script>
@@ -271,24 +270,8 @@ html, body {
   <div id="stagingRoot" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" style="display:none;"></div>
 
   <header class="cc-topbar">
-    <div class="super-sel">
-      <i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i>
-      <select id="ccSuperSel" onchange="ccOnSuperChange(this.value)">
-        {% for t in tenants %}
-        <option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="topbar-sep"></div>
-    <div class="role-pill">
-      <i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i>
-      <label>Role</label>
-      <select id="ccRoleSel" onchange="ccOnRoleChange(this.value)">
-        <option value="superadmin" selected>superadmin</option>
-      </select>
-    </div>
-    <div style="flex:1;"></div>
     <span style="font-size:11px;color:var(--text-muted);">Ingestion</span>
+    <div style="flex:1;"></div>
   </header>
 
   <div class="cc-cols">
@@ -446,16 +429,9 @@ html, body {
 
   {% else %}
   <div style="padding:40px;text-align:center;">
-    <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to begin</div>
-    <div class="super-sel" style="display:inline-flex;">
-      <i class="fas fa-cube" style="color:var(--primary);"></i>
-      <select onchange="ccOnSuperChange(this.value)" style="min-width:200px;">
-        <option value="">— Select —</option>
-        {% for t in tenants %}
-        <option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>
-        {% endfor %}
-      </select>
-    </div>
+    <i class="fas fa-layer-group" style="font-size:36px;color:var(--primary);opacity:0.5;margin-bottom:16px;"></i>
+    <div style="font-size:15px;font-weight:600;margin-bottom:8px;">No SuperTable selected</div>
+    <p style="font-size:13px;color:var(--text-muted);">Choose a workspace from the sidebar to begin ingestion.</p>
   </div>
   {% endif %}
 

@@ -325,8 +325,6 @@
     @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
     .fade-in { animation: fadeIn .3s ease forwards; }
 
-    /* Hide the legacy pairSel selector visually but keep it in DOM for original JS */
-    #pairSel { display: none !important; }
   </style>
 
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -2468,33 +2466,10 @@ function deleteTable(simple) {
 
   {% if has_tenant %}
 
-  <!-- Hidden select for backward compat with original JS that reads pairSel -->
-  <select id="pairSel">
-    {% for t in tenants %}
-    <option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>
-    {% endfor %}
-  </select>
 
   <!-- ═══ TOP BAR ═══ -->
   <header class="cc-topbar">
-    <div class="cc-super-selector">
-      <i class="fas fa-cube" style="color:var(--primary-color);font-size:13px;"></i>
-      <select onchange="ccOnSuperChange(this.value)">
-        {% for t in tenants %}
-        <option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>
-        {% endfor %}
-      </select>
-    </div>
 
-    <div class="topbar-sep"></div>
-
-    <div class="cc-role-pill">
-      <i class="fas fa-shield-halved" style="font-size:10px;color:#059669;"></i>
-      <label for="ccRoleSel">Role</label>
-      <select id="ccRoleSel" title="Select role" onchange="ccOnRoleChange(this.value)">
-        <option value="superadmin" selected>superadmin</option>
-      </select>
-    </div>
 
     <div style="flex:1;"></div>
 
@@ -2568,16 +2543,8 @@ function deleteTable(simple) {
   {% else %}
   <div style="padding: 60px 40px; text-align: center;">
     <i class="fas fa-cube" style="font-size: 36px; color: var(--primary-color); opacity: 0.5; margin-bottom: 16px;"></i>
-    <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">Select a SuperTable</h3>
-    <div class="cc-super-selector" style="justify-content: center; margin: 0 auto; max-width: 300px;">
-      <i class="fas fa-cube" style="color:var(--primary-color);"></i>
-      <select onchange="ccOnSuperChange(this.value)" style="min-width: 200px;">
-        <option value="">— Select —</option>
-        {% for t in tenants %}
-        <option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>
-        {% endfor %}
-      </select>
-    </div>
+    <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">No SuperTable selected</h3>
+    <p style="font-size: 13px; color: var(--text-muted);">Choose a workspace from the sidebar to view tables.</p>
   </div>
   {% endif %}
 
@@ -2733,6 +2700,23 @@ function deleteTable(simple) {
   </div>
 </div>
 
+
+<script>
+window.addEventListener("supertable-changed", function(e) {
+  var d = (e && e.detail) || {};
+  if (!d.org || !d.sup) return;
+  var url = new URL('/ui/tables', window.location.origin);
+  url.searchParams.set('org', d.org);
+  url.searchParams.set('sup', d.sup);
+  window.location.href = url.toString();
+});
+window.addEventListener("role-changed", function() {
+  if (window.__cc_selectedTable) {
+    var idx = (window.__cc_tables || []).findIndex(function(t) { return t.name === window.__cc_selectedTable; });
+    if (idx >= 0) ccSelectTable(window.__cc_selectedTable, idx);
+  }
+});
+</script>
 
 </body>
 </html>

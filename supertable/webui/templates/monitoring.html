@@ -127,7 +127,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}.fade-in{animation:fadeIn .3s ease forwards;}
 .toast{position:fixed;right:18px;top:16px;z-index:9999;background:var(--text);color:#fff;border-radius:8px;padding:10px 16px;font-size:12px;font-weight:600;box-shadow:0 10px 25px rgba(0,0,0,.2);display:none;}
 .hidden{display:none;}
-#pairSel{display:none;}
   </style>
   <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
 </head>
@@ -135,12 +134,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 {% include "sidebar.html" %}
 <div class="content-container">
 {% if has_tenant %}
-<select id="pairSel">{% for t in tenants %}<option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>{% endfor %}</select>
 <div id="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
 
   <header class="cc-topbar">
-    <div class="super-sel"><i class="fas fa-cube" style="color:var(--primary);font-size:13px;"></i><select id="ccSuperSel" onchange="ccOnSuperChange(this.value)">{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div>
-    <div class="topbar-sep"></div>
     <span style="font-size:11px;color:var(--text-muted);">Monitoring</span>
     <div style="flex:1;"></div>
     <button class="btn-sm" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
@@ -233,7 +229,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 </div>
 {% else %}
-<div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view Monitoring</div><div class="super-sel" style="display:inline-flex;"><i class="fas fa-cube" style="color:var(--primary);"></i><select onchange="ccOnSuperChange(this.value)" style="min-width:200px;"><option value="">— Select —</option>{% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}</select></div></div>
+<div style="padding:40px;text-align:center;"><div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable from the sidebar</div></div>
 {% endif %}
 </div>
 <div class="toast" id="toast"></div>
@@ -500,6 +496,20 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   renderSection();
   var _c=ctx();if(_c.org&&_c.sup)refreshAll();
 })();
+</script>
+<script>
+window.addEventListener("supertable-changed", function(e) {
+  var d = (e && e.detail) || {};
+  if (!d.org || !d.sup) return;
+  if (typeof window.ccOnSuperChange === "function") {
+    window.ccOnSuperChange(d.org + "/" + d.sup);
+  } else {
+    var url = new URL('/ui/monitoring', window.location.origin);
+    url.searchParams.set('org', d.org);
+    url.searchParams.set('sup', d.sup);
+    window.location.href = url.toString();
+  }
+});
 </script>
 </body>
 </html>

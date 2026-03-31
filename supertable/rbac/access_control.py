@@ -90,7 +90,11 @@ def _check_operation_access(
         logger.error(f"Role '{role_name}' has no role type")
         raise PermissionError(f"You don't have permission to {label}.")
 
-    role_type = RoleType(role_type_str)
+    try:
+        role_type = RoleType(role_type_str)
+    except ValueError:
+        logger.error(f"Role '{role_name}' has invalid role type: {role_type_str}")
+        raise PermissionError(f"You don't have permission to {label}.")
 
     if not has_permission(role_type, permission):
         logger.error(f"Role '{role_name}' does not have {permission.name} permission.")
@@ -101,13 +105,22 @@ def _check_operation_access(
 
 
 def _check_readonly_guard(super_name: str, organization: str, label: str) -> None:
-    """Block mutations on read-only SuperTables (snapshot clones)."""
+    """Block mutations on read-only SuperTables (snapshot clones, replicas, locked)."""
     try:
         from supertable.redis_catalog import RedisCatalog
         root = RedisCatalog().get_root(organization, super_name)
         if root and root.get("read_only"):
+            clone_type = root.get("clone_type", "")
+            if clone_type == "replica":
+                reason = "live replica"
+            elif clone_type == "readonly":
+                reason = "read-only snapshot clone"
+            elif root.get("cloned_from"):
+                reason = "read-only clone"
+            else:
+                reason = "locked"
             raise PermissionError(
-                f"This SuperTable is read-only (snapshot clone). Cannot {label}."
+                f"This SuperTable is {reason}. Cannot {label}."
             )
     except PermissionError:
         raise
@@ -214,7 +227,10 @@ def restrict_read_access(
     if not role_type_str:
         raise PermissionError("You don't have permission to read the table.")
 
-    role_type = RoleType(role_type_str)
+    try:
+        role_type = RoleType(role_type_str)
+    except ValueError:
+        raise PermissionError("You don't have permission to read the table.")
 
     if not has_permission(role_type, Permission.READ):
         raise PermissionError("You don't have permission to read the table.")

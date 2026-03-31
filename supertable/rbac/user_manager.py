@@ -31,8 +31,18 @@ class UserManager:
     # ── bootstrap ───────────────────────────────────────────────────── #
 
     def _init_user_storage(self) -> None:
-        """Ensure meta key exists and create the default superuser."""
-        self._catalog.rbac_init_user_meta(self.organization, self.super_name)
+        """Ensure meta key exists and create the default superuser.
+
+        Fast path: if the meta key already exists AND a superuser is
+        present, skip entirely.
+        """
+        org, sup = self.organization, self.super_name
+        # Fast path: meta key exists + superuser exists → skip
+        if self._catalog.r.exists(f"supertable:{org}:{sup}:rbac:users:meta"):
+            if self._catalog.rbac_get_user_id_by_username(org, sup, "superuser"):
+                return
+
+        self._catalog.rbac_init_user_meta(org, sup)
         self._ensure_default_superuser()
 
     def _ensure_default_superuser(self) -> None:
@@ -122,14 +132,14 @@ class UserManager:
         if existing is None:
             raise ValueError(f"User {user_id} does not exist")
 
-        update_fields: Dict[str, str] = {}
+        update_fields: Dict[str, Any] = {}
 
         if "roles" in data:
             roles = data["roles"]
             for role_id in roles:
                 if not self._catalog.rbac_role_exists(org, sup, role_id):
                     raise ValueError(f"Role {role_id} does not exist")
-            update_fields["roles"] = json.dumps(roles)
+            update_fields["roles"] = roles  # raw list — rbac_update_user serializes
 
         if "username" in data:
             new_username = data["username"]
