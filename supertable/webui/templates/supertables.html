@@ -36,50 +36,41 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .btn-primary:hover{background:var(--primary-dark);color:#fff;}
 .btn-danger{background:var(--error);color:#fff;border-color:var(--error);}
 .btn-danger:hover{opacity:.85;}
-
-/* Cards grid */
-.st-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;}
+.st-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px;}
 .st-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:var(--transition);}
 .st-card:hover{border-color:var(--primary);box-shadow:0 2px 12px rgba(28,150,202,.08);}
-.st-card-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:12px;}
+.st-card-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;}
 .st-card-name{font-size:16px;font-weight:700;font-family:var(--mono);word-break:break-all;}
-.st-card-meta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;font-size:12px;color:var(--text-sec);}
+.st-card-meta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--text-sec);}
 .st-card-meta span{display:flex;align-items:center;gap:4px;}
 .st-card-actions{display:flex;gap:6px;flex-wrap:wrap;}
-
-/* Badges */
 .badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.02em;}
 .badge-active{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
 .badge-readonly{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
 .badge-clone{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
-
+/* Divergence bar */
+.div-bar{height:4px;border-radius:2px;background:var(--border-light);margin-top:8px;overflow:hidden;}
+.div-fill{height:100%;border-radius:2px;transition:width .3s;}
+.div-label{font-size:10px;color:var(--text-muted);margin-top:3px;}
 /* Modal */
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9999;justify-content:center;align-items:center;}
 .modal-overlay.active{display:flex;}
-.modal-box{background:var(--bg-card);border-radius:var(--radius);padding:28px;width:480px;max-width:90vw;box-shadow:0 8px 40px rgba(0,0,0,.15);}
+.modal-box{background:var(--bg-card);border-radius:var(--radius);padding:28px;width:520px;max-width:90vw;box-shadow:0 8px 40px rgba(0,0,0,.15);}
 .modal-title{font-size:16px;font-weight:700;margin-bottom:16px;display:flex;align-items:center;gap:8px;}
 .field-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-sec);margin-bottom:4px;}
-.field-input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;background:var(--bg-card);}
-.field-input:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
+.field-input,.field-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;background:var(--bg-card);}
+.field-input:focus,.field-select:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
 .field-group{margin-bottom:14px;}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;}
 .flash-error{background:var(--error-bg);color:#991b1b;padding:8px 12px;border-radius:var(--radius-sm);font-size:12px;margin-bottom:12px;border:1px solid rgba(239,68,68,.2);}
-.flash-ok{background:var(--success-bg);color:#065f46;padding:8px 12px;border-radius:var(--radius-sm);font-size:12px;margin-bottom:12px;border:1px solid rgba(16,185,129,.2);}
-
-/* Toggle */
 .toggle-row{display:flex;gap:8px;}
 .toggle-opt{padding:6px 16px;font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;background:var(--bg-surface);color:var(--text-sec);transition:var(--transition);}
 .toggle-opt.selected{background:var(--primary);color:#fff;border-color:var(--primary);}
-
-/* Empty state */
 .empty-state{text-align:center;padding:60px 20px;color:var(--text-muted);}
 .empty-state i{font-size:40px;margin-bottom:12px;display:block;color:var(--border);}
-
-/* Toast */
 .toast{position:fixed;bottom:24px;right:24px;padding:10px 20px;border-radius:var(--radius-sm);font-size:12px;font-weight:600;z-index:99999;opacity:0;transition:opacity .3s;pointer-events:none;}
-.toast.show{opacity:1;}
-.toast-ok{background:var(--success);color:#fff;}
-.toast-err{background:var(--error);color:#fff;}
+.toast.show{opacity:1;}.toast-ok{background:var(--success);color:#fff;}.toast-err{background:var(--error);color:#fff;}
+.field-hint{font-size:11px;color:var(--text-muted);margin-top:4px;}
   </style>
 </head>
 <body>
@@ -88,9 +79,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <div class="wrap">
   <div class="page-hdr">
     <div class="page-title"><i class="fas fa-cubes" style="color:var(--primary);"></i> SuperTables</div>
-    <button class="btn-sm btn-primary" onclick="showModal('create')"><i class="fas fa-plus"></i> Create</button>
+    <div style="display:flex;gap:8px;">
+      <button class="btn-sm" onclick="openCloneTable()"><i class="fas fa-table"></i> Clone table</button>
+      <button class="btn-sm btn-primary" onclick="showCreate()"><i class="fas fa-plus"></i> Create</button>
+    </div>
   </div>
-
   <div id="loading" style="text-align:center;padding:40px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading…</div>
   <div class="st-grid" id="grid" style="display:none;"></div>
   <div class="empty-state" id="empty" style="display:none;"><i class="fas fa-cubes"></i><div style="font-size:15px;font-weight:600;margin-bottom:8px;">No SuperTables found</div><div>Create one to get started.</div></div>
@@ -102,41 +95,57 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div class="modal-box">
     <div class="modal-title"><i class="fas fa-plus-circle" style="color:var(--primary);"></i> Create SuperTable</div>
     <div id="createErr"></div>
-    <div class="field-group">
-      <div class="field-label">Name</div>
-      <input class="field-input" id="createName" placeholder="my-supertable" autocomplete="off"/>
-    </div>
+    <div class="field-group"><div class="field-label">Name</div><input class="field-input" id="createName" placeholder="my-supertable" autocomplete="off"/></div>
     <div class="modal-actions">
-      <button class="btn-sm" onclick="hideModal('modalCreate')">Cancel</button>
-      <button class="btn-sm btn-primary" id="btnCreateSubmit"><i class="fas fa-plus"></i> Create</button>
+      <button class="btn-sm" onclick="hide('modalCreate')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnCreate"><i class="fas fa-plus"></i> Create</button>
     </div>
   </div>
 </div>
 
-<!-- Clone Modal -->
+<!-- Clone SuperTable Modal -->
 <div class="modal-overlay" id="modalClone">
   <div class="modal-box">
     <div class="modal-title"><i class="fas fa-clone" style="color:var(--primary);"></i> Clone SuperTable</div>
     <div id="cloneErr"></div>
-    <div class="field-group">
-      <div class="field-label">Source</div>
-      <input class="field-input" id="cloneSource" readonly style="background:var(--bg-surface);"/>
-    </div>
-    <div class="field-group">
-      <div class="field-label">Target name</div>
-      <input class="field-input" id="cloneTarget" placeholder="my-clone" autocomplete="off"/>
-    </div>
+    <div class="field-group"><div class="field-label">Source</div><input class="field-input" id="cloneSource" readonly style="background:var(--bg-surface);"/></div>
+    <div class="field-group"><div class="field-label">Target name</div><input class="field-input" id="cloneTarget" placeholder="my-clone" autocomplete="off"/></div>
     <div class="field-group">
       <div class="field-label">Clone type</div>
       <div class="toggle-row" id="cloneTypeRow">
-        <div class="toggle-opt selected" data-val="readonly" onclick="selCloneType(this)"><i class="fas fa-eye"></i> Read-only</div>
-        <div class="toggle-opt" data-val="full" onclick="selCloneType(this)"><i class="fas fa-copy"></i> Full clone</div>
+        <div class="toggle-opt selected" data-val="writable" onclick="selType(this)"><i class="fas fa-pen"></i> Writable</div>
+        <div class="toggle-opt" data-val="readonly" onclick="selType(this)"><i class="fas fa-lock"></i> Read-only</div>
       </div>
-      <div style="margin-top:8px;font-size:11px;color:var(--text-muted);" id="cloneTypeHint">Zero-copy snapshot. No writes allowed on the clone.</div>
+      <div class="field-hint" id="cloneHint">Zero-copy clone. New writes go to the clone's own storage (copy-on-write).</div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Time travel (optional)</div>
+      <input class="field-input" id="cloneTimestamp" type="datetime-local" style="max-width:260px;"/>
+      <div class="field-hint">Leave empty for latest data. Set a date to clone data as it was at that point.</div>
     </div>
     <div class="modal-actions">
-      <button class="btn-sm" onclick="hideModal('modalClone')">Cancel</button>
-      <button class="btn-sm btn-primary" id="btnCloneSubmit"><i class="fas fa-clone"></i> Clone</button>
+      <button class="btn-sm" onclick="hide('modalClone')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnClone"><i class="fas fa-clone"></i> Clone</button>
+    </div>
+  </div>
+</div>
+
+<!-- Clone Table Modal -->
+<div class="modal-overlay" id="modalCloneTable">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-table" style="color:var(--primary);"></i> Clone table</div>
+    <div id="ctErr"></div>
+    <div class="field-group"><div class="field-label">Source SuperTable</div><select class="field-select" id="ctSourceSup"></select></div>
+    <div class="field-group"><div class="field-label">Table</div><select class="field-select" id="ctTable"><option value="">— Select source first —</option></select></div>
+    <div class="field-group"><div class="field-label">Target SuperTable</div><select class="field-select" id="ctTargetSup"></select></div>
+    <div class="field-group">
+      <div class="field-label">Time travel (optional)</div>
+      <input class="field-input" id="ctVersion" type="number" placeholder="Version number" style="max-width:180px;"/>
+      <div class="field-hint">Leave empty for latest. Enter a snapshot version number for time travel.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalCloneTable')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnCloneTable"><i class="fas fa-clone"></i> Clone table</button>
     </div>
   </div>
 </div>
@@ -147,14 +156,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="modal-title"><i class="fas fa-trash" style="color:var(--error);"></i> Delete SuperTable</div>
     <div id="deleteErr"></div>
     <p style="font-size:12px;color:var(--text-sec);margin-bottom:12px;">This will permanently delete all tables, data, and configuration. Type the name to confirm.</p>
-    <div class="field-group">
-      <div class="field-label">SuperTable name</div>
-      <input class="field-input" id="deleteConfirm" placeholder="" autocomplete="off"/>
-    </div>
+    <div class="field-group"><div class="field-label">SuperTable name</div><input class="field-input" id="deleteConfirm" autocomplete="off"/></div>
     <input type="hidden" id="deleteTarget"/>
     <div class="modal-actions">
-      <button class="btn-sm" onclick="hideModal('modalDelete')">Cancel</button>
-      <button class="btn-sm btn-danger" id="btnDeleteSubmit"><i class="fas fa-trash"></i> Delete</button>
+      <button class="btn-sm" onclick="hide('modalDelete')">Cancel</button>
+      <button class="btn-sm btn-danger" id="btnDelete"><i class="fas fa-trash"></i> Delete</button>
     </div>
   </div>
 </div>
@@ -165,52 +171,53 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 (function(){
   var ORG = "{{ sel_org }}";
   var items = [];
-  var cloneType = "readonly";
+  var cloneType = "writable";
 
   function enc(s){return encodeURIComponent(s);}
   function esc(s){var d=document.createElement("div");d.textContent=String(s||"");return d.innerHTML;}
+  function toast(msg,ok){var t=document.getElementById("toast");t.textContent=msg;t.className="toast "+(ok?"toast-ok":"toast-err")+" show";setTimeout(function(){t.className="toast";},3000);}
+  function hide(id){document.getElementById(id).classList.remove("active");}
+  window.hide=hide;
 
-  function toast(msg,ok){
-    var t=document.getElementById("toast");
-    t.textContent=msg;t.className="toast "+(ok?"toast-ok":"toast-err")+" show";
-    setTimeout(function(){t.className="toast";},3000);
+  async function api(method,url,body){
+    var opts={method:method,credentials:"same-origin",headers:{"Content-Type":"application/json"}};
+    if(body)opts.body=JSON.stringify(body);
+    var r=await fetch(url,opts);var j=await r.json();
+    if(!r.ok)throw new Error(j.detail||j.message||r.status);
+    return j;
   }
 
-  async function apiGet(u){var r=await fetch(u,{credentials:"same-origin"});var j=await r.json();if(!r.ok)throw new Error(j.detail||j.message||r.status);return j;}
-  async function apiPost(u,b){var r=await fetch(u,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});var j=await r.json();if(!r.ok)throw new Error(j.detail||j.message||r.status);return j;}
-  async function apiPut(u,b){var r=await fetch(u,{method:"PUT",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});var j=await r.json();if(!r.ok)throw new Error(j.detail||j.message||r.status);return j;}
-  async function apiDel(u){var r=await fetch(u,{method:"DELETE",credentials:"same-origin"});var j=await r.json();if(!r.ok)throw new Error(j.detail||j.message||r.status);return j;}
-
-  function showModal(id){
-    if(id==="create"){document.getElementById("createName").value="";document.getElementById("createErr").innerHTML="";document.getElementById("modalCreate").classList.add("active");document.getElementById("createName").focus();}
+  function divBar(div){
+    if(!div||!div.total_files)return "";
+    var pct=div.divergence_pct||0;
+    var color=pct<10?"var(--primary)":pct<50?"var(--warn)":"var(--success)";
+    return '<div class="div-bar"><div class="div-fill" style="width:'+pct+'%;background:'+color+';"></div></div>'
+      +'<div class="div-label">'+pct+'% diverged — '+div.own_files+' own / '+div.shared_files+' shared files</div>';
   }
-  function hideModal(id){document.getElementById(id).classList.remove("active");}
-  window.showModal=showModal;window.hideModal=hideModal;
-
-  function fmtTs(ms){if(!ms)return "—";return new Date(ms).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});}
 
   function render(){
-    var grid=document.getElementById("grid");
-    var empty=document.getElementById("empty");
+    var grid=document.getElementById("grid"),empty=document.getElementById("empty");
     document.getElementById("loading").style.display="none";
     if(!items.length){grid.style.display="none";empty.style.display="block";return;}
     empty.style.display="none";grid.style.display="grid";
-
     var h="";
     items.forEach(function(it){
       var badges="";
       if(it.read_only)badges+='<span class="badge badge-readonly"><i class="fas fa-lock"></i> Read-only</span>';
       else badges+='<span class="badge badge-active"><i class="fas fa-check-circle"></i> Active</span>';
-      if(it.cloned_from)badges+=' <span class="badge badge-clone"><i class="fas fa-clone"></i> '+esc(it.clone_type==="full"?"Full":"Snapshot")+" of "+esc(it.cloned_from)+"</span>";
-
-      h+='<div class="st-card" data-name="'+esc(it.name)+'">';
-      h+='<div class="st-card-hdr"><div class="st-card-name">'+esc(it.name)+'</div><div>'+badges+'</div></div>';
+      if(it.cloned_from){
+        var lbl=it.clone_type==="writable"?"Writable clone":"Snapshot clone";
+        badges+=' <span class="badge badge-clone"><i class="fas fa-clone"></i> '+lbl+" of "+esc(it.cloned_from)+"</span>";
+      }
+      h+='<div class="st-card">';
+      h+='<div class="st-card-hdr"><div class="st-card-name">'+esc(it.name)+'</div><div style="display:flex;gap:4px;flex-wrap:wrap;">'+badges+'</div></div>';
       h+='<div class="st-card-meta">';
       h+='<span><i class="fas fa-table"></i> '+it.table_count+' table'+(it.table_count!==1?"s":"")+'</span>';
       h+='<span><i class="fas fa-code-branch"></i> v'+it.version+'</span>';
-      h+='<span><i class="fas fa-calendar"></i> '+fmtTs(it.ts)+'</span>';
+      if(it.ts)h+='<span><i class="fas fa-calendar"></i> '+new Date(it.ts).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"})+'</span>';
       h+='</div>';
-      h+='<div class="st-card-actions">';
+      if(it.divergence)h+=divBar(it.divergence);
+      h+='<div class="st-card-actions" style="margin-top:12px;">';
       h+='<button class="btn-sm" onclick="openClone(\''+esc(it.name)+'\')"><i class="fas fa-clone"></i> Clone</button>';
       if(!it.read_only)h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',true)"><i class="fas fa-lock"></i> Lock</button>';
       else h+='<button class="btn-sm" onclick="toggleRO(\''+esc(it.name)+'\',false)"><i class="fas fa-lock-open"></i> Unlock</button>';
@@ -221,86 +228,107 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   }
 
   async function load(){
-    try{
-      var d=await apiGet("/api/v1/supertables/details?organization="+enc(ORG));
-      items=(d&&d.items)||[];
-    }catch(e){items=[];toast("Load failed: "+e.message,false);}
+    try{var d=await api("GET","/api/v1/supertables/details?organization="+enc(ORG));items=(d&&d.items)||[];}
+    catch(e){items=[];toast("Load failed: "+e.message,false);}
     render();
   }
 
   // Create
-  document.getElementById("btnCreateSubmit").addEventListener("click",async function(){
+  window.showCreate=function(){document.getElementById("createName").value="";document.getElementById("createErr").innerHTML="";document.getElementById("modalCreate").classList.add("active");document.getElementById("createName").focus();};
+  document.getElementById("btnCreate").addEventListener("click",async function(){
     var name=document.getElementById("createName").value.trim();
     if(!name){document.getElementById("createErr").innerHTML='<div class="flash-error">Name is required.</div>';return;}
-    try{
-      await apiPost("/api/v1/supertables?organization="+enc(ORG)+"&super_name="+enc(name),{});
-      hideModal("modalCreate");toast("Created "+name,true);load();
-    }catch(e){document.getElementById("createErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+    try{await api("POST","/api/v1/supertables?organization="+enc(ORG)+"&super_name="+enc(name));hide("modalCreate");toast("Created "+name,true);load();}
+    catch(e){document.getElementById("createErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
 
-  // Clone
+  // Clone SuperTable
   window.openClone=function(name){
-    document.getElementById("cloneSource").value=name;
-    document.getElementById("cloneTarget").value="";
-    document.getElementById("cloneErr").innerHTML="";
-    cloneType="readonly";
-    document.querySelectorAll("#cloneTypeRow .toggle-opt").forEach(function(o){o.classList.toggle("selected",o.getAttribute("data-val")==="readonly");});
-    document.getElementById("cloneTypeHint").textContent="Zero-copy snapshot. No writes allowed on the clone.";
-    document.getElementById("modalClone").classList.add("active");
-    document.getElementById("cloneTarget").focus();
+    document.getElementById("cloneSource").value=name;document.getElementById("cloneTarget").value="";
+    document.getElementById("cloneErr").innerHTML="";document.getElementById("cloneTimestamp").value="";
+    cloneType="writable";
+    document.querySelectorAll("#cloneTypeRow .toggle-opt").forEach(function(o){o.classList.toggle("selected",o.getAttribute("data-val")==="writable");});
+    document.getElementById("cloneHint").textContent="Zero-copy clone. New writes go to the clone's own storage (copy-on-write).";
+    document.getElementById("modalClone").classList.add("active");document.getElementById("cloneTarget").focus();
   };
-  window.selCloneType=function(el){
+  window.selType=function(el){
     cloneType=el.getAttribute("data-val");
     document.querySelectorAll("#cloneTypeRow .toggle-opt").forEach(function(o){o.classList.toggle("selected",o.getAttribute("data-val")===cloneType);});
-    document.getElementById("cloneTypeHint").textContent=cloneType==="readonly"
-      ?"Zero-copy snapshot. No writes allowed on the clone."
-      :"Deep copy of all data and roles. Fully independent.";
+    document.getElementById("cloneHint").textContent=cloneType==="writable"
+      ?"Zero-copy clone. New writes go to the clone's own storage (copy-on-write)."
+      :"Zero-copy snapshot. All writes to this clone are blocked.";
   };
-  document.getElementById("btnCloneSubmit").addEventListener("click",async function(){
+  document.getElementById("btnClone").addEventListener("click",async function(){
     var source=document.getElementById("cloneSource").value.trim();
     var target=document.getElementById("cloneTarget").value.trim();
     if(!target){document.getElementById("cloneErr").innerHTML='<div class="flash-error">Target name is required.</div>';return;}
+    var body={organization:ORG,source:source,target:target,clone_type:cloneType};
+    var tsVal=document.getElementById("cloneTimestamp").value;
+    if(tsVal)body.at_timestamp=new Date(tsVal).getTime();
+    try{await api("POST","/api/v1/supertables/clone",body);hide("modalClone");toast("Cloned "+source+" → "+target,true);load();}
+    catch(e){document.getElementById("cloneErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+  });
+
+  // Clone Table
+  window.openCloneTable=function(){
+    document.getElementById("ctErr").innerHTML="";document.getElementById("ctVersion").value="";
+    var selSrc=document.getElementById("ctSourceSup"),selTgt=document.getElementById("ctTargetSup");
+    selSrc.innerHTML="";selTgt.innerHTML="";
+    items.forEach(function(it){
+      selSrc.innerHTML+='<option value="'+esc(it.name)+'">'+esc(it.name)+'</option>';
+      selTgt.innerHTML+='<option value="'+esc(it.name)+'">'+esc(it.name)+'</option>';
+    });
+    document.getElementById("ctTable").innerHTML='<option value="">— Select source first —</option>';
+    document.getElementById("modalCloneTable").classList.add("active");
+    loadTablesForClone();
+  };
+  document.getElementById("ctSourceSup").addEventListener("change",loadTablesForClone);
+  async function loadTablesForClone(){
+    var sup=document.getElementById("ctSourceSup").value;if(!sup)return;
     try{
-      await apiPost("/api/v1/supertables/clone",{organization:ORG,source:source,target:target,clone_type:cloneType});
-      hideModal("modalClone");toast("Cloned "+source+" → "+target,true);load();
-    }catch(e){document.getElementById("cloneErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+      var d=await api("GET","/api/v1/ingestion/tables?org="+enc(ORG)+"&sup="+enc(sup)+"&role_name=superadmin");
+      var tables=(d&&d.tables)||[];
+      var sel=document.getElementById("ctTable");sel.innerHTML='<option value="">— Select —</option>';
+      tables.forEach(function(t){sel.innerHTML+='<option value="'+esc(t)+'">'+esc(t)+'</option>';});
+    }catch(e){document.getElementById("ctTable").innerHTML='<option value="">Error loading</option>';}
+  }
+  document.getElementById("btnCloneTable").addEventListener("click",async function(){
+    var sourceSup=document.getElementById("ctSourceSup").value;
+    var table=document.getElementById("ctTable").value;
+    var targetSup=document.getElementById("ctTargetSup").value;
+    if(!sourceSup||!table||!targetSup){document.getElementById("ctErr").innerHTML='<div class="flash-error">All fields are required.</div>';return;}
+    if(sourceSup===targetSup){document.getElementById("ctErr").innerHTML='<div class="flash-error">Source and target must be different.</div>';return;}
+    var body={organization:ORG,source_sup:sourceSup,target_sup:targetSup,table:table};
+    var ver=document.getElementById("ctVersion").value.trim();
+    if(ver)body.at_version=parseInt(ver,10);
+    try{await api("POST","/api/v1/supertables/clone-table",body);hide("modalCloneTable");toast("Cloned "+table+" → "+targetSup,true);load();}
+    catch(e){document.getElementById("ctErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
 
   // Read-only toggle
   window.toggleRO=async function(name,enabled){
-    var verb=enabled?"lock":"unlock";
     if(!confirm((enabled?"Lock":"Unlock")+" "+name+"? "+(enabled?"All writes will be blocked.":"Writes will be allowed again.")))return;
-    try{
-      await apiPut("/api/v1/supertables/read-only",{organization:ORG,super_name:name,enabled:enabled});
-      toast(name+" "+(enabled?"locked":"unlocked"),true);load();
-    }catch(e){toast(e.message,false);}
+    try{await api("PUT","/api/v1/supertables/read-only",{organization:ORG,super_name:name,enabled:enabled});toast(name+" "+(enabled?"locked":"unlocked"),true);load();}
+    catch(e){toast(e.message,false);}
   };
 
   // Delete
   window.openDelete=function(name){
-    document.getElementById("deleteTarget").value=name;
-    document.getElementById("deleteConfirm").value="";
-    document.getElementById("deleteConfirm").placeholder=name;
-    document.getElementById("deleteErr").innerHTML="";
-    document.getElementById("modalDelete").classList.add("active");
-    document.getElementById("deleteConfirm").focus();
+    document.getElementById("deleteTarget").value=name;document.getElementById("deleteConfirm").value="";
+    document.getElementById("deleteConfirm").placeholder=name;document.getElementById("deleteErr").innerHTML="";
+    document.getElementById("modalDelete").classList.add("active");document.getElementById("deleteConfirm").focus();
   };
-  document.getElementById("btnDeleteSubmit").addEventListener("click",async function(){
+  document.getElementById("btnDelete").addEventListener("click",async function(){
     var name=document.getElementById("deleteTarget").value;
-    var confirm_val=document.getElementById("deleteConfirm").value.trim();
-    if(confirm_val!==name){document.getElementById("deleteErr").innerHTML='<div class="flash-error">Type the exact name to confirm.</div>';return;}
-    try{
-      await apiDel("/api/v1/supertables?organization="+enc(ORG)+"&super_name="+enc(name));
-      hideModal("modalDelete");toast("Deleted "+name,true);load();
-    }catch(e){document.getElementById("deleteErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+    var cv=document.getElementById("deleteConfirm").value.trim();
+    if(cv!==name){document.getElementById("deleteErr").innerHTML='<div class="flash-error">Type the exact name to confirm.</div>';return;}
+    try{await api("DELETE","/api/v1/supertables?organization="+enc(ORG)+"&super_name="+enc(name));hide("modalDelete");toast("Deleted "+name,true);load();}
+    catch(e){document.getElementById("deleteErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
   });
 
-  // Close modals on overlay click
-  document.querySelectorAll(".modal-overlay").forEach(function(m){
-    m.addEventListener("click",function(e){if(e.target===m)m.classList.remove("active");});
-  });
+  // Modal close on overlay click
+  document.querySelectorAll(".modal-overlay").forEach(function(m){m.addEventListener("click",function(e){if(e.target===m)m.classList.remove("active");});});
 
-  // Init
   load();
 })();
 </script>

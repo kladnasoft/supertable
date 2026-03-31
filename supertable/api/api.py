@@ -582,41 +582,37 @@ def api_supertables_clone(
     source = str(payload.get("source") or "").strip()
     target = str(payload.get("target") or "").strip()
     clone_type = str(payload.get("clone_type") or "readonly").strip().lower()
+    at_timestamp = payload.get("at_timestamp")  # optional: epoch-ms for time travel
 
     if not organization or not source or not target:
         raise HTTPException(status_code=400, detail="organization, source, and target are required")
     if source == target:
         raise HTTPException(status_code=400, detail="source and target must be different")
-    if clone_type not in ("readonly", "full"):
-        raise HTTPException(status_code=400, detail="clone_type must be 'readonly' or 'full'")
+    if clone_type not in ("readonly", "writable"):
+        raise HTTPException(status_code=400, detail="clone_type must be 'readonly' or 'writable'")
 
-    from supertable.services.supertable_manager import clone_readonly, clone_full
+    at_ts = int(at_timestamp) if at_timestamp is not None else None
+
+    from supertable.services.supertable_manager import clone_supertable
     try:
-        if clone_type == "readonly":
-            result = clone_readonly(organization, source, target)
-            _audit(
-                category=EventCategory.DATA_MUTATION,
-                action=Actions.SUPERTABLE_CLONE_READONLY,
-                organization=organization, super_name=target,
-                resource_type="supertable", resource_id=target,
-                severity=Severity.WARNING,
-                detail=make_detail(source=source, target=target, tables_cloned=result.get("tables_cloned", 0)),
-            )
-        else:
-            result = clone_full(organization, source, target)
-            _audit(
-                category=EventCategory.DATA_MUTATION,
-                action=Actions.SUPERTABLE_CLONE_FULL,
-                organization=organization, super_name=target,
-                resource_type="supertable", resource_id=target,
-                severity=Severity.CRITICAL,
-                detail=make_detail(
-                    source=source, target=target,
-                    tables_cloned=result.get("tables_cloned", 0),
-                    files_copied=result.get("files_copied", 0),
-                    roles_cloned=result.get("roles_cloned", 0),
-                ),
-            )
+        result = clone_supertable(
+            organization, source, target,
+            read_only=(clone_type == "readonly"),
+            at_timestamp=at_ts,
+        )
+        action = Actions.SUPERTABLE_CLONE_READONLY if clone_type == "readonly" else Actions.SUPERTABLE_CLONE_WRITABLE
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=action,
+            organization=organization, super_name=target,
+            resource_type="supertable", resource_id=target,
+            severity=Severity.WARNING,
+            detail=make_detail(
+                source=source, target=target, clone_type=clone_type,
+                tables_cloned=result.get("tables_cloned", 0),
+                at_timestamp=at_ts,
+            ),
+        )
         return JSONResponse(result, status_code=201)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -625,6 +621,53 @@ def api_supertables_clone(
     except Exception as e:
         logger.exception("SuperTable clone failed")
         raise HTTPException(status_code=500, detail=f"Clone failed: {e}")
+
+
+@router.post("/api/v1/supertables/clone-table")
+def api_supertables_clone_table(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    """Clone a single table between supertables (zero-copy, with optional time travel)."""
+    organization = str(payload.get("organization") or "").strip()
+    source_sup = str(payload.get("source_sup") or "").strip()
+    target_sup = str(payload.get("target_sup") or "").strip()
+    table_name = str(payload.get("table") or "").strip()
+    at_version = payload.get("at_version")
+    at_timestamp = payload.get("at_timestamp")
+
+    if not organization or not source_sup or not target_sup or not table_name:
+        raise HTTPException(status_code=400, detail="organization, source_sup, target_sup, and table are required")
+
+    at_v = int(at_version) if at_version is not None else None
+    at_ts = int(at_timestamp) if at_timestamp is not None else None
+
+    from supertable.services.supertable_manager import clone_table
+    try:
+        result = clone_table(
+            organization, source_sup, target_sup, table_name,
+            at_version=at_v, at_timestamp=at_ts,
+        )
+        _audit(
+            category=EventCategory.DATA_MUTATION,
+            action=Actions.TABLE_CLONE,
+            organization=organization, super_name=target_sup,
+            resource_type="table", resource_id=table_name,
+            severity=Severity.WARNING,
+            detail=make_detail(
+                source_sup=source_sup, target_sup=target_sup,
+                table=table_name, at_version=at_v, at_timestamp=at_ts,
+            ),
+        )
+        return JSONResponse(result, status_code=201)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("Table clone failed")
+        raise HTTPException(status_code=500, detail=f"Table clone failed: {e}")
 
 
 @router.put("/api/v1/supertables/read-only")
@@ -656,6 +699,222 @@ def api_supertables_set_readonly(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Set read-only failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   DATA SHARING — provider + consumer + manifest
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/api/v1/shares")
+def api_shares_list(
+    request: Request,
+    organization: str = Query(""),
+    org: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+    from supertable.services.sharing import list_org_shares
+    return {"ok": True, "shares": list_org_shares(organization)}
+
+
+@router.post("/api/v1/shares")
+def api_shares_create(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    organization = str(payload.get("organization") or "").strip()
+    super_name = str(payload.get("super_name") or "").strip()
+    tables = payload.get("tables") or []
+    grantee_org = str(payload.get("grantee_org") or "").strip()
+    label = str(payload.get("label") or "").strip()
+
+    if not organization or not super_name or not tables or not grantee_org:
+        raise HTTPException(status_code=400, detail="organization, super_name, tables, and grantee_org are required")
+    if not isinstance(tables, list):
+        raise HTTPException(status_code=400, detail="tables must be a list")
+
+    from supertable.services.sharing import create_share
+    try:
+        result = create_share(organization, super_name, tables, grantee_org, created_by="superuser", label=label)
+        _audit(
+            category=EventCategory.CONFIG_CHANGE, action=Actions.SHARE_CREATE,
+            organization=organization, super_name=super_name,
+            resource_type="share", resource_id=result["share_id"],
+            severity=Severity.WARNING,
+            detail=make_detail(tables=tables, grantee_org=grantee_org),
+        )
+        return JSONResponse(result, status_code=201)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create share failed: {e}")
+
+
+@router.delete("/api/v1/shares/{share_id}")
+def api_shares_revoke(
+    request: Request,
+    share_id: str,
+    organization: str = Query(""),
+    org: str = Query(""),
+    _: Any = Depends(admin_guard_api),
+):
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+    from supertable.services.sharing import revoke_share
+    try:
+        result = revoke_share(organization, share_id)
+        _audit(
+            category=EventCategory.CONFIG_CHANGE, action=Actions.SHARE_REVOKE,
+            organization=organization, resource_type="share", resource_id=share_id,
+            severity=Severity.CRITICAL,
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Revoke share failed: {e}")
+
+
+@router.get("/api/v1/shares/{share_id}/manifest")
+def api_shares_manifest(
+    request: Request,
+    share_id: str,
+    organization: str = Query(""),
+    org: str = Query(""),
+):
+    """Public manifest endpoint — authenticated by bearer token, not session."""
+    organization = (organization or org or "").strip()
+    if not organization:
+        raise HTTPException(status_code=400, detail="organization is required")
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    bearer_token = auth_header[7:].strip()
+
+    from supertable.services.sharing import get_share_manifest
+    try:
+        manifest = get_share_manifest(organization, share_id, bearer_token)
+        try:
+            _audit(
+                category=EventCategory.DATA_ACCESS, action=Actions.SHARE_MANIFEST_ACCESS,
+                organization=organization, resource_type="share", resource_id=share_id,
+                severity=Severity.INFO,
+                detail=make_detail(grantee_org=manifest.get("grantee_org", "")),
+            )
+        except Exception:
+            pass
+        return JSONResponse(manifest)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Manifest generation failed: {e}")
+
+
+# ── Consumer: linked shares ──
+
+@router.get("/api/v1/linked-shares")
+def api_linked_shares_list(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        raise HTTPException(status_code=400, detail="org and sup are required")
+    from supertable.services.sharing import list_linked_shares
+    return {"ok": True, "links": list_linked_shares(sel_org, sel_sup)}
+
+
+@router.post("/api/v1/linked-shares")
+def api_linked_shares_create(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(admin_guard_api),
+):
+    org = str(payload.get("organization") or payload.get("org") or "").strip()
+    sup = str(payload.get("super_name") or payload.get("sup") or "").strip()
+    provider_url = str(payload.get("provider_url") or "").strip()
+    provider_token = str(payload.get("provider_token") or "").strip()
+    alias_prefix = str(payload.get("alias_prefix") or "").strip()
+    label = str(payload.get("label") or "").strip()
+
+    if not org or not sup or not provider_url or not provider_token:
+        raise HTTPException(status_code=400, detail="organization, super_name, provider_url, and provider_token are required")
+
+    from supertable.services.sharing import link_share
+    try:
+        result = link_share(org, sup, provider_url, provider_token, alias_prefix, label)
+        _audit(
+            category=EventCategory.CONFIG_CHANGE, action=Actions.SHARE_LINK,
+            organization=org, super_name=sup,
+            resource_type="linked_share", resource_id=result.get("link_id", ""),
+            severity=Severity.WARNING,
+            detail=make_detail(provider_url=provider_url, tables=result.get("tables", [])),
+        )
+        return JSONResponse(result, status_code=201)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Link share failed: {e}")
+
+
+@router.delete("/api/v1/linked-shares/{link_id}")
+def api_linked_shares_delete(
+    request: Request,
+    link_id: str,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        raise HTTPException(status_code=400, detail="org and sup are required")
+    from supertable.services.sharing import unlink_share
+    try:
+        result = unlink_share(sel_org, sel_sup, link_id)
+        _audit(
+            category=EventCategory.CONFIG_CHANGE, action=Actions.SHARE_UNLINK,
+            organization=sel_org, super_name=sel_sup,
+            resource_type="linked_share", resource_id=link_id,
+            severity=Severity.WARNING,
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unlink share failed: {e}")
+
+
+@router.post("/api/v1/linked-shares/{link_id}/refresh")
+def api_linked_shares_refresh(
+    request: Request,
+    link_id: str,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(admin_guard_api),
+):
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        raise HTTPException(status_code=400, detail="org and sup are required")
+    from supertable.services.sharing import refresh_linked_share
+    try:
+        return refresh_linked_share(sel_org, sel_sup, link_id, force=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

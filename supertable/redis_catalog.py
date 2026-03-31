@@ -39,6 +39,24 @@ def _mirrors_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:mirrors"
 
 
+# -- Data Sharing key helpers ---------------------------------------------- #
+
+def _share_doc_key(org: str, share_id: str) -> str:
+    return f"supertable:{org}:shares:doc:{share_id}"
+
+
+def _share_index_key(org: str) -> str:
+    return f"supertable:{org}:shares:index"
+
+
+def _linked_share_doc_key(org: str, sup: str, link_id: str) -> str:
+    return f"supertable:{org}:{sup}:linked_shares:doc:{link_id}"
+
+
+def _linked_share_index_key(org: str, sup: str) -> str:
+    return f"supertable:{org}:{sup}:linked_shares:index"
+
+
 # -- RBAC key helpers (UUID-based identity) -------------------------------- #
 
 def _rbac_user_meta_key(org: str, sup: str) -> str:
@@ -1053,6 +1071,113 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] SCAN delete error: {e}")
         return deleted
+
+    # --------------------------------------------------------------------------- #
+    # Data Sharing — provider-side share definitions
+    # --------------------------------------------------------------------------- #
+
+    def create_share(self, org: str, share_id: str, share_doc: Dict[str, Any]) -> None:
+        """Store a share definition and add to the org-level index."""
+        try:
+            with self.r.pipeline() as p:
+                p.set(_share_doc_key(org, share_id), json.dumps(share_doc))
+                p.sadd(_share_index_key(org), share_id)
+                p.execute()
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] create_share error: {e}")
+            raise
+
+    def get_share(self, org: str, share_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            raw = self.r.get(_share_doc_key(org, share_id))
+            return json.loads(raw) if raw else None
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_share error: {e}")
+            return None
+
+    def delete_share(self, org: str, share_id: str) -> bool:
+        try:
+            with self.r.pipeline() as p:
+                p.delete(_share_doc_key(org, share_id))
+                p.srem(_share_index_key(org), share_id)
+                p.execute()
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_share error: {e}")
+            return False
+
+    def list_shares(self, org: str) -> List[Dict[str, Any]]:
+        shares: List[Dict[str, Any]] = []
+        try:
+            members = self.r.smembers(_share_index_key(org))
+            for sid_raw in (members or []):
+                sid = sid_raw if isinstance(sid_raw, str) else sid_raw.decode("utf-8")
+                raw = self.r.get(_share_doc_key(org, sid))
+                if raw:
+                    try:
+                        shares.append(json.loads(raw))
+                    except Exception:
+                        continue
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_shares error: {e}")
+        return shares
+
+    # --------------------------------------------------------------------------- #
+    # Data Sharing — consumer-side linked shares
+    # --------------------------------------------------------------------------- #
+
+    def create_linked_share(self, org: str, sup: str, link_id: str, link_doc: Dict[str, Any]) -> None:
+        try:
+            with self.r.pipeline() as p:
+                p.set(_linked_share_doc_key(org, sup, link_id), json.dumps(link_doc))
+                p.sadd(_linked_share_index_key(org, sup), link_id)
+                p.execute()
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] create_linked_share error: {e}")
+            raise
+
+    def get_linked_share(self, org: str, sup: str, link_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            raw = self.r.get(_linked_share_doc_key(org, sup, link_id))
+            return json.loads(raw) if raw else None
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_linked_share error: {e}")
+            return None
+
+    def update_linked_share(self, org: str, sup: str, link_id: str, doc: Dict[str, Any]) -> bool:
+        try:
+            self.r.set(_linked_share_doc_key(org, sup, link_id), json.dumps(doc))
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] update_linked_share error: {e}")
+            return False
+
+    def delete_linked_share(self, org: str, sup: str, link_id: str) -> bool:
+        try:
+            with self.r.pipeline() as p:
+                p.delete(_linked_share_doc_key(org, sup, link_id))
+                p.srem(_linked_share_index_key(org, sup), link_id)
+                p.execute()
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_linked_share error: {e}")
+            return False
+
+    def list_linked_shares(self, org: str, sup: str) -> List[Dict[str, Any]]:
+        links: List[Dict[str, Any]] = []
+        try:
+            members = self.r.smembers(_linked_share_index_key(org, sup))
+            for lid_raw in (members or []):
+                lid = lid_raw if isinstance(lid_raw, str) else lid_raw.decode("utf-8")
+                raw = self.r.get(_linked_share_doc_key(org, sup, lid))
+                if raw:
+                    try:
+                        links.append(json.loads(raw))
+                    except Exception:
+                        continue
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] list_linked_shares error: {e}")
+        return links
 
     # --------------------------------------------------------------------------- #
     # Staging / Pipe meta (for website UI)

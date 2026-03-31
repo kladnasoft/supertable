@@ -449,6 +449,22 @@ def supertables_page(
     return resp
 
 
+@app.get("/ui/sharing", response_class=HTMLResponse)
+def sharing_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    ctx = _page_context(request, org, sup)
+    if ctx is None:
+        return _redirect_to_login()
+    if not ctx.get("session_is_superuser") and not ctx.get("session_is_admin"):
+        return _redirect_to_login()
+    resp = templates.TemplateResponse("sharing.html", ctx)
+    _no_store(resp)
+    return resp
+
+
 @app.get("/ui/tables", response_class=HTMLResponse)
 def tables_page(
     request: Request,

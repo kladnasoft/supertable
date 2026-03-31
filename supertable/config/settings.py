@@ -275,6 +275,10 @@ class Settings:
     SUPERTABLE_AUDIT_SIEM_ENABLED: bool = True               # SUPERTABLE_AUDIT_SIEM_ENABLED
     SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS: int = 10            # SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS
 
+    # ── Data Sharing ────────────────────────────────────────────────
+    SUPERTABLE_SHARE_PRESIGN_TTL: int = 14400                # SUPERTABLE_SHARE_PRESIGN_TTL (seconds, default 4h)
+    SUPERTABLE_SHARE_REFRESH_BUFFER: int = 600               # SUPERTABLE_SHARE_REFRESH_BUFFER (seconds, refresh 10min before expiry)
+
 
     # ── Convenience properties ───────────────────────────────────────
 
@@ -518,6 +522,9 @@ def _build_settings() -> Settings:
         SUPERTABLE_AUDIT_FERNET_KEY=_env_str("SUPERTABLE_AUDIT_FERNET_KEY"),
         SUPERTABLE_AUDIT_SIEM_ENABLED=_env_bool("SUPERTABLE_AUDIT_SIEM_ENABLED", True),
         SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS=_env_int("SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS", 10),
+        # Data Sharing
+        SUPERTABLE_SHARE_PRESIGN_TTL=_env_int("SUPERTABLE_SHARE_PRESIGN_TTL", 14400),
+        SUPERTABLE_SHARE_REFRESH_BUFFER=_env_int("SUPERTABLE_SHARE_REFRESH_BUFFER", 600),
     )
 
 

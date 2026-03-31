@@ -1,0 +1,344 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Data Island Core – Data Sharing</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --primary-color:#1c96ca;--secondary-color:#147ba3;--dark-color:#1a1a2e;
+  --text-color:#1e293b;--text-secondary:#64748b;--text-light:#8d99ae;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;--warn:#f59e0b;--warn-bg:#fffbeb;--error:#ef4444;--error-bg:#fef2f2;
+  --purple:#7c3aed;--purple-bg:rgba(124,58,237,.06);--blue:#3b82f6;--blue-bg:rgba(59,130,246,.06);
+  --mono:'IBM Plex Mono',ui-monospace,monospace;--font:'Inter',-apple-system,sans-serif;
+  --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow-x:hidden;}
+.content-container{margin-left:280px;min-height:100vh;background:var(--bg);transition:var(--transition);padding-bottom:40px;}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
+.wrap{max-width:1200px;margin:0 auto;padding:24px;}
+.page-hdr{display:flex;align-items:center;gap:12px;margin-bottom:20px;justify-content:space-between;}
+.page-title{font-size:20px;font-weight:800;display:flex;align-items:center;gap:10px;}
+.btn-sm{padding:6px 14px;font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-card);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:var(--transition);}
+.btn-sm:hover{border-color:var(--primary);color:var(--primary);}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary);}
+.btn-primary:hover{background:var(--primary-dark);color:#fff;}
+.btn-danger{background:var(--error);color:#fff;border-color:var(--error);}
+.section-hdr{font-size:14px;font-weight:700;margin:24px 0 12px;display:flex;align-items:center;gap:8px;}
+.section-hdr:first-child{margin-top:0;}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:10px;transition:var(--transition);}
+.card:hover{border-color:var(--primary);box-shadow:0 1px 8px rgba(28,150,202,.06);}
+.card-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+.card-name{font-weight:700;font-family:var(--mono);font-size:13px;}
+.card-meta{font-size:11px;color:var(--text-sec);display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;}
+.card-meta span{display:flex;align-items:center;gap:3px;}
+.card-actions{margin-left:auto;display:flex;gap:6px;flex-shrink:0;}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;}
+.badge-active{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
+.badge-linked{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
+.empty{text-align:center;padding:30px;color:var(--text-muted);font-size:12px;}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9999;justify-content:center;align-items:center;}
+.modal-overlay.active{display:flex;}
+.modal-box{background:var(--bg-card);border-radius:var(--radius);padding:28px;width:540px;max-width:90vw;box-shadow:0 8px 40px rgba(0,0,0,.15);}
+.modal-title{font-size:16px;font-weight:700;margin-bottom:16px;display:flex;align-items:center;gap:8px;}
+.field-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-sec);margin-bottom:4px;}
+.field-input,.field-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);outline:none;background:var(--bg-card);}
+.field-input:focus,.field-select:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light);}
+.field-group{margin-bottom:14px;}
+.field-hint{font-size:11px;color:var(--text-muted);margin-top:4px;}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;}
+.flash-error{background:var(--error-bg);color:#991b1b;padding:8px 12px;border-radius:var(--radius-sm);font-size:12px;margin-bottom:12px;border:1px solid rgba(239,68,68,.2);}
+.token-box{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;font-family:var(--mono);font-size:12px;word-break:break-all;margin:12px 0;position:relative;}
+.token-box .copy-btn{position:absolute;top:6px;right:8px;font-size:10px;cursor:pointer;color:var(--primary);border:none;background:none;}
+.toast{position:fixed;bottom:24px;right:24px;padding:10px 20px;border-radius:var(--radius-sm);font-size:12px;font-weight:600;z-index:99999;opacity:0;transition:opacity .3s;pointer-events:none;}
+.toast.show{opacity:1;}.toast-ok{background:var(--success);color:#fff;}.toast-err{background:var(--error);color:#fff;}
+.tab-bar{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px;}
+.tab-btn{padding:10px 18px;font-size:12px;font-weight:600;color:var(--text-muted);cursor:pointer;border:none;background:none;border-bottom:2px solid transparent;transition:var(--transition);}
+.tab-btn:hover{color:var(--text);}.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);}
+.pane{display:none;}.pane.active{display:block;}
+  </style>
+</head>
+<body>
+{% include "sidebar.html" %}
+<div class="content-container">
+<div class="wrap">
+  <div class="page-hdr">
+    <div class="page-title"><i class="fas fa-share-nodes" style="color:var(--primary);"></i> Data Sharing</div>
+  </div>
+
+  <div class="tab-bar">
+    <button class="tab-btn active" data-pane="provider"><i class="fas fa-upload"></i> Shared by me</button>
+    <button class="tab-btn" data-pane="consumer"><i class="fas fa-download"></i> Shared with me</button>
+  </div>
+
+  <!-- Provider pane -->
+  <div class="pane active" id="pane-provider">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <div class="section-hdr" style="margin:0;"><i class="fas fa-upload" style="color:var(--primary);"></i> Outgoing shares</div>
+      <button class="btn-sm btn-primary" onclick="openCreateShare()"><i class="fas fa-plus"></i> Create share</button>
+    </div>
+    <div id="sharesList"></div>
+  </div>
+
+  <!-- Consumer pane -->
+  <div class="pane" id="pane-consumer">
+  {% if sel_sup %}
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <div class="section-hdr" style="margin:0;"><i class="fas fa-download" style="color:var(--primary);"></i> Linked shares <span style="font-weight:400;font-size:12px;color:var(--text-muted);margin-left:6px;">{{ sel_sup }}</span></div>
+      <button class="btn-sm btn-primary" onclick="openLinkShare()"><i class="fas fa-link"></i> Link external share</button>
+    </div>
+    <div id="linksList"></div>
+  {% else %}
+    <div style="padding:40px;text-align:center;">
+      <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable to view linked shares</div>
+      <div style="display:inline-flex;align-items:center;gap:8px;">
+        <i class="fas fa-cube" style="color:var(--primary);"></i>
+        <select onchange="if(this.value)window.location.href='/ui/sharing?org='+this.value.split('/')[0]+'&sup='+this.value.split('/')[1]" style="min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font);">
+          <option value="">— Select —</option>
+          {% for t in tenants %}<option value="{{ t.org }}/{{ t.sup }}">{{ t.org }} / {{ t.sup }}</option>{% endfor %}
+        </select>
+      </div>
+    </div>
+  {% endif %}
+  </div>
+</div>
+</div>
+
+<!-- Create Share Modal -->
+<div class="modal-overlay" id="modalCreateShare">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-share-from-square" style="color:var(--primary);"></i> Create share</div>
+    <div id="csErr"></div>
+    <div class="field-group"><div class="field-label">SuperTable</div><select class="field-select" id="csSuper"></select></div>
+    <div class="field-group"><div class="field-label">Tables to share</div><select class="field-select" id="csTables" multiple style="height:100px;"></select><div class="field-hint">Hold Ctrl/Cmd to select multiple tables.</div></div>
+    <div class="field-group"><div class="field-label">Grantee organization</div><input class="field-input" id="csGrantee" placeholder="partner-org" autocomplete="off"/></div>
+    <div class="field-group"><div class="field-label">Label (optional)</div><input class="field-input" id="csLabel" placeholder="Q4 sales data for Partner Inc" autocomplete="off"/></div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalCreateShare')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnCreateShare"><i class="fas fa-share"></i> Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Share Created Success Modal -->
+<div class="modal-overlay" id="modalShareCreated">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-check-circle" style="color:var(--success);"></i> Share created</div>
+    <p style="font-size:12px;color:var(--text-sec);margin-bottom:12px;">Send this manifest URL and bearer token to the consumer. The token is shown only once.</p>
+    <div class="field-group">
+      <div class="field-label">Manifest URL</div>
+      <div class="token-box" id="scManifestUrl"></div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Bearer token</div>
+      <div class="token-box" id="scToken"><button class="copy-btn" onclick="copyToken()"><i class="fas fa-copy"></i> Copy</button><span id="scTokenVal"></span></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm btn-primary" onclick="hide('modalShareCreated')">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Link Share Modal -->
+<div class="modal-overlay" id="modalLinkShare">
+  <div class="modal-box">
+    <div class="modal-title"><i class="fas fa-link" style="color:var(--primary);"></i> Link external share</div>
+    <div id="lsErr"></div>
+    <div class="field-group"><div class="field-label">Manifest URL</div><input class="field-input" id="lsUrl" placeholder="https://provider.example.com/api/v1/shares/sh_abc123/manifest?organization=acme" autocomplete="off"/></div>
+    <div class="field-group"><div class="field-label">Bearer token</div><input class="field-input" id="lsToken" placeholder="Paste the bearer token" autocomplete="off"/></div>
+    <div class="field-group"><div class="field-label">Alias prefix (optional)</div><input class="field-input" id="lsAlias" placeholder="acme_" autocomplete="off"/><div class="field-hint">Tables will appear as prefix_tablename in queries.</div></div>
+    <div class="field-group"><div class="field-label">Label (optional)</div><input class="field-input" id="lsLabel" placeholder="Sales data from Acme" autocomplete="off"/></div>
+    <div class="modal-actions">
+      <button class="btn-sm" onclick="hide('modalLinkShare')">Cancel</button>
+      <button class="btn-sm btn-primary" id="btnLinkShare"><i class="fas fa-link"></i> Link</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  var ORG = "{{ sel_org }}";
+  var SUP = "{{ sel_sup }}";
+
+  function enc(s){return encodeURIComponent(s);}
+  function esc(s){var d=document.createElement("div");d.textContent=String(s||"");return d.innerHTML;}
+  function toast(msg,ok){var t=document.getElementById("toast");t.textContent=msg;t.className="toast "+(ok?"toast-ok":"toast-err")+" show";setTimeout(function(){t.className="toast";},3000);}
+  function hide(id){document.getElementById(id).classList.remove("active");}
+  window.hide=hide;
+
+  async function api(method,url,body){
+    var opts={method:method,credentials:"same-origin",headers:{"Content-Type":"application/json"}};
+    if(body)opts.body=JSON.stringify(body);
+    var r=await fetch(url,opts);var j=await r.json();
+    if(!r.ok)throw new Error(j.detail||j.message||r.status);
+    return j;
+  }
+
+  function fmtDate(ms){if(!ms)return "—";return new Date(ms).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});}
+
+  // Tabs
+  document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){
+    document.querySelectorAll(".tab-btn").forEach(function(x){x.classList.remove("active");});
+    document.querySelectorAll(".pane").forEach(function(x){x.classList.remove("active");});
+    b.classList.add("active");
+    var p=document.getElementById("pane-"+b.getAttribute("data-pane"));if(p)p.classList.add("active");
+  });});
+
+  // ── Provider: list shares ──
+  async function loadShares(){
+    var el=document.getElementById("sharesList");
+    try{
+      var d=await api("GET","/api/v1/shares?organization="+enc(ORG));
+      var shares=d.shares||[];
+      if(!shares.length){el.innerHTML='<div class="empty"><i class="fas fa-share-nodes"></i> No outgoing shares yet.</div>';return;}
+      var h="";
+      shares.forEach(function(s){
+        h+='<div class="card"><div class="card-row">';
+        h+='<div><div class="card-name">'+esc(s.share_id)+'</div>';
+        h+='<div class="card-meta">';
+        h+='<span><i class="fas fa-building"></i> '+esc(s.grantee_org)+'</span>';
+        h+='<span><i class="fas fa-table"></i> '+(s.tables||[]).join(", ")+'</span>';
+        h+='<span><i class="fas fa-calendar"></i> '+fmtDate(s.created_ms)+'</span>';
+        if(s.label)h+='<span><i class="fas fa-tag"></i> '+esc(s.label)+'</span>';
+        h+='</div></div>';
+        h+='<div class="card-actions">';
+        h+='<span class="badge badge-active"><i class="fas fa-check-circle"></i> Active</span>';
+        h+='<button class="btn-sm" onclick="revokeShare(\''+esc(s.share_id)+'\')" style="color:var(--error);border-color:rgba(239,68,68,.3);"><i class="fas fa-ban"></i> Revoke</button>';
+        h+='</div></div></div>';
+      });
+      el.innerHTML=h;
+    }catch(e){el.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+  }
+
+  window.revokeShare=async function(shareId){
+    if(!confirm("Revoke share "+shareId+"? The consumer will lose access immediately."))return;
+    try{await api("DELETE","/api/v1/shares/"+enc(shareId)+"?organization="+enc(ORG));toast("Share revoked",true);loadShares();}
+    catch(e){toast(e.message,false);}
+  };
+
+  // ── Provider: create share ──
+  window.openCreateShare=async function(){
+    document.getElementById("csErr").innerHTML="";
+    document.getElementById("csGrantee").value="";
+    document.getElementById("csLabel").value="";
+    var sel=document.getElementById("csSuper");
+    sel.innerHTML="";
+    try{
+      var d=await api("GET","/api/v1/supertables?organization="+enc(ORG));
+      (d.supers||[]).forEach(function(s){sel.innerHTML+='<option value="'+esc(s)+'">'+esc(s)+'</option>';});
+    }catch(e){}
+    loadTablesForShare();
+    document.getElementById("modalCreateShare").classList.add("active");
+  };
+  document.getElementById("csSuper").addEventListener("change",loadTablesForShare);
+  async function loadTablesForShare(){
+    var sup=document.getElementById("csSuper").value;if(!sup)return;
+    try{
+      var d=await api("GET","/api/v1/ingestion/tables?org="+enc(ORG)+"&sup="+enc(sup)+"&role_name=superadmin");
+      var sel=document.getElementById("csTables");sel.innerHTML="";
+      (d.tables||[]).forEach(function(t){sel.innerHTML+='<option value="'+esc(t)+'">'+esc(t)+'</option>';});
+    }catch(e){}
+  }
+  document.getElementById("btnCreateShare").addEventListener("click",async function(){
+    var sup=document.getElementById("csSuper").value;
+    var tablesEl=document.getElementById("csTables");
+    var tables=Array.from(tablesEl.selectedOptions).map(function(o){return o.value;});
+    var grantee=document.getElementById("csGrantee").value.trim();
+    var label=document.getElementById("csLabel").value.trim();
+    if(!sup||!tables.length||!grantee){document.getElementById("csErr").innerHTML='<div class="flash-error">SuperTable, at least one table, and grantee org are required.</div>';return;}
+    try{
+      var result=await api("POST","/api/v1/shares",{organization:ORG,super_name:sup,tables:tables,grantee_org:grantee,label:label});
+      hide("modalCreateShare");
+      // Show success modal with token
+      var baseUrl=window.location.origin+"/api/v1/shares/"+enc(result.share_id)+"/manifest?organization="+enc(ORG);
+      document.getElementById("scManifestUrl").textContent=baseUrl;
+      document.getElementById("scTokenVal").textContent=result.token;
+      document.getElementById("modalShareCreated").classList.add("active");
+      loadShares();
+    }catch(e){document.getElementById("csErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+  });
+  window.copyToken=function(){
+    var val=document.getElementById("scTokenVal").textContent;
+    navigator.clipboard.writeText(val).then(function(){toast("Token copied",true);});
+  };
+
+  // ── Consumer: list linked shares ──
+  async function loadLinks(){
+    var el=document.getElementById("linksList");
+    if(!el||!SUP)return;
+    try{
+      var d=await api("GET","/api/v1/linked-shares?org="+enc(ORG)+"&sup="+enc(SUP));
+      var links=d.links||[];
+      if(!links.length){el.innerHTML='<div class="empty"><i class="fas fa-link-slash"></i> No linked shares yet. Click "Link external share" to connect to a provider.</div>';return;}
+      var h="";
+      links.forEach(function(l){
+        var tables=(l.cached_tables||[]).join(", ")||"—";
+        h+='<div class="card"><div class="card-row">';
+        h+='<div><div class="card-name">'+esc(l.label||l.link_id)+'</div>';
+        h+='<div class="card-meta">';
+        h+='<span><i class="fas fa-building"></i> '+esc(l.provider_org||"—")+'</span>';
+        h+='<span><i class="fas fa-table"></i> '+esc(tables)+'</span>';
+        h+='<span><i class="fas fa-rows"></i> '+(l.cached_total_rows||0).toLocaleString()+' rows</span>';
+        h+='<span><i class="fas fa-clock"></i> Refreshed: '+fmtDate(l.last_refreshed_ms)+'</span>';
+        h+='</div></div>';
+        h+='<div class="card-actions">';
+        h+='<span class="badge badge-linked"><i class="fas fa-link"></i> Linked</span>';
+        h+='<button class="btn-sm" onclick="refreshLink(\''+esc(l.link_id)+'\')"><i class="fas fa-rotate"></i> Refresh</button>';
+        h+='<button class="btn-sm" onclick="unlinkShare(\''+esc(l.link_id)+'\')" style="color:var(--error);border-color:rgba(239,68,68,.3);"><i class="fas fa-link-slash"></i> Unlink</button>';
+        h+='</div></div></div>';
+      });
+      el.innerHTML=h;
+    }catch(e){el.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+  }
+
+  window.refreshLink=async function(linkId){
+    try{var r=await api("POST","/api/v1/linked-shares/"+enc(linkId)+"/refresh?org="+enc(ORG)+"&sup="+enc(SUP));toast(r.refreshed?"Refreshed":"Cache still valid",true);if(r.refreshed)loadLinks();}
+    catch(e){toast(e.message,false);}
+  };
+  window.unlinkShare=async function(linkId){
+    if(!confirm("Unlink this share? You will lose access to the shared tables."))return;
+    try{await api("DELETE","/api/v1/linked-shares/"+enc(linkId)+"?org="+enc(ORG)+"&sup="+enc(SUP));toast("Unlinked",true);loadLinks();}
+    catch(e){toast(e.message,false);}
+  };
+
+  // ── Consumer: link share ──
+  window.openLinkShare=function(){
+    document.getElementById("lsErr").innerHTML="";
+    document.getElementById("lsUrl").value="";document.getElementById("lsToken").value="";
+    document.getElementById("lsAlias").value="";document.getElementById("lsLabel").value="";
+    document.getElementById("modalLinkShare").classList.add("active");
+    document.getElementById("lsUrl").focus();
+  };
+  document.getElementById("btnLinkShare").addEventListener("click",async function(){
+    var url=document.getElementById("lsUrl").value.trim();
+    var token=document.getElementById("lsToken").value.trim();
+    var alias=document.getElementById("lsAlias").value.trim();
+    var label=document.getElementById("lsLabel").value.trim();
+    if(!url||!token){document.getElementById("lsErr").innerHTML='<div class="flash-error">Manifest URL and bearer token are required.</div>';return;}
+    try{
+      await api("POST","/api/v1/linked-shares",{organization:ORG,super_name:SUP,provider_url:url,provider_token:token,alias_prefix:alias,label:label});
+      hide("modalLinkShare");toast("Share linked successfully",true);loadLinks();
+    }catch(e){document.getElementById("lsErr").innerHTML='<div class="flash-error">'+esc(e.message)+'</div>';}
+  });
+
+  // Modal close on overlay click
+  document.querySelectorAll(".modal-overlay").forEach(function(m){m.addEventListener("click",function(e){if(e.target===m)m.classList.remove("active");});});
+
+  loadShares();loadLinks();
+})();
+</script>
+</body>
+</html>
