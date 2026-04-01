@@ -1485,12 +1485,25 @@ def execute_api(
             "query_profile": getattr(getattr(dr, "query_plan_manager", None), "query_profile", None),
         }
 
+        # Resolve actual engine used (plan_stats contains the real engine, not the requested one)
+        engine_used = engine_raw
+        try:
+            _ps = meta_payload.get("plan_stats") or []
+            if isinstance(_ps, list):
+                for _entry in _ps:
+                    if isinstance(_entry, dict) and "ENGINE" in _entry:
+                        engine_used = str(_entry["ENGINE"])
+                        break
+        except Exception:
+            pass
+
         _audit(
             **audit_context(request), category=EventCategory.DATA_ACCESS,
             action=Actions.QUERY_EXECUTE, organization=organization,
             super_name=super_name, resource_type="query", resource_id="",
             detail=make_detail(
-                sql_preview=q[:200], row_count=total_count, engine=engine_raw,
+                sql_preview=q[:200], row_count=total_count,
+                engine_requested=engine_raw, engine_used=engine_used,
                 role_name=role_name,
             ),
         )

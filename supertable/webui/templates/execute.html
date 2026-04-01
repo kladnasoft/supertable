@@ -125,53 +125,52 @@
     /* ═══ 3-COLUMN LAYOUT ═══ */
     .cc-columns { flex: 1; display: flex; overflow: hidden; min-height: 0; }
 
-    /* ─── LEFT PANEL: Schema Explorer ─── */
-    .cc-panel-left {
-      width: 279px; min-width: 279px; border-right: 1px solid var(--panel-border);
+    /* ═══ ICON RAIL + SLIDE-OUT PANELS ═══ */
+    .cc-icon-rail {
+      width: 44px; flex-shrink: 0; background: var(--bg-surface);
+      border-right: 1px solid var(--panel-border);
+      display: flex; flex-direction: column; align-items: center;
+      padding: 8px 0; gap: 2px; z-index: 2;
+    }
+    .cc-rail-btn {
+      width: 34px; height: 34px; border-radius: 6px; border: none;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; color: var(--text-muted); background: transparent;
+      font-size: 14px; transition: all 0.15s ease; position: relative;
+    }
+    .cc-rail-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
+    .cc-rail-btn.active { background: var(--primary-light); color: var(--primary-color); }
+    .cc-rail-btn .rail-tooltip {
+      position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%);
+      background: var(--dark-color); color: #e2e8f0; font-size: 11px; font-weight: 600;
+      padding: 4px 8px; border-radius: 4px; white-space: nowrap;
+      pointer-events: none; opacity: 0; transition: opacity 0.15s; z-index: 100;
+    }
+    .cc-rail-btn:hover .rail-tooltip { opacity: 1; }
+    .cc-rail-sep { width: 24px; height: 1px; background: var(--panel-border); margin: 4px 0; }
+
+    .cc-slide-panel {
+      width: 280px; min-width: 280px; border-right: 1px solid var(--panel-border);
       background: var(--panel-bg); display: flex; flex-direction: column;
-      flex-shrink: 0; transition: width 0.25s ease, min-width 0.25s ease;
+      flex-shrink: 0; transition: width 0.2s ease, min-width 0.2s ease, opacity 0.15s ease;
+      overflow: hidden; z-index: 1;
     }
-    .cc-panel-left.collapsed { width: 0; min-width: 0; overflow: hidden; border-right: none; }
+    .cc-slide-panel.collapsed { width: 0; min-width: 0; border-right: none; opacity: 0; }
 
-    /* Re-open tab shown when panel is collapsed */
-    .cc-panel-reopen {
-      display: none; width: 28px; flex-shrink: 0;
-      border-right: 1px solid var(--panel-border); background: var(--bg-surface);
-      cursor: pointer; transition: var(--transition); position: relative;
+    /* ─── LEFT PANEL: Schema Explorer (inside slide panel) ─── */
+    .cc-panel-left {
+      width: 280px; min-width: 280px; border-right: 1px solid var(--panel-border);
+      background: var(--panel-bg); display: flex; flex-direction: column;
+      flex-shrink: 0; transition: width 0.2s ease, min-width 0.2s ease, opacity 0.15s ease;
+      overflow: hidden;
     }
-    .cc-panel-reopen:hover { background: var(--primary-light); }
-    .cc-panel-reopen i {
-      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-      font-size: 12px; color: var(--text-muted); transition: color 0.15s;
-    }
-    .cc-panel-reopen:hover i { color: var(--primary-color); }
-    .cc-panel-reopen .reopen-label {
-      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%) rotate(-90deg);
-      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-      color: var(--text-muted); white-space: nowrap; display: none;
-    }
-    .cc-panel-reopen:hover .reopen-label { display: block; }
-    .cc-panel-reopen:hover i { display: none; }
-    .cc-panel-left.collapsed + .cc-panel-reopen-left { display: block; }
+    .cc-panel-left.collapsed { width: 0; min-width: 0; overflow: hidden; border-right: none; opacity: 0; }
 
-    .cc-panel-reopen-right {
-      display: none; width: 28px; flex-shrink: 0;
-      border-left: 1px solid var(--panel-border); background: var(--bg-surface);
-      cursor: pointer; transition: var(--transition); position: relative;
-    }
-    .cc-panel-reopen-right:hover { background: var(--primary-light); }
-    .cc-panel-reopen-right i {
-      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-      font-size: 12px; color: var(--text-muted); transition: color 0.15s;
-    }
-    .cc-panel-reopen-right:hover i { color: var(--primary-color); }
-    .cc-panel-reopen-right .reopen-label {
-      position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%) rotate(90deg);
-      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-      color: var(--text-muted); white-space: nowrap; display: none;
-    }
-    .cc-panel-reopen-right:hover .reopen-label { display: block; }
-    .cc-panel-reopen-right:hover i { display: none; }
+    /* Re-open tab — hidden, replaced by icon rail */
+    .cc-panel-reopen { display: none !important; }
+    .cc-panel-reopen-left { display: none !important; }
+
+    .cc-panel-reopen-right { display: none !important; }
 
     .cc-panel-header {
       display: flex; align-items: center; justify-content: space-between;
@@ -406,11 +405,9 @@
     .pivot-result-wrap .pivot-grand-total td { font-weight: 700; background: var(--data-table-header-bg); border-top: 2px solid #e2e8f0; }
     .pivot-empty { text-align: center; padding: 30px 15px; color: var(--text-light); font-size: 13px; }
 
-    /* ─── RIGHT PANEL: History + Profile ─── */
+    /* ─── RIGHT PANEL: Hidden — moved to icon rail ─── */
     .cc-panel-right {
-      width: 260px; min-width: 260px; border-left: 1px solid var(--panel-border);
-      background: var(--panel-bg); display: flex; flex-direction: column; flex-shrink: 0;
-      transition: width 0.25s ease, min-width 0.25s ease;
+      width: 0; min-width: 0; overflow: hidden; border-left: none; display: none;
     }
     .cc-panel-right.collapsed { width: 0; min-width: 0; overflow: hidden; border-left: none; }
 
@@ -486,6 +483,29 @@
     .plan-stat-pill { display: inline-flex; align-items: center; gap: 5px; background: var(--primary-light); border: 1px solid rgba(28,150,202,0.15); border-radius: 999px; padding: 4px 12px; font-size: 11px; font-weight: 600; color: var(--secondary-color); }
     .plan-stat-pill i { font-size: 10px; opacity: 0.6; }
 
+    /* ═══ PROFILER DASHBOARD ═══ */
+    .prof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .prof-section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 8px; }
+    .prof-metric { padding: 10px 12px; border-radius: 8px; }
+    .prof-metric-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .prof-metric-value { font-size: 18px; font-weight: 700; margin-top: 2px; font-family: var(--mono); }
+    .prof-phase-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+    .prof-phase-label { font-size: 12px; width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #475569; font-weight: 500; }
+    .prof-phase-track { flex: 1; height: 8px; background: var(--border-light); border-radius: 4px; overflow: hidden; }
+    .prof-phase-bar { height: 100%; background: var(--primary-color); border-radius: 4px; transition: width 0.6s cubic-bezier(0.34,1.56,0.64,1); }
+    .prof-phase-val { font-size: 12px; font-weight: 600; width: 55px; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .prof-op-card { padding: 8px 10px; border: 1px solid var(--panel-border); border-radius: 8px; margin-bottom: 6px; transition: var(--transition); cursor: default; }
+    .prof-op-card:hover { border-color: var(--primary-color); }
+    .prof-op-card.hottest { border-left: 3px solid var(--error); }
+    .prof-op-header { display: flex; align-items: center; gap: 8px; }
+    .prof-op-name { font-size: 12px; font-weight: 700; flex: 1; letter-spacing: 0.02em; }
+    .prof-op-time { font-size: 12px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .prof-op-pct { font-size: 10px; color: var(--text-muted); width: 30px; text-align: right; }
+    .prof-op-bar { margin-top: 4px; height: 4px; background: var(--border-light); border-radius: 2px; overflow: hidden; }
+    .prof-op-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+    .prof-op-meta { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+    .prof-op-extra { font-size: 10px; color: var(--text-muted); font-family: var(--mono); white-space: pre-wrap; word-break: break-all; max-height: 80px; overflow-y: auto; margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border-light); display: none; }
+    .prof-op-card:hover .prof-op-extra { display: block; }
     /* Keyboard shortcuts overlay */
     .cc-shortcuts-overlay {
       position: fixed; inset: 0; background: rgba(15,23,42,0.5); z-index: 9999;
@@ -655,6 +675,8 @@
             statusCls: s.statusCls,
             rows: s.rows,
             timings: s.timings,
+            queryProfile: s.queryProfile || null,
+            engineUsed: s.engineUsed || null,
             errorVisible: s.errorVisible,
             errorTitle: s.errorTitle,
             errorMessage: s.errorMessage
@@ -688,6 +710,8 @@
             statusCls: saved.statusCls || '',
             rows: saved.rows || [],
             timings: saved.timings || null,
+            queryProfile: saved.queryProfile || null,
+            engineUsed: saved.engineUsed || null,
             errorVisible: !!saved.errorVisible,
             errorTitle: saved.errorTitle || '',
             errorMessage: saved.errorMessage || '',
@@ -915,6 +939,10 @@
         if (session.queryProfile) {
           renderQueryPlan(session.queryProfile);
         }
+        // Ensure profiler dashboard is populated from session data
+        if (typeof _profilerTimingsData !== 'undefined') _profilerTimingsData = session.timings || null;
+        if (typeof _profilerPlanData !== 'undefined') _profilerPlanData = session.queryProfile || null;
+        if (typeof renderProfilerDashboard === 'function') renderProfilerDashboard();
       }
 
       switchTab(session.innerTab || 'execute');
@@ -964,8 +992,18 @@
       __execSessions.splice(idx, 1);
 
       if (!__execSessions.length) {
-        const fresh = __createExecSession({ name: 'Execution 1' });
-        __execSessions.push(fresh);
+        // All tabs closed — clear editor and results
+        __activeExecSessionId = null;
+        if (window.editor) { window.editor.setValue(''); }
+        var resEl = document.getElementById('result');
+        if (resEl) resEl.innerHTML = '';
+        var badge = document.getElementById('ccSummaryBadge');
+        if (badge) { badge.className = 'summary-badge ready'; badge.innerHTML = '<i class="fas fa-circle" style="font-size:7px;"></i> Ready'; }
+        var stats = document.getElementById('ccSummaryStats');
+        if (stats) stats.innerHTML = '';
+        __renderExecTabs();
+        _persistExecSessions();
+        return;
       }
 
       if (__activeExecSessionId === id) {
@@ -1120,8 +1158,10 @@
 
     function setStatus(text, cls) {
       const el = document.getElementById('status');
-      el.className = 'text-sm muted ' + (cls || '');
-      el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
+      if (el) {
+        el.className = 'text-sm muted ' + (cls || '');
+        el.innerHTML = `<i class="fas fa-circle" style="font-size:8px;"></i>&nbsp;${text}`;
+      }
 
       const s = __getActiveExecSession ? __getActiveExecSession() : null;
       if (s) {
@@ -1192,19 +1232,25 @@
         const resultDiv = document.getElementById('result');
         const timingCard = document.getElementById('timings-visualization-card');
 
-        statusEl.className = 'text-sm muted error';
-        statusEl.innerHTML = `<i class="fas fa-times-circle"></i>&nbsp;${statusText}`;
+        if (statusEl) {
+          statusEl.className = 'text-sm muted error';
+          statusEl.innerHTML = `<i class="fas fa-times-circle"></i>&nbsp;${statusText}`;
+        }
 
         // Show the error on the Result tab
-        errorDisplay.style.display = 'block';
-        document.getElementById('query-error-display').querySelector('strong').textContent = title + ':';
-        document.getElementById('query-error-message').textContent = message;
+        if (errorDisplay) {
+          errorDisplay.style.display = 'block';
+          var _errTitle = errorDisplay.querySelector('strong');
+          if (_errTitle) _errTitle.textContent = title + ':';
+          var _errMsg = document.getElementById('query-error-message');
+          if (_errMsg) _errMsg.textContent = message;
+        }
 
         // Clear rows, headers, results area and timing chart
         window.__curRows = [];
         window.__curHeaders = [];
-        resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Query failed. See error details above.</div>';
-        timingCard.style.display = 'none';
+        if (resultDiv) resultDiv.innerHTML = '<div class="muted text-sm" style="padding: 15px;">Query failed. See error details above.</div>';
+        if (timingCard) timingCard.style.display = 'none';
 
         if (timingsChart) {
             timingsChart = null;
@@ -1412,7 +1458,7 @@ let html = '';
       var total = 0;
       function walk(n) {
         if (!n) return;
-        var t = n.operator_timing || n.timing || 0;
+        var t = (typeof n.operator_timing === 'number') ? n.operator_timing : (typeof n.timing === 'number' ? n.timing : 0);
         total += t;
         (n.children || []).forEach(walk);
       }
@@ -1424,7 +1470,7 @@ let html = '';
       if (!node) return '';
 
       var opName = node.operator_name || node.operator_type || node.name || 'Unknown';
-      var timing = node.operator_timing || node.timing || 0;
+      var timing = (typeof node.operator_timing === 'number') ? node.operator_timing : (typeof node.timing === 'number' ? node.timing : 0);
       var pct = totalTiming > 0 ? (timing / totalTiming * 100) : 0;
       var cardinality = node.operator_cardinality || node.cardinality || 0;
       var rowsScanned = node.operator_rows_scanned || node.rows_scanned || 0;
@@ -1754,7 +1800,7 @@ let html = '';
 
       console.log('[execute] fetching /api/v1/tables/schema from server');
       try {
-        var data = await api('/api/v1/tables/schema', {
+        var data = await api('/api/v1/tables/schemas', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2073,6 +2119,15 @@ let html = '';
         if (data.status === 'ok') {
           const timings = (data.meta && data.meta.timings) ? data.meta.timings : null;
           const queryProfile = (data.meta && data.meta.query_profile) ? data.meta.query_profile : null;
+          const planStats = (data.meta && data.meta.plan_stats) ? data.meta.plan_stats : null;
+
+          // Resolve actual engine used from plan_stats
+          var _engineUsed = '';
+          if (Array.isArray(planStats)) {
+            for (var _psi = 0; _psi < planStats.length; _psi++) {
+              if (planStats[_psi] && planStats[_psi].ENGINE) { _engineUsed = planStats[_psi].ENGINE; break; }
+            }
+          }
 
           let durationMs = null;
           if (typeof data.duration_ms === 'number') {
@@ -2095,6 +2150,7 @@ let html = '';
               session.errorMessage = metaErr.message;
               session.rows = [];
               session.timings = timings || null;
+              session.engineUsed = _engineUsed || null;
               session.statusText = errStatusText;
               session.statusCls = 'error';
               session.innerTab = 'result';
@@ -2125,6 +2181,7 @@ let html = '';
             session.rows = rows;
             session.timings = timings || null;
             session.queryProfile = queryProfile || null;
+            session.engineUsed = _engineUsed || null;
             session.errorVisible = false;
             session.errorTitle = '';
             session.errorMessage = '';
@@ -2569,37 +2626,211 @@ let html = '';
       const qEl      = document.getElementById('saveViewQueryPreview');
       const stEl     = document.getElementById('saveViewStatus');
       const manage   = document.getElementById('saveViewManageLink');
+      const display  = document.getElementById('saveRoleParsedDisplay');
 
       if (orgEl) orgEl.textContent  = organization;
       if (supEl) supEl.textContent  = superName;
       if (qEl)   qEl.value          = q;
       if (stEl)  stEl.style.display = 'none';
 
-      // Auto-detect tables
-      const detectedTables = _detectTablesFromSQL(q);
-      if (tablesEl) tablesEl.value = detectedTables.length ? detectedTables.join(', ') : '*';
-      if (colsEl)   colsEl.value   = '*';
+      // ── Parse SQL into table groups ──
+      var parsed = _parseSQLForRole(q);
 
-      // Auto-convert WHERE → FilterBuilder JSON
-      const filterJSON = _whereToFilterJSON(q);
-      if (filtersEl) {
-        filtersEl.value = JSON.stringify(filterJSON, null, 2);
-      }
+      // Populate hidden fields for saveViewNow()
+      var allTables = parsed.tables.map(function(t) { return t.name; });
+      var allCols = [];
+      parsed.tables.forEach(function(t) { t.columns.forEach(function(c) { allCols.push(c); }); });
+      if (tablesEl) tablesEl.value = allTables.length ? allTables.join(', ') : '*';
+      if (colsEl)   colsEl.value   = allCols.length ? allCols.join(', ') : '*';
+
+      var filterJSON = _whereToFilterJSON(q);
+      if (filtersEl) filtersEl.value = JSON.stringify(filterJSON, null, 2);
 
       if (nameEl && !nameEl.value) {
-        const ts = new Date().toISOString().slice(0, 10);
-        nameEl.value = `${superName}-role-${ts}`;
+        var ts = new Date().toISOString().slice(0, 10);
+        nameEl.value = superName + '-role-' + ts;
       }
 
       if (manage) {
-        const url = new URL('/ui/security', window.location.origin);
+        var url = new URL('/ui/security', window.location.origin);
         url.searchParams.set('org', organization);
         url.searchParams.set('sup', superName);
         manage.href = url.toString();
       }
 
+      // ── Render accordion rows ──
+      if (display) {
+        var tableColors = ['#1c96ca', '#7c3aed', '#0d9488', '#d97706', '#dc2626'];
+        var tableBgs    = ['#e6f4fa', '#f5f3ff', '#f0fdfa', '#fef3c7', '#fef2f2'];
+        var html = '';
+
+        if (parsed.tables.length) {
+          html += '<div style="border:1px solid var(--panel-border);border-radius:10px;overflow:hidden;">';
+          parsed.tables.forEach(function(tbl, ti) {
+            var color = tableColors[ti % tableColors.length];
+            var bg = tableBgs[ti % tableBgs.length];
+            var colCount = tbl.columns.length;
+            var filterCount = tbl.filters.length;
+            var summary = colCount + ' column' + (colCount !== 1 ? 's' : '');
+            if (filterCount > 0) summary += ' \u00b7 ' + filterCount + ' filter' + (filterCount !== 1 ? 's' : '');
+            else summary += ' \u00b7 no filters';
+
+            // JOIN divider between tables
+            if (ti > 0 && parsed.joins.length > ti - 1) {
+              var join = parsed.joins[ti - 1] || '';
+              html += '<div style="padding:4px 12px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-muted);background:var(--bg-surface);border-top:1px solid var(--panel-border);border-bottom:1px solid var(--panel-border);">'
+                + '<i class="fas fa-link" style="font-size:8px;"></i>'
+                + '<span style="font-family:var(--mono);font-size:10px;">' + _esc(join) + '</span></div>';
+            } else if (ti > 0) {
+              html += '<div style="border-top:1px solid var(--panel-border);"></div>';
+            }
+
+            html += '<div style="padding:10px 12px;">';
+            // Table header
+            html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
+              + '<div style="width:24px;height:24px;border-radius:6px;background:' + bg + ';display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="fas fa-table" style="font-size:10px;color:' + color + ';"></i></div>'
+              + '<span style="font-size:13px;font-weight:700;color:' + color + ';">' + _esc(tbl.name) + '</span>';
+            if (tbl.alias) html += '<span style="font-size:10px;color:var(--text-muted);">' + _esc(tbl.alias) + '</span>';
+            html += '<span style="font-size:10px;color:var(--text-muted);margin-left:auto;">' + summary + '</span></div>';
+
+            // Columns
+            if (colCount) {
+              html += '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:' + (filterCount ? '6' : '0') + 'px;">';
+              tbl.columns.forEach(function(c) {
+                html += '<span style="padding:2px 7px;border-radius:4px;background:#f0fdfa;font-size:11px;font-weight:500;color:#0f766e;">' + _esc(c) + '</span>';
+              });
+              html += '</div>';
+            }
+
+            // Filters
+            if (filterCount) {
+              tbl.filters.forEach(function(f) {
+                html += '<div style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;background:#eef2ff;font-size:11px;margin-top:2px;">'
+                  + '<span style="font-weight:600;color:#4338ca;">' + _esc(f.col) + '</span>'
+                  + '<span style="color:#94a3b8;">' + _esc(f.op) + '</span>'
+                  + '<span style="font-family:var(--mono);color:#4f46e5;font-weight:600;">' + _esc(f.val) + '</span></div>';
+              });
+            }
+
+            html += '</div>';
+          });
+          html += '</div>';
+        } else {
+          html += '<div style="padding:12px;color:var(--text-muted);font-size:12px;text-align:center;">Could not parse tables from query.</div>';
+        }
+
+        display.innerHTML = html;
+      }
+
       $('#saveViewModal').modal('show');
       try { if (nameEl) nameEl.focus(); } catch (e) {}
+    }
+
+    // ── Parse SQL into table-grouped structure for accordion display ──
+    function _parseSQLForRole(sql) {
+      var result = { tables: [], joins: [] };
+      if (!sql) return result;
+
+      // Strip comments
+      var q = sql.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+
+      // Extract tables with aliases: FROM table alias, JOIN table alias
+      var tableMap = {};  // alias → { name, alias, columns:[], filters:[] }
+      var tableOrder = [];
+      var tblPattern = /\b(?:FROM|JOIN)\s+(?:(\w+)\.)?("(?:[^"]+)"|[a-zA-Z_]\w*)\s+(?:AS\s+)?(?!ON\b|WHERE\b|GROUP\b|ORDER\b|HAVING\b|LEFT\b|RIGHT\b|INNER\b|OUTER\b|CROSS\b|FULL\b|SET\b|LIMIT\b|UNION\b)([a-zA-Z_]\w*)?/gi;
+      var tm;
+      while ((tm = tblPattern.exec(q)) !== null) {
+        var tName = (tm[2] || '').replace(/^"|"$/g, '').trim();
+        var tAlias = (tm[3] || '').trim();
+        if (!tName) continue;
+        var key = tAlias || tName;
+        if (!tableMap[key]) {
+          tableMap[key] = { name: tName, alias: tAlias, columns: [], filters: [] };
+          tableOrder.push(key);
+        }
+      }
+
+      // If no tables found, try simpler pattern
+      if (!tableOrder.length) {
+        var simpleTables = _detectTablesFromSQL(sql);
+        simpleTables.forEach(function(t) {
+          tableMap[t] = { name: t, alias: '', columns: [], filters: [] };
+          tableOrder.push(t);
+        });
+      }
+
+      // Extract SELECT columns, map to tables by alias prefix
+      var selMatch = q.match(/\bSELECT\s+([\s\S]*?)\bFROM\b/i);
+      if (selMatch) {
+        var selPart = selMatch[1].replace(/\bDISTINCT\s+/i, '');
+        var cols = selPart.split(',').map(function(c) { return c.trim(); }).filter(Boolean);
+        cols.forEach(function(raw) {
+          // Strip AS alias: "expr AS alias" → keep the expression
+          var asMatch = raw.match(/^(.+?)\s+AS\s+\w+$/i);
+          var expr = asMatch ? asMatch[1].trim() : raw.trim();
+
+          // Check for alias.column pattern
+          var dotMatch = expr.match(/^(\w+)\.(.+)$/);
+          if (dotMatch) {
+            var prefix = dotMatch[1];
+            var colName = dotMatch[2].replace(/^"|"$/g, '');
+            if (tableMap[prefix]) {
+              tableMap[prefix].columns.push(colName);
+              return;
+            }
+          }
+
+          // Unqualified column — assign to first table
+          if (tableOrder.length) {
+            var colClean = expr.replace(/^"|"$/g, '');
+            tableMap[tableOrder[0]].columns.push(colClean);
+          }
+        });
+      }
+
+      // Extract WHERE filters, map to tables
+      var whereMatch = q.match(/\bWHERE\b([\s\S]+?)(?=\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$)/i);
+      if (whereMatch) {
+        var wherePart = whereMatch[1].trim();
+        // Split on AND (top-level only, not inside parens)
+        var conditions = wherePart.split(/\bAND\b/i).map(function(c) { return c.trim(); }).filter(Boolean);
+        conditions.forEach(function(cond) {
+          // Parse: col op value
+          var cm = cond.match(/^(\w+(?:\.\w+)?)\s*(=|!=|<>|>=|<=|>|<|LIKE|ILIKE|IN|NOT\s+IN|IS\s+NOT|IS|BETWEEN)\s*(.+)$/i);
+          if (!cm) return;
+          var fullCol = cm[1], op = cm[2], val = cm[3].trim();
+          var colDot = fullCol.match(/^(\w+)\.(\w+)$/);
+          var alias = colDot ? colDot[1] : null;
+          var colName = colDot ? colDot[2] : fullCol;
+
+          // Find which table this belongs to
+          var targetKey = null;
+          if (alias && tableMap[alias]) {
+            targetKey = alias;
+          } else {
+            // Search all tables for a matching column in their column list
+            for (var ki = 0; ki < tableOrder.length; ki++) {
+              var k = tableOrder[ki];
+              if (tableMap[k].columns.indexOf(colName) >= 0) { targetKey = k; break; }
+            }
+            // Default to first table
+            if (!targetKey && tableOrder.length) targetKey = tableOrder[0];
+          }
+          if (targetKey) {
+            tableMap[targetKey].filters.push({ col: colName, op: op, val: val });
+          }
+        });
+      }
+
+      // Extract JOIN ON conditions
+      var joinPattern = /\bJOIN\b[\s\S]*?\bON\b\s+([^\n]+?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bJOIN\b|$)/gi;
+      var jm;
+      while ((jm = joinPattern.exec(q)) !== null) {
+        result.joins.push('ON ' + jm[1].trim().replace(/\s+/g, ' '));
+      }
+
+      tableOrder.forEach(function(k) { result.tables.push(tableMap[k]); });
+      return result;
     }
 
     async function saveViewNow() {
@@ -3461,12 +3692,248 @@ $(document).ready(function(){
         __schemaBtn.addEventListener('click', function () {
           var icon = __schemaBtn.querySelector('i');
           if (icon) { icon.style.transition = 'transform 0.5s ease'; icon.style.transform = 'rotate(360deg)'; }
-          _clearCachedSchema();
-          loadSchema(true).then(function () {
+
+          // Parse SQL to extract table names — only refresh those
+          var sql = window.editor ? window.editor.getValue() : '';
+          var tableNames = _extractTableNamesFromSQL(sql);
+
+          if (tableNames.length === 0) {
+            // Can't parse or no tables — do nothing, stop spinner
+            console.log('[intellisense] No tables found in SQL, skipping refresh');
+            setTimeout(function () { if (icon) icon.style.transform = ''; }, 600);
+            return;
+          }
+
+          console.log('[intellisense] Refreshing schemas for: ' + tableNames.join(', '));
+          _refreshTablesSchema(tableNames).then(function () {
             setTimeout(function () { if (icon) icon.style.transform = ''; }, 600);
           });
         });
       }
+
+      // Extract table names from SQL (after FROM, JOIN keywords)
+      function _extractTableNamesFromSQL(sql) {
+        if (!sql || !sql.trim()) return [];
+        // Remove single-line comments
+        var cleaned = sql.replace(/--[^\n]*/g, '');
+        // Remove block comments
+        cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, '');
+        // Remove string literals (single-quoted only — preserve double-quoted identifiers)
+        cleaned = cleaned.replace(/'[^']*'/g, "''");
+
+        var tables = [];
+        // Match: FROM/JOIN followed by optional "quoted" or bare identifier, with optional schema.table
+        var pattern = /\b(?:FROM|JOIN)\s+("(?:[^"]+)"|[a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\.\s*("(?:[^"]+)"|[a-zA-Z_][a-zA-Z0-9_]*))?/gi;
+        var match;
+        while ((match = pattern.exec(cleaned)) !== null) {
+          // Use the last part (table name) — if schema.table, take table; otherwise take first match
+          var raw = match[2] || match[1];
+          // Strip surrounding double quotes
+          var name = raw.replace(/^"|"$/g, '').trim();
+          if (!name) continue;
+          // Skip subqueries / CTEs — if next char is '(' it's not a table
+          var afterIdx = match.index + match[0].length;
+          var nextChar = cleaned.substring(afterIdx).trim()[0];
+          if (nextChar === '(') continue;
+          // Skip SQL keywords that could follow FROM/JOIN
+          var kw = ['SELECT','WHERE','ON','SET','VALUES','GROUP','ORDER','HAVING','LIMIT','UNION','INTERSECT','EXCEPT','LATERAL'];
+          if (kw.indexOf(name.toUpperCase()) >= 0) continue;
+          if (tables.indexOf(name) < 0) tables.push(name);
+        }
+        return tables;
+      }
+
+      // Refresh schema for specific tables only, merge into cache
+      async function _refreshTablesSchema(tableNames) {
+        var { organization, superName } = getTenant();
+        if (!organization || !superName) return;
+        var roleName = (window.__st_active_role || window.__st_role_name || ROLE_NAME || '').trim();
+        if (!roleName) return;
+
+        var existingSchema = _getCachedSchema() || {};
+        var updated = false;
+
+        for (var ti = 0; ti < tableNames.length; ti++) {
+          var tableName = tableNames[ti];
+          try {
+            var resp = await fetch('/api/v1/tables/schema?organization=' + encodeURIComponent(organization) +
+              '&super_name=' + encodeURIComponent(superName) +
+              '&table=' + encodeURIComponent(tableName) +
+              '&role_name=' + encodeURIComponent(roleName), { credentials: 'same-origin' });
+            if (!resp.ok) continue;
+            var data = await resp.json();
+            if (data && data.ok && data.schema) {
+              // Extract column names from schema rows
+              var cols = [];
+              if (Array.isArray(data.schema) && data.schema.length && typeof data.schema[0] === 'object') {
+                cols = Object.keys(data.schema[0]);
+              }
+              existingSchema[tableName] = cols;
+              updated = true;
+            }
+          } catch (e) {
+            console.warn('[intellisense] Failed to refresh ' + tableName + ':', e);
+          }
+        }
+
+        if (updated) {
+          _setCachedSchema(existingSchema);
+          _applySchema(existingSchema);
+          // Also update schema tree in sidebar
+          if (typeof ccRenderSchemaTree === 'function') ccRenderSchemaTree();
+          console.log('[intellisense] Updated ' + tableNames.length + ' table(s)');
+        }
+      }
+
+      /* ── SQL Formatter ────────────────────────────────────────── */
+      function formatSQL(sql) {
+        if (!sql || !sql.trim()) return sql;
+        // Normalize whitespace
+        var s = sql.replace(/\r\n/g, '\n').replace(/\t/g, ' ');
+        // Collapse multiple spaces (outside quotes)
+        var inStr = false, quoteChar = '', collapsed = '';
+        for (var ci = 0; ci < s.length; ci++) {
+          var ch = s[ci];
+          if (inStr) { collapsed += ch; if (ch === quoteChar && s[ci - 1] !== '\\') inStr = false; continue; }
+          if (ch === '\'' || ch === '"') { inStr = true; quoteChar = ch; collapsed += ch; continue; }
+          if (/\s/.test(ch)) {
+            if (collapsed.length && !/\s/.test(collapsed[collapsed.length - 1])) collapsed += ' ';
+          } else { collapsed += ch; }
+        }
+        s = collapsed.trim();
+
+        // Major clause keywords — each starts a new line at indent 0
+        var majorKw = ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY',
+                       'LIMIT', 'OFFSET', 'UNION ALL', 'UNION', 'INTERSECT', 'EXCEPT',
+                       'INSERT INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE FROM',
+                       'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN', 'OUTER JOIN', 'FULL JOIN',
+                       'CROSS JOIN', 'LEFT OUTER JOIN', 'RIGHT OUTER JOIN', 'FULL OUTER JOIN',
+                       'JOIN', 'ON', 'WITH', 'WINDOW'];
+
+        // Sort longest first to avoid partial matches
+        majorKw.sort(function (a, b) { return b.length - a.length; });
+
+        // Tokenize: protect strings/identifiers, then work on keywords
+        var tokens = [];
+        var remaining = s;
+        while (remaining.length) {
+          // String literal
+          if (remaining[0] === '\'' || remaining[0] === '"') {
+            var q = remaining[0], end = 1;
+            while (end < remaining.length && !(remaining[end] === q && remaining[end - 1] !== '\\')) end++;
+            tokens.push(remaining.substring(0, end + 1));
+            remaining = remaining.substring(end + 1);
+            continue;
+          }
+          // Parentheses
+          if (remaining[0] === '(' || remaining[0] === ')') {
+            tokens.push(remaining[0]);
+            remaining = remaining.substring(1);
+            continue;
+          }
+          // Comma
+          if (remaining[0] === ',') {
+            tokens.push(',');
+            remaining = remaining.substring(1);
+            continue;
+          }
+          // Whitespace
+          if (/\s/.test(remaining[0])) {
+            remaining = remaining.substring(1);
+            continue;
+          }
+          // Check for keyword match (case-insensitive)
+          var matched = false;
+          var upper = remaining.toUpperCase();
+          for (var ki = 0; ki < majorKw.length; ki++) {
+            var kw = majorKw[ki];
+            if (upper.indexOf(kw) === 0) {
+              var after = remaining[kw.length];
+              if (!after || /[\s(,;]/.test(after)) {
+                tokens.push({ type: 'kw', value: kw });
+                remaining = remaining.substring(kw.length);
+                matched = true;
+                break;
+              }
+            }
+          }
+          if (matched) continue;
+          // Regular word/operator
+          var wEnd = 0;
+          while (wEnd < remaining.length && !/[\s(),]/.test(remaining[wEnd]) && remaining[wEnd] !== '\'' && remaining[wEnd] !== '"') wEnd++;
+          if (wEnd === 0) wEnd = 1;
+          // Uppercase SQL keywords
+          var word = remaining.substring(0, wEnd);
+          var simpleKw = ['AS', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'BETWEEN', 'LIKE', 'ILIKE',
+                          'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'DISTINCT',
+                          'ALL', 'ANY', 'TRUE', 'FALSE', 'OVER', 'PARTITION', 'BY', 'ROWS', 'RANGE',
+                          'NULLS', 'FIRST', 'LAST', 'FILTER', 'WITHIN', 'CAST', 'COALESCE',
+                          'COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+          var wordUp = word.toUpperCase();
+          if (simpleKw.indexOf(wordUp) >= 0) word = wordUp;
+          tokens.push(word);
+          remaining = remaining.substring(wEnd);
+        }
+
+        // Build formatted output
+        var lines = [], currentLine = '', indent = 0, parenDepth = 0;
+        function pushLine() { if (currentLine.trim()) lines.push('  '.repeat(indent) + currentLine.trim()); currentLine = ''; }
+
+        for (var ti = 0; ti < tokens.length; ti++) {
+          var tok = tokens[ti];
+          if (typeof tok === 'object' && tok.type === 'kw') {
+            // Major keyword — new line, reset indent context
+            pushLine();
+            if (['ON'].indexOf(tok.value) >= 0) {
+              currentLine = tok.value + ' ';
+              indent = parenDepth + 1;
+            } else if (tok.value.indexOf('JOIN') >= 0) {
+              indent = parenDepth;
+              currentLine = tok.value + ' ';
+            } else {
+              indent = parenDepth;
+              currentLine = tok.value + ' ';
+            }
+          } else if (tok === '(') {
+            currentLine += '(';
+            parenDepth++;
+          } else if (tok === ')') {
+            parenDepth = Math.max(0, parenDepth - 1);
+            currentLine += ')';
+          } else if (tok === ',') {
+            currentLine += ',';
+            // New line after comma in SELECT / GROUP BY / ORDER BY context
+            if (parenDepth === 0) { pushLine(); indent = 1; }
+          } else if (tok === 'AND' || tok === 'OR') {
+            pushLine();
+            indent = parenDepth + 1;
+            currentLine = tok + ' ';
+          } else {
+            currentLine += (currentLine.trim() ? ' ' : '') + tok;
+          }
+        }
+        pushLine();
+        return lines.join('\n');
+      }
+
+      var __fmtBtn = document.getElementById('btnFormatSql');
+      if (__fmtBtn) {
+        __fmtBtn.addEventListener('click', function () {
+          if (!window.editor) return;
+          var raw = window.editor.getValue();
+          var formatted = formatSQL(raw);
+          window.editor.setValue(formatted);
+          window.editor.focus();
+        });
+      }
+
+      // Keyboard shortcut: Alt+Shift+F to format
+      document.addEventListener('keydown', function (e) {
+        if (e.altKey && e.shiftKey && e.key === 'F') {
+          e.preventDefault();
+          if (__fmtBtn) __fmtBtn.click();
+        }
+      });
 
       // Only default to execute tab if sessions were NOT restored from storage
       // (restored sessions apply their own innerTab in __applyExecSessionState)
@@ -3521,25 +3988,39 @@ $(document).ready(function(){
         <span class="shortcut">⌘↵</span>
       </button>
 
+      <button class="btn-sm" id="btnFormatSql" title="Format SQL (Alt+Shift+F)"><i class="fas fa-align-left"></i> Format</button>
+
       <div class="topbar-sep"></div>
 
-      <button class="btn-sm" id="btnRefreshSchema" title="Refresh table schemas"><i class="fas fa-sync-alt"></i> Schema</button>
+      <button class="btn-sm" id="btnRefreshSchema" title="Refresh IntelliSense schema"><i class="fas fa-sync-alt"></i> IntelliSense</button>
       <button class="btn-sm" id="btnSaveView" title="Save as RBAC role"><i class="fas fa-shield-halved"></i> Save role</button>
       <button class="btn-sm" onclick="ccToggleShortcuts()" title="Keyboard shortcuts"><i class="fas fa-keyboard"></i></button>
     </header>
 
-    <!-- ═══ 3-COLUMN BODY ═══ -->
+    <!-- ═══ ICON RAIL + SLIDE PANEL BODY ═══ -->
     <div class="cc-columns">
 
-      <!-- LEFT PANEL: Schema Explorer -->
-      <aside class="cc-panel-left" id="ccPanelLeft">
+      <!-- ICON RAIL -->
+      <nav class="cc-icon-rail" id="ccIconRail">
+        <button class="cc-rail-btn active" id="railSchema" data-panel="schema" title="Schema">
+          <i class="fas fa-table"></i><span class="rail-tooltip">Schema</span>
+        </button>
+        <button class="cc-rail-btn" id="railHistory" data-panel="history" title="History">
+          <i class="fas fa-clock-rotate-left"></i><span class="rail-tooltip">History</span>
+        </button>
+        <button class="cc-rail-btn" id="railSnippets" data-panel="snippets" title="Snippets">
+          <i class="fas fa-bolt"></i><span class="rail-tooltip">Snippets</span>
+        </button>
+      </nav>
+
+      <!-- SLIDE PANEL: Schema -->
+      <aside class="cc-slide-panel" id="ccSlideSchema" data-rail="schema">
         <div class="cc-panel-header">
           <span class="cc-panel-title">Schema</span>
           <div class="cc-panel-actions">
             <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);"></span>
             <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
             <button class="cc-icon-btn" onclick="loadSchema(true)" title="Refresh schema"><i class="fas fa-sync-alt"></i></button>
-            <button class="cc-panel-toggle" onclick="ccTogglePanel('left')"><i class="fas fa-chevron-left"></i></button>
           </div>
         </div>
         <div class="schema-search-wrap">
@@ -3547,22 +4028,29 @@ $(document).ready(function(){
           <input class="schema-search" placeholder="Filter tables…" id="schemaFilter" oninput="ccFilterSchema(this.value)"/>
         </div>
         <div class="schema-tree" id="schemaTree"></div>
-
-        <div class="snippets-section">
-          <div class="cc-panel-header">
-            <span class="cc-panel-title">Snippets</span>
-          </div>
-          <div class="snippet-item" onclick="ccInsertSnippet('SELECT * FROM ... LIMIT 100')"><i class="fas fa-bolt"></i> Quick select</div>
-          <div class="snippet-item" onclick="ccInsertSnippet('SELECT COUNT(*) as cnt,\n  ... as dim\nFROM ...\nGROUP BY dim\nORDER BY cnt DESC')"><i class="fas fa-bolt"></i> Group &amp; count</div>
-          <div class="snippet-item" onclick="ccInsertSnippet('WITH cte AS (\n  SELECT ...\n  FROM ...\n)\nSELECT * FROM cte')"><i class="fas fa-bolt"></i> CTE template</div>
-        </div>
       </aside>
 
-      <!-- Re-open tab for left panel (visible only when collapsed) -->
-      <div class="cc-panel-reopen cc-panel-reopen-left" onclick="ccTogglePanel('left')">
-        <i class="fas fa-chevron-right"></i>
-        <span class="reopen-label">Schema</span>
-      </div>
+      <!-- SLIDE PANEL: History + Profile -->
+      <aside class="cc-slide-panel collapsed" id="ccSlideHistory" data-rail="history">
+        <div class="cc-panel-header">
+          <span class="cc-panel-title">Query history</span>
+        </div>
+        <div class="history-list" id="ccHistoryList"></div>
+      </aside>
+
+      <!-- SLIDE PANEL: Snippets -->
+      <aside class="cc-slide-panel collapsed" id="ccSlideSnippets" data-rail="snippets">
+        <div class="cc-panel-header">
+          <span class="cc-panel-title">Snippets</span>
+          <div class="cc-panel-actions">
+            <button class="cc-icon-btn" id="btnAddSnippet" title="Save current SQL as snippet"><i class="fas fa-plus"></i></button>
+          </div>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:4px 0;" id="ccSnippetList"></div>
+      </aside>
+
+      <!-- Profile timings target — hidden, populated by existing JS -->
+      <div id="ccProfileTimings" style="display:none;"></div>
 
       <!-- CENTER STAGE -->
       <main class="cc-center">
@@ -3600,11 +4088,8 @@ $(document).ready(function(){
           <div id="tab-pivot" class="cc-result-tab" onclick="switchTab('pivot')">
             <i class="fas fa-table-cells" style="font-size:11px;"></i> Pivot
           </div>
-          <div id="tab-timings" class="cc-result-tab" onclick="switchTab('timings')">
-            <i class="fas fa-chart-bar" style="font-size:11px;"></i> Timings
-          </div>
-          <div id="tab-plan" class="cc-result-tab" onclick="switchTab('plan')">
-            <i class="fas fa-project-diagram" style="font-size:11px;"></i> Plan
+          <div id="tab-profiler" class="cc-result-tab" onclick="switchTab('profiler')">
+            <i class="fas fa-gauge-high" style="font-size:11px;"></i> Profiler
           </div>
         </div>
 
@@ -3675,53 +4160,29 @@ $(document).ready(function(){
             </div>
           </div>
 
-          <!-- TIMINGS (without query plan — plan is its own tab now) -->
-          <div class="cc-result-panel" id="tab-content-timings">
-            <div id="timings-visualization-card">
-              <div class="timings-header">
-                <h4>Execution Timeline</h4>
-                <span class="timings-total" id="timingsTotalLabel"></span>
-                <div class="timings-sub">Internal execution steps excluding total query time.</div>
+          <!-- PROFILER (merged Timings + Plan) -->
+          <div class="cc-result-panel" id="tab-content-profiler">
+            <div id="profilerDashboard" style="padding: 16px 20px;">
+              <div id="profilerEmpty" style="text-align:center;padding:30px 15px;color:var(--text-muted);font-size:13px;">
+                No profiling data available. Execute a query first.
               </div>
+            </div>
+            <!-- Hidden: keep original elements for JS compat -->
+            <div id="timings-visualization-card" style="display:none;">
+              <div class="timings-header"><h4>Execution Timeline</h4><span class="timings-total" id="timingsTotalLabel"></span><div class="timings-sub"></div></div>
               <div class="timings-rows" id="timingsRows"></div>
             </div>
-          </div>
-
-          <!-- QUERY PLAN (its own tab) -->
-          <div class="cc-result-panel" id="tab-content-plan">
-            <div id="planTreeSection" class="plan-tree-section" style="display:block; border-top:none; margin-top:0; padding-top:10px;">
+            <div id="planTreeSection" class="plan-tree-section" style="display:none;">
               <div class="plan-tree-header"><h4><i class="fas fa-project-diagram"></i> Query plan</h4></div>
               <div id="planStatsRow" class="plan-stats-row"></div>
               <div id="planSqlPreview" class="plan-tree-sql" style="display:none;"></div>
               <div id="planTreeWrap" class="plan-tree-wrap"></div>
-              <div id="planEmpty" class="plan-empty">No query plan available. Execute a query first.</div>
+              <div id="planEmpty" class="plan-empty"></div>
             </div>
           </div>
 
         </div><!-- /cc-results-content -->
       </main>
-
-      <!-- Re-open tab for right panel (visible only when collapsed) -->
-      <div class="cc-panel-reopen-right" id="ccPanelRightReopen" onclick="ccTogglePanel('right')">
-        <i class="fas fa-chevron-left"></i>
-        <span class="reopen-label">History</span>
-      </div>
-
-      <!-- RIGHT PANEL: History on top + Execution Profile on bottom -->
-      <aside class="cc-panel-right" id="ccPanelRight">
-        <div class="cc-panel-header">
-          <span class="cc-panel-title">Query history</span>
-          <button class="cc-panel-toggle" onclick="ccTogglePanel('right')"><i class="fas fa-chevron-right"></i></button>
-        </div>
-        <div class="history-list" id="ccHistoryList"></div>
-
-        <div class="profile-section">
-          <div class="cc-panel-header">
-            <span class="cc-panel-title">Execution profile</span>
-          </div>
-          <div id="ccProfileTimings"></div>
-        </div>
-      </aside>
 
     </div><!-- /cc-columns -->
 
@@ -3740,10 +4201,12 @@ $(document).ready(function(){
               Organization: <strong id="saveViewOrg"></strong> &nbsp;•&nbsp; SuperTable: <strong id="saveViewSup"></strong>
             </div>
             <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveViewName">Role name <span style="color:#ef4444;">*</span></label><input id="saveViewName" type="text" class="form-control" placeholder="e.g. eu-reader" maxlength="120" /><small class="text-muted">This becomes the role_name users select at login.</small></div>
-            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleTables">Tables <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-detected)</span></label><input id="saveRoleTables" type="text" class="form-control" placeholder="e.g. orders, customers — or * for all" /><small class="text-muted">Comma-separated.</small></div>
-            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleColumns">Columns <span style="font-weight:400; color:#94a3b8; font-size:11px;">(default: all)</span></label><input id="saveRoleColumns" type="text" class="form-control" value="*" /></div>
-            <div class="form-group"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveRoleFilters">Filters <span style="font-weight:400; color:#94a3b8; font-size:11px;">(auto-converted)</span></label><textarea id="saveRoleFilters" class="form-control" rows="4" style="font-family:monospace; font-size:12px;"></textarea><small class="text-muted">FilterBuilder JSON</small></div>
-            <div class="form-group" style="margin-bottom:0;"><label class="text-sm" style="font-weight:600; color:var(--text-muted);" for="saveViewQueryPreview">Source query</label><textarea id="saveViewQueryPreview" class="form-control" rows="4" readonly style="font-family:monospace; font-size:12px; background:#f8fafc;"></textarea></div>
+            <div id="saveRoleParsedDisplay" style="margin-top:12px;"></div>
+            <!-- Hidden fields for saveViewNow() compat -->
+            <input type="hidden" id="saveRoleTables" />
+            <input type="hidden" id="saveRoleColumns" />
+            <textarea id="saveRoleFilters" style="display:none;"></textarea>
+            <textarea id="saveViewQueryPreview" style="display:none;"></textarea>
             <div id="saveViewStatus" class="text-sm" style="margin-top:10px; display:none;"></div>
           </div>
           <div class="modal-footer" style="border-top: 1px solid var(--panel-border);">
@@ -3773,10 +4236,12 @@ $(document).ready(function(){
     <div class="cc-shortcuts-card">
       <h3><i class="fas fa-keyboard" style="color:var(--primary-color);margin-right:6px;"></i>Keyboard shortcuts</h3>
       <div class="cc-shortcut-row"><span>Execute query</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">↵</span></div></div>
+      <div class="cc-shortcut-row"><span>Format SQL</span><div class="cc-shortcut-keys"><span class="cc-kbd">Alt</span><span class="cc-kbd">⇧</span><span class="cc-kbd">F</span></div></div>
       <div class="cc-shortcut-row"><span>New execution tab</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">T</span></div></div>
       <div class="cc-shortcut-row"><span>Autocomplete</span><div class="cc-shortcut-keys"><span class="cc-kbd">Tab</span></div></div>
       <div class="cc-shortcut-row"><span>Toggle schema panel</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">B</span></div></div>
       <div class="cc-shortcut-row"><span>Toggle history panel</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">H</span></div></div>
+      <div class="cc-shortcut-row"><span>Toggle snippets panel</span><div class="cc-shortcut-keys"><span class="cc-kbd">⌘</span><span class="cc-kbd">J</span></div></div>
       <div class="cc-shortcut-row"><span>Show shortcuts</span><div class="cc-shortcut-keys"><span class="cc-kbd">?</span></div></div>
     </div>
   </div>
@@ -4025,15 +4490,13 @@ $(document).ready(function(){
           btn.appendChild(label);
           btn.addEventListener('click', function() { __activateExecSession(s.id); });
 
-          if (__execSessions.length > 1) {
-            var closeBtn = document.createElement('button');
-            closeBtn.type = 'button';
-            closeBtn.className = 'tab-close';
-            closeBtn.title = 'Close';
-            closeBtn.innerHTML = '<i class="fas fa-times"></i>';
-            closeBtn.addEventListener('click', function(e) { e.stopPropagation(); __closeExecSession(s.id); });
-            btn.appendChild(closeBtn);
-          }
+          var closeBtn = document.createElement('button');
+          closeBtn.type = 'button';
+          closeBtn.className = 'tab-close';
+          closeBtn.title = 'Close';
+          closeBtn.innerHTML = '<i class="fas fa-times"></i>';
+          closeBtn.addEventListener('click', function(e) { e.stopPropagation(); __closeExecSession(s.id); });
+          btn.appendChild(closeBtn);
 
           host.appendChild(btn);
         });
@@ -4046,6 +4509,8 @@ $(document).ready(function(){
       switchTab = function(tabName) {
         // Map old 'execute' tab to 'result' since editor is always visible
         if (tabName === 'execute') tabName = 'result';
+        // Map old separate timings/plan tabs to merged profiler
+        if (tabName === 'timings' || tabName === 'plan') tabName = 'profiler';
 
         // Deactivate all result tabs
         document.querySelectorAll('.cc-result-tab').forEach(function(t) { t.classList.remove('active'); });
@@ -4063,18 +4528,6 @@ $(document).ready(function(){
         // Chart.js resize
         if (tabName === 'visualize' && window.__vizChartInstance) {
           setTimeout(function() { try { window.__vizChartInstance.resize(); } catch(e){} }, 0);
-        }
-
-        // Show timings card when switching to timings tab
-        if (tabName === 'timings') {
-          var tc = document.getElementById('timings-visualization-card');
-          if (tc) tc.style.display = 'block';
-        }
-
-        // Show plan section when switching to plan tab
-        if (tabName === 'plan') {
-          var ps = document.getElementById('planTreeSection');
-          if (ps) ps.style.display = 'block';
         }
 
         window.__activeInnerTabName = tabName;
@@ -4129,42 +4582,217 @@ $(document).ready(function(){
     // --- Remap __mountInnerTabs to no-op (tabs are inline now) ---
     __mountInnerTabs = function() {};
 
-    // --- Also render timings in the right panel profile section ---
-    (function() {
-      var _origRenderTimingsChart = renderTimingsChart;
-      var _origAfter = function(timings) {
-        // Render compact profile in right panel
-        var el = document.getElementById('ccProfileTimings');
-        if (!el || !timings || !timings.length) return;
+    // --- Profiler Dashboard: merged Timings + Plan ---
+    var _profilerTimingsData = null;
+    var _profilerPlanData = null;
 
-        var colors = ['#6BAED6','#74C476','#1c96ca','#FDAE6B','#9ECAE1','#A1D99B','#C6DBEF','#E7CB94'];
-        var rawData = [], labels = [];
-        timings.forEach(function(t) {
+    function renderProfilerDashboard() {
+      var container = document.getElementById('profilerDashboard');
+      var emptyEl = document.getElementById('profilerEmpty');
+      if (!container) return;
+
+      if (!_profilerTimingsData && !_profilerPlanData) {
+        if (emptyEl) emptyEl.style.display = 'block';
+        return;
+      }
+      if (emptyEl) emptyEl.style.display = 'none';
+
+      var html = '';
+
+      // ── Engine pill — read actual engine from session ──
+      var engineName = '';
+      var __s = typeof __getActiveExecSession === 'function' ? __getActiveExecSession() : null;
+      if (__s && __s.engineUsed) engineName = __s.engineUsed;
+      if (!engineName) engineName = 'Unknown';
+      // Format engine name for display
+      var _engineDisplay = engineName.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+
+      html += '<div class="prof-grid">';
+
+      // ═══ LEFT COLUMN: Metrics + Pipeline (inside card) ═══
+      html += '<div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:14px 16px;">';
+
+      // Engine — compact inline header
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border-light);">';
+      html += '<i class="fas fa-microchip" style="font-size:11px;color:var(--primary-color);"></i>';
+      html += '<span style="font-size:11px;font-weight:700;color:var(--secondary-color);">' + _esc(_engineDisplay) + '</span>';
+      html += '<span style="font-size:10px;color:var(--text-muted);margin-left:auto;">Query profiler</span>';
+      html += '</div>';
+
+      // Metrics
+      if (_profilerPlanData) {
+        var p = _profilerPlanData;
+
+        // Performance — teal family
+        html += '<div style="margin-bottom:10px;">';
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;"><div style="width:3px;height:12px;border-radius:2px;background:#0d9488;"></div><span class="prof-section-title" style="margin:0;">Performance</span></div>';
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">';
+        if (p.latency != null) {
+          html += '<div class="prof-metric" style="background:#f0fdfa;padding:6px 8px;"><div class="prof-metric-label" style="color:#0f766e;font-size:9px;">Latency</div><div class="prof-metric-value" style="color:#0f766e;font-size:14px;margin-top:1px;">' + _planFormatMs(p.latency) + '</div></div>';
+        }
+        if (p.cpu_time != null) {
+          html += '<div class="prof-metric" style="background:#f0fdfa;padding:6px 8px;"><div class="prof-metric-label" style="color:#0f766e;font-size:9px;">CPU</div><div class="prof-metric-value" style="color:#0f766e;font-size:14px;margin-top:1px;">' + _planFormatMs(p.cpu_time) + '</div></div>';
+        }
+        if (p.system_peak_buffer_memory != null && p.system_peak_buffer_memory > 0) {
+          html += '<div class="prof-metric" style="background:#f0fdfa;padding:6px 8px;"><div class="prof-metric-label" style="color:#0f766e;font-size:9px;">Buffer</div><div class="prof-metric-value" style="color:#0f766e;font-size:14px;margin-top:1px;">' + _planFormatBytes(p.system_peak_buffer_memory) + '</div></div>';
+        }
+        html += '</div></div>';
+
+        // I/O — indigo family (between teal and blue)
+        html += '<div style="margin-bottom:10px;">';
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;"><div style="width:3px;height:12px;border-radius:2px;background:#4f46e5;"></div><span class="prof-section-title" style="margin:0;">I/O</span></div>';
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">';
+        if (p.total_bytes_read != null) {
+          var _readVal = p.total_bytes_read === 0 ? 'Cached' : _planFormatBytes(p.total_bytes_read);
+          html += '<div class="prof-metric" style="background:#eef2ff;padding:6px 8px;"><div class="prof-metric-label" style="color:#4338ca;font-size:9px;">Storage</div><div class="prof-metric-value" style="color:#4338ca;font-size:14px;margin-top:1px;">' + _readVal + '</div></div>';
+        }
+        if (p.total_bytes_written != null) {
+          var _spillVal = p.total_bytes_written > 0 ? _planFormatBytes(p.total_bytes_written) : 'None';
+          html += '<div class="prof-metric" style="background:#eef2ff;padding:6px 8px;"><div class="prof-metric-label" style="color:#4338ca;font-size:9px;">Spill</div><div class="prof-metric-value" style="color:#4338ca;font-size:14px;margin-top:1px;">' + _spillVal + '</div></div>';
+        }
+        if (p.result_set_size != null) {
+          html += '<div class="prof-metric" style="background:#eef2ff;padding:6px 8px;"><div class="prof-metric-label" style="color:#4338ca;font-size:9px;">Result</div><div class="prof-metric-value" style="color:#4338ca;font-size:14px;margin-top:1px;">' + _planFormatBytes(p.result_set_size) + '</div></div>';
+        }
+        html += '</div></div>';
+
+        // Rows — blue family
+        html += '<div style="margin-bottom:10px;">';
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;"><div style="width:3px;height:12px;border-radius:2px;background:var(--primary-color);"></div><span class="prof-section-title" style="margin:0;">Rows</span></div>';
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">';
+        if (p.cumulative_rows_scanned != null) {
+          html += '<div class="prof-metric" style="background:var(--primary-light);padding:6px 8px;"><div class="prof-metric-label" style="color:var(--secondary-color);font-size:9px;">Scanned</div><div class="prof-metric-value" style="color:var(--secondary-color);font-size:14px;margin-top:1px;">' + _planFormatRows(p.cumulative_rows_scanned) + '</div></div>';
+        }
+        if (p.cumulative_cardinality != null) {
+          html += '<div class="prof-metric" style="background:var(--primary-light);padding:6px 8px;"><div class="prof-metric-label" style="color:var(--secondary-color);font-size:9px;">Processed</div><div class="prof-metric-value" style="color:var(--secondary-color);font-size:14px;margin-top:1px;">' + _planFormatRows(p.cumulative_cardinality) + '</div></div>';
+        }
+        if (p.rows_returned != null) {
+          html += '<div class="prof-metric" style="background:var(--primary-light);padding:6px 8px;"><div class="prof-metric-label" style="color:var(--secondary-color);font-size:9px;">Returned</div><div class="prof-metric-value" style="color:var(--secondary-color);font-size:14px;margin-top:1px;">' + _planFormatRows(p.rows_returned) + '</div></div>';
+        }
+        html += '</div></div>';
+      }
+
+      // Pipeline phases
+      if (_profilerTimingsData && _profilerTimingsData.length) {
+        var rawPhases = [];
+        _profilerTimingsData.forEach(function(t) {
           var key = Object.keys(t)[0];
           if (key.toLowerCase().includes('total') || key.toLowerCase().includes('duration')) return;
-          rawData.push(t[key] * 1000);
-          labels.push(key.replace(/_/g, ' '));
+          rawPhases.push({ name: key.replace(/_/g, ' '), ms: t[key] * 1000 });
         });
-        if (!rawData.length) return;
+        if (rawPhases.length) {
+          var maxPhase = Math.max.apply(null, rawPhases.map(function(p) { return p.ms; }));
+          html += '<div class="prof-section-title">Pipeline phases</div>';
+          rawPhases.forEach(function(phase, i) {
+            var pct = maxPhase > 0 ? (phase.ms / maxPhase) * 100 : 0;
+            html += '<div class="prof-phase-row">';
+            html += '<span class="prof-phase-label">' + _esc(phase.name) + '</span>';
+            html += '<div class="prof-phase-track"><div class="prof-phase-bar" data-width="' + pct.toFixed(1) + '" style="width:0%;"></div></div>';
+            html += '<span class="prof-phase-val">' + (phase.ms >= 1 ? Math.round(phase.ms) + 'ms' : phase.ms.toFixed(2) + 'ms') + '</span>';
+            html += '</div>';
+          });
+        }
+      }
 
-        var max = Math.max.apply(null, rawData);
-        el.innerHTML = '';
-        rawData.forEach(function(ms, i) {
-          var pct = max > 0 ? (ms / max * 100) : 0;
-          var row = document.createElement('div');
-          row.className = 'profile-timing-row';
-          row.innerHTML =
-            '<span class="profile-timing-label">' + labels[i] + '</span>' +
-            '<div class="profile-timing-bar-track"><div class="profile-timing-bar" style="width:0%;background:' + colors[i % colors.length] + ';"></div></div>' +
-            '<span class="profile-timing-val">' + (ms >= 1 ? Math.round(ms) + 'ms' : ms.toFixed(2) + 'ms') + '</span>';
-          el.appendChild(row);
-          setTimeout(function() { row.querySelector('.profile-timing-bar').style.width = pct + '%'; }, 100 + i * 80);
+      html += '</div>';
+
+      // ═══ RIGHT COLUMN: Operators by cost (inside card) ═══
+      html += '<div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:16px;">';
+
+      if (_profilerPlanData && _profilerPlanData.children && _profilerPlanData.children.length) {
+        // Flatten operator tree
+        var flatOps = [];
+        var totalOpTiming = _planCollectTimings(_profilerPlanData);
+        function _flattenOps(node, depth) {
+          if (!node) return;
+          var opName = node.operator_name || node.operator_type || node.name || 'Unknown';
+          var timing = (typeof node.operator_timing === 'number') ? node.operator_timing : (typeof node.timing === 'number' ? node.timing : 0);
+          var pct = totalOpTiming > 0 ? (timing / totalOpTiming * 100) : 0;
+          var cardinality = node.operator_cardinality || node.cardinality || 0;
+          var rowsScanned = node.operator_rows_scanned || node.rows_scanned || 0;
+          var extraInfo = node.extra_info || {};
+          var extraParts = [];
+          if (typeof extraInfo === 'object') {
+            for (var k in extraInfo) {
+              if (!extraInfo.hasOwnProperty(k)) continue;
+              var v = extraInfo[k];
+              if (Array.isArray(v)) v = v.join(', ');
+              extraParts.push(k + ': ' + v);
+            }
+          }
+          flatOps.push({
+            name: opName.trim(), timing: timing, pct: pct,
+            cardinality: cardinality, rowsScanned: rowsScanned,
+            extra: extraParts.join('\n'), depth: depth
+          });
+          (node.children || []).forEach(function(c) { _flattenOps(c, depth + 1); });
+        }
+        _profilerPlanData.children.forEach(function(c) { _flattenOps(c, 0); });
+
+        // Sort by time descending
+        flatOps.sort(function(a, b) { return b.timing - a.timing; });
+
+        html += '<div class="prof-section-title">Operators by cost</div>';
+        flatOps.forEach(function(op, i) {
+          var barW = totalOpTiming > 0 ? Math.max(2, (op.timing / totalOpTiming) * 100) : 0;
+          var isHottest = i === 0 && op.timing > 0;
+          var metaParts = [];
+          if (op.cardinality > 0) metaParts.push(_planFormatRows(op.cardinality) + ' rows');
+          if (op.rowsScanned > 0) metaParts.push('scanned ' + _planFormatRows(op.rowsScanned));
+
+          html += '<div class="prof-op-card' + (isHottest ? ' hottest' : '') + '">';
+          html += '<div class="prof-op-header">';
+          html += '<span class="prof-op-name">' + _esc(op.name) + '</span>';
+          html += '<span class="prof-op-time">' + (op.timing > 0 ? _planFormatMs(op.timing) : '<0.01ms') + '</span>';
+          html += '<span class="prof-op-pct">' + op.pct.toFixed(0) + '%</span>';
+          html += '</div>';
+          html += '<div class="prof-op-bar"><div class="prof-op-bar-fill" data-width="' + barW.toFixed(1) + '" style="width:0%;background:' + (isHottest ? 'var(--error)' : 'var(--primary-color)') + ';"></div></div>';
+          if (metaParts.length) html += '<div class="prof-op-meta">' + metaParts.join(' · ') + '</div>';
+          if (op.extra) html += '<div class="prof-op-extra">' + _esc(op.extra) + '</div>';
+          html += '</div>';
         });
-      };
+      } else {
+        html += '<div style="padding:20px 0;text-align:center;color:var(--text-muted);font-size:12px;">No operator data available.</div>';
+      }
 
+      html += '</div>';
+      html += '</div>';
+
+      container.innerHTML = html;
+
+      // Animate bars after render
+      setTimeout(function() {
+        container.querySelectorAll('.prof-phase-bar[data-width]').forEach(function(bar, i) {
+          setTimeout(function() { bar.style.width = bar.getAttribute('data-width') + '%'; }, 50 + i * 60);
+        });
+        container.querySelectorAll('.prof-op-bar-fill[data-width]').forEach(function(bar, i) {
+          setTimeout(function() { bar.style.width = bar.getAttribute('data-width') + '%'; }, 80 + i * 40);
+        });
+      }, 30);
+    }
+
+    (function() {
+      var _origRenderTimingsChart = renderTimingsChart;
       renderTimingsChart = function(timings) {
         _origRenderTimingsChart(timings);
-        _origAfter(timings);
+        // Force-hide — the original sets display:block on the old container
+        var _tc = document.getElementById('timings-visualization-card');
+        if (_tc) _tc.style.display = 'none';
+        _profilerTimingsData = timings;
+        renderProfilerDashboard();
+        var el = document.getElementById('ccProfileTimings');
+        if (el) el.innerHTML = '';
+      };
+    })();
+
+    (function() {
+      var _origRenderQueryPlan = renderQueryPlan;
+      renderQueryPlan = function(profile) {
+        _origRenderQueryPlan(profile);
+        // Force-hide — the original sets display:block on the old container
+        var _ps = document.getElementById('planTreeSection');
+        if (_ps) _ps.style.display = 'none';
+        _profilerPlanData = profile;
+        renderProfilerDashboard();
       };
     })();
 
@@ -4351,15 +4979,46 @@ $(document).ready(function(){
     })();
 
     // --- Panel toggle ---
-    function ccTogglePanel(side) {
-      var el = side === 'left' ? document.getElementById('ccPanelLeft') : document.getElementById('ccPanelRight');
-      if (el) el.classList.toggle('collapsed');
-      // Toggle re-open tab visibility for right panel
-      if (side === 'right') {
-        var reopen = document.getElementById('ccPanelRightReopen');
-        if (reopen) reopen.style.display = el.classList.contains('collapsed') ? 'block' : 'none';
+    /* ── Icon rail panel switching ── */
+    var _activeRailPanel = 'schema';
+    function ccRailSelect(panel) {
+      var panels = document.querySelectorAll('.cc-slide-panel');
+      var btns = document.querySelectorAll('.cc-rail-btn[data-panel]');
+
+      if (_activeRailPanel === panel) {
+        // Toggle off — collapse all
+        panels.forEach(function(p) { p.classList.add('collapsed'); });
+        btns.forEach(function(b) { b.classList.remove('active'); });
+        _activeRailPanel = null;
+        setTimeout(function() { if (window.editor) window.editor.refresh(); }, 250);
+        return;
       }
-      setTimeout(function() { if (window.editor) window.editor.refresh(); }, 300);
+
+      // Switch panel
+      panels.forEach(function(p) {
+        if (p.getAttribute('data-rail') === panel) p.classList.remove('collapsed');
+        else p.classList.add('collapsed');
+      });
+      btns.forEach(function(b) {
+        if (b.getAttribute('data-panel') === panel) b.classList.add('active');
+        else b.classList.remove('active');
+      });
+      _activeRailPanel = panel;
+      setTimeout(function() { if (window.editor) window.editor.refresh(); }, 250);
+    }
+
+    // Wire rail buttons
+    document.querySelectorAll('.cc-rail-btn[data-panel]').forEach(function(btn) {
+      btn.addEventListener('click', function() { ccRailSelect(btn.getAttribute('data-panel')); });
+    });
+
+    // Legacy compat — ccTogglePanel still works
+    function ccTogglePanel(side) {
+      if (side === 'left') {
+        ccRailSelect(_activeRailPanel || 'schema');
+      } else if (side === 'right') {
+        ccRailSelect('history');
+      }
     }
 
     // --- Keyboard shortcuts ---
@@ -4374,12 +5033,78 @@ $(document).ready(function(){
         var overlay = document.getElementById('ccShortcutsOverlay');
         if (overlay) overlay.classList.remove('visible');
       }
+      // Rail panel shortcuts: Cmd/Ctrl + B/H/J
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey) {
+        if (e.key === 'b') { e.preventDefault(); ccRailSelect('schema'); }
+        if (e.key === 'h') { e.preventDefault(); ccRailSelect('history'); }
+        if (e.key === 'j') { e.preventDefault(); ccRailSelect('snippets'); }
+      }
     });
 
-    // --- Snippets ---
+    // --- Snippets (built-in + user-managed via localStorage) ---
+    var _BUILTIN_SNIPPETS = [
+      { label: 'Quick select', sql: 'SELECT * FROM ... LIMIT 100' },
+      { label: 'Group & count', sql: 'SELECT COUNT(*) as cnt,\n  ... as dim\nFROM ...\nGROUP BY dim\nORDER BY cnt DESC' },
+      { label: 'CTE template', sql: 'WITH cte AS (\n  SELECT ...\n  FROM ...\n)\nSELECT * FROM cte' },
+      { label: 'Monthly aggregation', sql: "SELECT\n  DATE_TRUNC('month', created_at) AS month,\n  COUNT(*) AS cnt\nFROM ...\nGROUP BY month\nORDER BY month" },
+      { label: 'Last 7 days', sql: "SELECT *\nFROM ...\nWHERE created_at >= CURRENT_DATE - INTERVAL '7 days'" },
+      { label: 'Window function', sql: 'SELECT\n  col,\n  ROW_NUMBER() OVER (ORDER BY col) AS rn\nFROM ...' }
+    ];
+    var _USER_SNIPPETS_KEY = 'st_user_snippets';
+
+    function _getUserSnippets() {
+      try { var raw = localStorage.getItem(_USER_SNIPPETS_KEY); return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
+    }
+    function _saveUserSnippets(list) {
+      try { localStorage.setItem(_USER_SNIPPETS_KEY, JSON.stringify(list)); } catch (e) {}
+    }
+
     function ccInsertSnippet(sql) {
       if (window.editor) { window.editor.setValue(sql); window.editor.focus(); }
     }
+
+    function ccDeleteUserSnippet(idx) {
+      var list = _getUserSnippets();
+      if (idx >= 0 && idx < list.length) { list.splice(idx, 1); _saveUserSnippets(list); }
+      ccRenderSnippets();
+    }
+
+    function ccRenderSnippets() {
+      var el = document.getElementById('ccSnippetList');
+      if (!el) return;
+      var html = '<div style="padding:2px 10px 4px;"><span style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;">Built-in</span></div>';
+      _BUILTIN_SNIPPETS.forEach(function (s) {
+        html += '<div class="snippet-item" onclick="ccInsertSnippet(' + JSON.stringify(s.sql).replace(/"/g, '&quot;') + ')"><i class="fas fa-bolt"></i> ' + s.label + '</div>';
+      });
+      var user = _getUserSnippets();
+      if (user.length) {
+        html += '<div style="padding:8px 10px 4px;border-top:1px solid var(--border-light);margin-top:4px;"><span style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;">My snippets</span></div>';
+        user.forEach(function (s, i) {
+          html += '<div class="snippet-item" style="position:relative;">'
+            + '<span style="flex:1;display:flex;align-items:center;gap:6px;overflow:hidden;cursor:pointer;" onclick="ccInsertSnippet(' + JSON.stringify(s.sql).replace(/"/g, '&quot;') + ')"><i class="fas fa-bookmark" style="font-size:10px;color:var(--primary-color);"></i><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + (s.label || 'Untitled') + '</span></span>'
+            + '<button onclick="ccDeleteUserSnippet(' + i + ')" style="border:none;background:none;color:var(--text-muted);cursor:pointer;padding:2px 4px;border-radius:3px;font-size:10px;flex-shrink:0;margin-left:auto;opacity:0.4;transition:all .15s;" onmouseenter="this.style.opacity=1;this.style.color=\'#ef4444\'" onmouseleave="this.style.opacity=0.4;this.style.color=\'var(--text-muted)\'"><i class="fas fa-trash-alt"></i></button>'
+            + '</div>';
+        });
+      }
+      el.innerHTML = html;
+    }
+
+    // Add snippet button
+    var _addSnipBtn = document.getElementById('btnAddSnippet');
+    if (_addSnipBtn) {
+      _addSnipBtn.addEventListener('click', function () {
+        var sql = (window.editor ? window.editor.getValue() : '').trim();
+        if (!sql) return;
+        var label = prompt('Snippet name:');
+        if (!label || !label.trim()) return;
+        var list = _getUserSnippets();
+        list.push({ label: label.trim(), sql: sql });
+        _saveUserSnippets(list);
+        ccRenderSnippets();
+      });
+    }
+
+    ccRenderSnippets();
 
     // --- Editor resize handle ---
     (function() {

@@ -138,12 +138,27 @@
   }
 
   .logo-edition {
-    color: #475569;
+    color: #94a3b8;
     background: none;
     -webkit-background-clip: unset;
     background-clip: unset;
     margin-left: 4px;
     font-weight: 800;
+  }
+
+  .logo-subtitle {
+    font-size: 10px;
+    font-weight: 600;
+    color: #94a3b8;
+    white-space: nowrap;
+    letter-spacing: 0.3px;
+    margin-top: 1px;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .logo-subtitle {
+    opacity: 0; width: 0; overflow: hidden; pointer-events: none;
   }
 
   .logo-stack { display: flex; flex-direction: column; line-height: 1.02; }
@@ -302,8 +317,8 @@
   .sidebar-section-title {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 14px 10px 6px;
+    gap: 6px;
+    padding: 14px 4px 6px;
     font-size: 10px;
     line-height: 1;
     text-transform: uppercase;
@@ -316,45 +331,62 @@
     content: '';
     height: 1px;
     flex: 1;
-    background: linear-gradient(90deg, rgba(148,163,184,0.35), rgba(148,163,184,0));
+    background: linear-gradient(90deg, rgba(148,163,184,0.25), transparent);
   }
 
-  .sidebar-collapsed .sidebar-section-title { justify-content: center; padding: 12px 0 4px; }
+  .sidebar-collapsed .sidebar-section-title { justify-content: center; padding: 8px 0 2px; }
   .sidebar-collapsed .sidebar-section-title span { display: none; }
-  .sidebar-collapsed .sidebar-section-title::after { display: none; }
+  .sidebar-collapsed .sidebar-section-title::after {
+    flex: none;
+    width: 20px;
+    background: rgba(148,163,184,0.2);
+  }
 
-  /* ── Nav items ─────────────────────────────────────────────────── */
+  /* ── Neural mesh nav items ─────────────────────────────────────── */
+
+  @keyframes nm-ripple {
+    0%   { transform: translate(-50%, -50%) scale(0.6); opacity: 0.5; }
+    100% { transform: translate(-50%, -50%) scale(2.8); opacity: 0; }
+  }
+
+  @keyframes nm-glow {
+    0%, 100% { text-shadow: 0 0 4px rgba(28, 150, 202, 0.15); }
+    50%      { text-shadow: 0 0 14px rgba(28, 150, 202, 0.55); }
+  }
 
   .nav-item {
     display: flex;
     align-items: center;
     justify-content: flex-start;
     width: 100%;
-    padding: 10px 10px;
-    margin: 0;
+    padding: 8px 10px;
+    margin: 2px 0;
     border: none;
     border-radius: 8px;
     background: transparent;
     cursor: pointer;
     transition: background 0.15s ease;
     text-decoration: none;
-    color: var(--text-color, #2b2d42);
+    color: rgba(43, 45, 66, 0.75);
     font-size: 13px;
     font-weight: 500;
   }
 
-  .nav-item:hover { background: rgba(0, 0, 0, 0.03); text-decoration: none; color: var(--primary-color); }
-  .nav-item:hover .nav-item-icon { color: var(--primary-color, #1c96ca); }
+  .nav-item:hover { background: rgba(0, 0, 0, 0.02); text-decoration: none; color: rgba(43, 45, 66, 0.75); }
 
   .nav-item-icon {
     font-size: 16px;
-    color: #64748b;
+    color: rgba(100, 116, 139, 0.5);
     flex-shrink: 0;
     transition: color 0.15s ease;
+    position: relative;
+    z-index: 2;
+    width: 22px;
+    text-align: center;
   }
 
   .nav-item-label {
-    margin-left: 10px;
+    margin-left: 12px;
     white-space: nowrap;
     opacity: 1;
     transition: opacity 0.18s ease;
@@ -365,12 +397,45 @@
   .sidebar-collapsed .nav-item-icon { font-size: 18px; }
 
   .nav-item-active {
-    background: rgba(28, 150, 202, 0.08);
+    background: rgba(28, 150, 202, 0.05);
     color: var(--primary-color, #1c96ca);
-    box-shadow: inset 0 0 0 1px rgba(28,150,202,0.08);
   }
 
-  .nav-item-active .nav-item-icon { color: var(--primary-color, #1c96ca); }
+  .nav-item-active .nav-item-icon {
+    color: var(--primary-color, #1c96ca);
+    animation: nm-glow 2.5s ease infinite;
+  }
+
+  .nav-item-active-tag {
+    margin-left: auto;
+    font-size: 9px;
+    color: rgba(28, 150, 202, 0.45);
+    font-weight: 600;
+    letter-spacing: 1px;
+    white-space: nowrap;
+  }
+
+  .sidebar-collapsed .nav-item-active-tag { display: none; }
+
+  .nm-ripple-ring {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    pointer-events: none;
+  }
+
+  .nm-ripple-ring-1 {
+    border: 1.5px solid rgba(28, 150, 202, 0.3);
+    animation: nm-ripple 2.5s ease infinite;
+  }
+
+  .nm-ripple-ring-2 {
+    border: 1.5px solid rgba(28, 150, 202, 0.2);
+    animation: nm-ripple 2.5s ease 0.8s infinite;
+  }
 
   .nav-item-external::after {
     content: '\f35d';
@@ -660,7 +725,7 @@
         <span class="data-grid"></span>
       </span>
     </span>
-    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-edition">Core</span></span></span>
+    <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-edition">Core</span></span><span class="logo-subtitle">Powered By SuperTable</span></span>
   </div>
 
   <!-- ── Workspace panel ──────────────────────────────────── -->
@@ -727,14 +792,14 @@
     {"section": "Explore"},
     {"href": "/ui/execute", "id": "link-execute", "icon": "fa-terminal", "label": "SQL Editor"},
     {"href": "/ui/tables", "id": "link-tables", "icon": "fa-table", "label": "Tables"},
-    {"section": "Data Pipeline"},
+    {"section": "Pipeline"},
     {"href": "/ui/ingestion", "id": "link-staging", "icon": "fa-layer-group", "label": "Ingestion"},
     {"href": "/ui/quality", "id": "link-quality", "icon": "fa-heartbeat", "label": "Data Quality"},
     {"href": "/ui/monitoring", "id": "link-monitoring", "icon": "fa-chart-line", "label": "Monitoring"},
-    {"section": "Infrastructure"},
+    {"section": "Admin"},
     {"href": "/ui/supertables", "id": "link-supertables", "icon": "fa-cubes", "label": "SuperTables", "requireAudit": true},
-    {"href": "/ui/sharing", "id": "link-sharing", "icon": "fa-share-nodes", "label": "Data Sharing", "requireAudit": true},
     {"href": "/ui/engine", "id": "link-engine", "icon": "fa-microchip", "label": "Engine"},
+    {"href": "/ui/sharing", "id": "link-sharing", "icon": "fa-share-nodes", "label": "Data Sharing", "requireAudit": true},
     {"href": "/ui/platform", "id": "link-platform", "icon": "fa-toolbox", "label": "Platform Tools", "requireAudit": true},
     {"section": "Governance"},
     {"href": "/ui/security", "id": "link-security", "icon": "fa-shield-halved", "label": "Security"},
@@ -762,7 +827,19 @@
     a.id = item.id;
     a.className = 'nav-item' + (isActive ? ' nav-item-active' : '') + (item.external ? ' nav-item-external' : '');
     if (item.external) { a.target = '_blank'; a.rel = 'noopener noreferrer'; }
-    a.innerHTML = '<i class="fas ' + item.icon + ' nav-item-icon"></i><span class="nav-item-label">' + item.label + '</span>';
+
+    var iconWrap = '<div style="position:relative;width:22px;flex-shrink:0;display:flex;align-items:center;justify-content:center;">'
+      + '<i class="fas ' + item.icon + ' nav-item-icon"></i>';
+    if (isActive) {
+      iconWrap += '<div class="nm-ripple-ring nm-ripple-ring-1"></div>'
+        + '<div class="nm-ripple-ring nm-ripple-ring-2"></div>';
+    }
+    iconWrap += '</div>';
+
+    var label = '<span class="nav-item-label">' + item.label + '</span>';
+    var tag = isActive ? '<span class="nav-item-active-tag">ACTIVE</span>' : '';
+
+    a.innerHTML = iconWrap + label + tag;
     navEl.appendChild(a);
   });
 })();
@@ -796,11 +873,6 @@
 
   if (ctxPanel) ctxPanel.classList.add("ctx-panel-hidden");
   if (ctxArrow) ctxArrow.classList.add("collapsed");
-
-  if (localStorage.getItem("st_ctx_open") === "true") {
-    if (ctxPanel) ctxPanel.classList.remove("ctx-panel-hidden");
-    if (ctxArrow) ctxArrow.classList.remove("collapsed");
-  }
 
   if (ctxToggle && ctxPanel) {
     ctxToggle.addEventListener("click", function () {
