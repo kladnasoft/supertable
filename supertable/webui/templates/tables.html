@@ -75,97 +75,94 @@
     .btn-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--panel-border); color: var(--text-secondary); font-weight: 500; cursor: pointer; font-size: 12px; transition: var(--transition); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-family: inherit; }
     .btn-sm:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
 
-    /* ═══ 3-COLUMN LAYOUT ═══ */
-    .cc-columns { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+    /* ═══ METRIC BAR + WIDE LIST / DETAIL SPLIT ═══ */
+    .cc-columns { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
 
-    /* ─── LEFT: TABLE LIST ─── */
-    .cc-panel-left {
-      width: 280px; min-width: 280px; border-right: 1px solid var(--panel-border);
-      background: var(--panel-bg); display: flex; flex-direction: column; flex-shrink: 0;
-      transition: width 0.25s ease, min-width 0.25s ease;
+    .cc-metric-bar {
+      display: flex; gap: 10px; padding: 10px 14px; background: var(--panel-bg);
+      border-bottom: 1px solid var(--panel-border); flex-shrink: 0; flex-wrap: wrap;
     }
-    .cc-panel-left.collapsed { width: 0; min-width: 0; overflow: hidden; border-right: none; }
-    .cc-panel-toggle { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 12px; padding: 4px; border-radius: 4px; transition: all .15s; }
-    .cc-panel-toggle:hover { background: var(--bg-hover); color: var(--text-color); }
-    .cc-panel-reopen-left {
-      display: none; width: 28px; flex-shrink: 0;
-      border-right: 1px solid var(--panel-border); background: var(--bg-surface);
-      cursor: pointer; transition: all .15s; position: relative;
+    .cc-metric-card { padding: 6px 12px; border-radius: 8px; flex: 1; min-width: 70px; }
+    .cc-metric-label { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+    .cc-metric-value { font-size: 18px; font-weight: 700; margin-top: 1px; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+    .cc-split { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+
+    /* ─── LEFT: TABLE LIST WITH BARS ─── */
+    .cc-list-panel {
+      width: 280px; min-width: 280px; flex-shrink: 0;
+      border-right: 1px solid var(--panel-border); background: var(--panel-bg);
+      display: flex; flex-direction: column;
     }
-    .cc-panel-reopen-left:hover { background: var(--primary-light); }
-    .cc-panel-reopen-left i { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 12px; color: var(--text-muted); transition: color .15s; }
-    .cc-panel-reopen-left:hover i { color: var(--primary-color); }
-    .cc-panel-left.collapsed ~ .cc-panel-reopen-left { display: block; }
-    .cc-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
-    .cc-panel-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
-    .cc-panel-actions { display: flex; align-items: center; gap: 6px; }
-    .cc-icon-btn { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--panel-border); background: transparent; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px; transition: all .15s; }
-    .cc-icon-btn:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
-    .cc-sys-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 10px; font-weight: 600; color: var(--text-muted); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--panel-border); background: transparent; transition: all .15s; font-family: inherit; white-space: nowrap; }
-    .cc-sys-toggle:hover { border-color: var(--primary-color); color: var(--primary-color); }
-    .cc-sys-toggle.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
-    .cc-search-wrap { position: relative; flex-shrink: 0; padding: 8px 10px; }
-    .cc-search-wrap i { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
-    .cc-search-wrap input { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface); font-family: inherit; outline: none; }
-    .cc-search-wrap input:focus { border-color: var(--primary-color); box-shadow: 0 0 0 2px var(--primary-light); }
+    .cc-list-toolbar {
+      display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+      border-bottom: 1px solid var(--panel-border); flex-shrink: 0;
+    }
+    .cc-list-toolbar .cc-search-wrap { position: relative; flex: 1; }
+    .cc-list-toolbar .cc-search-wrap i { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); font-size: 10px; color: var(--text-muted); pointer-events: none; }
+    .cc-list-toolbar .cc-search-wrap input {
+      width: 100%; padding: 5px 8px 5px 28px; border: 1px solid var(--panel-border);
+      border-radius: var(--radius-sm); font-size: 12px; background: var(--bg-surface);
+      font-family: inherit; outline: none;
+    }
+    .cc-list-toolbar .cc-search-wrap input:focus { border-color: var(--primary-color); box-shadow: 0 0 0 2px var(--primary-light); }
     .cc-table-list { flex: 1; overflow-y: auto; }
+
     .cc-tbl-item {
-      display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer;
-      transition: all .15s; border-bottom: 1px solid var(--border-light); position: relative;
+      display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer;
+      transition: all .15s; border-bottom: 1px solid var(--border-light);
+      border-left: 3px solid transparent;
     }
     .cc-tbl-item:hover { background: var(--bg-hover); }
-    .cc-tbl-item.active { background: var(--primary-light); border-left: 3px solid var(--primary-color); }
-    .cc-tbl-icon {
-      width: 32px; height: 32px; border-radius: 8px; display: flex;
-      align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0;
-      background: var(--primary-light); color: var(--primary-color);
-    }
-    .cc-tbl-info { flex: 1; min-width: 0; }
-    .cc-tbl-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .cc-tbl-meta { font-size: 11px; color: var(--text-muted); display: flex; gap: 8px; margin-top: 2px; }
-    .cc-tbl-meta span { display: flex; align-items: center; gap: 3px; }
+    .cc-tbl-item.active { background: var(--primary-light); border-left-color: var(--primary-color); }
     .cc-freshness-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .cc-freshness-dot.fresh { background: var(--success); }
     .cc-freshness-dot.aging { background: var(--warning); }
     .cc-freshness-dot.stale { background: var(--error); }
-    .cc-tbl-item.sys { opacity: 0.5; }
-    .cc-tbl-item.sys .cc-tbl-icon { background: var(--bg-surface); color: var(--text-muted); }
+    .cc-tbl-info { width: 140px; min-width: 80px; flex-shrink: 0; }
+    .cc-tbl-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cc-tbl-updated { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+    .cc-tbl-rows { width: 50px; text-align: right; font-size: 11px; font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .cc-tbl-bar { flex: 1; height: 4px; background: var(--border-light); border-radius: 2px; overflow: hidden; min-width: 30px; }
+    .cc-tbl-bar-fill { height: 100%; background: var(--primary-color); border-radius: 2px; }
+    .cc-tbl-size { width: 50px; text-align: right; font-size: 11px; color: var(--text-secondary); }
+    .cc-tbl-cols { width: 24px; text-align: right; font-size: 10px; color: var(--text-muted); }
+    .cc-tbl-ver { width: 24px; text-align: right; font-size: 10px; color: var(--text-muted); }
+    .cc-sys-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 10px; font-weight: 600; color: var(--text-muted); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--panel-border); background: transparent; transition: all .15s; font-family: inherit; white-space: nowrap; }
+    .cc-sys-toggle:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    .cc-sys-toggle.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
 
-    /* ─── CENTER: DETAIL ─── */
-    .cc-center { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
-    .cc-detail-header { padding: 16px 20px 0; background: var(--panel-bg); border-bottom: 1px solid var(--panel-border); flex-shrink: 0; }
-    .cc-detail-title { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .cc-detail-title i { color: var(--primary-color); }
-    .cc-detail-subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-    .cc-detail-metrics { display: flex; gap: 12px; margin: 14px 0 0; flex-wrap: wrap; padding-bottom: 14px; }
-    .cc-dm { background: var(--bg-surface); border: 1px solid var(--border-light); border-radius: 8px; padding: 8px 14px; display: flex; flex-direction: column; min-width: 100px; }
-    .cc-dm-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
-    .cc-dm-value { font-size: 18px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
-    .cc-dm-value.green { color: #059669; } .cc-dm-value.amber { color: #d97706; } .cc-dm-value.red { color: #dc2626; }
+    /* ─── RIGHT: DETAIL ─── */
+    .cc-detail { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+    .cc-detail-header { padding: 12px 16px; background: var(--panel-bg); border-bottom: 1px solid var(--panel-border); flex-shrink: 0; }
+    .cc-detail-title { font-size: 16px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
+    .cc-detail-subtitle { font-size: 11px; color: var(--text-muted); }
 
     .cc-detail-tabs {
-      display: flex; gap: 0; padding: 10px 20px; background: var(--panel-bg);
+      display: flex; gap: 0; padding: 6px 16px; background: var(--panel-bg);
       border-bottom: 1px solid var(--panel-border); flex-shrink: 0; align-items: center;
     }
     .cc-dtab {
-      display: flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 8px;
+      display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 6px;
       cursor: pointer; transition: all .15s; border: 1px solid transparent;
       white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-muted);
     }
     .cc-dtab:hover { background: var(--bg-hover); border-color: var(--panel-border); color: var(--text-secondary); }
-    .cc-dtab.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); font-weight: 600; }
-    .cc-dtab .badge { font-size: 10px; font-weight: 700; background: var(--bg-surface); border: 1px solid var(--border-light); padding: 0 5px; border-radius: 999px; color: var(--text-muted); }
-    .cc-dtab.active .badge { background: var(--primary-light); border-color: rgba(28,150,202,.2); color: var(--primary-color); }
-    .cc-dtab-sep { width: 1px; height: 24px; background: var(--panel-border); margin: 0 6px; flex-shrink: 0; }
-
+    .cc-dtab.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
+    .cc-dtab-sep { width: 1px; height: 20px; background: var(--panel-border); margin: 0 4px; flex-shrink: 0; }
     .cc-detail-content { flex: 1; overflow: auto; background: var(--bg); }
-    .cc-dpanel { display: none; padding: 20px; }
+    .cc-dpanel { display: none; padding: 16px; }
     .cc-dpanel.active { display: block; }
+
+    .cc-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); gap: 12px; padding: 40px; }
+    .cc-empty-state i { font-size: 36px; opacity: .3; }
 
     .btn-exec-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--primary-color); color: var(--primary-color); font-weight: 600; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
     .btn-exec-sm:hover { background: var(--primary-light); }
     .btn-danger-sm { padding: 5px 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--error); color: var(--error); font-weight: 500; cursor: pointer; font-size: 12px; transition: all .15s; display: inline-flex; align-items: center; gap: 4px; font-family: inherit; }
     .btn-danger-sm:hover { background: var(--error-bg); }
+    .cc-icon-btn { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--panel-border); background: transparent; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px; transition: all .15s; }
+    .cc-icon-btn:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--primary-light); }
 
     /* Schema table */
     .cc-schema-tbl { width: 100%; border-collapse: collapse; font-size: 12px; background: var(--panel-bg); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--panel-border); }
@@ -357,9 +354,10 @@
     }
 
     function ccTogglePanel() {
-      var panel = document.getElementById('ccPanelLeft');
-      if (panel) panel.classList.toggle('collapsed');
+      // No-op — old 3-column panel no longer exists
     }
+
+    var __cc_maxRows = 1;
 
     function ccRenderTableList(filter) {
       var list = document.getElementById('ccTableList');
@@ -370,7 +368,10 @@
       var showSys = window.__cc_showSystemTables;
       var visibleCount = 0;
 
-      // Sort by name (sys tables first when shown, then user tables alphabetically)
+      // Compute max rows for bar scaling
+      __cc_maxRows = 1;
+      tables.forEach(function(t) { if ((t.rows || 0) > __cc_maxRows) __cc_maxRows = t.rows; });
+
       var sorted = tables.slice().sort(function(a, b) {
         var aSys = (a.name || '').startsWith('__') ? 0 : 1;
         var bSys = (b.name || '').startsWith('__') ? 0 : 1;
@@ -381,31 +382,32 @@
       sorted.forEach(function(t) {
         var name = t.name || '';
         var origIdx = tables.indexOf(t);
-        // Filter system tables (__*) unless toggle is active
         if (!showSys && name.startsWith('__')) return;
         if (fl && name.toLowerCase().indexOf(fl) < 0) return;
         visibleCount++;
+
         var fresh = ccFreshness(t.updated_utc);
         var isSys = name.startsWith('__');
+        var barW = __cc_maxRows > 0 ? Math.max(3, ((t.rows || 0) / __cc_maxRows) * 100) : 0;
+
         var div = document.createElement('div');
         div.className = 'cc-tbl-item' + (isSys ? ' sys' : '');
         div.setAttribute('data-idx', origIdx);
         if (window.__cc_selectedTable === name) div.classList.add('active');
         div.innerHTML =
-          '<div class="cc-tbl-icon"><i class="fas fa-' + (isSys ? 'cog' : 'table') + '"></i></div>' +
-          '<div class="cc-tbl-info">' +
+          '<div class="cc-freshness-dot ' + fresh + '" title="' + fresh + '"></div>' +
+          '<div style="flex:1;min-width:0;">' +
             '<div class="cc-tbl-name">' + ccEsc(name) + '</div>' +
-            '<div class="cc-tbl-meta">' +
-              '<span><i class="fas fa-layer-group" style="font-size:9px;"></i> ' + ccHumanCount(t.rows) + '</span>' +
-              '<span><i class="fas fa-hdd" style="font-size:9px;"></i> ' + ccHumanBytes(t.size) + '</span>' +
+            '<div style="display:flex;align-items:center;gap:6px;margin-top:3px;">' +
+              '<span class="cc-tbl-rows">' + ccHumanCount(t.rows) + '</span>' +
+              '<div class="cc-tbl-bar"><div class="cc-tbl-bar-fill" style="width:' + barW.toFixed(1) + '%;"></div></div>' +
+              '<span class="cc-tbl-size">' + ccHumanBytes(t.size) + '</span>' +
             '</div>' +
-          '</div>' +
-          '<div class="cc-freshness-dot ' + fresh + '" title="' + fresh + '"></div>';
+          '</div>';
         div.addEventListener('click', function() { ccSelectTable(name, origIdx); });
         list.appendChild(div);
       });
 
-      // Update counts — show filtered vs total
       var countEl = document.getElementById('ccTableCount');
       if (countEl) {
         var totalNonSys = tables.filter(function(t) { return !(t.name || '').startsWith('__'); }).length;
@@ -416,49 +418,6 @@
           countEl.textContent = visibleCount + (totalSys > 0 ? ' (+' + totalSys + ' sys)' : '');
         }
       }
-    }
-
-    function ccToggleSystemTables() {
-      window.__cc_showSystemTables = !window.__cc_showSystemTables;
-      var btn = document.getElementById('ccSysToggle');
-      if (btn) {
-        btn.classList.toggle('active', window.__cc_showSystemTables);
-        btn.querySelector('i').className = window.__cc_showSystemTables ? 'fas fa-eye' : 'fas fa-eye-slash';
-        btn.setAttribute('style', btn.style.cssText); // force repaint
-      }
-      // Re-render with current search filter
-      var searchInput = document.querySelector('.cc-search-wrap input');
-      ccRenderTableList(searchInput ? searchInput.value : '');
-    }
-
-    function ccRefreshMeta() {
-      var btn = document.getElementById('ccRefreshBtn');
-      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
-
-      if (!ORGANIZATION || !currentSuper) {
-        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
-        return;
-      }
-
-      var role = getActiveRole();
-      var metaUrl = '/api/v1/supertables/meta?organization=' + encodeURIComponent(ORGANIZATION) +
-                    '&super_name=' + encodeURIComponent(currentSuper) +
-                    (role ? '&role_name=' + encodeURIComponent(role) : '');
-
-      api(metaUrl).then(function(data) {
-        var meta = null;
-        if (data && data.meta) { meta = data.meta.super || data.meta; }
-        var tables = (meta && Array.isArray(meta.tables)) ? meta.tables : [];
-        window.__cc_tables = tables;
-        // Preserve search filter while re-rendering
-        var searchInput = document.querySelector('.cc-search-wrap input');
-        ccRenderTableList(searchInput ? searchInput.value : '');
-        ccUpdateSummary(tables);
-      }).catch(function(e) {
-        console.warn('[cc-tables] refresh failed:', e.message || e);
-      }).finally(function() {
-        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
-      });
     }
 
     function ccSelectTable(name, idx) {
@@ -480,44 +439,46 @@
       var freshLabel = fresh === 'fresh' ? 'Fresh' : fresh === 'aging' ? 'Aging' : 'Stale';
       var freshCls = fresh === 'fresh' ? 'green' : fresh === 'aging' ? 'amber' : 'red';
 
-      // Header
+      // Header — compact dense layout
+      var safeName = (t.name || '').replace(/'/g, "\\'");
       document.getElementById('ccDetailHeader').innerHTML =
-        '<div class="cc-detail-title"><i class="fas fa-table"></i> ' + ccEsc(t.name) + '</div>' +
-        '<div class="cc-detail-subtitle">' + (t.files || 0) + ' files &middot; Updated ' + ccTimeAgo(t.updated_utc) + '</div>' +
-        '<div class="cc-detail-metrics">' +
-          '<div class="cc-dm"><div class="cc-dm-label">Rows</div><div class="cc-dm-value">' + ccHumanCount(t.rows) + '</div></div>' +
-          '<div class="cc-dm"><div class="cc-dm-label">Size</div><div class="cc-dm-value">' + ccHumanBytes(t.size) + '</div></div>' +
-          '<div class="cc-dm"><div class="cc-dm-label">Files</div><div class="cc-dm-value">' + (t.files || 0) + '</div></div>' +
-          '<div class="cc-dm"><div class="cc-dm-label">Freshness</div><div class="cc-dm-value ' + freshCls + '">' + freshLabel + '</div></div>' +
+        '<div style="display:flex;align-items:center;gap:6px;">' +
+          '<div class="cc-detail-title"><i class="fas fa-table" style="color:var(--primary-color);font-size:14px;"></i> ' + ccEsc(t.name) + '</div>' +
+          '<div class="cc-freshness-dot ' + fresh + '"></div>' +
+          '<span class="cc-detail-subtitle">' + ccTimeAgo(t.updated_utc) + '</span>' +
+          '<div style="flex:1;"></div>' +
+          '<button class="btn-exec-sm" onclick="goExecuteWithLeaf(\'' + safeName + '\')"><i class="fas fa-terminal" style="font-size:10px;"></i> Query</button>' +
+          ' <button class="btn-danger-sm" onclick="deleteTable(\'' + safeName + '\')"><i class="fas fa-trash" style="font-size:10px;"></i> Delete</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:12px;margin-top:8px;font-size:12px;flex-wrap:wrap;">' +
+          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + ccHumanCount(t.rows) + '</strong> rows</span>' +
+          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + ccHumanBytes(t.size) + '</strong> size</span>' +
+          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + (t.files || 0) + '</strong> files</span>' +
+          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + (t.cols_count || t.columns || '—') + '</strong> cols</span>' +
+          '<span style="color:var(--text-secondary);">v<strong style="color:var(--text-color);font-family:var(--mono);">' + (t.snapshot_version != null ? t.snapshot_version : '?') + '</strong></span>' +
+          '<span style="color:' + (freshCls === 'green' ? '#059669' : freshCls === 'amber' ? '#d97706' : '#dc2626') + ';font-weight:600;">' + freshLabel + '</span>' +
         '</div>';
 
-      // Tabs
-      var safeName = (t.name || '').replace(/'/g, "\\'");
+      // Tabs — clean, no action buttons (they're in the header)
       document.getElementById('ccDetailTabs').innerHTML =
         '<div class="cc-dtab active" onclick="ccSwitchDTab(this,\'schema\')"><i class="fas fa-columns" style="font-size:11px;"></i> Schema</div>' +
         '<div class="cc-dtab-sep"></div>' +
-        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'quality\')"><i class="fas fa-heartbeat" style="font-size:11px;"></i> Data quality</div>' +
+        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'quality\')"><i class="fas fa-heartbeat" style="font-size:11px;"></i> Quality</div>' +
         '<div class="cc-dtab-sep"></div>' +
         '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'stats\')"><i class="fas fa-chart-bar" style="font-size:11px;"></i> Stats</div>' +
         '<div class="cc-dtab-sep"></div>' +
-        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'settings\')"><i class="fas fa-sliders-h" style="font-size:11px;"></i> Settings</div>' +
-        '<div style="flex:1;"></div>' +
-        '<button class="btn-exec-sm" onclick="goExecuteWithLeaf(\'' + safeName + '\')"><i class="fas fa-terminal" style="font-size:10px;"></i> Query</button>' +
-        ' <button class="btn-danger-sm" onclick="deleteTable(\'' + safeName + '\')"><i class="fas fa-trash" style="font-size:10px;"></i> Delete</button>';
+        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'settings\')"><i class="fas fa-sliders-h" style="font-size:11px;"></i> Settings</div>';
 
-      // Content — Schema tab (loaded via API, same as original openSchema)
+      // Content panels
       var content = document.getElementById('ccDetailContent');
       content.innerHTML =
-        '<div class="cc-dpanel active" id="ccdp-schema"><div style="padding:20px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading schema…</div></div>' +
-        '<div class="cc-dpanel" id="ccdp-quality"><div style="padding:20px;color:var(--text-muted);"><i class="fas fa-info-circle"></i> Schema must be loaded first. Select the Schema tab.</div></div>' +
-        '<div class="cc-dpanel" id="ccdp-stats"><div style="padding:20px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading stats…</div></div>' +
-        '<div class="cc-dpanel" id="ccdp-settings"><div style="padding:20px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading settings…</div></div>';
+        '<div class="cc-dpanel active" id="ccdp-schema"><div style="padding:16px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading schema…</div></div>' +
+        '<div class="cc-dpanel" id="ccdp-quality"><div style="padding:16px;color:var(--text-muted);"><i class="fas fa-info-circle"></i> Loading…</div></div>' +
+        '<div class="cc-dpanel" id="ccdp-stats"><div style="padding:16px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading stats…</div></div>' +
+        '<div class="cc-dpanel" id="ccdp-settings"><div style="padding:16px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading settings…</div></div>';
 
-      // Fetch schema
       ccLoadSchema(t.name);
-      // Fetch stats
       ccLoadStats(t.name);
-      // Fetch settings
       ccLoadSettings(t.name);
     }
 
@@ -527,6 +488,46 @@
       document.querySelectorAll('.cc-dpanel').forEach(function(p) { p.classList.remove('active'); });
       var panel = document.getElementById('ccdp-' + name);
       if (panel) panel.classList.add('active');
+    }
+
+    function ccToggleSystemTables() {
+      window.__cc_showSystemTables = !window.__cc_showSystemTables;
+      var btn = document.getElementById('ccSysToggle');
+      if (btn) {
+        btn.classList.toggle('active', window.__cc_showSystemTables);
+        btn.querySelector('i').className = window.__cc_showSystemTables ? 'fas fa-eye' : 'fas fa-eye-slash';
+      }
+      var filterInput = document.getElementById('ccTableFilter');
+      ccRenderTableList(filterInput ? filterInput.value : '');
+    }
+
+    function ccRefreshMeta() {
+      var btn = document.getElementById('ccRefreshBtn');
+      if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
+
+      if (!ORGANIZATION || !currentSuper) {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
+        return;
+      }
+
+      var role = getActiveRole();
+      var metaUrl = '/api/v1/supertables/meta?organization=' + encodeURIComponent(ORGANIZATION) +
+                    '&super_name=' + encodeURIComponent(currentSuper) +
+                    (role ? '&role_name=' + encodeURIComponent(role) : '');
+
+      api(metaUrl).then(function(data) {
+        var meta = null;
+        if (data && data.meta) { meta = data.meta.super || data.meta; }
+        var tables = (meta && Array.isArray(meta.tables)) ? meta.tables : [];
+        window.__cc_tables = tables;
+        var filterInput = document.getElementById('ccTableFilter');
+        ccRenderTableList(filterInput ? filterInput.value : '');
+        ccUpdateSummary(tables);
+      }).catch(function(e) {
+        console.warn('[cc-tables] refresh failed:', e.message || e);
+      }).finally(function() {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i>'; }
+      });
     }
 
     function ccTypePillCls(type) {
@@ -1077,27 +1078,23 @@
 
     function ccUpdateSummary(tables) {
       var totalRows = 0, totalSize = 0, totalFiles = 0;
-      var freshCount = 0;
+      var freshCount = 0, agingCount = 0, staleCount = 0;
       (tables || []).forEach(function(t) {
         totalRows += (t.rows || 0);
         totalSize += (t.size || 0);
         totalFiles += (t.files || 0);
-        if (ccFreshness(t.updated_utc) === 'fresh') freshCount++;
+        var f = ccFreshness(t.updated_utc);
+        if (f === 'fresh') freshCount++;
+        else if (f === 'aging') agingCount++;
+        else staleCount++;
       });
       var el = function(id) { return document.getElementById(id); };
       if (el('ccSumTables')) el('ccSumTables').textContent = tables.length;
       if (el('ccSumRows')) el('ccSumRows').textContent = ccHumanCount(totalRows);
       if (el('ccSumSize')) el('ccSumSize').textContent = ccHumanBytes(totalSize);
-      if (el('ccSumFiles')) el('ccSumFiles').textContent = totalFiles;
-      if (el('ccSumFresh')) el('ccSumFresh').textContent = freshCount + '/' + tables.length;
-      // Health score: freshness-weighted
-      var score = tables.length ? Math.round(freshCount / tables.length * 100) : 0;
-      if (el('ccHealthScore')) { el('ccHealthScore').textContent = score; el('ccHealthScore').className = 'score ' + (score >= 80 ? 'good' : 'ok'); }
-      if (el('ccHealthArc')) {
-        var circ = 2 * Math.PI * 34; // r=34
-        el('ccHealthArc').setAttribute('stroke-dasharray', Math.round(circ * score / 100) + ' ' + Math.round(circ));
-        el('ccHealthArc').setAttribute('stroke', score >= 80 ? '#10b981' : '#f59e0b');
-      }
+      if (el('ccSumFresh')) el('ccSumFresh').textContent = freshCount;
+      if (el('ccSumAging')) el('ccSumAging').textContent = agingCount;
+      if (el('ccSumStale')) el('ccSumStale').textContent = staleCount;
       // Topbar summary
       if (el('ccTopSummary')) el('ccTopSummary').innerHTML = '<strong style="color:var(--text-color);">' + tables.length + '</strong> tables &middot; <strong style="color:var(--text-color);">' + ccHumanCount(totalRows) + '</strong> rows &middot; <strong style="color:var(--text-color);">' + ccHumanBytes(totalSize) + '</strong>';
     }
@@ -2469,75 +2466,57 @@ function deleteTable(simple) {
 
   <!-- ═══ TOP BAR ═══ -->
   <header class="cc-topbar">
-
-
+    <span style="font-size:14px;font-weight:700;">Tables</span>
     <div style="flex:1;"></div>
-
     <span id="ccTopSummary" style="font-size:11px;color:var(--text-muted);"></span>
   </header>
 
-  <!-- ═══ 3-COLUMN BODY ═══ -->
+  <!-- ═══ METRIC BAR + WIDE LIST / DETAIL SPLIT ═══ -->
   <div class="cc-columns">
 
-    <!-- LEFT: TABLE LIST -->
-    <div class="cc-panel-left" id="ccPanelLeft">
-      <div class="cc-panel-header">
-        <span class="cc-panel-title">Tables</span>
-        <div class="cc-panel-actions">
-          <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);">0</span>
+    <!-- METRIC BAR -->
+    <div class="cc-metric-bar">
+      <div class="cc-metric-card" style="background:#f8fafc;"><div class="cc-metric-label" style="color:#475569;">Tables</div><div class="cc-metric-value" style="color:#475569;" id="ccSumTables">—</div></div>
+      <div class="cc-metric-card" style="background:var(--primary-light);"><div class="cc-metric-label" style="color:var(--secondary-color);">Total rows</div><div class="cc-metric-value" style="color:var(--secondary-color);" id="ccSumRows">—</div></div>
+      <div class="cc-metric-card" style="background:#f0fdfa;"><div class="cc-metric-label" style="color:#0f766e;">Total size</div><div class="cc-metric-value" style="color:#0f766e;" id="ccSumSize">—</div></div>
+      <div class="cc-metric-card" style="background:#ecfdf5;"><div class="cc-metric-label" style="color:#059669;">Fresh</div><div class="cc-metric-value" style="color:#059669;" id="ccSumFresh">—</div></div>
+      <div class="cc-metric-card" style="background:#fffbeb;"><div class="cc-metric-label" style="color:#d97706;">Aging</div><div class="cc-metric-value" style="color:#d97706;" id="ccSumAging">—</div></div>
+      <div class="cc-metric-card" style="background:#fef2f2;"><div class="cc-metric-label" style="color:#dc2626;">Stale</div><div class="cc-metric-value" style="color:#dc2626;" id="ccSumStale">—</div></div>
+    </div>
+
+    <!-- SPLIT: WIDE LIST + DETAIL -->
+    <div class="cc-split">
+
+      <!-- LEFT: WIDE TABLE LIST -->
+      <div class="cc-list-panel">
+        <div class="cc-list-toolbar">
+          <div class="cc-search-wrap">
+            <i class="fas fa-search"></i>
+            <input id="ccTableFilter" placeholder="Filter tables…" oninput="ccRenderTableList(this.value)"/>
+          </div>
           <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
-          <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh table list"><i class="fas fa-sync-alt"></i></button>
-          <button class="cc-panel-toggle" onclick="ccTogglePanel()" title="Collapse panel"><i class="fas fa-chevron-left"></i></button>
+          <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);flex-shrink:0;">0</span>
+          <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh"><i class="fas fa-sync-alt"></i></button>
+        </div>
+        <div class="cc-table-list" id="ccTableList"></div>
+      </div>
+
+      <!-- RIGHT: DETAIL -->
+      <div class="cc-detail">
+        <div class="cc-empty-state" id="ccEmptyState">
+          <i class="fas fa-table"></i>
+          <div style="font-size:15px;font-weight:600;">Select a table</div>
+          <div style="font-size:12px;">Click a table from the list to view schema, quality, and stats.</div>
+        </div>
+
+        <div id="ccDetailView" style="display:none;flex-direction:column;height:100%;">
+          <div class="cc-detail-header" id="ccDetailHeader"></div>
+          <div class="cc-detail-tabs" id="ccDetailTabs"></div>
+          <div class="cc-detail-content" id="ccDetailContent"></div>
         </div>
       </div>
-      <div class="cc-search-wrap">
-        <i class="fas fa-search"></i>
-        <input placeholder="Filter tables…" oninput="ccRenderTableList(this.value)"/>
-      </div>
-      <div class="cc-table-list" id="ccTableList"></div>
-    </div>
-    <div class="cc-panel-reopen-left" onclick="ccTogglePanel()" title="Show table list">
-      <i class="fas fa-chevron-right"></i>
-    </div>
 
-    <!-- CENTER: DETAIL -->
-    <div class="cc-center">
-      <div class="cc-empty-state" id="ccEmptyState">
-        <i class="fas fa-table"></i>
-        <div style="font-size:15px;font-weight:600;">Select a table</div>
-        <div style="font-size:12px;">Click a table from the list to view schema, data quality, and stats.</div>
-      </div>
-
-      <div id="ccDetailView" style="display:none;flex-direction:column;height:100%;">
-        <div class="cc-detail-header" id="ccDetailHeader"></div>
-        <div class="cc-detail-tabs" id="ccDetailTabs"></div>
-        <div class="cc-detail-content" id="ccDetailContent"></div>
-      </div>
-    </div>
-
-    <!-- RIGHT: SUMMARY -->
-    <div class="cc-panel-right">
-      <div class="cc-summary-card">
-        <div class="cc-summary-card-title">Data health</div>
-        <div class="cc-health-ring">
-          <svg width="80" height="80" viewBox="0 0 80 80">
-            <circle cx="40" cy="40" r="34" fill="none" stroke="#e0e5f0" stroke-width="6"/>
-            <circle id="ccHealthArc" cx="40" cy="40" r="34" fill="none" stroke="#10b981" stroke-width="6" stroke-dasharray="0 214" stroke-linecap="round"/>
-          </svg>
-          <div id="ccHealthScore" class="score good">—</div>
-        </div>
-        <div class="cc-summary-stat"><span class="label">Fresh tables</span><span class="val" id="ccSumFresh">—</span></div>
-      </div>
-
-      <div class="cc-summary-card">
-        <div class="cc-summary-card-title">SuperTable overview</div>
-        <div class="cc-summary-stat"><span class="label">Total tables</span><span class="val" id="ccSumTables">—</span></div>
-        <div class="cc-summary-stat"><span class="label">Total rows</span><span class="val" id="ccSumRows">—</span></div>
-        <div class="cc-summary-stat"><span class="label">Total size</span><span class="val" id="ccSumSize">—</span></div>
-        <div class="cc-summary-stat"><span class="label">Files</span><span class="val" id="ccSumFiles">—</span></div>
-      </div>
-    </div>
-
+    </div><!-- /cc-split -->
   </div><!-- /cc-columns -->
 
   {% else %}
