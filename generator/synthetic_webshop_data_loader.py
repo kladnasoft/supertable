@@ -13,7 +13,6 @@ import argparse
 import supertable.config.homedir
 
 from supertable.data_writer import DataWriter
-from supertable.utils.helper import format_size
 from synthetic_webshop_defaults import organization, super_name, role_name, overwrite_columns, generated_data_dir
 
 # --- Logging suppression (quiet the library, keep our prints) ---
@@ -89,6 +88,13 @@ def get_compact_thread_id() -> str:
             next_thread_id += 1
     return tid
 
+def format_size(num_bytes: float) -> str:
+    """Convert a byte count into a human-readable size string (e.g. '1.23 MB')."""
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:,.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:,.2f} EB"
 
 def format_duration(seconds):
     """Convert seconds to human-readable HH:MM:SS.ss format"""

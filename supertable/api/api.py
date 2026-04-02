@@ -337,6 +337,167 @@ def healthz():
         return f"error: {e}"
 
 
+def _collect_redis_diagnostics() -> dict:
+    """Collect extended Redis diagnostics: ping, server INFO, mode, sentinel topology.
+
+    Always returns a dict with at least {"status": "ok"|"fail"}.
+    Never raises — every sub-probe is individually guarded.
+    """
+    import redis as _redis
+
+    result: dict = {}
+
+    # ── 1. Ping ─────────────────────────────────────────────────────────────────────────
+    try:
+        pong = redis_client.ping()
+        if not pong:
+            return {"status": "fail", "error": "ping returned false"}
+        result["status"] = "ok"
+    except Exception as e:
+        return {"status": "fail", "error": str(e)}
+
+    # ── 2. Mode detection ───────────────────────────────────────────────────────────────
+    sentinel_enabled = (settings.SUPERTABLE_REDIS_SENTINEL or "").strip().lower() in (
+        "1", "true", "yes", "y", "on",
+    )
+    sentinel_master_name = (settings.SUPERTABLE_REDIS_SENTINEL_MASTER or "mymaster").strip()
+    _sent_pw = settings.SUPERTABLE_REDIS_SENTINEL_PASSWORD or settings.SUPERTABLE_REDIS_PASSWORD or None
+    sentinel_password = (_sent_pw.strip() if _sent_pw else None) or None
+
+    sentinel_hosts: list = []
+    if sentinel_enabled:
+        for part in (settings.SUPERTABLE_REDIS_SENTINELS or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                h, p = part.split(":")
+                sentinel_hosts.append((h.strip(), int(p)))
+            except ValueError:
+                pass
+
+    result["mode"] = "sentinel" if (sentinel_enabled and sentinel_hosts) else "standalone"
+    result["db"] = settings.SUPERTABLE_REDIS_DB
+
+    # ── 3. Server INFO ───────────────────────────────────────────────────────────────────
+    try:
+        info = redis_client.info()
+        uptime_s = int(info.get("uptime_in_seconds") or 0)
+        days, rem = divmod(uptime_s, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        uptime_str = (f"{days}d " if days else "") + f"{hours:02d}h {mins:02d}m"
+
+        hits = int(info.get("keyspace_hits") or 0)
+        misses = int(info.get("keyspace_misses") or 0)
+        hit_rate = round(hits / (hits + misses) * 100, 1) if (hits + misses) > 0 else None
+
+        result["server"] = {
+            "redis_version": info.get("redis_version"),
+            "role": info.get("role"),
+            "uptime": uptime_str,
+            "connected_clients": info.get("connected_clients"),
+            "blocked_clients": info.get("blocked_clients"),
+            "used_memory_human": info.get("used_memory_human"),
+            "used_memory_peak_human": info.get("used_memory_peak_human"),
+            "maxmemory_human": info.get("maxmemory_human") or "0B (no limit)",
+            "total_commands_processed": info.get("total_commands_processed"),
+            "total_connections_received": info.get("total_connections_received"),
+            "keyspace_hit_rate": f"{hit_rate}%" if hit_rate is not None else "n/a",
+            "aof_enabled": bool(info.get("aof_enabled")),
+            "rdb_last_bgsave_status": info.get("rdb_last_bgsave_status"),
+        }
+    except Exception as e:
+        result["server_error"] = str(e)
+
+    # ── 4. DB key count ───────────────────────────────────────────────────────────────────
+    try:
+        result["db_keys"] = redis_client.dbsize()
+    except Exception:
+        pass
+
+    # ── 5. Sentinel topology ───────────────────────────────────────────────────────────────
+    if sentinel_enabled and sentinel_hosts:
+        result["sentinel_master_name"] = sentinel_master_name
+        result["sentinel_hosts_configured"] = [f"{h}:{p}" for h, p in sentinel_hosts]
+
+        sentinels_probed: list = []
+        master_data: Optional[dict] = None
+        replicas_data: list = []
+
+        for s_host, s_port in sentinel_hosts:
+            probe: dict = {"address": f"{s_host}:{s_port}"}
+            try:
+                sc = _redis.StrictRedis(
+                    host=s_host,
+                    port=s_port,
+                    password=sentinel_password,
+                    socket_timeout=1.0,
+                    decode_responses=True,
+                )
+                sc.ping()
+                probe["status"] = "ok"
+
+                # Query master + replicas once from the first healthy sentinel
+                if master_data is None:
+                    try:
+                        raw = sc.execute_command("SENTINEL", "MASTER", sentinel_master_name)
+                        if isinstance(raw, list) and len(raw) >= 2:
+                            m = dict(zip(raw[::2], raw[1::2]))
+                            master_data = {
+                                "address": f"{m.get('ip', '?')}" + ":" + f"{m.get('port', '?')}",
+                                "flags": m.get("flags", ""),
+                                "num_replicas": m.get("num-slaves", "0"),
+                                "num_other_sentinels": m.get("num-other-sentinels", "0"),
+                                "quorum": m.get("quorum", "?"),
+                                "failover_timeout_ms": m.get("failover-timeout", "?"),
+                                "config_epoch": m.get("config-epoch", "?"),
+                            }
+                    except Exception as me:
+                        master_data = {"error": str(me)}
+
+                    try:
+                        replicas_raw = sc.execute_command("SENTINEL", "REPLICAS", sentinel_master_name)
+                        if isinstance(replicas_raw, list):
+                            for r_item in replicas_raw:
+                                if isinstance(r_item, list) and len(r_item) >= 2:
+                                    r = dict(zip(r_item[::2], r_item[1::2]))
+                                    replicas_data.append({
+                                        "address": f"{r.get('ip', '?')}" + ":" + f"{r.get('port', '?')}",
+                                        "flags": r.get("flags", ""),
+                                        "master_link_status": r.get("master-link-status", "?"),
+                                        "slave_priority": r.get("slave-priority", "?"),
+                                        "repl_offset": r.get("slave-repl-offset", "?"),
+                                    })
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                probe["status"] = "fail"
+                probe["error"] = str(e)
+            sentinels_probed.append(probe)
+
+        result["sentinels"] = sentinels_probed
+        if master_data:
+            result["master"] = master_data
+        if replicas_data:
+            result["replicas"] = replicas_data
+
+    else:
+        # Standalone: derive address from connection pool kwargs
+        try:
+            kw = getattr(getattr(redis_client, "connection_pool", None), "connection_kwargs", {}) or {}
+            result["address"] = (
+                f"{kw.get('host', settings.SUPERTABLE_REDIS_HOST)}"
+                + ":"
+                + str(kw.get("port", settings.SUPERTABLE_REDIS_PORT))
+            )
+        except Exception:
+            result["address"] = f"{settings.SUPERTABLE_REDIS_HOST}:{settings.SUPERTABLE_REDIS_PORT}"
+
+    return result
+
+
 @router.get("/api/v1/health/deep")
 def healthz_deep():
     """Deep health check — verifies Redis, storage, and DuckDB can fulfill their contracts.
@@ -347,48 +508,126 @@ def healthz_deep():
     checks = {}
     all_ok = True
 
-    # 1. Redis: ping
+    # 1. Redis: ping + extended diagnostics
     try:
-        pong = redis_client.ping()
-        checks["redis"] = {"status": "ok"} if pong else {"status": "fail", "error": "ping returned false"}
-        if not pong:
+        redis_diag = _collect_redis_diagnostics()
+        checks["redis"] = redis_diag
+        if redis_diag.get("status") != "ok":
             all_ok = False
     except Exception as e:
         checks["redis"] = {"status": "fail", "error": str(e)}
         all_ok = False
 
-    # 2. Storage: write + read + delete a probe file
+    # 2. Storage: write + read + delete a probe file + collect diagnostics
     try:
         from supertable.storage.storage_factory import get_storage
         storage = get_storage()
         probe_path = "__healthz__/probe.txt"
         probe_data = f"healthz-{time.time()}"
+        t0 = time.perf_counter()
         storage.write_text(probe_path, probe_data)
         readback = storage.read_text(probe_path)
-        if readback.strip() == probe_data:
-            checks["storage"] = {"status": "ok", "backend": type(storage).__name__}
-        else:
-            checks["storage"] = {"status": "fail", "error": "read-back mismatch"}
-            all_ok = False
+        probe_ms = round((time.perf_counter() - t0) * 1000)
         try:
             storage.delete(probe_path)
         except Exception:
             pass
+        if readback.strip() == probe_data:
+            sdiag: dict = {
+                "status": "ok",
+                "backend": type(storage).__name__,
+                "probe_latency_ms": probe_ms,
+            }
+            # Collect backend-specific metadata (all guarded — never break the probe)
+            try:
+                sdiag["bucket"] = getattr(storage, "bucket_name", None)
+            except Exception:
+                pass
+            try:
+                ep = getattr(storage, "endpoint_url", None) or getattr(storage, "_endpoint", None)
+                if ep:
+                    sdiag["endpoint"] = ep
+            except Exception:
+                pass
+            try:
+                region = getattr(storage, "region", None)
+                if region:
+                    sdiag["region"] = region
+            except Exception:
+                pass
+            try:
+                prefix = getattr(storage, "base_prefix", None)
+                sdiag["prefix"] = prefix if prefix else "(none)"
+            except Exception:
+                pass
+            try:
+                sdiag["url_style"] = getattr(storage, "url_style", None)
+            except Exception:
+                pass
+            try:
+                sdiag["secure"] = getattr(storage, "secure", None)
+            except Exception:
+                pass
+            # LocalStorage: expose root path
+            try:
+                root = getattr(storage, "root", None) or getattr(storage, "base_path", None)
+                if root:
+                    sdiag["root_path"] = str(root)
+            except Exception:
+                pass
+            checks["storage"] = sdiag
+        else:
+            checks["storage"] = {"status": "fail", "error": "read-back mismatch", "backend": type(storage).__name__}
+            all_ok = False
     except Exception as e:
         checks["storage"] = {"status": "fail", "error": str(e)}
         all_ok = False
 
-    # 3. DuckDB: run a trivial query
+    # 3. DuckDB: version + settings + loaded extensions
     try:
         import duckdb
         conn = duckdb.connect(":memory:")
-        result = conn.execute("SELECT 1 AS healthz").fetchone()
+        probe_row = conn.execute("SELECT 1 AS healthz").fetchone()
+        if not (probe_row and probe_row[0] == 1):
+            raise RuntimeError("unexpected SELECT 1 result")
+
+        ddiag: dict = {"status": "ok"}
+
+        # Version
+        try:
+            ver_row = conn.execute("SELECT version()").fetchone()
+            ddiag["version"] = ver_row[0] if ver_row else duckdb.__version__
+        except Exception:
+            ddiag["version"] = getattr(duckdb, "__version__", "unknown")
+
+        # Active settings
+        for setting, key in [
+            ("memory_limit",          "memory_limit"),
+            ("threads",               "threads"),
+            ("temp_directory",        "temp_directory"),
+            ("preserve_insertion_order", "preserve_insertion_order"),
+        ]:
+            try:
+                row = conn.execute(f"SELECT current_setting('{setting}')").fetchone()
+                if row and row[0] is not None:
+                    ddiag[key] = str(row[0])
+            except Exception:
+                pass
+
+        # Loaded extensions
+        try:
+            exts = conn.execute(
+                "SELECT extension_name, extension_version FROM duckdb_extensions() "
+                "WHERE loaded = true ORDER BY extension_name"
+            ).fetchall()
+            ddiag["loaded_extensions"] = [
+                {"name": r[0], "version": r[1] or ""} for r in (exts or [])
+            ]
+        except Exception:
+            pass
+
         conn.close()
-        if result and result[0] == 1:
-            checks["duckdb"] = {"status": "ok"}
-        else:
-            checks["duckdb"] = {"status": "fail", "error": "unexpected result"}
-            all_ok = False
+        checks["duckdb"] = ddiag
     except Exception as e:
         checks["duckdb"] = {"status": "fail", "error": str(e)}
         all_ok = False

@@ -128,13 +128,26 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div class="result-box" id="holdResult"></div>
   </div></div>
 
-  <div class="pane" id="pane-health"><div class="card">
-    <div class="card-title"><i class="fas fa-heartbeat" style="color:var(--primary);"></i> Deep Health Check</div>
-    <p style="font-size:12px;color:var(--text-sec);margin-bottom:16px;">Verifies Redis, storage, and DuckDB.</p>
-    <button class="btn-sm btn-primary" id="btnHealth"><i class="fas fa-stethoscope"></i> Run</button>
-    <div class="result-box" id="healthResult"></div>
-    <div id="healthChecks" style="display:none;margin-top:12px;"></div>
-  </div></div>
+  <div class="pane" id="pane-health">
+    <div class="card" style="margin-bottom:14px;">
+      <div class="card-title"><i class="fas fa-heartbeat" style="color:var(--primary);"></i> Deep Health Check</div>
+      <p style="font-size:12px;color:var(--text-sec);margin-bottom:14px;">Verifies Redis, storage, and DuckDB connectivity and configuration.</p>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <button class="btn-sm btn-primary" id="btnHealth"><i class="fas fa-stethoscope"></i> Run check</button>
+        <div class="result-box" id="healthResult" style="margin-top:0;flex:1;min-width:160px;"></div>
+      </div>
+    </div>
+    <div id="healthTiles" style="display:none;">
+      <div id="hcGrid" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px;"></div>
+      <div id="hcDrawer" style="display:none;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);overflow:hidden;">
+        <div id="hcDrawerHeader" style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--bg-surface);">
+          <span id="hcDrawerTitle" style="font-size:13px;font-weight:700;flex:1;"></span>
+          <button class="btn-sm" id="hcDrawerClose" style="padding:2px 8px;font-size:12px;">&#x2715;</button>
+        </div>
+        <div id="hcDrawerBody" style="padding:14px 16px;display:grid;grid-template-columns:1fr 1fr;gap:0 28px;"></div>
+      </div>
+    </div>
+  </div>
 </div></div>
 
 <script>
@@ -169,8 +182,227 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.getElementById("btnHoldOff").addEventListener("click",async function(){if(!confirm("Deactivate legal hold?"))return;var c=C();try{await P("/api/v1/audit/legal-hold",{organization:c.org,enabled:false});show("holdResult","result-ok","Deactivated.");refHold();}catch(e){show("holdResult","result-err",esc(e.message));}});
   document.getElementById("btnRetRun").addEventListener("click",async function(){if(!confirm("Run retention now?"))return;var c=C();show("holdResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running…');try{var d=await P("/api/v1/audit/retention/run",{organization:c.org});if(d.skipped_legal_hold){show("holdResult","result-warn","Skipped — legal hold active.");return;}show("holdResult","result-ok","Deleted "+d.deleted_partitions+" partition(s). Cutoff: "+esc(d.cutoff_date||"—"));}catch(e){show("holdResult","result-err",esc(e.message));}});
 
-  // ── Health ──
-  document.getElementById("btnHealth").addEventListener("click",async function(){show("healthResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Running…');document.getElementById("healthChecks").style.display="none";try{var d=await G("/healthz/deep");var ok=d.status==="ok";show("healthResult",ok?"result-ok":"result-err",ok?'<i class="fas fa-check-circle"></i> All systems operational.':'<i class="fas fa-exclamation-triangle"></i> Degraded.');var ch=d.checks||{};var h='<div class="card" style="margin-top:0;">';Object.keys(ch).forEach(function(n){var c=ch[n];var o=c.status==="ok";h+='<div class="stat-row"><span class="label"><i class="fas fa-'+(o?"check-circle":"times-circle")+'" style="color:var('+(o?"--success":"--error")+');margin-right:6px;"></i>'+esc(n)+'</span><span class="val" style="color:var('+(o?"--success":"--error")+');">'+esc(c.status)+(c.backend?" · "+esc(c.backend):"")+(c.error?" · "+esc(c.error):"")+'</span></div>';});h+='</div>';document.getElementById("healthChecks").innerHTML=h;document.getElementById("healthChecks").style.display="block";}catch(e){show("healthResult","result-err","Failed: "+esc(e.message));}});
+  // ── Health (Design C: grid tiles + inline drawer) ───────────────────────
+
+  var _hcData = null;
+  var _hcOpen = null;
+
+  function _kv(label, val, mono) {
+    if (val === null || val === undefined || val === "") return "";
+    var vs = mono
+      ? '<span class="val" style="font-family:var(--mono);">' + esc(String(val)) + "</span>"
+      : '<span class="val">' + esc(String(val)) + "</span>";
+    return '<div class="stat-row"><span class="label">' + esc(label) + "</span>" + vs + "</div>";
+  }
+  function _sec(label, icon) {
+    return (
+      '<div class="field-label" style="margin-top:12px;margin-bottom:5px;">' +
+      (icon ? '<i class="fas fa-' + icon + '" style="margin-right:4px;color:var(--primary);"></i>' : "") +
+      esc(label) + "</div>"
+    );
+  }
+  function _errBox(msg) {
+    return '<div style="margin-top:8px;padding:8px 10px;background:var(--error-bg);border-radius:var(--radius-sm);font-size:11px;color:#991b1b;">' + esc(msg) + "</div>";
+  }
+
+  function _buildRedisDrawer(r) {
+    var left = "", right = "";
+    left += _sec("Connection", "plug");
+    if (r.mode === "sentinel" && r.master) {
+      left += _kv("Master", r.master.address, true);
+      left += _kv("Sentinel name", r.sentinel_master_name, true);
+    } else if (r.address) {
+      left += _kv("Address", r.address, true);
+    }
+    left += _kv("DB index", r.db, true);
+    left += _kv("Keys in DB", r.db_keys !== undefined ? r.db_keys.toLocaleString() : null, true);
+    if (r.server) {
+      var sv = r.server;
+      left += _sec("Server", "server");
+      left += _kv("Redis version", sv.redis_version, true);
+      left += _kv("Role", sv.role, true);
+      left += _kv("Uptime", sv.uptime, true);
+      left += _kv("Memory used", sv.used_memory_human, true);
+      left += _kv("Memory peak", sv.used_memory_peak_human, true);
+      left += _kv("Max memory", sv.maxmemory_human, true);
+      left += _kv("Connected clients", sv.connected_clients, true);
+      left += _kv("Blocked clients", sv.blocked_clients, true);
+      left += _kv("Commands processed", sv.total_commands_processed !== undefined ? sv.total_commands_processed.toLocaleString() : null, true);
+      left += _kv("Keyspace hit rate", sv.keyspace_hit_rate, true);
+      left += _kv("AOF enabled", sv.aof_enabled ? "yes" : "no", true);
+      left += _kv("Last bgsave", sv.rdb_last_bgsave_status, true);
+    }
+    if (r.server_error) left += _kv("Server info error", r.server_error, false);
+    if (r.error) left += _errBox(r.error);
+    if (r.mode === "sentinel") {
+      right += _sec("Sentinels", "network-wired");
+      (r.sentinels || []).forEach(function(s) {
+        var ok = s.status === "ok";
+        right += '<div class="stat-row"><span class="label"><i class="fas fa-circle" style="font-size:7px;color:var(' + (ok ? "--success" : "--error") + ');margin-right:6px;vertical-align:middle;"></i>' + esc(s.address) + "</span>" + '<span class="val" style="color:var(' + (ok ? "--success" : "--error") + ');">' + esc(s.status) + (s.error ? " \u00b7 " + esc(s.error) : "") + "</span></div>";
+      });
+      if (r.master && !r.master.error) {
+        var m = r.master;
+        right += _sec("Master", "crown");
+        right += _kv("Address", m.address, true);
+        right += _kv("Flags", m.flags, true);
+        right += _kv("Replicas", m.num_replicas, true);
+        right += _kv("Other sentinels", m.num_other_sentinels, true);
+        right += _kv("Quorum", m.quorum, true);
+        right += _kv("Failover timeout", m.failover_timeout_ms + " ms", true);
+        right += _kv("Config epoch", m.config_epoch, true);
+      }
+      if ((r.replicas || []).length > 0) {
+        right += _sec("Replicas", "copy");
+        r.replicas.forEach(function(rep) {
+          var linked = rep.master_link_status === "ok";
+          right += '<div class="stat-row"><span class="label"><i class="fas fa-' + (linked ? "link" : "link-slash") + '" style="color:var(' + (linked ? "--success" : "--error") + ');margin-right:5px;font-size:10px;"></i>' + esc(rep.address) + "</span>" + '<span class="val" style="font-size:11px;font-family:var(--mono);">link:' + esc(rep.master_link_status) + "  off:" + esc(rep.repl_offset) + "  prio:" + esc(rep.slave_priority) + "</span></div>";
+        });
+      }
+    }
+    return [left, right];
+  }
+
+  function _buildStorageDrawer(s) {
+    var left = "", right = "";
+    left += _sec("Backend", "database");
+    left += _kv("Type", s.backend, true);
+    left += _kv("Endpoint", s.endpoint, true);
+    left += _kv("Bucket", s.bucket, true);
+    left += _kv("Region", s.region, true);
+    left += _kv("Prefix", s.prefix !== undefined ? (s.prefix || "(none)") : null, true);
+    right += _sec("Connection", "plug");
+    right += _kv("URL style", s.url_style, true);
+    right += _kv("TLS", s.secure !== undefined && s.secure !== null ? (s.secure ? "yes (https)" : "no (http)") : null, true);
+    right += _kv("Probe latency", s.probe_latency_ms !== undefined ? s.probe_latency_ms + " ms" : null, true);
+    right += _kv("Root path", s.root_path, true);
+    if (s.error) left += _errBox(s.error);
+    return [left, right];
+  }
+
+  function _buildDuckDBDrawer(dk) {
+    var left = "", right = "";
+    left += _sec("Engine", "cog");
+    left += _kv("Version", dk.version, true);
+    left += _kv("Memory limit", dk.memory_limit, true);
+    left += _kv("Threads", dk.threads, true);
+    left += _kv("Temp directory", dk.temp_directory, true);
+    left += _kv("Preserve insertion order", dk.preserve_insertion_order, true);
+    if (dk.loaded_extensions && dk.loaded_extensions.length) {
+      right += _sec("Loaded extensions", "puzzle-piece");
+      dk.loaded_extensions.forEach(function(ext) {
+        right += '<div class="stat-row"><span class="label" style="font-family:var(--mono);">' + esc(ext.name) + "</span>" + '<span class="val" style="font-family:var(--mono);color:var(--text-muted);">' + esc(ext.version || "") + "</span></div>";
+      });
+    }
+    if (dk.error) left += _errBox(dk.error);
+    return [left, right];
+  }
+
+  function _openHcDrawer(key) {
+    if (!_hcData) return;
+    var ch = _hcData.checks || {};
+    var drawer = document.getElementById("hcDrawer");
+    var title = document.getElementById("hcDrawerTitle");
+    var body = document.getElementById("hcDrawerBody");
+    if (_hcOpen === key) {
+      drawer.style.display = "none";
+      _hcOpen = null;
+      document.querySelectorAll(".hc-tile").forEach(function(t) { t.style.borderColor = ""; t.style.background = ""; });
+      return;
+    }
+    _hcOpen = key;
+    document.querySelectorAll(".hc-tile").forEach(function(t) {
+      var active = t.getAttribute("data-key") === key;
+      t.style.borderColor = active ? "var(--primary)" : "";
+      t.style.background = active ? "var(--primary-light)" : "";
+    });
+    var cols = ["", ""];
+    if (key === "redis" && ch.redis) {
+      var r = ch.redis;
+      var modeTag = r.mode === "sentinel"
+        ? ' <span style="font-size:10px;padding:2px 7px;border-radius:3px;background:#e0f2fe;color:#0369a1;font-weight:700;">SENTINEL</span>'
+        : ' <span style="font-size:10px;padding:2px 7px;border-radius:3px;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-sec);font-weight:700;">STANDALONE</span>';
+      title.innerHTML = "Redis" + modeTag;
+      cols = _buildRedisDrawer(r);
+    } else if (key === "storage" && ch.storage) {
+      var s = ch.storage;
+      title.innerHTML = "Storage \u00b7 " + esc(s.backend || "");
+      cols = _buildStorageDrawer(s);
+    } else if (key === "duckdb" && ch.duckdb) {
+      var dk = ch.duckdb;
+      title.innerHTML = "DuckDB \u00b7 " + esc(dk.version || "");
+      cols = _buildDuckDBDrawer(dk);
+    } else {
+      var cx = ch[key] || {};
+      title.textContent = key.charAt(0).toUpperCase() + key.slice(1);
+      cols[0] = _kv("Status", cx.status, false) + (cx.error ? _errBox(cx.error) : "");
+    }
+    body.innerHTML = "<div>" + cols[0] + "</div><div>" + cols[1] + "</div>";
+    drawer.style.display = "block";
+  }
+
+  function _buildHcGrid(d) {
+    var ch = d.checks || {};
+    var grid = document.getElementById("hcGrid");
+    grid.innerHTML = "";
+    var order = ["redis", "storage", "duckdb"];
+    var extras = Object.keys(ch).filter(function(k) { return order.indexOf(k) < 0; });
+    var keys = order.concat(extras).filter(function(k) { return !!ch[k]; });
+    var icons = { redis: "database", storage: "hdd", duckdb: "feather-alt" };
+    var subtitles = {
+      redis: function(c) { var p = []; if (c.mode) p.push(c.mode); if (c.db_keys !== undefined) p.push(c.db_keys.toLocaleString() + " keys"); return p.join(" \u00b7 "); },
+      storage: function(c) { var p = []; if (c.backend) p.push(c.backend.replace("Storage", "")); if (c.probe_latency_ms !== undefined) p.push(c.probe_latency_ms + " ms"); return p.join(" \u00b7 "); },
+      duckdb: function(c) { var p = []; if (c.version) p.push(c.version); if (c.threads) p.push(c.threads + " threads"); return p.join(" \u00b7 "); }
+    };
+    keys.forEach(function(key) {
+      var c = ch[key];
+      var ok = c.status === "ok";
+      var icon = icons[key] || "cube";
+      var sub = subtitles[key] ? subtitles[key](c) : "";
+      var tile = document.createElement("div");
+      tile.className = "hc-tile";
+      tile.setAttribute("data-key", key);
+      tile.style.cssText = "border:1px solid var(--border);border-radius:var(--radius);padding:16px 14px;cursor:pointer;background:var(--bg-card);transition:border-color .15s,background .15s;";
+      tile.innerHTML =
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;">' +
+          '<i class="fas fa-' + icon + '" style="font-size:18px;color:var(--primary);"></i>' +
+          '<span style="font-size:11px;font-weight:700;color:var(' + (ok ? "--success" : "--error") + ');">' +
+            '<i class="fas fa-' + (ok ? "check-circle" : "times-circle") + '" style="margin-right:3px;"></i>' + (ok ? "ok" : "fail") +
+          '</span>' +
+        '</div>' +
+        '<div style="font-size:13px;font-weight:700;margin-bottom:3px;">' + esc(key.charAt(0).toUpperCase() + key.slice(1)) + '</div>' +
+        '<div style="font-size:11px;color:var(--text-sec);">' + esc(sub) + '</div>' +
+        '<div style="margin-top:10px;font-size:10px;color:var(--primary);">click for details \u203a</div>';
+      tile.addEventListener("click", function() { _openHcDrawer(key); });
+      tile.addEventListener("mouseenter", function() { if (_hcOpen !== key) { this.style.borderColor = "var(--primary-dark)"; this.style.background = "var(--bg-hover)"; } });
+      tile.addEventListener("mouseleave", function() { if (_hcOpen !== key) { this.style.borderColor = ""; this.style.background = ""; } });
+      grid.appendChild(tile);
+    });
+  }
+
+  document.getElementById("hcDrawerClose").addEventListener("click", function() {
+    document.getElementById("hcDrawer").style.display = "none";
+    _hcOpen = null;
+    document.querySelectorAll(".hc-tile").forEach(function(t) { t.style.borderColor = ""; t.style.background = ""; });
+  });
+
+  document.getElementById("btnHealth").addEventListener("click", async function() {
+    show("healthResult", "result-ok", '<i class="fas fa-spinner fa-spin"></i> Running\u2026');
+    document.getElementById("healthTiles").style.display = "none";
+    document.getElementById("hcDrawer").style.display = "none";
+    _hcOpen = null;
+    try {
+      var d = await G("/healthz/deep");
+      _hcData = d;
+      var ok = d.status === "ok";
+      show("healthResult", ok ? "result-ok" : "result-err",
+        ok ? '<i class="fas fa-check-circle"></i> All systems operational.'
+           : '<i class="fas fa-exclamation-triangle"></i> Degraded.');
+      _buildHcGrid(d);
+      document.getElementById("healthTiles").style.display = "block";
+    } catch(e) {
+      show("healthResult", "result-err", "Failed: " + esc(e.message));
+    }
+  });
 
   // ── Lineage ──
   document.getElementById("btnLinLoad").addEventListener("click",async function(){var t=(document.getElementById("linTable").value||"").trim();if(!t){alert("Select a table.");return;}var c=C();show("linResult","result-ok",'<i class="fas fa-spinner fa-spin"></i> Loading lineage…');document.getElementById("linTimeline").style.display="none";try{var d=await G("/api/v1/tables/lineage?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t)+"&limit=200");var tl=d.timeline||[];if(!tl.length){show("linResult","result-warn","No lineage data found. Lineage is recorded on new writes only.");return;}show("linResult","result-ok",tl.length+" version(s) with lineage.");var h='<div style="position:relative;padding-left:24px;">';tl.forEach(function(v,i){var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";var lin=v.lineage||{};var src=lin.source_type||"unknown";var isDelete=!!lin.delete_only;var dotColor=isDelete?"var(--error)":src.indexOf("mcp")===0?"var(--primary)":"var(--success)";var icon=isDelete?"fa-trash":src==="api_upload"?"fa-upload":src.indexOf("mcp")===0?"fa-robot":"fa-pen";var user=lin.username||lin.role_name||"—";var fname=lin.filename||"";var details=[];if(fname)details.push(fname);if(lin.incoming_rows)details.push(lin.incoming_rows+" rows");if(lin.overwrite_columns&&lin.overwrite_columns.length)details.push("keys: "+lin.overwrite_columns.join(", "));h+='<div style="position:relative;padding:12px 0 12px 20px;border-left:2px solid var(--border);margin-left:6px;">';h+='<div style="position:absolute;left:-7px;top:16px;width:14px;height:14px;border-radius:50%;background:'+dotColor+';border:2px solid var(--bg-card);"></div>';h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">';h+='<span style="font-weight:700;font-family:var(--mono);font-size:12px;">v'+v.version+'</span>';h+='<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-surface);border:1px solid var(--border-light);color:var(--text-sec);"><i class="fas '+icon+'" style="margin-right:3px;"></i>'+esc(src)+'</span>';h+='<span style="font-size:10px;color:var(--text-muted);">by '+esc(user)+'</span>';h+='</div>';h+='<div style="font-size:11px;color:var(--text-sec);">'+esc(ts)+(v.resource_count?' · '+v.resource_count+' files':'')+(v.total_rows?' · '+v.total_rows.toLocaleString()+' rows':'')+'</div>';if(details.length)h+='<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">'+esc(details.join(" · "))+'</div>';h+='</div>';});h+='</div>';document.getElementById("linTimeline").innerHTML=h;document.getElementById("linTimeline").style.display="block";}catch(e){show("linResult","result-err",esc(e.message));}});

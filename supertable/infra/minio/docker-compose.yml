@@ -1,0 +1,111 @@
+x-minio-common-env: &minio-common-env
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin123!
+  MINIO_REGION: eu-central-1
+  MINIO_PROMETHEUS_AUTH_TYPE: public
+
+# Default: 2-node cluster (minio1 + minio2)
+#   docker compose up -d
+#
+# Full: 4-node cluster (minio1..4) with erasure coding HA
+#   MINIO_NODES=4 docker compose --profile all-nodes up -d
+
+services:
+  minio1:
+    image: quay.io/minio/minio
+    hostname: minio1
+    ports:
+      - "9000:9000"  # S3 API port
+      - "9001:9001"  # Console
+    environment:
+      <<: *minio-common-env
+    volumes:
+      - minio1-data:/data
+      - minio1-config:/root/.minio
+      - ./scripts:/scripts  # Mount scripts directory
+    command: server http://minio{1...${MINIO_NODES:-2}}/data --console-address ":9001"
+    networks:
+      supertable-net:
+        aliases:
+          - minio
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio2:
+    image: quay.io/minio/minio
+    hostname: minio2
+    environment:
+      <<: *minio-common-env
+    volumes:
+      - minio2-data:/data
+      - minio2-config:/root/.minio
+    command: server http://minio{1...${MINIO_NODES:-2}}/data
+    networks:
+      - supertable-net
+    restart: unless-stopped
+
+  minio3:
+    image: quay.io/minio/minio
+    hostname: minio3
+    profiles:
+      - all-nodes
+    environment:
+      <<: *minio-common-env
+    volumes:
+      - minio3-data:/data
+      - minio3-config:/root/.minio
+    command: server http://minio{1...${MINIO_NODES:-2}}/data
+    networks:
+      - supertable-net
+    restart: unless-stopped
+
+  minio4:
+    image: quay.io/minio/minio
+    hostname: minio4
+    profiles:
+      - all-nodes
+    environment:
+      <<: *minio-common-env
+    volumes:
+      - minio4-data:/data
+      - minio4-config:/root/.minio
+    command: server http://minio{1...${MINIO_NODES:-2}}/data
+    networks:
+      - supertable-net
+    restart: unless-stopped
+
+  setup:
+    image: minio/mc
+    depends_on:
+      - minio1
+      - minio2
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for MinIO cluster to be ready...'
+      /scripts/wait-for-minio.sh
+      echo 'Setting up policies and access keys...'
+      /scripts/setup-keys.sh
+      "
+    networks:
+      - supertable-net
+
+networks:
+  supertable-net:
+    name: supertable-net
+
+volumes:
+  minio1-data:
+  minio1-config:
+  minio2-data:
+  minio2-config:
+  minio3-data:
+  minio3-config:
+  minio4-data:
+  minio4-config:
