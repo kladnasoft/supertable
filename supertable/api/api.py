@@ -105,7 +105,14 @@ from supertable.services.security import (
 )
 
 # -- monitoring helpers --
-from supertable.services.monitoring import _read_monitoring_list, compute_monitoring_summary
+from supertable.services.monitoring import (
+    _read_monitoring_list,
+    compute_monitoring_summary,
+    read_lock_state,
+    read_error_feed,
+    compute_timeseries,
+    compute_catalog_stats,
+)
 from supertable.monitoring_writer import MonitoringWriter
 
 # -- audit --
@@ -2815,7 +2822,7 @@ def monitoring_reads(
 
     items = _read_monitoring_list(
         redis_client, org, sup,
-        monitor_type="plans", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=limit,
+        monitor_type="plans", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=min(limit, 5000),
     )
     return JSONResponse({"ok": True, "items": items})
 
@@ -2836,7 +2843,7 @@ def monitoring_writes(
 
     items = _read_monitoring_list(
         redis_client, org, sup,
-        monitor_type="writes", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=limit,
+        monitor_type="writes", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=min(limit, 5000),
         ts_fields=("recorded_at", "execution_time", "timestamp"),
     )
     return JSONResponse({"ok": True, "items": items})
@@ -2880,6 +2887,179 @@ def monitoring_summary(
         redis_client, org, sup, window_hours=window_hours,
     )
     return JSONResponse({"ok": True, "summary": summary})
+
+
+@router.get("/api/v1/monitoring/catalog")
+def monitoring_catalog(
+    org: str = Query(""),
+    sup: str = Query(""),
+    _=Depends(logged_in_guard_api),
+):
+    """Catalog statistics: table count, snapshots, users, roles, tokens."""
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "stats": {}})
+
+    from supertable.services.monitoring import compute_catalog_stats as _cat_stats
+    raw = _cat_stats(redis_client, catalog, org, sup)
+    # Normalise field names to what the dashboard frontend expects
+    stats = {
+        "tables": raw.get("table_count", 0),
+        "total_snapshots": raw.get("total_snapshots", 0),
+        "users": raw.get("user_count", 0),
+        "roles": raw.get("role_count", 0),
+        "tokens": raw.get("token_count", 0),
+        "top_tables_by_version": [
+            {"name": t["table"], "version": t["snapshots"], "ts_ms": t["ts"]}
+            for t in raw.get("top_tables_by_snapshots", [])
+        ],
+        "recent_tables": sorted(
+            [
+                {"name": t["table"], "ts_ms": t["ts"]}
+                for t in raw.get("top_tables_by_snapshots", [])
+                if t.get("ts")
+            ],
+            key=lambda x: x["ts_ms"],
+            reverse=True,
+        )[:5],
+    }
+    return JSONResponse({"ok": True, "stats": stats})
+
+
+@router.get("/api/v1/monitoring/timeseries")
+def monitoring_timeseries(
+    org: str = Query(""),
+    sup: str = Query(""),
+    window_hours: int = Query(24),
+    bucket_hours: int = Query(1),
+    _=Depends(logged_in_guard_api),
+):
+    """Time-bucketed read/write volumes for charting."""
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "buckets": []})
+
+    window_hours = max(1, min(window_hours, 720))
+    bucket_hours = max(1, min(bucket_hours, 168))
+    bucket_minutes = bucket_hours * 60
+
+    from supertable.services.monitoring import compute_timeseries as _ts
+    raw_buckets = _ts(
+        redis_client, org, sup,
+        window_hours=window_hours, bucket_minutes=bucket_minutes,
+    )
+    # Normalise field names to what the dashboard frontend expects
+    buckets = [
+        {
+            "ts_ms": b["ts_ms"],
+            "reads": b.get("reads", 0),
+            "writes_inserted": b.get("rows_inserted", 0),
+            "writes_deleted": b.get("rows_deleted", 0),
+            "errors": b.get("errors", 0),
+            "mcp_calls": b.get("mcp_calls", 0),
+        }
+        for b in raw_buckets
+    ]
+    return JSONResponse({"ok": True, "buckets": buckets})
+
+
+@router.get("/api/v1/monitoring/locks")
+def monitoring_locks(
+    org: str = Query(""),
+    sup: str = Query(""),
+    _=Depends(logged_in_guard_api),
+):
+    """Currently-held per-table Redis locks with TTL."""
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "locks": []})
+
+    from supertable.services.monitoring import compute_active_locks
+    raw = compute_active_locks(redis_client, org, sup)
+    locks = [
+        {
+            "table_name": l["table_name"],
+            "ttl_ms": l["ttl_ms"],
+            "held": l["ttl_ms"] is not None and l["ttl_ms"] > 0,
+        }
+        for l in raw
+    ]
+    return JSONResponse({"ok": True, "locks": locks})
+
+
+@router.get("/api/v1/monitoring/errors")
+def monitoring_errors(
+    org: str = Query(""),
+    sup: str = Query(""),
+    window_hours: int = Query(24),
+    limit: int = Query(200),
+    _=Depends(logged_in_guard_api),
+):
+    """Unified error feed from reads, writes, and MCP calls."""
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "items": [], "count": 0})
+
+    window_hours = max(1, min(window_hours, 168))
+    limit = max(1, min(limit, 1000))
+
+    from supertable.services.monitoring import compute_errors_feed
+    raw = compute_errors_feed(
+        redis_client, org, sup,
+        window_hours=window_hours, limit=limit,
+    )
+    # Normalise source → op_type for frontend compatibility
+    for item in raw:
+        if "source" in item and "op_type" not in item:
+            item["op_type"] = item["source"]
+    return JSONResponse({"ok": True, "items": raw, "count": len(raw)})
+
+
+@router.get("/api/v1/monitoring/instances")
+def monitoring_instances(
+    _=Depends(logged_in_guard_api),
+):
+    """Return all currently-live API instance heartbeats.
+
+    Scans supertable:instances:api:* and returns a list of instance records
+    with hostname, PID, started_at, instance_id, and live TTL.
+    Intended for the Live Instances widget (auto-refresh every 15s).
+    """
+    pattern = "supertable:instances:api:*"
+    instances = []
+    now_ms = int(time.time() * 1000)
+
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=200)
+            for key in keys:
+                try:
+                    k = key if isinstance(key, str) else key.decode("utf-8")
+                    raw = redis_client.get(k)
+                    if not raw:
+                        continue
+                    s = raw if isinstance(raw, str) else raw.decode("utf-8")
+                    data = json.loads(s)
+                    ttl_ms = int(redis_client.pttl(k) or -1)
+                    data["ttl_ms"] = ttl_ms
+                    data["alive"] = ttl_ms > 0
+                    # last_seen: key was refreshed (TTL reset to 30s) N ms ago
+                    data["last_seen_ms"] = now_ms - (30_000 - max(0, ttl_ms))
+                    instances.append(data)
+                except Exception:
+                    pass
+            if cursor == 0:
+                break
+    except Exception as exc:
+        logger.warning("[monitoring] instance scan failed: %s", exc)
+
+    instances.sort(key=lambda x: x.get("hostname", ""))
+    return JSONResponse({"ok": True, "instances": instances, "count": len(instances)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

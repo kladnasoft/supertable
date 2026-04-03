@@ -583,7 +583,16 @@ def _resolve_engine(engine_name: Optional[str]):
     return name  # fallback (string)
 
 # ---------- Logging decorator ----------
-def _emit_mcp_metric(fn: str, kwargs: dict, dt_ms: float, status: str, result_rows: int = 0) -> None:
+def _emit_mcp_metric(
+    fn: str,
+    kwargs: dict,
+    dt_ms: float,
+    status: str,
+    result_rows: int = 0,
+    *,
+    out: Any = None,
+    error: Any = None,
+) -> None:
     """Best-effort MCP tool metric emission.  Never raises."""
     try:
         org = kwargs.get("organization", "")
@@ -592,17 +601,38 @@ def _emit_mcp_metric(fn: str, kwargs: dict, dt_ms: float, status: str, result_ro
             return
         from datetime import datetime, timezone
         from supertable.monitoring_writer import MonitoringWriter
+
+        payload: dict = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "tool": fn,
+            "status": status,
+            "duration_ms": round(dt_ms, 2),
+            "role": kwargs.get("role", ""),
+            "result_rows": result_rows,
+        }
+
+        # Engine and query-level elapsed for query_sql calls
+        if isinstance(out, dict):
+            engine_val = out.get("engine")
+            if engine_val:
+                payload["engine"] = str(engine_val)
+            elapsed = out.get("elapsed_ms")
+            if elapsed is not None:
+                payload["query_elapsed_ms"] = round(float(elapsed), 2)
+
+        # Error message
+        if error is not None:
+            payload["error_message"] = f"{type(error).__name__}: {error}"[:500]
+
+        # SQL — truncated to 500 chars, same limit as audit log
+        sql_val = kwargs.get("sql")
+        if fn == "query_sql" and sql_val and isinstance(sql_val, str):
+            payload["sql"] = sql_val[:500]
+
         with MonitoringWriter(
             organization=org, super_name=sup, monitor_type="mcp",
         ) as mon:
-            mon.log_metric({
-                "recorded_at": datetime.now(timezone.utc).isoformat(),
-                "tool": fn,
-                "status": status,
-                "duration_ms": round(dt_ms, 2),
-                "role": kwargs.get("role", ""),
-                "result_rows": result_rows,
-            })
+            mon.log_metric(payload)
     except Exception:
         pass
 
@@ -639,12 +669,12 @@ def log_tool(func):
                         keys = []
                     summary = f"keys={keys}"
             logger.info("← tool %s response (%0.2f ms) %s", fn, dt, summary)
-            _emit_mcp_metric(fn, kwargs, dt, "ok", result_rows)
+            _emit_mcp_metric(fn, kwargs, dt, "ok", result_rows, out=out)
             return out
         except Exception as exc:
             dt = (time.perf_counter() - t0) * 1000.0 if "t0" in locals() else 0.0
             logger.exception("✖ tool %s error: %s", fn, exc)
-            _emit_mcp_metric(fn, kwargs, dt, "error")
+            _emit_mcp_metric(fn, kwargs, dt, "error", error=exc)
             # Return consistent error envelope for all tools.
             # query_sql has a richer envelope; other tools use a simpler shape.
             if fn == "query_sql":

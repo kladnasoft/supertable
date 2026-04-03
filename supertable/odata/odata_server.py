@@ -132,6 +132,58 @@ def _audit_odata(request: Request, ctx: Dict[str, Any], **detail_kwargs) -> None
         pass  # Never fail a request due to audit
 
 
+def _emit_odata_metric(
+    organization: str,
+    super_name: str,
+    *,
+    entity_set: str,
+    role_name: str,
+    status: str,
+    duration_ms: float,
+    result_rows: int = 0,
+    sql: str = "",
+    odata_filter: Optional[str] = None,
+    odata_select: Optional[str] = None,
+    odata_top: Optional[int] = None,
+    odata_apply: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Best-effort OData monitoring metric emission.  Never raises."""
+    try:
+        from datetime import datetime, timezone
+        from supertable.monitoring_writer import MonitoringWriter
+
+        payload: Dict[str, Any] = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "table_name": entity_set,
+            "role_name": role_name,
+            "status": status,
+            "duration_ms": round(duration_ms, 2),
+            "result_rows": result_rows,
+        }
+        if sql:
+            payload["sql"] = sql[:500]
+        if odata_filter:
+            payload["odata_filter"] = odata_filter[:500]
+        if odata_select:
+            payload["odata_select"] = odata_select[:500]
+        if odata_top is not None:
+            payload["odata_top"] = int(odata_top)
+        if odata_apply:
+            payload["odata_apply"] = odata_apply[:500]
+        if error:
+            payload["error"] = error[:500]
+
+        with MonitoringWriter(
+            organization=organization,
+            super_name=super_name,
+            monitor_type="odata",
+        ) as mon:
+            mon.log_metric(payload)
+    except Exception:
+        pass  # Never fail a request due to monitoring
+
+
 # ---------------------------------------------------------------------------
 # Response headers
 # ---------------------------------------------------------------------------
@@ -256,6 +308,13 @@ def odata_query(
     duration_ms = (time.perf_counter() - t0) * 1000.0
 
     if status != Status.OK:
+        _emit_odata_metric(
+            organization, super_name,
+            entity_set=entity_set_name, role_name=role_name,
+            status="error", duration_ms=duration_ms,
+            sql=sql, odata_filter=filter_, odata_select=select,
+            odata_top=top, odata_apply=apply, error=message,
+        )
         _audit_odata(
             request, ctx,
             operation="query", entity_set=entity_set_name,
@@ -269,6 +328,13 @@ def odata_query(
     odata_response = format_odata_response(entity_set_name, result, context_url)
 
     row_count = len(odata_response.get("value", []))
+    _emit_odata_metric(
+        organization, super_name,
+        entity_set=entity_set_name, role_name=role_name,
+        status="ok", duration_ms=duration_ms, result_rows=row_count,
+        sql=sql, odata_filter=filter_, odata_select=select,
+        odata_top=top, odata_apply=apply,
+    )
     _audit_odata(
         request, ctx,
         operation="query", entity_set=entity_set_name,

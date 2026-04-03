@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 
 from supertable.config.settings import settings
 import queue
@@ -46,6 +47,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
 from supertable.config.defaults import logger
+
+# ---------------------------------------------------------------------------
+# Instance identity — stable for the lifetime of this process.
+# Injected into every monitoring payload so the monitoring page can show
+# per-instance breakdowns when multiple API instances run concurrently.
+# ---------------------------------------------------------------------------
+_MONITORING_INSTANCE_ID: str = f"{socket.gethostname()}:{os.getpid()}"
 
 try:
     # Optional dependency. If Redis isn't available/configured, we fall back to log-only.
@@ -190,9 +198,11 @@ class _AsyncMonitoringLogger:
         """
         Enqueue a metric. Never blocks the caller; if queue is full, drop the metric.
         """
-        if "recorded_at" not in payload:
+        if "recorded_at" not in payload or "instance_id" not in payload:
             payload = dict(payload)
-            payload["recorded_at"] = time.time()
+            if "recorded_at" not in payload:
+                payload["recorded_at"] = time.time()
+            payload.setdefault("instance_id", _MONITORING_INSTANCE_ID)
 
         with self.queue_stats_lock:
             self.queue_stats["total_received"] += 1
