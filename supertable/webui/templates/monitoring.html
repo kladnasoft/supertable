@@ -409,7 +409,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <!-- Instances -->
     <div class="locks-section">
       <div class="locks-header">
-        <i class="fas fa-cubes" style="color:var(--primary);"></i>Live API Instances
+        <i class="fas fa-cubes" style="color:var(--primary);"></i>Live Instances
         <span class="auto-badge">auto 15s</span>
         <span id="instanceCount" style="font-size:10px;color:var(--text-muted);font-family:var(--mono);"></span>
       </div>
@@ -446,6 +446,37 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
           <div id="catalogRecentTables"></div>
         </div>
       </div>
+
+      <!-- GC + Snapshots -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:0 18px 18px;">
+        <div class="catalog-card">
+          <div class="catalog-card-title"><i class="fas fa-broom" style="color:var(--warn);"></i> Garbage Collection</div>
+          <p style="font-size:11px;color:var(--text-sec);margin-bottom:10px;">Scan and delete orphaned Parquet files.</p>
+          <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+            <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:3px;">Table</div><select style="padding:5px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;font-family:var(--font);background:var(--bg-surface);outline:none;min-width:140px;" id="gcTable"><option value="">Loading…</option></select></div>
+            <button class="btn-sm" style="font-size:11px;padding:4px 10px;background:var(--primary);color:#fff;border-color:var(--primary);" id="btnGcPreview"><i class="fas fa-search"></i> Preview</button>
+            <button class="btn-sm" style="font-size:11px;padding:4px 10px;background:var(--error);color:#fff;border-color:var(--error);display:none;" id="btnGcClean"><i class="fas fa-trash"></i> Delete</button>
+          </div>
+          <div id="gcResult" style="display:none;margin-top:8px;padding:8px;border-radius:var(--radius-sm);font-size:11px;"></div>
+          <div id="gcFiles" style="display:none;margin-top:8px;"><div id="gcFileList" style="max-height:150px;overflow-y:auto;font-family:var(--mono);font-size:10px;background:var(--bg-surface);padding:6px;border-radius:var(--radius-sm);border:1px solid var(--border-light);"></div></div>
+        </div>
+        <div class="catalog-card">
+          <div class="catalog-card-title"><i class="fas fa-clock-rotate-left" style="color:var(--success);"></i> Snapshot History</div>
+          <p style="font-size:11px;color:var(--text-sec);margin-bottom:10px;">Browse version history for any table.</p>
+          <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+            <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:3px;">Table</div><select style="padding:5px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;font-family:var(--font);background:var(--bg-surface);outline:none;min-width:140px;" id="ttTable"><option value="">Loading…</option></select></div>
+            <button class="btn-sm" style="font-size:11px;padding:4px 10px;background:var(--primary);color:#fff;border-color:var(--primary);" id="btnTtLoad"><i class="fas fa-search"></i> Load</button>
+          </div>
+          <div id="ttResult" style="display:none;margin-top:8px;padding:8px;border-radius:var(--radius-sm);font-size:11px;"></div>
+          <div id="ttWrap" style="display:none;margin-top:8px;">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><input id="ttSearch" placeholder="Filter…" style="flex:1;padding:5px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;font-family:var(--font);background:var(--bg-surface);outline:none;"/><span id="ttPageInfo" style="font-size:9px;color:var(--text-muted);white-space:nowrap;"></span></div>
+            <div id="ttVersions" style="max-height:250px;overflow-y:auto;"></div>
+            <div id="ttPag" style="display:flex;align-items:center;gap:6px;margin-top:6px;"></div>
+          </div>
+          <div id="ttDetail" style="display:none;margin-top:8px;"></div>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -1523,7 +1554,9 @@ function renderInstances(){
   var wrap=document.getElementById("instancesTableWrap");
   var cntEl=document.getElementById("instanceCount");if(!wrap)return;
   var alive=instancesData.filter(function(i){return i.alive;});
-  if(cntEl)cntEl.textContent=" ("+alive.length+" alive"+(instancesData.length>alive.length?", "+(instancesData.length-alive.length)+" expired":"")+")" ;
+  var apiCount=alive.filter(function(i){return(i.server_type||"api")==="api";}).length;
+  var mcpCount=alive.filter(function(i){return i.server_type==="mcp";}).length;
+  if(cntEl)cntEl.textContent=" ("+apiCount+" API"+(mcpCount?", "+mcpCount+" MCP":"")+(instancesData.length>alive.length?", "+(instancesData.length-alive.length)+" expired":"")+")" ;
   if(!instancesData.length){
     wrap.innerHTML='<div class="locks-empty"><i class="fas fa-cubes"></i>No instances registered yet.<div style="font-size:11px;margin-top:4px;">Instances appear here within 15s of starting.</div></div>';
     return;
@@ -1531,16 +1564,22 @@ function renderInstances(){
   var now=Date.now();
   var rows=instancesData.map(function(inst){
     var alive=inst.alive;
+    var stype=inst.server_type||"api";
+    var typeBadge=stype==="mcp"
+      ?'<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;background:rgba(124,58,237,.08);color:var(--purple);border:1px solid rgba(124,58,237,.2);">MCP</span>'
+      :'<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;background:rgba(41,181,232,.08);color:var(--primary);border:1px solid rgba(41,181,232,.2);">API</span>';
     var uptime=inst.started_at?Math.floor((now/1000)-inst.started_at):null;
     var uptimeStr=uptime===null?"—":uptime<60?uptime+"s":uptime<3600?Math.floor(uptime/60)+"m "+String(uptime%60).padStart(2,"0")+"s":Math.floor(uptime/3600)+"h "+String(Math.floor((uptime%3600)/60)).padStart(2,"0")+"m";
     var lastSeenAgo=inst.last_seen_ms?Math.round((now-inst.last_seen_ms)/1000):null;
     var lastStr=lastSeenAgo===null?"—":lastSeenAgo<5?"just now":lastSeenAgo+"s ago";
     var ttlPct=alive?Math.min(100,Math.round((inst.ttl_ms||0)/30000*100)):0;
     var ttlCol=ttlPct>60?"var(--success)":ttlPct>25?"var(--warn)":"var(--error)";
+    var extra=stype==="mcp"&&inst.transport?' <span style="font-size:9px;color:var(--text-muted);">('+esc(inst.transport)+(inst.port&&inst.transport!=="stdio"?":"+inst.port:"")+')</span>':"";
     return'<tr>'
+      +'<td>'+typeBadge+'</td>'
       +'<td><span style="display:inline-flex;align-items:center;gap:5px;">'
         +'<span style="width:7px;height:7px;border-radius:50%;background:'+(alive?"var(--success)":"var(--error)")+';flex-shrink:0;box-shadow:'+(alive?"0 0 5px rgba(16,185,129,.4)":"none")+'"></span>'
-        +'<span style="font-family:var(--mono);font-weight:600;font-size:11px;">'+esc(inst.hostname||"—")+'</span>'
+        +'<span style="font-family:var(--mono);font-weight:600;font-size:11px;">'+esc(inst.hostname||"—")+'</span>'+extra
       +'</span></td>'
       +'<td style="font-family:var(--mono);font-size:11px;">'+esc(String(inst.pid||"—"))+'</td>'
       +'<td style="font-family:var(--mono);font-size:10px;color:var(--text-muted);">'+esc(String(inst.instance_id||"—").slice(0,10))+'</td>'
@@ -1555,7 +1594,7 @@ function renderInstances(){
       +'</tr>';
   }).join("");
   wrap.innerHTML='<table class="locks-table"><thead><tr>'
-    +'<th>Hostname</th><th>PID</th><th>Instance ID</th><th>Uptime</th><th>Last Heartbeat</th><th>TTL</th>'
+    +'<th>Type</th><th>Hostname</th><th>PID</th><th>Instance ID</th><th>Uptime</th><th>Last Heartbeat</th><th>TTL</th>'
     +'</tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
@@ -1576,6 +1615,7 @@ function renderLocks(){
 
 // ─── CATALOG renderer ────────────────────────────────────────────────────
 function renderCatalog(){
+  _loadToolTables();
   if(!catalogData){document.getElementById("kpiTables").textContent="…";return;}
   var d=catalogData;
   function setK(id,v){var el=document.getElementById(id);if(el)el.textContent=fmtNum(v);}
@@ -1733,6 +1773,59 @@ function _renderOdataDetail(it){
   if(content)content.innerHTML=h;
 }
 
+
+// ─── Platform Tools (moved from platform.html) ─────────────────────────
+var _ptTablesLoaded=false;
+async function _loadToolTables(){
+  if(_ptTablesLoaded)return;_ptTablesLoaded=true;
+  var c=ctx();if(!c.org||!c.sup)return;
+  try{var d=await getJSON("/api/v1/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name=superadmin");var t=(d&&d.tables)||[];
+  ["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(!s)return;s.innerHTML='<option value="">— Select table —</option>';t.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;s.appendChild(o);});});
+  }catch(e){["gcTable","ttTable"].forEach(function(id){var s=document.getElementById(id);if(s)s.innerHTML='<option value="">Error</option>';});}
+}
+function _ptShow(id,cls,h){var e=document.getElementById(id);if(!e)return;e.className=cls;e.innerHTML=h;e.style.display="block";}
+
+// -- GC --
+var _gcD=null;
+(function(){
+  var bp=document.getElementById("btnGcPreview"),bc=document.getElementById("btnGcClean");if(!bp)return;
+  bp.addEventListener("click",async function(){
+    var t=(document.getElementById("gcTable").value||"").trim();if(!t){alert("Select a table.");return;}
+    var c=ctx();_ptShow("gcResult","padding:10px;background:var(--info-bg);border:1px solid rgba(41,181,232,.2);border-radius:var(--radius-sm);","<i class='fas fa-spinner fa-spin'></i> Scanning…");
+    document.getElementById("gcFiles").style.display="none";bc.style.display="none";
+    try{var d=await getJSON("/api/v1/gc/preview?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t));_gcD=d;
+      var n=(d.orphaned_data_files||[]).length+(d.orphaned_snapshot_files||[]).length;
+      if(!n){_ptShow("gcResult","padding:10px;background:var(--success-bg);border:1px solid rgba(47,200,159,.2);border-radius:var(--radius-sm);","<i class='fas fa-check-circle'></i> Clean — no orphans.");return;}
+      _ptShow("gcResult","padding:10px;background:var(--warn-bg);border:1px solid rgba(245,166,35,.2);border-radius:var(--radius-sm);","<i class='fas fa-exclamation-triangle'></i> "+n+" orphaned files. Live: "+d.live_file_count);
+      var l=document.getElementById("gcFileList");l.innerHTML="";(d.orphaned_data_files||[]).concat(d.orphaned_snapshot_files||[]).forEach(function(f){l.innerHTML+='<div style="padding:2px 0;border-bottom:1px solid var(--border-light);">'+esc(f)+'</div>';});
+      document.getElementById("gcFiles").style.display="block";bc.style.display="inline-flex";
+    }catch(e){_ptShow("gcResult","padding:10px;background:var(--error-bg);border:1px solid rgba(229,72,77,.2);border-radius:var(--radius-sm);",esc(e.message));}
+  });
+  bc.addEventListener("click",async function(){
+    var t=(document.getElementById("gcTable").value||"").trim();if(!t)return;
+    var n=_gcD?(((_gcD.orphaned_data_files||[]).length)+(_gcD.orphaned_snapshot_files||[]).length):0;
+    if(!confirm("Delete "+n+" orphaned files?"))return;var c=ctx();
+    _ptShow("gcResult","padding:10px;background:var(--info-bg);border:1px solid rgba(41,181,232,.2);border-radius:var(--radius-sm);","<i class='fas fa-spinner fa-spin'></i> Deleting…");
+    try{var d=await fetch("/api/v1/gc/clean",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({organization:c.org,super_name:c.sup,table_name:t,role_name:"superadmin"})});var j=await d.json();
+      _ptShow("gcResult","padding:10px;background:var(--success-bg);border:1px solid rgba(47,200,159,.2);border-radius:var(--radius-sm);","<i class='fas fa-check-circle'></i> Deleted "+(j.deleted_data_files+j.deleted_snapshot_files)+" files.");
+      document.getElementById("gcFiles").style.display="none";bc.style.display="none";
+    }catch(e){_ptShow("gcResult","padding:10px;background:var(--error-bg);border:1px solid rgba(229,72,77,.2);border-radius:var(--radius-sm);",esc(e.message));}
+  });
+})();
+
+// -- Snapshot History --
+var _ttA=[],_ttF=[],_ttP=0,_ttPP=50,_ttT="";
+function _ttRender(){var q=(document.getElementById("ttSearch").value||"").trim();_ttF=q?_ttA.filter(function(v){return String(v.version).indexOf(q)>=0;}):_ttA.slice();_ttP=0;_ttPage();}
+function _ttPage(){var s=_ttP*_ttPP,e=s+_ttPP,pg=_ttF.slice(s,e),tp=Math.ceil(_ttF.length/_ttPP)||1;document.getElementById("ttPageInfo").textContent=_ttF.length+" versions · page "+(_ttP+1)+"/"+tp;var h="";pg.forEach(function(v,i){var gi=s+i;var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";var lin=v.lineage||{};var src=lin.source_type||"";var srcTag=src?(' <span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--bg-surface);border:1px solid var(--border-light);color:var(--text-muted);">'+esc(src)+'</span>'):"";var user=lin.username||lin.role_name||"";var userTag=user?(' <span style="font-size:9px;color:var(--text-muted);">by '+esc(user)+'</span>'):"";h+='<div class="tt-vrow" data-gi="'+gi+'" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border-light);border-radius:var(--radius-sm);margin-bottom:4px;cursor:pointer;transition:var(--transition);"><div style="font-weight:700;font-family:var(--mono);min-width:50px;">v'+v.version+'</div><div style="flex:1;"><div style="font-size:12px;">'+v.resource_count+' files · '+v.total_rows.toLocaleString()+' rows'+srcTag+userTag+'</div><div style="font-size:10px;color:var(--text-muted);">'+ts+'</div></div></div>';});document.getElementById("ttVersions").innerHTML=h;document.querySelectorAll(".tt-vrow").forEach(function(r){r.addEventListener("click",function(){_ttSel(parseInt(r.getAttribute("data-gi")));});});var ph="";if(_ttP>0)ph+='<button class="btn-sm" onclick="_ttP--;_ttPage()"><i class="fas fa-chevron-left"></i></button>';ph+='<span style="font-size:10px;color:var(--text-muted);">'+(_ttP+1)+"/"+tp+'</span>';if(e<_ttF.length)ph+='<button class="btn-sm" onclick="_ttP++;_ttPage()"><i class="fas fa-chevron-right"></i></button>';document.getElementById("ttPag").innerHTML=ph;}
+async function _ttSel(gi){var v=_ttF[gi];if(!v)return;document.querySelectorAll(".tt-vrow").forEach(function(r){r.style.borderColor=parseInt(r.getAttribute("data-gi"))===gi?"var(--primary)":"";r.style.background=parseInt(r.getAttribute("data-gi"))===gi?"var(--bg-hover)":"";});var c=ctx();var det=document.getElementById("ttDetail");det.style.display="block";det.innerHTML='<div style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading v'+v.version+'…</div>';try{var d=await getJSON("/api/v1/tables/snapshot?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(_ttT)+"&version="+v.version);var sn=d.snapshot||{};var sa=sn.schema||[];if(typeof sa==="string"){try{sa=JSON.parse(sa);}catch(e2){sa=[];}}if(!Array.isArray(sa))sa=[];var names=sa.map(function(s2){return(typeof s2==="string")?s2:(s2&&s2.name)||"";}).filter(Boolean);var res=sn.resources||[];var tr=res.reduce(function(a,r){return a+(r.rows||0);},0);var h='<div style="background:var(--bg-surface);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:12px;"><div style="font-weight:700;margin-bottom:8px;">v'+sn.snapshot_version+'</div>';h+='<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;"><span style="color:var(--text-sec);">Updated</span><span style="font-weight:600;">'+(sn.last_updated_ms?new Date(sn.last_updated_ms).toLocaleString():"—")+'</span></div>';h+='<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;"><span style="color:var(--text-sec);">Files</span><span style="font-weight:600;">'+res.length+'</span></div>';h+='<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;"><span style="color:var(--text-sec);">Total rows</span><span style="font-weight:600;">'+tr.toLocaleString()+'</span></div>';if(names.length)h+='<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;"><span style="color:var(--text-sec);">Columns</span><span style="font-weight:600;font-size:10px;max-width:60%;word-break:break-all;text-align:right;">'+esc(names.join(", "))+'</span></div>';h+='</div>';det.innerHTML=h;}catch(e){det.innerHTML='<div style="color:var(--error);font-size:12px;">'+esc(e.message)+'</div>';}}
+(function(){
+  var s=document.getElementById("ttSearch");if(s)s.addEventListener("input",_ttRender);
+  var btn=document.getElementById("btnTtLoad");if(!btn)return;
+  btn.addEventListener("click",async function(){var t=(document.getElementById("ttTable").value||"").trim();if(!t){alert("Select a table.");return;}_ttT=t;_ttA=[];_ttF=[];_ttP=0;var c=ctx();_ptShow("ttResult","padding:10px;background:var(--info-bg);border:1px solid rgba(41,181,232,.2);border-radius:var(--radius-sm);","<i class='fas fa-spinner fa-spin'></i> Loading…");document.getElementById("ttWrap").style.display="none";document.getElementById("ttDetail").style.display="none";if(s)s.value="";try{var d=await getJSON("/api/v1/tables/snapshot-history?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t)+"&limit=500");_ttA=d.versions||[];if(!_ttA.length){_ptShow("ttResult","padding:10px;background:var(--warn-bg);border:1px solid rgba(245,166,35,.2);border-radius:var(--radius-sm);","No history found.");return;}_ptShow("ttResult","padding:10px;background:var(--success-bg);border:1px solid rgba(47,200,159,.2);border-radius:var(--radius-sm);",_ttA.length+" version(s).");_ttF=_ttA.slice();document.getElementById("ttWrap").style.display="block";_ttPage();}catch(e){_ptShow("ttResult","padding:10px;background:var(--error-bg);border:1px solid rgba(229,72,77,.2);border-radius:var(--radius-sm);",esc(e.message));}});
+})();
+
+// Make snapshot pagination functions global for onclick
+window._ttP=0;window._ttPage=_ttPage;
 
 window.clearOpsBucket=clearOpsBucket;
 window.renderSection=renderSection;

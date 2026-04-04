@@ -205,6 +205,21 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       <div id="exportStatus" style="margin-top:10px;font-size:11px;color:var(--text-muted);"></div>
     </div>
 
+    <!-- Legal Hold -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-gavel"></i> Legal Hold</span>
+      </div>
+      <p style="font-size:12px;color:var(--text-sec);margin-bottom:12px;">When active, no audit data is deleted by retention cleanup.</p>
+      <div id="holdStatus" style="margin-bottom:12px;"><span style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Checking…</span></div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="filter-btn" id="btnHoldOn" style="display:none;"><i class="fas fa-lock"></i> Activate</button>
+        <button class="filter-btn" id="btnHoldOff" style="display:none;"><i class="fas fa-lock-open"></i> Deactivate</button>
+        <button class="filter-btn" id="btnRetRun" style="margin-left:auto;"><i class="fas fa-calendar-minus"></i> Run Retention</button>
+      </div>
+      <div id="holdResult" style="display:none;margin-top:10px;padding:8px;border-radius:var(--radius-sm);font-size:12px;"></div>
+    </div>
+
   </div>
 
 </div>
@@ -373,8 +388,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     }
   });
 
+  // ── Legal Hold ──
+  async function refHold(){
+    try{var d=await fetch('/api/v1/audit/legal-hold?organization='+encodeURIComponent(org),{credentials:'same-origin'}).then(function(r){return r.json();});
+      var a=!!d.legal_hold_active;
+      document.getElementById('holdStatus').innerHTML=a?'<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;background:var(--error-bg);color:var(--error);border:1px solid rgba(239,68,68,.2);"><i class="fas fa-lock"></i> ACTIVE</span>':'<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);"><i class="fas fa-lock-open"></i> Inactive</span>';
+      document.getElementById('btnHoldOn').style.display=a?'none':'inline-flex';
+      document.getElementById('btnHoldOff').style.display=a?'inline-flex':'none';
+    }catch(e){document.getElementById('holdStatus').innerHTML='<span style="color:var(--error);font-size:12px;">'+escHtml(e.message)+'</span>';}
+  }
+  function holdShow(cls,msg){var e=document.getElementById('holdResult');e.className=cls;e.innerHTML=msg;e.style.display='block';}
+  document.getElementById('btnHoldOn').addEventListener('click',async function(){if(!confirm('Activate legal hold?'))return;try{await fetch('/api/v1/audit/legal-hold',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org,enabled:true})});holdShow('padding:8px;background:var(--success-bg);border:1px solid rgba(16,185,129,.2);border-radius:var(--radius-sm);font-size:12px;','Activated.');refHold();}catch(e){holdShow('padding:8px;background:var(--error-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);font-size:12px;',escHtml(e.message));}});
+  document.getElementById('btnHoldOff').addEventListener('click',async function(){if(!confirm('Deactivate legal hold?'))return;try{await fetch('/api/v1/audit/legal-hold',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org,enabled:false})});holdShow('padding:8px;background:var(--success-bg);border:1px solid rgba(16,185,129,.2);border-radius:var(--radius-sm);font-size:12px;','Deactivated.');refHold();}catch(e){holdShow('padding:8px;background:var(--error-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);font-size:12px;',escHtml(e.message));}});
+  document.getElementById('btnRetRun').addEventListener('click',async function(){if(!confirm('Run retention now?'))return;holdShow('padding:8px;background:var(--info-bg);border:1px solid rgba(41,181,232,.2);border-radius:var(--radius-sm);font-size:12px;','<i class="fas fa-spinner fa-spin"></i> Running…');try{var r=await fetch('/api/v1/audit/retention/run',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({organization:org})});var d=await r.json();if(d.skipped_legal_hold){holdShow('padding:8px;background:var(--warn-bg);border:1px solid rgba(245,166,35,.2);border-radius:var(--radius-sm);font-size:12px;','Skipped — legal hold active.');return;}holdShow('padding:8px;background:var(--success-bg);border:1px solid rgba(16,185,129,.2);border-radius:var(--radius-sm);font-size:12px;','Deleted '+(d.deleted_partitions||0)+' partition(s).');}catch(e){holdShow('padding:8px;background:var(--error-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);font-size:12px;',escHtml(e.message));}});
+
   // Initial load
   loadEvents();
+  refHold();
 })();
 </script>
 </body>

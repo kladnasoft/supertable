@@ -2561,6 +2561,33 @@ async def store_catalog(
             return {"result": None, "status": "ERROR", "message": f"{exc.__class__.__name__}: {exc}"}
 
 
+# ---------------------------------------------------------------------------
+# Instance registration via shared ServiceRegistry
+# ---------------------------------------------------------------------------
+_mcp_registry = None
+
+
+def _start_mcp_registry(transport: str = "stdio", port: int = 0) -> None:
+    global _mcp_registry
+    try:
+        from supertable.service_registry import ServiceRegistry
+        _mcp_registry = ServiceRegistry(
+            "mcp",
+            metadata={"transport": transport, "port": port},
+        )
+        _mcp_registry.start()
+    except Exception as exc:
+        logger.warning("[mcp] service registry failed (non-fatal): %s", exc)
+
+
+def _stop_mcp_registry() -> None:
+    if _mcp_registry is not None:
+        try:
+            _mcp_registry.stop()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     try:
         transport = _normalize_transport_value(getattr(CFG, "transport", "stdio"))
@@ -2577,6 +2604,8 @@ if __name__ == "__main__":
             )
 
         run_kwargs: Dict[str, Any] = {"transport": transport}
+        _hb_port = CFG.http_port if transport != "stdio" else 0
+        _start_mcp_registry(transport, _hb_port)
         if transport != "stdio":
             logger.info(
                 "HTTP transport configured. host=%s port=%s path=%s",
@@ -2616,7 +2645,9 @@ if __name__ == "__main__":
             mcp.run(**run_kwargs)
     except KeyboardInterrupt:
         logger.info("Shutting down MCP server (KeyboardInterrupt).")
+        _stop_mcp_registry()
         sys.exit(0)
     except Exception as exc:
         logger.exception("Fatal error in MCP server: %s", exc)
+        _stop_mcp_registry()
         sys.exit(1)

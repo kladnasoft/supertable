@@ -294,6 +294,8 @@ html, body {
         <button class="tab-btn" data-tab="staging" onclick="switchTab('staging')"><i class="fas fa-folder-open"></i> Staging Files</button>
         <div class="tab-sep"></div>
         <button class="tab-btn" data-tab="pipe" onclick="switchTab('pipe')"><i class="fas fa-diagram-project"></i> Pipe Editor</button>
+        <div class="tab-sep"></div>
+        <button class="tab-btn" data-tab="lineage" onclick="switchTab('lineage')"><i class="fas fa-route"></i> Lineage</button>
       </div>
 
       <!-- LOAD TAB -->
@@ -396,6 +398,19 @@ html, body {
         </div>
         <textarea class="pipe-editor" id="pipeEditor" placeholder="Select a staging and pipe from the left panel, or create a new pipe…"></textarea>
       </div>
+
+      <!-- LINEAGE TAB -->
+      <div class="flow-area" id="pane-lineage" style="display:none;padding:14px;">
+        <div style="font-size:14px;font-weight:600;margin-bottom:4px;"><i class="fas fa-route" style="color:var(--primary);margin-right:4px;"></i> Data Lineage</div>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">Track who wrote what data, from where, and how — for every version of a table.</p>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+          <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:3px;">Table</div><select style="padding:5px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font);background:var(--bg-surface);outline:none;min-width:160px;" id="linTable"><option value="">Loading…</option></select></div>
+          <button class="btn-sm btn-primary" id="btnLinLoad"><i class="fas fa-route"></i> Load Lineage</button>
+        </div>
+        <div id="linResult" style="display:none;padding:8px;border-radius:var(--radius-sm);font-size:12px;margin-bottom:8px;"></div>
+        <div id="linTimeline" style="display:none;"></div>
+      </div>
+
     </div>
 
     <!-- RIGHT: Intelligence panel -->
@@ -510,10 +525,11 @@ html, body {
   }
 
   window.switchTab=function(name){
-    ["load","staging","pipe"].forEach(function(t){
+    ["load","staging","pipe","lineage"].forEach(function(t){
       var btn=document.querySelector('.tab-btn[data-tab="'+t+'"]'),pane=document.getElementById("pane-"+t);
       if(btn)btn.classList.toggle("active",t===name);if(pane)pane.style.display=(t===name)?"":"none";
     });
+    if(name==="lineage")loadLineageTables();
     var u=new URL(window.location.href);u.hash="#"+name;history.replaceState(null,"",u.toString());
   };
 
@@ -656,7 +672,28 @@ html, body {
 
   window.addEventListener("supertable-changed",function(e){var detail=(e&&e.detail)?e.detail:{};var org=detail.org||"",sup=detail.sup||"";if(!org||!sup)return;try{if(e&&typeof e.preventDefault==="function")e.preventDefault();}catch(_){}var el=root();if(el){el.dataset.org=org;el.dataset.sup=sup;}selectedStaging="";lastStagingNames=[];lastPipeItems=[];refreshStagings().catch(function(e){console.error("refreshStagings:",e);});refreshTableSuggestions();refreshRecentWrites();});
 
-  var h=(window.location.hash||"").replace("#","");if(h==="pipe"||h==="load"||h==="staging"){switchTab(h);}else{switchTab("load");}
+  // ── Lineage ──
+  var _linTablesLoaded=false;
+  async function loadLineageTables(){
+    if(_linTablesLoaded)return;_linTablesLoaded=true;
+    var c=currentOrgSup();if(!c.org||!c.sup)return;
+    try{var d=await getJSON("/api/v1/ingestion/tables?org="+enc(c.org)+"&sup="+enc(c.sup)+"&role_name=superadmin");var t=(d&&d.tables)||[];
+      var sel=document.getElementById("linTable");if(!sel)return;sel.innerHTML='<option value="">— Select table —</option>';t.forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o);});
+    }catch(e){var sel=document.getElementById("linTable");if(sel)sel.innerHTML='<option value="">Error</option>';}
+  }
+  function _linShow(id,cls,h){var e=document.getElementById(id);if(!e)return;e.className="";e.style.cssText=cls;e.innerHTML=h;e.style.display="block";}
+  document.getElementById("btnLinLoad").addEventListener("click",async function(){
+    var t=(document.getElementById("linTable").value||"").trim();if(!t){alert("Select a table.");return;}
+    var c=currentOrgSup();_linShow("linResult","padding:8px;background:var(--primary-light);border:1px solid rgba(28,150,202,.2);border-radius:6px;font-size:12px;","<i class='fas fa-spinner fa-spin'></i> Loading lineage…");document.getElementById("linTimeline").style.display="none";
+    try{var d=await getJSON("/api/v1/tables/lineage?org="+enc(c.org)+"&sup="+enc(c.sup)+"&table="+enc(t)+"&limit=200");var tl=d.timeline||[];
+      if(!tl.length){_linShow("linResult","padding:8px;background:#fffbeb;border:1px solid rgba(245,158,11,.2);border-radius:6px;font-size:12px;","No lineage data found.");return;}
+      _linShow("linResult","padding:8px;background:#ecfdf5;border:1px solid rgba(16,185,129,.2);border-radius:6px;font-size:12px;",tl.length+" version(s) with lineage.");
+      var h='<div style="position:relative;padding-left:24px;">';tl.forEach(function(v){var ts=v.last_updated_ms?new Date(v.last_updated_ms).toLocaleString():"—";var lin=v.lineage||{};var src=lin.source_type||"unknown";var isD=!!lin.delete_only;var dotC=isD?"var(--error)":src.indexOf("mcp")===0?"var(--primary)":"var(--success)";var icon=isD?"fa-trash":src==="api_upload"?"fa-upload":src.indexOf("mcp")===0?"fa-robot":"fa-pen";var user=lin.username||lin.role_name||"—";var det=[];if(lin.filename)det.push(lin.filename);if(lin.incoming_rows)det.push(lin.incoming_rows+" rows");if(lin.overwrite_columns&&lin.overwrite_columns.length)det.push("keys: "+lin.overwrite_columns.join(", "));h+='<div style="position:relative;padding:12px 0 12px 20px;border-left:2px solid var(--border);margin-left:6px;"><div style="position:absolute;left:-7px;top:16px;width:14px;height:14px;border-radius:50%;background:'+dotC+';border:2px solid #fff;"></div><div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;"><span style="font-weight:700;font-family:var(--mono);font-size:12px;">v'+v.version+'</span><span style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-surface);border:1px solid var(--border-light);color:var(--text-sec);"><i class="fas '+icon+'" style="margin-right:3px;"></i>'+esc(src)+'</span><span style="font-size:10px;color:var(--text-muted);">by '+esc(user)+'</span></div><div style="font-size:11px;color:var(--text-sec);">'+esc(ts)+(v.resource_count?" · "+v.resource_count+" files":"")+(v.total_rows?" · "+v.total_rows.toLocaleString()+" rows":"")+'</div>'+(det.length?'<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">'+esc(det.join(" · "))+'</div>':'')+'</div>';});
+      h+='</div>';document.getElementById("linTimeline").innerHTML=h;document.getElementById("linTimeline").style.display="block";
+    }catch(e){_linShow("linResult","padding:8px;background:#fef2f2;border:1px solid rgba(239,68,68,.2);border-radius:6px;font-size:12px;",esc(e.message));}
+  });
+
+  var h=(window.location.hash||"").replace("#","");if(h==="pipe"||h==="load"||h==="staging"||h==="lineage"){switchTab(h);if(h==="lineage")loadLineageTables();}else{switchTab("load");}
   refreshStagings();refreshTableSuggestions();refreshRecentWrites();
   window.refreshStagings=refreshStagings;window.switchTab=switchTab;
 })();

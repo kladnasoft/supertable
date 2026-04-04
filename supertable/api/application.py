@@ -21,12 +21,8 @@ Environment:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import socket
-import time
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -42,67 +38,20 @@ configure_logging(service="api")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Instance identity — computed once at module load, stable for the lifetime
-# of this process.  Used by the heartbeat and injected into monitoring payloads.
+# Instance registration via shared ServiceRegistry
 # ---------------------------------------------------------------------------
-_INSTANCE_ID: str = uuid.uuid4().hex[:12]
-_INSTANCE_HOSTNAME: str = socket.gethostname()
-_INSTANCE_PID: int = os.getpid()
-_INSTANCE_KEY: str = f"supertable:instances:api:{_INSTANCE_HOSTNAME}:{_INSTANCE_PID}"
-_INSTANCE_TTL_S: int = 30          # Redis key TTL — expires after 2 missed heartbeats
-_HEARTBEAT_INTERVAL_S: int = 15    # Refresh interval
+from supertable.service_registry import ServiceRegistry
 
-
-def _instance_payload() -> str:
-    """JSON string written to Redis on every heartbeat."""
-    return json.dumps({
-        "instance_id": _INSTANCE_ID,
-        "hostname": _INSTANCE_HOSTNAME,
-        "pid": _INSTANCE_PID,
-        "started_at": _STARTED_AT,
-        "version": "1.0.0",
-    })
-
-
-_STARTED_AT: float = time.time()
-
-
-async def _heartbeat_task() -> None:
-    """
-    Asyncio background task — refreshes this instance's Redis key every
-    _HEARTBEAT_INTERVAL_S seconds.  Runs for the entire lifetime of the
-    process.  If Redis is unavailable for a cycle, logs a warning and
-    retries on the next interval.
-    """
-    from supertable.server_common import redis_client as _rc  # noqa: import inside task
-
-    payload = _instance_payload()
-    while True:
-        try:
-            _rc.set(_INSTANCE_KEY, payload, ex=_INSTANCE_TTL_S)
-        except Exception as exc:
-            logger.warning("[heartbeat] failed to refresh instance key: %s", exc)
-        await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
-
-
-def _deregister_instance() -> None:
-    """Delete the instance key on clean shutdown so it disappears immediately."""
-    try:
-        from supertable.server_common import redis_client as _rc
-        _rc.delete(_INSTANCE_KEY)
-        logger.info("[heartbeat] instance deregistered: %s", _INSTANCE_KEY)
-    except Exception as exc:
-        logger.warning("[heartbeat] deregister failed (non-fatal): %s", exc)
+_registry = ServiceRegistry("api", metadata={
+    "port": getattr(settings, "SUPERTABLE_API_PORT", 8051),
+})
 
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Manage the instance heartbeat background task."""
-    task = asyncio.create_task(_heartbeat_task(), name="instance-heartbeat")
-    logger.info(
-        "[heartbeat] instance registered: id=%s host=%s pid=%d",
-        _INSTANCE_ID, _INSTANCE_HOSTNAME, _INSTANCE_PID,
-    )
+    await _registry.astart()
+    task = asyncio.create_task(_registry.aheartbeat(), name="registry-api")
     try:
         yield
     finally:
@@ -111,7 +60,7 @@ async def _lifespan(application: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
-        _deregister_instance()
+        _registry.astop()
 
 
 # ---------------------------------------------------------------------------

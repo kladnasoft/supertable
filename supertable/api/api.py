@@ -3045,42 +3045,14 @@ def monitoring_errors(
 def monitoring_instances(
     _=Depends(logged_in_guard_api),
 ):
-    """Return all currently-live API instance heartbeats.
+    """Return all currently-live service instance heartbeats.
 
-    Scans supertable:instances:api:* and returns a list of instance records
-    with hostname, PID, started_at, instance_id, and live TTL.
+    Scans supertable:registry:* and returns a list of instance records
+    with hostname, PID, started_at, service_type, and live TTL.
     Intended for the Live Instances widget (auto-refresh every 15s).
     """
-    pattern = "supertable:instances:api:*"
-    instances = []
-    now_ms = int(time.time() * 1000)
-
-    try:
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=200)
-            for key in keys:
-                try:
-                    k = key if isinstance(key, str) else key.decode("utf-8")
-                    raw = redis_client.get(k)
-                    if not raw:
-                        continue
-                    s = raw if isinstance(raw, str) else raw.decode("utf-8")
-                    data = json.loads(s)
-                    ttl_ms = int(redis_client.pttl(k) or -1)
-                    data["ttl_ms"] = ttl_ms
-                    data["alive"] = ttl_ms > 0
-                    # last_seen: key was refreshed (TTL reset to 30s) N ms ago
-                    data["last_seen_ms"] = now_ms - (30_000 - max(0, ttl_ms))
-                    instances.append(data)
-                except Exception:
-                    pass
-            if cursor == 0:
-                break
-    except Exception as exc:
-        logger.warning("[monitoring] instance scan failed: %s", exc)
-
-    instances.sort(key=lambda x: x.get("hostname", ""))
+    from supertable.service_registry import ServiceRegistry
+    instances = ServiceRegistry.scan(redis_client)
     return JSONResponse({"ok": True, "instances": instances, "count": len(instances)})
 
 
