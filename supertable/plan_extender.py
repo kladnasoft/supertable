@@ -92,6 +92,13 @@ def extend_execution_plan(
 
     # Prepare flat metric payload for the monitoring table
     try:
+        # Extract engine from plan_stats (stored as {"ENGINE": "duckdb_lite"} entry)
+        _engine_used = "unknown"
+        for _entry in (plan_stats.stats if hasattr(plan_stats, "stats") else []):
+            if isinstance(_entry, dict) and "ENGINE" in _entry:
+                _engine_used = str(_entry["ENGINE"])
+                break
+
         stats = {
             "query_id": getattr(query_plan_manager, "query_id", ""),
             "query_hash": getattr(query_plan_manager, "query_hash", ""),
@@ -100,6 +107,7 @@ def extend_execution_plan(
             "role_name": role_name,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "table_name": getattr(query_plan_manager, "original_table", ""),
+            "engine": _engine_used,
             "status": status,
             "message": message,
             "result_rows": int(result_shape[0]),

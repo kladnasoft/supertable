@@ -149,6 +149,22 @@ def _read_raw_list(
     return items
 
 
+def _extract_engine(item: Dict[str, Any]) -> Optional[str]:
+    """Extract engine name from profile_overview JSON string (fallback for old entries)."""
+    raw = item.get("profile_overview")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        entries = json.loads(raw)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and "ENGINE" in entry:
+                    return str(entry["ENGINE"])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _compute_ops_and_timeseries(
     redis_client: Any,
     org: str,
@@ -214,7 +230,7 @@ def _compute_ops_and_timeseries(
         dur = _extract_duration_ms(it)
         if dur is not None and dur >= 0:
             read_durations.append(dur)
-        engine = it.get("engine") or "unknown"
+        engine = it.get("engine") or _extract_engine(it) or "unknown"
         engine_counts[engine] += 1
         idx = _idx(it["_ts_ms"])
         if idx >= 0:

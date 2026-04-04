@@ -214,6 +214,22 @@ def _extract_duration_ms(item: Dict[str, Any]) -> Optional[float]:
 # Per-category summary builders
 # ---------------------------------------------------------------------------
 
+def _extract_engine_from_overview(item: Dict[str, Any]) -> Optional[str]:
+    """Extract engine from profile_overview JSON string (fallback for old entries)."""
+    raw = item.get("profile_overview")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        entries = json.loads(raw)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and "ENGINE" in entry:
+                    return str(entry["ENGINE"])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _summarize_read_ops(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Summarize read operation metrics."""
     durations: List[float] = []
@@ -238,7 +254,7 @@ def _summarize_read_ops(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 pass
 
-        engine = it.get("engine") or "unknown"
+        engine = it.get("engine") or _extract_engine_from_overview(it) or "unknown"
         engine_counts[engine] += 1
 
         table = it.get("table_name") or it.get("table")

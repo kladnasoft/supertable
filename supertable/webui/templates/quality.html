@@ -33,6 +33,13 @@
 /* ═══ TOPBAR ═══ */
 .cc-topbar { display: flex; align-items: center; gap: 10px; padding: 6px 16px; background: var(--panel-bg); border-bottom: 1px solid var(--panel-border); flex-shrink: 0; min-height: 46px; }
 .topbar-sep { width: 1px; height: 20px; background: var(--panel-border); flex-shrink: 0; }
+.topbar-badge { display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600; }
+.topbar-badge.ok { background:var(--success-bg, rgba(16,185,129,.08));color:var(--success); }
+.topbar-badge.warn { background:var(--warn-bg, rgba(245,158,11,.08));color:var(--warn); }
+.topbar-badge.crit { background:var(--error-bg, rgba(239,68,68,.08));color:var(--error); }
+.topbar-badge.loading { background:var(--bg-surface);color:var(--text-muted); }
+@keyframes dq-spin { to { transform: rotate(360deg); } }
+.pulsing { animation: dq-spin 1s linear infinite; }
 .super-sel { display: flex; align-items: center; gap: 6px; background: var(--bg-surface); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 0 4px 0 10px; font-size: 13px; font-weight: 600; }
 .super-sel select { border: none; background: transparent; color: var(--text-color); font-weight: 600; font-size: 13px; font-family: var(--font); padding: 6px 4px; outline: none; cursor: pointer; min-width: 120px; }
 .role-pill { display: flex; align-items: center; gap: 5px; background: #ecfdf5; border: 1px solid rgba(16,185,129,.25); border-radius: 999px; padding: 4px 10px; }
@@ -246,10 +253,24 @@
 
 <!-- ═══ TOP BAR ═══ -->
 <header class="cc-topbar">
+  <span style="font-size:11px;color:var(--text-muted);">Data quality</span>
+  <span id="dqTopStatusBadge" class="topbar-badge loading" style="font-size:10px;padding:3px 10px;border-radius:6px;font-weight:600;display:inline-flex;align-items:center;gap:5px;"><i class="fas fa-circle-notch pulsing"></i> Loading…</span>
   <div style="flex:1;"></div>
   <span style="font-size:11px;color:var(--text-muted);" id="dqTopSummary"></span>
   <div class="topbar-sep"></div>
-  <button class="btn-dq btn-dq-ghost" onclick="dqRefresh()" style="padding:4px 10px;"><i class="fas fa-sync-alt"></i> Refresh</button>
+  <span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);" id="dqLastRefreshLabel"></span>
+  <button class="btn-dq btn-dq-ghost" id="dqBtnRefresh" style="padding:4px 10px;"><i class="fas fa-rotate"></i> Refresh</button>
+  <div style="display:flex;align-items:center;gap:6px;margin-left:4px;border-left:1px solid var(--border);padding-left:10px;">
+    <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:var(--text-muted);font-weight:600;white-space:nowrap;user-select:none;">
+      <input type="checkbox" id="dqAutoRefreshToggle" style="width:14px;height:14px;accent-color:var(--primary);cursor:pointer;margin:0;"> Auto
+    </label>
+    <select id="dqAutoRefreshInterval" style="padding:3px 6px;border-radius:6px;border:1px solid var(--border);font-size:10px;font-family:var(--mono);color:var(--text-muted);background:var(--bg-card);cursor:pointer;outline:none;">
+      <option value="10">10s</option>
+      <option value="30" selected>30s</option>
+      <option value="60">60s</option>
+      <option value="300">5m</option>
+    </select>
+  </div>
 </header>
 
 <!-- ═══ KIND BAR — Secondary Nav ═══ -->
@@ -861,6 +882,24 @@ function dqUpdateIntelPanel() {
   var sumEl = document.getElementById('dqTopSummary');
   if (sumEl) {
     sumEl.innerHTML = '<strong style="color:var(--text-color);">' + nTables + '</strong> tables · <strong style="color:var(--text-color);">' + nChecked + '</strong> checked' + (totalAnomalies > 0 ? ' · <strong style="color:var(--error);">' + totalAnomalies + '</strong> anomalies' : '');
+  }
+
+  // Topbar status badge
+  var badge = document.getElementById('dqTopStatusBadge');
+  if (badge) {
+    if (avgScore === null) {
+      badge.className = 'topbar-badge loading';
+      badge.innerHTML = '<i class="fas fa-circle-notch pulsing"></i> No data';
+    } else if (countCrit > 0) {
+      badge.className = 'topbar-badge crit';
+      badge.innerHTML = '<i class="fas fa-circle-exclamation"></i> ' + countCrit + ' critical';
+    } else if (countWarn > 0 || totalAnomalies > 0) {
+      badge.className = 'topbar-badge warn';
+      badge.innerHTML = '<i class="fas fa-triangle-exclamation"></i> ' + (countWarn + totalAnomalies) + ' warning' + ((countWarn + totalAnomalies) !== 1 ? 's' : '');
+    } else {
+      badge.className = 'topbar-badge ok';
+      badge.innerHTML = '<i class="fas fa-check-circle"></i> Healthy';
+    }
   }
 
   // Kind bar overview count
@@ -1899,12 +1938,41 @@ function dqEsc(s) {
 }
 
 function dqRefresh() {
+  var lbl = document.getElementById('dqLastRefreshLabel');
+  if (lbl) lbl.textContent = 'Refreshing…';
   dqLoadOverview();
   dqLoadRules();
   dqLoadChecks();
   dqLoadSchedule();
   dqPopulateHistoryTableSelect();
+  setTimeout(function() {
+    if (lbl) {
+      var now = new Date();
+      lbl.textContent = 'Updated ' + ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2) + ':' + ('0' + now.getSeconds()).slice(-2);
+    }
+  }, 600);
 }
+
+// ── Auto-refresh wiring ──────────────────────────────────────
+var _dqAutoTimer = null, _dqAutoRunning = false;
+function _dqStartAutoRefresh() {
+  _dqStopAutoRefresh();
+  var sec = parseInt((document.getElementById('dqAutoRefreshInterval') || {}).value) || 30;
+  _dqAutoTimer = setInterval(function() {
+    if (_dqAutoRunning) return;
+    _dqAutoRunning = true;
+    try { dqRefresh(); } finally { setTimeout(function() { _dqAutoRunning = false; }, 2000); }
+  }, sec * 1000);
+}
+function _dqStopAutoRefresh() { if (_dqAutoTimer) { clearInterval(_dqAutoTimer); _dqAutoTimer = null; } _dqAutoRunning = false; }
+(function() {
+  var toggle = document.getElementById('dqAutoRefreshToggle');
+  var interval = document.getElementById('dqAutoRefreshInterval');
+  var btn = document.getElementById('dqBtnRefresh');
+  if (toggle) toggle.addEventListener('change', function() { if (this.checked) _dqStartAutoRefresh(); else _dqStopAutoRefresh(); });
+  if (interval) interval.addEventListener('change', function() { if (toggle && toggle.checked) _dqStartAutoRefresh(); });
+  if (btn) btn.addEventListener('click', function() { dqRefresh(); });
+})();
 
 // ── Init ─────────────────────────────────────────────────────
 if (DQ_ORG && DQ_SUP) {
@@ -1912,6 +1980,15 @@ if (DQ_ORG && DQ_SUP) {
   dqLoadRules();
   dqLoadChecks();
   dqLoadSchedule();
+
+  // Set initial refresh timestamp
+  setTimeout(function() {
+    var lbl = document.getElementById('dqLastRefreshLabel');
+    if (lbl) {
+      var now = new Date();
+      lbl.textContent = 'Updated ' + ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2) + ':' + ('0' + now.getSeconds()).slice(-2);
+    }
+  }, 800);
 
   // Fetch available roles for the role selector
   fetch('/api/v1/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))
