@@ -24,12 +24,16 @@
   --radius:10px;--radius-sm:6px;--transition:all .2s cubic-bezier(.25,.8,.25,1);
 }
 *{box-sizing:border-box;margin:0;padding:0;}
-html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow-x:hidden;}
-.content-container{margin-left:280px;min-height:100vh;background:var(--bg);transition:var(--transition);padding-bottom:40px;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow:hidden;}
+.content-container{margin-left:280px;height:100vh;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);transition:var(--transition);}
 .sidebar-collapsed ~ .content-container{margin-left:80px;}
-.wrap{max-width:1200px;margin:0 auto;padding:24px;}
-.page-hdr{display:flex;align-items:center;gap:12px;margin-bottom:20px;justify-content:space-between;}
-.page-title{font-size:20px;font-weight:800;display:flex;align-items:center;gap:10px;}
+.cc-topbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:46px;}
+.sh-scroll{flex:1;overflow-y:auto;padding:16px 20px;}
+.sh-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;}
+.sh-badge-ok{background:var(--success-bg);color:var(--success);}
+.sh-badge-loading{background:var(--bg-surface);color:var(--text-muted);}
+@keyframes sh-spin{to{transform:rotate(360deg);}}
+.sh-spin{animation:sh-spin 1s linear infinite;}
 .btn-sm{padding:6px 14px;font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-card);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:var(--transition);}
 .btn-sm:hover{border-color:var(--primary);color:var(--primary);}
 .btn-primary{background:var(--primary);color:#fff;border-color:var(--primary);}
@@ -75,40 +79,37 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <body>
 {% include "sidebar.html" %}
 <div class="content-container">
-<div class="wrap">
-  <div class="page-hdr">
-    <div class="page-title"><i class="fas fa-share-nodes" style="color:var(--primary);"></i> Data Sharing</div>
-  </div>
 
-  <div class="tab-bar">
-    <button class="tab-btn active" data-pane="provider"><i class="fas fa-upload"></i> Shared by me</button>
-    <button class="tab-btn" data-pane="consumer"><i class="fas fa-download"></i> Shared with me</button>
-  </div>
+  <header class="cc-topbar">
+    <span style="font-size:11px;color:var(--text-muted);">Data sharing</span>
+    <span id="shStatusBadge" class="sh-badge sh-badge-loading"><i class="fas fa-circle-notch sh-spin"></i> Loading…</span>
+    <div style="flex:1;"></div>
+    <button class="btn-sm btn-primary" onclick="openCreateShare()"><i class="fas fa-plus"></i> Create share</button>
+    <button class="btn-sm" onclick="openLinkShare()"><i class="fas fa-link"></i> Link external</button>
+  </header>
 
-  <!-- Provider pane -->
-  <div class="pane active" id="pane-provider">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-      <div class="section-hdr" style="margin:0;"><i class="fas fa-upload" style="color:var(--primary);"></i> Outgoing shares</div>
-      <button class="btn-sm btn-primary" onclick="openCreateShare()"><i class="fas fa-plus"></i> Create share</button>
+  <div class="sh-scroll">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-pane="provider"><i class="fas fa-upload"></i> Shared by me</button>
+      <button class="tab-btn" data-pane="consumer"><i class="fas fa-download"></i> Shared with me</button>
     </div>
-    <div id="sharesList"></div>
-  </div>
 
-  <!-- Consumer pane -->
-  <div class="pane" id="pane-consumer">
-  {% if sel_sup %}
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-      <div class="section-hdr" style="margin:0;"><i class="fas fa-download" style="color:var(--primary);"></i> Linked shares <span style="font-weight:400;font-size:12px;color:var(--text-muted);margin-left:6px;">{{ sel_sup }}</span></div>
-      <button class="btn-sm btn-primary" onclick="openLinkShare()"><i class="fas fa-link"></i> Link external share</button>
+    <!-- Provider pane -->
+    <div class="pane active" id="pane-provider">
+      <div id="sharesList"></div>
     </div>
-    <div id="linksList"></div>
-  {% else %}
-    <div style="padding:40px;text-align:center;">
-      <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable from the sidebar to view linked shares</div>
+
+    <!-- Consumer pane -->
+    <div class="pane" id="pane-consumer">
+    {% if sel_sup %}
+      <div id="linksList"></div>
+    {% else %}
+      <div style="padding:40px;text-align:center;">
+        <div style="font-size:15px;font-weight:600;margin-bottom:12px;">Select a SuperTable from the sidebar to view linked shares</div>
+      </div>
+    {% endif %}
     </div>
-  {% endif %}
   </div>
-</div>
 </div>
 
 <!-- Create Share Modal -->
@@ -252,6 +253,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         h+='</div></div></div>';
       });
       el.innerHTML=h;
+      var badge=document.getElementById("shStatusBadge");
+      if(badge){badge.className="sh-badge sh-badge-ok";badge.innerHTML='<i class="fas fa-share-nodes"></i> '+shares.length+' share'+(shares.length!==1?'s':'');}
     }catch(e){el.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
   }
 

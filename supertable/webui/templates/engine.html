@@ -30,6 +30,33 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 .cc-topbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:46px;}
 .topbar-sep{width:1px;height:20px;background:var(--border);flex-shrink:0;}
+
+.eng-scroll{flex:1;overflow-y:auto;padding:16px 20px;}
+.eng-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;max-width:1200px;}
+.eng-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;transition:var(--transition);}
+.eng-card:hover{border-color:var(--primary);box-shadow:0 2px 8px rgba(28,150,202,.08);}
+.eng-card-hdr{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+.eng-card-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;border:1px solid;}
+.eng-card-name{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.eng-card-sub{font-size:10px;color:var(--text-muted);font-family:var(--mono);margin-top:1px;}
+.eng-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-bottom:8px;}
+.eng-chip-ok{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
+.eng-chip-warn{background:var(--warn-bg);color:var(--warn);border:1px solid rgba(245,158,11,.2);}
+.eng-chip-err{background:var(--error-bg);color:var(--error);border:1px solid rgba(239,68,68,.2);}
+.eng-chip-blue{background:var(--primary-light);color:var(--primary);border:1px solid rgba(28,150,202,.2);}
+.eng-chip-purple{background:rgba(124,58,237,.06);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
+.eng-kv{display:flex;justify-content:space-between;padding:3px 0;font-size:11px;}
+.eng-kv .k{color:var(--text-sec);}
+.eng-kv .v{font-weight:600;font-family:var(--mono);color:var(--text);}
+.eng-card-actions{display:flex;gap:4px;margin-top:auto;padding-top:10px;border-top:1px solid var(--border-light);}
+.eng-card-actions .btn-sm{flex:1;justify-content:center;font-size:11px;padding:5px 0;}
+.eng-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;}
+.eng-badge-ok{background:var(--success-bg);color:var(--success);}
+.eng-badge-warn{background:var(--warn-bg);color:var(--warn);}
+.eng-badge-err{background:var(--error-bg);color:var(--error);}
+.eng-badge-loading{background:var(--bg-surface);color:var(--text-muted);}
+@keyframes eng-spin{to{transform:rotate(360deg);}}
+.eng-spin{animation:eng-spin 1s linear infinite;}
 .super-sel{display:flex;align-items:center;gap:6px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0 4px 0 10px;font-size:13px;font-weight:600;}
 .super-sel select{border:none;background:transparent;color:var(--text);font-weight:600;font-size:13px;font-family:var(--font);padding:6px 4px;outline:none;cursor:pointer;min-width:120px;}
 .role-pill{display:flex;align-items:center;gap:5px;background:#ecfdf5;border:1px solid rgba(16,185,129,.25);border-radius:999px;padding:4px 10px;}
@@ -149,63 +176,18 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <div id="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
 
   <header class="cc-topbar">
-    <span style="font-size:11px;color:var(--text-muted);">SQL Engine</span>
+    <span style="font-size:11px;color:var(--text-muted);">Engine</span>
+    <span id="engStatusBadge" class="eng-badge eng-badge-loading"><i class="fas fa-circle-notch eng-spin"></i> Loading…</span>
     <div style="flex:1;"></div>
+    <span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);" id="engLastRefresh"></span>
+    <button class="btn-sm" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+    <button class="btn-sm btn-primary" id="btnNewEngine"><i class="fas fa-plus"></i> Add Spark pool</button>
   </header>
 
-  <div class="page-title-bar">
-    <div class="page-title-icon"><i class="fas fa-bolt"></i></div>
-    <span class="page-title-text">SQL Engines</span>
-    <span class="page-title-sub">Spark Thrift JDBC/ODBC connections</span>
-    <div style="flex:1;"></div>
-    <button class="btn-accent" id="btnNewEngine"><i class="fas fa-plus"></i> New SQL Engine</button>
-  </div>
-
-  <div class="cc-cols">
-    <div class="panel-left">
-      <div class="panel-hdr">
-        <span class="panel-title">SQL Engines <span id="poolTotal" style="color:var(--text-sec);font-weight:600;"></span></span>
-        <button class="btn-sm" style="padding:3px 6px;font-size:11px;" id="btnRefresh" title="Refresh"><i class="fas fa-rotate"></i></button>
-      </div>
-      <div class="swrap"><i class="fas fa-search"></i><input id="poolSearch" placeholder="Search engines…"/></div>
-      <div class="pool-list" id="poolList"></div>
-      <div id="poolEmpty" style="display:none;padding:14px;color:var(--text-muted);font-size:12px;text-align:center;">No SQL engines configured.</div>
-    </div>
-
-    <div class="cc-center">
-      <div class="detail-header" id="detailHeader">
-        <div>
-          <div class="detail-title" id="detailTitle"><i class="fas fa-bolt" style="color:var(--amber);"></i> <span id="detailName">—</span></div>
-          <div class="detail-meta" id="detailMeta"></div>
-        </div>
-        <div style="display:flex;gap:6px;" id="detailActions"></div>
-      </div>
-      <div class="detail-area" id="detailArea">
-        <div id="detailContent"></div>
-        <div id="detailEmpty" class="detail-empty"><i class="fas fa-bolt"></i><div style="font-size:14px;font-weight:600;">Select a SQL Engine</div><div style="font-size:12px;">Click an engine from the list to view its configuration.</div></div>
-      </div>
-    </div>
-
-    <div class="panel-right">
-      <div class="stat-card">
-        <div class="stat-card-title"><i class="fas fa-bolt" style="color:var(--amber);"></i> Engine Overview</div>
-        <div class="stat-row"><span class="label">Total engines</span><span class="val" id="rightTotal">—</span></div>
-        <div class="stat-row"><span class="label">Active</span><span class="val" style="color:var(--success);" id="rightActive">—</span></div>
-        <div class="stat-row"><span class="label">Draining</span><span class="val" style="color:var(--warn);" id="rightDraining">—</span></div>
-        <div class="stat-row"><span class="label">Offline</span><span class="val" style="color:var(--error);" id="rightOffline">—</span></div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-title"><i class="fas fa-circle-check" style="color:var(--success);"></i> Connectivity</div>
-        <div id="rightHealth"></div>
-      </div>
-      <div class="stat-card" id="duckdbConfigCard">
-        <div class="duckdb-hdr">
-          <div class="stat-card-title" style="margin-bottom:0;"><i class="fas fa-database" style="color:var(--purple);"></i> DuckDB Config</div>
-          <button class="btn-edit-cfg" id="btnEditDuckdbCfg" title="Edit configuration"><i class="fas fa-pen"></i></button>
-        </div>
-        <div id="duckdbConfigBody" style="margin-top:8px;">
-          <div style="font-size:11px;color:var(--text-muted);padding:8px 0;">Loading…</div>
-        </div>
+  <div class="eng-scroll">
+    <div class="eng-grid" id="engineGrid">
+      <div style="padding:40px;text-align:center;color:var(--text-muted);grid-column:1/-1;">
+        <i class="fas fa-circle-notch eng-spin" style="font-size:20px;margin-bottom:8px;display:block;"></i> Loading engines…
       </div>
     </div>
   </div>
@@ -284,93 +266,98 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   function filteredPools(){var items=pools;var q=(searchQ||"").trim().toLowerCase();if(q)items=items.filter(function(p){return(p.name||"").toLowerCase().indexOf(q)>=0||(p.thrift_host||"").toLowerCase().indexOf(q)>=0;});return items;}
 
-  // ---- Pool list ----
-  function renderPoolList(){
-    var wrap=document.getElementById("poolList"),empty=document.getElementById("poolEmpty"),total=document.getElementById("poolTotal");
-    if(!wrap)return;var items=filteredPools();
-    if(total)total.textContent="("+items.length+")";
-    wrap.innerHTML="";if(empty)empty.style.display=items.length?"none":"block";
-    items.forEach(function(p,i){
+  // ---- Engine Cards ----
+  function renderEngineCards(){
+    var grid=document.getElementById("engineGrid");
+    if(!grid)return;
+    var html="";
+
+    // DuckDB Lite card
+    var liteCfg=duckdbCfg||{};
+    var liteMax=liteCfg.engine_lite_max_bytes?liteCfg.engine_lite_max_bytes:{};
+    var lMem=liteCfg.duckdb_memory_limit?liteCfg.duckdb_memory_limit:{};
+    var lCache=liteCfg.duckdb_external_cache_size?liteCfg.duckdb_external_cache_size:{};
+    var lIO=liteCfg.duckdb_io_multiplier?liteCfg.duckdb_io_multiplier:{};
+    html+='<div class="eng-card">';
+    html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(124,58,237,.06);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-bolt"></i></div><div><div class="eng-card-name">DuckDB Lite</div><div class="eng-card-sub">In-process, ephemeral</div></div></div>';
+    html+='<div class="eng-chip eng-chip-purple"><i class="fas fa-circle" style="font-size:5px;"></i> Primary · ≤ '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</div>';
+    html+='<div class="eng-kv"><span class="k">Memory</span><span class="v">'+(lMem.value||"1GB")+'</span></div>';
+    html+='<div class="eng-kv"><span class="k">Cache</span><span class="v">'+(lCache.value||"off")+'</span></div>';
+    html+='<div class="eng-kv"><span class="k">IO multiplier</span><span class="v">×'+(lIO.value||"3")+'</span></div>';
+    html+='<div class="eng-card-actions"><button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button></div>';
+    html+='</div>';
+
+    // DuckDB Pro card
+    var freshCfg=liteCfg.engine_freshness_sec?liteCfg.engine_freshness_sec:{};
+    html+='<div class="eng-card">';
+    html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(28,150,202,.06);border-color:rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-database"></i></div><div><div class="eng-card-name">DuckDB Pro</div><div class="eng-card-sub">Persistent, cached views</div></div></div>';
+    html+='<div class="eng-chip eng-chip-blue"><i class="fas fa-circle" style="font-size:5px;"></i> Cached · stable data</div>';
+    html+='<div class="eng-kv"><span class="k">Freshness</span><span class="v">'+(freshCfg.value||"300")+'s</span></div>';
+    html+='<div class="eng-kv"><span class="k">Memory</span><span class="v">'+(lMem.value||"1GB")+'</span></div>';
+    html+='<div class="eng-kv"><span class="k">Threshold</span><span class="v">> '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</span></div>';
+    html+='<div class="eng-card-actions"><button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button></div>';
+    html+='</div>';
+
+    // Spark pool cards
+    var items=filteredPools();
+    items.forEach(function(p){
       var cs=connStatus[p.id]||"unknown";
-      var div=document.createElement("div");
-      div.className="pool-item"+(selectedPool&&selectedPool.id===p.id?" active":"")+" fade-in";
-      div.style.animationDelay=(i*0.03)+"s";
-      div.innerHTML='<div class="picon"><i class="fas fa-bolt"></i></div>'+
-        '<div class="pmeta"><div class="pname">'+esc(p.name||"Engine")+'</div>'+
-        '<div class="pinfo">'+esc(p.thrift_host||"—")+':'+esc(String(p.thrift_port||10000))+'</div></div>'+
-        '<div class="pright">'+
-        '<button class="ptest-btn" data-pool-id="'+esc(p.id)+'" title="Test connection"><i class="fas fa-plug-circle-check"></i></button>'+
-        '<span class="conn-dot '+cs+'" data-dot-id="'+esc(p.id)+'" title="'+esc(cs)+'"></span>'+
-        '</div>';
-      div.querySelector(".pmeta").addEventListener("click",function(){selectPool(p);});
-      div.querySelector(".picon").addEventListener("click",function(){selectPool(p);});
-      div.querySelector(".ptest-btn").addEventListener("click",function(ev){ev.stopPropagation();testPoolInline(p);});
-      wrap.appendChild(div);
+      var statusColor=p.status==="active"?"var(--success)":p.status==="draining"?"var(--warn)":"var(--error)";
+      var chipCls=p.status==="active"?"eng-chip-ok":p.status==="draining"?"eng-chip-warn":"eng-chip-err";
+      var connLabel=cs==="ok"?"Connected":cs==="fail"?"Failed":cs==="testing"?"Testing…":"Not tested";
+      var connIcon=cs==="ok"?"fa-check-circle":cs==="fail"?"fa-times-circle":cs==="testing"?"fa-circle-notch eng-spin":"fa-circle";
+      var connColor=cs==="ok"?"var(--success)":cs==="fail"?"var(--error)":"var(--text-muted)";
+      html+='<div class="eng-card" data-pool-id="'+esc(p.id)+'">';
+      html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(217,119,6,.06);border-color:rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-server"></i></div><div><div class="eng-card-name">'+esc(p.name||"Spark Pool")+'</div><div class="eng-card-sub">'+esc(p.thrift_host||"—")+':'+esc(String(p.thrift_port||10000))+'</div></div></div>';
+      html+='<div class="eng-chip '+chipCls+'"><i class="fas fa-circle" style="font-size:5px;"></i> '+esc(p.status||"active")+'</div>';
+      html+='<div class="eng-kv"><span class="k">Connection</span><span class="v" style="color:'+connColor+';display:flex;align-items:center;gap:4px;"><i class="fas '+connIcon+'" style="font-size:9px;"></i> '+connLabel+'</span></div>';
+      if(p.min_bytes)html+='<div class="eng-kv"><span class="k">Min size</span><span class="v">'+fmtBytes(p.min_bytes)+'</span></div>';
+      if(p.max_bytes)html+='<div class="eng-kv"><span class="k">Max size</span><span class="v">'+fmtBytes(p.max_bytes)+'</span></div>';
+      html+='<div class="eng-card-actions">';
+      html+='<button class="btn-sm eng-edit-pool" data-pid="'+esc(p.id)+'"><i class="fas fa-pen"></i> Edit</button>';
+      html+='<button class="btn-sm eng-test-pool" data-pid="'+esc(p.id)+'"><i class="fas fa-plug-circle-check"></i> Test</button>';
+      html+='<button class="btn-sm eng-del-pool" data-pid="'+esc(p.id)+'" style="color:var(--error);"><i class="fas fa-trash"></i></button>';
+      html+='</div></div>';
     });
+
+    grid.innerHTML=html;
+
+    // Wire card buttons
+    grid.querySelectorAll(".eng-cfg-duckdb").forEach(function(btn){btn.addEventListener("click",function(){openDuckdbModal();});});
+    grid.querySelectorAll(".eng-edit-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p)openSqlModal(p);});});
+    grid.querySelectorAll(".eng-test-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p){testPoolInline(p);toast("Testing "+p.name+"…");}});});
+    grid.querySelectorAll(".eng-del-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p)deletePool(p);});});
+
+    // Update topbar badge
+    updateEngBadge();
+
+    // Update refresh label
+    var lbl=document.getElementById("engLastRefresh");
+    if(lbl){var now=new Date();lbl.textContent="Updated "+("0"+now.getHours()).slice(-2)+":"+("0"+now.getMinutes()).slice(-2)+":"+("0"+now.getSeconds()).slice(-2);}
   }
 
-  function selectPool(p){selectedPool=p;renderPoolList();renderDetail();}
+  function updateEngBadge(){
+    var badge=document.getElementById("engStatusBadge");if(!badge)return;
+    var total=2+pools.length;
+    var ok=2;// DuckDB Lite + Pro always online
+    pools.forEach(function(p){if(connStatus[p.id]==="ok")ok++;});
+    var tested=Object.keys(connStatus).length;
+    if(!pools.length&&!tested){badge.className="eng-badge eng-badge-ok";badge.innerHTML='<i class="fas fa-check-circle"></i> '+total+' engines online';}
+    else if(ok===total){badge.className="eng-badge eng-badge-ok";badge.innerHTML='<i class="fas fa-check-circle"></i> '+ok+'/'+total+' online';}
+    else{badge.className="eng-badge eng-badge-warn";badge.innerHTML='<i class="fas fa-triangle-exclamation"></i> '+ok+'/'+total+' online';}
+  }
 
   // ---- Test ----
   async function testPoolInline(p){
-    var c=ctx();connStatus[p.id]="testing";updateDot(p.id,"testing");
+    var c=ctx();connStatus[p.id]="testing";renderEngineCards();
     try{
       var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:p.thrift_host||"",thrift_port:p.thrift_port||10000};
       var js=await postJSON("/api/v1/compute/test-connection",payload);
       connStatus[p.id]=js&&js.ok?"ok":"fail";
     }catch(e){connStatus[p.id]="fail";}
-    updateDot(p.id,connStatus[p.id]);
-    renderRight();
+    renderEngineCards();
   }
-  function updateDot(poolId,status){document.querySelectorAll('[data-dot-id="'+poolId+'"]').forEach(function(d){d.className="conn-dot "+status;d.title=status;});}
   function testAllPools(){pools.forEach(function(p){testPoolInline(p);});}
-
-  // ---- Detail ----
-  function renderDetail(){
-    var content=document.getElementById("detailContent"),empty=document.getElementById("detailEmpty"),nameEl=document.getElementById("detailName"),metaEl=document.getElementById("detailMeta"),actions=document.getElementById("detailActions");
-    if(!selectedPool){if(content)content.innerHTML="";if(empty)empty.style.display="flex";if(nameEl)nameEl.textContent="—";if(metaEl)metaEl.textContent="";if(actions)actions.innerHTML="";return;}
-    var p=selectedPool;if(empty)empty.style.display="none";
-    if(nameEl)nameEl.textContent=p.name||"Engine";
-    if(metaEl)metaEl.textContent="ID: "+(p.id||"—");
-
-    var btns='<button class="btn-sm btn-test" id="detailTest"><i class="fas fa-plug-circle-check"></i> Test</button>';
-    btns+='<button class="btn-sm" id="detailEdit"><i class="fas fa-pen"></i> Edit</button>';
-    btns+='<button class="btn-sm btn-danger" id="detailDelete"><i class="fas fa-trash"></i> Delete</button>';
-    if(actions)actions.innerHTML=btns;
-    document.getElementById("detailTest").addEventListener("click",function(){testPoolInline(p);toast("Testing "+p.name+"…");});
-    document.getElementById("detailEdit").addEventListener("click",function(){openSqlModal(p);});
-    document.getElementById("detailDelete").addEventListener("click",function(){deletePool(p);});
-
-    var cs=connStatus[p.id]||"unknown";
-    var html='<div class="config-grid">';
-    html+='<div class="config-card full"><div class="cl">Connection</div><div class="cv" style="display:flex;align-items:center;gap:8px;"><span class="conn-dot '+cs+'" data-dot-id="'+esc(p.id)+'"></span> '+(cs==="ok"?"Connected":cs==="fail"?"Failed":cs==="testing"?"Testing…":"Not tested")+"</div></div>";
-    html+='<div class="config-card"><div class="cl">Status</div><div class="cv"><span class="conn-dot '+(p.status||"active")+'" style="display:inline-block;margin-right:6px;width:8px;height:8px;border-radius:50%;background:'+(p.status==="active"?"var(--success)":p.status==="draining"?"var(--warn)":"var(--error)")+';"></span>'+esc(p.status||"active")+"</div></div>";
-    html+='<div class="config-card"><div class="cl">Thrift Host</div><div class="cv">'+esc(p.thrift_host||"—")+"</div></div>";
-    html+='<div class="config-card"><div class="cl">Thrift Port</div><div class="cv">'+esc(String(p.thrift_port||10000))+"</div></div>";
-    html+='<div class="config-card"><div class="cl">Min Size</div><div class="cv">'+(p.min_bytes?((p.min_bytes/1e6).toFixed(1)+" MB"):"—")+"</div></div>";
-    html+='<div class="config-card"><div class="cl">Max Size</div><div class="cv">'+(p.max_bytes?((p.max_bytes/1e6).toFixed(1)+" MB"):"unlimited")+"</div></div>";
-    html+="</div>";
-    if(content)content.innerHTML=html;
-  }
-
-  // ---- Right panel ----
-  function renderRight(){
-    var total=pools.length,active=0,draining=0,offline=0,tested=0,ok=0;
-    pools.forEach(function(p){if((p.status||"active")==="active")active++;else if(p.status==="draining")draining++;else offline++;var cs=connStatus[p.id];if(cs==="ok"||cs==="fail")tested++;if(cs==="ok")ok++;});
-    document.getElementById("rightTotal").textContent=String(total);
-    document.getElementById("rightActive").textContent=String(active);
-    document.getElementById("rightDraining").textContent=String(draining);
-    document.getElementById("rightOffline").textContent=String(offline);
-
-    var pct=tested?Math.round(ok/tested*100):0;
-    var color=pct>=80?"var(--success)":pct>=50?"var(--warn)":"var(--error)";
-    if(!tested)color="var(--text-muted)";
-    document.getElementById("rightHealth").innerHTML=
-      '<div class="stat-row"><span class="label">Tested</span><span class="val">'+tested+'/'+total+'</span></div>'+
-      '<div class="stat-row"><span class="label">Reachable</span><span class="val" style="color:'+color+';">'+ok+'/'+tested+'</span></div>'+
-      '<div style="height:6px;border-radius:3px;background:var(--bg-surface);margin-top:6px;overflow:hidden;border:1px solid var(--border-light);"><div style="height:100%;border-radius:3px;width:'+(tested?pct:0)+'%;background:'+color+';transition:width .6s;"></div></div>'+
-      '<div style="margin-top:6px;font-size:10px;color:var(--text-muted);">All engines are tested on load. Click <i class="fas fa-plug-circle-check"></i> to re-test.</div>';
-  }
 
   // ---- Data (reuses /api/v1/compute/pools/* endpoints, filters to spark-thrift) ----
   async function loadPools(){
@@ -379,7 +366,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var all=js&&js.data&&Array.isArray(js.data.items)?js.data.items:[];
     pools=all.filter(function(p){return p.kind==="spark-thrift";});
     if(selectedPool){var found=pools.find(function(p){return p.id===selectedPool.id;});selectedPool=found||null;}
-    renderPoolList();renderDetail();renderRight();testAllPools();
+    renderEngineCards();testAllPools();
   }
   async function upsertPool(pool){var c=ctx();await postJSON("/api/v1/compute/upsert",{org:c.org,sup:c.sup,item:pool});await loadPools();}
   async function deletePool(pool){var c=ctx();if(!confirm("Delete engine '"+pool.name+"'?"))return;await del("/api/v1/compute/pools/"+enc(pool.id)+"?org="+enc(c.org)+"&sup="+enc(c.sup));if(selectedPool&&selectedPool.id===pool.id)selectedPool=null;delete connStatus[pool.id];await loadPools();toast("Deleted");}
@@ -406,8 +393,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   document.getElementById("modalSql").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalSql"))sqlModalHide();});
 
   document.getElementById("btnNewEngine").addEventListener("click",function(){openSqlModal(null);});
-  document.getElementById("poolSearch").addEventListener("input",function(ev){searchQ=ev.target.value||"";renderPoolList();});
-  document.getElementById("btnRefresh").addEventListener("click",function(){connStatus={};loadPools().catch(function(e){toast(e.message);});});
+  document.getElementById("btnRefresh").addEventListener("click",function(){connStatus={};loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();});
 
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"){var el=document.getElementById("modalSql");if(el&&el.style.display==="flex")el.style.display="none";var el2=document.getElementById("modalDuckdb");if(el2&&el2.style.display==="flex")el2.style.display="none";}});
 
@@ -437,22 +423,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   function srcBadge(s){return '<span class="src-badge '+esc(s)+'">'+esc(s)+'</span>';}
 
   function renderDuckdbConfig(){
-    var body=document.getElementById("duckdbConfigBody");
-    if(!body)return;
-    if(!duckdbCfg){body.innerHTML='<div style="font-size:11px;color:var(--text-muted);padding:4px 0;">Not loaded</div>';return;}
-    var html='<div class="cfg-section-title">Auto-Pick</div>';
-    DC_FIELDS.forEach(function(f,i){
-      if(i===3)html+='<div class="cfg-section-title" style="margin-top:4px;">Connection</div>';
-      var c=duckdbCfg[f.key]||{};
-      var val=c.value||"";
-      var src=c.source||"default";
-      html+='<div class="cfg-row"><span class="label">'+esc(f.label)+'</span><span class="val">'+esc(f.fmt(val))+' '+srcBadge(src)+'</span></div>';
-    });
-    if(duckdbCfg.modified_ms){
-      var d=new Date(duckdbCfg.modified_ms);
-      html+='<div style="margin-top:8px;font-size:9px;color:var(--text-muted);border-top:1px solid var(--border-light);padding-top:4px;">Last saved: '+d.toLocaleString()+'</div>';
-    }
-    body.innerHTML=html;
+    // DuckDB config is rendered inline in the engine cards
+    renderEngineCards();
   }
 
   async function loadDuckdbConfig(){
@@ -499,7 +471,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     }
   }
 
-  document.getElementById("btnEditDuckdbCfg").addEventListener("click",function(){openDuckdbModal();});
   document.getElementById("btnDuckdbClose").addEventListener("click",function(e){e.preventDefault();closeDuckdbModal();});
   document.getElementById("btnDuckdbCancel").addEventListener("click",function(e){e.preventDefault();closeDuckdbModal();});
   document.getElementById("modalDuckdb").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalDuckdb"))closeDuckdbModal();});

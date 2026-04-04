@@ -171,6 +171,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   <header class="cc-topbar">
     <span style="font-size:11px;color:var(--text-muted);">Security</span>
+    <span id="secStatusBadge" style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;background:var(--bg-surface);color:var(--text-muted);"></span>
     <div style="flex:1;"></div>
   </header>
 
@@ -502,7 +503,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     }
   }
 
-  function renderAll(){renderSectionBar();renderList();renderDetail();renderRight();}
+  function renderAll(){renderSectionBar();renderList();renderDetail();renderRight();var b=document.getElementById("secStatusBadge");if(b){b.style.background="rgba(16,185,129,.08)";b.style.color="#059669";b.innerHTML='<i class="fas fa-shield-halved"></i> '+allRoles.length+' roles · '+allUsers.length+' users';}}
 
   // Data loading
   async function loadRoles(){var c=ctx();try{var d=await apiGet("/api/v1/rbac/roles?organization="+enc(c.org)+"&super_name="+enc(c.sup));allRoles=(d&&d.data&&d.data.items)?d.data.items:[];}catch(e){allRoles=[];toast("Roles: "+e.message);}}

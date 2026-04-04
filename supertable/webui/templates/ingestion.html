@@ -261,7 +261,7 @@ html, body {
 
   {% if has_tenant %}
 
-  <select id="pairSel">
+  <select id="pairSel" style="display:none;">
     {% for t in tenants %}
     <option value="{{ t.sup }}" {% if t.selected %}selected{% endif %}>{{ t.sup }}</option>
     {% endfor %}
