@@ -28,14 +28,17 @@ logger = logging.getLogger(__name__)
 
 def _col_category(col_type: str) -> str:
     t = (col_type or "").lower()
-    if re.search(r"(int|bigint|smallint|long|decimal|float|double|numeric|real)", t):
-        return "numeric"
-    if re.search(r"(date|time|timestamp)", t):
+    # Check string-like types first to avoid substring false positives
+    # (e.g. "VARCHAR" contains no numeric substring, but ordering matters
+    #  for less common types).
+    if re.search(r"(char|string|text|varchar)", t):
+        return "string"
+    if re.search(r"(date|time|timestamp|interval)", t):
         return "date"
     if re.search(r"(bool)", t):
         return "bool"
-    if re.search(r"(char|string|text|varchar)", t):
-        return "string"
+    if re.search(r"(int|bigint|smallint|long|decimal|float|double|numeric|real)", t):
+        return "numeric"
     return "other"
 
 
@@ -78,15 +81,20 @@ def build_quick_sql(
 
         # Numeric / date: min, max
         if cat in ("numeric", "date"):
-            parts.append(f"MIN({q}) AS __min_{s}")
-            parts.append(f"MAX({q}) AS __max_{s}")
+            if cat == "numeric":
+                # TRY_CAST guards against schema-vs-Parquet type mismatches
+                parts.append(f"MIN(TRY_CAST({q} AS DOUBLE)) AS __min_{s}")
+                parts.append(f"MAX(TRY_CAST({q} AS DOUBLE)) AS __max_{s}")
+            else:
+                parts.append(f"MIN({q}) AS __min_{s}")
+                parts.append(f"MAX({q}) AS __max_{s}")
 
         # Numeric only: mean, stddev, zero count, negative count
         if cat == "numeric":
-            parts.append(f"AVG({q}) AS __avg_{s}")
-            parts.append(f"STDDEV({q}) AS __stddev_{s}")
-            parts.append(f"COUNT(*) FILTER (WHERE {q} = 0) AS __zero_{s}")
-            parts.append(f"COUNT(*) FILTER (WHERE {q} < 0) AS __neg_{s}")
+            parts.append(f"AVG(TRY_CAST({q} AS DOUBLE)) AS __avg_{s}")
+            parts.append(f"STDDEV(TRY_CAST({q} AS DOUBLE)) AS __stddev_{s}")
+            parts.append(f"COUNT(*) FILTER (WHERE TRY_CAST({q} AS DOUBLE) = 0) AS __zero_{s}")
+            parts.append(f"COUNT(*) FILTER (WHERE TRY_CAST({q} AS DOUBLE) < 0) AS __neg_{s}")
 
     select_clause = ",\n  ".join(parts)
     sql = f"SELECT\n  {select_clause}\nFROM {table_fqn}"

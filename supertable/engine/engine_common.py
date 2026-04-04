@@ -542,7 +542,7 @@ def rewrite_query_with_hashed_tables(
                     exp.TableAlias(this=exp.to_identifier(alias_name)),
                 )
 
-    return parsed.sql()
+    return parsed.sql(dialect="duckdb")
 
 
 # =========================================================

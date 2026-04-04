@@ -171,27 +171,7 @@
 
   #toggleSidebar:hover .logo-text { text-shadow: 0 2px 8px rgba(28, 150, 202, 0.3); }
 
-  /* ── Workspace panel ─────────────────────────────────────────── */
-
-  .sb-workspace {
-    margin: 8px 12px;
-    padding: 10px 12px;
-    border-radius: 10px;
-    background: rgba(28, 150, 202, 0.03);
-    border: 1px solid rgba(28, 150, 202, 0.08);
-    flex-shrink: 0;
-    transition: margin var(--sb-transition), padding var(--sb-transition),
-                opacity var(--sb-transition), max-height var(--sb-transition);
-  }
-
-  .sidebar-collapsed .sb-workspace {
-    margin: 4px;
-    padding: 0;
-    opacity: 0;
-    max-height: 0;
-    overflow: hidden;
-    border: none;
-  }
+  /* ── Workspace (now inside ctx-panel) ────────────────────────── */
 
   .sb-ws-label {
     font-size: 10px;
@@ -258,13 +238,8 @@
     background: rgba(28, 150, 202, 0.05);
   }
 
-  .sb-ws-refresh i {
-    transition: transform 0.5s ease;
-  }
-
-  .sb-ws-refresh:hover i {
-    transform: rotate(180deg);
-  }
+  .sb-ws-refresh i { transition: transform 0.5s ease; }
+  .sb-ws-refresh:hover i { transform: rotate(180deg); }
 
   .sb-ws-badge {
     display: flex;
@@ -280,7 +255,6 @@
   }
 
   .sb-ws-badge i { font-size: 9px; }
-
   .sb-ws-badge.hidden { display: none; }
 
   .sb-ws-badge-readonly {
@@ -448,24 +422,23 @@
 
   .sidebar-collapsed .nav-item-external::after { display: none; }
 
-  /* ── User context panel ──────────────────────────────────────── */
+  /* ── Context panel (top) ──────────────────────────────────────── */
 
   .sidebar-ctx {
-    padding: 0 15px 8px;
+    padding: 0 15px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
     gap: 0;
     transition: padding var(--sb-transition);
-    border-top: 1px solid rgba(0, 0, 0, 0.05);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
   }
 
-  .sidebar-collapsed .sidebar-ctx { padding: 0 0 8px; align-items: center; }
+  .sidebar-collapsed .sidebar-ctx { padding: 0; align-items: center; }
 
   .ctx-toggle {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     width: 100%;
     padding: 10px 10px;
     margin: 0;
@@ -474,18 +447,52 @@
     background: transparent;
     cursor: pointer;
     transition: background 0.15s ease;
+    gap: 8px;
   }
 
   .ctx-toggle:hover { background: rgba(0, 0, 0, 0.03); }
 
-  .ctx-toggle-icon {
-    font-size: 20px;
-    color: var(--primary-color, #1c96ca);
+  .ctx-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #22c55e;
     flex-shrink: 0;
-    transition: color 0.15s ease;
   }
 
-  .ctx-toggle:hover .ctx-toggle-icon { color: var(--secondary-color, #147ba3); }
+  .ctx-toggle-rolename {
+    font-size: 12px;
+    font-weight: 600;
+    color: #0f172a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    text-align: left;
+    min-width: 0;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .ctx-toggle-rolename { opacity: 0; width: 0; overflow: hidden; pointer-events: none; position: absolute; }
+  .sidebar-collapsed .ctx-toggle { justify-content: center; padding: 8px 0; }
+
+  .ctx-role-badge {
+    font-size: 9px;
+    font-weight: 700;
+    color: var(--primary-color, #1c96ca);
+    background: rgba(28, 150, 202, 0.08);
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+
+  .sidebar-collapsed .ctx-role-badge { opacity: 0; width: 0; overflow: hidden; pointer-events: none; position: absolute; }
+  .sidebar-collapsed .ctx-status-dot { display: none; }
 
   .ctx-toggle-arrow {
     font-size: 10px;
@@ -494,66 +501,60 @@
     transition: transform 0.25s ease, opacity 0.18s ease;
   }
 
-  .ctx-toggle-arrow.collapsed { transform: rotate(180deg); }
+  .ctx-toggle-arrow.collapsed { transform: rotate(-90deg); }
 
-  .ctx-toggle-username {
-    font-size: 12px;
-    font-weight: 600;
-    color: #0f172a;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    flex: 1;
-    padding-left: 10px;
-    min-width: 0;
-    text-align: left;
-    opacity: 1;
-    transition: opacity 0.18s ease;
-  }
-
-  .sidebar-collapsed .ctx-toggle-username { opacity: 0; width: 0; overflow: hidden; pointer-events: none; position: absolute; }
-  .sidebar-collapsed .ctx-toggle { justify-content: center; padding: 8px 0; }
   .sidebar-collapsed .ctx-toggle-arrow { opacity: 0; width: 0; overflow: hidden; pointer-events: none; position: absolute; }
-  .sidebar-collapsed .ctx-toggle-icon { font-size: 22px; }
 
   .ctx-panel {
     overflow: hidden;
-    max-height: 300px;
+    max-height: 400px;
     opacity: 1;
     transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
-    padding: 2px 0 4px;
   }
 
-  .ctx-panel.ctx-panel-hidden { max-height: 0; opacity: 0; padding: 0; }
-  .sidebar-collapsed .ctx-panel { max-height: 0; opacity: 0; padding: 0; pointer-events: none; }
+  .ctx-panel.ctx-panel-hidden { max-height: 0; opacity: 0; }
+  .sidebar-collapsed .ctx-panel { max-height: 0; opacity: 0; pointer-events: none; }
 
-  .ctx-row {
+  .ctx-panel-inner {
+    padding: 4px 10px 10px;
+    border-radius: 8px;
+    background: rgba(28, 150, 202, 0.03);
+    border: 1px solid rgba(28, 150, 202, 0.08);
+    margin-bottom: 8px;
+  }
+
+  .ctx-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,0,0,0.06) 20%, rgba(0,0,0,0.06) 80%, transparent);
+    margin: 8px 0;
+  }
+
+  .ctx-panel-footer {
+    padding-top: 0;
+  }
+
+  .ctx-footer-row {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 6px 10px;
-    border-radius: 6px;
-    transition: background 0.15s ease;
-    min-width: 0;
+    gap: 8px;
+    padding: 4px 0;
   }
 
-  .ctx-row:hover { background: rgba(0, 0, 0, 0.025); }
-
   .ctx-icon {
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: 10px;
     background: var(--primary-light, #e6f4fa);
     color: var(--primary-color, #1c96ca);
   }
 
   .ctx-value {
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
     color: #0f172a;
     white-space: nowrap;
@@ -563,14 +564,6 @@
     min-width: 0;
     flex: 1;
   }
-
-  .ctx-divider {
-    height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(0,0,0,0.06) 20%, rgba(0,0,0,0.06) 80%, transparent);
-    margin: 4px 10px;
-  }
-
-  .ctx-logout { padding: 2px 10px 0; }
 
   .ctx-logout-btn {
     display: flex;
@@ -623,6 +616,17 @@
   }
 
   .sidebar-collapsed .ctx-toggle:hover .ctx-toggle-tooltip { opacity: 1; }
+
+  /* In collapsed mode, show a compact icon for the context toggle */
+  .sidebar-collapsed .ctx-toggle .ctx-status-dot { display: none; }
+
+  .sidebar-collapsed .ctx-toggle::before {
+    content: '\f013';
+    font-family: 'Font Awesome 6 Free';
+    font-weight: 900;
+    font-size: 18px;
+    color: var(--primary-color, #1c96ca);
+  }
 
   /* ── kladna Soft branding ──────────────────────────────────────── */
 
@@ -728,49 +732,54 @@
     <span class="logo-stack"><span class="logo-text">Data Island <span class="logo-edition">Core</span></span><span class="logo-subtitle">Powered By SuperTable</span></span>
   </div>
 
-  <!-- ── Workspace panel ──────────────────────────────────── -->
-  <div class="sb-workspace" id="sbWorkspace">
-    <div class="sb-ws-header">
-      <div class="sb-ws-label">Workspace</div>
-      <button type="button" class="sb-ws-refresh" id="sbRefreshBtn" title="Refresh workspaces &amp; roles">
-        <i class="fas fa-arrows-rotate"></i>
-      </button>
+  <!-- ── Context panel (role + workspace) ────────────────── -->
+  <div class="sidebar-ctx" id="sidebarUserSection">
+    <button type="button" class="ctx-toggle" id="ctxToggleBtn" title="Workspace &amp; role settings">
+      <span class="ctx-status-dot"></span>
+      <span class="ctx-toggle-rolename" id="ctxToggleRoleName">—</span>
+      <span class="ctx-role-badge">role</span>
+      <i class="fas fa-chevron-down ctx-toggle-arrow" id="ctxToggleArrow"></i>
+      <span class="ctx-toggle-tooltip">Workspace</span>
+    </button>
+    <div class="ctx-panel" id="ctxPanel">
+      <div class="ctx-panel-inner">
+        <div class="sb-ws-header">
+          <div class="sb-ws-label">Workspace</div>
+          <button type="button" class="sb-ws-refresh" id="sbRefreshBtn" title="Refresh workspaces &amp; roles">
+            <i class="fas fa-arrows-rotate"></i>
+          </button>
+        </div>
+        <select class="sb-ws-select" id="sbSuperSel">
+          <option value="">Loading…</option>
+        </select>
+        <div class="sb-ws-badge hidden" id="sbWorkspaceBadge">
+          <i class="fas fa-lock" id="sbBadgeIcon"></i> <span id="sbBadgeText">Read-only</span>
+        </div>
+        <div class="sb-ws-label" style="margin-top: 6px;">Active role</div>
+        <select class="sb-ws-select" id="sbRoleSel">
+          <option value="">Loading…</option>
+        </select>
+        <div class="ctx-divider"></div>
+        <div class="ctx-panel-footer">
+          <div class="ctx-footer-row">
+            <div class="ctx-icon"><i class="fas fa-building"></i></div>
+            <span class="ctx-value" id="ctxOrgValue">—</span>
+          </div>
+          <div class="ctx-footer-row">
+            <div class="ctx-icon"><i class="fas fa-circle-user"></i></div>
+            <span class="ctx-value" id="ctxUsernameValue">—</span>
+          </div>
+          <div class="ctx-divider"></div>
+          <a href="/ui/logout" class="ctx-logout-btn" title="Sign out">
+            <i class="fas fa-arrow-right-from-bracket"></i>
+            <span>Sign out</span>
+          </a>
+        </div>
+      </div>
     </div>
-    <select class="sb-ws-select" id="sbSuperSel">
-      <option value="">Loading…</option>
-    </select>
-    <div class="sb-ws-badge hidden" id="sbWorkspaceBadge">
-      <i class="fas fa-lock" id="sbBadgeIcon"></i> <span id="sbBadgeText">Read-only</span>
-    </div>
-    <div class="sb-ws-label" style="margin-top: 6px;">Active role</div>
-    <select class="sb-ws-select" id="sbRoleSel">
-      <option value="">Loading…</option>
-    </select>
   </div>
 
   <nav class="sidebar-nav" id="moduleNav"></nav>
-
-  <!-- User context -->
-  <div class="sidebar-ctx" id="sidebarUserSection">
-    <button type="button" class="ctx-toggle" id="ctxToggleBtn" title="Account settings">
-      <i class="fas fa-circle-user ctx-toggle-icon"></i>
-      <span class="ctx-toggle-username" id="ctxToggleUsername">—</span>
-      <i class="fas fa-chevron-up ctx-toggle-arrow" id="ctxToggleArrow"></i>
-    </button>
-    <div class="ctx-panel" id="ctxPanel">
-      <div class="ctx-row" title="Organization">
-        <div class="ctx-icon"><i class="fas fa-building"></i></div>
-        <span class="ctx-value" id="ctxOrgValue">—</span>
-      </div>
-      <div class="ctx-divider"></div>
-      <div class="ctx-logout">
-        <a href="/ui/logout" class="ctx-logout-btn" title="Sign out">
-          <i class="fas fa-arrow-right-from-bracket"></i>
-          <span>Sign out</span>
-        </a>
-      </div>
-    </div>
-  </div>
 
   <!-- kladna Soft branding -->
   <div class="profile-section">
@@ -904,9 +913,15 @@
   window.__st_sup = PRESELECT_SUP || "";
 
   var orgValueEl = document.getElementById("ctxOrgValue");
-  var toggleUsernameEl = document.getElementById("ctxToggleUsername");
+  var toggleRoleEl = document.getElementById("ctxToggleRoleName");
+  var usernameValueEl = document.getElementById("ctxUsernameValue");
   if (ORG_NAME && orgValueEl) orgValueEl.textContent = ORG_NAME;
-  if (username && toggleUsernameEl) toggleUsernameEl.textContent = username;
+  if (username && usernameValueEl) usernameValueEl.textContent = username;
+
+  function syncToggleRole(roleName) {
+    if (toggleRoleEl) toggleRoleEl.textContent = roleName || "—";
+  }
+  syncToggleRole(window.__st_role_name);
 
   var _SUPERS_KEY = "st_supers:" + ORG_NAME;
   var _ROLES_PREFIX = "st_user_roles:" + ORG_NAME + ":";
@@ -1043,6 +1058,7 @@
       opt.value = ""; opt.textContent = "No roles";
       roleSel.appendChild(opt);
       window.__st_active_role = ""; window.__st_role_name = "";
+      syncToggleRole("");
       return;
     }
 
@@ -1059,6 +1075,7 @@
     window.__st_active_role = roleSel.value;
     window.__st_role_name = roleSel.value;
     localStorage.setItem("st_active_role", roleSel.value);
+    syncToggleRole(roleSel.value);
   }
 
   superSel.addEventListener("change", function () {
@@ -1079,6 +1096,7 @@
     window.__st_active_role = roleSel.value;
     window.__st_role_name = roleSel.value;
     localStorage.setItem("st_active_role", roleSel.value);
+    syncToggleRole(roleSel.value);
     fetch("/api/v1/session/role", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({role_name: roleSel.value}) }).catch(function (e) { console.warn("Failed to persist role:", e); });
     try { window.dispatchEvent(new CustomEvent("role-changed", { detail: { role_name: roleSel.value } })); } catch (e) {}
   });

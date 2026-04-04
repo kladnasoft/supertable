@@ -102,11 +102,11 @@ class DataReader:
             )
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
 
-            # 1) ESTIMATE
+            # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
                 organization=self.organization,
                 storage=self.storage,
-                tables=tables
+                tables=physical_tables
             )
             reflection = estimator.estimate()
 

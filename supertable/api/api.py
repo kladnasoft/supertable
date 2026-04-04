@@ -3643,7 +3643,7 @@ def api_quality_history(
         from supertable.data_reader import DataReader
 
         table_fqn = f"{s}.__data_quality__"
-        conditions = [f"checked_at >= CURRENT_TIMESTAMP - INTERVAL '{days} days'"]
+        conditions = [f"CAST(checked_at AS TIMESTAMPTZ) >= CURRENT_TIMESTAMP - INTERVAL '{days} days'"]
         if table:
             safe_table = table.replace("'", "''")
             conditions.append(f"table_name = '{safe_table}'")

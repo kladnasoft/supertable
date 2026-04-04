@@ -622,13 +622,10 @@
       <div class="dq-tab-panel" id="dqp-history">
         <div class="section-hdr">
           <div>
-            <div class="section-title">Quality Score History</div>
-            <div class="section-desc">Track quality score trends over time per table.</div>
+            <div class="section-title">Quality check timeline</div>
+            <div class="section-desc">Aggregated runs across all tables. Click a row to expand.</div>
           </div>
           <div style="display:flex;align-items:center;gap:10px;">
-            <select id="dqHistoryTable" class="dq-sort-select" style="min-width:180px;" onchange="dqLoadHistory()">
-              <option value="">All tables</option>
-            </select>
             <select id="dqHistoryLimit" class="dq-sort-select" onchange="dqLoadHistory()">
               <option value="1">Last 24 hours</option>
               <option value="7" selected>Last 7 days</option>
@@ -640,17 +637,8 @@
           </div>
         </div>
 
-        <!-- Chart container -->
-        <div id="dqHistoryChart" style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;min-height:340px;position:relative;">
-          <div class="dq-empty" style="padding:40px;"><i class="fas fa-chart-line"></i><div class="dq-empty-text">Select a table or click "All tables" to view history</div></div>
-        </div>
-
-        <!-- Legend -->
-        <div style="display:flex;gap:16px;align-items:center;margin-top:12px;font-size:11px;color:var(--text-muted);flex-wrap:wrap;">
-          <span style="display:flex;align-items:center;gap:4px;"><span style="width:10px;height:10px;border-radius:2px;background:var(--success);"></span> Score ≥ 85</span>
-          <span style="display:flex;align-items:center;gap:4px;"><span style="width:10px;height:10px;border-radius:2px;background:var(--warn);"></span> Score 65–84</span>
-          <span style="display:flex;align-items:center;gap:4px;"><span style="width:10px;height:10px;border-radius:2px;background:var(--error);"></span> Score &lt; 65</span>
-          <span style="display:flex;align-items:center;gap:4px;"><span style="width:12px;height:1px;border-top:1px dashed #cbd5e1;"></span> Thresholds (85, 65)</span>
+        <div id="dqHistoryChart" style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-height:100px;">
+          <div class="dq-empty" style="padding:40px;"><i class="fas fa-layer-group"></i><div class="dq-empty-text">Run quality checks to build timeline</div></div>
         </div>
       </div>
 
@@ -1733,194 +1721,155 @@ function dqRunAllNow(mode) {
 var _dqHistoryData = [];
 
 function dqPopulateHistoryTableSelect() {
-  var sel = document.getElementById('dqHistoryTable');
-  if (!sel) return;
-  var current = sel.value;
-  sel.innerHTML = '<option value="">All tables</option>';
-  _dqAllTableNames.forEach(function(name) {
-    var opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = name;
-    sel.appendChild(opt);
-  });
-  if (current) sel.value = current;
+  // No-op: table selector removed in aggregate timeline redesign.
 }
 
 window.dqLoadHistory = function() {
-  var table = document.getElementById('dqHistoryTable').value;
   var days = document.getElementById('dqHistoryLimit').value || '7';
   var params = 'days=' + days;
-  if (table) params += '&table=' + encodeURIComponent(table);
 
-  var chart = document.getElementById('dqHistoryChart');
-  chart.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:300px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin" style="margin-right:8px;"></i> Loading history…</div>';
+  var container = document.getElementById('dqHistoryChart');
+  container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin" style="margin-right:8px;"></i> Loading timeline…</div>';
 
   dqApi('/api/v1/quality/history?' + params).then(function(data) {
     var rows = (data.ok && data.rows) ? data.rows : [];
     _dqHistoryData = rows;
 
     if (!rows.length) {
-      chart.innerHTML = '<div class="dq-empty" style="padding:40px;"><i class="fas fa-chart-line"></i><div class="dq-empty-text">No history data yet</div><div class="dq-empty-hint">Run quality checks to start building history.</div></div>';
+      container.innerHTML = '<div class="dq-empty" style="padding:40px;"><i class="fas fa-layer-group"></i><div class="dq-empty-text">No history data yet</div><div class="dq-empty-hint">Run quality checks to start building timeline.</div></div>';
       return;
     }
 
-    // Sort chronologically (oldest first for charting)
-    rows.sort(function(a, b) {
-      return new Date(a.checked_at) - new Date(b.checked_at);
-    });
-
-    dqRenderScoreChart(chart, rows);
+    rows.sort(function(a, b) { return new Date(b.checked_at) - new Date(a.checked_at); });
+    dqRenderAggregateTimeline(container, rows);
   }).catch(function() {
-    chart.innerHTML = '<div class="dq-empty" style="padding:40px;"><i class="fas fa-exclamation-triangle"></i><div class="dq-empty-text">Failed to load history</div></div>';
+    container.innerHTML = '<div class="dq-empty" style="padding:40px;"><i class="fas fa-exclamation-triangle"></i><div class="dq-empty-text">Failed to load timeline</div></div>';
   });
 };
 
-function dqRenderScoreChart(container, rows) {
-  // ── Chart dimensions ──────────────────────────────────────
-  var W = container.clientWidth - 40 || 800;
-  var H = 280;
-  var PAD = { top: 20, right: 20, bottom: 50, left: 44 };
-  var cW = W - PAD.left - PAD.right;
-  var cH = H - PAD.top - PAD.bottom;
+function dqRenderAggregateTimeline(container, rows) {
+  // ── Group into runs (checks within 5 min of each other) ────
+  var RUN_GAP_MS = 5 * 60 * 1000;
+  var runs = [];
+  var currentRun = null;
 
-  // ── Data extraction ───────────────────────────────────────
-  var points = rows.map(function(r) {
-    return {
-      t: new Date(r.checked_at),
-      score: r.quality_score || 0,
-      table: r.table_name || '',
-      status: r.status || 'ok',
-      anomalies: r.anomaly_count || 0,
-      rows: r.row_count || 0,
-    };
+  rows.forEach(function(r) {
+    var t = new Date(r.checked_at).getTime();
+    if (!currentRun || currentRun.tMin - t > RUN_GAP_MS) {
+      currentRun = { tMin: t, tMax: t, rows: [] };
+      runs.push(currentRun);
+    }
+    if (t < currentRun.tMin) currentRun.tMin = t;
+    if (t > currentRun.tMax) currentRun.tMax = t;
+    currentRun.rows.push(r);
   });
 
-  var tMin = points[0].t.getTime();
-  var tMax = points[points.length - 1].t.getTime();
-  var tRange = tMax - tMin || 1;
+  // ── Build table ────────────────────────────────────────────
+  var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+  html += '<tr style="border-bottom:1px solid var(--border);">';
+  html += '<th style="width:28px;padding:8px 4px 8px 12px;"></th>';
+  html += '<th style="text-align:left;padding:8px 10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Run time</th>';
+  html += '<th style="text-align:left;padding:8px 10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Avg score</th>';
+  html += '<th style="text-align:left;padding:8px 10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Tables</th>';
+  html += '<th style="text-align:left;padding:8px 10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Score range</th>';
+  html += '<th style="text-align:left;padding:8px 10px;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);">Warnings</th>';
+  html += '</tr>';
 
-  function xPos(t) { return PAD.left + ((t.getTime() - tMin) / tRange) * cW; }
-  function yPos(s) { return PAD.top + cH - (s / 100) * cH; }
-
-  // ── Build SVG ─────────────────────────────────────────────
-  var svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg" style="font-family:var(--font);overflow:visible;">';
-
-  // Background threshold bands
-  svg += '<rect x="' + PAD.left + '" y="' + PAD.top + '" width="' + cW + '" height="' + (yPos(85) - PAD.top) + '" fill="rgba(239,68,68,.03)"/>';
-  svg += '<rect x="' + PAD.left + '" y="' + yPos(85) + '" width="' + cW + '" height="' + (yPos(65) - yPos(85)) + '" fill="rgba(245,158,11,.03)"/>';
-  svg += '<rect x="' + PAD.left + '" y="' + yPos(100) + '" width="' + cW + '" height="' + (yPos(85) - yPos(100)) + '" fill="rgba(16,185,129,.03)"/>';
-
-  // Threshold lines
-  svg += '<line x1="' + PAD.left + '" y1="' + yPos(85) + '" x2="' + (PAD.left + cW) + '" y2="' + yPos(85) + '" stroke="#cbd5e1" stroke-dasharray="4 3" stroke-width="1"/>';
-  svg += '<line x1="' + PAD.left + '" y1="' + yPos(65) + '" x2="' + (PAD.left + cW) + '" y2="' + yPos(65) + '" stroke="#cbd5e1" stroke-dasharray="4 3" stroke-width="1"/>';
-
-  // Y-axis labels
-  [0, 25, 50, 65, 85, 100].forEach(function(v) {
-    var y = yPos(v);
-    svg += '<text x="' + (PAD.left - 8) + '" y="' + (y + 4) + '" text-anchor="end" font-size="10" fill="#94a3b8">' + v + '</text>';
-    if (v !== 65 && v !== 85) {
-      svg += '<line x1="' + PAD.left + '" y1="' + y + '" x2="' + (PAD.left + cW) + '" y2="' + y + '" stroke="#f1f5f9" stroke-width="1"/>';
-    }
-  });
-
-  // X-axis labels (show ~6 ticks)
-  var nTicks = Math.min(6, points.length);
-  var tickStep = Math.max(1, Math.floor(points.length / nTicks));
-  for (var ti = 0; ti < points.length; ti += tickStep) {
-    var p = points[ti];
-    var x = xPos(p.t);
-    var dateStr = (p.t.getMonth() + 1) + '/' + p.t.getDate();
-    var timeStr = p.t.getHours() + ':' + ('0' + p.t.getMinutes()).slice(-2);
-    svg += '<text x="' + x + '" y="' + (H - PAD.bottom + 16) + '" text-anchor="middle" font-size="10" fill="#94a3b8">' + dateStr + '</text>';
-    svg += '<text x="' + x + '" y="' + (H - PAD.bottom + 28) + '" text-anchor="middle" font-size="9" fill="#cbd5e1">' + timeStr + '</text>';
-    svg += '<line x1="' + x + '" y1="' + PAD.top + '" x2="' + x + '" y2="' + (PAD.top + cH) + '" stroke="#f1f5f9" stroke-width="1"/>';
-  }
-
-  // Axes
-  svg += '<line x1="' + PAD.left + '" y1="' + PAD.top + '" x2="' + PAD.left + '" y2="' + (PAD.top + cH) + '" stroke="#e0e5f0" stroke-width="1"/>';
-  svg += '<line x1="' + PAD.left + '" y1="' + (PAD.top + cH) + '" x2="' + (PAD.left + cW) + '" y2="' + (PAD.top + cH) + '" stroke="#e0e5f0" stroke-width="1"/>';
-
-  // ── Group by table for multi-table view ───────────────────
-  var tableFilter = document.getElementById('dqHistoryTable').value;
-  var tableGroups = {};
-  points.forEach(function(p) {
-    var key = p.table || '__all__';
-    if (!tableGroups[key]) tableGroups[key] = [];
-    tableGroups[key].push(p);
-  });
-
-  // Color palette for multiple tables
-  var palette = ['#1c96ca', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
-  var colorIdx = 0;
-
-  Object.keys(tableGroups).sort().forEach(function(tableName) {
-    var pts = tableGroups[tableName];
-    if (pts.length < 2) {
-      // Single point — just draw a dot
-      var sp = pts[0];
-      var sc = sp.score >= 85 ? '#10b981' : sp.score >= 65 ? '#f59e0b' : '#ef4444';
-      svg += '<circle cx="' + xPos(sp.t) + '" cy="' + yPos(sp.score) + '" r="4" fill="' + sc + '" stroke="#fff" stroke-width="1.5">';
-      svg += '<title>' + dqEsc(sp.table) + ': ' + sp.score + ' (' + dqHistoryDateFmt(sp.t) + ')</title></circle>';
-      return;
-    }
-
-    // Line color: per-table if multi, score-based if single table
-    var lineColor = tableFilter ? '#1c96ca' : palette[colorIdx % palette.length];
-    colorIdx++;
-
-    // Draw line path
-    var pathD = '';
-    pts.forEach(function(p, i) {
-      var x = xPos(p.t);
-      var y = yPos(p.score);
-      pathD += (i === 0 ? 'M' : 'L') + x + ',' + y;
-    });
-    svg += '<path d="' + pathD + '" fill="none" stroke="' + lineColor + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity="0.85"/>';
-
-    // Area fill (subtle)
-    if (tableFilter) {
-      var areaD = pathD + 'L' + xPos(pts[pts.length - 1].t) + ',' + (PAD.top + cH) + 'L' + xPos(pts[0].t) + ',' + (PAD.top + cH) + 'Z';
-      svg += '<path d="' + areaD + '" fill="' + lineColor + '" opacity="0.06"/>';
-    }
-
-    // Dots
-    pts.forEach(function(p) {
-      var x = xPos(p.t);
-      var y = yPos(p.score);
-      var dotColor = p.score >= 85 ? '#10b981' : p.score >= 65 ? '#f59e0b' : '#ef4444';
-      var r = tableFilter ? 4 : 3;
-      svg += '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + dotColor + '" stroke="#fff" stroke-width="1.5" style="cursor:pointer;">';
-      svg += '<title>' + dqEsc(p.table) + '\nScore: ' + p.score + '\nStatus: ' + p.status + '\nAnomalies: ' + p.anomalies + '\nRows: ' + (p.rows || 0).toLocaleString() + '\n' + dqHistoryDateFmt(p.t) + '</title>';
-      svg += '</circle>';
+  runs.forEach(function(run, idx) {
+    // Aggregate run stats
+    var tables = {};
+    var totalWarnings = 0;
+    run.rows.forEach(function(r) {
+      var tName = r.table_name || '?';
+      if (!tables[tName]) tables[tName] = { score: 0, checks: [], types: {} };
+      tables[tName].score = r.quality_score || 0;
+      tables[tName].checks.push(r);
+      tables[tName].types[r.check_type || 'quick'] = true;
+      totalWarnings += (r.warnings || 0) + (r.critical_count || 0);
     });
 
-    // Table label at end of line (multi-table only)
-    if (!tableFilter && pts.length > 0) {
-      var last = pts[pts.length - 1];
-      var lx = xPos(last.t) + 6;
-      var ly = yPos(last.score) + 3;
-      svg += '<text x="' + lx + '" y="' + ly + '" font-size="9" font-weight="600" fill="' + lineColor + '">' + dqEsc(dqTruncate(tableName, 16)) + '</text>';
-    }
+    var tableNames = Object.keys(tables).sort();
+    var scores = tableNames.map(function(t) { return tables[t].score; });
+    var avgScore = Math.round(scores.reduce(function(a, b) { return a + b; }, 0) / scores.length);
+    var minScore = Math.min.apply(null, scores);
+    var maxScore = Math.max.apply(null, scores);
+
+    var scoreCls = avgScore >= 85 ? 'var(--success)' : avgScore >= 65 ? 'var(--warn)' : 'var(--error)';
+    var scoreBg = avgScore >= 85 ? 'rgba(16,185,129,.08)' : avgScore >= 65 ? 'rgba(245,158,11,.08)' : 'rgba(239,68,68,.08)';
+    var barColor = minScore >= 85 ? '#10b981' : minScore >= 65 ? '#f59e0b' : '#ef4444';
+    var barW = Math.max(20, minScore);
+
+    // Run time label
+    var d1 = new Date(run.tMax);
+    var d2 = new Date(run.tMin);
+    var datePart = _dqFmtShortDate(d1);
+    var timePart = _dqFmtTime(d2) + ' – ' + _dqFmtTime(d1);
+
+    var rowId = 'dqRunDetail_' + idx;
+
+    html += '<tr onclick="dqToggleRunDetail(\'' + rowId + '\', this)" style="cursor:pointer;border-bottom:1px solid var(--border);" onmouseenter="this.style.background=\'var(--bg-hover)\'" onmouseleave="this.style.background=\'\'">';
+    html += '<td style="padding:8px 4px 8px 12px;color:var(--text-muted);font-size:11px;"><i class="fas fa-chevron-right dq-run-chev" style="transition:transform .15s;font-size:9px;"></i></td>';
+    html += '<td style="padding:8px 10px;font-weight:500;white-space:nowrap;"><span style="color:var(--text);">' + dqEsc(datePart) + '</span> <span style="color:var(--text-muted);font-weight:400;font-size:11px;">' + dqEsc(timePart) + '</span></td>';
+    html += '<td style="padding:8px 10px;"><span style="display:inline-block;min-width:36px;text-align:center;padding:2px 8px;border-radius:4px;font-weight:500;background:' + scoreBg + ';color:' + scoreCls + ';">' + avgScore + '</span></td>';
+    html += '<td style="padding:8px 10px;color:var(--text-muted);font-size:12px;">' + tableNames.length + ' tables</td>';
+    html += '<td style="padding:8px 10px;font-size:12px;white-space:nowrap;">';
+    html += '<span style="display:inline-block;width:50px;height:5px;background:var(--bg-hover);border-radius:3px;vertical-align:middle;margin-right:6px;overflow:hidden;"><span style="display:block;width:' + barW + '%;height:100%;background:' + barColor + ';border-radius:3px;"></span></span>';
+    html += '<span style="color:var(--text-muted);">' + minScore + ' – ' + maxScore + '</span>';
+    html += '</td>';
+    html += '<td style="padding:8px 10px;color:' + (totalWarnings > 0 ? 'var(--warn)' : 'var(--text-muted)') + ';font-size:12px;">' + totalWarnings + '</td>';
+    html += '</tr>';
+
+    // Expandable detail row
+    html += '<tr id="' + rowId + '" style="display:none;"><td colspan="6" style="padding:0;background:var(--bg-hover);border-bottom:1px solid var(--border);">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:11px;margin:0;">';
+    tableNames.forEach(function(tName) {
+      var t = tables[tName];
+      var tScoreCls = t.score >= 85 ? 'var(--success)' : t.score >= 65 ? 'var(--warn)' : 'var(--error)';
+      var tScoreBg = t.score >= 85 ? 'rgba(16,185,129,.08)' : t.score >= 65 ? 'rgba(245,158,11,.08)' : 'rgba(239,68,68,.08)';
+      var typeKeys = Object.keys(t.types).sort();
+      var typePills = typeKeys.map(function(tp) {
+        var bg = tp === 'deep' ? 'rgba(126,107,221,.08)' : 'rgba(28,150,202,.08)';
+        var col = tp === 'deep' ? '#534ab7' : '#1c96ca';
+        return '<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:' + bg + ';color:' + col + ';font-weight:500;">' + tp + '</span>';
+      }).join(' ');
+
+      // Find the quick check for row count
+      var quickCheck = t.checks.find(function(c) { return c.check_type === 'quick'; });
+      var rowCount = quickCheck ? (quickCheck.row_count || 0) : 0;
+      var rowStr = rowCount > 0 ? rowCount.toLocaleString() + ' rows' : '—';
+      var passedStr = quickCheck ? (quickCheck.passed || 0) + '/' + (quickCheck.total_checks || 0) : '—';
+
+      html += '<tr style="border-bottom:1px solid var(--border);">';
+      html += '<td style="padding:6px 10px 6px 48px;font-weight:500;color:var(--text);">' + dqEsc(tName) + '</td>';
+      html += '<td style="padding:6px 10px;"><span style="display:inline-block;min-width:30px;text-align:center;padding:1px 6px;border-radius:3px;font-weight:500;font-size:11px;background:' + tScoreBg + ';color:' + tScoreCls + ';">' + t.score + '</span></td>';
+      html += '<td style="padding:6px 10px;">' + typePills + '</td>';
+      html += '<td style="padding:6px 10px;color:var(--text-muted);font-family:var(--font-mono, monospace);font-size:10px;">' + rowStr + '</td>';
+      html += '<td style="padding:6px 10px;color:var(--text-muted);font-size:10px;">' + passedStr + '</td>';
+      html += '</tr>';
+    });
+    html += '</table></td></tr>';
   });
 
-  svg += '</svg>';
+  html += '</table>';
+  container.innerHTML = html;
+}
 
-  // ── Summary stats ─────────────────────────────────────────
-  var avgScore = Math.round(points.reduce(function(a, p) { return a + p.score; }, 0) / points.length);
-  var minScore = Math.min.apply(null, points.map(function(p) { return p.score; }));
-  var maxScore = Math.max.apply(null, points.map(function(p) { return p.score; }));
-  var latestScore = points[points.length - 1].score;
-  var avgColor = avgScore >= 85 ? 'var(--success)' : avgScore >= 65 ? 'var(--warn)' : 'var(--error)';
+window.dqToggleRunDetail = function(id, headerRow) {
+  var detail = document.getElementById(id);
+  if (!detail) return;
+  var isHidden = detail.style.display === 'none';
+  detail.style.display = isHidden ? '' : 'none';
+  var chev = headerRow.querySelector('.dq-run-chev');
+  if (chev) chev.style.transform = isHidden ? 'rotate(90deg)' : '';
+};
 
-  var statsHtml = '<div style="display:flex;gap:20px;margin-bottom:16px;flex-wrap:wrap;">';
-  statsHtml += '<div style="font-size:11px;color:var(--text-muted);">Data points: <strong style="color:var(--text);">' + points.length + '</strong></div>';
-  statsHtml += '<div style="font-size:11px;color:var(--text-muted);">Avg: <strong style="color:' + avgColor + ';">' + avgScore + '</strong></div>';
-  statsHtml += '<div style="font-size:11px;color:var(--text-muted);">Min: <strong>' + minScore + '</strong></div>';
-  statsHtml += '<div style="font-size:11px;color:var(--text-muted);">Max: <strong>' + maxScore + '</strong></div>';
-  statsHtml += '<div style="font-size:11px;color:var(--text-muted);">Latest: <strong style="color:' + (latestScore >= 85 ? 'var(--success)' : latestScore >= 65 ? 'var(--warn)' : 'var(--error)') + ';">' + latestScore + '</strong></div>';
-  statsHtml += '</div>';
+function _dqFmtShortDate(d) {
+  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[d.getMonth()] + ' ' + d.getDate();
+}
 
-  container.innerHTML = statsHtml + svg;
+function _dqFmtTime(d) {
+  return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
 }
 
 function dqHistoryDateFmt(d) {
