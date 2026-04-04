@@ -505,6 +505,7 @@ def _collect_redis_diagnostics() -> dict:
     return result
 
 
+@router.get("/api/v1/health/infra")
 @router.get("/api/v1/health/deep")
 def healthz_deep():
     """Deep health check — verifies Redis, storage, and DuckDB can fulfill their contracts.
@@ -2887,6 +2888,27 @@ def monitoring_summary(
         redis_client, org, sup, window_hours=window_hours,
     )
     return JSONResponse({"ok": True, "summary": summary})
+
+
+@router.get("/api/v1/summary")
+def api_summary(
+    org: str = Query(""),
+    sup: str = Query(""),
+    window_hours: int = Query(1),
+    _=Depends(logged_in_guard_api),
+):
+    """Unified summary page data — all metrics in a single call, zero locks."""
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    if not org or not sup:
+        return JSONResponse({"ok": True, "data": {}})
+
+    window_hours = max(1, min(window_hours, 672))
+    from supertable.services.summary import compute_summary
+    data = compute_summary(
+        redis_client, catalog, org, sup, window_hours=window_hours,
+    )
+    return JSONResponse({"ok": True, "data": data})
 
 
 @router.get("/api/v1/monitoring/catalog")

@@ -533,6 +533,20 @@ def engine_page(
     return resp
 
 
+@app.get("/ui/summary", response_class=HTMLResponse)
+def summary_page(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+):
+    ctx = _page_context(request, org, sup)
+    if ctx is None:
+        return _redirect_to_login()
+    resp = templates.TemplateResponse("summary.html", ctx)
+    _no_store(resp)
+    return resp
+
+
 @app.get("/ui/monitoring", response_class=HTMLResponse)
 def monitoring_page(
     request: Request,

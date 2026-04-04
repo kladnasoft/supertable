@@ -12,19 +12,19 @@
   <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
   <style>
 :root{
-  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
-  --primary-color:#1c96ca;--secondary-color:#147ba3;
-  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
-  --border:#e0e5f0;--border-light:#f1f5f9;
-  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
-  --success:#10b981;--success-bg:#ecfdf5;
-  --warn:#f59e0b;--warn-bg:#fffbeb;
-  --error:#ef4444;--error-bg:#fef2f2;
-  --info:#3b82f6;--info-bg:#eff6ff;
+  --primary:#29B5E8;--primary-light:#E0F4FD;--primary-dark:#11567F;
+  --primary-color:#29B5E8;--secondary-color:#11567F;
+  --bg:#F5F7FA;--bg-card:#fff;--bg-surface:#FAFBFD;--bg-hover:#F0F2F7;
+  --border:#E4E9F2;--border-light:#F0F2F7;
+  --text:#1B2559;--text-sec:#6E7891;--text-muted:#6E7891;
+  --success:#2FC89F;--success-bg:#E6FAF3;
+  --warn:#F5A623;--warn-bg:#FFF8EB;
+  --error:#E5484D;--error-bg:#FEECEE;
+  --info:#29B5E8;--info-bg:#E0F4FD;
   --purple:#7c3aed;--purple-bg:rgba(124,58,237,.08);
   --mono:'IBM Plex Mono',ui-monospace,monospace;
   --font:'Inter',-apple-system,sans-serif;
-  --radius:10px;--radius-sm:6px;
+  --radius:12px;--radius-sm:8px;
   --transition:all .2s cubic-bezier(.25,.8,.25,1);
 }
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -42,16 +42,15 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 /* section bar */
 .bar-row{display:flex;align-items:center;gap:0;padding:7px 14px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;scrollbar-width:none;}
 .bar-row::-webkit-scrollbar{display:none;}
-.section-node{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:7px;cursor:pointer;transition:var(--transition);border:1px solid transparent;white-space:nowrap;font-size:12px;font-weight:600;color:var(--text-sec);}
+.section-node{display:flex;align-items:center;gap:8px;padding:7px 16px;border-radius:8px;cursor:pointer;transition:var(--transition);border:1px solid transparent;white-space:nowrap;font-size:12px;font-weight:600;color:var(--text-sec);}
 .section-node:hover{background:var(--bg-hover);border-color:var(--border);}
-.section-node.active{background:var(--primary-light);border-color:rgba(28,150,202,.35);color:var(--primary);}
-.section-node .sicon{width:8px;height:8px;border-radius:50%;flex-shrink:0;font-size:0;line-height:0;}
-.section-node .sicon i{display:none;}
-.section-node .scount{font-size:10px;color:var(--text-muted);font-family:var(--mono);}
+.section-node.active{background:var(--primary-light);border-color:var(--primary);color:var(--primary);}
+.section-node .sicon{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;}
+.section-node .scount{font-size:10px;color:var(--text-muted);font-family:var(--mono);margin-left:2px;}
 .section-node.active .scount{color:var(--primary);}
 .bar-sep{width:1px;height:18px;background:var(--border);margin:0 3px;flex-shrink:0;}
 .date-pills{display:flex;gap:4px;margin-left:auto;flex-shrink:0;padding-left:10px;}
-.date-pill{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text-sec);transition:var(--transition);font-family:var(--font);}
+.date-pill{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:#fff;color:var(--text-sec);transition:var(--transition);font-family:var(--font);}
 .date-pill:hover{border-color:var(--primary);color:var(--primary);}
 .date-pill.active{background:var(--primary);color:#fff;border-color:var(--primary);}
 
@@ -208,7 +207,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
 /* errors */
 .err-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;}
-.err-badge.read{background:rgba(28,150,202,.1);color:var(--primary);}
+.err-badge.read{background:rgba(41,181,232,.1);color:var(--primary);}
 .err-badge.write{background:var(--success-bg);color:var(--success);}
 .err-badge.mcp{background:var(--purple-bg);color:var(--purple);}
 
@@ -235,11 +234,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .bucket-filter-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;background:var(--primary-light);border:1px solid var(--primary);border-radius:20px;font-size:11px;font-weight:600;color:var(--primary);margin:6px 0;position:absolute;top:10px;right:16px;}
 .bucket-filter-chip button{background:none;border:none;cursor:pointer;color:var(--primary);font-size:11px;padding:0;line-height:1;}
 .ops-bottom{flex:1;display:flex;overflow:hidden;min-height:0;}
-.ops-list-panel{width:280px;min-width:280px;border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;background:var(--bg-card);}
+.ops-list-panel{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg-card);}
 .ops-list{flex:1;overflow-y:auto;}
 .ops-row{display:flex;align-items:center;gap:8px;padding:8px 12px 8px 10px;cursor:pointer;transition:var(--transition);border-left:3px solid transparent;border-bottom:1px solid var(--border-light);}
 .ops-row:hover{background:var(--bg-hover);}
-.ops-row.active{background:rgba(28,150,202,.05);border-left-color:var(--primary);}
+.ops-row.active{background:rgba(41,181,232,.05);border-left-color:var(--primary);}
 .ops-row .or-meta{flex:1;min-width:0;}
 .ops-row .or-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .ops-row .or-info{font-size:10px;color:var(--text-muted);font-family:var(--mono);margin-top:2px;display:flex;align-items:center;gap:6px;}
@@ -256,7 +255,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .lineage-pre{background:var(--bg-surface);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:8px 10px;font-family:var(--mono);font-size:10px;max-height:100px;overflow:auto;color:var(--text-sec);white-space:pre-wrap;word-break:break-all;}
 
 /* utilities */
-.btn-sm{padding:5px 10px;border-radius:var(--radius-sm);background:transparent;border:1px solid var(--border);color:var(--text-sec);font-weight:500;cursor:pointer;font-size:12px;transition:var(--transition);display:inline-flex;align-items:center;gap:4px;font-family:var(--font);white-space:nowrap;}
+.btn-sm{padding:6px 14px;border-radius:var(--radius-sm);background:transparent;border:1px solid var(--border);color:var(--text-sec);font-weight:600;cursor:pointer;font-size:12px;transition:all .15s;display:inline-flex;align-items:center;gap:5px;font-family:var(--font);white-space:nowrap;}
 .btn-sm:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light);}
 .hidden{display:none!important;}
 ::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
@@ -281,60 +280,107 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div style="flex:1;"></div>
     <span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);" id="lastRefreshLabel"></span>
     <button class="btn-sm" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
+    <div style="display:flex;align-items:center;gap:6px;margin-left:4px;border-left:1px solid var(--border);padding-left:10px;">
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:var(--text-sec);font-weight:600;white-space:nowrap;user-select:none;">
+        <input type="checkbox" id="autoRefreshToggle" style="width:14px;height:14px;accent-color:var(--primary);cursor:pointer;margin:0;"> Auto
+      </label>
+      <select id="autoRefreshInterval" style="padding:3px 6px;border-radius:6px;border:1px solid var(--border);font-size:10px;font-family:var(--mono);color:var(--text-sec);background:var(--bg-card);cursor:pointer;outline:none;">
+        <option value="5">5s</option>
+        <option value="10" selected>10s</option>
+        <option value="30">30s</option>
+        <option value="60">60s</option>
+        <option value="300">5m</option>
+      </select>
+    </div>
   </header>
 
   <div class="bar-row">
-    <div class="section-node active" data-section="summary"><span class="sicon" style="background:var(--purple-bg);color:var(--purple);"><i class="fas fa-chart-pie"></i></span>Summary</div>
+    <div class="section-node active" data-section="summary"><span class="sicon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-mountain-sun"></i></span>Landscape</div>
     <div class="bar-sep"></div>
-    <div class="section-node" data-section="infra"><span class="sicon" style="background:rgba(245,158,11,.08);color:var(--warn);"><i class="fas fa-server"></i></span>Infra</div>
+    <div class="section-node" data-section="infra"><span class="sicon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warn);"><i class="fas fa-server"></i></span>Infra</div>
     <div class="bar-sep"></div>
-    <div class="section-node" data-section="catalog"><span class="sicon" style="background:var(--success-bg);color:var(--success);"><i class="fas fa-database"></i></span>Catalog</div>
+    <div class="section-node" data-section="catalog"><span class="sicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-database"></i></span>Catalog</div>
     <div class="bar-sep"></div>
-    <div class="section-node" data-section="timeline"><span class="sicon" style="background:var(--primary-light);color:var(--primary);"><i class="fas fa-chart-area"></i></span>Timeline</div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="errors"><span class="sicon" style="background:var(--error-bg);color:var(--error);"><i class="fas fa-circle-exclamation"></i></span>Errors<span class="scount" id="countErrors"></span></div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="reads"><span class="sicon" style="background:var(--primary-light);color:var(--primary);"><i class="fas fa-book-open"></i></span>Reads<span class="scount" id="countReads"></span></div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="writes"><span class="sicon" style="background:var(--success-bg);color:var(--success);"><i class="fas fa-pen-to-square"></i></span>Writes<span class="scount" id="countWrites"></span></div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="mcp"><span class="sicon" style="background:var(--purple-bg);color:var(--purple);"><i class="fas fa-robot"></i></span>MCP<span class="scount" id="countMcp"></span></div>
-    <div class="section-node" data-section="odata"><span class="sicon" style="background:rgba(234,88,12,.08);color:#ea580c;"><i class="fas fa-share-nodes"></i></span>OData<span class="scount" id="countOdata"></span></div>
-    <div class="date-pills">
-      <button class="date-pill" data-range="today">Today</button>
-      <button class="date-pill active" data-range="7d">7d</button>
-      <button class="date-pill" data-range="30d">30d</button>
-      <button class="date-pill" data-range="all">All</button>
-    </div>
+    <div class="section-node" data-section="timeline"><span class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-bolt"></i></span>Activity</div>
+  </div>
+  <!-- Timeline sub-tab bar (visible when timeline group is active) -->
+  <div id="timelineSubBar" class="bar-row hidden" style="padding-left:28px;border-top:none;">
+    <div class="section-node active" data-section="errors"><span class="sicon" style="background:rgba(229,72,77,.08);border:1px solid rgba(229,72,77,.2);color:var(--error);"><i class="fas fa-circle-exclamation"></i></span>Errors<span class="scount" id="countErrors"></span></div>
+    <div class="section-node" data-section="reads"><span class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-book-open"></i></span>Reads<span class="scount" id="countReads"></span></div>
+    <div class="section-node" data-section="writes"><span class="sicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-pen-to-square"></i></span>Writes<span class="scount" id="countWrites"></span></div>
+    <div class="section-node" data-section="mcp"><span class="sicon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-robot"></i></span>MCP<span class="scount" id="countMcp"></span></div>
+    <div class="section-node" data-section="odata"><span class="sicon" style="background:rgba(234,88,12,.08);border:1px solid rgba(234,88,12,.2);color:#ea580c;"><i class="fas fa-share-nodes"></i></span>OData<span class="scount" id="countOdata"></span></div>
   </div>
 
-  <!-- SUMMARY -->
-  <div id="viewSummary" class="section-body">
-    <div class="summary-grid" id="summaryGrid"></div>
-    <!-- Infra status quick-tile row -->
-    <div id="summaryInfraRow" style="display:grid;grid-template-columns:repeat(3,1fr);gap:11px;padding:0 18px 0;margin-top:11px;"></div>
-    <div style="padding:13px 18px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px;flex-shrink:0;">
-      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
-        <div class="sec-header" style="margin-bottom:11px;"><i class="fas fa-table" style="color:var(--primary);"></i>Top Tables</div>
-        <div id="summaryTopTables"></div>
+  <!-- SUMMARY — Data Landscape -->
+  <div id="viewSummary" class="section-body" style="overflow-y:auto;">
+    <!-- Header -->
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:16px 18px 0;">
+      <div><div style="font-size:16px;font-weight:600;color:var(--text);">Data <span style="color:var(--primary);">landscape</span></div><div id="sumHdrSub" style="font-size:11px;color:var(--text-muted);margin-top:2px;">—</div></div>
+      <div style="text-align:right;"><div id="sumQScore" style="font-size:38px;font-weight:600;color:var(--primary);line-height:1;">—</div><div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:2px;">quality index</div></div>
+    </div>
+    <!-- Line chart -->
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 16px;margin:14px 18px 0;box-shadow:var(--shadow-sm);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;">Operations activity</span>
+        <div style="display:flex;gap:12px;font-size:10px;color:var(--text-muted);font-weight:600;">
+          <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:3px;border-radius:2px;background:var(--primary);"></span>Reads</span>
+          <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:3px;border-radius:2px;background:var(--primary-dark);"></span>Writes</span>
+          <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:3px;border-radius:2px;background:var(--error);"></span>Errors</span>
+        </div>
       </div>
-      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
-        <div class="sec-header" style="margin-bottom:11px;"><i class="fas fa-clock" style="color:var(--warn);"></i>Slowest Ops</div>
-        <div id="summarySlowest"></div>
+      <canvas id="sumLineChart" style="width:100%;height:112px;display:block;"></canvas>
+      <div id="sumChartLabels" style="display:flex;margin-top:4px;"></div>
+    </div>
+    <!-- Time selector -->
+    <div id="sumTimeSel" style="display:flex;gap:4px;padding:12px 18px 0;">
+      <button class="date-pill active" data-sum-hours="1">1h</button>
+      <button class="date-pill" data-sum-hours="6">6h</button>
+      <button class="date-pill" data-sum-hours="24">24h</button>
+      <button class="date-pill" data-sum-hours="168">7d</button>
+      <button class="date-pill" data-sum-hours="336">14d</button>
+      <button class="date-pill" data-sum-hours="672">28d</button>
+    </div>
+    <!-- Operations strip -->
+    <div style="padding:12px 18px 0;">
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;box-shadow:var(--shadow-sm);margin-bottom:8px;">
+        <div style="padding:5px 12px;font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-surface);border-bottom:1px solid var(--border-light);">Operations</div>
+        <div id="sumOpsStrip" style="display:flex;"></div>
       </div>
-      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
-        <div class="sec-header" style="margin-bottom:11px;"><i class="fas fa-layer-group" style="color:var(--success);"></i>Catalog</div>
-        <div id="summaryCatalog"></div>
+      <!-- Platform strip -->
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;box-shadow:var(--shadow-sm);">
+        <div style="padding:5px 12px;font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-surface);border-bottom:1px solid var(--border-light);">Platform state</div>
+        <div id="sumPlatStrip" style="display:flex;"></div>
       </div>
-  </div>
+    </div>
+    <!-- Quality / Engines / Access -->
+    <div style="padding:11px 18px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;">
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;">
+        <div class="sec-header" style="margin-bottom:9px;"><i class="fas fa-heart-pulse" style="color:var(--primary);"></i>Data Quality · <span id="sumQTotal">0 tables</span></div>
+        <div id="sumQBar" style="display:flex;gap:2px;height:18px;border-radius:4px;overflow:hidden;margin-bottom:4px;"></div>
+        <div id="sumQLbls" style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);font-weight:600;"></div>
+        <div id="sumQAlerts" style="margin-top:6px;font-size:11px;color:var(--text-sec);line-height:1.7;"></div>
+      </div>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;">
+        <div class="sec-header" style="margin-bottom:9px;"><i class="fas fa-microchip" style="color:var(--primary);"></i>Engine Distribution</div>
+        <div id="sumEngines"></div>
+      </div>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;">
+        <div class="sec-header" style="margin-bottom:9px;"><i class="fas fa-layer-group" style="color:var(--success);"></i>Access & Ingestion</div>
+        <div id="sumAccess" style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:12px;color:var(--text-sec);line-height:1.8;"></div>
+      </div>
+    </div>
   </div>
 
   <!-- INFRA -->
   <div id="viewInfra" class="section-body hidden">
+    <!-- Gauges -->
+    <div id="infraGauges" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;padding:15px 18px 0;"></div>
+    <!-- 3-column cards -->
     <div class="infra-grid">
       <div class="infra-card">
         <div class="infra-card-head">
-          <div class="infra-card-title"><div class="infra-card-icon" style="background:rgba(220,38,38,.08);color:#dc2626;"><i class="fas fa-bolt"></i></div>Redis</div>
+          <div class="infra-card-title"><div class="infra-card-icon" style="background:rgba(229,72,77,.08);color:#E5484D;"><i class="fas fa-bolt"></i></div>Redis</div>
           <span class="infra-status loading" id="infraRedisStatus"><i class="fas fa-circle-notch pulsing"></i> …</span>
         </div>
         <div id="infraRedisKV"><div style="color:var(--text-muted);font-size:12px;">Loading…</div></div>
@@ -354,6 +400,13 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <div id="infraDuckKV"><div style="color:var(--text-muted);font-size:12px;">Loading…</div></div>
       </div>
     </div>
+    <!-- Sentinel topology -->
+    <div id="infraSentinelSection" style="padding:0 18px;display:none;">
+      <div class="infra-card" style="margin-bottom:13px;">
+        <div id="infraSentinelContent"></div>
+      </div>
+    </div>
+    <!-- Instances -->
     <div class="locks-section">
       <div class="locks-header">
         <i class="fas fa-cubes" style="color:var(--primary);"></i>Live API Instances
@@ -362,6 +415,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       </div>
       <div id="instancesTableWrap"></div>
     </div>
+    <!-- Locks -->
     <div class="locks-section">
       <div class="locks-header">
         <i class="fas fa-lock" style="color:var(--error);"></i>Active Table Locks
@@ -396,27 +450,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   </div>
 
   <!-- TIMELINE -->
-  <div id="viewTimeline" class="section-body hidden">
-    <div class="timeline-body">
-      <div class="timeline-controls">
-        <span class="ctrl-label">Bucket</span>
-        <button class="bucket-btn active" data-bucket="1">Hourly</button>
-        <button class="bucket-btn" data-bucket="6">6-Hour</button>
-        <button class="bucket-btn" data-bucket="24">Daily</button>
-      </div>
-      <div class="chart-card"><div class="chart-title"><i class="fas fa-book-open" style="color:var(--primary);"></i>Read Operations</div><div class="chart-wrap" id="chartReads"></div></div>
-      <div class="chart-card"><div class="chart-title"><i class="fas fa-pen-to-square" style="color:var(--success);"></i>Rows Written</div><div class="chart-wrap" id="chartWrites"></div></div>
-      <div class="chart-card"><div class="chart-title"><i class="fas fa-robot" style="color:var(--purple);"></i>MCP Calls</div><div class="chart-wrap" id="chartMcp"></div></div>
-      <div class="chart-card"><div class="chart-title"><i class="fas fa-share-nodes" style="color:#ea580c;"></i>OData Requests</div><div class="chart-wrap" id="chartOdata"></div></div>
-      <div class="chart-card"><div class="chart-title"><i class="fas fa-circle-exclamation" style="color:var(--error);"></i>Total Errors</div><div class="chart-wrap" id="chartErrors"></div></div>
-      <div class="tl-table-wrap">
-        <table class="tl-table">
-          <thead><tr><th style="text-align:left;">Bucket</th><th>Reads</th><th>Rows In</th><th>Rows Del</th><th>MCP</th><th>OData</th><th>Errors</th></tr></thead>
-          <tbody id="timelineTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+  <div id="viewTimeline" class="section-body hidden"></div>
 
   <!-- ERRORS -->
   <div id="viewErrors" class="section-body hidden">
@@ -427,36 +461,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="gran-btn" data-gran="30d" data-op="err">30d</button>
         <button class="gran-btn" data-gran="1yr" data-op="err">1yr</button>
       </div>
-      <div class="ops-sep"></div>
-      <div class="ops-metric-pills">
-        <button class="metric-btn active" data-m="count" data-op="err">Count</button>
-        <button class="metric-btn" data-m="avg_ms" data-op="err">Avg</button>
-        <button class="metric-btn" data-m="p50_ms" data-op="err">P50</button>
-        <button class="metric-btn" data-m="p90_ms" data-op="err">P90</button>
-        <button class="metric-btn" data-m="p99_ms" data-op="err">P99</button>
-        <button class="metric-btn" data-m="p100_ms" data-op="err">Max</button>
-      </div>
     </div>
     <div class="ops-stats-strip" id="errStatsStrip"></div>
-    <div class="ops-chart-section">
-      <div id="errChart"></div>
-      <span class="bucket-filter-chip hidden" id="errBucketChip">
-        <i class="fas fa-filter"></i> Bucket filter active
-        <button onclick="clearOpsBucket('err')">✕</button>
-      </span>
-    </div>
     <div class="ops-bottom">
       <div class="ops-list-panel">
         <div class="swrap"><i class="fas fa-search"></i><input id="errSearch" placeholder="Table, type, error text…"/></div>
         <div class="ops-list" id="errList"></div>
-      </div>
-      <div class="ops-detail-panel">
-        <div id="errDetailContent"></div>
-        <div id="errDetailEmpty" class="ops-empty">
-          <i class="fas fa-circle-exclamation"></i>
-          <div style="font-size:14px;font-weight:600;">Select an error</div>
-          <div style="font-size:12px;">Click any row to inspect the failed operation.</div>
-        </div>
       </div>
     </div>
   </div>
@@ -470,37 +480,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="gran-btn" data-gran="30d" data-op="read">30d</button>
         <button class="gran-btn" data-gran="1yr" data-op="read">1yr</button>
       </div>
-      <div class="ops-sep"></div>
-      <div class="ops-metric-pills">
-        <button class="metric-btn active" data-m="count" data-op="read">Count</button>
-        <button class="metric-btn" data-m="avg_ms" data-op="read">Avg</button>
-        <button class="metric-btn" data-m="p50_ms" data-op="read">P50</button>
-        <button class="metric-btn" data-m="p90_ms" data-op="read">P90</button>
-        <button class="metric-btn" data-m="p99_ms" data-op="read">P99</button>
-        <button class="metric-btn" data-m="p100_ms" data-op="read">Max</button>
-        <button class="metric-btn" data-m="rows" data-op="read">Rows</button>
-      </div>
     </div>
     <div class="ops-stats-strip" id="readStatsStrip"></div>
-    <div class="ops-chart-section">
-      <div id="readChart"></div>
-      <span class="bucket-filter-chip hidden" id="readBucketChip">
-        <i class="fas fa-filter"></i> Bucket filter active
-        <button onclick="clearOpsBucket('read')">✕</button>
-      </span>
-    </div>
     <div class="ops-bottom">
       <div class="ops-list-panel">
         <div class="swrap"><i class="fas fa-search"></i><input id="readSearch" placeholder="Table, query ID, role…"/></div>
         <div class="ops-list" id="readList"></div>
-      </div>
-      <div class="ops-detail-panel" id="readDetailPanel">
-        <div id="readDetailContent"></div>
-        <div id="readDetailEmpty" class="ops-empty">
-          <i class="fas fa-book-open"></i>
-          <div style="font-size:14px;font-weight:600;">Select a read operation</div>
-          <div style="font-size:12px;">Click any row in the list to view timings, SQL, and profile.</div>
-        </div>
       </div>
     </div>
   </div>
@@ -514,37 +499,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="gran-btn" data-gran="30d" data-op="write">30d</button>
         <button class="gran-btn" data-gran="1yr" data-op="write">1yr</button>
       </div>
-      <div class="ops-sep"></div>
-      <div class="ops-metric-pills">
-        <button class="metric-btn active" data-m="count" data-op="write">Count</button>
-        <button class="metric-btn" data-m="avg_ms" data-op="write">Avg</button>
-        <button class="metric-btn" data-m="p50_ms" data-op="write">P50</button>
-        <button class="metric-btn" data-m="p90_ms" data-op="write">P90</button>
-        <button class="metric-btn" data-m="p99_ms" data-op="write">P99</button>
-        <button class="metric-btn" data-m="p100_ms" data-op="write">Max</button>
-        <button class="metric-btn" data-m="rows" data-op="write">Rows In</button>
-      </div>
     </div>
     <div class="ops-stats-strip" id="writeStatsStrip"></div>
-    <div class="ops-chart-section">
-      <div id="writeChart"></div>
-      <span class="bucket-filter-chip hidden" id="writeBucketChip">
-        <i class="fas fa-filter"></i> Bucket filter active
-        <button onclick="clearOpsBucket('write')">✕</button>
-      </span>
-    </div>
     <div class="ops-bottom">
       <div class="ops-list-panel">
         <div class="swrap"><i class="fas fa-search"></i><input id="writeSearch" placeholder="Table, query ID, role…"/></div>
         <div class="ops-list" id="writeList"></div>
-      </div>
-      <div class="ops-detail-panel" id="writeDetailPanel">
-        <div id="writeDetailContent"></div>
-        <div id="writeDetailEmpty" class="ops-empty">
-          <i class="fas fa-pen-to-square"></i>
-          <div style="font-size:14px;font-weight:600;">Select a write operation</div>
-          <div style="font-size:12px;">Click any row in the list to view ingestion details.</div>
-        </div>
       </div>
     </div>
   </div>
@@ -558,37 +518,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="gran-btn" data-gran="30d" data-op="mcp">30d</button>
         <button class="gran-btn" data-gran="1yr" data-op="mcp">1yr</button>
       </div>
-      <div class="ops-sep"></div>
-      <div class="ops-metric-pills">
-        <button class="metric-btn active" data-m="count" data-op="mcp">Count</button>
-        <button class="metric-btn" data-m="avg_ms" data-op="mcp">Avg</button>
-        <button class="metric-btn" data-m="p50_ms" data-op="mcp">P50</button>
-        <button class="metric-btn" data-m="p90_ms" data-op="mcp">P90</button>
-        <button class="metric-btn" data-m="p99_ms" data-op="mcp">P99</button>
-        <button class="metric-btn" data-m="p100_ms" data-op="mcp">Max</button>
-        <button class="metric-btn" data-m="rows" data-op="mcp">Rows</button>
-      </div>
     </div>
     <div class="ops-stats-strip" id="mcpStatsStrip"></div>
-    <div class="ops-chart-section">
-      <div id="mcpChart"></div>
-      <span class="bucket-filter-chip hidden" id="mcpBucketChip">
-        <i class="fas fa-filter"></i> Bucket filter active
-        <button onclick="clearOpsBucket('mcp')">✕</button>
-      </span>
-    </div>
     <div class="ops-bottom">
       <div class="ops-list-panel">
         <div class="swrap"><i class="fas fa-search"></i><input id="mcpSearch" placeholder="Tool name, role…"/></div>
         <div class="ops-list" id="mcpList"></div>
-      </div>
-      <div class="ops-detail-panel">
-        <div id="mcpDetailContent"></div>
-        <div id="mcpDetailEmpty" class="ops-empty">
-          <i class="fas fa-robot"></i>
-          <div style="font-size:14px;font-weight:600;">Select a tool call</div>
-          <div style="font-size:12px;">Click any row to view MCP invocation details.</div>
-        </div>
       </div>
     </div>
   </div>
@@ -601,37 +536,12 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="gran-btn" data-gran="30d" data-op="odata">30d</button>
         <button class="gran-btn" data-gran="1yr" data-op="odata">1yr</button>
       </div>
-      <div class="ops-sep"></div>
-      <div class="ops-metric-pills">
-        <button class="metric-btn active" data-m="count" data-op="odata">Count</button>
-        <button class="metric-btn" data-m="avg_ms" data-op="odata">Avg</button>
-        <button class="metric-btn" data-m="p50_ms" data-op="odata">P50</button>
-        <button class="metric-btn" data-m="p90_ms" data-op="odata">P90</button>
-        <button class="metric-btn" data-m="p99_ms" data-op="odata">P99</button>
-        <button class="metric-btn" data-m="p100_ms" data-op="odata">Max</button>
-        <button class="metric-btn" data-m="rows" data-op="odata">Rows</button>
-      </div>
     </div>
     <div class="ops-stats-strip" id="odataStatsStrip"></div>
-    <div class="ops-chart-section">
-      <div id="odataChart"></div>
-      <span class="bucket-filter-chip hidden" id="odataBucketChip">
-        <i class="fas fa-filter"></i> Bucket filter active
-        <button onclick="clearOpsBucket('odata')">✕</button>
-      </span>
-    </div>
     <div class="ops-bottom">
       <div class="ops-list-panel">
         <div class="swrap"><i class="fas fa-search"></i><input id="odataSearch" placeholder="Table, filter, role…"/></div>
         <div class="ops-list" id="odataList"></div>
-      </div>
-      <div class="ops-detail-panel">
-        <div id="odataDetailContent"></div>
-        <div id="odataDetailEmpty" class="ops-empty">
-          <i class="fas fa-share-nodes"></i>
-          <div style="font-size:14px;font-weight:600;">Select an OData request</div>
-          <div style="font-size:12px;">Click any row to view query details and generated SQL.</div>
-        </div>
       </div>
     </div>
   </div>
@@ -727,24 +637,45 @@ function winHours(){
 
 // ─── Section routing ─────────────────────────────────────────────────────
 var VIEWS={summary:"viewSummary",infra:"viewInfra",catalog:"viewCatalog",timeline:"viewTimeline",errors:"viewErrors",reads:"viewReads",writes:"viewWrites",mcp:"viewMcp",odata:"viewOdata"};
+var _TL_GROUP=["errors","reads","writes","mcp","odata"];
+function _isTL(s){return _TL_GROUP.indexOf(s)>=0;}
 function renderSection(){
-  document.querySelectorAll(".section-node").forEach(function(n){n.classList.toggle("active",n.dataset.section===section);});
+  // Clicking Activity top tab → redirect to Errors sub-tab
+  if(section==="timeline"){section="errors";}
+  var isTL=_isTL(section);
+  // Top bar: highlight timeline for any sub-section
+  document.querySelectorAll(".bar-row:first-of-type .section-node").forEach(function(n){
+    var s=n.dataset.section;
+    if(s==="timeline")n.classList.toggle("active",isTL);
+    else n.classList.toggle("active",s===section);
+  });
+  // Sub-tab bar: show when timeline group is active, highlight current sub-section
+  var subBar=document.getElementById("timelineSubBar");
+  if(subBar){
+    subBar.classList.toggle("hidden",!isTL);
+    subBar.querySelectorAll(".section-node").forEach(function(n){n.classList.toggle("active",n.dataset.section===section);});
+  }
+  // Views: show the active one
   Object.keys(VIEWS).forEach(function(k){var el=document.getElementById(VIEWS[k]);if(el)el.classList.toggle("hidden",k!==section);});
   if(section==="summary")  renderSummary();
   if(section==="infra")    renderInfra();
   if(section==="catalog")  renderCatalog();
-  if(section==="timeline") renderTimeline();
   if(section==="errors")   renderErrors();
   if(section==="reads")    renderReads();
   if(section==="writes")   renderWrites();
   if(section==="mcp")      renderMcp();
   if(section==="odata")    renderOdata();
 }
-document.querySelectorAll(".section-node").forEach(function(n){
-  n.addEventListener("click",function(){section=n.dataset.section;selRead=null;selWrite=null;selMcp=null;selErr=null;renderSection();});
+// Top bar click: only the 4 main tabs
+document.querySelectorAll(".bar-row:first-of-type .section-node").forEach(function(n){
+  n.addEventListener("click",function(){section=n.dataset.section;selRead=null;selWrite=null;selMcp=null;selErr=null;if(!_sectionLoaded[section])refreshSection();else renderSection();});
 });
-document.querySelectorAll(".date-pill").forEach(function(p){
-  p.addEventListener("click",function(){dateRange=p.dataset.range;document.querySelectorAll(".date-pill").forEach(function(x){x.classList.toggle("active",x===p);});refreshAll();});
+// Sub-tab bar click
+document.getElementById("timelineSubBar").querySelectorAll(".section-node").forEach(function(n){
+  n.addEventListener("click",function(){section=n.dataset.section;selRead=null;selWrite=null;selMcp=null;selErr=null;if(!_sectionLoaded[section])refreshSection();else renderSection();});
+});
+document.querySelectorAll(".date-pill[data-range]").forEach(function(p){
+  p.addEventListener("click",function(){dateRange=p.dataset.range;document.querySelectorAll(".date-pill[data-range]").forEach(function(x){x.classList.toggle("active",x===p);});refreshAll();});
 });
 
 // ─── Filter helpers ──────────────────────────────────────────────────────
@@ -866,11 +797,11 @@ function renderOpsChart(elId,bkts,metric,color,gran,selIdx,onClickFn){
   var g=GRAN[gran]||GRAN["24h"];
   for(var i=0;i<n;i+=step){
     var lx=bx(i)+bw/2;
-    xl+='<text x="'+lx.toFixed(0)+'" y="'+(MT+PH+14)+'" text-anchor="middle" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">'+esc(fmtBL(bkts[i].ts_ms,g.bucket_ms/3600000||1))+'</text>';
+    xl+='<text x="'+lx.toFixed(0)+'" y="'+(MT+PH+14)+'" text-anchor="middle" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">'+esc(fmtBL(bkts[i].ts_ms,g.bucket_ms/3600000||1))+'</text>';
   }
   // y-axis labels
-  var yl='<text x="'+(ML-4)+'" y="'+(MT+PH)+'" text-anchor="end" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">0</text>'
-    +'<text x="'+(ML-4)+'" y="'+(MT+6)+'" text-anchor="end" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">'+(metric.endsWith("_ms")&&maxV>=1000?(maxV/1000).toFixed(1)+"s":fmtNum(maxV))+'</text>';
+  var yl='<text x="'+(ML-4)+'" y="'+(MT+PH)+'" text-anchor="end" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">0</text>'
+    +'<text x="'+(ML-4)+'" y="'+(MT+6)+'" text-anchor="end" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">'+(metric.endsWith("_ms")&&maxV>=1000?(maxV/1000).toFixed(1)+"s":fmtNum(maxV))+'</text>';
   var grid='<line x1="'+ML+'" y1="'+(MT+PH/2)+'" x2="'+(ML+pw)+'" y2="'+(MT+PH/2)+'" stroke="#eef2f8" stroke-width="1"/>'
     +'<line x1="'+ML+'" y1="'+(MT+PH)+'" x2="'+(ML+pw)+'" y2="'+(MT+PH)+'" stroke="#dde4ee" stroke-width="1"/>';
   var totalH=MT+PH+MB;
@@ -887,11 +818,11 @@ function renderOpsChart(elId,bkts,metric,color,gran,selIdx,onClickFn){
 function renderStatsStrip(elId,stats,rowLabel,color){
   var el=document.getElementById(elId);if(!el)return;
   var errPct=stats.count>0?Math.round(stats.errors/stats.count*100):0;
-  var p99col=stats.p99_ms>1000?"#ef4444":stats.p99_ms>300?"#f59e0b":"#10b981";
+  var p99col=stats.p99_ms>1000?"#E5484D":stats.p99_ms>300?"#F5A623":"#2FC89F";
   var tiles=[
     {label:"Total Ops",    value:fmtNum(stats.count),   sub:"operations",           accent:color},
-    {label:"Errors",       value:String(stats.errors),   sub:errPct+"% error rate",  accent:"#ef4444"},
-    {label:rowLabel,       value:fmtRows(stats.rows),    sub:"total",                accent:"#10b981"},
+    {label:"Errors",       value:String(stats.errors),   sub:errPct+"% error rate",  accent:"#E5484D"},
+    {label:rowLabel,       value:fmtRows(stats.rows),    sub:"total",                accent:"#2FC89F"},
     {label:"P99",          value:fmtMs(stats.p99_ms),    sub:"Max "+fmtMs(stats.p100_ms), accent:p99col},
   ];
   el.innerHTML=tiles.map(function(t){
@@ -1046,8 +977,8 @@ function renderReads(){
   var stats=statsFromItems(allReads,"result_rows");
   var cntBadge=document.getElementById("countReads");
   if(cntBadge)cntBadge.textContent=allReads.length?" ("+allReads.length+")":"";
-  renderStatsStrip("readStatsStrip",stats,"Rows Out","#1c96ca");
-  renderOpsChart("readChart",bkts,readMetric,"#1c96ca",readGran,readBucket,function(idx){
+  renderStatsStrip("readStatsStrip",stats,"Rows Out","#29B5E8");
+  renderOpsChart("readChart",bkts,readMetric,"#29B5E8",readGran,readBucket,function(idx){
     readBucket=(readBucket===idx)?null:idx;
     var chip=document.getElementById("readBucketChip");
     if(chip)chip.classList.toggle("hidden",readBucket===null);
@@ -1058,7 +989,7 @@ function renderReads(){
   renderOpsList("readList",items,selRead,function(i){
     selRead=i;
     renderReads();
-  },"result_rows","#1c96ca");
+  },"result_rows","#29B5E8");
   renderOpsDetail("readDetailContent","readDetailEmpty",selRead!==null?items[selRead]:null,false);
 }
 
@@ -1069,8 +1000,8 @@ function renderWrites(){
   var stats=statsFromItems(allWrites,"inserted");
   var cntBadge=document.getElementById("countWrites");
   if(cntBadge)cntBadge.textContent=allWrites.length?" ("+allWrites.length+")":"";
-  renderStatsStrip("writeStatsStrip",stats,"Rows In","#10b981");
-  renderOpsChart("writeChart",bkts,writeMetric,"#10b981",writeGran,writeBucket,function(idx){
+  renderStatsStrip("writeStatsStrip",stats,"Rows In","#2FC89F");
+  renderOpsChart("writeChart",bkts,writeMetric,"#2FC89F",writeGran,writeBucket,function(idx){
     writeBucket=(writeBucket===idx)?null:idx;
     var chip=document.getElementById("writeBucketChip");
     if(chip)chip.classList.toggle("hidden",writeBucket===null);
@@ -1081,7 +1012,7 @@ function renderWrites(){
   renderOpsList("writeList",items,selWrite,function(i){
     selWrite=i;
     renderWrites();
-  },"inserted","#10b981");
+  },"inserted","#2FC89F");
   renderOpsDetail("writeDetailContent","writeDetailEmpty",selWrite!==null?items[selWrite]:null,true);
 }
 
@@ -1101,9 +1032,9 @@ function sparkline(containerId,buckets,field,color){
   var pts=vals.map(function(v,i){return px(i)+","+py(v);}).join(" ");
   var area=pts+" "+px(n-1)+","+(PT+ph)+" "+PL+","+(PT+ph);
   var xl="";var step=Math.max(1,Math.ceil(n/7));
-  for(var i=0;i<n;i+=step)xl+='<text x="'+px(i)+'" y="'+(PT+ph+13)+'" text-anchor="middle" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">'+esc(fmtBL(buckets[i].ts_ms,bucketHours))+'</text>';
-  var yl='<text x="'+(PL-4)+'" y="'+(PT+ph)+'" text-anchor="end" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">0</text>'
-    +'<text x="'+(PL-4)+'" y="'+(PT+4)+'" text-anchor="end" font-size="9" fill="#94a3b8" font-family="IBM Plex Mono,monospace">'+fmtNum(maxV)+'</text>';
+  for(var i=0;i<n;i+=step)xl+='<text x="'+px(i)+'" y="'+(PT+ph+13)+'" text-anchor="middle" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">'+esc(fmtBL(buckets[i].ts_ms,bucketHours))+'</text>';
+  var yl='<text x="'+(PL-4)+'" y="'+(PT+ph)+'" text-anchor="end" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">0</text>'
+    +'<text x="'+(PL-4)+'" y="'+(PT+4)+'" text-anchor="end" font-size="9" fill="#6E7891" font-family="IBM Plex Mono,monospace">'+fmtNum(maxV)+'</text>';
   var grid='<line x1="'+PL+'" y1="'+(PT+ph/2)+'" x2="'+(PL+pw)+'" y2="'+(PT+ph/2)+'" stroke="#e8eef5" stroke-width="1"/>'
     +'<line x1="'+PL+'" y1="'+PT+'" x2="'+(PL+pw)+'" y2="'+PT+'" stroke="#e8eef5" stroke-width="1"/>'
     +'<line x1="'+PL+'" y1="'+(PT+ph)+'" x2="'+(PL+pw)+'" y2="'+(PT+ph)+'" stroke="#c8d5e8" stroke-width="1"/>';
@@ -1140,7 +1071,7 @@ async function loadErrors(){
   var url="/api/v1/monitoring/errors?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit="+g.limit+"&from_ts="+from;
   try{var d=await getJSON(url);allErrors=(d&&d.items)||[];}catch(e){allErrors=[];}
 }
-async function loadInfra(){try{infraData=await getJSON("/api/v1/health/deep");}catch(e){infraData=null;}}
+async function loadInfra(){try{infraData=await getJSON("/api/v1/health/infra");}catch(e){infraData=null;}}
 async function loadCatalog(){var c=ctx();try{var d=await getJSON("/api/v1/monitoring/catalog?org="+enc(c.org)+"&sup="+enc(c.sup));catalogData=(d&&d.stats)||null;}catch(e){catalogData=null;}}
 async function loadTimeline(){var c=ctx();try{var d=await getJSON("/api/v1/monitoring/timeseries?org="+enc(c.org)+"&sup="+enc(c.sup)+"&bucket_hours="+bucketHours+"&window_hours="+winHours());timelineData=(d&&d.buckets)||[];}catch(e){timelineData=[];}}
 async function loadLocks(){var c=ctx();try{var d=await getJSON("/api/v1/monitoring/locks?org="+enc(c.org)+"&sup="+enc(c.sup));locksData=(d&&d.locks)||[];}catch(e){locksData=[];}}
@@ -1150,19 +1081,55 @@ async function loadOdata(){
   var from=Date.now()-g.window_ms;
   var url="/api/v1/monitoring/odata?org="+enc(c.org)+"&sup="+enc(c.sup)+"&limit="+g.limit+"&from_ts="+from;
   try{var d=await getJSON(url);allOdata=(d&&d.items)||[];}catch(e){allOdata=[];}
-}async function refreshAll(){
+}
+var _sectionLoaded={};
+async function refreshSection(){
+  var lbl=document.getElementById("lastRefreshLabel");if(lbl)lbl.textContent="Refreshing…";
+  var c=ctx();if(!c.org||!c.sup){if(lbl)lbl.textContent="";return;}
+  var loaders=[];
+  if(section==="timeline"){section="errors";}
+  if(section==="summary"){loaders.push(loadSumData());}
+  else if(section==="infra"){loaders.push(loadInfra(),loadLocks(),loadInstances());}
+  else if(section==="catalog"){loaders.push(loadCatalog());}
+  else if(section==="errors"){loaders.push(loadErrors());}
+  else if(section==="reads"){loaders.push(loadReads());}
+  else if(section==="writes"){loaders.push(loadWrites());}
+  else if(section==="mcp"){loaders.push(loadMcp());}
+  else if(section==="odata"){loaders.push(Promise.resolve());}
+  await Promise.all(loaders);
+  _sectionLoaded[section]=true;
+  if(lbl)lbl.textContent="Updated "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  renderSection();
+}
+async function refreshAll(){
   selRead=null;selWrite=null;selMcp=null;selErr=null;
   var lbl=document.getElementById("lastRefreshLabel");if(lbl)lbl.textContent="Refreshing…";
   var c=ctx();if(!c.org||!c.sup){if(lbl)lbl.textContent="";return;}
-  await Promise.all([loadReads(),loadWrites(),loadMcp(),loadErrors(),loadOdata(),loadInfra(),loadCatalog(),loadTimeline(),loadLocks(),loadInstances()]);
+  await Promise.all([loadSumData(),loadReads(),loadWrites(),loadMcp(),loadErrors(),loadInfra(),loadCatalog(),loadLocks(),loadInstances()]);
+  Object.keys(_sectionLoaded).forEach(function(k){_sectionLoaded[k]=true;});
+  _sectionLoaded.summary=true;_sectionLoaded.infra=true;_sectionLoaded.catalog=true;_sectionLoaded.timeline=true;_sectionLoaded.errors=true;_sectionLoaded.reads=true;_sectionLoaded.writes=true;_sectionLoaded.mcp=true;_sectionLoaded.odata=true;
   if(lbl)lbl.textContent="Updated "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
   renderSection();
 }
 
-// ─── Auto-refresh timers ──────────────────────────────────────────────────
-setInterval(function(){var c=ctx();if(!c.org||!c.sup)return;loadLocks().then(function(){if(section==="infra")renderLocks();});},10000);
-setInterval(function(){loadInstances().then(function(){if(section==="infra")renderInstances();});},15000);
-setInterval(function(){loadInfra().then(function(){renderInfraTopbar();if(section==="infra")renderInfraCards();if(section==="summary")renderSummaryInfraRow();});},30000);
+// ─── Auto-refresh ─────────────────────────────────────────────────────
+var _autoTimer=null,_autoRunning=false;
+function _startAutoRefresh(){
+  _stopAutoRefresh();
+  var sec=parseInt(document.getElementById("autoRefreshInterval").value)||10;
+  _autoTimer=setInterval(function(){
+    if(_autoRunning)return;
+    _autoRunning=true;
+    refreshSection().finally(function(){_autoRunning=false;});
+  },sec*1000);
+}
+function _stopAutoRefresh(){if(_autoTimer){clearInterval(_autoTimer);_autoTimer=null;}_autoRunning=false;}
+document.getElementById("autoRefreshToggle").addEventListener("change",function(){
+  if(this.checked)_startAutoRefresh();else _stopAutoRefresh();
+});
+document.getElementById("autoRefreshInterval").addEventListener("change",function(){
+  if(document.getElementById("autoRefreshToggle").checked)_startAutoRefresh();
+});
 
 // ─── Search wiring ────────────────────────────────────────────────────────
 document.getElementById("readSearch").addEventListener("input",function(e){srchRead=e.target.value;if(section==="reads")renderReads();});
@@ -1209,7 +1176,7 @@ function renderSummaryInfraRow(){
   var ch=(infraData&&infraData.checks)||{};
   var items=[
     {
-      id:"redis",label:"Redis",icon:"fa-bolt",iconBg:"rgba(220,38,38,.08)",iconCol:"#dc2626",
+      id:"redis",label:"Redis",icon:"fa-bolt",iconBg:"rgba(229,72,77,.08)",iconCol:"#E5484D",
       ok:(ch.redis||{}).status==="ok",
       detail: (ch.redis&&ch.redis.status==="ok")
         ? (ch.redis.server
@@ -1218,14 +1185,14 @@ function renderSummaryInfraRow(){
         : (infraData ? esc((ch.redis&&ch.redis.error)||"Unavailable") : "Checking…"),
     },
     {
-      id:"storage",label:"Storage",icon:"fa-hard-drive",iconBg:"rgba(16,185,129,.08)",iconCol:"var(--success)",
+      id:"storage",label:"Storage",icon:"fa-hard-drive",iconBg:"rgba(47,200,159,.08)",iconCol:"var(--success)",
       ok:(ch.storage||{}).status==="ok",
       detail: (ch.storage&&ch.storage.status==="ok")
         ? esc((ch.storage.backend||"")+(ch.storage.probe_latency_ms!=null?" · "+ch.storage.probe_latency_ms+"ms latency":"")+(ch.storage.bucket?" · "+ch.storage.bucket:"")+(ch.storage.root_path?" · "+ch.storage.root_path:""))
         : (infraData ? esc((ch.storage&&ch.storage.error)||"Unavailable") : "Checking…"),
     },
     {
-      id:"duckdb",label:"DuckDB",icon:"fa-database",iconBg:"rgba(245,158,11,.08)",iconCol:"var(--warn)",
+      id:"duckdb",label:"DuckDB",icon:"fa-database",iconBg:"rgba(245,166,35,.08)",iconCol:"var(--warn)",
       ok:(ch.duckdb||{}).status==="ok",
       detail: (ch.duckdb&&ch.duckdb.status==="ok")
         ? esc((ch.duckdb.version||"")+(ch.duckdb.memory_limit?" · "+ch.duckdb.memory_limit:"")+(ch.duckdb.threads?" · "+ch.duckdb.threads+" threads":""))
@@ -1249,40 +1216,170 @@ function renderSummaryInfraRow(){
       +'</div>';
   }).join("");
 }
+
+/* ── Summary: Data Landscape ──────────────────────────────────────────── */
+var sumWindowHours=1,sumData=null;
+
+function _sumStripItem(val,label,cls){
+  return '<div style="flex:1;padding:12px 10px;text-align:center;border-right:1px solid var(--border-light);">'
+    +'<div style="font-size:21px;font-weight:700;'+(cls||'color:var(--text);')+'">'+val+'</div>'
+    +'<div style="font-size:10px;color:var(--text-muted);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;">'+esc(label)+'</div></div>';
+}
+function _sumBarRow(name,pct){
+  return '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">'
+    +'<span style="width:64px;color:var(--text-sec);font-size:11px;font-weight:600;">'+esc(name)+'</span>'
+    +'<div style="flex:1;height:6px;background:var(--bg-surface);border-radius:3px;overflow:hidden;">'
+    +'<div style="height:100%;background:var(--primary);border-radius:3px;width:'+pct+'%;"></div></div>'
+    +'<span style="width:30px;text-align:right;color:var(--text-muted);font-size:11px;font-family:var(--mono);">'+pct+'%</span></div>';
+}
+
+function _drawSumLineChart(ts,bm){
+  var canvas=document.getElementById("sumLineChart");if(!canvas)return;
+  var dpr=window.devicePixelRatio||1;
+  var rect=canvas.getBoundingClientRect();
+  canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;
+  var ctx=canvas.getContext("2d");ctx.scale(dpr,dpr);
+  var W=rect.width,H=rect.height,pad={t:4,b:16,l:0,r:0};
+  var cW=W-pad.l-pad.r,cH=H-pad.t-pad.b;
+  if(!ts||!ts.length){ctx.clearRect(0,0,W,H);return;}
+
+  var mx=1;
+  for(var i=0;i<ts.length;i++){
+    if((ts[i].reads||0)>mx)mx=ts[i].reads;
+    if((ts[i].writes||0)>mx)mx=ts[i].writes;
+    if((ts[i].errors||0)>mx)mx=ts[i].errors;
+  }
+  var stepX=ts.length>1?cW/(ts.length-1):cW;
+
+  function drawLine(field,color,width){
+    ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineJoin="round";
+    for(var i=0;i<ts.length;i++){
+      var x=pad.l+i*stepX;
+      var y=pad.t+cH-(((ts[i][field]||0)/mx)*cH);
+      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+  function drawArea(field,color){
+    ctx.beginPath();ctx.fillStyle=color;
+    ctx.moveTo(pad.l,pad.t+cH);
+    for(var i=0;i<ts.length;i++){
+      var x=pad.l+i*stepX;
+      var y=pad.t+cH-(((ts[i][field]||0)/mx)*cH);
+      ctx.lineTo(x,y);
+    }
+    ctx.lineTo(pad.l+(ts.length-1)*stepX,pad.t+cH);ctx.closePath();ctx.fill();
+  }
+
+  ctx.clearRect(0,0,W,H);
+  drawArea("reads","rgba(41,181,232,.08)");
+  drawLine("reads","#29B5E8",1.5);
+  drawLine("writes","#11567F",1.5);
+  drawLine("errors","#E5484D",1.5);
+
+  // X-axis labels
+  var lblEl=document.getElementById("sumChartLabels");if(lblEl){
+    lblEl.innerHTML="";
+    var le=Math.max(1,Math.floor(ts.length/8));
+    for(var i=0;i<ts.length;i++){
+      var lb=document.createElement("span");
+      lb.style.cssText="flex:1;text-align:center;font-size:9px;color:var(--text-muted);font-weight:600;";
+      if(i%le===0&&ts[i].ts_ms){
+        var d=new Date(ts[i].ts_ms);
+        lb.textContent=bm<60?d.getHours()+":"+String(d.getMinutes()).padStart(2,"0"):bm<1440?d.getHours()+":00":(d.getMonth()+1)+"/"+d.getDate();
+      }
+      lblEl.appendChild(lb);
+    }
+  }
+}
+
+document.getElementById("sumTimeSel").addEventListener("click",function(e){
+  var btn=e.target.closest("[data-sum-hours]");if(!btn)return;
+  document.querySelectorAll("#sumTimeSel .date-pill").forEach(function(b){b.classList.remove("active");});
+  btn.classList.add("active");
+  sumWindowHours=parseInt(btn.dataset.sumHours)||1;
+  loadSumData();
+});
+
+async function loadSumData(){
+  var c=ctx();if(!c.org||!c.sup)return;
+  try{
+    var d=await getJSON("/api/v1/summary?org="+enc(c.org)+"&sup="+enc(c.sup)+"&window_hours="+sumWindowHours);
+    sumData=(d&&d.data)||null;
+  }catch(e){sumData=null;}
+  renderSumContent();
+}
+
+function renderSumContent(){
+  var d=sumData;if(!d)return;
+  var c=ctx();
+  // Header
+  var sub=document.getElementById("sumHdrSub");if(sub)sub.textContent=[c.org,c.sup,fmtNum((d.platform||{}).table_count)+" tables"].join(" · ");
+  var qs=document.getElementById("sumQScore");if(qs)qs.textContent=(d.quality||{}).score!=null?(d.quality||{}).score:"—";
+  // Line chart
+  _drawSumLineChart(d.timeseries,d.bucket_minutes||1);
+  // Operations strip
+  var ops=d.operations||{};
+  var os=document.getElementById("sumOpsStrip");
+  if(os){
+    var errCls=ops.errors>0?"color:var(--error);":"color:var(--text);";
+    var mcpCls=ops.mcp_calls===0?"color:#cbd5e1;":"color:var(--text);";
+    os.innerHTML=_sumStripItem(fmtRows(ops.read_ops),"Read ops")
+      +_sumStripItem(fmtRows(ops.write_ops),"Write ops")
+      +_sumStripItem(fmtRows(ops.mcp_calls),"MCP calls",mcpCls)
+      +_sumStripItem(fmtRows(ops.odata_calls),"OData")
+      +_sumStripItem(fmtRows(ops.rows_ingested),"Rows ingested")
+      +_sumStripItem(fmtRows(ops.rows_deleted),"Rows deleted")
+      +_sumStripItem(fmtRows(ops.errors),"Errors",errCls);
+  }
+  // Platform strip
+  var pl=d.platform||{};
+  var ps=document.getElementById("sumPlatStrip");
+  if(ps)ps.innerHTML=_sumStripItem(fmtNum(pl.table_count),"Tables")
+    +_sumStripItem(fmtNum(pl.total_snapshots),"Snapshots")
+    +_sumStripItem(pl.storage_bytes?fmtRows(pl.storage_bytes):"—","Capacity")
+    +_sumStripItem(pl.avg_read_ms?fmtMs(pl.avg_read_ms):"—","Avg latency")
+    +_sumStripItem(String(pl.role_count||0),"Roles")
+    +_sumStripItem(String(pl.user_count||0),"Users")
+    +_sumStripItem(String(pl.token_count||0),"Tokens");
+  // Quality
+  var q=d.quality||{};
+  var qt=document.getElementById("sumQTotal");if(qt)qt.textContent=fmtNum(q.tables_checked)+" tables";
+  var qb=document.getElementById("sumQBar");
+  if(qb){qb.innerHTML="";
+    if(q.tables_checked>0){
+      if(q.tables_ok>0)qb.innerHTML+='<div style="flex:'+q.tables_ok+';background:var(--primary);"></div>';
+      if(q.tables_warning>0)qb.innerHTML+='<div style="flex:'+q.tables_warning+';background:var(--warn);"></div>';
+      if(q.tables_critical>0)qb.innerHTML+='<div style="flex:'+q.tables_critical+';background:var(--error);"></div>';
+    }
+  }
+  var ql=document.getElementById("sumQLbls");if(ql)ql.innerHTML='<span>'+fmtNum(q.tables_ok)+' ok</span><span>'+fmtNum(q.tables_warning)+' warn</span><span>'+fmtNum(q.tables_critical)+' critical</span>';
+  var qa=document.getElementById("sumQAlerts");
+  if(qa){qa.innerHTML="";(q.alerts||[]).forEach(function(a){
+    var sev=a.severity==="critical"?"var(--error)":"var(--warn)";
+    qa.innerHTML+='<span style="width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:5px;background:'+sev+'"></span>'+esc(a.table)+(a.column?" · "+esc(a.column):"")+" — "+esc(a.name)+"<br>";
+  });}
+  // Engine distribution
+  var eng=d.engine_distribution||{};
+  var ee=document.getElementById("sumEngines");
+  if(ee){ee.innerHTML="";var tot=0,ent=[];for(var k in eng){if(eng.hasOwnProperty(k)){tot+=eng[k];ent.push([k,eng[k]]);}}
+    ent.sort(function(a,b){return b[1]-a[1];});
+    ee.innerHTML=ent.map(function(e){var pct=tot>0?Math.round(e[1]/tot*100):0;return _sumBarRow(e[0],pct);}).join("");
+    if(!ent.length)ee.innerHTML='<div style="font-size:11px;color:var(--text-muted);">No data</div>';
+  }
+  // Access & ingestion
+  var ing=d.ingestion||{};
+  var ac=document.getElementById("sumAccess");
+  if(ac)ac.innerHTML='<div><span style="color:var(--text);font-weight:500;">'+fmtNum(pl.token_count)+'</span> API tokens</div>'
+    +'<div><span style="color:var(--text);font-weight:500;">'+fmtNum(ops.odata_calls)+'</span> OData endpoints</div>'
+    +'<div><span style="color:var(--text);font-weight:500;">'+fmtNum(ing.staging_count)+'</span> staging areas</div>'
+    +'<div><span style="color:var(--text);font-weight:500;">'+(ing.pipe_enabled||0)+'/'+(ing.pipe_total||0)+'</span> pipes enabled</div>';
+}
+
 function renderSummary(){
-  var reads=allReads,writes=allWrites,mcp=allMcp;
-  var rErr=reads.filter(function(i){var s=String(i.status||"").toUpperCase();return s==="ERROR"||s==="FAIL"||s==="FAILED";}).length;
-  var wErr=writes.filter(function(i){return!!i.error;}).length;
-  var mErr=mcp.filter(function(i){return String(i.status||"").toLowerCase()==="error";}).length;
-  var totalIns=writes.reduce(function(s,i){return s+(Number(i.inserted)||0);},0);
-  var tiles=[
-    {icon:"fa-book-open",col:"var(--primary)",bg:"var(--primary-light)",num:reads.length,lbl:"Read Ops"},
-    {icon:"fa-pen-to-square",col:"var(--success)",bg:"var(--success-bg)",num:writes.length,lbl:"Write Ops"},
-    {icon:"fa-robot",col:"var(--purple)",bg:"var(--purple-bg)",num:mcp.length,lbl:"MCP Calls"},
-    {icon:"fa-triangle-exclamation",col:"var(--error)",bg:"var(--error-bg)",num:rErr+wErr+mErr,lbl:"Errors"},
-    {icon:"fa-arrow-down-to-line",col:"var(--success)",bg:"var(--success-bg)",num:totalIns,lbl:"Rows Ingested",rows:true},
-  ];
-  var g=document.getElementById("summaryGrid");
-  if(g)g.innerHTML=tiles.map(function(t){return'<div class="summary-tile"><div class="sicon" style="background:'+t.bg+';color:'+t.col+';"><i class="fas '+t.icon+'"></i></div><div><div class="snum">'+esc(t.rows?fmtRows(t.num):String(t.num))+'</div><div class="slabel">'+esc(t.lbl)+'</div></div></div>';}).join("");
-  var tbl={};reads.concat(writes).forEach(function(it){var t=it.table_name||it.target_table;if(t)tbl[t]=(tbl[t]||0)+1;});
-  var s=Object.keys(tbl).sort(function(a,b){return tbl[b]-tbl[a];}).slice(0,6);var mx=s.length?tbl[s[0]]:1;
-  var th=document.getElementById("summaryTopTables");
-  if(th)th.innerHTML=s.length?s.map(function(t){return'<div class="bar-row-item"><div class="bar-label" title="'+esc(t)+'">'+esc(t.length>11?t.slice(0,11)+"…":t)+'</div><div class="bar-track"><div class="bar-fill" style="width:'+Math.round(tbl[t]/mx*100)+'%;background:var(--primary);"></div></div><div class="bar-val">'+tbl[t]+'</div></div>';}).join(""):'<div style="font-size:11px;color:var(--text-muted);">No data</div>';
-  var durs=[];
-  reads.forEach(function(it){var d=durMs(it);if(d!==null&&d>0)durs.push({name:it.table_name||it.query_id||"read",dur:d,col:"var(--primary)"});});
-  writes.forEach(function(it){var d=durMs(it);if(d!==null&&d>0)durs.push({name:it.table_name||it.target_table||"write",dur:d,col:"var(--success)"});});
-  durs.sort(function(a,b){return b.dur-a.dur;});var top5=durs.slice(0,5);var md=top5.length?top5[0].dur:1;
-  var sl=document.getElementById("summarySlowest");
-  if(sl)sl.innerHTML=top5.length?top5.map(function(d){return'<div class="bar-row-item"><div class="bar-label" title="'+esc(d.name)+'">'+esc(d.name.length>11?d.name.slice(0,11)+"…":d.name)+'</div><div class="bar-track"><div class="bar-fill" style="width:'+Math.round(d.dur/md*100)+'%;background:'+d.col+'"></div></div><div class="bar-val">'+esc(fmtMs(d.dur))+'</div></div>';}).join(""):'<div style="font-size:11px;color:var(--text-muted);">No data</div>';
-  renderSummaryCatalog();renderSummaryInfraRow();
+  if(sumData)renderSumContent();
 }
-function renderSummaryCatalog(){
-  var el=document.getElementById("summaryCatalog");if(!el)return;
-  if(!catalogData){el.innerHTML='<div style="font-size:11px;color:var(--text-muted);">Loading…</div>';return;}
-  var d=catalogData;
-  el.innerHTML=[{l:"Tables",v:fmtNum(d.tables)},{l:"Snapshots",v:fmtNum(d.total_snapshots)},{l:"Users",v:String(d.users)},{l:"Roles",v:String(d.roles)},{l:"API Tokens",v:String(d.tokens)}]
-    .map(function(r){return'<div class="stat-row"><span class="label">'+esc(r.l)+'</span><span class="val">'+esc(r.v)+'</span></div>';}).join("");
-}
+function renderSummaryCatalog(){}
 // ─── INFRA renderers ──────────────────────────────────────────────────────
 function renderInfraTopbar(){
   var badge=document.getElementById("infraStatusBadge");if(!badge)return;
@@ -1298,7 +1395,35 @@ function renderInfraCards(){
   if(!infraData){["infraRedisStatus","infraStorageStatus","infraDuckStatus"].forEach(function(id){var el=document.getElementById(id);if(el){el.className="infra-status loading";el.innerHTML='<i class="fas fa-circle-notch pulsing"></i> …';}});return;}
   renderInfraTopbar();
   var ch=infraData.checks||{};
-  // Redis
+
+  // ── Gauges ──────────────────────────────────────────────────────────
+  var gEl=document.getElementById("infraGauges");
+  if(gEl){
+    var redis=ch.redis||{},srv=(redis.server||{}),storage=ch.storage||{},duck=ch.duckdb||{};
+    var hitPct=parseFloat(srv.keyspace_hit_rate)||0;
+    var used=parseHuman(srv.used_memory_human),peak=parseHuman(srv.used_memory_peak_human);
+    var memPct=peak>0?Math.min(100,Math.round(used/peak*100)):0;
+    var sentOk=0,sentTotal=(redis.sentinels||[]).length;
+    (redis.sentinels||[]).forEach(function(s){if(s.status==="ok")sentOk++;});
+    var latMs=Number(storage.probe_latency_ms||0);
+    var threads=Number(duck.threads||0);
+    function gauge(val,label,max,color,unit){
+      var circ=214,offset=Math.round(circ*(1-Math.min(val,max)/max));
+      var display=unit?val+unit:val;
+      return '<div style="text-align:center"><svg viewBox="0 0 80 80" style="width:72px;height:72px;margin:0 auto 6px">'
+        +'<circle cx="40" cy="40" r="34" fill="none" stroke="var(--border-light)" stroke-width="5"/>'
+        +'<circle cx="40" cy="40" r="34" fill="none" stroke="'+color+'" stroke-width="5" stroke-dasharray="'+circ+'" stroke-dashoffset="'+offset+'" transform="rotate(-90 40 40)" stroke-linecap="round"/>'
+        +'<text x="40" y="44" text-anchor="middle" font-size="15" font-weight="700" fill="var(--text)">'+esc(String(display))+'</text>'
+        +'</svg><div style="font-size:10px;color:var(--text-muted);font-weight:600;">'+esc(label)+'</div></div>';
+    }
+    gEl.innerHTML=gauge(hitPct,"Hit rate",100,hitPct>90?"var(--success)":"var(--warn)","%")
+      +gauge(memPct,"Memory",100,memPct>85?"var(--error)":memPct>65?"var(--warn)":"var(--primary)","%")
+      +(sentTotal>0?gauge(sentOk+"/"+sentTotal,"Sentinels",1,"var(--success)",""):gauge("—","Sentinels",1,"var(--border)",""))
+      +gauge(latMs,"Storage latency",500,latMs>100?"var(--warn)":"var(--success)","ms")
+      +gauge(threads,"DuckDB",64,"var(--primary)","t");
+  }
+
+  // ── Redis card (no sentinel) ────────────────────────────────────────
   var redis=ch.redis||{};
   var rsEl=document.getElementById("infraRedisStatus");
   if(rsEl){rsEl.className="infra-status "+(redis.status==="ok"?"ok":"fail");rsEl.innerHTML=(redis.status==="ok"?'<i class="fas fa-circle-check"></i> OK':'<i class="fas fa-circle-xmark"></i> FAIL');}
@@ -1315,10 +1440,47 @@ function renderInfraCards(){
         +kv("Max Memory",srv.maxmemory_human||"0B (no limit)")+kv("Hit Rate",srv.keyspace_hit_rate||"n/a",hitPct>90?"ok":hitPct>70?"warn":"err")
         +kv("DB Keys",redis.db_keys!=null?String(redis.db_keys):"—")+kv("RDB Status",srv.rdb_last_bgsave_status||"—",srv.rdb_last_bgsave_status==="ok"?"ok":"warn")
         +kv("AOF",srv.aof_enabled?"enabled":"disabled")+kv("Total Commands",fmtNum(srv.total_commands_processed))
-        +(redis.address?kv("Address",redis.address):"")+(redis.sentinel_master_name?kv("Sentinel Master",redis.sentinel_master_name):"");
+        +(redis.address?kv("Address",redis.address):"");
     }else{rkv.innerHTML='<div style="color:var(--error);font-size:12px;">'+esc(redis.error||"Connection failed")+'</div>';}
   }
-  // Storage
+
+  // ── Sentinel topology (separate card) ───────────────────────────────
+  var sentSec=document.getElementById("infraSentinelSection");
+  var sentEl=document.getElementById("infraSentinelContent");
+  if(sentSec&&sentEl){
+    if(redis.sentinel_master_name&&redis.status==="ok"){
+      sentSec.style.display="";
+      var h='<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:10px;display:flex;align-items:center;gap:6px;"><i class="fas fa-project-diagram" style="color:var(--primary);font-size:12px;"></i>Sentinel topology · '+esc(redis.sentinel_master_name)+'</div>';
+      h+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;font-size:11px;">';
+      // Master
+      var m=redis.master||{};
+      h+='<div><div style="font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:4px;">MASTER</div>';
+      h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;"><span style="width:6px;height:6px;border-radius:50%;background:var(--success);"></span><b>'+esc(m.address||"—")+'</b></div>';
+      h+='<div style="color:var(--text-muted);padding-left:12px;">flags: '+esc(m.flags||"—")+' · quorum: '+esc(String(m.quorum||"—"))+' · replicas: '+esc(String(m.num_replicas||"0"))+'</div></div>';
+      // Sentinels
+      var sents=redis.sentinels||[];
+      h+='<div><div style="font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:4px;">SENTINELS ('+sents.length+')</div>';
+      sents.forEach(function(s){
+        var sok=s.status==="ok";
+        h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;"><span style="width:6px;height:6px;border-radius:50%;background:'+(sok?"var(--success)":"var(--error)")+';"></span>'+esc(s.address)+'</div>';
+      });
+      h+='</div>';
+      // Replicas
+      var repls=redis.replicas||[];
+      h+='<div><div style="font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:4px;">REPLICAS ('+repls.length+')</div>';
+      repls.forEach(function(r){
+        var rlnk=r.master_link_status==="ok";
+        h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;"><span style="width:6px;height:6px;border-radius:50%;background:'+(rlnk?"var(--success)":"var(--error)")+';"></span>'+esc(r.address)+'</div>';
+        h+='<div style="color:var(--text-muted);padding-left:12px;">link: '+esc(r.master_link_status||"?")+' · priority: '+esc(String(r.slave_priority||"?"))+' · offset: '+fmtNum(Number(r.repl_offset||0))+'</div>';
+      });
+      h+='</div></div>';
+      sentEl.innerHTML=h;
+    }else{
+      sentSec.style.display="none";
+    }
+  }
+
+  // ── Storage ─────────────────────────────────────────────────────────
   var storage=ch.storage||{};
   var ssEl=document.getElementById("infraStorageStatus");
   if(ssEl){ssEl.className="infra-status "+(storage.status==="ok"?"ok":"fail");ssEl.innerHTML=(storage.status==="ok"?'<i class="fas fa-circle-check"></i> OK':'<i class="fas fa-circle-xmark"></i> FAIL');}
@@ -1333,7 +1495,8 @@ function renderInfraCards(){
         +(storage.secure!=null?kv("TLS",storage.secure?"enabled":"disabled",storage.secure?"ok":"warn"):"");
     }else{skv.innerHTML='<div style="color:var(--error);font-size:12px;">'+esc(storage.error||"Unknown error")+'</div>';}
   }
-  // DuckDB
+
+  // ── DuckDB ──────────────────────────────────────────────────────────
   var duck=ch.duckdb||{};
   var dsEl=document.getElementById("infraDuckStatus");
   if(dsEl){dsEl.className="infra-status "+(duck.status==="ok"?"ok":"fail");dsEl.innerHTML=(duck.status==="ok"?'<i class="fas fa-circle-check"></i> OK':'<i class="fas fa-circle-xmark"></i> FAIL');}
@@ -1438,17 +1601,17 @@ function renderTimeline(){
   }
   sparkline("chartMcp",alignBkts(mcpBkts),"count","#7c3aed");
   sparkline("chartOdata",alignBkts(odataBkts),"count","#ea580c");
-  sparkline("chartReads",bkts,"reads","#1c96ca");
-  sparkline("chartWrites",bkts,"writes_inserted","#10b981");
-  sparkline("chartErrors",bkts,"errors","#ef4444");
+  sparkline("chartReads",bkts,"reads","#29B5E8");
+  sparkline("chartWrites",bkts,"writes_inserted","#2FC89F");
+  sparkline("chartErrors",bkts,"errors","#E5484D");
   var tbody=document.getElementById("timelineTableBody");if(!tbody)return;
   if(!bkts.length){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:18px;">No data</td></tr>';return;}
   tbody.innerHTML=bkts.slice().reverse().slice(0,30).map(function(b){
     function countFor(srcBkts){var n=0;srcBkts.forEach(function(m){if(Math.abs(m.ts_ms-b.ts_ms)<bucketMs/2)n+=m.count;});return n;}
     var mcpCount=countFor(mcpBkts);var odataCount=countFor(odataBkts);
     return'<tr><td>'+esc(fmtBL(b.ts_ms,bucketHours))+'</td>'
-      +'<td style="color:'+(b.reads>0?"#1c96ca":"var(--text-muted)")+';">'+b.reads+'</td>'
-      +'<td style="color:'+(b.writes_inserted>0?"#10b981":"var(--text-muted)")+';">'+fmtNum(b.writes_inserted)+'</td>'
+      +'<td style="color:'+(b.reads>0?"#29B5E8":"var(--text-muted)")+';">'+b.reads+'</td>'
+      +'<td style="color:'+(b.writes_inserted>0?"#2FC89F":"var(--text-muted)")+';">'+fmtNum(b.writes_inserted)+'</td>'
       +'<td style="color:'+(b.writes_deleted>0?"var(--warn)":"var(--text-muted)")+';">'+fmtNum(b.writes_deleted)+'</td>'
       +'<td style="color:'+(mcpCount>0?"#7c3aed":"var(--text-muted)")+';">'+mcpCount+'</td>'
       +'<td style="color:'+(odataCount>0?"#ea580c":"var(--text-muted)")+';">'+odataCount+'</td>'
@@ -1462,15 +1625,15 @@ function renderErrors(){
   var stats=statsFromItems(allErrors,"result_rows");
   var cntBadge=document.getElementById("countErrors");
   if(cntBadge)cntBadge.textContent=allErrors.length?" ("+allErrors.length+")":"";
-  renderStatsStrip("errStatsStrip",stats,"—","#ef4444");
-  renderOpsChart("errChart",bkts,errMetric,"#ef4444",errGran,errBucket,function(idx){
+  renderStatsStrip("errStatsStrip",stats,"—","#E5484D");
+  renderOpsChart("errChart",bkts,errMetric,"#E5484D",errGran,errBucket,function(idx){
     errBucket=(errBucket===idx)?null:idx;
     var chip=document.getElementById("errBucketChip");
     if(chip)chip.classList.toggle("hidden",errBucket===null);
     selErr=null;renderErrors();
   });
   var items=fErr();
-  renderOpsList("errList",items,selErr,function(i){selErr=i;renderErrors();},"result_rows","#ef4444");
+  renderOpsList("errList",items,selErr,function(i){selErr=i;renderErrors();},"result_rows","#E5484D");
   _renderErrDetail(items[selErr]||null);
 }
 function _renderErrDetail(it){
@@ -1574,7 +1737,7 @@ function _renderOdataDetail(it){
 window.clearOpsBucket=clearOpsBucket;
 window.renderSection=renderSection;
 renderSection();
-var _c=ctx();if(_c.org&&_c.sup)refreshAll();
+var _c=ctx();if(_c.org&&_c.sup)refreshSection();
 })();
 </script>
 <script>

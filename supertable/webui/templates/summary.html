@@ -1,0 +1,278 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Data Island Core – Summary</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+:root{
+  --primary:#1c96ca;--primary-light:#e6f4fa;--primary-dark:#147ba3;
+  --bg:#f3f6fb;--bg-card:#fff;--bg-surface:#f8fafc;--bg-hover:#f1f5f9;
+  --border:#e0e5f0;--border-light:#f1f5f9;
+  --text:#1e293b;--text-sec:#64748b;--text-muted:#94a3b8;
+  --success:#10b981;--success-bg:#ecfdf5;
+  --warn:#f59e0b;--warn-bg:#fffbeb;
+  --error:#ef4444;--error-bg:#fef2f2;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --font:'Inter',-apple-system,sans-serif;
+  --radius:14px;--radius-sm:8px;
+  --transition:all .2s cubic-bezier(.25,.8,.25,1);
+  --shadow-sm:0 1px 3px rgba(15,23,42,.04),0 1px 2px rgba(15,23,42,.03);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;height:100%;overflow-x:hidden;}
+.content-container{margin-left:280px;min-height:100vh;background:var(--bg);transition:var(--transition);padding-bottom:40px;}
+.sidebar-collapsed ~ .content-container{margin-left:80px;}
+.wrap{max-width:1320px;margin:0 auto;padding:24px;}
+.hdr-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;}
+.hdr-row h2{font-size:17px;font-weight:600;color:var(--text);}
+.hdr-row h2 em{color:var(--primary);font-style:normal;}
+.hdr-sub{font-size:11px;color:var(--text-muted);margin-top:2px;}
+.score-block{text-align:right;}
+.score-val{font-size:40px;font-weight:600;color:var(--primary);line-height:1;}
+.score-lbl{font-size:10px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-top:2px;}
+.chart-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:14px;box-shadow:var(--shadow-sm);}
+.chart-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+.chart-title{font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;}
+.chart-legend{display:flex;gap:12px;font-size:10px;color:var(--text-muted);font-weight:600;}
+.chart-legend span{display:flex;align-items:center;gap:4px;}
+.chart-legend .ldot{width:8px;height:8px;border-radius:2px;}
+.bar-chart{display:flex;align-items:flex-end;gap:1px;height:112px;}
+.bar-col{flex:1;display:flex;flex-direction:column-reverse;gap:1px;height:100%;}
+.bar-seg{min-height:0;transition:height .25s;border-radius:1px 1px 0 0;}
+.bar-seg.r{background:var(--primary);}
+.bar-seg.w{background:var(--primary-dark);}
+.bar-seg.e{background:var(--error);}
+.bar-labels{display:flex;gap:1px;margin-top:4px;}
+.bar-labels .bl{flex:1;text-align:center;font-size:9px;color:var(--text-muted);font-weight:600;}
+.time-sel{display:flex;gap:4px;margin-bottom:16px;}
+.time-btn{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text-sec);transition:var(--transition);font-family:var(--font);}
+.time-btn:hover{border-color:var(--primary);color:var(--primary);}
+.time-btn.active{background:var(--primary);color:#fff;border-color:var(--primary);}
+.mg{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;margin-bottom:8px;box-shadow:var(--shadow-sm);}
+.mg-hdr{padding:5px 12px;font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-surface);border-bottom:1px solid var(--border-light);}
+.mg-body{display:flex;}
+.mg-item{flex:1;padding:12px 10px;text-align:center;border-right:1px solid var(--border-light);}
+.mg-item:last-child{border-right:none;}
+.mg-item .mv{font-size:20px;font-weight:600;color:var(--text);}
+.mg-item .ml{font-size:10px;color:var(--text-muted);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;}
+.mg-item.err .mv{color:var(--error);}
+.mg-item.muted .mv{color:#cbd5e1;}
+.infra-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0;}
+.infra-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;display:flex;gap:10px;align-items:flex-start;box-shadow:var(--shadow-sm);}
+.ic-dot{width:8px;height:8px;border-radius:50%;margin-top:4px;flex-shrink:0;}
+.ic-dot.ok{background:var(--success);}
+.ic-dot.fail{background:var(--error);}
+.ic-name{font-size:12px;font-weight:600;color:var(--text);}
+.ic-status{font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;text-transform:uppercase;letter-spacing:.03em;}
+.ic-status.ok{background:var(--success-bg);color:var(--success);}
+.ic-status.fail{background:var(--error-bg);color:var(--error);}
+.ic-detail{font-size:11px;color:var(--text-sec);line-height:1.5;margin-top:2px;}
+.cols3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;}
+.sc{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;box-shadow:var(--shadow-sm);}
+.sc-t{font-size:10px;color:var(--text-muted);margin-bottom:8px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;}
+.bar-r{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.bar-r .nm{width:64px;color:var(--text-sec);font-size:11px;font-weight:600;}
+.bar-trk{flex:1;height:6px;background:var(--bg-surface);border-radius:3px;overflow:hidden;}
+.bar-f{height:100%;background:var(--primary);border-radius:3px;transition:width .3s;}
+.bar-r .pct{width:30px;text-align:right;color:var(--text-muted);font-size:11px;font-family:var(--mono);}
+.qbar{display:flex;gap:2px;height:20px;border-radius:4px;overflow:hidden;margin-bottom:4px;}
+.qlabels{display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);font-weight:600;}
+.q-alerts{margin-top:8px;font-size:11px;color:var(--text-sec);line-height:1.7;}
+.qdot{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:5px;}
+.acc-grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 14px;font-size:12px;color:var(--text-sec);line-height:1.8;}
+.acc-grid span{color:var(--text);font-weight:500;}
+.footer-bar{display:flex;gap:14px;font-size:11px;color:var(--text-muted);padding-top:10px;border-top:1px solid var(--border);flex-wrap:wrap;align-items:center;font-weight:600;}
+.alert-tag{color:var(--warn);}
+.loading-overlay{position:absolute;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:10;font-size:12px;color:var(--text-muted);}
+.loading-overlay.hidden{display:none;}
+@media(max-width:992px){.cols3{grid-template-columns:1fr;}.infra-row{grid-template-columns:1fr;}.mg-body{flex-wrap:wrap;}}
+  </style>
+</head>
+<body>
+{% include "sidebar.html" %}
+<div class="content-container" id="root" data-org="{{ sel_org }}" data-sup="{{ sel_sup }}">
+<div class="wrap" style="position:relative;">
+  <div class="loading-overlay" id="loader"><i class="fas fa-circle-notch fa-spin" style="margin-right:6px;"></i> Loading summary…</div>
+  <div class="hdr-row">
+    <div><h2>Data <em>landscape</em></h2><div class="hdr-sub" id="hdrSub">—</div></div>
+    <div class="score-block"><div class="score-val" id="qScore">—</div><div class="score-lbl">quality index</div></div>
+  </div>
+  <div class="chart-card">
+    <div class="chart-hdr">
+      <span class="chart-title">Operations activity</span>
+      <div class="chart-legend"><span><span class="ldot" style="background:var(--primary)"></span>Reads</span><span><span class="ldot" style="background:var(--primary-dark)"></span>Writes</span><span><span class="ldot" style="background:var(--error)"></span>Errors</span></div>
+    </div>
+    <div class="bar-chart" id="barChart"></div>
+    <div class="bar-labels" id="barLabels"></div>
+  </div>
+  <div class="time-sel" id="timeSel">
+    <div class="time-btn active" data-hours="1">1h</div>
+    <div class="time-btn" data-hours="6">6h</div>
+    <div class="time-btn" data-hours="24">24h</div>
+    <div class="time-btn" data-hours="168">7d</div>
+  </div>
+  <div class="mg"><div class="mg-hdr">Operations</div><div class="mg-body">
+    <div class="mg-item"><div class="mv" id="opReads">—</div><div class="ml">Read ops</div></div>
+    <div class="mg-item"><div class="mv" id="opWrites">—</div><div class="ml">Write ops</div></div>
+    <div class="mg-item"><div class="mv" id="opMcp">—</div><div class="ml">MCP calls</div></div>
+    <div class="mg-item"><div class="mv" id="opOdata">—</div><div class="ml">OData</div></div>
+    <div class="mg-item"><div class="mv" id="opIngested">—</div><div class="ml">Rows ingested</div></div>
+    <div class="mg-item"><div class="mv" id="opDeleted">—</div><div class="ml">Rows deleted</div></div>
+    <div class="mg-item err"><div class="mv" id="opErrors">—</div><div class="ml">Errors</div></div>
+  </div></div>
+  <div class="mg" style="margin-bottom:0;"><div class="mg-hdr">Platform state</div><div class="mg-body">
+    <div class="mg-item"><div class="mv" id="plTables">—</div><div class="ml">Tables</div></div>
+    <div class="mg-item"><div class="mv" id="plSnapshots">—</div><div class="ml">Snapshots</div></div>
+    <div class="mg-item"><div class="mv" id="plCapacity">—</div><div class="ml">Capacity</div></div>
+    <div class="mg-item"><div class="mv" id="plLatency">—</div><div class="ml">Avg latency</div></div>
+    <div class="mg-item"><div class="mv" id="plRoles">—</div><div class="ml">Roles</div></div>
+    <div class="mg-item"><div class="mv" id="plUsers">—</div><div class="ml">Users</div></div>
+    <div class="mg-item"><div class="mv" id="plTokens">—</div><div class="ml">Tokens</div></div>
+  </div></div>
+  <div class="infra-row">
+    <div class="infra-card" id="infraRedis"><div class="ic-dot ok"></div><div style="flex:1;min-width:0;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;"><span class="ic-name">Redis</span><span class="ic-status ok" id="irStatus">—</span></div><div class="ic-detail" id="irDetail">—</div></div></div>
+    <div class="infra-card" id="infraStorage"><div class="ic-dot ok"></div><div style="flex:1;min-width:0;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;"><span class="ic-name">Storage</span><span class="ic-status ok" id="isStatus">—</span></div><div class="ic-detail" id="isDetail">—</div></div></div>
+    <div class="infra-card" id="infraDuckdb"><div class="ic-dot ok"></div><div style="flex:1;min-width:0;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;"><span class="ic-name">DuckDB</span><span class="ic-status ok" id="idStatus">—</span></div><div class="ic-detail" id="idDetail">—</div></div></div>
+  </div>
+  <div class="cols3">
+    <div class="sc"><div class="sc-t">Data quality · <span id="qTotal">0</span> checks</div><div class="qbar" id="qBar"></div><div class="qlabels"><span id="qPassed">0 passed</span><span id="qWarn">0 warn</span><span id="qFail">0 failed</span></div><div class="q-alerts" id="qAlerts"></div></div>
+    <div class="sc"><div class="sc-t">Engine distribution</div><div id="engineBars"></div></div>
+    <div class="sc"><div class="sc-t">Access & ingestion</div><div class="acc-grid" id="accGrid">—</div></div>
+  </div>
+  <div class="footer-bar" id="footerBar">—</div>
+</div>
+</div>
+<script>
+(function(){
+var enc=encodeURIComponent,root=document.getElementById("root"),
+    org=root?root.dataset.org:"",sup=root?root.dataset.sup:"",
+    windowHours=1;
+
+function $(id){return document.getElementById(id);}
+function fmt(n){if(n==null)return"—";var v=Number(n);return isNaN(v)?"—":v.toLocaleString();}
+function fmtMs(ms){if(!ms)return"—";var n=Number(ms);if(isNaN(n))return"—";return n<1000?Math.round(n)+"ms":(n/1000).toFixed(2)+"s";}
+
+async function getJSON(url){
+  var r=await fetch(url,{credentials:"same-origin"});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  return await r.json();
+}
+
+$("timeSel").addEventListener("click",function(e){
+  var btn=e.target.closest(".time-btn");if(!btn)return;
+  document.querySelectorAll(".time-btn").forEach(function(b){b.classList.remove("active");});
+  btn.classList.add("active");
+  windowHours=parseInt(btn.dataset.hours)||1;
+  loadSummary();
+});
+
+function renderChart(ts,bm){
+  var c=$("barChart"),l=$("barLabels");c.innerHTML="";l.innerHTML="";
+  if(!ts||!ts.length)return;
+  var mx=1;
+  for(var i=0;i<ts.length;i++){var s=(ts[i].reads||0)+(ts[i].writes||0)+(ts[i].errors||0);if(s>mx)mx=s;}
+  var le=Math.max(1,Math.floor(ts.length/8));
+  for(var i=0;i<ts.length;i++){
+    var t=ts[i],rH=Math.round(((t.reads||0)/mx)*100),wH=Math.round(((t.writes||0)/mx)*100),eH=Math.round(((t.errors||0)/mx)*100);
+    var col=document.createElement("div");col.className="bar-col";
+    var rB=document.createElement("div");rB.className="bar-seg r";rB.style.height=rH+"%";col.appendChild(rB);
+    if(wH>0){var wB=document.createElement("div");wB.className="bar-seg w";wB.style.height=wH+"%";col.appendChild(wB);}
+    if(eH>0){var eB=document.createElement("div");eB.className="bar-seg e";eB.style.height=eH+"%";col.appendChild(eB);}
+    c.appendChild(col);
+    var lb=document.createElement("div");lb.className="bl";
+    if(i%le===0&&t.ts_ms){var d=new Date(t.ts_ms);lb.textContent=bm<60?d.getHours()+":"+String(d.getMinutes()).padStart(2,"0"):bm<1440?d.getHours()+":00":(d.getMonth()+1)+"/"+d.getDate();}
+    l.appendChild(lb);
+  }
+}
+
+function renderInfra(inf){
+  if(!inf)return;
+  [{el:"infraRedis",st:"irStatus",dt:"irDetail",d:inf.redis,fmt:function(r){var p=[];if(r.version)p.push(r.version);if(r.db_keys!=null)p.push(fmt(r.db_keys)+" keys");if(r.hit_rate!=null)p.push("hit "+r.hit_rate+"%");return p.join(" · ");}},
+   {el:"infraStorage",st:"isStatus",dt:"isDetail",d:inf.storage,fmt:function(s){var p=[];if(s.backend)p.push(s.backend);if(s.latency_ms!=null)p.push(s.latency_ms+"ms latency");if(s.bucket)p.push(s.bucket);return p.join(" · ");}},
+   {el:"infraDuckdb",st:"idStatus",dt:"idDetail",d:inf.duckdb,fmt:function(d){var p=[];if(d.version)p.push(d.version);if(d.memory_limit)p.push(d.memory_limit);if(d.threads)p.push(d.threads+" threads");return p.join(" · ");}}
+  ].forEach(function(cfg){
+    var ok=cfg.d&&cfg.d.status==="ok";
+    $(cfg.el).querySelector(".ic-dot").className="ic-dot "+(ok?"ok":"fail");
+    var st=$(cfg.st);st.className="ic-status "+(ok?"ok":"fail");st.textContent=ok?"OK":"FAIL";
+    $(cfg.dt).textContent=cfg.d?cfg.fmt(cfg.d):"—";
+  });
+}
+
+function renderEngines(dist){
+  var el=$("engineBars");el.innerHTML="";if(!dist)return;
+  var tot=0,ent=[];for(var k in dist){if(dist.hasOwnProperty(k)){tot+=dist[k];ent.push([k,dist[k]]);}}
+  ent.sort(function(a,b){return b[1]-a[1];});
+  ent.forEach(function(e){
+    var pct=tot>0?Math.round(e[1]/tot*100):0;
+    var row=document.createElement("div");row.className="bar-r";
+    row.innerHTML='<span class="nm">'+e[0]+'</span><div class="bar-trk"><div class="bar-f" style="width:'+pct+'%"></div></div><span class="pct">'+pct+'%</span>';
+    el.appendChild(row);
+  });
+}
+
+function renderQuality(q){
+  if(!q)return;
+  $("qScore").textContent=q.score!=null?q.score:"—";
+  $("qTotal").textContent=fmt(q.total_checks);
+  $("qPassed").textContent=fmt(q.passed)+" passed";
+  $("qWarn").textContent=fmt(q.warnings)+" warn";
+  $("qFail").textContent=fmt(q.failures)+" failed";
+  var bar=$("qBar");bar.innerHTML="";
+  if(q.total_checks>0){
+    if(q.passed>0){var p=document.createElement("div");p.style.flex=q.passed;p.style.background="var(--primary)";bar.appendChild(p);}
+    if(q.warnings>0){var w=document.createElement("div");w.style.flex=q.warnings;w.style.background="var(--warn)";bar.appendChild(w);}
+    if(q.failures>0){var f=document.createElement("div");f.style.flex=q.failures;f.style.background="var(--error)";bar.appendChild(f);}
+  }
+  var al=$("qAlerts");al.innerHTML="";
+  (q.alerts||[]).forEach(function(a){
+    al.innerHTML+='<span class="qdot" style="background:'+(a.severity==="fail"?"var(--error)":"var(--warn)")+'"></span>'+a.table+" — "+a.name+" ("+a.check+")<br>";
+  });
+}
+
+function render(d){
+  if(!d)return;
+  $("hdrSub").textContent=[org,sup,fmt((d.platform||{}).table_count)+" tables"].join(" · ");
+  renderChart(d.timeseries,d.bucket_minutes||1);
+  var ops=d.operations||{};
+  $("opReads").textContent=fmt(ops.read_ops);
+  $("opWrites").textContent=fmt(ops.write_ops);
+  $("opMcp").textContent=fmt(ops.mcp_calls);
+  $("opMcp").parentElement.className="mg-item"+(ops.mcp_calls===0?" muted":"");
+  $("opOdata").textContent=fmt(ops.odata_calls);
+  $("opIngested").textContent=fmt(ops.rows_ingested);
+  $("opDeleted").textContent=fmt(ops.rows_deleted);
+  $("opErrors").textContent=fmt(ops.errors);
+  var pl=d.platform||{};
+  $("plTables").textContent=fmt(pl.table_count);
+  $("plSnapshots").textContent=fmt(pl.total_snapshots);
+  $("plCapacity").textContent=pl.storage_bytes?fmt(pl.storage_bytes):"—";
+  $("plLatency").textContent=fmtMs(pl.avg_read_ms);
+  $("plRoles").textContent=fmt(pl.role_count);
+  $("plUsers").textContent=fmt(pl.user_count);
+  $("plTokens").textContent=fmt(pl.token_count);
+  renderInfra(d.infrastructure);renderQuality(d.quality);renderEngines(d.engine_distribution);
+  var ing=d.ingestion||{};
+  $("accGrid").innerHTML="<div><span>"+fmt(pl.token_count)+"</span> API tokens</div><div><span>"+fmt(ops.odata_calls)+"</span> OData endpoints</div><div><span>"+fmt(ing.staging_count)+"</span> staging areas</div><div><span>"+fmt(ing.pipe_enabled)+"/"+fmt(ing.pipe_total)+"</span> pipes enabled</div>";
+  var warns=((d.quality||{}).warnings||0),fails=((d.quality||{}).failures||0);
+  $("footerBar").innerHTML="<span>Spark: available</span><span>MCP: enabled</span><span>Audit: enabled</span>"+(warns+fails>0?'<span style="margin-left:auto" class="alert-tag">'+warns+" warnings · "+fails+" failures</span>":"");
+  $("loader").classList.add("hidden");
+}
+
+async function loadSummary(){
+  if(!org||!sup){$("loader").classList.add("hidden");return;}
+  try{var d=await getJSON("/api/v1/summary?org="+enc(org)+"&sup="+enc(sup)+"&window_hours="+windowHours);render(d.data||{});}
+  catch(e){console.error("[summary]",e);$("loader").classList.add("hidden");}
+}
+
+loadSummary();
+})();
+</script>
+</body>
+</html>

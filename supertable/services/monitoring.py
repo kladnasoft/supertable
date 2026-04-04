@@ -1155,38 +1155,44 @@ def compute_active_locks(
     sup: str,
 ) -> List[Dict[str, Any]]:
     """
-    Scan for currently-held per-table Redis locks.
+    Check for currently-held per-table Redis locks.
+
+    Uses a server-side Lua script to KEYS + PTTL in a single round trip.
+    This avoids the 2× Sentinel routing latency of SCAN + pipeline.
 
     Lock key pattern: supertable:{org}:{sup}:lock:leaf:{table_name}
-
-    Returns [{table_name, ttl_ms}] for keys that still exist (TTL > 0),
-    sorted by table name.  Keys with TTL == -1 (no expiry — should never
-    happen but guarded) are included with ttl_ms=None.
     """
     pattern = f"supertable:{org}:{sup}:lock:leaf:*"
     prefix = f"supertable:{org}:{sup}:lock:leaf:"
     results: List[Dict[str, Any]] = []
 
+    _LUA_LOCKS = """
+    local keys = redis.call('KEYS', ARGV[1])
+    local out = {}
+    for i, k in ipairs(keys) do
+        local ttl = redis.call('PTTL', k)
+        if ttl > 0 or ttl == -1 then
+            out[#out+1] = k
+            out[#out+1] = ttl
+        end
+    end
+    return out
+    """
+
     try:
-        cursor = 0
-        while True:
-            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=500)
-            for key in keys:
-                key_str = key if isinstance(key, str) else key.decode("utf-8")
+        raw = redis_client.eval(_LUA_LOCKS, 0, pattern)
+        if raw:
+            for i in range(0, len(raw), 2):
+                key_str = raw[i] if isinstance(raw[i], str) else raw[i].decode("utf-8")
                 table_name = key_str[len(prefix):]
                 try:
-                    ttl_ms = redis_client.pttl(key_str)
-                    # pttl returns -2 if key doesn't exist, -1 if no TTL
-                    if ttl_ms == -2:
-                        continue
-                    results.append({
-                        "table_name": table_name,
-                        "ttl_ms": ttl_ms if ttl_ms >= 0 else None,
-                    })
-                except Exception:
-                    pass
-            if cursor == 0:
-                break
+                    ttl_val = int(raw[i + 1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                results.append({
+                    "table_name": table_name,
+                    "ttl_ms": ttl_val if ttl_val >= 0 else None,
+                })
     except Exception as e:
         logger.warning("[monitoring] lock scan failed: %s", e)
 
