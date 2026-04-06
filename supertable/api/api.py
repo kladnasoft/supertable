@@ -1907,9 +1907,23 @@ def api_get_table_schema(
     if not organization or not super_name:
         raise HTTPException(status_code=400, detail="organization and super_name are required")
     role = _resolve_role(request, role_name)
+
+    # Fast path: read permanent schema from Redis (written by DataWriter on every write)
+    schema_key = f"supertable:{organization}:{super_name}:schema:{table}"
+    try:
+        raw = redis_client.get(schema_key)
+        if raw:
+            schema_dict = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            if schema_dict:
+                return {"ok": True, "schema": [schema_dict]}
+    except Exception:
+        pass
+
+    # Fallback: MetaReader (disk)
     try:
         mr = MetaReader(organization=organization, super_name=super_name)
         schema = mr.get_table_schema(table, role)
+
         return {"ok": True, "schema": schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Get table schema failed: {e}")
@@ -2119,33 +2133,36 @@ def api_ingestion_list_tables(
     if sess_role and sess_role != role and not is_superuser(request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # Fast path: SMEMBERS from dedicated set (written by DataWriter on every write)
+    tables: List[str] = []
     try:
-        mr = MetaReader(organization=org_val, super_name=sup_val)
-        meta = mr.get_super_meta(role) or {}
-    except Exception as e:
-        logger.warning("Failed to fetch super meta for ingestion tables (%s/%s): %s", org_val, sup_val, e)
-        return {"ok": True, "tables": []}
-
-    super_meta = meta.get("super", {}) if isinstance(meta, dict) else {}
-    raw_tables = []
-    try:
-        raw_tables = super_meta.get("tables") if isinstance(super_meta, dict) else None
+        members = redis_client.smembers(f"supertable:{org_val}:{sup_val}:table_names")
+        if members:
+            tables = sorted({(m if isinstance(m, str) else m.decode("utf-8")) for m in members if m})
     except Exception:
-        raw_tables = None
+        pass
 
-    names: List[str] = []
-    if isinstance(raw_tables, list):
-        for t in raw_tables:
-            if isinstance(t, str):
-                name = t.strip()
-            elif isinstance(t, dict):
-                name = str(t.get("name") or "").strip()
-            else:
-                name = str(t or "").strip()
-            if name and name not in names:
-                names.append(name)
+    # Fallback: scan Redis leaf keys
+    if not tables:
+        try:
+            pattern = f"supertable:{org_val}:{sup_val}:meta:leaf:*"
+            cursor = 0
+            seen: set = set()
+            while True:
+                cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+                for key in keys:
+                    k = key if isinstance(key, str) else key.decode("utf-8")
+                    simple = k.rsplit("meta:leaf:", 1)[-1]
+                    if simple and not simple.startswith("__") and simple not in seen:
+                        seen.add(simple)
+                        tables.append(simple)
+                if cursor == 0:
+                    break
+        except Exception:
+            pass
+        tables.sort()
 
-    return {"ok": True, "tables": names}
+    return {"ok": True, "tables": tables}
 
 
 @router.get("/api/v1/ingestion/stagings/files")

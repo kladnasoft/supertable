@@ -441,6 +441,25 @@ class DataWriter:
                 self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
                 mark("bump_root")
 
+                # --- Store schema + table name in Redis (permanent, not cache) ---
+                try:
+                    schema_raw = new_snapshot_dict.get("schema", {})
+                    if isinstance(schema_raw, dict):
+                        schema_json = json.dumps(schema_raw, ensure_ascii=False)
+                    elif isinstance(schema_raw, list):
+                        merged = {}
+                        for item in schema_raw:
+                            if isinstance(item, dict):
+                                merged.update(item)
+                        schema_json = json.dumps(merged, ensure_ascii=False)
+                    else:
+                        schema_json = "{}"
+                    _org, _sup = self.super_table.organization, self.super_table.super_name
+                    self.catalog.r.set(f"supertable:{_org}:{_sup}:schema:{simple_name}", schema_json)
+                    self.catalog.r.sadd(f"supertable:{_org}:{_sup}:table_names", simple_name)
+                except Exception as e:
+                    logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
+
                 # --- Optional mirroring -------------------------------------------
                 try:
                     MirrorFormats.mirror_if_enabled(
