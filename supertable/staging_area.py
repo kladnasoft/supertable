@@ -220,7 +220,8 @@ class Staging:
         if not self.storage.exists(self.files_index_path):
             self.storage.write_json(self.files_index_path, [])
 
-    def save_as_parquet(self, *, role_name: str, arrow_table: pa.Table, base_file_name: str) -> str:
+    def save_as_parquet(self, *, role_name: str, arrow_table: pa.Table, base_file_name: str,
+                        source: str = "upload", duration_ms: float = 0, pipe_name: str = "", pipe_id: str = "") -> str:
         self._require_stage_mode()
         check_write_access(
             super_name=self.super_name,
@@ -239,7 +240,9 @@ class Staging:
 
             current_index = self.storage.read_json(self.files_index_path) or []
             current_index.append(
-                {"file": file_name, "written_at_ns": ts_ns, "rows": arrow_table.num_rows}
+                {"file": file_name, "written_at_ns": ts_ns, "rows": arrow_table.num_rows,
+                 "source": source, "duration_ms": round(duration_ms) if duration_ms else None,
+                 "pipe_name": pipe_name or None, "pipe_id": pipe_id or None, "status": "ok"}
             )
             self.storage.write_json(self.files_index_path, current_index)
 

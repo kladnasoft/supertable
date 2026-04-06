@@ -2468,38 +2468,29 @@ def api_enable_pipe(
 ):
     sess = get_session(request) or {}
     role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
-    from supertable.super_pipe import SuperPipe
+    pid = (pipe_id or pipe_name or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="pipe_id required")
 
+    # Redis first (fast path)
+    meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
+    if not meta:
+        storage = get_storage()
+        meta = _read_json_if_exists(storage, os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")) or {}
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Pipe '{pid}' not found")
+
+    meta["enabled"] = True
+    meta["updated_at_ns"] = time.time_ns()
+    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta)
+
+    # Async disk write (non-blocking for the response)
     try:
-        pid = (pipe_id or pipe_name or "").strip()
-        meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
-        pn = str(meta.get("pipe_name") or pid)
-        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
-        pipe.set_enabled(pipe_name=pn, enabled=True, role_name=role_eff)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Enable pipe failed: {e}")
+        storage = get_storage()
+        _write_json_atomic(storage, os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json"), meta)
+    except Exception:
+        pass
 
-    storage = get_storage()
-    pipes = _load_pipe_index(storage, org, sup)
-    if pipes:
-        for p in pipes:
-            if p.get("staging_name") == staging_name and (p.get("pipe_id") == pid or p.get("pipe_name") == pid):
-                p["enabled"] = True
-                p["updated_at_ns"] = time.time_ns()
-        _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
-
-    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")
-    meta2 = _read_json_if_exists(storage, p_path) or meta
-    if isinstance(meta2, dict):
-        meta2["enabled"] = True
-    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta2 if isinstance(meta2, dict) else {})
-    _audit(
-        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_ENABLE,
-        organization=org, super_name=sup, resource_type="pipe",
-        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
-    )
     return {"ok": True}
 
 
@@ -2516,38 +2507,29 @@ def api_disable_pipe(
 ):
     sess = get_session(request) or {}
     role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
-    from supertable.super_pipe import SuperPipe
+    pid = (pipe_id or pipe_name or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="pipe_id required")
 
+    # Redis first (fast path)
+    meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
+    if not meta:
+        storage = get_storage()
+        meta = _read_json_if_exists(storage, os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")) or {}
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Pipe '{pid}' not found")
+
+    meta["enabled"] = False
+    meta["updated_at_ns"] = time.time_ns()
+    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta)
+
+    # Async disk write (non-blocking for the response)
     try:
-        pid = (pipe_id or pipe_name or "").strip()
-        meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
-        pn = str(meta.get("pipe_name") or pid)
-        pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
-        pipe.set_enabled(pipe_name=pn, enabled=False, role_name=role_eff)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Disable pipe failed: {e}")
+        storage = get_storage()
+        _write_json_atomic(storage, os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json"), meta)
+    except Exception:
+        pass
 
-    storage = get_storage()
-    pipes = _load_pipe_index(storage, org, sup)
-    if pipes:
-        for p in pipes:
-            if p.get("staging_name") == staging_name and (p.get("pipe_id") == pid or p.get("pipe_name") == pid):
-                p["enabled"] = False
-                p["updated_at_ns"] = time.time_ns()
-        _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
-
-    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")
-    meta2 = _read_json_if_exists(storage, p_path) or meta
-    if isinstance(meta2, dict):
-        meta2["enabled"] = False
-    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta2 if isinstance(meta2, dict) else {})
-    _audit(
-        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_DISABLE,
-        organization=org, super_name=sup, resource_type="pipe",
-        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
-    )
     return {"ok": True}
 
 
@@ -2685,7 +2667,10 @@ async def api_ingestion_load_upload(
 
         def _do_stage() -> str:
             stg = Staging(organization=org_eff, super_name=sup_eff, staging_name=stg_eff)
-            return stg.save_as_parquet(role_name=role_eff, arrow_table=arrow_table, base_file_name=base_name)
+            stg_t0 = time.perf_counter()
+            result = stg.save_as_parquet(role_name=role_eff, arrow_table=arrow_table, base_file_name=base_name,
+                                         source="upload", duration_ms=(time.perf_counter() - t0) * 1000.0)
+            return result
 
         try:
             saved = await asyncio.to_thread(_do_stage)
@@ -2901,7 +2886,18 @@ def api_ingestion_summary(
                         tr += int(item.get("rows") or 0)
         except Exception:
             pass
-        stagings.append({"name": name, "file_count": fc, "total_rows": tr})
+        last_ns = 0
+        try:
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        ns = int(item.get("written_at_ns") or 0)
+                        if ns > last_ns:
+                            last_ns = ns
+        except Exception:
+            pass
+        pc = len(_redis_list_pipes(org, sup, name))
+        stagings.append({"name": name, "file_count": fc, "total_rows": tr, "pipe_count": pc, "last_written_at_ns": last_ns})
         total_files += fc
         total_rows += tr
 
