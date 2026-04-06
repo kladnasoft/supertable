@@ -2202,7 +2202,7 @@ def api_ingestion_list_pipes(
     items: List[Dict[str, Any]] = []
     for pn, raw in zip(pipe_names, raws):
         meta = _redis_json_load(raw) or {}
-        items.append({"pipe_name": pn, "simple_name": str(meta.get("simple_name") or ""), "enabled": bool(meta.get("enabled"))})
+        items.append({"pipe_id": pn, "pipe_name": str(meta.get("pipe_name") or pn), "simple_name": str(meta.get("simple_name") or ""), "enabled": bool(meta.get("enabled"))})
 
     items.sort(key=lambda x: str(x.get("pipe_name") or ""))
     return {"items": items}
@@ -2213,14 +2213,16 @@ def api_ingestion_get_pipe_meta(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
-    pipe_name: str = Query(...),
+    pipe_id: str = Query(""),
+    pipe_name: str = Query(""),
     _: Any = Depends(logged_in_guard_api),
 ):
     if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
         raise HTTPException(status_code=400, detail="Invalid staging_name")
-    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
-        raise HTTPException(status_code=400, detail="Invalid pipe_name")
-    meta = _redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {}
+    pid = (pipe_id or pipe_name or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="pipe_id or pipe_name required")
+    meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
     return {"meta": meta}
 
 
@@ -2230,8 +2232,11 @@ def api_create_staging(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
+    role_name: Optional[str] = Query(None),
     _: Any = Depends(logged_in_guard_api),
 ):
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
     if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
         raise HTTPException(status_code=400, detail="Invalid staging_name")
 
@@ -2255,6 +2260,7 @@ def api_create_staging(
         category=EventCategory.DATA_MUTATION, action=Actions.STAGING_CREATE,
         organization=org, super_name=sup, resource_type="staging",
         resource_id=staging_name, severity=Severity.INFO,
+        detail=make_detail(role_name=role_eff),
     )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
@@ -2265,8 +2271,11 @@ def api_delete_staging(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
+    role_name: Optional[str] = Query(None),
     _: Any = Depends(logged_in_guard_api),
 ):
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
     if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
         raise HTTPException(status_code=400, detail="Invalid staging_name")
 
@@ -2297,6 +2306,7 @@ def api_delete_staging(
         category=EventCategory.DATA_MUTATION, action=Actions.STAGING_DELETE,
         organization=org, super_name=sup, resource_type="staging",
         resource_id=staging_name, severity=Severity.WARNING,
+        detail=make_detail(role_name=role_eff),
     )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name}
 
@@ -2310,17 +2320,33 @@ def api_save_pipe(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    org = str(payload.get("organization") or payload.get("org") or "").strip()
-    sup = str(payload.get("super_name") or payload.get("sup") or "").strip()
+    # Security: org, sup, role_name are ALWAYS taken from the session — never
+    # from the payload.  This prevents a crafted JSON from writing pipes into
+    # a different organization or escalating privileges.
+    sess = get_session(request) or {}
+    sess_org = str(sess.get("org") or "").strip()
+    sess_sup = str(sess.get("sup") or sess.get("super_name") or "").strip()
+    sess_role = str(sess.get("role_name") or "").strip()
+
+    # Fall back to payload only if session doesn't carry org/sup (token auth)
+    org = sess_org or str(payload.get("organization") or payload.get("org") or "").strip()
+    sup = sess_sup or str(payload.get("super_name") or payload.get("sup") or "").strip()
+    role_eff = sess_role or str(payload.get("role_name") or "").strip() or "superadmin"
+
     staging_name = str(payload.get("staging_name") or "").strip()
     pipe_name = str(payload.get("pipe_name") or "").strip()
+    pipe_id = str(payload.get("pipe_id") or "").strip()
 
     if not org or not sup:
         raise HTTPException(status_code=400, detail="organization and super_name are required")
     if not _STAGING_NAME_RE.fullmatch(staging_name):
         raise HTTPException(status_code=400, detail="Invalid staging_name")
-    if not _STAGING_NAME_RE.fullmatch(pipe_name):
-        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+    if not pipe_name:
+        raise HTTPException(status_code=400, detail="pipe_name is required")
+
+    # Generate pipe_id if not provided (new pipe)
+    if not pipe_id:
+        pipe_id = "p_" + uuid.uuid4().hex[:8]
 
     storage = get_storage()
     stg_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
@@ -2339,12 +2365,14 @@ def api_save_pipe(
     pipe_def["super_name"] = sup
     pipe_def["staging_name"] = staging_name
     pipe_def["pipe_name"] = pipe_name
+    pipe_def["role_name"] = role_eff
     pipe_def.setdefault("enabled", True)
     pipe_def.setdefault("overwrite_columns", ["day"])
     pipe_def.setdefault("meta", {})
     pipe_def["updated_at_ns"] = time.time_ns()
 
-    pipe_path = os.path.join(stg_dir, "pipes", f"{pipe_name}.json")
+    pipe_def["pipe_id"] = pipe_id
+    pipe_path = os.path.join(stg_dir, "pipes", f"{pipe_id}.json")
     try:
         _write_json_atomic(storage, pipe_path, pipe_def)
     except Exception as e:
@@ -2356,13 +2384,13 @@ def api_save_pipe(
         _write_json_atomic(storage, _staging_index_path(org, sup), {"staging_names": names, "updated_at_ns": time.time_ns()})
 
     pipes = _load_pipe_index(storage, org, sup)
-    pipes = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name)]
+    pipes = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_id") == pipe_id)]
     overwrite_cols = pipe_def.get("overwrite_columns")
     if not isinstance(overwrite_cols, list):
         overwrite_cols = []
     pipes.append({
-        "pipe_name": pipe_name, "organization": org, "super_name": sup,
-        "staging_name": staging_name, "role_name": str(pipe_def.get("role_name") or "").strip(),
+        "pipe_id": pipe_id, "pipe_name": pipe_name, "organization": org, "super_name": sup,
+        "staging_name": staging_name, "role_name": role_eff,
         "simple_name": str(pipe_def.get("simple_name") or "").strip(),
         "overwrite_columns": overwrite_cols, "enabled": bool(pipe_def.get("enabled")),
         "path": pipe_path, "updated_at_ns": time.time_ns(),
@@ -2370,15 +2398,15 @@ def api_save_pipe(
     _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
 
     _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
-    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, pipe_def)
+    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_id, pipe_def)
 
     _audit(
         category=EventCategory.DATA_MUTATION, action=Actions.PIPE_CREATE,
         organization=org, super_name=sup, resource_type="pipe",
-        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
-        detail=make_detail(staging=staging_name, pipe=pipe_name, enabled=pipe_def.get("enabled")),
+        resource_id=f"{staging_name}/{pipe_id}", severity=Severity.INFO,
+        detail=make_detail(staging=staging_name, pipe=pipe_name, pipe_id=pipe_id, enabled=pipe_def.get("enabled"), role_name=role_eff),
     )
-    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "path": pipe_path}
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "pipe_id": pipe_id, "path": pipe_path}
 
 
 @router.post("/api/v1/ingestion/pipes/delete")
@@ -2387,16 +2415,21 @@ def api_delete_pipe(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
-    pipe_name: str = Query(...),
+    pipe_id: str = Query(""),
+    pipe_name: str = Query(""),
+    role_name: Optional[str] = Query(None),
     _: Any = Depends(logged_in_guard_api),
 ):
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
     if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
         raise HTTPException(status_code=400, detail="Invalid staging_name")
-    if not _STAGING_NAME_RE.fullmatch((pipe_name or "").strip()):
-        raise HTTPException(status_code=400, detail="Invalid pipe_name")
+    pid = (pipe_id or pipe_name or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="pipe_id required")
 
     storage = get_storage()
-    path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
+    path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")
 
     try:
         if storage.exists(path):
@@ -2408,17 +2441,18 @@ def api_delete_pipe(
 
     pipes = _load_pipe_index(storage, org, sup)
     if pipes:
-        pipes2 = [p for p in pipes if not (p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name.strip())]
+        pipes2 = [p for p in pipes if not (p.get("staging_name") == staging_name and (p.get("pipe_id") == pid or p.get("pipe_name") == pid))]
         if pipes2 != pipes:
             _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes2, "updated_at_ns": time.time_ns()})
 
-    _redis_delete_pipe_meta(org, sup, staging_name, pipe_name.strip())
+    _redis_delete_pipe_meta(org, sup, staging_name, pid)
     _audit(
         category=EventCategory.DATA_MUTATION, action=Actions.PIPE_DELETE,
         organization=org, super_name=sup, resource_type="pipe",
-        resource_id=f"{staging_name}/{pipe_name.strip()}", severity=Severity.WARNING,
+        resource_id=f"{staging_name}/{pid}", severity=Severity.WARNING,
+        detail=make_detail(role_name=role_eff),
     )
-    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name.strip()}
+    return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_id": pid}
 
 
 @router.post("/api/v1/ingestion/pipes/enable")
@@ -2427,14 +2461,21 @@ def api_enable_pipe(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
-    pipe_name: str = Query(...),
+    pipe_id: str = Query(""),
+    pipe_name: str = Query(""),
+    role_name: Optional[str] = Query(None),
     _: Any = Depends(logged_in_guard_api),
 ):
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
     from supertable.super_pipe import SuperPipe
 
     try:
+        pid = (pipe_id or pipe_name or "").strip()
+        meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
+        pn = str(meta.get("pipe_name") or pid)
         pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
-        pipe.set_enabled(pipe_name=pipe_name, enabled=True)
+        pipe.set_enabled(pipe_name=pn, enabled=True, role_name=role_eff)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -2444,16 +2485,16 @@ def api_enable_pipe(
     pipes = _load_pipe_index(storage, org, sup)
     if pipes:
         for p in pipes:
-            if p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name:
+            if p.get("staging_name") == staging_name and (p.get("pipe_id") == pid or p.get("pipe_name") == pid):
                 p["enabled"] = True
                 p["updated_at_ns"] = time.time_ns()
         _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
 
-    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
-    meta = _read_json_if_exists(storage, p_path) or (_redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {})
-    if isinstance(meta, dict):
-        meta["enabled"] = True
-    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")
+    meta2 = _read_json_if_exists(storage, p_path) or meta
+    if isinstance(meta2, dict):
+        meta2["enabled"] = True
+    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta2 if isinstance(meta2, dict) else {})
     _audit(
         category=EventCategory.DATA_MUTATION, action=Actions.PIPE_ENABLE,
         organization=org, super_name=sup, resource_type="pipe",
@@ -2468,14 +2509,21 @@ def api_disable_pipe(
     org: str = Query(...),
     sup: str = Query(...),
     staging_name: str = Query(...),
-    pipe_name: str = Query(...),
+    pipe_id: str = Query(""),
+    pipe_name: str = Query(""),
+    role_name: Optional[str] = Query(None),
     _: Any = Depends(logged_in_guard_api),
 ):
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
     from supertable.super_pipe import SuperPipe
 
     try:
+        pid = (pipe_id or pipe_name or "").strip()
+        meta = _redis_get_pipe_meta(org, sup, staging_name, pid) or {}
+        pn = str(meta.get("pipe_name") or pid)
         pipe = SuperPipe(organization=org, super_name=sup, staging_name=staging_name)
-        pipe.set_enabled(pipe_name=pipe_name, enabled=False)
+        pipe.set_enabled(pipe_name=pn, enabled=False, role_name=role_eff)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -2485,16 +2533,16 @@ def api_disable_pipe(
     pipes = _load_pipe_index(storage, org, sup)
     if pipes:
         for p in pipes:
-            if p.get("staging_name") == staging_name and p.get("pipe_name") == pipe_name:
+            if p.get("staging_name") == staging_name and (p.get("pipe_id") == pid or p.get("pipe_name") == pid):
                 p["enabled"] = False
                 p["updated_at_ns"] = time.time_ns()
         _write_json_atomic(storage, _pipe_index_path(org, sup), {"pipes": pipes, "updated_at_ns": time.time_ns()})
 
-    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pipe_name.strip()}.json")
-    meta = _read_json_if_exists(storage, p_path) or (_redis_get_pipe_meta(org, sup, staging_name, pipe_name) or {})
-    if isinstance(meta, dict):
-        meta["enabled"] = False
-    _redis_upsert_pipe_meta(org, sup, staging_name, pipe_name, meta if isinstance(meta, dict) else {})
+    p_path = os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json")
+    meta2 = _read_json_if_exists(storage, p_path) or meta
+    if isinstance(meta2, dict):
+        meta2["enabled"] = False
+    _redis_upsert_pipe_meta(org, sup, staging_name, pid, meta2 if isinstance(meta2, dict) else {})
     _audit(
         category=EventCategory.DATA_MUTATION, action=Actions.PIPE_DISABLE,
         organization=org, super_name=sup, resource_type="pipe",
@@ -2637,7 +2685,7 @@ async def api_ingestion_load_upload(
 
         def _do_stage() -> str:
             stg = Staging(organization=org_eff, super_name=sup_eff, staging_name=stg_eff)
-            return stg.save_as_parquet(arrow_table=arrow_table, base_file_name=base_name)
+            return stg.save_as_parquet(role_name=role_eff, arrow_table=arrow_table, base_file_name=base_name)
 
         try:
             saved = await asyncio.to_thread(_do_stage)
@@ -2744,18 +2792,20 @@ async def api_ingestion_load_upload(
 async def api_file_columns(
     request: Request,
     file: UploadFile = File(...),
+    preview: int = Form(10),
     _: Any = Depends(logged_in_guard_api),
 ):
-    """Extract column names from an uploaded file without loading all data.
+    """Extract column names and optional preview rows from an uploaded file.
 
-    Used by the ingestion UI to show delete criteria columns for Parquet
-    files (where client-side preview is not possible).  Reads only schema
-    metadata, not the full dataset.
+    Used by the ingestion UI for schema display and data preview.
+    For Parquet files (where client-side preview is not possible), returns
+    up to `preview` sample rows alongside column names.
     """
     filename = (file.filename or "upload").strip()
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    preview_limit = max(0, min(preview or 10, 50))
 
-    def _extract(upload: UploadFile) -> List[str]:
+    def _extract(upload: UploadFile) -> Tuple[List[str], List[Dict[str, Any]], int]:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}" if ext else "")
         tmp_path = tmp.name
         try:
@@ -2771,20 +2821,30 @@ async def api_file_columns(
             import pyarrow.json as pa_json_mod
 
             if ext in ("parquet", "pq"):
-                schema = pq_mod.read_schema(tmp_path)
-                return schema.names
+                tbl = pq_mod.read_table(tmp_path)
+                cols = tbl.column_names
+                total = tbl.num_rows
+                rows: List[Dict[str, Any]] = []
+                if preview_limit > 0:
+                    sliced = tbl.slice(0, min(preview_limit, total))
+                    for i in range(sliced.num_rows):
+                        row = {}
+                        for c in cols:
+                            v = sliced.column(c)[i].as_py()
+                            row[c] = v
+                        rows.append(row)
+                return cols, rows, total
             elif ext in ("csv", "tsv"):
                 delimiter = "\t" if ext == "tsv" else ","
-                # Read just the first row to get headers
                 read_opts = pa_csv_mod.ReadOptions(autogenerate_column_names=False)
                 parse_opts = pa_csv_mod.ParseOptions(delimiter=delimiter)
                 tbl = pa_csv_mod.read_csv(tmp_path, read_options=read_opts, parse_options=parse_opts)
-                return tbl.column_names
+                return tbl.column_names, [], tbl.num_rows
             elif ext in ("json", "jsonl", "ndjson"):
                 tbl = pa_json_mod.read_json(tmp_path)
-                return tbl.column_names
+                return tbl.column_names, [], tbl.num_rows
             else:
-                return []
+                return [], [], 0
         finally:
             try:
                 upload.file.close()
@@ -2796,11 +2856,495 @@ async def api_file_columns(
                 pass
 
     try:
-        columns = await asyncio.to_thread(_extract, file)
+        columns, rows, total = await asyncio.to_thread(_extract, file)
     except Exception as e:
-        return JSONResponse({"ok": False, "columns": [], "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": False, "columns": [], "rows": [], "error": str(e)}, status_code=400)
 
-    return {"ok": True, "columns": columns, "file_type": ext, "file_name": filename}
+    return {"ok": True, "columns": columns, "rows": rows, "total_rows": total, "file_type": ext, "file_name": filename}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   INGESTION LANDSCAPE (single-call optimized endpoint)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/api/v1/ingestion/summary")
+def api_ingestion_summary(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    hours: int = Query(24, ge=1, le=672),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Single optimized endpoint for the Ingestion Landscape view.
+
+    Returns stagings, pipes, recent writes, and activity histogram
+    in one round-trip.  Filters writes by the requested time window.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    # 1. Stagings with file counts
+    names = _redis_list_stagings(org, sup)
+    storage = get_storage()
+    stagings: List[Dict[str, Any]] = []
+    total_files = 0
+    total_rows = 0
+    for name in names:
+        idx_path = os.path.join(_staging_base_dir(org, sup), f"{name}_files.json")
+        fc, tr = 0, 0
+        try:
+            data = storage.read_json(idx_path) or []
+            if isinstance(data, list):
+                fc = len(data)
+                for item in data:
+                    if isinstance(item, dict):
+                        tr += int(item.get("rows") or 0)
+        except Exception:
+            pass
+        stagings.append({"name": name, "file_count": fc, "total_rows": tr})
+        total_files += fc
+        total_rows += tr
+
+    # 2. All pipes across all stagings — batch via Redis pipeline
+    pipes: List[Dict[str, Any]] = []
+    all_pipe_keys: List[Tuple[str, str]] = []  # (stg_name, pipe_name)
+    for stg_name in names:
+        pipe_names = _redis_list_pipes(org, sup, stg_name)
+        for pn in pipe_names:
+            all_pipe_keys.append((stg_name, pn))
+
+    if all_pipe_keys:
+        try:
+            pl = redis_client.pipeline()
+            for stg_name, pn in all_pipe_keys:
+                pl.get(_pipe_key(org, sup, stg_name, pn))
+            raws = pl.execute()
+        except Exception:
+            raws = [None] * len(all_pipe_keys)
+
+        for (stg_name, pn), raw in zip(all_pipe_keys, raws):
+            meta = _redis_json_load(raw) or {}
+            pipes.append({
+                "pipe_name": pn,
+                "staging_name": stg_name,
+                "simple_name": str(meta.get("simple_name") or ""),
+                "overwrite_columns": meta.get("overwrite_columns") or [],
+                "enabled": bool(meta.get("enabled")),
+            })
+
+    # 3. Recent writes (time-filtered)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff_iso = cutoff.isoformat()
+    writes: List[Dict[str, Any]] = []
+    write_total_rows = 0
+    write_total_dur = 0.0
+    dur_count = 0
+    try:
+        raw_items = _read_monitoring_list(
+            redis_client, org, sup,
+            monitor_type="writes", from_ts_ms=None, to_ts_ms=None, limit=500,
+        )
+        for item in raw_items:
+            ts = item.get("recorded_at") or ""
+            if ts and ts < cutoff_iso:
+                continue
+            writes.append(item)
+            write_total_rows += int(item.get("inserted") or 0)
+            d = item.get("duration")
+            if d is not None:
+                write_total_dur += float(d)
+                dur_count += 1
+    except Exception as e:
+        logger.warning("[landscape] Failed to read writes: %s", e)
+
+    avg_dur_ms = round((write_total_dur / dur_count) * 1000) if dur_count else 0
+
+    # 4. Activity histogram (bucket writes by hour)
+    bucket_count = min(hours, 48)  # cap at 48 buckets
+    bucket_size_h = max(1, hours // bucket_count)
+    now = datetime.now(timezone.utc)
+    buckets = [0] * bucket_count
+    for item in writes:
+        ts = item.get("recorded_at") or ""
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            hrs_ago = (now - dt).total_seconds() / 3600
+            idx = int(hrs_ago / bucket_size_h)
+            if 0 <= idx < bucket_count:
+                buckets[bucket_count - 1 - idx] += int(item.get("inserted") or 0)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "stagings": stagings,
+        "pipes": pipes,
+        "recent_writes": writes[:30],
+        "total_staging_count": len(names),
+        "total_files": total_files,
+        "total_rows": total_rows,
+        "write_count": len(writes),
+        "write_total_rows": write_total_rows,
+        "avg_duration_ms": avg_dur_ms,
+        "active_pipes": sum(1 for p in pipes if p["enabled"]),
+        "total_pipes": len(pipes),
+        "activity_buckets": buckets,
+        "bucket_size_hours": bucket_size_h,
+        "hours": hours,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   PIPE EXECUTE / STAGING LOAD / PREVIEW / PURGE
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/api/v1/ingestion/pipes/execute")
+async def api_execute_pipe(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    pipe_id: str = Query(""),
+    pipe_name: str = Query(""),
+    role_name: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Execute a pipe: read all staging files and write to the target table."""
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
+    t0 = time.perf_counter()
+
+    pid = (pipe_id or pipe_name or "").strip()
+    # Read pipe meta — try Redis first, fall back to disk
+    meta = _redis_get_pipe_meta(org, sup, staging_name, pid)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Pipe '{pid}' not found")
+    if not meta.get("enabled"):
+        raise HTTPException(status_code=400, detail=f"Pipe '{pid}' is disabled")
+
+    simple_name = str(meta.get("simple_name") or "").strip()
+    if not simple_name:
+        raise HTTPException(status_code=400, detail="Pipe has no target table (simple_name)")
+
+    overwrite_cols = meta.get("overwrite_columns") or []
+    if not isinstance(overwrite_cols, list):
+        overwrite_cols = []
+
+    # Read staging files
+    storage = get_storage()
+    idx_path = os.path.join(_staging_base_dir(org, sup), f"{staging_name}_files.json")
+    try:
+        file_index = storage.read_json(idx_path) or []
+    except Exception:
+        file_index = []
+    if not file_index:
+        raise HTTPException(status_code=400, detail="No files in staging area")
+
+    def _do_execute():
+        import pyarrow as pa
+        tables = []
+        stage_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
+        for item in file_index:
+            if not isinstance(item, dict):
+                continue
+            fname = item.get("file")
+            if not fname:
+                continue
+            fpath = os.path.join(stage_dir, fname)
+            try:
+                tbl = storage.read_parquet(fpath)
+                tables.append(tbl)
+            except Exception as e:
+                logger.warning("[pipe-execute] Failed to read %s: %s", fpath, e)
+        if not tables:
+            raise RuntimeError("No readable parquet files in staging")
+        combined = pa.concat_tables(tables, promote_options="default")
+
+        from supertable.data_writer import DataWriter
+        dw = DataWriter(super_name=sup, organization=org)
+        lineage = {
+            "source_type": "pipe_execute",
+            "pipe_name": pipe_name,
+            "staging_name": staging_name,
+            "role_name": role_eff,
+            "username": (sess or {}).get("username", ""),
+            "overwrite_columns": overwrite_cols,
+        }
+        return dw.write(
+            role_name=role_eff, simple_name=simple_name, data=combined,
+            overwrite_columns=overwrite_cols, lineage=lineage,
+        )
+
+    try:
+        cols, rows_written, inserted, deleted = await asyncio.to_thread(_do_execute)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipe execute failed: {e}")
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.DATA_WRITE,
+        organization=org, super_name=sup, resource_type="pipe",
+        resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
+        detail=make_detail(
+            pipe=pipe_name, staging=staging_name, table=simple_name,
+            rows=rows_written, inserted=inserted, deleted=deleted,
+            role_name=role_eff, duration_ms=round(dt_ms),
+        ),
+    )
+    return {
+        "ok": True, "pipe_name": pipe_name, "table": simple_name,
+        "rows": rows_written, "inserted": inserted, "deleted": deleted,
+        "files_processed": len(file_index), "server_duration_ms": dt_ms,
+    }
+
+
+@router.get("/api/v1/ingestion/staging/preview")
+async def api_staging_file_preview(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    file_name: str = Query(...),
+    limit: int = Query(20, ge=1, le=200),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Preview rows from a staging file."""
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    storage = get_storage()
+    fpath = os.path.join(_staging_base_dir(org, sup), staging_name, file_name.strip())
+
+    def _read():
+        tbl = storage.read_parquet(fpath)
+        sliced = tbl.slice(0, min(limit, tbl.num_rows))
+        cols = sliced.column_names
+        rows = []
+        for i in range(sliced.num_rows):
+            row = {}
+            for c in cols:
+                v = sliced.column(c)[i].as_py()
+                row[c] = v
+            rows.append(row)
+        return cols, rows, tbl.num_rows
+
+    try:
+        columns, rows, total = await asyncio.to_thread(_read)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preview failed: {e}")
+
+    return {"ok": True, "columns": columns, "rows": rows, "total_rows": total, "preview_rows": len(rows)}
+
+
+@router.post("/api/v1/ingestion/staging/delete-file")
+def api_staging_delete_file(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    file_name: str = Query(...),
+    role_name: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Delete a single file from a staging area."""
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    fname = (file_name or "").strip()
+    if not fname or "/" in fname or "\\" in fname or ".." in fname:
+        raise HTTPException(status_code=400, detail="Invalid file_name")
+
+    storage = get_storage()
+    stage_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
+    fpath = os.path.join(stage_dir, fname)
+    idx_path = os.path.join(_staging_base_dir(org, sup), f"{staging_name}_files.json")
+
+    # Delete the physical file
+    try:
+        if storage.exists(fpath):
+            storage.delete(fpath)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+    # Update the file index
+    try:
+        file_index = storage.read_json(idx_path) or []
+        if isinstance(file_index, list):
+            file_index = [it for it in file_index if not (isinstance(it, dict) and it.get("file") == fname)]
+            storage.write_json(idx_path, file_index)
+    except Exception:
+        pass  # Index update is best-effort
+
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.STAGING_DELETE,
+        organization=org, super_name=sup, resource_type="staging_file",
+        resource_id=f"{staging_name}/{fname}", severity=Severity.WARNING,
+        detail=make_detail(role_name=role_eff, file_name=fname),
+    )
+    return {"ok": True, "staging_name": staging_name, "file_name": fname}
+
+
+@router.post("/api/v1/ingestion/staging/purge")
+def api_staging_purge(
+    request: Request,
+    org: str = Query(...),
+    sup: str = Query(...),
+    staging_name: str = Query(...),
+    role_name: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Delete all files from a staging area without deleting the staging itself."""
+    sess = get_session(request) or {}
+    role_eff = (role_name or (sess.get("role_name") or "")).strip() or "superadmin"
+    if not _STAGING_NAME_RE.fullmatch((staging_name or "").strip()):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+
+    storage = get_storage()
+    stage_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
+    idx_path = os.path.join(_staging_base_dir(org, sup), f"{staging_name}_files.json")
+
+    deleted_count = 0
+    try:
+        file_index = storage.read_json(idx_path) or []
+        if isinstance(file_index, list):
+            for item in file_index:
+                if not isinstance(item, dict):
+                    continue
+                fname = item.get("file")
+                if not fname:
+                    continue
+                try:
+                    storage.delete(os.path.join(stage_dir, fname))
+                    deleted_count += 1
+                except Exception:
+                    pass
+        # Reset the index
+        storage.write_json(idx_path, [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Purge failed: {e}")
+
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.STAGING_DELETE,
+        organization=org, super_name=sup, resource_type="staging_files",
+        resource_id=staging_name, severity=Severity.WARNING,
+        detail=make_detail(role_name=role_eff, deleted_files=deleted_count),
+    )
+    return {"ok": True, "staging_name": staging_name, "deleted_files": deleted_count}
+
+
+@router.post("/api/v1/ingestion/staging/load-to-table")
+async def api_staging_load_to_table(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Load one or all staged files to a target table."""
+    sess = get_session(request) or {}
+    org = str(payload.get("org") or "").strip()
+    sup = str(payload.get("sup") or "").strip()
+    staging_name = str(payload.get("staging_name") or "").strip()
+    table_name = str(payload.get("table_name") or "").strip()
+    role_eff = (str(payload.get("role_name") or "") or (sess.get("role_name") or "")).strip() or "superadmin"
+    file_name = str(payload.get("file_name") or "").strip()  # empty = all files
+    raw_cols = payload.get("overwrite_columns") or []
+    if isinstance(raw_cols, str):
+        raw_cols = [c.strip() for c in re.split(r"[\n,]+", raw_cols) if c.strip()]
+    overwrite_cols: List[str] = raw_cols if isinstance(raw_cols, list) else []
+
+    if not org or not sup:
+        raise HTTPException(status_code=400, detail="org and sup required")
+    if not staging_name or not _STAGING_NAME_RE.fullmatch(staging_name):
+        raise HTTPException(status_code=400, detail="Invalid staging_name")
+    if not table_name:
+        raise HTTPException(status_code=400, detail="table_name required")
+
+    storage = get_storage()
+    stage_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
+    idx_path = os.path.join(_staging_base_dir(org, sup), f"{staging_name}_files.json")
+    t0 = time.perf_counter()
+
+    def _do_load():
+        import pyarrow as pa
+        file_index = storage.read_json(idx_path) or []
+        if not isinstance(file_index, list) or not file_index:
+            raise RuntimeError("No files in staging area")
+
+        targets = file_index
+        if file_name:
+            targets = [it for it in file_index if isinstance(it, dict) and it.get("file") == file_name]
+            if not targets:
+                raise RuntimeError(f"File '{file_name}' not found in staging")
+
+        # Sort by written_at_ns for deterministic ordering
+        targets = sorted(targets, key=lambda x: int(x.get("written_at_ns") or 0))
+
+        tables = []
+        for item in targets:
+            if not isinstance(item, dict):
+                continue
+            fname = item.get("file")
+            if not fname:
+                continue
+            fpath = os.path.join(stage_dir, fname)
+            try:
+                tbl = storage.read_parquet(fpath)
+                tables.append(tbl)
+            except Exception as e:
+                logger.warning("[staging-load] Failed to read %s: %s", fpath, e)
+        if not tables:
+            raise RuntimeError("No readable parquet files")
+
+        combined = pa.concat_tables(tables, promote_options="default")
+
+        from supertable.data_writer import DataWriter
+        dw = DataWriter(super_name=sup, organization=org)
+        lineage = {
+            "source_type": "staging_load",
+            "staging_name": staging_name,
+            "file_name": file_name or f"all ({len(targets)} files)",
+            "role_name": role_eff,
+            "username": (sess or {}).get("username", ""),
+            "overwrite_columns": overwrite_cols,
+            "incoming_rows": combined.num_rows,
+        }
+        result = dw.write(
+            role_name=role_eff, simple_name=table_name, data=combined,
+            overwrite_columns=overwrite_cols, lineage=lineage,
+        )
+        return result, len(targets), combined.num_rows
+
+    try:
+        (cols, rows_written, inserted, deleted), files_loaded, incoming = await asyncio.to_thread(_do_load)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Load failed: {e}")
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _audit(
+        category=EventCategory.DATA_MUTATION, action=Actions.DATA_WRITE,
+        organization=org, super_name=sup, resource_type="table",
+        resource_id=table_name, severity=Severity.INFO,
+        detail=make_detail(
+            staging=staging_name, table=table_name, role_name=role_eff,
+            rows=rows_written, inserted=inserted, deleted=deleted,
+            files_loaded=files_loaded, duration_ms=round(dt_ms),
+        ),
+    )
+    return {
+        "ok": True, "table_name": table_name, "staging_name": staging_name,
+        "files_loaded": files_loaded, "incoming_rows": incoming,
+        "rows": rows_written, "inserted": inserted, "deleted": deleted,
+        "server_duration_ms": dt_ms,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3307,6 +3851,92 @@ def _get_dqc(request: Request, org: str = None, sup: str = None) -> DQConfig:
 
 def _dq_resolve(org: str = None, sup: str = None):
     return resolve_pair(org, sup)
+
+
+@router.get("/api/v1/quality/summary")
+def api_quality_summary(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Single optimized endpoint for the Quality Summary tab.
+
+    Returns table list, quality overview, rule count, schedule brief,
+    and pre-computed aggregates in one round-trip.
+    """
+    o, s = _dq_resolve(org, sup)
+    if not o or not s:
+        return {"ok": True, "tables": [], "quality": {}, "rule_count": 0,
+                "quality_index": 0, "counts": {"ok": 0, "warning": 0, "critical": 0, "unchecked": 0}}
+
+    dqc = _get_dqc(request, org, sup)
+
+    # 1. Table names (Redis scan)
+    tables: List[str] = []
+    try:
+        pattern = f"supertable:{o}:{s}:meta:leaf:*"
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+            for key in keys:
+                k = key if isinstance(key, str) else key.decode("utf-8")
+                simple = k.rsplit("meta:leaf:", 1)[-1]
+                if simple and not simple.startswith("__"):
+                    tables.append(simple)
+            if cursor == 0:
+                break
+        tables = sorted(set(tables))
+    except Exception as e:
+        logger.error(f"[dq-summary] List tables failed: {e}")
+
+    # 2. Quality overview
+    all_latest = dqc.get_all_latest()
+
+    # 3. Rule count
+    rule_count = 0
+    try:
+        rules = dqc.get_rules()
+        rule_count = len(rules) if isinstance(rules, list) else 0
+    except Exception:
+        pass
+
+    # 4. Pre-compute aggregates
+    scores = []
+    count_ok, count_warn, count_crit = 0, 0, 0
+    checked_tables = set()
+    for tname, tdata in (all_latest or {}).items():
+        if not isinstance(tdata, dict):
+            continue
+        checked_tables.add(tname)
+        status = tdata.get("status", "ok")
+        if status == "ok":
+            count_ok += 1
+        elif status == "warning":
+            count_warn += 1
+        elif status == "critical":
+            count_crit += 1
+        qs = tdata.get("quality_score")
+        if qs is not None:
+            scores.append(qs)
+
+    unchecked = len(tables) - len(checked_tables)
+    quality_index = round(sum(scores) / len(scores)) if scores else 0
+
+    return {
+        "ok": True,
+        "tables": tables,
+        "quality": all_latest,
+        "rule_count": rule_count,
+        "quality_index": quality_index,
+        "counts": {
+            "ok": count_ok,
+            "warning": count_warn,
+            "critical": count_crit,
+            "unchecked": max(0, unchecked),
+            "total": len(tables),
+        },
+    }
 
 
 @router.get("/api/v1/quality/overview")

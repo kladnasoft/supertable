@@ -15,19 +15,20 @@
    DATA QUALITY — Command Center (standalone, matches compute.html)
    ═══════════════════════════════════════════════════════════════ */
 :root {
-  --primary: #1c96ca; --primary-light: #e6f4fa; --primary-dark: #147ba3;
-  --primary-color: #1c96ca; --secondary-color: #147ba3; --dark-color: #1a1a2e;
-  --success: #10b981; --success-bg: #ecfdf5;
-  --error: #ef4444; --error-bg: #fef2f2;
-  --warning: #f59e0b; --warning-bg: #fffbeb;
-  --text-color: #1e293b; --text-secondary: #64748b; --text-muted: #94a3b8;
-  --panel-bg: #ffffff; --panel-border: #e0e5f0; --border-light: #f1f5f9;
-  --bg: #f3f6fb; --bg-surface: #f8fafc; --bg-hover: #f1f5f9;
-  --radius: 10px; --radius-sm: 6px;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --font: 'Inter', -apple-system, sans-serif;
-  --transition: all .2s cubic-bezier(.25,.8,.25,1);
-  --amber: #d97706; --purple: #7c3aed; --green: #059669;
+  --primary:#29B5E8;--primary-light:#E0F4FD;--primary-dark:#11567F;
+  --primary-color:#29B5E8;--secondary-color:#11567F;--dark-color:#1a1a2e;
+  --success:#2FC89F;--success-bg:#E6FAF3;
+  --error:#E5484D;--error-bg:#FEECEE;
+  --warning:#F5A623;--warning-bg:#FFF8EB;
+  --warn:#F5A623;--warn-bg:#FFF8EB;
+  --text-color:#1B2559;--text-secondary:#6E7891;--text-muted:#6E7891;--text:#1B2559;--text-sec:#6E7891;
+  --panel-bg:#ffffff;--panel-border:#E4E9F2;--border-light:#F0F2F7;--border:#E4E9F2;
+  --bg:#F5F7FA;--bg-card:#fff;--bg-surface:#FAFBFD;--bg-hover:#F0F2F7;
+  --radius:12px;--radius-sm:8px;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --font:'Inter',-apple-system,sans-serif;
+  --transition:all .2s cubic-bezier(.25,.8,.25,1);
+  --amber:#F5A623;--purple:#7c3aed;--green:#2FC89F;
 }
 
 /* ═══ TOPBAR ═══ */
@@ -124,9 +125,9 @@
 .dq-sort-select:focus { border-color: var(--primary); }
 .dq-table-count { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 
-.dq-overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.dq-overview-grid { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: var(--radius); overflow: hidden; }
 .dq-table-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: var(--radius); padding: 14px 16px; cursor: pointer; transition: all .15s; position: relative; }
-.dq-table-card:hover { border-color: var(--primary); box-shadow: 0 4px 12px rgba(28,150,202,.08); }
+.dq-table-card:hover { border-color: var(--primary); box-shadow: 0 4px 12px rgba(41,181,232,.08); }
 .dq-table-card.status-ok { border-left: 4px solid var(--success); }
 .dq-table-card.status-warning { border-left: 4px solid var(--warning); }
 .dq-table-card.status-critical { border-left: 4px solid var(--error); }
@@ -276,12 +277,12 @@
 <!-- ═══ KIND BAR — Secondary Nav ═══ -->
 <div class="kind-bar" id="dqKindBar">
   <div class="kind-node active" data-tab="overview" onclick="dqSwitchTab(this,'overview')">
-    <div class="kicon" style="background:rgba(28,150,202,.08);border:1px solid rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-th-large"></i></div>
+    <div class="kicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-th-large"></i></div>
     Overview <span class="kcount" id="dqKindOverviewCount"></span>
   </div>
   <div class="kind-sep"></div>
   <div class="kind-node" data-tab="rules" onclick="dqSwitchTab(this,'rules')">
-    <div class="kicon" style="background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-list-check"></i></div>
+    <div class="kicon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warn);"><i class="fas fa-list-check"></i></div>
     Rules <span class="kcount" id="dqRuleCount">0</span>
   </div>
   <div class="kind-sep"></div>
@@ -291,7 +292,7 @@
   </div>
   <div class="kind-sep"></div>
   <div class="kind-node" data-tab="schedule" onclick="dqSwitchTab(this,'schedule')">
-    <div class="kicon" style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.2);color:var(--green);"><i class="fas fa-clock"></i></div>
+    <div class="kicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-clock"></i></div>
     Schedule
   </div>
   <div class="kind-sep"></div>
@@ -310,6 +311,27 @@
 
       <!-- ══════════════════ OVERVIEW ══════════════════ -->
       <div class="dq-tab-panel active" id="dqp-overview">
+        <!-- SUMMARY HEADER -->
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
+          <div><div style="font-size:16px;font-weight:600;">Quality <span style="color:var(--primary);">summary</span></div><div id="dqSummarySubtitle" style="font-size:11px;color:var(--text-muted);margin-top:2px;">Loading...</div></div>
+          <div style="text-align:right;"><div id="dqSummaryScore" style="font-size:38px;font-weight:600;color:var(--text-muted);line-height:1;">—</div><div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-top:2px;">quality index</div></div>
+        </div>
+        <!-- HEALTH BAR -->
+        <div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);">Table health distribution</span>
+            <div id="dqHealthLegend" style="display:flex;gap:10px;font-size:10px;color:var(--text-muted);font-weight:500;"></div>
+          </div>
+          <div id="dqHealthBar" style="display:flex;gap:2px;height:22px;border-radius:6px;overflow:hidden;background:var(--border-light);"></div>
+        </div>
+        <!-- SUMMARY TILES -->
+        <div id="dqSummaryTiles" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;">
+          <div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:12px;display:flex;align-items:center;gap:10px;"><div style="width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-check-circle"></i></div><div><div id="dqTileOk" style="font-size:19px;font-weight:800;font-family:var(--mono);line-height:1;color:var(--success);">—</div><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-top:2px;">Tables OK</div></div></div>
+          <div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:12px;display:flex;align-items:center;gap:10px;"><div style="width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warning);"><i class="fas fa-exclamation-triangle"></i></div><div><div id="dqTileWarn" style="font-size:19px;font-weight:800;font-family:var(--mono);line-height:1;color:var(--warning);">—</div><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-top:2px;">Warnings</div></div></div>
+          <div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:12px;display:flex;align-items:center;gap:10px;"><div style="width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(229,72,77,.08);border:1px solid rgba(229,72,77,.2);color:var(--error);"><i class="fas fa-times-circle"></i></div><div><div id="dqTileCrit" style="font-size:19px;font-weight:800;font-family:var(--mono);line-height:1;color:var(--error);">—</div><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-top:2px;">Critical</div></div></div>
+          <div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:12px;display:flex;align-items:center;gap:10px;"><div style="width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-list-check"></i></div><div><div id="dqTileRules" style="font-size:19px;font-weight:800;font-family:var(--mono);line-height:1;">—</div><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-top:2px;">Active rules</div></div></div>
+        </div>
+        <!-- FILTER + TABLE -->
         <div class="dq-toolbar">
           <div class="dq-search-wrap">
             <i class="fas fa-search"></i>
@@ -666,56 +688,36 @@
     </div><!-- /center-area -->
   </div><!-- /cc-center -->
 
-  <!-- ══════════ RIGHT PANEL — Intelligence ══════════ -->
+  <!-- ══════════ RIGHT PANEL — Actions ══════════ -->
   <div class="panel-right" id="dqRightPanel">
 
-    <!-- Health Score -->
-    <div class="intel-section">
-      <div class="intel-title"><i class="fas fa-heartbeat"></i> Health Score</div>
-      <div class="intel-big-number none" id="dqIntelScore">—</div>
-      <div class="intel-subtitle" id="dqIntelScoreLabel">No data yet</div>
-    </div>
+    <!-- Hidden elements for JS compat -->
+    <span id="dqIntelScore" style="display:none;">—</span>
+    <span id="dqIntelScoreLabel" style="display:none;"></span>
+    <span id="dqIntelOk" style="display:none;">0</span>
+    <span id="dqIntelWarn" style="display:none;">0</span>
+    <span id="dqIntelCrit" style="display:none;">0</span>
+    <span id="dqIntelUnchecked" style="display:none;">0</span>
+    <div id="dqIntelAnomalies" style="display:none;"></div>
 
-    <!-- Status Breakdown -->
+    <!-- Run checks -->
     <div class="intel-section">
-      <div class="intel-title"><i class="fas fa-chart-pie"></i> Status Breakdown</div>
-      <div class="intel-stat-row">
-        <div class="intel-stat-label"><i class="fas fa-check-circle" style="color:var(--success);"></i> Healthy</div>
-        <div class="intel-stat-value" style="color:var(--success);" id="dqIntelOk">0</div>
+      <div class="intel-title"><i class="fas fa-play-circle" style="color:var(--success);"></i> Run checks</div>
+      <button class="intel-action-btn primary" onclick="dqRunAllNow('quick')"><i class="fas fa-bolt"></i> Run all quick</button>
+      <button class="intel-action-btn" onclick="dqRunAllNow('deep')"><i class="fas fa-microscope"></i> Run all deep</button>
+      <button class="intel-action-btn" onclick="dqRunAllNow('custom')"><i class="fas fa-sliders-h"></i> Run all custom rules</button>
+      <div style="margin-top:10px;">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:4px;">Run single table</div>
+        <div style="display:flex;gap:4px;">
+          <select id="dqRunSingleTable" style="flex:1;padding:5px 8px;border:1px solid var(--panel-border);border-radius:var(--radius-sm);font-size:11px;font-family:var(--font);background:var(--bg-surface);outline:none;"></select>
+          <button class="intel-action-btn" style="margin:0;width:auto;padding:5px 10px;" onclick="var t=document.getElementById('dqRunSingleTable').value;if(t)dqRunTableNow(t,'quick');"><i class="fas fa-play"></i></button>
+        </div>
       </div>
-      <div class="intel-stat-row">
-        <div class="intel-stat-label"><i class="fas fa-exclamation-triangle" style="color:var(--warning);"></i> Warning</div>
-        <div class="intel-stat-value" style="color:var(--warning);" id="dqIntelWarn">0</div>
-      </div>
-      <div class="intel-stat-row">
-        <div class="intel-stat-label"><i class="fas fa-times-circle" style="color:var(--error);"></i> Critical</div>
-        <div class="intel-stat-value" style="color:var(--error);" id="dqIntelCrit">0</div>
-      </div>
-      <div class="intel-stat-row">
-        <div class="intel-stat-label"><i class="fas fa-question-circle" style="color:var(--text-muted);"></i> Unchecked</div>
-        <div class="intel-stat-value" id="dqIntelUnchecked">0</div>
-      </div>
-    </div>
-
-    <!-- Anomalies -->
-    <div class="intel-section">
-      <div class="intel-title"><i class="fas fa-exclamation-circle"></i> Active Anomalies</div>
-      <div id="dqIntelAnomalies">
-        <div style="font-size:11px;color:var(--text-muted);">None detected</div>
-      </div>
-    </div>
-
-    <!-- Quick Actions -->
-    <div class="intel-section">
-      <div class="intel-title"><i class="fas fa-bolt"></i> Quick Actions</div>
-      <button class="intel-action-btn primary" onclick="dqRunAllNow('quick')"><i class="fas fa-play"></i> Run All Quick</button>
-      <button class="intel-action-btn" onclick="dqRunAllNow('deep')"><i class="fas fa-microscope"></i> Run All Deep</button>
-      <button class="intel-action-btn" onclick="dqRefresh()"><i class="fas fa-sync-alt"></i> Refresh Data</button>
     </div>
 
     <!-- Schedule Status -->
     <div class="intel-section" style="border-bottom:none;">
-      <div class="intel-title"><i class="fas fa-clock"></i> Schedule</div>
+      <div class="intel-title"><i class="fas fa-clock" style="color:var(--primary);"></i> Schedule</div>
       <div id="dqIntelSchedule">
         <div style="font-size:11px;color:var(--text-muted);">Loading…</div>
       </div>
@@ -786,6 +788,11 @@ function dqToast(msg, duration) {
 
 function dqSwitchTab(el, tabName) {
   document.querySelectorAll('.kind-node').forEach(function(n) { n.classList.remove('active'); });
+  // Lazy load tab data on first visit
+  if (tabName === 'rules' && !_dqTabLoaded.rules) { _dqTabLoaded.rules = true; dqLoadRules(); }
+  if (tabName === 'checks' && !_dqTabLoaded.checks) { _dqTabLoaded.checks = true; dqLoadChecks(); }
+  if (tabName === 'schedule' && !_dqTabLoaded.schedule) { _dqTabLoaded.schedule = true; dqLoadSchedule(); }
+  if (tabName === 'history' && !_dqTabLoaded.history) { _dqTabLoaded.history = true; dqPopulateHistoryTableSelect(); }
   document.querySelectorAll('.dq-tab-panel').forEach(function(p) { p.classList.remove('active'); });
   el.classList.add('active');
   var panel = document.getElementById('dqp-' + tabName);
@@ -961,6 +968,66 @@ function dqUpdateFilterCounts() {
   el = document.getElementById('dqLfCrit'); if (el) el.textContent = countCrit;
 }
 
+function dqLoadSummary() {
+  dqApi('/api/v1/quality/summary').then(function(d) {
+    if (!d.ok) return;
+    _dqAllTableNames = d.tables || [];
+    _dqOverviewData = d.quality || {};
+
+    // Populate summary header
+    var ss = document.getElementById('dqSummaryScore');
+    if (ss) {
+      ss.textContent = d.quality_index > 0 ? d.quality_index : '\u2014';
+      ss.style.color = d.quality_index >= 85 ? 'var(--success)' : d.quality_index >= 65 ? 'var(--warning)' : d.quality_index > 0 ? 'var(--error)' : 'var(--text-muted)';
+    }
+    var sub = document.getElementById('dqSummarySubtitle');
+    if (sub) sub.textContent = (d.counts.total || 0) + ' tables \u00b7 ' + (d.counts.ok || 0) + ' OK, ' + (d.counts.warning || 0) + ' warnings, ' + (d.counts.critical || 0) + ' critical';
+
+    // Summary tiles
+    var el;
+    el = document.getElementById('dqTileOk'); if (el) el.textContent = d.counts.ok || 0;
+    el = document.getElementById('dqTileWarn'); if (el) el.textContent = d.counts.warning || 0;
+    el = document.getElementById('dqTileCrit'); if (el) el.textContent = d.counts.critical || 0;
+    el = document.getElementById('dqTileRules'); if (el) el.textContent = d.rule_count || 0;
+    el = document.getElementById('dqRuleCount'); if (el) el.textContent = d.rule_count || 0;
+
+    // Health bar
+    var hb = document.getElementById('dqHealthBar');
+    var cn = d.counts;
+    if (hb && cn.total > 0) {
+      hb.innerHTML = (cn.ok > 0 ? '<div style="flex:' + cn.ok + ';background:var(--success);border-radius:0;"></div>' : '') +
+        (cn.warning > 0 ? '<div style="flex:' + cn.warning + ';background:var(--warning);border-radius:0;"></div>' : '') +
+        (cn.critical > 0 ? '<div style="flex:' + cn.critical + ';background:var(--error);border-radius:0;"></div>' : '') +
+        (cn.unchecked > 0 ? '<div style="flex:' + cn.unchecked + ';background:var(--border-light);border-radius:0;"></div>' : '');
+    }
+    var hl = document.getElementById('dqHealthLegend');
+    if (hl) {
+      hl.innerHTML = '<span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;border-radius:2px;background:var(--success);display:inline-block;"></span> OK ' + (cn.ok||0) + '</span>' +
+        '<span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;border-radius:2px;background:var(--warning);display:inline-block;"></span> Warn ' + (cn.warning||0) + '</span>' +
+        '<span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;border-radius:2px;background:var(--error);display:inline-block;"></span> Crit ' + (cn.critical||0) + '</span>' +
+        (cn.unchecked > 0 ? '<span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;border-radius:2px;background:var(--border-light);display:inline-block;"></span> No data ' + cn.unchecked + '</span>' : '');
+    }
+
+    // Trigger existing rendering
+    dqPopulateTableSelects();
+    // Populate single-table run dropdown
+    var rsel = document.getElementById('dqRunSingleTable');
+    if (rsel) { rsel.innerHTML = '<option value="">Select table…</option>'; _dqAllTableNames.forEach(function(n) { rsel.innerHTML += '<option value="' + dqEsc(n) + '">' + dqEsc(n) + '</option>'; }); }
+    _dqOverviewPage = 1;
+    dqFilterOverview();
+    dqUpdateFilterCounts();
+    dqUpdateIntelPanel();
+    dqUpdateScheduleIntel();
+
+    // Timestamp
+    var lbl = document.getElementById('dqLastRefreshLabel');
+    if (lbl) {
+      var now = new Date();
+      lbl.textContent = 'Updated ' + ('0'+now.getHours()).slice(-2) + ':' + ('0'+now.getMinutes()).slice(-2) + ':' + ('0'+now.getSeconds()).slice(-2);
+    }
+  });
+}
+
 function dqLoadOverview() {
   Promise.all([
     dqApi('/api/v1/quality/overview'),
@@ -974,6 +1041,9 @@ function dqLoadOverview() {
 
     // Populate table selectors (rules + schedule + history forms)
     dqPopulateTableSelects();
+    // Populate single-table run dropdown
+    var rsel = document.getElementById('dqRunSingleTable');
+    if (rsel) { rsel.innerHTML = '<option value="">Select table…</option>'; _dqAllTableNames.forEach(function(n) { rsel.innerHTML += '<option value="' + dqEsc(n) + '">' + dqEsc(n) + '</option>'; }); }
     dqPopulateHistoryTableSelect();
 
     _dqOverviewPage = 1;
@@ -982,6 +1052,7 @@ function dqLoadOverview() {
     // Update filter counts + intelligence panel
     dqUpdateFilterCounts();
     dqUpdateIntelPanel();
+    dqUpdateScheduleIntel();
   });
 }
 
@@ -1063,49 +1134,60 @@ function dqFilterOverview() {
     return;
   }
 
-  var html = '';
+  var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;"><tr>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:left;">Table</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:left;">Status</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:right;">Score</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:right;">Rows</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:right;">Checks</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:right;">Last check</th>';
+  html += '<th style="padding:7px 14px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);background:var(--bg-surface);border-bottom:1px solid var(--panel-border);text-align:left;">Anomalies</th>';
+  html += '</tr>';
   pageEntries.forEach(function(entry) {
     var name = entry.name;
     var t = entry.data;
     var safeName = dqEsc(name).replace(/'/g, "\\'");
-    if (!t) {
-      html += '<div class="dq-table-card fade-in" onclick="dqOpenTable(\'' + safeName + '\')">';
-      html += '<div class="dq-table-card-header"><div class="dq-table-card-name"><i class="fas fa-table"></i> ' + dqEsc(name) + '</div>';
-      html += '<div class="dq-table-card-score" style="color:var(--text-muted);">—</div></div>';
-      html += '<div class="dq-no-data">No quality data yet</div>';
-      html += '<div class="dq-card-footer"><button class="dq-card-btn" onclick="event.stopPropagation();dqRunTableNow(\'' + safeName + '\',\'quick\')"><i class="fas fa-play"></i> Run Quick Check</button></div>';
-      html += '</div>';
-      return;
-    }
-    var score = t.quality_score || 0;
-    var status = t.status || 'ok';
-    var scoreCls = score >= 85 ? 'good' : score >= 65 ? 'ok' : 'bad';
-    var anomalies = t.anomalies || [];
+    var score = t ? (t.quality_score || 0) : 0;
+    var status = t ? (t.status || 'ok') : '';
+    var scoreCls = score >= 85 ? 'var(--success)' : score >= 65 ? 'var(--warning)' : 'var(--error)';
+    var dotColor = status === 'critical' ? 'var(--error)' : status === 'warning' ? 'var(--warning)' : status === 'ok' ? 'var(--success)' : 'var(--panel-border)';
+    var statusLabel = status === 'critical' ? 'Crit' : status === 'warning' ? 'Warn' : status === 'ok' ? 'OK' : '\u2014';
+    var statusBg = status === 'critical' ? 'var(--error-bg)' : status === 'warning' ? 'var(--warning-bg)' : status === 'ok' ? 'var(--success-bg)' : 'var(--bg-surface)';
+    var statusColor = status === 'critical' ? 'var(--error)' : status === 'warning' ? '#92400e' : status === 'ok' ? 'var(--success)' : 'var(--text-muted)';
+    var anomalies = t ? (t.anomalies || []) : [];
+    var passed = t ? (t.passed || 0) : 0;
+    var totalChecks = passed + (t ? (t.warnings || 0) : 0) + (t ? (t.critical || 0) : 0);
+    totalChecks = totalChecks || (t ? 8 : 0);
 
-    html += '<div class="dq-table-card status-' + status + ' fade-in" onclick="dqOpenTable(\'' + safeName + '\')">';
-    html += '<div class="dq-table-card-header">';
-    html += '<div class="dq-table-card-name"><i class="fas fa-table"></i> ' + dqEsc(name) + '</div>';
-    html += '<div class="dq-table-card-score ' + scoreCls + '">' + score + '</div>';
-    html += '</div>';
-    html += '<div class="dq-table-card-metrics">';
-    html += '<span><i class="fas fa-layer-group" style="font-size:9px;"></i> ' + (t.row_count || 0).toLocaleString() + ' rows</span>';
-    html += '<span><i class="fas fa-check-circle" style="font-size:9px;color:var(--success);"></i> ' + (t.passed || 0) + ' passed</span>';
-    if (t.warnings) html += '<span><i class="fas fa-exclamation-triangle" style="font-size:9px;color:var(--warning);"></i> ' + t.warnings + '</span>';
-    if (t.critical) html += '<span><i class="fas fa-times-circle" style="font-size:9px;color:var(--error);"></i> ' + t.critical + '</span>';
-    html += '<span><i class="fas fa-clock" style="font-size:9px;"></i> ' + dqTimeAgo(t.checked_at) + '</span>';
-    html += '</div>';
-
-    if (anomalies.length > 0) {
-      html += '<div class="dq-table-card-anomalies">';
-      anomalies.slice(0, 3).forEach(function(a) {
-        html += '<span class="dq-anomaly-pill ' + (a.severity || 'warning') + '">' + (a.check_id || '') + ': ' + dqTruncate(a.message || '', 45) + '</span>';
-      });
-      if (anomalies.length > 3) html += '<span style="font-size:10px;color:var(--text-muted);"> +' + (anomalies.length - 3) + ' more</span>';
-      html += '</div>';
+    html += '<tr style="cursor:pointer;" onclick="dqOpenTable(\'' + safeName + '\')" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);"><span style="width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;background:' + dotColor + ';"></span><strong>' + dqEsc(name) + '</strong></td>';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);"><span style="font-size:9px;font-weight:600;padding:2px 7px;border-radius:20px;background:' + statusBg + ';color:' + statusColor + ';">' + statusLabel + '</span></td>';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);text-align:right;"><span style="font-weight:800;font-size:14px;font-family:var(--mono);color:' + (t ? scoreCls : 'var(--text-muted)') + ';">' + (t ? score : '\u2014') + '</span></td>';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);text-align:right;font-family:var(--mono);">' + (t ? (t.row_count || 0).toLocaleString() : '\u2014') + '</td>';
+    if (t && totalChecks > 0) {
+      var passW = Math.round((passed / totalChecks) * 80);
+      var warnW = Math.round(((t.warnings || 0) / totalChecks) * 80);
+      var critW = 80 - passW - warnW;
+      html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);text-align:right;font-family:var(--mono);"><span style="display:inline-flex;gap:1px;height:10px;width:80px;border-radius:2px;overflow:hidden;vertical-align:middle;">';
+      if (passW > 0) html += '<span style="height:100%;width:' + passW + 'px;background:var(--success);display:block;"></span>';
+      if (warnW > 0) html += '<span style="height:100%;width:' + warnW + 'px;background:var(--warning);display:block;"></span>';
+      if (critW > 0) html += '<span style="height:100%;width:' + critW + 'px;background:var(--error);display:block;"></span>';
+      html += '</span> ' + passed + '/' + totalChecks + '</td>';
+    } else {
+      html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);text-align:right;color:var(--text-muted);">no checks</td>';
     }
-    html += '<div class="dq-card-footer"><button class="dq-card-btn" onclick="event.stopPropagation();dqRunTableNow(\'' + safeName + '\',\'quick\')"><i class="fas fa-play"></i> Run</button></div>';
-    html += '</div>';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);text-align:right;font-family:var(--mono);">' + (t ? dqTimeAgo(t.checked_at) : 'never') + '</td>';
+    html += '<td style="padding:8px 14px;border-bottom:1px solid var(--border-light);">';
+    anomalies.slice(0, 2).forEach(function(a) {
+      var aBg = (a.severity === 'critical') ? 'var(--error-bg)' : 'var(--warning-bg)';
+      var aColor = (a.severity === 'critical') ? '#991b1b' : '#92400e';
+      var aIcon = (a.severity === 'critical') ? 'fa-times-circle' : 'fa-exclamation-triangle';
+      html += '<span style="font-size:9px;font-weight:600;padding:2px 7px;border-radius:20px;display:inline-flex;align-items:center;gap:3px;background:' + aBg + ';color:' + aColor + ';margin-right:3px;"><i class="fas ' + aIcon + '" style="font-size:7px;"></i> ' + dqTruncate(a.message || '', 30) + '</span>';
+    });
+    if (anomalies.length > 2) html += '<span style="font-size:9px;color:var(--text-muted);"> +' + (anomalies.length - 2) + '</span>';
+    html += '</td></tr>';
   });
+  html += '</table>';
   grid.innerHTML = html;
 
   // Render pagination
@@ -1588,6 +1670,9 @@ function dqLoadSchedule() {
     var allNames = (tData.ok && tData.tables) ? tData.tables : [];
     _dqAllTableNames = allNames;
     dqPopulateTableSelects();
+    // Populate single-table run dropdown
+    var rsel = document.getElementById('dqRunSingleTable');
+    if (rsel) { rsel.innerHTML = '<option value="">Select table…</option>'; _dqAllTableNames.forEach(function(n) { rsel.innerHTML += '<option value="' + dqEsc(n) + '">' + dqEsc(n) + '</option>'; }); }
 
     dqRenderScheduleOverrides();
     dqUpdateScheduleIntel();
@@ -1867,7 +1952,7 @@ function dqRenderAggregateTimeline(container, rows) {
       var tScoreBg = t.score >= 85 ? 'rgba(16,185,129,.08)' : t.score >= 65 ? 'rgba(245,158,11,.08)' : 'rgba(239,68,68,.08)';
       var typeKeys = Object.keys(t.types).sort();
       var typePills = typeKeys.map(function(tp) {
-        var bg = tp === 'deep' ? 'rgba(126,107,221,.08)' : 'rgba(28,150,202,.08)';
+        var bg = tp === 'deep' ? 'rgba(126,107,221,.08)' : 'rgba(41,181,232,.08)';
         var col = tp === 'deep' ? '#534ab7' : '#1c96ca';
         return '<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:' + bg + ';color:' + col + ';font-weight:500;">' + tp + '</span>';
       }).join(' ');
@@ -1940,17 +2025,8 @@ function dqEsc(s) {
 function dqRefresh() {
   var lbl = document.getElementById('dqLastRefreshLabel');
   if (lbl) lbl.textContent = 'Refreshing…';
-  dqLoadOverview();
-  dqLoadRules();
-  dqLoadChecks();
-  dqLoadSchedule();
-  dqPopulateHistoryTableSelect();
-  setTimeout(function() {
-    if (lbl) {
-      var now = new Date();
-      lbl.textContent = 'Updated ' + ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2) + ':' + ('0' + now.getSeconds()).slice(-2);
-    }
-  }, 600);
+  _dqTabLoaded = {};
+  dqLoadSummary();
 }
 
 // ── Auto-refresh wiring ──────────────────────────────────────
@@ -1975,20 +2051,9 @@ function _dqStopAutoRefresh() { if (_dqAutoTimer) { clearInterval(_dqAutoTimer);
 })();
 
 // ── Init ─────────────────────────────────────────────────────
+var _dqTabLoaded = {};
 if (DQ_ORG && DQ_SUP) {
-  dqLoadOverview();
-  dqLoadRules();
-  dqLoadChecks();
-  dqLoadSchedule();
-
-  // Set initial refresh timestamp
-  setTimeout(function() {
-    var lbl = document.getElementById('dqLastRefreshLabel');
-    if (lbl) {
-      var now = new Date();
-      lbl.textContent = 'Updated ' + ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2) + ':' + ('0' + now.getSeconds()).slice(-2);
-    }
-  }, 800);
+  dqLoadSummary(); // single call — rules/checks/schedule lazy-loaded per tab
 
   // Fetch available roles for the role selector
   fetch('/api/v1/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))

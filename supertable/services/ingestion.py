@@ -50,8 +50,8 @@ def _staging_index_key(org: str, sup: str) -> str:
     return f"supertable:{org}:{sup}:meta:staging:meta"
 
 
-def _pipe_key(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
-    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}"
+def _pipe_key(org: str, sup: str, staging_name: str, pipe_id: str) -> str:
+    return f"supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_id}"
 
 
 def _pipe_index_key(org: str, sup: str, staging_name: str) -> str:
@@ -234,9 +234,9 @@ def _make_redis_helpers(redis_client: Any) -> Dict[str, Any]:
         except Exception:
             return None
 
-    def redis_get_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> Optional[Dict[str, Any]]:
+    def redis_get_pipe_meta(org: str, sup: str, staging_name: str, pipe_id: str) -> Optional[Dict[str, Any]]:
         try:
-            return _redis_json_load(redis_client.get(_pipe_key(org, sup, staging_name, pipe_name)))
+            return _redis_json_load(redis_client.get(_pipe_key(org, sup, staging_name, pipe_id)))
         except Exception:
             return None
 
@@ -312,30 +312,30 @@ def _make_redis_helpers(redis_client: Any) -> Dict[str, Any]:
         org: str,
         sup: str,
         staging_name: str,
-        pipe_name: str,
+        pipe_id: str,
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload: Dict[str, Any] = dict(meta or {})
         payload.setdefault("organization", org)
         payload.setdefault("super_name", sup)
         payload.setdefault("staging_name", staging_name)
-        payload.setdefault("pipe_name", pipe_name)
+        payload.setdefault("pipe_id", pipe_id)
         payload["updated_at_ms"] = int(time.time() * 1000)
 
         try:
-            redis_client.set(_pipe_key(org, sup, staging_name, pipe_name), json.dumps(payload, ensure_ascii=False))
-            redis_client.sadd(_pipe_index_key(org, sup, staging_name), pipe_name)
+            redis_client.set(_pipe_key(org, sup, staging_name, pipe_id), json.dumps(payload, ensure_ascii=False))
+            redis_client.sadd(_pipe_index_key(org, sup, staging_name), pipe_id)
             redis_client.sadd(_staging_index_key(org, sup), staging_name)
         except Exception:
             pass
 
-    def redis_delete_pipe_meta(org: str, sup: str, staging_name: str, pipe_name: str) -> None:
+    def redis_delete_pipe_meta(org: str, sup: str, staging_name: str, pipe_id: str) -> None:
         try:
-            redis_client.srem(_pipe_index_key(org, sup, staging_name), pipe_name)
+            redis_client.srem(_pipe_index_key(org, sup, staging_name), pipe_id)
         except Exception:
             pass
         try:
-            redis_client.delete(_pipe_key(org, sup, staging_name, pipe_name))
+            redis_client.delete(_pipe_key(org, sup, staging_name, pipe_id))
         except Exception:
             pass
 
