@@ -250,6 +250,7 @@ class Actions:
     PIPE_DELETE = "pipe_delete"
     PIPE_ENABLE = "pipe_enable"
     PIPE_DISABLE = "pipe_disable"
+    PIPE_EXECUTE = "pipe_execute"
     FILE_UPLOAD = "file_upload"
     SUPERTABLE_CREATE = "supertable_create"
     SUPERTABLE_DELETE = "supertable_delete"

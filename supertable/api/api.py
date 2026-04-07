@@ -2086,13 +2086,34 @@ def api_ingestion_recent_writes(
     key = f"monitor:{org_eff}:{sup_eff}:stats"
     items: List[Dict[str, Any]] = []
     try:
-        raw_list = redis_client.lrange(key, -limit, -1) or []
+        raw_list = redis_client.lrange(key, -limit * 2, -1) or []
         raw_list = list(reversed(raw_list))
         for raw in raw_list:
             try:
                 entry = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-                if isinstance(entry, dict):
-                    items.append(entry)
+                if not isinstance(entry, dict):
+                    continue
+                # Filter system tables
+                tname = str(entry.get("table_name") or "")
+                if tname.startswith("__") and tname.endswith("__"):
+                    continue
+                # Extract source_type from lineage
+                _lin = entry.get("lineage")
+                _src = ""
+                if isinstance(_lin, str) and _lin:
+                    try:
+                        _lin_obj = json.loads(_lin)
+                        _src = str(_lin_obj.get("source_type") or "")
+                    except Exception:
+                        pass
+                elif isinstance(_lin, dict):
+                    _src = str(_lin.get("source_type") or "")
+                if not _src:
+                    _src = str(entry.get("source") or entry.get("source_type") or "")
+                entry["source_type"] = _src or "unknown"
+                items.append(entry)
+                if len(items) >= limit:
+                    break
             except Exception:
                 continue
     except Exception as e:
@@ -2135,33 +2156,34 @@ def api_ingestion_list_tables(
 
     # Fast path: SMEMBERS from dedicated set (written by DataWriter on every write)
     tables: List[str] = []
+    seen: set = set()
     try:
         members = redis_client.smembers(f"supertable:{org_val}:{sup_val}:table_names")
         if members:
-            tables = sorted({(m if isinstance(m, str) else m.decode("utf-8")) for m in members if m})
+            for m in members:
+                name = m if isinstance(m, str) else m.decode("utf-8")
+                if name and not (name.startswith("__") and name.endswith("__")):
+                    seen.add(name)
     except Exception:
         pass
 
-    # Fallback: scan Redis leaf keys
-    if not tables:
-        try:
-            pattern = f"supertable:{org_val}:{sup_val}:meta:leaf:*"
-            cursor = 0
-            seen: set = set()
-            while True:
-                cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
-                for key in keys:
-                    k = key if isinstance(key, str) else key.decode("utf-8")
-                    simple = k.rsplit("meta:leaf:", 1)[-1]
-                    if simple and not simple.startswith("__") and simple not in seen:
-                        seen.add(simple)
-                        tables.append(simple)
-                if cursor == 0:
-                    break
-        except Exception:
-            pass
-        tables.sort()
+    # Always scan Redis leaf keys to catch tables not in the set
+    try:
+        pattern = f"supertable:{org_val}:{sup_val}:meta:leaf:*"
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=1000)
+            for key in keys:
+                k = key if isinstance(key, str) else key.decode("utf-8")
+                simple = k.rsplit("meta:leaf:", 1)[-1]
+                if simple and not (simple.startswith("__") and simple.endswith("__")):
+                    seen.add(simple)
+            if cursor == 0:
+                break
+    except Exception:
+        pass
 
+    tables = sorted(seen)
     return {"ok": True, "tables": tables}
 
 
@@ -2187,6 +2209,12 @@ def api_ingestion_list_staging_files(
     data = storage.read_json(index_path) or []
     if not isinstance(data, list):
         data = []
+
+    # Sort by written_at_ns descending (newest first) for display
+    try:
+        data = sorted(data, key=lambda x: int(x.get("written_at_ns") or 0) if isinstance(x, dict) else 0, reverse=True)
+    except Exception:
+        pass
 
     total = len(data)
     items = data[offset: offset + limit]
@@ -2219,7 +2247,7 @@ def api_ingestion_list_pipes(
     items: List[Dict[str, Any]] = []
     for pn, raw in zip(pipe_names, raws):
         meta = _redis_json_load(raw) or {}
-        items.append({"pipe_id": pn, "pipe_name": str(meta.get("pipe_name") or pn), "simple_name": str(meta.get("simple_name") or ""), "enabled": bool(meta.get("enabled"))})
+        items.append({"pipe_id": pn, "pipe_name": str(meta.get("pipe_name") or pn), "simple_name": str(meta.get("simple_name") or ""), "overwrite_columns": meta.get("overwrite_columns") or [], "enabled": bool(meta.get("enabled"))})
 
     items.sort(key=lambda x: str(x.get("pipe_name") or ""))
     return {"items": items}
@@ -2362,8 +2390,14 @@ def api_save_pipe(
         raise HTTPException(status_code=400, detail="pipe_name is required")
 
     # Generate pipe_id if not provided (new pipe)
+    _is_new_pipe = not pipe_id
     if not pipe_id:
         pipe_id = "p_" + uuid.uuid4().hex[:8]
+
+    # Read existing pipe meta for create-vs-update detection
+    _prev_meta: Optional[Dict[str, Any]] = None
+    if not _is_new_pipe:
+        _prev_meta = _redis_get_pipe_meta(org, sup, staging_name, pipe_id)
 
     storage = get_storage()
     stg_dir = os.path.join(_staging_base_dir(org, sup), staging_name)
@@ -2417,11 +2451,33 @@ def api_save_pipe(
     _redis_upsert_staging_meta(org, sup, staging_name, {"staging_name": staging_name})
     _redis_upsert_pipe_meta(org, sup, staging_name, pipe_id, pipe_def)
 
+    _simple = str(pipe_def.get("simple_name") or "").strip()
+    _ow = pipe_def.get("overwrite_columns") or []
+    _action = Actions.PIPE_CREATE if _is_new_pipe or not _prev_meta else Actions.PIPE_UPDATE
+    _detail = make_detail(
+        staging=staging_name, pipe=pipe_name, pipe_id=pipe_id,
+        simple_name=_simple, overwrite_columns=_ow,
+        enabled=pipe_def.get("enabled"), role_name=role_eff,
+    )
+    if _prev_meta and not _is_new_pipe:
+        _prev_name = str(_prev_meta.get("pipe_name") or "")
+        _prev_simple = str(_prev_meta.get("simple_name") or "")
+        _prev_ow = _prev_meta.get("overwrite_columns") or []
+        _changes = {}
+        if _prev_name and _prev_name != pipe_name:
+            _changes["pipe_name"] = {"from": _prev_name, "to": pipe_name}
+        if _prev_simple != _simple:
+            _changes["simple_name"] = {"from": _prev_simple, "to": _simple}
+        if sorted(str(x) for x in _prev_ow) != sorted(str(x) for x in (_ow if isinstance(_ow, list) else [])):
+            _changes["overwrite_columns"] = {"from": _prev_ow, "to": _ow}
+        if _changes:
+            _detail["changes"] = _changes
     _audit(
-        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_CREATE,
+        category=EventCategory.CONFIG_CHANGE if not _is_new_pipe and _prev_meta else EventCategory.DATA_MUTATION,
+        action=_action,
         organization=org, super_name=sup, resource_type="pipe",
-        resource_id=f"{staging_name}/{pipe_id}", severity=Severity.INFO,
-        detail=make_detail(staging=staging_name, pipe=pipe_name, pipe_id=pipe_id, enabled=pipe_def.get("enabled"), role_name=role_eff),
+        resource_id=f"{staging_name}/{pipe_id}", severity=Severity.WARNING,
+        detail=_detail,
     )
     return {"ok": True, "organization": org, "super_name": sup, "staging_name": staging_name, "pipe_name": pipe_name, "pipe_id": pipe_id, "path": pipe_path}
 
@@ -2508,10 +2564,18 @@ def api_enable_pipe(
     except Exception:
         pass
 
+    try:
+        _audit(
+            **audit_context(request), category=EventCategory.CONFIG_CHANGE,
+            action=Actions.PIPE_ENABLE, organization=org, super_name=sup,
+            resource_type="pipe", resource_id=f"{staging_name}/{pid}",
+            severity=Severity.WARNING,
+            detail=make_detail(pipe=pid, staging=staging_name, role_name=role_eff),
+        )
+    except Exception:
+        pass
+
     return {"ok": True}
-
-
-@router.post("/api/v1/ingestion/pipes/disable")
 def api_disable_pipe(
     request: Request,
     org: str = Query(...),
@@ -2544,6 +2608,17 @@ def api_disable_pipe(
     try:
         storage = get_storage()
         _write_json_atomic(storage, os.path.join(_staging_base_dir(org, sup), staging_name, "pipes", f"{pid}.json"), meta)
+    except Exception:
+        pass
+
+    try:
+        _audit(
+            **audit_context(request), category=EventCategory.CONFIG_CHANGE,
+            action=Actions.PIPE_DISABLE, organization=org, super_name=sup,
+            resource_type="pipe", resource_id=f"{staging_name}/{pid}",
+            severity=Severity.WARNING,
+            detail=make_detail(pipe=pid, staging=staging_name, role_name=role_eff),
+        )
     except Exception:
         pass
 
@@ -2684,9 +2759,8 @@ async def api_ingestion_load_upload(
 
         def _do_stage() -> str:
             stg = Staging(organization=org_eff, super_name=sup_eff, staging_name=stg_eff)
-            stg_t0 = time.perf_counter()
             result = stg.save_as_parquet(role_name=role_eff, arrow_table=arrow_table, base_file_name=base_name,
-                                         source="upload", duration_ms=(time.perf_counter() - t0) * 1000.0)
+                                         source="upload", duration_ms=0)
             return result
 
         try:
@@ -2694,15 +2768,16 @@ async def api_ingestion_load_upload(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Staging save failed: {e}")
 
-        dt_ms = (time.perf_counter() - t0) * 1000.0
+        staging_ms = (time.perf_counter() - t0) * 1000.0
         rows_count = getattr(arrow_table, "num_rows", None)
+
         _audit(
             **audit_context(request), category=EventCategory.DATA_MUTATION,
             action=Actions.FILE_UPLOAD, organization=org_eff, super_name=sup_eff,
             resource_type="staging", resource_id=stg_eff, severity=Severity.INFO,
             detail=make_detail(
                 mode="staging", staging=stg_eff, filename=file.filename or "",
-                rows=rows_count, file_type=ext, duration_ms=round(dt_ms),
+                rows=rows_count, file_type=ext, duration_ms=round(staging_ms),
             ),
         )
         # Staging uploads bypass DataWriter, so emit a monitoring metric directly.
@@ -2713,6 +2788,7 @@ async def api_ingestion_load_upload(
                 mon.log_metric({
                     "recorded_at": datetime.now(timezone.utc).isoformat(),
                     "source": "upload",
+                    "source_type": "staging_upload",
                     "mode": "staging",
                     "table_name": "",
                     "staging_name": stg_eff,
@@ -2721,16 +2797,122 @@ async def api_ingestion_load_upload(
                     "incoming_rows": rows_count if rows_count is not None else 0,
                     "inserted": rows_count if rows_count is not None else 0,
                     "deleted": 0,
-                    "duration": round(dt_ms / 1000.0, 6),
+                    "duration": round(staging_ms / 1000.0, 6),
                     "role_name": role_eff,
                     "username": (sess or {}).get("username", ""),
                 })
         except Exception:
             pass  # Never fail an upload due to monitoring
+
+        # Auto-execute enabled pipes for the just-uploaded file
+        pipe_results: List[Dict[str, Any]] = []
+        try:
+            pipe_names = _redis_list_pipes(org_eff, sup_eff, stg_eff)
+            for pn in pipe_names:
+                pmeta = _redis_get_pipe_meta(org_eff, sup_eff, stg_eff, pn)
+                if not pmeta or not pmeta.get("enabled"):
+                    continue
+                target_table = str(pmeta.get("simple_name") or "").strip()
+                if not target_table:
+                    continue
+                ow = pmeta.get("overwrite_columns") or []
+                if not isinstance(ow, list):
+                    ow = []
+
+                def _do_pipe_load(_tbl=target_table, _ow=ow, _pn=pn) -> Dict[str, Any]:
+                    import pyarrow as pa  # noqa: F811
+                    _pt0 = time.perf_counter()
+                    stage_dir = os.path.join(_staging_base_dir(org_eff, sup_eff), stg_eff)
+                    fpath = os.path.join(stage_dir, saved)
+                    tbl = get_storage().read_parquet(fpath)
+                    from supertable.data_writer import DataWriter
+                    dw = DataWriter(super_name=sup_eff, organization=org_eff)
+                    lineage = {
+                        "source_type": "pipe_execute",
+                        "pipe_name": str(pmeta.get("pipe_name") or _pn),
+                        "staging_name": stg_eff,
+                        "file_name": saved,
+                        "role_name": role_eff,
+                        "username": (sess or {}).get("username", ""),
+                        "overwrite_columns": _ow,
+                    }
+                    _cols, _rows, _ins, _del = dw.write(
+                        role_name=role_eff, simple_name=_tbl, data=tbl,
+                        overwrite_columns=_ow, lineage=lineage,
+                    )
+                    _pt_ms = (time.perf_counter() - _pt0) * 1000.0
+                    return {"pipe_name": str(pmeta.get("pipe_name") or _pn), "pipe_id": _pn,
+                            "table": _tbl, "inserted": _ins, "deleted": _del,
+                            "duration_ms": round(_pt_ms, 1), "ok": True}
+
+                try:
+                    pr = await asyncio.to_thread(_do_pipe_load)
+                    pipe_results.append(pr)
+                    try:
+                        _audit(
+                            **audit_context(request), category=EventCategory.DATA_MUTATION,
+                            action=Actions.PIPE_EXECUTE, organization=org_eff, super_name=sup_eff,
+                            resource_type="pipe", resource_id=f"{stg_eff}/{pn}",
+                            severity=Severity.INFO,
+                            detail=make_detail(
+                                pipe=str(pmeta.get("pipe_name") or pn), staging=stg_eff,
+                                table=target_table, file=saved,
+                                inserted=pr.get("inserted", 0), deleted=pr.get("deleted", 0),
+                                duration_ms=pr.get("duration_ms", 0),
+                                role_name=role_eff, auto_trigger="staging_upload",
+                            ),
+                        )
+                    except Exception:
+                        pass
+                except Exception as pe:
+                    pipe_results.append({
+                        "pipe_name": str(pmeta.get("pipe_name") or pn), "pipe_id": pn,
+                        "table": target_table, "ok": False, "error": str(pe),
+                    })
+                    try:
+                        _audit(
+                            **audit_context(request), category=EventCategory.DATA_MUTATION,
+                            action=Actions.PIPE_EXECUTE, organization=org_eff, super_name=sup_eff,
+                            resource_type="pipe", resource_id=f"{stg_eff}/{pn}",
+                            severity=Severity.WARNING, outcome=Outcome.FAILURE,
+                            detail=make_detail(
+                                pipe=str(pmeta.get("pipe_name") or pn), staging=stg_eff,
+                                table=target_table, file=saved,
+                                error=str(pe), role_name=role_eff,
+                                auto_trigger="staging_upload",
+                            ),
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Never fail an upload due to pipe execution
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Patch file index with full duration breakdown (after all pipes complete)
+        try:
+            _idx_path = os.path.join(org_eff, sup_eff, "staging", f"{stg_eff}_files.json")
+            _idx = get_storage().read_json(_idx_path) or []
+            if isinstance(_idx, list) and _idx:
+                last = _idx[-1]
+                if isinstance(last, dict) and last.get("file") == saved:
+                    last["duration_ms"] = round(total_ms)
+                    last["staging_ms"] = round(staging_ms)
+                    if pipe_results:
+                        last["pipe_results"] = [
+                            {k: v for k, v in pr.items() if k in ("pipe_name", "table", "duration_ms", "inserted", "deleted", "ok")}
+                            for pr in pipe_results
+                        ]
+                    get_storage().write_json(_idx_path, _idx)
+        except Exception:
+            pass  # best effort
+
         return {
             "ok": True, "mode": "staging", "organization": org_eff, "super_name": sup_eff,
             "staging_name": stg_eff, "saved_file_name": saved, "rows": rows_count if rows_count is not None else 0,
-            "file_type": ext or "unknown", "job_uuid": job_uuid, "server_duration_ms": dt_ms,
+            "file_type": ext or "unknown", "job_uuid": job_uuid,
+            "server_duration_ms": total_ms, "staging_duration_ms": staging_ms,
+            "pipe_results": pipe_results,
         }
 
     table_eff = (table_name or "").strip()
@@ -2938,7 +3120,8 @@ def api_ingestion_summary(
         for (stg_name, pn), raw in zip(all_pipe_keys, raws):
             meta = _redis_json_load(raw) or {}
             pipes.append({
-                "pipe_name": pn,
+                "pipe_id": pn,
+                "pipe_name": str(meta.get("pipe_name") or pn),
                 "staging_name": stg_name,
                 "simple_name": str(meta.get("simple_name") or ""),
                 "overwrite_columns": meta.get("overwrite_columns") or [],
@@ -2961,6 +3144,24 @@ def api_ingestion_summary(
             ts = item.get("recorded_at") or ""
             if ts and ts < cutoff_iso:
                 continue
+            # Filter out system tables (__xxx__)
+            tname = str(item.get("table_name") or "")
+            if tname.startswith("__") and tname.endswith("__"):
+                continue
+            # Extract source_type from lineage JSON string
+            _lin = item.get("lineage")
+            _src = ""
+            if isinstance(_lin, str) and _lin:
+                try:
+                    _lin_obj = json.loads(_lin)
+                    _src = str(_lin_obj.get("source_type") or "")
+                except Exception:
+                    pass
+            elif isinstance(_lin, dict):
+                _src = str(_lin.get("source_type") or "")
+            if not _src:
+                _src = str(item.get("source") or item.get("source_type") or "")
+            item["source_type"] = _src or "unknown"
             writes.append(item)
             write_total_rows += int(item.get("inserted") or 0)
             d = item.get("duration")
@@ -2972,11 +3173,13 @@ def api_ingestion_summary(
 
     avg_dur_ms = round((write_total_dur / dur_count) * 1000) if dur_count else 0
 
-    # 4. Activity histogram (bucket writes by hour)
+    # 4. Activity histogram (bucket writes by hour) — split by source
     bucket_count = min(hours, 48)  # cap at 48 buckets
     bucket_size_h = max(1, hours // bucket_count)
     now = datetime.now(timezone.utc)
     buckets = [0] * bucket_count
+    upload_buckets = [0] * bucket_count
+    pipe_buckets = [0] * bucket_count
     for item in writes:
         ts = item.get("recorded_at") or ""
         if not ts:
@@ -2986,7 +3189,14 @@ def api_ingestion_summary(
             hrs_ago = (now - dt).total_seconds() / 3600
             idx = int(hrs_ago / bucket_size_h)
             if 0 <= idx < bucket_count:
-                buckets[bucket_count - 1 - idx] += int(item.get("inserted") or 0)
+                rows = int(item.get("inserted") or 0)
+                bi = bucket_count - 1 - idx
+                buckets[bi] += rows
+                src = item.get("source_type") or ""
+                if src == "pipe_execute":
+                    pipe_buckets[bi] += rows
+                else:
+                    upload_buckets[bi] += rows
         except Exception:
             pass
 
@@ -3004,6 +3214,8 @@ def api_ingestion_summary(
         "active_pipes": sum(1 for p in pipes if p["enabled"]),
         "total_pipes": len(pipes),
         "activity_buckets": buckets,
+        "upload_buckets": upload_buckets,
+        "pipe_buckets": pipe_buckets,
         "bucket_size_hours": bucket_size_h,
         "hours": hours,
     }
@@ -3100,7 +3312,7 @@ async def api_execute_pipe(
 
     dt_ms = (time.perf_counter() - t0) * 1000.0
     _audit(
-        category=EventCategory.DATA_MUTATION, action=Actions.DATA_WRITE,
+        category=EventCategory.DATA_MUTATION, action=Actions.PIPE_EXECUTE,
         organization=org, super_name=sup, resource_type="pipe",
         resource_id=f"{staging_name}/{pipe_name}", severity=Severity.INFO,
         detail=make_detail(
