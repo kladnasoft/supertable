@@ -243,6 +243,7 @@ CROSS JOIN histogram h
 
 def build_deep_numeric_sql(table_fqn: str, column: str) -> str:
     q = _quote(column)
+    c = f"TRY_CAST({q} AS DOUBLE)"
     return f"""
 WITH
   stats AS (
@@ -250,16 +251,16 @@ WITH
       COUNT(*)                                         AS total_rows,
       COUNT({q})                                       AS non_nulls,
       COUNT(DISTINCT {q})                              AS distinct_vals,
-      AVG({q})                                         AS avg_value,
-      VARIANCE({q})                                    AS var_value,
-      STDDEV({q})                                      AS stddev_value,
-      MIN({q}) FILTER (WHERE {q} IS NOT NULL)          AS min_value,
-      MAX({q}) FILTER (WHERE {q} IS NOT NULL)          AS max_value,
-      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {q})  AS median_value,
-      PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {q}) AS p25_value,
-      PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {q}) AS p75_value,
-      COUNT(*) FILTER (WHERE {q} = 0 OR {q} IS NULL)::float / NULLIF(COUNT(*), 0) AS zero_or_null_rate,
-      COUNT(*) FILTER (WHERE {q} < 0)::float / NULLIF(COUNT(*), 0)                AS negative_rate
+      AVG({c})                                         AS avg_value,
+      VARIANCE({c})                                    AS var_value,
+      STDDEV({c})                                      AS stddev_value,
+      MIN({c}) FILTER (WHERE {q} IS NOT NULL)          AS min_value,
+      MAX({c}) FILTER (WHERE {q} IS NOT NULL)          AS max_value,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {c})  AS median_value,
+      PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {c}) AS p25_value,
+      PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {c}) AS p75_value,
+      COUNT(*) FILTER (WHERE {c} = 0 OR {q} IS NULL)::float / NULLIF(COUNT(*), 0) AS zero_or_null_rate,
+      COUNT(*) FILTER (WHERE {c} < 0)::float / NULLIF(COUNT(*), 0)                AS negative_rate
     FROM {table_fqn}
   ),
   freq_stats AS (
@@ -289,9 +290,9 @@ WITH
   histogram AS (
     SELECT list({{'bucket_id': bucket_id, 'bucket_min': bucket_min, 'bucket_max': bucket_max, 'freq': freq}}) AS buckets
     FROM (
-      SELECT bucket_id, MIN({q}) AS bucket_min, MAX({q}) AS bucket_max, COUNT(*) AS freq
+      SELECT bucket_id, MIN({c}) AS bucket_min, MAX({c}) AS bucket_max, COUNT(*) AS freq
       FROM (
-        SELECT {q}, NTILE(10) OVER (ORDER BY {q}) AS bucket_id
+        SELECT {q}, {c}, NTILE(10) OVER (ORDER BY {c}) AS bucket_id
         FROM {table_fqn} WHERE {q} IS NOT NULL
       ) ordered
       GROUP BY bucket_id ORDER BY bucket_id

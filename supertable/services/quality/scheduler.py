@@ -68,6 +68,9 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
     result in at most 1 quality check per cooldown period.
     """
     try:
+        # Skip system tables — they are written by quality checks themselves
+        if table_name.startswith("__") and table_name.endswith("__"):
+            return
         from supertable.services.quality.config import DQConfig
         dqc = DQConfig(r, org, sup)
         schedule = dqc.get_schedule()
@@ -333,6 +336,8 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     try:
         from supertable.data_reader import DataReader
         dr = DataReader(super_name=sup, organization=org, query=sql)
+        if dr.query_plan_manager:
+            dr.query_plan_manager.source_type = "system"
         result_df, status, message = dr.execute(role_name="superadmin")
         if result_df is None or result_df.empty:
             logger.warning(f"[dq-scheduler] Quick SQL returned empty for {table_name}")
@@ -455,6 +460,8 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
         try:
             dr = DataReader(super_name=sup, organization=org, query=sql)
+            if dr.query_plan_manager:
+                dr.query_plan_manager.source_type = "system"
             result_df, status, message = dr.execute(role_name="superadmin")
             if result_df is None or result_df.empty:
                 continue
@@ -538,6 +545,8 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             continue
         try:
             dr = DataReader(super_name=sup, organization=org, query=rule_sql)
+            if dr.query_plan_manager:
+                dr.query_plan_manager.source_type = "system"
             r_df, _, _ = dr.execute(role_name="superadmin")
             r_result = r_df.to_dict(orient="records") if r_df is not None and not r_df.empty else []
             eval_result = evaluate_custom_rule(rule, r_result)

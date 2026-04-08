@@ -1008,11 +1008,13 @@ def compute_catalog_stats(
     """
     result: Dict[str, Any] = {}
 
-    # Table count + snapshot sum + top-10 tables by version
+    # Table count + snapshot sum + total rows/size from payloads
     try:
         table_versions: Dict[str, int] = {}
         table_ts: Dict[str, int] = {}
         total_snapshots = 0
+        total_rows = 0
+        total_size_bytes = 0
         for leaf in catalog.scan_leaf_items(org, sup):
             name = leaf.get("simple") or ""
             ver = 0
@@ -1026,11 +1028,26 @@ def compute_catalog_stats(
             except (TypeError, ValueError):
                 pass
             total_snapshots += ver
+            # Sum rows and file sizes from cached payload
+            payload = leaf.get("payload")
+            if isinstance(payload, dict):
+                for res in (payload.get("resources") or []):
+                    if isinstance(res, dict):
+                        try:
+                            total_rows += int(res.get("rows", 0) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        try:
+                            total_size_bytes += int(res.get("file_size", 0) or 0)
+                        except (TypeError, ValueError):
+                            pass
             if name:
                 table_versions[name] = ver
                 table_ts[name] = ts
         result["table_count"] = len(table_versions)
         result["total_snapshots"] = total_snapshots
+        result["total_rows"] = total_rows
+        result["total_size_bytes"] = total_size_bytes
         result["top_tables_by_snapshots"] = [
             {"table": t, "snapshots": v, "ts": table_ts.get(t, 0)}
             for t, v in sorted(table_versions.items(), key=lambda x: -x[1])[:10]
@@ -1045,6 +1062,8 @@ def compute_catalog_stats(
         logger.warning("[monitoring] catalog table scan failed: %s", e)
         result["table_count"] = 0
         result["total_snapshots"] = 0
+        result["total_rows"] = 0
+        result["total_size_bytes"] = 0
         result["top_tables_by_snapshots"] = []
         result["newest_table"] = None
 

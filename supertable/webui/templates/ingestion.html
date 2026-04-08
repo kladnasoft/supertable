@@ -314,11 +314,15 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         <button class="btn-sm" data-hours="672" style="padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;">28d</button>
       </div>
     </div>
-    <div style="display:flex;gap:12px;font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:8px;">
-        <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:3px;border-radius:2px;background:var(--primary);"></span>Uploads</span>
-        <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:3px;border-radius:2px;background:var(--success);"></span>Pipe runs</span>
-      </div>
-    <div id="rightSparkline" style="margin-bottom:4px;"></div>
+    <div id="ingChartFilters" style="display:flex;gap:8px;font-size:10px;font-weight:600;margin-bottom:8px;">
+      <span class="ing-filter active" data-field="uploads" style="display:flex;align-items:center;gap:4px;cursor:pointer;padding:2px 8px;border-radius:10px;border:1px solid var(--primary);color:var(--primary);background:rgba(41,181,232,.08);"><span style="width:8px;height:8px;border-radius:2px;background:var(--primary);"></span>Uploads</span>
+      <span class="ing-filter active" data-field="pipes" style="display:flex;align-items:center;gap:4px;cursor:pointer;padding:2px 8px;border-radius:10px;border:1px solid var(--success);color:var(--success);background:rgba(47,200,159,.08);"><span style="width:8px;height:8px;border-radius:2px;background:var(--success);"></span>Pipe runs</span>
+    </div>
+    <div style="position:relative;">
+      <canvas id="ingActivityCanvas" style="width:100%;height:56px;display:block;cursor:crosshair;"></canvas>
+      <div id="ingChartTooltip" style="display:none;position:absolute;pointer-events:none;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;font-size:11px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10;white-space:nowrap;"></div>
+    </div>
+    <div id="ingChartLabels" style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;"></div>
   </div>
   <div class="summary-grid" style="margin-top:14px;">
     <div class="summary-tile"><div class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-folder-open"></i></div><div><div class="snum" id="rightStagingCount">—</div><div class="slabel">Staging areas</div></div></div>
@@ -1060,8 +1064,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       el=document.getElementById("rightPipeCount");if(el)el.textContent=d.active_pipes+"/"+d.total_pipes;
       el=document.getElementById("rightTotalRows");if(el)el.textContent=d.write_total_rows>0?d.write_total_rows.toLocaleString():"0";
       el=document.getElementById("rightAvgDuration");if(el)el.textContent=d.avg_duration_ms>0?d.avg_duration_ms+"ms":"\u2014";
-      // Sparkline from pre-bucketed data
-      var spa=document.getElementById("rightSparkline");if(spa&&d.activity_buckets){var bk=d.activity_buckets;var ubk=d.upload_buckets||bk;var pbk=d.pipe_buckets||[];var mx=Math.max.apply(null,bk)||1;var w=spa.offsetWidth||480;var bw=Math.max(2,Math.floor(w/bk.length)-1);var svg='<svg width="100%" viewBox="0 0 '+(bk.length*(bw+1))+' 56" preserveAspectRatio="none" style="display:block;">';var bsh=d.bucket_size_hours||1;bk.forEach(function(v,i){var uv=ubk[i]||0;var pv=pbk[i]||0;var totalH=Math.max(1,(v/mx)*52);var hAgo=Math.round((bk.length-1-i)*bsh);var fmtV=function(n){return n>=1000000?(n/1000000).toFixed(1)+"M":n>=1000?Math.round(n/1000)+"k":String(n);};var timeLabel=hAgo===0?"now":hAgo+"h ago";var ttip=fmtV(uv)+' upload + '+fmtV(pv)+' pipe \u00b7 '+timeLabel;var x=i*(bw+1);if(v>0){var pH=Math.max(0,(pv/v)*totalH);var uH=totalH-pH;svg+='<rect x="'+x+'" y="'+(56-totalH)+'" width="'+bw+'" height="'+uH+'" rx="1" fill="var(--primary)" opacity="0.6" style="cursor:pointer;"><title>'+esc(ttip)+'</title></rect>';if(pH>0){svg+='<rect x="'+x+'" y="'+(56-pH)+'" width="'+bw+'" height="'+pH+'" rx="1" fill="var(--success)" opacity="0.7" style="cursor:pointer;"><title>'+esc(ttip)+'</title></rect>';}}else{svg+='<rect x="'+x+'" y="55" width="'+bw+'" height="1" rx="1" fill="var(--primary)" opacity="0.12"><title>0 \u00b7 '+timeLabel+'</title></rect>';}});svg+='</svg><div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;"><span>'+_lsHours+'h ago</span><span>now</span></div>';spa.innerHTML=svg;}
+      // Ingestion activity chart (canvas with filters + hover)
+      if(d.activity_buckets){_ingChartData={bk:d.activity_buckets,ubk:d.upload_buckets||d.activity_buckets,pbk:d.pipe_buckets||[],bsh:d.bucket_size_hours||1};_drawIngChart();}
+      var lblEl=document.getElementById("ingChartLabels");if(lblEl)lblEl.innerHTML='<span>'+_lsHours+'h ago</span><span>now</span>';
       // Populate staging names from landscape data (for Upload tab dropdown)
       var stgs=d.stagings||[];
       if(stgs.length&&!lastStagingNames.length){lastStagingNames=stgs.map(function(s){return s.name;});stgs.forEach(function(s){lastStagingMeta[s.name]=s;});refreshLoadStagingDropdown();}
@@ -1074,6 +1079,78 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
     }catch(e){console.error("loadLandscape:",e);var tSum=document.getElementById("ingTopSummary");if(tSum&&tSum.textContent==="Loading…")tSum.textContent="Error loading data";}
   }
+  // ── Ingestion activity chart (canvas + filters + hover) ──────────────
+  var _ingChartData=null;
+  var _ingChartFilters={uploads:true,pipes:true};
+
+  function _drawIngChart(){
+    var cd=_ingChartData;if(!cd)return;
+    var canvas=document.getElementById("ingActivityCanvas");if(!canvas)return;
+    var dpr=window.devicePixelRatio||1;
+    var rect=canvas.getBoundingClientRect();
+    canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;
+    var c2=canvas.getContext("2d");c2.scale(dpr,dpr);
+    var W=rect.width,H=rect.height;
+    var bk=cd.bk,ubk=cd.ubk,pbk=cd.pbk;
+    if(!bk||!bk.length){c2.clearRect(0,0,W,H);return;}
+    var showU=_ingChartFilters.uploads,showP=_ingChartFilters.pipes;
+    var mx=1;
+    for(var i=0;i<bk.length;i++){
+      var s=(showU?ubk[i]||0:0)+(showP?pbk[i]||0:0);
+      if(s>mx)mx=s;
+    }
+    var barW=Math.max(1,W/bk.length-1);
+    var gap=Math.max(0.5,W/bk.length*0.15);
+    c2.clearRect(0,0,W,H);
+    for(var i=0;i<bk.length;i++){
+      var x=i*(W/bk.length);
+      var uv=showU?ubk[i]||0:0;var pv=showP?pbk[i]||0:0;
+      var total=uv+pv;if(total===0){c2.fillStyle="rgba(41,181,232,.1)";c2.fillRect(x+gap/2,H-1,barW-gap,1);continue;}
+      var fullH=(total/mx)*(H-4);
+      var y=H;
+      var uH=(uv/total)*fullH,pH=(pv/total)*fullH;
+      if(uH>0){c2.fillStyle="rgba(41,181,232,.65)";c2.fillRect(x+gap/2,y-uH,barW-gap,uH);y-=uH;}
+      if(pH>0){c2.fillStyle="rgba(47,200,159,.7)";c2.fillRect(x+gap/2,y-pH,barW-gap,pH);}
+    }
+  }
+
+  (function(){
+    var canvas=document.getElementById("ingActivityCanvas");if(!canvas)return;
+    var tip=document.getElementById("ingChartTooltip");
+    canvas.addEventListener("mousemove",function(e){
+      var cd=_ingChartData;if(!cd||!cd.bk||!cd.bk.length||!tip)return;
+      var rect=canvas.getBoundingClientRect();
+      var mx2=e.clientX-rect.left;
+      var idx=Math.floor(mx2/rect.width*cd.bk.length);
+      if(idx<0||idx>=cd.bk.length){tip.style.display="none";return;}
+      var hAgo=Math.round((cd.bk.length-1-idx)*cd.bsh);
+      var tl=hAgo===0?"now":hAgo+"h ago";
+      var fmtV=function(n){return n>=1000000?(n/1000000).toFixed(1)+"M":n>=1000?Math.round(n/1000)+"k":String(n);};
+      var lines='<div style="font-weight:600;margin-bottom:3px;">'+esc(tl)+'</div>';
+      if(_ingChartFilters.uploads)lines+='<div style="color:#29B5E8;">Uploads: '+fmtV(cd.ubk[idx]||0)+' rows</div>';
+      if(_ingChartFilters.pipes)lines+='<div style="color:#2FC89F;">Pipe runs: '+fmtV(cd.pbk[idx]||0)+' rows</div>';
+      tip.innerHTML=lines;tip.style.display="block";
+      var tx=mx2+12;if(tx+tip.offsetWidth>rect.width)tx=mx2-tip.offsetWidth-12;
+      tip.style.left=tx+"px";tip.style.top="0px";
+    });
+    canvas.addEventListener("mouseleave",function(){if(tip)tip.style.display="none";});
+  })();
+
+  document.getElementById("ingChartFilters").addEventListener("click",function(e){
+    var f=e.target.closest(".ing-filter");if(!f)return;
+    var field=f.dataset.field;
+    _ingChartFilters[field]=!_ingChartFilters[field];
+    if(_ingChartFilters[field]){
+      f.style.opacity="1";
+      var colors={uploads:"var(--primary)",pipes:"var(--success)"};
+      f.style.borderColor=colors[field];f.style.color=colors[field];
+      f.style.background=field==="uploads"?"rgba(41,181,232,.08)":"rgba(47,200,159,.08)";
+    } else {
+      f.style.opacity=".35";f.style.borderColor="var(--border)";f.style.background="transparent";f.style.color="var(--text-muted)";
+    }
+    _drawIngChart();
+  });
+
   // Date pill clicks
   document.querySelectorAll("#lsDatePills button").forEach(function(btn){btn.addEventListener("click",function(){var h=parseInt(this.getAttribute("data-hours"));document.querySelectorAll("#lsDatePills button").forEach(function(b){b.style.background="";b.style.color="";b.style.borderColor="";});this.style.background="var(--primary)";this.style.color="#fff";this.style.borderColor="var(--primary)";loadLandscape(h);});});
   // Load on init — single call, no redundant fetches

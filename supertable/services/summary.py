@@ -35,7 +35,7 @@ _WINDOW_BUCKETS: List[Tuple[int, int]] = [
     #  (window_hours, bucket_minutes)
     (1,    1),     # 1h  → 60 × 1-min bars
     (6,    5),     # 6h  → 72 × 5-min bars
-    (24,   30),    # 24h → 48 × 30-min bars
+    (24,   60),    # 24h → 24 × 1-hour bars
     (168,  240),   # 7d  → 42 × 4-hour bars
     (336,  480),   # 14d → 42 × 8-hour bars
     (672,  720),   # 28d → 56 × 12-hour bars
@@ -180,7 +180,7 @@ def _compute_ops_and_timeseries(
     """
     now_ms = int(time.time() * 1_000)
     from_ms = now_ms - (window_hours * 3_600_000)
-    scan_limit = 10_000
+    scan_limit = 2_000  # Summary only needs enough to fill buckets, not full detail
 
     bucket_min = _bucket_minutes_for(window_hours)
     bucket_ms = bucket_min * 60_000
@@ -188,7 +188,7 @@ def _compute_ops_and_timeseries(
 
     # Pre-allocate bucket array (oldest-first)
     buckets = [
-        {"ts_ms": from_ms + i * bucket_ms, "reads": 0, "writes": 0, "errors": 0}
+        {"ts_ms": from_ms + i * bucket_ms, "reads": 0, "writes": 0, "errors": 0, "mcp": 0, "odata": 0}
         for i in range(n_buckets)
     ]
 
@@ -272,8 +272,32 @@ def _compute_ops_and_timeseries(
         status = str(it.get("status", "ok")).lower()
         if status in ("error", "fail", "failed"):
             mcp_errors += 1
+        idx = _idx(it["_ts_ms"])
+        if idx >= 0:
+            buckets[idx]["mcp"] += 1
+            if status in ("error", "fail", "failed"):
+                buckets[idx]["errors"] += 1
 
-    total_errors = read_errors + write_errors + mcp_errors
+    # ── Aggregate OData ──────────────────────────────────────────────────
+    odata_key = f"monitor:{org}:{sup}:odata"
+    odata_items = _read_raw_list(
+        redis_client, odata_key, from_ms, scan_limit,
+        ts_fields=("recorded_at", "execution_time", "timestamp"),
+    )
+    odata_count = len(odata_items)
+    odata_errors = 0
+
+    for it in odata_items:
+        status = str(it.get("status", "ok")).lower()
+        if status in ("error", "fail", "failed"):
+            odata_errors += 1
+        idx = _idx(it["_ts_ms"])
+        if idx >= 0:
+            buckets[idx]["odata"] += 1
+            if status in ("error", "fail", "failed"):
+                buckets[idx]["errors"] += 1
+
+    total_errors = read_errors + write_errors + mcp_errors + odata_errors
 
     # ── Clean up _ts_ms from items (not leaked to caller) ────────────────
     # (items are not returned, so no cleanup needed)
@@ -282,6 +306,7 @@ def _compute_ops_and_timeseries(
         "read_ops": read_count,
         "write_ops": write_count,
         "mcp_calls": mcp_count,
+        "odata_calls": odata_count,
         "errors": total_errors,
         "rows_ingested": total_inserted,
         "rows_deleted": total_deleted,
@@ -442,6 +467,35 @@ def _count_odata(redis_client: Any, org: str, sup: str) -> int:
         return 0
 
 
+def _count_linked_shares(redis_client: Any, org: str, sup: str) -> int:
+    """Count linked shares (SCARD on index set). Never raises."""
+    try:
+        key = f"supertable:{org}:{sup}:linked_shares:index"
+        return int(redis_client.scard(key) or 0)
+    except Exception:
+        return 0
+
+
+def _count_supertables(redis_client: Any, org: str) -> int:
+    """Count SuperTables for an organization (SCAN meta:root keys). Never raises."""
+    try:
+        pattern = f"supertable:{org}:*:meta:root"
+        names: set = set()
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=200)
+            for k in keys:
+                k = k if isinstance(k, str) else k.decode("utf-8")
+                parts = k.split(":")
+                if len(parts) >= 3:
+                    names.add(parts[2])
+            if cursor == 0:
+                break
+        return len(names)
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Quality overview
 # ---------------------------------------------------------------------------
@@ -554,7 +608,7 @@ def compute_summary(
     except Exception as exc:
         logger.warning("[summary] monitoring aggregation failed: %s", exc)
         ops = {
-            "read_ops": 0, "write_ops": 0, "mcp_calls": 0, "errors": 0,
+            "read_ops": 0, "write_ops": 0, "mcp_calls": 0, "odata_calls": 0, "errors": 0,
             "rows_ingested": 0, "rows_deleted": 0, "avg_read_ms": 0,
             "engine_distribution": {}, "timeseries": [], "bucket_minutes": 1,
         }
@@ -569,9 +623,11 @@ def compute_summary(
 
     # ── 3. Ingestion counts ─────────────────────────────────────────────
     ingestion = _count_ingestion(redis_client, catalog, org, sup)
+    ingestion["odata_endpoints"] = _count_odata(redis_client, org, sup)
+    ingestion["linked_shares"] = _count_linked_shares(redis_client, org, sup)
 
-    # ── 4. OData endpoint count ─────────────────────────────────────────
-    odata_count = _count_odata(redis_client, org, sup)
+    # ── 4. SuperTable count (org-wide) ───────────────────────────────────
+    supertable_count = _count_supertables(redis_client, org)
 
     # ── 5. Quality overview ─────────────────────────────────────────────
     quality = _quality_summary(redis_client, catalog, org, sup)
@@ -586,7 +642,7 @@ def compute_summary(
             "read_ops": ops.get("read_ops", 0),
             "write_ops": ops.get("write_ops", 0),
             "mcp_calls": ops.get("mcp_calls", 0),
-            "odata_calls": odata_count,
+            "odata_calls": ops.get("odata_calls", 0),
             "rows_ingested": ops.get("rows_ingested", 0),
             "rows_deleted": ops.get("rows_deleted", 0),
             "errors": ops.get("errors", 0),
@@ -594,14 +650,14 @@ def compute_summary(
 
         # Platform state (point-in-time)
         "platform": {
+            "supertable_count": supertable_count,
             "table_count": cat.get("table_count", 0),
-            "total_rows": None,
             "total_snapshots": cat.get("total_snapshots", 0),
-            "storage_bytes": None,
+            "total_rows": cat.get("total_rows", 0),
+            "total_size_bytes": cat.get("total_size_bytes", 0),
             "user_count": cat.get("user_count", 0),
             "role_count": cat.get("role_count", 0),
             "token_count": cat.get("token_count", 0),
-            "avg_read_ms": ops.get("avg_read_ms", 0),
         },
 
         # Timeseries for line chart

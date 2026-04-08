@@ -267,7 +267,7 @@ function render(d){
 
 async function loadSummary(){
   if(!org||!sup){$("loader").classList.add("hidden");return;}
-  try{var d=await getJSON("/api/v1/summary?org="+enc(org)+"&sup="+enc(sup)+"&window_hours="+windowHours);render(d.data||{});}
+  try{var d=await getJSON("/api/v1/monitoring/summary?org="+enc(org)+"&sup="+enc(sup)+"&window_hours="+windowHours);render(d.data||{});}
   catch(e){console.error("[summary]",e);$("loader").classList.add("hidden");}
 }
 

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +94,21 @@ def preview_obsolete_files(
     organization: str,
     super_name: str,
     simple_name: str,
+    cutoff_version: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Identify orphaned files without deleting them.
+    """Identify reclaimable files for a table.
 
-    Returns:
-        {
-            "table": str,
-            "orphaned_data_files": [str, ...],
-            "orphaned_snapshot_files": [str, ...],
-            "current_snapshot_path": str,
-            "current_version": int,
-            "live_file_count": int,
-        }
+    Two modes:
+
+    **Without cutoff_version** (legacy, used by gc/clean):
+        Scans storage and compares against the current snapshot manifest.
+        Finds ALL orphaned files including leftovers from failed writes.
+
+    **With cutoff_version** (version-aware, used by UI):
+        Walks the snapshot chain, collects file sets for kept versions
+        (>= cutoff) and removed versions (< cutoff).  Reclaimable data
+        files = files ONLY in removed versions, not in any kept version.
+        Uses ``file_size`` from resource entries — no storage scan needed.
     """
     from supertable.redis_catalog import RedisCatalog
     from supertable.storage.storage_factory import get_storage
@@ -122,13 +125,11 @@ def preview_obsolete_files(
         "live_file_count": 0,
     }
 
-    # Read the current snapshot from Redis leaf pointer
     leaf = catalog.get_leaf(organization, super_name, simple_name)
     if not leaf or not leaf.get("path"):
         result["error"] = "Table not found or has no snapshot"
         return result
 
-    # Skip virtual share leaves — they have no local data files
     leaf_payload = leaf.get("payload") if isinstance(leaf, dict) else None
     if isinstance(leaf_payload, dict) and leaf_payload.get("_linked_share"):
         result["skipped"] = True
@@ -138,58 +139,128 @@ def preview_obsolete_files(
     current_path = leaf["path"]
     result["current_snapshot_path"] = current_path
 
-    # Get snapshot data (prefer Redis cached payload)
-    snapshot = leaf.get("payload") if isinstance(leaf, dict) else None
-    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("resources"), list):
+    # ── Walk the full snapshot chain ──────────────────────────────────────
+    # Collect per-version: file paths, file sizes, snapshot JSON paths
+    kept_files: Set[str] = set()             # files in versions >= cutoff
+    removed_files: Dict[str, int] = {}       # file → file_size, versions < cutoff
+    kept_snapshot_paths: Set[str] = set()
+    removed_snapshot_paths: List[str] = []
+
+    walk_path: Optional[str] = current_path
+    walk_data = leaf.get("payload") if isinstance(leaf, dict) else None
+    if not isinstance(walk_data, dict) or not isinstance(walk_data.get("resources"), list):
+        walk_data = None
+    visited: set = set()
+    max_walk = 500
+
+    while walk_path and len(visited) < max_walk:
+        if walk_path in visited:
+            break
+        visited.add(walk_path)
+
+        if walk_data is None:
+            try:
+                walk_data = storage.read_json(walk_path)
+            except Exception:
+                break
+        if not isinstance(walk_data, dict):
+            break
+
+        ver = int(walk_data.get("snapshot_version", 0))
+        resources = walk_data.get("resources") or []
+
+        if result["current_version"] == 0:
+            result["current_version"] = ver
+
+        is_kept = (cutoff_version is None) or (ver >= cutoff_version)
+
+        if is_kept:
+            kept_snapshot_paths.add(walk_path)
+            for res in resources:
+                f = res.get("file", "")
+                if f:
+                    kept_files.add(f)
+        else:
+            removed_snapshot_paths.append(walk_path)
+            for res in resources:
+                f = res.get("file", "")
+                if f and f not in removed_files:
+                    removed_files[f] = int(res.get("file_size", 0) or 0)
+
+        prev_path = walk_data.get("previous_snapshot")
+        walk_path = prev_path if isinstance(prev_path, str) and prev_path else None
+        walk_data = None
+
+    result["live_file_count"] = len(kept_files)
+
+    # ── Compute reclaimable files ─────────────────────────────────────────
+    if cutoff_version is not None:
+        # Version-aware mode: diff removed vs kept manifests
+        clone_protected = _collect_clone_referenced_files(organization, super_name, simple_name)
+        protected = kept_files | clone_protected
+        result["clone_protected_file_count"] = len(clone_protected)
+
+        data_bytes = 0
+        for f, size in removed_files.items():
+            if f not in protected:
+                result["orphaned_data_files"].append(f)
+                data_bytes += size
+
+        # Snapshot JSONs for removed versions
+        snapshot_bytes = 0
+        for sp in removed_snapshot_paths:
+            result["orphaned_snapshot_files"].append(sp)
+            try:
+                snapshot_bytes += storage.size(sp)
+            except Exception:
+                pass
+
+        result["orphaned_data_bytes"] = data_bytes
+        result["orphaned_snapshot_bytes"] = snapshot_bytes
+        result["total_orphaned_bytes"] = data_bytes + snapshot_bytes
+    else:
+        # Legacy mode: storage scan (finds ALL orphans including failed writes)
+        clone_protected = _collect_clone_referenced_files(organization, super_name, simple_name)
+        protected = kept_files | clone_protected
+        result["clone_protected_file_count"] = len(clone_protected)
+
+        data_dir = os.path.join(
+            organization, super_name, "tables", simple_name, "data",
+        )
         try:
-            from supertable.super_table import SuperTable
-            st = SuperTable(super_name, organization)
-            snapshot = st.read_simple_table_snapshot(current_path)
-        except Exception as e:
-            result["error"] = f"Failed to read snapshot: {e}"
-            return result
+            storage_files = storage.list_files(data_dir, "*.parquet")
+        except Exception:
+            storage_files = []
 
-    result["current_version"] = int(snapshot.get("snapshot_version", 0))
+        data_bytes = 0
+        for file_path in storage_files:
+            if file_path not in protected:
+                result["orphaned_data_files"].append(file_path)
+                try:
+                    data_bytes += storage.size(file_path)
+                except Exception:
+                    pass
 
-    # Build set of live data file paths from the manifest
-    resources = snapshot.get("resources", []) or []
-    live_files: Set[str] = set()
-    for res in resources:
-        f = res.get("file", "")
-        if f:
-            live_files.add(f)
-    result["live_file_count"] = len(live_files)
+        snapshot_dir = os.path.join(
+            organization, super_name, "tables", simple_name, "snapshots",
+        )
+        try:
+            snapshot_files = storage.list_files(snapshot_dir, "*.json")
+        except Exception:
+            snapshot_files = []
 
-    # Clone protection: files referenced by clones are NOT orphaned
-    clone_protected = _collect_clone_referenced_files(organization, super_name, simple_name)
-    protected_files = live_files | clone_protected
-    result["clone_protected_file_count"] = len(clone_protected)
+        snapshot_bytes = 0
+        for snap_path in snapshot_files:
+            if snap_path != current_path:
+                result["orphaned_snapshot_files"].append(snap_path)
+                try:
+                    snapshot_bytes += storage.size(snap_path)
+                except Exception:
+                    pass
 
-    # Scan data directory for actual files on storage
-    data_dir = os.path.join(
-        organization, super_name, "tables", simple_name, "data",
-    )
-    try:
-        storage_files = storage.list_files(data_dir, "*.parquet")
-    except Exception:
-        storage_files = []
-
-    for file_path in storage_files:
-        if file_path not in protected_files:
-            result["orphaned_data_files"].append(file_path)
-
-    # Scan snapshot directory for old snapshot JSON files
-    snapshot_dir = os.path.join(
-        organization, super_name, "tables", simple_name, "snapshots",
-    )
-    try:
-        snapshot_files = storage.list_files(snapshot_dir, "*.json")
-    except Exception:
-        snapshot_files = []
-
-    for snap_path in snapshot_files:
-        if snap_path != current_path:
-            result["orphaned_snapshot_files"].append(snap_path)
+        result["orphaned_data_bytes"] = data_bytes
+        result["orphaned_snapshot_bytes"] = snapshot_bytes
+        result["total_orphaned_bytes"] = data_bytes + snapshot_bytes
 
     return result
 

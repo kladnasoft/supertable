@@ -703,9 +703,23 @@
     <!-- Run checks -->
     <div class="intel-section">
       <div class="intel-title"><i class="fas fa-play-circle" style="color:var(--success);"></i> Run checks</div>
-      <button class="intel-action-btn primary" onclick="dqRunAllNow('quick')"><i class="fas fa-bolt"></i> Run all quick</button>
-      <button class="intel-action-btn" onclick="dqRunAllNow('deep')"><i class="fas fa-microscope"></i> Run all deep</button>
-      <button class="intel-action-btn" onclick="dqRunAllNow('custom')"><i class="fas fa-sliders-h"></i> Run all custom rules</button>
+      <div style="display:flex;gap:4px;margin-bottom:8px;">
+        <select id="dqRunAllMode" style="flex:1;padding:5px 8px;border:1px solid var(--panel-border);border-radius:var(--radius-sm);font-size:11px;font-family:var(--font);background:var(--bg-surface);outline:none;">
+          <option value="quick">Quick</option>
+          <option value="deep">Deep</option>
+          <option value="custom">Custom rules</option>
+        </select>
+        <button class="intel-action-btn primary" id="btnRunAllIntel" style="margin:0;width:auto;padding:5px 12px;" onclick="dqRunAllNow()"><i class="fas fa-bolt"></i> Run all checks</button>
+      </div>
+      <div id="dqRunAllProgress" style="display:none;">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+          <i class="fas fa-circle-notch fa-spin" style="font-size:10px;color:var(--primary);"></i>
+          <span id="dqRunAllLabel" style="font-size:11px;color:var(--text-secondary);"></span>
+        </div>
+        <div style="height:4px;background:var(--border-light);border-radius:2px;overflow:hidden;">
+          <div id="dqRunAllBar" style="height:100%;background:var(--primary);border-radius:2px;transition:width .3s;width:0%;"></div>
+        </div>
+      </div>
       <div style="margin-top:10px;">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:4px;">Run single table</div>
         <div style="display:flex;gap:4px;">
@@ -944,6 +958,9 @@ function dqUpdateScheduleIntel() {
       html += '<div class="intel-stat-value">' + overrideCount + ' table' + (overrideCount !== 1 ? 's' : '') + '</div></div>';
     }
     container.innerHTML = html;
+  }).catch(function() {
+    var container = document.getElementById('dqIntelSchedule');
+    if (container) container.innerHTML = '<div style="font-size:11px;color:var(--text-muted);">Unable to load</div>';
   });
 }
 
@@ -1825,16 +1842,31 @@ function dqSaveSchedule() {
 // ── Run All Now ──────────────────────────────────────────────
 
 function dqRunAllNow(mode) {
+  if (!mode) mode = (document.getElementById('dqRunAllMode') || {}).value || 'quick';
   if (!confirm('Run ' + mode + ' check on ALL tables now?')) return;
+  var btn = document.getElementById('btnRunAllIntel');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
   dqApi('/api/v1/quality/run-all?mode=' + mode, { method: 'POST' }).then(function(data) {
-    if (!data.ok) { dqToast('Failed: ' + (data.detail || 'unknown error')); return; }
+    if (!data.ok) { dqToast('Failed: ' + (data.detail || 'unknown error')); if (btn) { btn.disabled = false; btn.style.opacity = '1'; } return; }
     dqToast(mode + ' check started on ' + (data.count || 0) + ' tables');
-    var refreshCount = 0;
-    var refreshTimer = setInterval(function() {
-      dqLoadOverview();
-      refreshCount++;
-      if (refreshCount >= 10) clearInterval(refreshTimer);
-    }, 10000);
+    var progWrap = document.getElementById('dqRunAllProgress');
+    if (progWrap) progWrap.style.display = 'block';
+    var pollTimer = setInterval(function() {
+      dqApi('/api/v1/quality/run-all/progress').then(function(p) {
+        var bar = document.getElementById('dqRunAllBar');
+        var lbl = document.getElementById('dqRunAllLabel');
+        if (p.total > 0 && bar) bar.style.width = Math.round((p.done / p.total) * 100) + '%';
+        if (lbl) lbl.textContent = p.done + ' / ' + p.total + (p.current ? ' — ' + p.current : '') + (p.failed ? ' (' + p.failed + ' failed)' : '');
+        if (!p.running) {
+          clearInterval(pollTimer);
+          if (bar) bar.style.width = '100%';
+          if (lbl) lbl.textContent = 'Done — ' + p.done + ' tables' + (p.failed ? ' (' + p.failed + ' failed)' : '');
+          if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+          dqLoadSummary();
+          setTimeout(function() { if (progWrap) progWrap.style.display = 'none'; }, 5000);
+        }
+      }).catch(function() { clearInterval(pollTimer); if (btn) { btn.disabled = false; btn.style.opacity = '1'; } if (progWrap) progWrap.style.display = 'none'; });
+    }, 2000);
   });
 }
 
@@ -2054,6 +2086,32 @@ function _dqStopAutoRefresh() { if (_dqAutoTimer) { clearInterval(_dqAutoTimer);
 var _dqTabLoaded = {};
 if (DQ_ORG && DQ_SUP) {
   dqLoadSummary(); // single call — rules/checks/schedule lazy-loaded per tab
+
+  // Check if a run-all is already in progress
+  dqApi('/api/v1/quality/run-all/progress').then(function(p) {
+    if (p.running) {
+      var btn = document.getElementById('btnRunAllIntel');
+      var progWrap = document.getElementById('dqRunAllProgress');
+      if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
+      if (progWrap) progWrap.style.display = 'block';
+      var pollTimer = setInterval(function() {
+        dqApi('/api/v1/quality/run-all/progress').then(function(p2) {
+          var bar = document.getElementById('dqRunAllBar');
+          var lbl = document.getElementById('dqRunAllLabel');
+          if (p2.total > 0 && bar) bar.style.width = Math.round((p2.done / p2.total) * 100) + '%';
+          if (lbl) lbl.textContent = p2.done + ' / ' + p2.total + (p2.current ? ' — ' + p2.current : '') + (p2.failed ? ' (' + p2.failed + ' failed)' : '');
+          if (!p2.running) {
+            clearInterval(pollTimer);
+            if (bar) bar.style.width = '100%';
+            if (lbl) lbl.textContent = 'Done — ' + p2.done + ' tables' + (p2.failed ? ' (' + p2.failed + ' failed)' : '');
+            if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+            dqLoadSummary();
+            setTimeout(function() { if (progWrap) progWrap.style.display = 'none'; }, 5000);
+          }
+        }).catch(function() { clearInterval(pollTimer); if (btn) { btn.disabled = false; btn.style.opacity = '1'; } if (progWrap) progWrap.style.display = 'none'; });
+      }, 2000);
+    }
+  }).catch(function() {});
 
   // Fetch available roles for the role selector
   fetch('/api/v1/rbac/roles?org=' + encodeURIComponent(DQ_ORG) + '&sup=' + encodeURIComponent(DQ_SUP))

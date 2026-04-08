@@ -107,7 +107,6 @@ from supertable.services.security import (
 # -- monitoring helpers --
 from supertable.services.monitoring import (
     _read_monitoring_list,
-    compute_monitoring_summary,
     read_lock_state,
     read_error_feed,
     compute_timeseries,
@@ -1661,6 +1660,16 @@ def execute_api(
 
         DR = _get_data_reader()
         dr = DR(super_name=super_name, organization=organization, query=q)
+
+        # Tag read source for monitoring: UI (session cookie) vs API/SDK (token)
+        if dr.query_plan_manager:
+            _src = payload.get("source_type", "").strip()
+            if _src in ("ui", "api", "sdk"):
+                dr.query_plan_manager.source_type = _src
+            elif getattr(request.state, "session", None):
+                dr.query_plan_manager.source_type = "ui"
+            else:
+                dr.query_plan_manager.source_type = "api"
 
         try:
             from supertable.engine.engine_enum import Engine as _EngineEnum
@@ -3585,16 +3594,123 @@ def monitoring_reads(
     limit: int = Query(500),
     _=Depends(logged_in_guard_api),
 ):
+    """Lightweight read operations list — strips heavy profiler fields.
+
+    Returns only: query_id, recorded_at, table_name, role_name, engine,
+    source_type, status, message, result_rows, result_columns, duration_ms.
+    ~100× smaller than the full payload.
+    """
     org = (org or "").strip()
     sup = (sup or "").strip()
     if not org or not sup:
         return JSONResponse({"ok": True, "items": []})
 
-    items = _read_monitoring_list(
+    raw_items = _read_monitoring_list(
         redis_client, org, sup,
         monitor_type="plans", from_ts_ms=from_ts, to_ts_ms=to_ts, limit=min(limit, 5000),
     )
-    return JSONResponse({"ok": True, "items": items})
+
+    # Strip heavy fields, compute duration_ms from execution_timings
+    _LIGHT_KEYS = {
+        "query_id", "query_hash", "recorded_at", "table_name", "role_name",
+        "engine", "source_type", "status", "message", "result_rows",
+        "result_columns", "instance_id",
+    }
+    items = []
+    for it in raw_items:
+        row = {k: it[k] for k in _LIGHT_KEYS if k in it}
+        # Extract duration_ms from execution_timings
+        dur_ms = None
+        raw_t = it.get("execution_timings")
+        if raw_t:
+            try:
+                tm = json.loads(raw_t) if isinstance(raw_t, str) else raw_t
+                if isinstance(tm, list):
+                    # Try TOTAL_EXECUTE first
+                    for entry in tm:
+                        if isinstance(entry, dict):
+                            for k in ("TOTAL_EXECUTE", "total", "total_s"):
+                                if k in entry:
+                                    dur_ms = round(float(entry[k]) * 1000, 1)
+                                    break
+                        if dur_ms is not None:
+                            break
+                    # Fallback: sum all timing entries
+                    if dur_ms is None:
+                        total = 0.0
+                        for entry in tm:
+                            if isinstance(entry, dict):
+                                for v in entry.values():
+                                    try:
+                                        total += float(v)
+                                    except (TypeError, ValueError):
+                                        pass
+                        if total > 0:
+                            dur_ms = round(total * 1000, 1)
+                elif isinstance(tm, dict):
+                    for k in ("total", "total_s", "TOTAL_EXECUTE"):
+                        if k in tm:
+                            dur_ms = round(float(tm[k]) * 1000, 1)
+                            break
+                    if dur_ms is None:
+                        total = sum(float(v) for v in tm.values() if isinstance(v, (int, float)))
+                        if total > 0:
+                            dur_ms = round(total * 1000, 1)
+            except Exception:
+                pass
+        # Last fallback: query_profile.latency
+        if dur_ms is None:
+            raw_qp = it.get("query_profile")
+            if raw_qp:
+                try:
+                    qp = json.loads(raw_qp) if isinstance(raw_qp, str) else raw_qp
+                    if isinstance(qp, dict) and qp.get("latency"):
+                        dur_ms = round(float(qp["latency"]) * 1000, 1)
+                except Exception:
+                    pass
+        row["duration_ms"] = dur_ms
+        items.append(row)
+
+    return JSONResponse({"ok": True, "items": items, "count": len(items)})
+
+
+@router.get("/api/v1/monitoring/reads/detail")
+def monitoring_read_detail(
+    org: str = Query(""),
+    sup: str = Query(""),
+    query_id: str = Query(""),
+    _=Depends(logged_in_guard_api),
+):
+    """Full detail for a single read operation by query_id.
+
+    Returns the complete record including execution_timings,
+    profile_overview, and query_profile (parsed from JSON strings).
+    """
+    org = (org or "").strip()
+    sup = (sup or "").strip()
+    query_id = (query_id or "").strip()
+    if not org or not sup or not query_id:
+        raise HTTPException(status_code=400, detail="org, sup, and query_id required")
+
+    # Scan the last 5000 entries to find the query
+    items = _read_monitoring_list(
+        redis_client, org, sup,
+        monitor_type="plans", from_ts_ms=None, to_ts_ms=None, limit=5000,
+    )
+
+    for it in items:
+        if it.get("query_id") == query_id:
+            # Parse JSON string fields into objects for the frontend
+            for field in ("execution_timings", "profile_overview", "query_profile"):
+                raw = it.get(field)
+                if isinstance(raw, str):
+                    try:
+                        it[field] = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return JSONResponse({"ok": True, "item": it})
+
+    raise HTTPException(status_code=404, detail=f"Query {query_id} not found")
 
 
 @router.get("/api/v1/monitoring/writes")
@@ -3647,25 +3763,6 @@ def monitoring_summary(
     window_hours: int = Query(24),
     _=Depends(logged_in_guard_api),
 ):
-    org = (org or "").strip()
-    sup = (sup or "").strip()
-    if not org or not sup:
-        return JSONResponse({"ok": True, "summary": {}})
-
-    window_hours = max(1, min(window_hours, 168))  # Clamp to 1h–7d
-    summary = compute_monitoring_summary(
-        redis_client, org, sup, window_hours=window_hours,
-    )
-    return JSONResponse({"ok": True, "summary": summary})
-
-
-@router.get("/api/v1/summary")
-def api_summary(
-    org: str = Query(""),
-    sup: str = Query(""),
-    window_hours: int = Query(1),
-    _=Depends(logged_in_guard_api),
-):
     """Unified summary page data — all metrics in a single call, zero locks."""
     org = (org or "").strip()
     sup = (sup or "").strip()
@@ -3686,7 +3783,7 @@ def monitoring_catalog(
     sup: str = Query(""),
     _=Depends(logged_in_guard_api),
 ):
-    """Catalog statistics: table count, snapshots, users, roles, tokens."""
+    """Catalog statistics: table count, snapshots, rows, size, version."""
     org = (org or "").strip()
     sup = (sup or "").strip()
     if not org or not sup:
@@ -3694,10 +3791,22 @@ def monitoring_catalog(
 
     from supertable.services.monitoring import compute_catalog_stats as _cat_stats
     raw = _cat_stats(redis_client, catalog, org, sup)
-    # Normalise field names to what the dashboard frontend expects
+
+    # Catalog root version
+    cat_version = 0
+    try:
+        root = catalog.get_root(org, sup)
+        if root:
+            cat_version = int(root.get("version", 0) or 0)
+    except Exception:
+        pass
+
     stats = {
         "tables": raw.get("table_count", 0),
         "total_snapshots": raw.get("total_snapshots", 0),
+        "total_rows": raw.get("total_rows", 0),
+        "total_size_bytes": raw.get("total_size_bytes", 0),
+        "catalog_version": cat_version,
         "users": raw.get("user_count", 0),
         "roles": raw.get("role_count", 0),
         "tokens": raw.get("token_count", 0),
@@ -4250,7 +4359,7 @@ def api_dq_get_schedule(
     request: Request,
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
-    _: Any = Depends(admin_guard_api),
+    _: Any = Depends(logged_in_guard_api),
 ):
     dqc = _get_dqc(request, org, sup)
     return {"ok": True, "schedule": dqc.get_schedule()}
@@ -4434,11 +4543,24 @@ def api_dq_run_all(
         return {"ok": True, "message": "No tables found", "count": 0}
 
     dqc = DQConfig(redis_client, o, s)
+    progress_key = f"supertable:{o}:{s}:dq:run-all-progress"
+
+    # Seed progress
+    import json as _json_mod
+    redis_client.set(progress_key, _json_mod.dumps({
+        "running": True, "mode": mode, "total": len(tables),
+        "done": 0, "current": "", "failed": 0,
+    }), ex=600)
 
     def _run_sequential():
         from supertable.services.quality.scheduler import _run_quick_check, _run_deep_check
-        for tbl in tables:
+        failed = 0
+        for idx, tbl in enumerate(tables):
             try:
+                redis_client.set(progress_key, _json_mod.dumps({
+                    "running": True, "mode": mode, "total": len(tables),
+                    "done": idx, "current": tbl, "failed": failed,
+                }), ex=600)
                 logger.info(f"[dq-run-all] {mode} check: {tbl}")
                 if mode == "deep":
                     _run_deep_check(redis_client, o, s, tbl, dqc)
@@ -4446,11 +4568,39 @@ def api_dq_run_all(
                     _run_quick_check(redis_client, o, s, tbl, dqc)
             except Exception as e:
                 logger.error(f"[dq-run-all] {mode} failed for {tbl}: {e}")
+                failed += 1
+        redis_client.set(progress_key, _json_mod.dumps({
+            "running": False, "mode": mode, "total": len(tables),
+            "done": len(tables), "current": "", "failed": failed,
+        }), ex=60)
 
     t = threading.Thread(target=_run_sequential, name="dq-run-all", daemon=True)
     t.start()
 
     return {"ok": True, "message": f"{mode} check started on {len(tables)} tables (sequential)", "count": len(tables)}
+
+
+@router.get("/api/v1/quality/run-all/progress")
+def api_dq_run_all_progress(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    o, s = _dq_resolve(org, sup)
+    if not o or not s:
+        return {"ok": True, "running": False}
+    progress_key = f"supertable:{o}:{s}:dq:run-all-progress"
+    raw = redis_client.get(progress_key)
+    if not raw:
+        return {"ok": True, "running": False}
+    import json as _json_mod
+    try:
+        data = _json_mod.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+    except Exception:
+        return {"ok": True, "running": False}
+    data["ok"] = True
+    return data
 
 
 @router.get("/api/v1/quality/history")
@@ -5304,15 +5454,21 @@ def api_gc_preview(
     org: Optional[str] = Query(None),
     sup: Optional[str] = Query(None),
     table: str = Query(""),
+    cutoff_version: Optional[int] = Query(None),
     _: Any = Depends(admin_guard_api),
 ):
-    """Preview orphaned files for a table (dry run)."""
+    """Preview orphaned files for a table (dry run).
+
+    If cutoff_version is provided, computes orphans relative to keeping
+    all versions >= cutoff_version.  Without it, compares against
+    the current snapshot only (legacy behavior).
+    """
     sel_org, sel_sup = resolve_pair(org, sup)
     if not sel_org or not sel_sup or not table:
         raise HTTPException(status_code=400, detail="org, sup, and table are required")
 
     from supertable.services.gc import preview_obsolete_files
-    result = preview_obsolete_files(sel_org, sel_sup, table.strip())
+    result = preview_obsolete_files(sel_org, sel_sup, table.strip(), cutoff_version=cutoff_version)
     return JSONResponse({"ok": True, **result})
 
 
@@ -5336,6 +5492,70 @@ def api_gc_clean(
 
     status_code = 200 if not result.get("errors") else 207
     return JSONResponse({"ok": True, **result}, status_code=status_code)
+
+
+@router.get("/api/v1/gc/schedule")
+def api_gc_get_schedule(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    _: Any = Depends(logged_in_guard_api),
+):
+    """Read GC schedule configuration."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        return {"ok": True, "schedule": {"enabled": False, "cron": "0 2 * * *", "all_tables": True}}
+    key = f"supertable:{sel_org}:{sel_sup}:gc:schedule"
+    raw = redis_client.get(key)
+    if raw:
+        import json as _json
+        try:
+            data = _json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        except Exception:
+            data = {"enabled": False, "cron": "0 2 * * *", "all_tables": True}
+    else:
+        data = {"enabled": False, "cron": "0 2 * * *", "all_tables": True}
+    return {"ok": True, "schedule": data}
+
+
+@router.put("/api/v1/gc/schedule")
+def api_gc_set_schedule(
+    request: Request,
+    org: Optional[str] = Query(None),
+    sup: Optional[str] = Query(None),
+    body: Dict[str, Any] = Body(None),
+    _: Any = Depends(admin_guard_api),
+):
+    """Save GC schedule configuration."""
+    sel_org, sel_sup = resolve_pair(org, sup)
+    if not sel_org or not sel_sup:
+        raise HTTPException(status_code=400, detail="org and sup required")
+    if body is None:
+        body = {}
+    import json as _json
+    key = f"supertable:{sel_org}:{sel_sup}:gc:schedule"
+    data = {
+        "enabled": bool(body.get("enabled", False)),
+        "cron": str(body.get("cron", "0 2 * * *")),
+        "all_tables": bool(body.get("all_tables", True)),
+    }
+    redis_client.set(key, _json.dumps(data))
+
+    try:
+        _audit(
+            category=EventCategory.CONFIG_CHANGE,
+            action=Actions.TABLE_CONFIG_CHANGE,
+            organization=sel_org,
+            super_name=sel_sup,
+            resource_type="gc_schedule",
+            resource_id="gc_schedule",
+            severity=Severity.WARNING,
+            detail=make_detail(**data),
+        )
+    except Exception:
+        pass
+
+    return {"ok": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
