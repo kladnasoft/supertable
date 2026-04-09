@@ -27,65 +27,81 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .content-container{margin-left:280px;height:100vh;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);transition:var(--transition);}
 .sidebar-collapsed ~ .content-container{margin-left:80px;}
 .cc-topbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:46px;}
-.au-scroll{flex:1;overflow-y:auto;padding:16px 20px;}
-.au-scroll>.card:last-child{margin-bottom:0;}
 
-.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:0 1px 3px rgba(15,23,42,.04);margin-bottom:20px;}
-.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
-.card-title{font-size:14px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;}
-.card-title i{color:var(--primary);font-size:13px;}
+/* metric tiles */
+.cc-tiles{display:flex;gap:8px;padding:10px 16px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;}
+.cc-tile{display:flex;align-items:center;gap:9px;padding:8px 14px;background:var(--bg-surface);border:1px solid var(--border-light);border-radius:var(--radius-sm);flex:1;}
+.tile-icon{width:30px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;}
+.tile-val{font-size:18px;font-weight:800;font-family:var(--mono);line-height:1;}
+.tile-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-top:1px;}
 
-/* Filters bar */
-.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;align-items:center;}
-.filter-select,.filter-input,.filter-btn{padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font);background:var(--bg-card);color:var(--text);}
-.filter-select:focus,.filter-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(28,150,202,.12);}
+.au-scroll{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;}
+.pane.active{display:flex;flex-direction:column;flex:1;min-height:0;}
+.pane{display:none;}
+
+/* filters */
+.filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px;}
+.filter-select,.filter-input{padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font);background:var(--bg-card);color:var(--text);outline:none;}
+.filter-select:focus,.filter-input:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(28,150,202,.12);}
 .filter-input{min-width:140px;}
-.filter-btn{cursor:pointer;background:var(--primary);color:#fff;border-color:var(--primary);font-weight:600;}
-.filter-btn:hover{background:var(--primary-dark);}
-.filter-btn-ghost{background:transparent;color:var(--text-sec);border-color:var(--border);}
-.filter-btn-ghost:hover{background:var(--bg-hover);}
+.btn-sm{padding:6px 14px;border-radius:var(--radius-sm);background:transparent;border:1px solid var(--border);color:var(--text-sec);font-weight:600;cursor:pointer;font-size:12px;transition:var(--transition);display:inline-flex;align-items:center;gap:5px;font-family:var(--font);white-space:nowrap;}
+.btn-sm:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light);}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary);}
+.btn-primary:hover{background:var(--primary-dark);border-color:var(--primary-dark);}
 
-/* Event table */
+/* table */
+.table-wrap{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--bg-card);flex:1;display:flex;flex-direction:column;min-height:0;}
+.table-scroll{flex:1;overflow-y:auto;}
 .event-table{width:100%;border-collapse:collapse;font-size:12px;}
-.event-table th{text-align:left;padding:8px 10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;font-size:10px;border-bottom:2px solid var(--border);position:sticky;top:0;background:var(--bg-card);z-index:1;}
+.event-table th{text-align:left;padding:8px 10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;font-size:9px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg-surface);z-index:1;}
 .event-table td{padding:7px 10px;border-bottom:1px solid var(--border-light);vertical-align:top;}
-.event-table tr:hover{background:var(--bg-hover);}
+.event-table tr.event-row:hover{background:var(--bg-hover);}
 .event-table tr.expanded{background:rgba(28,150,202,.04);}
 
-/* Severity badges */
-.sev{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;}
+/* severity & outcome badges */
+.sev{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;}
 .sev-info{background:var(--primary-light);color:var(--primary);}
 .sev-warning{background:var(--warn-bg);color:#92400e;}
 .sev-critical{background:var(--error-bg);color:#991b1b;}
-
-/* Outcome badges */
 .out{font-size:11px;font-weight:600;}
 .out-success{color:var(--success);}
 .out-failure{color:var(--error);}
 .out-denied{color:var(--warn);}
 
-/* Detail expansion */
+/* detail expansion */
 .detail-row{display:none;}
 .detail-row.show{display:table-row;}
-.detail-cell{padding:10px 10px 10px 40px;background:var(--bg-surface);border-bottom:1px solid var(--border);}
+.detail-cell{padding:10px 10px 10px 40px;background:var(--bg-surface);border-bottom:1px solid var(--border);position:relative;}
 .detail-json{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;background:var(--bg);padding:10px;border-radius:var(--radius-sm);border:1px solid var(--border-light);}
+.detail-copy{position:absolute;top:12px;right:14px;padding:4px 10px;font-size:10px;font-weight:600;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-card);color:var(--text-sec);cursor:pointer;display:flex;align-items:center;gap:4px;transition:var(--transition);}
+.detail-copy:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light);}
+.detail-copy.copied{border-color:var(--success);color:var(--success);background:var(--success-bg);}
 
-/* Bottom panels grid */
-.bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
-@media(max-width:900px){.bottom-grid{grid-template-columns:1fr;}}
+/* bottom cards */
+.bottom-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+@media(max-width:1100px){.bottom-grid{grid-template-columns:1fr;}}
 
-/* Integrity badges */
+/* tabs */
+.bar-row{display:flex;align-items:center;gap:0;padding:7px 14px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;scrollbar-width:none;}
+.bar-row::-webkit-scrollbar{display:none;}
+.section-node{display:flex;align-items:center;gap:8px;padding:7px 16px;border-radius:8px;cursor:pointer;transition:var(--transition);border:1px solid transparent;white-space:nowrap;font-size:12px;font-weight:600;color:var(--text-sec);}
+.section-node:hover{background:var(--bg-hover);border-color:var(--border);}
+.section-node.active{background:var(--primary-light);border-color:var(--primary);color:var(--primary);}
+.section-node .sicon{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;}
+.bar-sep{width:1px;height:18px;background:var(--border);margin:0 3px;flex-shrink:0;}
+.info-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;}
+.info-card-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-bottom:9px;display:flex;align-items:center;gap:6px;}
+.info-card-title i{font-size:12px;color:var(--primary);}
+.info-kv{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border-light);font-size:12px;}
+.info-kv:last-child{border-bottom:none;}
+.info-kv .k{color:var(--text-sec);}.info-kv .v{font-weight:600;font-family:var(--mono);}
+
 .chain-days{display:flex;gap:6px;margin-top:10px;}
 .chain-day{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;}
 .chain-ok{background:var(--success-bg);color:var(--success);}
 .chain-fail{background:var(--error-bg);color:var(--error);}
 .chain-pending{background:var(--bg-surface);color:var(--text-muted);border:1px dashed var(--border);}
-
-/* Event count */
 .event-count{font-size:12px;color:var(--text-muted);font-weight:500;}
-
-/* Scrollable table container */
-.table-scroll{max-height:55vh;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);}
   </style>
   <script>document.addEventListener('DOMContentLoaded',function(){if(!window.__st_sidebar_bound){var t=document.getElementById('sidebarToggle');if(t)t.addEventListener('click',function(){var s=document.getElementById('sidebar');if(s){s.classList.toggle('sidebar-collapsed');localStorage.setItem('st_sidebar_collapsed',s.classList.contains('sidebar-collapsed'));}});if(localStorage.getItem('st_sidebar_collapsed')==='true'){var s=document.getElementById('sidebar');if(s)s.classList.add('sidebar-collapsed');}}});</script>
 </head>
@@ -98,52 +114,80 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <span style="font-size:11px;color:var(--text-muted);">Audit log</span>
     <span class="event-count" id="eventCount" style="font-size:10px;padding:3px 10px;border-radius:20px;font-weight:600;background:var(--bg-surface);color:var(--text-muted);"></span>
     <div style="flex:1;"></div>
+    <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);cursor:pointer;">
+      <input type="checkbox" id="autoRefresh" style="margin:0;accent-color:var(--primary);"> Auto-refresh
+    </label>
   </header>
+
+  <!-- Metric tiles -->
+  <div class="cc-tiles">
+    <div class="cc-tile">
+      <div class="tile-icon" style="background:rgba(28,150,202,.08);border:1px solid rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-stream"></i></div>
+      <div><div class="tile-val" id="statTotal">—</div><div class="tile-lbl">Events</div></div>
+    </div>
+    <div class="cc-tile">
+      <div class="tile-icon" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:var(--error);"><i class="fas fa-circle-exclamation"></i></div>
+      <div><div class="tile-val" id="statCritical">—</div><div class="tile-lbl">Critical</div></div>
+    </div>
+    <div class="cc-tile">
+      <div class="tile-icon" style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:var(--warn);"><i class="fas fa-triangle-exclamation"></i></div>
+      <div><div class="tile-val" id="statWarning">—</div><div class="tile-lbl">Warnings</div></div>
+    </div>
+    <div class="cc-tile">
+      <div class="tile-icon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:#7c3aed;"><i class="fas fa-ban"></i></div>
+      <div><div class="tile-val" id="statFailure">—</div><div class="tile-lbl">Failures</div></div>
+    </div>
+  </div>
+
+  <!-- Section bar -->
+  <div class="bar-row">
+    <div class="section-node active" data-tab="stream"><span class="sicon" style="background:rgba(28,150,202,.08);border:1px solid rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-stream"></i></span>Events</div>
+    <div class="bar-sep"></div>
+    <div class="section-node" data-tab="settings"><span class="sicon" style="background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--success);"><i class="fas fa-shield-halved"></i></span>Compliance</div>
+    <div class="bar-sep"></div>
+    <div class="section-node" data-tab="export"><span class="sicon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-file-export"></i></span>Export</div>
+  </div>
 
   <div class="au-scroll">
 
-  <!-- ── Event Stream ─────────────────────────────────── -->
-  <div class="card">
-    <div class="card-header">
-      <span class="card-title"><i class="fas fa-stream"></i> Event stream</span>
-      <span class="event-count" id="eventCount"></span>
-    </div>
+  <!-- Events pane -->
+  <div class="pane active" id="pane-stream">
 
-    <div class="filters">
-      <select class="filter-select" id="fCategory">
-        <option value="">All categories</option>
-        <option value="authentication">Authentication</option>
-        <option value="authorization">Authorization</option>
-        <option value="data_access">Data access</option>
-        <option value="data_mutation">Data mutation</option>
-        <option value="rbac_change">RBAC change</option>
-        <option value="config_change">Config change</option>
-        <option value="token_management">Token mgmt</option>
-        <option value="system">System</option>
-        <option value="export">Export</option>
-        <option value="security_alert">Security alert</option>
-      </select>
-      <select class="filter-select" id="fSeverity">
-        <option value="">All severities</option>
-        <option value="info">Info</option>
-        <option value="warning">Warning</option>
-        <option value="critical">Critical</option>
-      </select>
-      <select class="filter-select" id="fOutcome">
-        <option value="">All outcomes</option>
-        <option value="success">Success</option>
-        <option value="failure">Failure</option>
-        <option value="denied">Denied</option>
-      </select>
-      <input class="filter-input" id="fActor" placeholder="Actor..." />
-      <input class="filter-input" id="fResource" placeholder="Resource..." />
-      <button class="filter-btn" onclick="loadEvents()"><i class="fas fa-search"></i> Search</button>
-      <button class="filter-btn filter-btn-ghost" onclick="resetFilters()"><i class="fas fa-times"></i> Clear</button>
-      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);margin-left:auto;cursor:pointer;">
-        <input type="checkbox" id="autoRefresh" style="margin:0;"> Auto-refresh
-      </label>
-    </div>
+  <!-- Filters -->
+  <div class="filter-bar">
+    <select class="filter-select" id="fCategory">
+      <option value="">All categories</option>
+      <option value="authentication">Authentication</option>
+      <option value="authorization">Authorization</option>
+      <option value="data_access">Data access</option>
+      <option value="data_mutation">Data mutation</option>
+      <option value="rbac_change">RBAC change</option>
+      <option value="config_change">Config change</option>
+      <option value="token_management">Token mgmt</option>
+      <option value="system">System</option>
+      <option value="export">Export</option>
+      <option value="security_alert">Security alert</option>
+    </select>
+    <select class="filter-select" id="fSeverity">
+      <option value="">All severities</option>
+      <option value="info">Info</option>
+      <option value="warning">Warning</option>
+      <option value="critical">Critical</option>
+    </select>
+    <select class="filter-select" id="fOutcome">
+      <option value="">All outcomes</option>
+      <option value="success">Success</option>
+      <option value="failure">Failure</option>
+      <option value="denied">Denied</option>
+    </select>
+    <input class="filter-input" id="fActor" placeholder="Actor..." />
+    <input class="filter-input" id="fResource" placeholder="Resource..." />
+    <button class="btn-sm btn-primary" onclick="loadEvents()"><i class="fas fa-search"></i> Search</button>
+    <button class="btn-sm" onclick="resetFilters()"><i class="fas fa-times"></i> Clear</button>
+  </div>
 
+  <!-- Event table -->
+  <div class="table-wrap">
     <div class="table-scroll">
       <table class="event-table">
         <thead>
@@ -164,65 +208,71 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     </div>
   </div>
 
-  <!-- ── Bottom panels ────────────────────────────────── -->
-  <div class="bottom-grid">
+  </div>
 
-    <!-- Integrity status -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title"><i class="fas fa-shield-halved"></i> Chain integrity</span>
-        <button class="filter-btn" onclick="verifyChain()" style="font-size:11px;padding:4px 10px;"><i class="fas fa-check-double"></i> Verify today</button>
-      </div>
-      <div id="chainStatus" style="font-size:12px;color:var(--text-sec);">
-        Chain verification checks that no audit events have been tampered with, deleted, or reordered. Click "Verify today" to run an integrity check.
+  <!-- Compliance pane -->
+  <div class="pane" id="pane-settings">
+
+  <div class="bottom-grid" style="grid-template-columns:1fr 1fr;">
+
+    <!-- Chain integrity -->
+    <div class="info-card">
+      <div class="info-card-title"><i class="fas fa-shield-halved"></i> Chain integrity</div>
+      <div id="chainStatus" style="font-size:12px;color:var(--text-sec);margin-bottom:10px;">
+        Verifies no events have been tampered with, deleted, or reordered.
       </div>
       <div class="chain-days" id="chainDays"></div>
-    </div>
-
-    <!-- Export -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title"><i class="fas fa-file-export"></i> Export</span>
+      <div style="margin-top:10px;">
+        <button class="btn-sm" onclick="verifyChain()" style="font-size:11px;"><i class="fas fa-check-double"></i> Verify today</button>
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
-        <label style="font-size:12px;color:var(--text-sec);">From</label>
-        <input type="date" class="filter-input" id="exportFrom" />
-        <label style="font-size:12px;color:var(--text-sec);">To</label>
-        <input type="date" class="filter-input" id="exportTo" />
-        <select class="filter-select" id="exportFormat">
-          <option value="json">JSON lines</option>
-          <option value="csv">CSV</option>
-        </select>
-        <select class="filter-select" id="exportCriteria">
-          <option value="">All events</option>
-          <option value="CC6.1">SOC 2 — CC6.1 (Access security)</option>
-          <option value="CC6.2">SOC 2 — CC6.2 (Authorization)</option>
-          <option value="CC7.2">SOC 2 — CC7.2 (Anomaly detection)</option>
-          <option value="CC8.1">SOC 2 — CC8.1 (Change management)</option>
-        </select>
-        <button class="filter-btn" onclick="exportAudit()"><i class="fas fa-download"></i> Download</button>
-      </div>
-      <div id="exportStatus" style="margin-top:10px;font-size:11px;color:var(--text-muted);"></div>
     </div>
 
     <!-- Legal Hold -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title"><i class="fas fa-gavel"></i> Legal Hold</span>
-      </div>
-      <p style="font-size:12px;color:var(--text-sec);margin-bottom:12px;">When active, no audit data is deleted by retention cleanup.</p>
-      <div id="holdStatus" style="margin-bottom:12px;"><span style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Checking…</span></div>
+    <div class="info-card">
+      <div class="info-card-title"><i class="fas fa-gavel"></i> Legal hold</div>
+      <p style="font-size:12px;color:var(--text-sec);margin-bottom:10px;">When active, no audit data is deleted by retention cleanup.</p>
+      <div id="holdStatus" style="margin-bottom:10px;"><span style="font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Checking…</span></div>
       <div style="display:flex;gap:8px;align-items:center;">
-        <button class="filter-btn" id="btnHoldOn" style="display:none;"><i class="fas fa-lock"></i> Activate</button>
-        <button class="filter-btn" id="btnHoldOff" style="display:none;"><i class="fas fa-lock-open"></i> Deactivate</button>
-        <button class="filter-btn" id="btnRetRun" style="margin-left:auto;"><i class="fas fa-calendar-minus"></i> Run Retention</button>
+        <button class="btn-sm" id="btnHoldOn" style="display:none;"><i class="fas fa-lock"></i> Activate</button>
+        <button class="btn-sm" id="btnHoldOff" style="display:none;"><i class="fas fa-lock-open"></i> Deactivate</button>
+        <button class="btn-sm" id="btnRetRun" style="margin-left:auto;"><i class="fas fa-calendar-minus"></i> Run Retention</button>
       </div>
       <div id="holdResult" style="display:none;margin-top:10px;padding:8px;border-radius:var(--radius-sm);font-size:12px;"></div>
     </div>
 
   </div>
 
-</div>
+  </div>
+
+  <!-- Export pane -->
+  <div class="pane" id="pane-export">
+
+  <div class="info-card" style="max-width:700px;">
+    <div class="info-card-title"><i class="fas fa-file-export"></i> Export audit data</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+      <label style="font-size:12px;color:var(--text-sec);">From</label>
+      <input type="date" class="filter-input" id="exportFrom" style="min-width:auto;" />
+      <label style="font-size:12px;color:var(--text-sec);">To</label>
+      <input type="date" class="filter-input" id="exportTo" style="min-width:auto;" />
+      <select class="filter-select" id="exportFormat">
+        <option value="json">JSON lines</option>
+        <option value="csv">CSV</option>
+      </select>
+      <select class="filter-select" id="exportCriteria">
+        <option value="">All events</option>
+        <option value="CC6.1">SOC 2 — CC6.1 (Access security)</option>
+        <option value="CC6.2">SOC 2 — CC6.2 (Authorization)</option>
+        <option value="CC7.2">SOC 2 — CC7.2 (Anomaly detection)</option>
+        <option value="CC8.1">SOC 2 — CC8.1 (Change management)</option>
+      </select>
+      <button class="btn-sm btn-primary" onclick="exportAudit()"><i class="fas fa-download"></i> Download</button>
+    </div>
+    <div id="exportStatus" style="margin-top:10px;font-size:11px;color:var(--text-muted);"></div>
+  </div>
+
+  </div>
+
+  </div>
 </div>
 
 <script>
@@ -230,6 +280,14 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   var org = {{ sel_org|default("", true)|tojson }};
   var sup = {{ sel_sup|default("", true)|tojson }};
   var autoTimer = null;
+
+  // Tabs
+  document.querySelectorAll('.section-node[data-tab]').forEach(function(b){b.addEventListener('click',function(){
+    document.querySelectorAll('.section-node[data-tab]').forEach(function(x){x.classList.remove('active');});
+    document.querySelectorAll('.pane').forEach(function(x){x.classList.remove('active');});
+    b.classList.add('active');
+    var p=document.getElementById('pane-'+b.getAttribute('data-tab'));if(p)p.classList.add('active');
+  });});
 
   // Set default export dates (last 30 days)
   var today = new Date();
@@ -296,6 +354,18 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var countEl = document.getElementById('eventCount');
     if (countEl) countEl.textContent = events.length + ' events';
 
+    // Update stat strip
+    var critical=0,warning=0,failure=0;
+    for(var s=0;s<events.length;s++){
+      if(events[s].severity==='critical')critical++;
+      if(events[s].severity==='warning')warning++;
+      if(events[s].outcome==='failure')failure++;
+    }
+    var stTotal=document.getElementById('statTotal');if(stTotal)stTotal.textContent=events.length;
+    var stCrit=document.getElementById('statCritical');if(stCrit)stCrit.textContent=critical;
+    var stWarn=document.getElementById('statWarning');if(stWarn)stWarn.textContent=warning;
+    var stFail=document.getElementById('statFailure');if(stFail)stFail.textContent=failure;
+
     if (!events.length) {
       tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-muted);">No events found</td></tr>';
       return;
@@ -315,6 +385,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         + '<td>' + outBadge(e.outcome) + '</td>'
         + '</tr>';
       html += '<tr class="detail-row" id="' + rid + '"><td colspan="7" class="detail-cell">'
+        + '<button class="detail-copy" onclick="copyDetail(this,\'' + rid + '\')"><i class="fas fa-copy"></i> Copy</button>'
         + '<div class="detail-json">' + escHtml(JSON.stringify(e, null, 2)) + '</div>'
         + '</td></tr>';
     }
@@ -326,6 +397,18 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if (!el) return;
     var showing = el.classList.toggle('show');
     if (row) row.classList.toggle('expanded', showing);
+  };
+
+  window.copyDetail = function(btn, rid) {
+    var el = document.getElementById(rid);
+    if (!el) return;
+    var json = el.querySelector('.detail-json');
+    if (!json) return;
+    navigator.clipboard.writeText(json.textContent).then(function() {
+      btn.classList.add('copied');
+      btn.innerHTML = '<i class="fas fa-check"></i> Copied';
+      setTimeout(function() { btn.classList.remove('copied'); btn.innerHTML = '<i class="fas fa-copy"></i> Copy'; }, 1500);
+    });
   };
 
   window.resetFilters = function() {

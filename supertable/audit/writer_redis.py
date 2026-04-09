@@ -147,7 +147,7 @@ class RedisAuditWriter:
         max_id = f"{end_ms}-18446744073709551615" if end_ms else "+"
 
         try:
-            entries = self._r.xrange(self._stream, min=min_id, max=max_id, count=count)
+            entries = self._r.xrevrange(self._stream, max=max_id, min=min_id, count=count)
             results = []
             for stream_id, fields in entries:
                 sid = stream_id if isinstance(stream_id, str) else stream_id.decode("utf-8")

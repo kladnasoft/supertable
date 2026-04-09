@@ -40,19 +40,23 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .btn-primary:hover{background:var(--primary-dark);color:#fff;}
 .btn-danger{background:var(--error);color:#fff;border-color:var(--error);}
 .btn-danger:hover{opacity:.85;}
-.st-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;max-width:1200px;}
-.st-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;transition:var(--transition);display:flex;flex-direction:column;}
-.st-card:hover{border-color:var(--primary);box-shadow:0 2px 12px rgba(28,150,202,.08);}
-.st-card-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;}
-.st-card-name{font-size:16px;font-weight:700;font-family:var(--mono);word-break:break-all;}
-.st-card-meta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--text-sec);}
-.st-card-meta span{display:flex;align-items:center;gap:4px;}
-.st-card-actions{display:flex;gap:6px;flex-wrap:wrap;}
-.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.02em;}
-.badge-active{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
-.badge-readonly{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
-.badge-clone{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
-.badge-replica{background:rgba(245,158,11,.08);color:#d97706;border:1px solid rgba(245,158,11,.2);}
+.st-list{display:flex;flex-direction:column;gap:8px;}
+.st-row{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;align-items:center;gap:10px;transition:var(--transition);}
+.st-row:hover{border-color:var(--primary);box-shadow:0 2px 8px rgba(28,150,202,.08);}
+.st-row-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;border:1px solid;}
+.st-row-body{flex:1;min-width:0;}
+.st-row-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.st-row-name{font-size:13px;font-weight:600;}
+.st-row-ver{font-size:10px;color:var(--text-muted);font-family:var(--mono);}
+.st-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;}
+.st-chip-ok{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
+.st-chip-ro{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
+.st-chip-clone{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(59,130,246,.2);}
+.st-chip-replica{background:rgba(245,158,11,.08);color:#d97706;border:1px solid rgba(245,158,11,.2);}
+.st-meta{display:flex;gap:14px;margin-top:4px;font-size:11px;color:var(--text-sec);}
+.st-meta span{display:flex;align-items:center;gap:3px;}
+.st-div-row{display:flex;align-items:center;gap:8px;margin-top:4px;}
+.st-row-actions{display:flex;gap:4px;flex-shrink:0;}
 /* Divergence bar */
 .div-bar{height:4px;border-radius:2px;background:var(--border-light);margin-top:8px;overflow:hidden;}
 .div-fill{height:100%;border-radius:2px;transition:width .3s;}
@@ -114,7 +118,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   <div class="st-scroll">
     <div id="loading" style="text-align:center;padding:40px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Loading…</div>
-    <div class="st-grid" id="grid" style="display:none;"></div>
+    <div class="st-list" id="grid" style="display:none;"></div>
     <div class="empty-state" id="empty" style="display:none;"><i class="fas fa-cubes"></i><div style="font-size:15px;font-weight:600;margin-bottom:8px;">No SuperTables found</div><div>Create one to get started.</div></div>
   </div>
 </div>
@@ -338,27 +342,47 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     var grid=document.getElementById("grid"),empty=document.getElementById("empty");
     document.getElementById("loading").style.display="none";
     if(!items.length){grid.style.display="none";empty.style.display="block";return;}
-    empty.style.display="none";grid.style.display="grid";
+    empty.style.display="none";grid.style.display="flex";
     var h="";
     items.forEach(function(it){
-      var badges="";
       var isReplica = it.clone_type === "replica";
-      if(isReplica) badges+='<span class="badge badge-replica"><i class="fas fa-link"></i> Live replica of '+esc(it.cloned_from)+'</span>';
-      else if(it.read_only) badges+='<span class="badge badge-readonly"><i class="fas fa-lock"></i> Read-only</span>';
-      else badges+='<span class="badge badge-active"><i class="fas fa-check-circle"></i> Active</span>';
-      if(it.cloned_from && !isReplica){
+      var isClone = it.cloned_from && !isReplica;
+      var isRO = it.read_only;
+
+      // Icon color: readonly=purple, replica=amber, clone=teal, active=primary
+      var iconBg,iconBorder,iconColor;
+      if(isRO){iconBg="rgba(124,58,237,.06)";iconBorder="rgba(124,58,237,.2)";iconColor="var(--purple)";}
+      else if(isReplica){iconBg="rgba(245,158,11,.06)";iconBorder="rgba(245,158,11,.2)";iconColor="#d97706";}
+      else if(isClone){iconBg="rgba(5,150,105,.06)";iconBorder="rgba(5,150,105,.2)";iconColor="#059669";}
+      else{iconBg="rgba(28,150,202,.06)";iconBorder="rgba(28,150,202,.2)";iconColor="var(--primary)";}
+
+      // Status chip
+      var chips="";
+      if(isReplica) chips+='<span class="st-chip st-chip-replica"><i class="fas fa-circle" style="font-size:5px;"></i> Live replica of '+esc(it.cloned_from)+'</span>';
+      else if(isRO) chips+='<span class="st-chip st-chip-ro"><i class="fas fa-circle" style="font-size:5px;"></i> Read-only</span>';
+      else chips+='<span class="st-chip st-chip-ok"><i class="fas fa-circle" style="font-size:5px;"></i> Active</span>';
+
+      // Clone chip (additional)
+      if(isClone){
         var lbl=it.clone_type==="writable"?"Writable clone":"Snapshot clone";
-        badges+=' <span class="badge badge-clone"><i class="fas fa-clone"></i> '+lbl+" of "+esc(it.cloned_from)+"</span>";
+        chips+='<span class="st-chip st-chip-clone"><i class="fas fa-circle" style="font-size:5px;"></i> '+lbl+" of "+esc(it.cloned_from)+"</span>";
       }
-      h+='<div class="st-card">';
-      h+='<div class="st-card-hdr"><div class="st-card-name">'+esc(it.name)+'</div><div style="display:flex;gap:4px;flex-wrap:wrap;">'+badges+'</div></div>';
-      h+='<div class="st-card-meta">';
-      h+='<span><i class="fas fa-table"></i> '+it.table_count+' table'+(it.table_count!==1?"s":"")+'</span>';
-      h+='<span><i class="fas fa-code-branch"></i> v'+it.version+'</span>';
-      if(it.ts)h+='<span><i class="fas fa-calendar"></i> '+new Date(it.ts).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"})+'</span>';
+
+      // Date
+      var dateStr="";
+      if(it.ts){try{dateStr=new Date(it.ts).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});}catch(e){}}
+
+      h+='<div class="st-row">';
+      h+='<div class="st-row-icon" style="background:'+iconBg+';border-color:'+iconBorder+';color:'+iconColor+';"><i class="fas fa-cubes"></i></div>';
+      h+='<div class="st-row-body">';
+      h+='<div class="st-row-top"><span class="st-row-name">'+esc(it.name)+'</span><span class="st-row-ver">v'+it.version+'</span>'+chips+'</div>';
+      h+='<div class="st-meta">';
+      h+='<span><i class="fas fa-table" style="width:12px;"></i> '+it.table_count+' table'+(it.table_count!==1?"s":"")+'</span>';
+      if(dateStr)h+='<span><i class="fas fa-calendar" style="width:12px;"></i> '+dateStr+'</span>';
       h+='</div>';
-      if(it.divergence)h+=divBar(it.divergence);
-      h+='<div class="st-card-actions" style="margin-top:12px;">';
+      if(it.divergence)h+='<div class="st-div-row">'+divBar(it.divergence)+'</div>';
+      h+='</div>';
+      h+='<div class="st-row-actions">';
       h+='<button class="btn-sm" onclick="openClone(\''+esc(it.name)+'\')"><i class="fas fa-clone"></i> Clone</button>';
       if(isReplica){
         h+='<button class="btn-sm" onclick="doPromote(\''+esc(it.name)+'\')"><i class="fas fa-arrow-up-right-from-square"></i> Promote</button>';
@@ -375,7 +399,6 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
       h+='</div></div>';
     });
     grid.innerHTML=h;
-    // Update topbar badge
     var badge=document.getElementById("stStatusBadge");
     if(badge){badge.className="st-badge st-badge-ok";badge.innerHTML='<i class="fas fa-cubes"></i> '+items.length+' SuperTable'+(items.length!==1?'s':'');}
   }

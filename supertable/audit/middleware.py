@@ -111,7 +111,27 @@ class AuditMiddleware(BaseHTTPMiddleware):
         elif status == 403:
             self._emit_authz_event(request, status, start_ms)
         elif status >= 500:
-            self._emit_error_event(request, status, "", start_ms)
+            # Try to extract error detail from the response body
+            error_msg = ""
+            try:
+                body_chunks = []
+                async for chunk in response.body_iterator:
+                    body_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+                body_bytes = b"".join(body_chunks)
+                import json as _json
+                try:
+                    body_json = _json.loads(body_bytes)
+                    error_msg = str(body_json.get("detail", ""))[:500]
+                except (ValueError, AttributeError):
+                    error_msg = body_bytes[:500].decode("utf-8", errors="replace")
+
+                # Rebuild the response body iterator so the client still receives it
+                async def _replay():
+                    yield body_bytes
+                response.body_iterator = _replay()
+            except Exception:
+                pass
+            self._emit_error_event(request, status, error_msg, start_ms)
 
         return response
 

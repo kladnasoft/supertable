@@ -32,24 +32,28 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .topbar-sep{width:1px;height:20px;background:var(--border);flex-shrink:0;}
 
 .eng-scroll{flex:1;overflow-y:auto;padding:16px 20px;}
-.eng-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;max-width:1200px;}
-.eng-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;transition:var(--transition);}
-.eng-card:hover{border-color:var(--primary);box-shadow:0 2px 8px rgba(28,150,202,.08);}
-.eng-card-hdr{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
-.eng-card-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;border:1px solid;}
-.eng-card-name{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.eng-card-sub{font-size:10px;color:var(--text-muted);font-family:var(--mono);margin-top:1px;}
-.eng-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;margin-bottom:8px;}
+.eng-list{display:flex;flex-direction:column;gap:8px;}
+.eng-row{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;align-items:center;gap:10px;transition:var(--transition);}
+.eng-row:hover{border-color:var(--primary);box-shadow:0 2px 8px rgba(28,150,202,.08);}
+.eng-row-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;border:1px solid;}
+.eng-row-body{flex:1;min-width:0;}
+.eng-row-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.eng-row-name{font-size:13px;font-weight:600;}
+.eng-row-sub{font-size:10px;color:var(--text-muted);font-family:var(--mono);}
+.eng-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;}
 .eng-chip-ok{background:var(--success-bg);color:var(--success);border:1px solid rgba(16,185,129,.2);}
 .eng-chip-warn{background:var(--warn-bg);color:var(--warn);border:1px solid rgba(245,158,11,.2);}
 .eng-chip-err{background:var(--error-bg);color:var(--error);border:1px solid rgba(239,68,68,.2);}
 .eng-chip-blue{background:var(--primary-light);color:var(--primary);border:1px solid rgba(28,150,202,.2);}
 .eng-chip-purple{background:rgba(124,58,237,.06);color:var(--purple);border:1px solid rgba(124,58,237,.2);}
-.eng-kv{display:flex;justify-content:space-between;padding:3px 0;font-size:11px;}
-.eng-kv .k{color:var(--text-sec);}
-.eng-kv .v{font-weight:600;font-family:var(--mono);color:var(--text);}
-.eng-card-actions{display:flex;gap:4px;margin-top:auto;padding-top:10px;border-top:1px solid var(--border-light);}
-.eng-card-actions .btn-sm{flex:1;justify-content:center;font-size:11px;padding:5px 0;}
+.eng-meta{display:flex;gap:14px;margin-top:4px;font-size:11px;color:var(--text-sec);}
+.eng-meta span{display:flex;align-items:center;gap:3px;}
+.eng-meta strong{font-weight:600;font-family:var(--mono);color:var(--text);}
+.eng-test-inline{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;padding:3px 8px;border-radius:4px;}
+.eng-test-ok{background:var(--success-bg);color:var(--success);}
+.eng-test-fail{background:var(--error-bg);color:var(--error);}
+.eng-test-testing{background:var(--primary-light);color:var(--primary);}
+.eng-row-actions{display:flex;gap:4px;flex-shrink:0;}
 .eng-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;}
 .eng-badge-ok{background:var(--success-bg);color:var(--success);}
 .eng-badge-warn{background:var(--warn-bg);color:var(--warn);}
@@ -160,6 +164,16 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .src-badge.default{background:var(--bg-surface);color:var(--text-muted);border:1px solid var(--border-light);}
 .cfg-section-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);padding:6px 0 2px;border-bottom:1px solid var(--border-light);margin-bottom:2px;}
 .duckdb-hdr{display:flex;align-items:center;justify-content:space-between;gap:6px;}
+.dc-settings-list{padding:4px 0 0;}
+.dc-row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border-light);}
+.dc-row-label{min-width:0;}
+.dc-row-name{font-size:12px;font-weight:600;color:var(--text);}
+.dc-row-desc{font-size:10px;color:var(--text-muted);margin-top:1px;}
+.dc-row-input{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.dc-src-pill{font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;white-space:nowrap;min-width:40px;text-align:center;}
+.dc-src-pill.src-redis{background:rgba(28,150,202,.1);color:var(--primary);border:1px solid rgba(28,150,202,.2);}
+.dc-src-pill.src-env{background:rgba(217,119,6,.08);color:#d97706;border:1px solid rgba(217,119,6,.2);}
+.dc-src-pill.src-default{background:var(--bg-surface);color:var(--text-muted);border:1px solid var(--border-light);}
 .btn-edit-cfg{border:none;background:transparent;color:var(--text-muted);cursor:pointer;font-size:10px;padding:2px 5px;border-radius:4px;transition:var(--transition);}
 .btn-edit-cfg:hover{color:var(--primary);background:var(--primary-light);}
 
@@ -181,12 +195,11 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     <div style="flex:1;"></div>
     <span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);" id="engLastRefresh"></span>
     <button class="btn-sm" id="btnRefresh"><i class="fas fa-rotate"></i> Refresh</button>
-    <button class="btn-sm btn-primary" id="btnNewEngine"><i class="fas fa-plus"></i> Add Spark pool</button>
   </header>
 
   <div class="eng-scroll">
-    <div class="eng-grid" id="engineGrid">
-      <div style="padding:40px;text-align:center;color:var(--text-muted);grid-column:1/-1;">
+    <div class="eng-list" id="engineGrid">
+      <div style="padding:40px;text-align:center;color:var(--text-muted);">
         <i class="fas fa-circle-notch eng-spin" style="font-size:20px;margin-bottom:8px;display:block;"></i> Loading engines…
       </div>
     </div>
@@ -219,29 +232,41 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 <div class="toast" id="toast"></div>
 
 <!-- DuckDB Config Modal -->
-<div class="modal-backdrop" id="modalDuckdb"><div class="modal-card" style="border-left-color:var(--purple);width:620px;">
-  <div class="modal-head"><div class="modal-title-wrap"><div class="modal-icon" style="background:rgba(124,58,237,.1);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-database"></i></div><div><div class="modal-title">DuckDB Engine Configuration</div><div class="modal-sub">Runtime settings stored in Redis. Empty fields fall back to env vars or defaults.</div></div></div><button class="btn-sm" id="btnDuckdbClose"><i class="fas fa-times"></i></button></div>
-
-  <div style="margin-bottom:8px;"><div class="cfg-section-title" style="font-size:10px;padding:0 0 6px;">Engine Auto-Pick Thresholds</div></div>
-  <div class="grid">
-    <div class="field"><div class="form-label"><span>Lite max bytes</span><span class="form-help" id="dcHintLite"></span></div><input class="form-control form-control-sm" id="dcLiteMax" type="number" min="0" style="font-family:var(--mono);" placeholder="104857600"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Upper bound (bytes) for DuckDB Lite in AUTO mode</div></div>
-    <div class="field"><div class="form-label"><span>Spark min bytes</span><span class="form-help" id="dcHintSpark"></span></div><input class="form-control form-control-sm" id="dcSparkMin" type="number" min="0" style="font-family:var(--mono);" placeholder="10737418240"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Lower bound (bytes) for Spark in AUTO mode</div></div>
-    <div class="field"><div class="form-label"><span>Freshness (sec)</span><span class="form-help" id="dcHintFresh"></span></div><input class="form-control form-control-sm" id="dcFreshness" type="number" min="0" style="font-family:var(--mono);" placeholder="300"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Seconds until data is considered "stable" for Pro caching</div></div>
+<div class="modal-backdrop" id="modalDuckdb"><div class="modal-card" style="border-left-color:var(--purple);width:480px;">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--border-light);">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div style="width:28px;height:28px;border-radius:8px;background:rgba(124,58,237,.08);display:flex;align-items:center;justify-content:center;"><i class="fas fa-database" style="font-size:12px;color:var(--purple);"></i></div>
+      <div><div style="font-size:14px;font-weight:700;">DuckDB runtime</div><div style="font-size:11px;color:var(--text-muted);">Stored in Redis · empty fields fall back to env / defaults</div></div>
+    </div>
+    <button class="btn-sm" id="btnDuckdbClose" style="padding:4px 6px;"><i class="fas fa-times"></i></button>
   </div>
 
-  <div style="margin:12px 0 8px;"><div class="cfg-section-title" style="font-size:10px;padding:0 0 6px;">DuckDB Connection</div></div>
-  <div class="grid">
-    <div class="field"><div class="form-label"><span>Memory limit</span><span class="form-help" id="dcHintMem"></span></div><input class="form-control form-control-sm" id="dcMemory" style="font-family:var(--mono);" placeholder="1GB"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">DuckDB PRAGMA memory_limit (e.g. 8GB, 512MB)</div></div>
-    <div class="field"><div class="form-label"><span>IO multiplier</span><span class="form-help" id="dcHintIO"></span></div><input class="form-control form-control-sm" id="dcIOMult" type="number" min="1" max="20" style="font-family:var(--mono);" placeholder="3"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">CPU cores × multiplier = IO threads (default 3)</div></div>
-    <div class="field"><div class="form-label"><span>Threads</span><span class="form-help" id="dcHintThreads"></span></div><input class="form-control form-control-sm" id="dcThreads" type="number" min="0" style="font-family:var(--mono);" placeholder="auto"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Explicit thread count (empty = auto-derived)</div></div>
-    <div class="field"><div class="form-label"><span>HTTP timeout (sec)</span><span class="form-help" id="dcHintHTTP"></span></div><input class="form-control form-control-sm" id="dcHttpTimeout" type="number" min="1" style="font-family:var(--mono);" placeholder="30"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">DuckDB http_timeout for S3/HTTP reads</div></div>
-    <div class="field" style="grid-column:1/-1;"><div class="form-label"><span>External cache size</span><span class="form-help" id="dcHintCache"></span></div><input class="form-control form-control-sm" id="dcCacheSize" style="font-family:var(--mono);" placeholder="e.g. 50GB (empty = disabled)"/><div style="font-size:9px;color:var(--text-muted);margin-top:3px;">Disk-level data block cache (DuckDB ≥ 1.3). Leave empty to disable.</div></div>
+  <div class="dc-settings-list">
+    <div class="dc-row">
+      <div class="dc-row-label"><div class="dc-row-name">Memory limit</div><div class="dc-row-desc">PRAGMA memory_limit</div></div>
+      <div class="dc-row-input"><input class="form-control form-control-sm" id="dcMemory" style="width:100px;text-align:right;font-family:var(--mono);font-size:12px;" placeholder="1GB"/><span class="dc-src-pill" id="dcHintMem"></span></div>
+    </div>
+    <div class="dc-row">
+      <div class="dc-row-label"><div class="dc-row-name">Threads</div><div class="dc-row-desc">Worker thread count</div></div>
+      <div class="dc-row-input"><input class="form-control form-control-sm" id="dcThreads" type="number" min="0" style="width:100px;text-align:right;font-family:var(--mono);font-size:12px;" placeholder="auto"/><span class="dc-src-pill" id="dcHintThreads"></span></div>
+    </div>
+    <div class="dc-row">
+      <div class="dc-row-label"><div class="dc-row-name">IO multiplier</div><div class="dc-row-desc">CPU cores × N = IO threads</div></div>
+      <div class="dc-row-input"><input class="form-control form-control-sm" id="dcIOMult" type="number" min="1" max="20" style="width:100px;text-align:right;font-family:var(--mono);font-size:12px;" placeholder="3"/><span class="dc-src-pill" id="dcHintIO"></span></div>
+    </div>
+    <div class="dc-row">
+      <div class="dc-row-label"><div class="dc-row-name">HTTP timeout</div><div class="dc-row-desc">S3/HTTP read timeout (seconds)</div></div>
+      <div class="dc-row-input"><input class="form-control form-control-sm" id="dcHttpTimeout" type="number" min="1" style="width:100px;text-align:right;font-family:var(--mono);font-size:12px;" placeholder="30"/><span class="dc-src-pill" id="dcHintHTTP"></span></div>
+    </div>
+    <div class="dc-row" style="border-bottom:none;">
+      <div class="dc-row-label"><div class="dc-row-name">Disk cache</div><div class="dc-row-desc">External block cache (DuckDB ≥ 1.3)</div></div>
+      <div class="dc-row-input"><input class="form-control form-control-sm" id="dcCacheSize" style="width:100px;text-align:right;font-family:var(--mono);font-size:12px;" placeholder="disabled"/><span class="dc-src-pill" id="dcHintCache"></span></div>
+    </div>
   </div>
 
-  <div class="modal-footer">
-    <div class="left"><span class="error" id="dcError" style="display:none;"></span></div>
+  <div style="display:flex;justify-content:space-between;align-items:center;padding-top:14px;border-top:1px solid var(--border-light);">
+    <div style="display:flex;align-items:center;gap:8px;"><button class="btn-sm" id="btnDuckdbReset" style="color:var(--error);border-color:rgba(239,68,68,.3);"><i class="fas fa-rotate-left"></i> Reset</button><span class="error" id="dcError" style="display:none;"></span></div>
     <div style="display:flex;gap:6px;">
-      <button class="btn-sm" id="btnDuckdbReset" style="color:var(--error);border-color:rgba(239,68,68,.3);" title="Clear all Redis overrides"><i class="fas fa-rotate-left"></i> Reset to Defaults</button>
       <button class="btn-sm" id="btnDuckdbCancel">Cancel</button>
       <button class="btn-sm btn-primary" id="btnDuckdbSave" style="background:var(--purple);border-color:var(--purple);"><i class="fas fa-save"></i> Save</button>
     </div>
@@ -263,6 +288,32 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   window.engOnSuperChange=function(val){if(!val)return;var p=val.split("/");if(p.length<2)return;var org=p[0].trim(),sup=p[1].trim();if(!org||!sup)return;var r=root();if(r){r.dataset.org=org;r.dataset.sup=sup;}selectedPool=null;connStatus={};loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();};
 
   var pools=[],selectedPool=null,searchQ="",connStatus={};
+  var fixedTestStatus={},fixedTestMsg={};
+
+  function fixedTestRow(status,msg){
+    if(status==="unknown")return '';
+    var cls=status==="ok"?"eng-test-ok":status==="fail"?"eng-test-fail":"eng-test-testing";
+    var icon=status==="ok"?"fa-check-circle":status==="fail"?"fa-times-circle":"fa-circle-notch eng-spin";
+    var label=status==="ok"?"OK":status==="fail"?"Failed":"Testing…";
+    return '<span class="eng-test-inline '+cls+'"><i class="fas '+icon+'" style="font-size:9px;"></i> '+label+(msg?' — '+esc(msg):'')+'</span>';
+  }
+
+  async function testFixedEngine(engine){
+    var c=ctx();fixedTestStatus[engine]="testing";fixedTestMsg[engine]="";renderEngineCards();
+    try{
+      if(engine==="spark"){
+        if(!pools.length){fixedTestStatus[engine]="fail";fixedTestMsg[engine]="No pools configured";renderEngineCards();return;}
+        var p=pools.find(function(x){return x.status==="active";})||pools[0];
+        var payload={org:c.org,sup:c.sup,kind:"spark-thrift",thrift_host:p.thrift_host||"",thrift_port:p.thrift_port||10000};
+        var js=await postJSON("/api/v1/compute/test-connection",payload);
+        fixedTestStatus[engine]=js&&js.ok?"ok":"fail";fixedTestMsg[engine]=(js&&js.message)||"";
+      }else{
+        var js=await postJSON("/api/v1/compute/test-connection",{org:c.org,sup:c.sup,kind:"in-process"});
+        fixedTestStatus[engine]=js&&js.ok?"ok":"fail";fixedTestMsg[engine]=(js&&js.message)||"";
+      }
+    }catch(e){fixedTestStatus[engine]="fail";fixedTestMsg[engine]=e.message||"Error";}
+    renderEngineCards();
+  }
 
   function filteredPools(){var items=pools;var q=(searchQ||"").trim().toLowerCase();if(q)items=items.filter(function(p){return(p.name||"").toLowerCase().indexOf(q)>=0||(p.thrift_host||"").toLowerCase().indexOf(q)>=0;});return items;}
 
@@ -272,61 +323,70 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
     if(!grid)return;
     var html="";
 
-    // DuckDB Lite card
+    // DuckDB Lite row
     var liteCfg=duckdbCfg||{};
     var liteMax=liteCfg.engine_lite_max_bytes?liteCfg.engine_lite_max_bytes:{};
     var lMem=liteCfg.duckdb_memory_limit?liteCfg.duckdb_memory_limit:{};
     var lCache=liteCfg.duckdb_external_cache_size?liteCfg.duckdb_external_cache_size:{};
     var lIO=liteCfg.duckdb_io_multiplier?liteCfg.duckdb_io_multiplier:{};
-    html+='<div class="eng-card">';
-    html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(124,58,237,.06);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-bolt"></i></div><div><div class="eng-card-name">DuckDB Lite</div><div class="eng-card-sub">In-process, ephemeral</div></div></div>';
-    html+='<div class="eng-chip eng-chip-purple"><i class="fas fa-circle" style="font-size:5px;"></i> Primary · ≤ '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</div>';
-    html+='<div class="eng-kv"><span class="k">Memory</span><span class="v">'+(lMem.value||"1GB")+'</span></div>';
-    html+='<div class="eng-kv"><span class="k">Cache</span><span class="v">'+(lCache.value||"off")+'</span></div>';
-    html+='<div class="eng-kv"><span class="k">IO multiplier</span><span class="v">×'+(lIO.value||"3")+'</span></div>';
-    html+='<div class="eng-card-actions"><button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button></div>';
+    var liteTs=fixedTestStatus["duckdb-lite"]||"unknown";
+    var liteMsg=fixedTestMsg["duckdb-lite"]||"";
+    html+='<div class="eng-row">';
+    html+='<div class="eng-row-icon" style="background:rgba(124,58,237,.06);border-color:rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-bolt"></i></div>';
+    html+='<div class="eng-row-body">';
+    html+='<div class="eng-row-top"><span class="eng-row-name">DuckDB Lite</span><span class="eng-row-sub">In-process, ephemeral</span>';
+    html+='<span class="eng-chip eng-chip-purple"><i class="fas fa-circle" style="font-size:5px;"></i> Primary · ≤ '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</span></div>';
+    html+='<div class="eng-meta"><span>Memory: <strong>'+(lMem.value||"1GB")+'</strong></span>';
+    html+='<span>Cache: <strong>'+(lCache.value||"off")+'</strong></span>';
+    html+='<span>IO mult: <strong>×'+(lIO.value||"3")+'</strong></span></div>';
+    html+='</div>';
+    html+='<div class="eng-row-actions">'+fixedTestRow(liteTs,liteMsg);
+    html+='<button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button>';
+    html+='<button class="btn-sm btn-test eng-test-fixed" data-engine="duckdb-lite"><i class="fas fa-plug-circle-check"></i> Test</button></div>';
     html+='</div>';
 
-    // DuckDB Pro card
+    // DuckDB Pro row
     var freshCfg=liteCfg.engine_freshness_sec?liteCfg.engine_freshness_sec:{};
-    html+='<div class="eng-card">';
-    html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(28,150,202,.06);border-color:rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-database"></i></div><div><div class="eng-card-name">DuckDB Pro</div><div class="eng-card-sub">Persistent, cached views</div></div></div>';
-    html+='<div class="eng-chip eng-chip-blue"><i class="fas fa-circle" style="font-size:5px;"></i> Cached · stable data</div>';
-    html+='<div class="eng-kv"><span class="k">Freshness</span><span class="v">'+(freshCfg.value||"300")+'s</span></div>';
-    html+='<div class="eng-kv"><span class="k">Memory</span><span class="v">'+(lMem.value||"1GB")+'</span></div>';
-    html+='<div class="eng-kv"><span class="k">Threshold</span><span class="v">> '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</span></div>';
-    html+='<div class="eng-card-actions"><button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button></div>';
+    var proTs=fixedTestStatus["duckdb-pro"]||"unknown";
+    var proMsg=fixedTestMsg["duckdb-pro"]||"";
+    html+='<div class="eng-row">';
+    html+='<div class="eng-row-icon" style="background:rgba(28,150,202,.06);border-color:rgba(28,150,202,.2);color:var(--primary);"><i class="fas fa-database"></i></div>';
+    html+='<div class="eng-row-body">';
+    html+='<div class="eng-row-top"><span class="eng-row-name">DuckDB Pro</span><span class="eng-row-sub">Persistent, cached views</span>';
+    html+='<span class="eng-chip eng-chip-blue"><i class="fas fa-circle" style="font-size:5px;"></i> Cached · stable data</span></div>';
+    html+='<div class="eng-meta"><span>Freshness: <strong>'+(freshCfg.value||"300")+'s</strong></span>';
+    html+='<span>Memory: <strong>'+(lMem.value||"1GB")+'</strong></span>';
+    html+='<span>Threshold: <strong>> '+(liteMax.value?fmtBytes(liteMax.value):"100 MB")+'</strong></span></div>';
+    html+='</div>';
+    html+='<div class="eng-row-actions">'+fixedTestRow(proTs,proMsg);
+    html+='<button class="btn-sm eng-cfg-duckdb"><i class="fas fa-pen"></i> Configure</button>';
+    html+='<button class="btn-sm btn-test eng-test-fixed" data-engine="duckdb-pro"><i class="fas fa-plug-circle-check"></i> Test</button></div>';
     html+='</div>';
 
-    // Spark pool cards
-    var items=filteredPools();
-    items.forEach(function(p){
-      var cs=connStatus[p.id]||"unknown";
-      var statusColor=p.status==="active"?"var(--success)":p.status==="draining"?"var(--warn)":"var(--error)";
-      var chipCls=p.status==="active"?"eng-chip-ok":p.status==="draining"?"eng-chip-warn":"eng-chip-err";
-      var connLabel=cs==="ok"?"Connected":cs==="fail"?"Failed":cs==="testing"?"Testing…":"Not tested";
-      var connIcon=cs==="ok"?"fa-check-circle":cs==="fail"?"fa-times-circle":cs==="testing"?"fa-circle-notch eng-spin":"fa-circle";
-      var connColor=cs==="ok"?"var(--success)":cs==="fail"?"var(--error)":"var(--text-muted)";
-      html+='<div class="eng-card" data-pool-id="'+esc(p.id)+'">';
-      html+='<div class="eng-card-hdr"><div class="eng-card-icon" style="background:rgba(217,119,6,.06);border-color:rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-server"></i></div><div><div class="eng-card-name">'+esc(p.name||"Spark Pool")+'</div><div class="eng-card-sub">'+esc(p.thrift_host||"—")+':'+esc(String(p.thrift_port||10000))+'</div></div></div>';
-      html+='<div class="eng-chip '+chipCls+'"><i class="fas fa-circle" style="font-size:5px;"></i> '+esc(p.status||"active")+'</div>';
-      html+='<div class="eng-kv"><span class="k">Connection</span><span class="v" style="color:'+connColor+';display:flex;align-items:center;gap:4px;"><i class="fas '+connIcon+'" style="font-size:9px;"></i> '+connLabel+'</span></div>';
-      if(p.min_bytes)html+='<div class="eng-kv"><span class="k">Min size</span><span class="v">'+fmtBytes(p.min_bytes)+'</span></div>';
-      if(p.max_bytes)html+='<div class="eng-kv"><span class="k">Max size</span><span class="v">'+fmtBytes(p.max_bytes)+'</span></div>';
-      html+='<div class="eng-card-actions">';
-      html+='<button class="btn-sm eng-edit-pool" data-pid="'+esc(p.id)+'"><i class="fas fa-pen"></i> Edit</button>';
-      html+='<button class="btn-sm eng-test-pool" data-pid="'+esc(p.id)+'"><i class="fas fa-plug-circle-check"></i> Test</button>';
-      html+='<button class="btn-sm eng-del-pool" data-pid="'+esc(p.id)+'" style="color:var(--error);"><i class="fas fa-trash"></i></button>';
-      html+='</div></div>';
-    });
+    // Spark SQL row
+    var sparkMin=liteCfg.engine_spark_min_bytes?liteCfg.engine_spark_min_bytes:{};
+    var sparkTs=fixedTestStatus["spark"]||"unknown";
+    var sparkMsg=fixedTestMsg["spark"]||"";
+    var activePools=pools.filter(function(p){return p.status==="active";}).length;
+    var sparkPool=pools.find(function(x){return x.status==="active";})||pools[0];
+    html+='<div class="eng-row">';
+    html+='<div class="eng-row-icon" style="background:rgba(217,119,6,.06);border-color:rgba(217,119,6,.2);color:var(--amber);"><i class="fas fa-server"></i></div>';
+    html+='<div class="eng-row-body">';
+    html+='<div class="eng-row-top"><span class="eng-row-name">Spark SQL</span><span class="eng-row-sub">'+(sparkPool?esc(sparkPool.thrift_host||"—")+':'+esc(String(sparkPool.thrift_port||10000)):'Not configured')+'</span>';
+    html+='<span class="eng-chip '+(activePools?'eng-chip-ok':'eng-chip-warn')+'"><i class="fas fa-circle" style="font-size:5px;"></i> '+(activePools?activePools+' active pool'+(activePools>1?'s':''):'No active pools')+'</span></div>';
+    html+='<div class="eng-meta"><span>Threshold: <strong>≥ '+(sparkMin.value?fmtBytes(sparkMin.value):"10 GB")+'</strong></span></div>';
+    html+='</div>';
+    html+='<div class="eng-row-actions">'+fixedTestRow(sparkTs,sparkMsg);
+    if(sparkPool)html+='<button class="btn-sm eng-cfg-spark"><i class="fas fa-pen"></i> Configure</button>';
+    html+='<button class="btn-sm btn-test eng-test-fixed" data-engine="spark"><i class="fas fa-plug-circle-check"></i> Test</button></div>';
+    html+='</div>';
 
     grid.innerHTML=html;
 
     // Wire card buttons
     grid.querySelectorAll(".eng-cfg-duckdb").forEach(function(btn){btn.addEventListener("click",function(){openDuckdbModal();});});
-    grid.querySelectorAll(".eng-edit-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p)openSqlModal(p);});});
-    grid.querySelectorAll(".eng-test-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p){testPoolInline(p);toast("Testing "+p.name+"…");}});});
-    grid.querySelectorAll(".eng-del-pool").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.id===btn.dataset.pid;});if(p)deletePool(p);});});
+    grid.querySelectorAll(".eng-cfg-spark").forEach(function(btn){btn.addEventListener("click",function(){var p=pools.find(function(x){return x.status==="active";})||pools[0];if(p)openSqlModal(p);});});
+    grid.querySelectorAll(".eng-test-fixed").forEach(function(btn){btn.addEventListener("click",function(){testFixedEngine(btn.dataset.engine);});});
 
     // Update topbar badge
     updateEngBadge();
@@ -338,8 +398,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   function updateEngBadge(){
     var badge=document.getElementById("engStatusBadge");if(!badge)return;
-    var total=2+pools.length;
+    var total=3;
     var ok=2;// DuckDB Lite + Pro always online
+    if(pools.filter(function(p){return p.status==="active";}).length)ok++;// Spark counts if any active pool
     pools.forEach(function(p){if(connStatus[p.id]==="ok")ok++;});
     var tested=Object.keys(connStatus).length;
     if(!pools.length&&!tested){badge.className="eng-badge eng-badge-ok";badge.innerHTML='<i class="fas fa-check-circle"></i> '+total+' engines online';}
@@ -392,8 +453,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   });
   document.getElementById("modalSql").addEventListener("click",function(ev){if(ev.target===document.getElementById("modalSql"))sqlModalHide();});
 
-  document.getElementById("btnNewEngine").addEventListener("click",function(){openSqlModal(null);});
-  document.getElementById("btnRefresh").addEventListener("click",function(){connStatus={};loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();});
+  document.getElementById("btnRefresh").addEventListener("click",function(){connStatus={};fixedTestStatus={};fixedTestMsg={};loadPools().catch(function(e){toast(e.message);});loadDuckdbConfig();});
 
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"){var el=document.getElementById("modalSql");if(el&&el.style.display==="flex")el.style.display="none";var el2=document.getElementById("modalDuckdb");if(el2&&el2.style.display==="flex")el2.style.display="none";}});
 
@@ -402,12 +462,9 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 
   // Field definitions: id → {redis key, human label, format fn}
   var DC_FIELDS=[
-    {key:"engine_lite_max_bytes",  input:"dcLiteMax",     label:"Lite max",    hint:"dcHintLite",    fmt:function(v){return v?fmtBytes(v):"—";}},
-    {key:"engine_spark_min_bytes", input:"dcSparkMin",    label:"Spark min",   hint:"dcHintSpark",   fmt:function(v){return v?fmtBytes(v):"—";}},
-    {key:"engine_freshness_sec",   input:"dcFreshness",   label:"Freshness",   hint:"dcHintFresh",   fmt:function(v){return v?(v+"s"):"—";}},
     {key:"duckdb_memory_limit",    input:"dcMemory",      label:"Memory",      hint:"dcHintMem",     fmt:function(v){return v||"—";}},
-    {key:"duckdb_io_multiplier",   input:"dcIOMult",      label:"IO mult",     hint:"dcHintIO",      fmt:function(v){return v?("×"+v):"—";}},
     {key:"duckdb_threads",         input:"dcThreads",     label:"Threads",     hint:"dcHintThreads", fmt:function(v){return v||"auto";}},
+    {key:"duckdb_io_multiplier",   input:"dcIOMult",      label:"IO mult",     hint:"dcHintIO",      fmt:function(v){return v?("×"+v):"—";}},
     {key:"duckdb_http_timeout",    input:"dcHttpTimeout", label:"HTTP timeout",hint:"dcHintHTTP",    fmt:function(v){return v?(v+"s"):"—";}},
     {key:"duckdb_external_cache_size",input:"dcCacheSize",label:"Disk cache",  hint:"dcHintCache",   fmt:function(v){return v||"off";}}
   ];
@@ -437,18 +494,17 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   }
 
   function openDuckdbModal(){
-    // Populate inputs from current config
     DC_FIELDS.forEach(function(f){
       var el=document.getElementById(f.input);if(!el)return;
       var c=duckdbCfg&&duckdbCfg[f.key]?duckdbCfg[f.key]:{};
-      // Show the Redis value if present; otherwise leave empty (placeholder shows default)
       el.value=(c.source==="redis")?c.value:"";
-      // Show hint: current source
       var hintEl=document.getElementById(f.hint);
       if(hintEl){
-        if(c.source==="env")hintEl.textContent="env: "+c.value;
-        else if(c.source==="default"&&c.default)hintEl.textContent="default: "+c.default;
-        else hintEl.textContent="";
+        var src=c.source||"default";
+        var val=c.value||c.default||"";
+        hintEl.className="dc-src-pill src-"+src;
+        hintEl.textContent=src+(val?" "+val:"");
+        hintEl.style.display=val?"":"none";
       }
     });
     var errEl=document.getElementById("dcError");if(errEl){errEl.style.display="none";errEl.textContent="";}
