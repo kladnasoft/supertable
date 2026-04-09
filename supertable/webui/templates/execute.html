@@ -1016,6 +1016,26 @@
       _persistExecSessions();
     }
 
+    function _maybeOpenLeafSession() {
+      if (getURLParameter('new') !== '1') return;
+      var leaf = getURLParameter('leaf');
+      if (!leaf) return;
+      var sup = (typeof defaultSuperName !== 'undefined' && defaultSuperName) ? defaultSuperName : '';
+      var query = sup ? 'SELECT * FROM ' + sup + '.' + leaf + ' LIMIT 1000' : 'SELECT * FROM ' + leaf + ' LIMIT 1000';
+      __saveActiveExecSessionState();
+      var s = __createExecSession({ name: leaf, query: query });
+      __execSessions.push(s);
+      __activeExecSessionId = s.id;
+      __renderExecTabs();
+      __resetUIForNewSession(s);
+      _persistExecSessions();
+      // Clean URL to prevent re-triggering on refresh
+      var cleanUrl = new URL(window.location);
+      cleanUrl.searchParams.delete('new');
+      cleanUrl.searchParams.delete('leaf');
+      window.history.replaceState({}, '', cleanUrl.toString());
+    }
+
     function __initExecSessions() {
       const addBtn = document.getElementById('btnNewExecution');
       const host = document.getElementById('openExecTabs');
@@ -1032,6 +1052,8 @@
         // Apply the active session state once the editor is ready
         const _applyRestored = function () {
           __applyExecSessionState(__getActiveExecSession());
+          // If navigated from tables with new=1, open a new tab with the leaf query
+          _maybeOpenLeafSession();
         };
         if (window.editor) {
           _applyRestored();
@@ -1049,9 +1071,11 @@
         return;
       }
 
+      var _hasLeaf = !!getURLParameter('leaf');
+      var _initQuery = _hasLeaf ? __buildDefaultExecutionQuery() : (window.editor ? window.editor.getValue() : __buildDefaultExecutionQuery());
       const first = __createExecSession({
-        name: 'Execution 1',
-        query: window.editor ? window.editor.getValue() : __buildDefaultExecutionQuery()
+        name: _hasLeaf ? getURLParameter('leaf') : 'Execution 1',
+        query: _initQuery
       });
 
       __execSessions.push(first);
@@ -1059,6 +1083,13 @@
 
       __renderExecTabs();
       _persistExecSessions();
+      // Clean URL params to prevent re-triggering on refresh
+      if (getURLParameter('new') === '1' || getURLParameter('leaf')) {
+        var cleanUrl = new URL(window.location);
+        cleanUrl.searchParams.delete('new');
+        cleanUrl.searchParams.delete('leaf');
+        window.history.replaceState({}, '', cleanUrl.toString());
+      }
     }
 
     function updateTenantSummary(superMeta) {

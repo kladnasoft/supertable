@@ -139,17 +139,34 @@
     .cc-detail-subtitle { font-size: 11px; color: var(--text-muted); }
 
     .cc-detail-tabs {
-      display: flex; gap: 0; padding: 6px 16px; background: var(--panel-bg);
+      display: flex; gap: 0; padding: 7px 14px; background: var(--panel-bg);
       border-bottom: 1px solid var(--panel-border); flex-shrink: 0; align-items: center;
+      overflow-x: auto; scrollbar-width: none;
     }
+    .cc-detail-tabs::-webkit-scrollbar { display: none; }
     .cc-dtab {
-      display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 6px;
-      cursor: pointer; transition: all .15s; border: 1px solid transparent;
-      white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-muted);
+      display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 8px;
+      cursor: pointer; transition: all .15s;
+      white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text-secondary);
     }
-    .cc-dtab:hover { background: var(--bg-hover); border-color: var(--panel-border); color: var(--text-secondary); }
-    .cc-dtab.active { background: var(--primary-light); border-color: var(--primary-color); color: var(--primary-color); }
-    .cc-dtab-sep { width: 1px; height: 20px; background: var(--panel-border); margin: 0 4px; flex-shrink: 0; }
+    .cc-dtab:hover { background: var(--bg-hover); }
+    .cc-dtab.active { background: var(--primary-light); color: var(--primary-color); }
+    .cc-dtab .sicon {
+      width: 26px; height: 26px; border-radius: 7px; display: inline-flex; align-items: center;
+      justify-content: center; font-size: 11px; flex-shrink: 0;
+    }
+    .cc-dtab-sep { width: 1px; height: 20px; background: var(--panel-border); margin: 0 2px; flex-shrink: 0; }
+    /* detail header tiles */
+    .cc-tile {
+      flex: 1; background: var(--panel-bg); border: 1px solid var(--panel-border);
+      border-radius: var(--radius); padding: 10px 12px; display: flex; align-items: center; gap: 10px;
+    }
+    .cc-tile .tile-icon {
+      width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center;
+      justify-content: center; font-size: 12px; flex-shrink: 0;
+    }
+    .cc-tile .tile-val { font-size: 17px; font-weight: 800; font-family: var(--mono); line-height: 1; }
+    .cc-tile .tile-lbl { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); margin-top: 2px; }
     .cc-detail-content { flex: 1; overflow: auto; background: var(--bg); }
     .cc-dpanel { display: none; padding: 16px; }
     .cc-dpanel.active { display: block; }
@@ -439,35 +456,38 @@
       var freshLabel = fresh === 'fresh' ? 'Fresh' : fresh === 'aging' ? 'Aging' : 'Stale';
       var freshCls = fresh === 'fresh' ? 'green' : fresh === 'aging' ? 'amber' : 'red';
 
-      // Header — compact dense layout
+      // Header — mini cards + unified freshness
       var safeName = (t.name || '').replace(/'/g, "\\'");
+      var freshColor=freshCls==='green'?'#059669':freshCls==='amber'?'#d97706':'#dc2626';
+      var freshBg=freshCls==='green'?'#ecfdf5':freshCls==='amber'?'#fffbeb':'#fef2f2';
       document.getElementById('ccDetailHeader').innerHTML =
         '<div style="display:flex;align-items:center;gap:6px;">' +
           '<div class="cc-detail-title"><i class="fas fa-table" style="color:var(--primary-color);font-size:14px;"></i> ' + ccEsc(t.name) + '</div>' +
-          '<div class="cc-freshness-dot ' + fresh + '"></div>' +
-          '<span class="cc-detail-subtitle">' + ccTimeAgo(t.updated_utc) + '</span>' +
+          '<div style="display:flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;background:'+freshBg+';font-size:11px;">' +
+            '<span style="width:6px;height:6px;border-radius:50%;background:'+freshColor+';"></span>' +
+            '<span style="font-weight:600;color:'+freshColor+';">' + freshLabel + '</span>' +
+            '<span style="color:'+freshColor+';opacity:.7;">\u00b7 ' + ccTimeAgo(t.updated_utc) + '</span>' +
+          '</div>' +
           '<div style="flex:1;"></div>' +
           '<button class="btn-exec-sm" onclick="goExecuteWithLeaf(\'' + safeName + '\')"><i class="fas fa-terminal" style="font-size:10px;"></i> Query</button>' +
-          ' <button class="btn-danger-sm" onclick="deleteTable(\'' + safeName + '\')"><i class="fas fa-trash" style="font-size:10px;"></i> Delete</button>' +
         '</div>' +
-        '<div style="display:flex;gap:12px;margin-top:8px;font-size:12px;flex-wrap:wrap;">' +
-          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + ccHumanCount(t.rows) + '</strong> rows</span>' +
-          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + ccHumanBytes(t.size) + '</strong> size</span>' +
-          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + (t.files || 0) + '</strong> files</span>' +
-          '<span style="color:var(--text-secondary);"><strong style="color:var(--text-color);font-family:var(--mono);">' + (t.cols_count || t.columns || '—') + '</strong> cols</span>' +
-          '<span style="color:var(--text-secondary);">v<strong style="color:var(--text-color);font-family:var(--mono);">' + (t.snapshot_version != null ? t.snapshot_version : '?') + '</strong></span>' +
-          '<span style="color:' + (freshCls === 'green' ? '#059669' : freshCls === 'amber' ? '#d97706' : '#dc2626') + ';font-weight:600;">' + freshLabel + '</span>' +
+        '<div style="display:flex;gap:8px;margin-top:10px;">' +
+          '<div class="cc-tile"><div class="tile-icon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary-color);"><i class="fas fa-layer-group"></i></div><div><div class="tile-val">' + ccHumanCount(t.rows) + '</div><div class="tile-lbl">Rows</div></div></div>' +
+          '<div class="cc-tile"><div class="tile-icon" style="background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);color:var(--text-secondary);"><i class="fas fa-database"></i></div><div><div class="tile-val">' + ccHumanBytes(t.size) + '</div><div class="tile-lbl">Size</div></div></div>' +
+          '<div class="cc-tile"><div class="tile-icon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-file"></i></div><div><div class="tile-val">' + (t.files || 0) + '</div><div class="tile-lbl">Files</div></div></div>' +
+          '<div class="cc-tile"><div class="tile-icon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:#7c3aed;"><i class="fas fa-columns"></i></div><div><div class="tile-val" id="ccHdrCols">' + (t.cols_count || '\u2014') + '</div><div class="tile-lbl">Cols</div></div></div>' +
+          '<div class="cc-tile"><div class="tile-icon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warning);"><i class="fas fa-heartbeat"></i></div><div><div class="tile-val" id="ccHdrQuality" style="color:var(--text-muted);">\u2014</div><div class="tile-lbl">Quality</div></div></div>' +
         '</div>';
 
-      // Tabs — clean, no action buttons (they're in the header)
+      // Tabs
       document.getElementById('ccDetailTabs').innerHTML =
-        '<div class="cc-dtab active" onclick="ccSwitchDTab(this,\'schema\')"><i class="fas fa-columns" style="font-size:11px;"></i> Schema</div>' +
+        '<div class="cc-dtab active" onclick="ccSwitchDTab(this,\'schema\')"><span class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary-color);"><i class="fas fa-columns"></i></span>Schema</div>' +
         '<div class="cc-dtab-sep"></div>' +
-        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'quality\')"><i class="fas fa-heartbeat" style="font-size:11px;"></i> Quality</div>' +
+        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'quality\')"><span class="sicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-heartbeat"></i></span>Quality</div>' +
         '<div class="cc-dtab-sep"></div>' +
-        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'stats\')"><i class="fas fa-chart-bar" style="font-size:11px;"></i> Stats</div>' +
+        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'stats\')"><span class="sicon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:#d97706;"><i class="fas fa-chart-bar"></i></span>Stats</div>' +
         '<div class="cc-dtab-sep"></div>' +
-        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'settings\')"><i class="fas fa-sliders-h" style="font-size:11px;"></i> Settings</div>';
+        '<div class="cc-dtab" onclick="ccSwitchDTab(this,\'settings\')"><span class="sicon" style="background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);color:var(--text-secondary);"><i class="fas fa-sliders-h"></i></span>Settings</div>';
 
       // Content panels
       var content = document.getElementById('ccDetailContent');
@@ -480,6 +500,16 @@
       ccLoadSchema(t.name);
       ccLoadStats(t.name);
       ccLoadSettings(t.name);
+
+      // Sync left panel row heights with right detail header/tabs
+      requestAnimationFrame(function(){
+        var hdr=document.getElementById('ccDetailHeader');
+        var tabs=document.getElementById('ccDetailTabs');
+        var sum=document.getElementById('ccPanelSummary');
+        var tb=document.querySelector('.cc-list-toolbar');
+        if(hdr&&sum) sum.style.minHeight=hdr.offsetHeight+'px';
+        if(tabs&&tb) tb.style.minHeight=tabs.offsetHeight+'px';
+      });
     }
 
     function ccSwitchDTab(el, name) {
@@ -556,6 +586,9 @@
         var pairs = extractSchemaPairs(schemaRaw);
         window.__cc_schemaPairs[tableName] = pairs;
 
+        // Update header cols card
+        var colsEl=document.getElementById('ccHdrCols');if(colsEl)colsEl.textContent=pairs.length;
+
         if (!pairs.length) {
           panel.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No schema available.</div>';
           return;
@@ -576,17 +609,6 @@
         // Build quality tab
         var t = window.__cc_tables.find(function(x) { return x.name === tableName; });
         var qhtml = '';
-
-        // Summary metrics row
-        qhtml += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:16px;">';
-        qhtml += '<div class="cc-dm" style="border-left:3px solid var(--primary-color);"><div class="cc-dm-label">Columns</div><div class="cc-dm-value">' + pairs.length + '</div></div>';
-        qhtml += '<div class="cc-dm" style="border-left:3px solid var(--success);"><div class="cc-dm-label">Rows</div><div class="cc-dm-value">' + (t ? ccHumanCount(t.rows) : '—') + '</div></div>';
-        var fresh = t ? ccFreshness(t.updated_utc) : 'stale';
-        var freshCls = fresh === 'fresh' ? 'green' : fresh === 'aging' ? 'amber' : 'red';
-        var freshLabel = fresh === 'fresh' ? 'Fresh' : fresh === 'aging' ? 'Aging' : 'Stale';
-        qhtml += '<div class="cc-dm" style="border-left:3px solid ' + (fresh === 'fresh' ? 'var(--success)' : fresh === 'aging' ? 'var(--warning)' : 'var(--error)') + ';"><div class="cc-dm-label">Freshness</div><div class="cc-dm-value ' + freshCls + '">' + freshLabel + '</div></div>';
-        qhtml += '<div class="cc-dm" id="ccQualityScore" style="border-left:3px solid var(--panel-border);"><div class="cc-dm-label">Quality score</div><div class="cc-dm-value" style="color:var(--text-muted);">—</div></div>';
-        qhtml += '</div>';
 
         // Run quality check button
         qhtml += '<div style="margin-bottom:20px;padding:14px;background:var(--bg-surface);border:1px solid var(--border-light);border-radius:8px;">';
@@ -884,6 +906,12 @@
           var scoreCls = score >= 85 ? 'green' : score >= 65 ? 'amber' : 'red';
           scoreEl.innerHTML = '<div class="cc-dm-label">Quality score</div><div class="cc-dm-value ' + scoreCls + '">' + score + '/100</div>';
         }
+        // Update header quality card
+        var hdrQ=document.getElementById('ccHdrQuality');
+        if(hdrQ&&latest.quality_score!=null){
+          var qs=latest.quality_score;var qc=qs>=85?'#059669':qs>=65?'#d97706':'#dc2626';
+          hdrQ.textContent=qs;hdrQ.style.color=qc;
+        }
 
         // Build results display from cached data
         var pairs = window.__cc_schemaPairs[tableName] || [];
@@ -900,13 +928,17 @@
         avgComplete /= colCount;
         avgUnique /= colCount;
 
-        html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:16px;">';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Total rows</div><div class="cc-dm-value">' + Number(total).toLocaleString() + '</div></div>';
-        var compCls = avgComplete >= 90 ? 'green' : avgComplete >= 70 ? 'amber' : 'red';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Avg completeness</div><div class="cc-dm-value ' + compCls + '">' + avgComplete.toFixed(1) + '%</div></div>';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Avg uniqueness</div><div class="cc-dm-value">' + avgUnique.toFixed(1) + '%</div></div>';
-        var issueCls = issueCount === 0 ? 'green' : issueCount <= 2 ? 'amber' : 'red';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Anomalies</div><div class="cc-dm-value ' + issueCls + '">' + issueCount + '</div></div>';
+        html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;">';
+        html += '<div class="cc-tile"><div class="tile-icon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary-color);"><i class="fas fa-layer-group"></i></div><div><div class="tile-val">' + Number(total).toLocaleString() + '</div><div class="tile-lbl">Total rows</div></div></div>';
+        var compCls = avgComplete >= 90 ? 'var(--success)' : avgComplete >= 70 ? 'var(--warning)' : 'var(--error)';
+        var compBg = avgComplete >= 90 ? 'rgba(47,200,159,.08)' : avgComplete >= 70 ? 'rgba(245,166,35,.08)' : 'rgba(229,72,77,.08)';
+        var compBrd = avgComplete >= 90 ? 'rgba(47,200,159,.2)' : avgComplete >= 70 ? 'rgba(245,166,35,.2)' : 'rgba(229,72,77,.2)';
+        html += '<div class="cc-tile"><div class="tile-icon" style="background:'+compBg+';border:1px solid '+compBrd+';color:'+compCls+';"><i class="fas fa-check-circle"></i></div><div><div class="tile-val" style="color:'+compCls+';">' + avgComplete.toFixed(1) + '%</div><div class="tile-lbl">Avg completeness</div></div></div>';
+        html += '<div class="cc-tile"><div class="tile-icon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:#7c3aed;"><i class="fas fa-fingerprint"></i></div><div><div class="tile-val">' + avgUnique.toFixed(1) + '%</div><div class="tile-lbl">Avg uniqueness</div></div></div>';
+        var issueColor = issueCount === 0 ? 'var(--success)' : issueCount <= 2 ? 'var(--warning)' : 'var(--error)';
+        var issueBg = issueCount === 0 ? 'rgba(47,200,159,.08)' : issueCount <= 2 ? 'rgba(245,166,35,.08)' : 'rgba(229,72,77,.08)';
+        var issueBrd = issueCount === 0 ? 'rgba(47,200,159,.2)' : issueCount <= 2 ? 'rgba(245,166,35,.2)' : 'rgba(229,72,77,.2)';
+        html += '<div class="cc-tile"><div class="tile-icon" style="background:'+issueBg+';border:1px solid '+issueBrd+';color:'+issueColor+';"><i class="fas fa-exclamation-triangle"></i></div><div><div class="tile-val" style="color:'+issueColor+';">' + issueCount + '</div><div class="tile-lbl">Anomalies</div></div></div>';
         html += '</div>';
 
         // Anomaly pills
@@ -976,12 +1008,7 @@
         var agg = aggregateStats(statsPayload);
         var resources = parseResourcesFromStats(statsPayload);
 
-        var html = '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:20px;">';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Rows</div><div class="cc-dm-value">' + (agg.rows != null ? Number(agg.rows).toLocaleString() : 'n/a') + '</div></div>';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Columns</div><div class="cc-dm-value">' + (agg.columns || 'n/a') + '</div></div>';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Files</div><div class="cc-dm-value">' + (agg.files || 'n/a') + '</div></div>';
-        html += '<div class="cc-dm"><div class="cc-dm-label">Version</div><div class="cc-dm-value">' + (agg.snapshot_version != null ? agg.snapshot_version : 'n/a') + '</div></div>';
-        html += '</div>';
+        var html = '';
 
         if (resources.length) {
           html += '<h4 style="font-size:14px;font-weight:700;margin-bottom:10px;"><i class="fas fa-file" style="color:var(--primary-color);margin-right:6px;"></i>Files</h4>';
@@ -1023,18 +1050,56 @@
         var chunkMB = cfg.max_memory_chunk_size ? (cfg.max_memory_chunk_size / (1024 * 1024)).toFixed(0) : '';
         var maxFiles = cfg.max_overlapping_files || '';
 
+        var safeName = tableName.replace(/'/g, "\\'");
+        var t = window.__cc_tables ? window.__cc_tables.find(function(x){return x.name===tableName;}) : null;
+        var fileCount = t ? (t.files||0) : 0;
+        var fileSize = t ? ccHumanBytes(t.size) : '—';
+
         panel.innerHTML =
-          '<div style="margin-bottom:14px;font-size:11px;color:var(--text-muted);background:var(--bg-surface);padding:10px 12px;border-radius:6px;border:1px solid var(--border-light);">' +
-          'Leave blank to inherit the global default.</div>' +
-          '<div class="cc-settings-field"><div class="cc-settings-label"><i class="fas fa-memory"></i> Memory chunk size</div>' +
-          '<div style="display:flex;align-items:center;gap:8px;"><input class="cc-settings-input" type="number" id="ccLimitsChunk" value="' + chunkMB + '" placeholder="e.g. 16"><span style="font-size:12px;font-weight:600;color:var(--text-muted);">MB</span></div>' +
-          '<div class="cc-settings-hint">Max bytes loaded per merge chunk.</div></div>' +
-          '<div class="cc-settings-field"><div class="cc-settings-label"><i class="fas fa-layer-group"></i> Max overlapping files</div>' +
-          '<div style="display:flex;align-items:center;gap:8px;"><input class="cc-settings-input" type="number" id="ccLimitsFiles" value="' + maxFiles + '" placeholder="e.g. 100"><span style="font-size:12px;font-weight:600;color:var(--text-muted);">files</span></div>' +
-          '<div class="cc-settings-hint">Triggers compaction at this threshold.</div></div>' +
-          '<div style="margin-top:20px;display:flex;gap:8px;">' +
-          '<button class="btn-exec-sm" onclick="ccSaveSettings(\'' + tableName.replace(/'/g, "\\'") + '\')"><i class="fas fa-save"></i> Save</button>' +
-          '<span id="ccSettingsStatus" style="font-size:12px;color:var(--text-muted);margin-left:8px;line-height:30px;"></span>' +
+          '<div style="display:flex;gap:12px;padding:4px;">' +
+          '<div style="flex:1;background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:16px;">' +
+            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">' +
+              '<div style="width:28px;height:28px;border-radius:7px;background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);display:flex;align-items:center;justify-content:center;"><i class="fas fa-sliders-h" style="font-size:11px;color:var(--primary-color);"></i></div>' +
+              '<div style="font-size:13px;font-weight:600;">Table limits</div>' +
+            '</div>' +
+            '<div style="font-size:11px;color:var(--text-muted);margin-bottom:14px;">Leave blank to inherit global defaults.</div>' +
+            '<div style="margin-bottom:14px;">' +
+              '<div style="font-size:12px;font-weight:600;margin-bottom:5px;">Memory chunk size</div>' +
+              '<div style="display:flex;align-items:center;gap:6px;">' +
+                '<input type="number" id="ccLimitsChunk" value="' + chunkMB + '" placeholder="e.g. 16" style="width:120px;padding:6px 10px;border:1px solid var(--panel-border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--bg-surface);color:var(--text-color);">' +
+                '<span style="font-size:12px;font-weight:600;color:var(--text-muted);">MB</span>' +
+              '</div>' +
+              '<div style="font-size:10px;color:var(--text-muted);margin-top:3px;">Max bytes loaded per merge chunk.</div>' +
+            '</div>' +
+            '<div style="margin-bottom:16px;">' +
+              '<div style="font-size:12px;font-weight:600;margin-bottom:5px;">Max overlapping files</div>' +
+              '<div style="display:flex;align-items:center;gap:6px;">' +
+                '<input type="number" id="ccLimitsFiles" value="' + maxFiles + '" placeholder="e.g. 100" style="width:120px;padding:6px 10px;border:1px solid var(--panel-border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--bg-surface);color:var(--text-color);">' +
+                '<span style="font-size:12px;font-weight:600;color:var(--text-muted);">files</span>' +
+              '</div>' +
+              '<div style="font-size:10px;color:var(--text-muted);margin-top:3px;">Triggers compaction at this threshold.</div>' +
+            '</div>' +
+            '<div style="display:flex;align-items:center;gap:8px;">' +
+              '<button class="btn-exec-sm" onclick="ccSaveSettings(\'' + safeName + '\')"><i class="fas fa-save" style="font-size:10px;"></i> Save</button>' +
+              '<span id="ccSettingsStatus" style="font-size:12px;color:var(--text-muted);"></span>' +
+            '</div>' +
+          '</div>' +
+          '<div style="width:220px;flex-shrink:0;display:flex;flex-direction:column;gap:10px;">' +
+            '<div style="background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:var(--radius);padding:16px;">' +
+              '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">' +
+                '<div style="width:28px;height:28px;border-radius:7px;background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);display:flex;align-items:center;justify-content:center;"><i class="fas fa-compress-arrows-alt" style="font-size:11px;color:#d97706;"></i></div>' +
+                '<div style="font-size:13px;font-weight:600;">Compact</div>' +
+              '</div>' +
+              '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;">Merge small files into larger, optimized parquet files.</div>' +
+              '<button style="width:100%;padding:8px 14px;border-radius:var(--radius-sm);border:1px solid rgba(245,166,35,.3);background:rgba(245,166,35,.08);color:#92400e;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;" onclick="ccCompactTable(\'' + safeName + '\')"><i class="fas fa-compress-arrows-alt" style="font-size:10px;"></i> Compact files</button>' +
+              '<div id="ccCompactStatus" style="font-size:10px;color:var(--text-muted);margin-top:6px;text-align:center;">' + fileCount + ' files \u00b7 ' + fileSize + '</div>' +
+            '</div>' +
+            '<div style="background:var(--panel-bg);border:1px solid rgba(229,72,77,.3);border-radius:var(--radius);padding:16px;">' +
+              '<div style="font-size:12px;font-weight:600;color:#991b1b;margin-bottom:8px;">Danger zone</div>' +
+              '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">Permanently delete this table and all its data.</div>' +
+              '<button style="width:100%;padding:8px 14px;border-radius:var(--radius-sm);border:1px solid rgba(229,72,77,.3);background:rgba(229,72,77,.08);color:#991b1b;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;" onclick="deleteTable(\'' + safeName + '\')"><i class="fas fa-trash" style="font-size:10px;"></i> Delete table</button>' +
+            '</div>' +
+          '</div>' +
           '</div>';
       } catch (e) {
         panel.innerHTML = '<div style="padding:20px;color:var(--error);">Error loading settings: ' + ccEsc(e.message || e) + '</div>';
@@ -1076,6 +1141,21 @@
       }
     }
 
+    async function ccCompactTable(tableName) {
+      var statusEl = document.getElementById('ccCompactStatus');
+      if (statusEl) statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Compacting…';
+      try {
+        var sup = currentSuper || '';
+        await api(META_BASE + '/api/v1/tables/compact?organization=' + encodeURIComponent(ORGANIZATION) +
+          '&super_name=' + encodeURIComponent(sup) + '&table=' + encodeURIComponent(tableName) +
+          '&role_name=' + encodeURIComponent(getActiveRole()), { method: 'POST' });
+        if (statusEl) { statusEl.innerHTML = '<span style="color:#059669;"><i class="fas fa-check"></i> Compacted!</span>'; }
+        setTimeout(function(){ ccRefreshMeta(); }, 500);
+      } catch (e) {
+        if (statusEl) { statusEl.innerHTML = '<span style="color:#dc2626;">' + ccEsc(e.message || 'Compact failed') + '</span>'; }
+      }
+    }
+
     function ccUpdateSummary(tables) {
       var totalRows = 0, totalSize = 0, totalFiles = 0;
       var freshCount = 0, agingCount = 0, staleCount = 0;
@@ -1095,8 +1175,13 @@
       if (el('ccSumFresh')) el('ccSumFresh').textContent = freshCount;
       if (el('ccSumAging')) el('ccSumAging').textContent = agingCount;
       if (el('ccSumStale')) el('ccSumStale').textContent = staleCount;
-      // Topbar summary
-      if (el('ccTopSummary')) el('ccTopSummary').innerHTML = '<strong style="color:var(--text-color);">' + tables.length + '</strong> tables &middot; <strong style="color:var(--text-color);">' + ccHumanCount(totalRows) + '</strong> rows &middot; <strong style="color:var(--text-color);">' + ccHumanBytes(totalSize) + '</strong>';
+      // Left panel summary
+      if (el('ccSumTables2')) el('ccSumTables2').textContent = tables.length;
+      if (el('ccSumRows2')) el('ccSumRows2').textContent = ccHumanCount(totalRows);
+      if (el('ccSumSize2')) el('ccSumSize2').textContent = ccHumanBytes(totalSize);
+      if (el('ccSumFresh2')) el('ccSumFresh2').textContent = freshCount;
+      if (el('ccSumAging2')) el('ccSumAging2').textContent = agingCount;
+      if (el('ccSumStale2')) el('ccSumStale2').textContent = staleCount;
     }
 
 
@@ -2113,6 +2198,7 @@ async function openSchema(simple) {
       url.searchParams.set('org', ORGANIZATION);
       if (sup) url.searchParams.set('sup', sup);
       url.searchParams.set('leaf', simple);
+      url.searchParams.set('new', '1');
       window.location.href = url.toString();
     }
 
@@ -2239,8 +2325,14 @@ function deleteTable(simple) {
         '&role_name=' + encodeURIComponent(getActiveRole()),
         { method: 'DELETE' }
       ).then(() => {
-        // Refresh current super meta/tables
-        loadTenantSuper(sup);
+        // Clear selected table and reset detail panel
+        window.__cc_selectedTable = null;
+        var emptyState = document.getElementById('ccEmptyState');
+        var detailView = document.getElementById('ccDetailView');
+        if (emptyState) emptyState.style.display = '';
+        if (detailView) detailView.style.display = 'none';
+        // Refresh table list
+        ccRefreshMeta();
       }).catch(err => {
         showModal('Delete failed', escapeHtml(err.message || err));
       });
@@ -2464,18 +2556,11 @@ function deleteTable(simple) {
   {% if has_tenant %}
 
 
-  <!-- ═══ TOP BAR ═══ -->
-  <header class="cc-topbar">
-    <span style="font-size:14px;font-weight:700;">Tables</span>
-    <div style="flex:1;"></div>
-    <span id="ccTopSummary" style="font-size:11px;color:var(--text-muted);"></span>
-  </header>
-
   <!-- ═══ METRIC BAR + WIDE LIST / DETAIL SPLIT ═══ -->
   <div class="cc-columns">
 
     <!-- METRIC BAR -->
-    <div class="cc-metric-bar">
+    <div class="cc-metric-bar" style="display:none;">
       <div class="cc-metric-card" style="background:#f8fafc;"><div class="cc-metric-label" style="color:#475569;">Tables</div><div class="cc-metric-value" style="color:#475569;" id="ccSumTables">—</div></div>
       <div class="cc-metric-card" style="background:var(--primary-light);"><div class="cc-metric-label" style="color:var(--secondary-color);">Total rows</div><div class="cc-metric-value" style="color:var(--secondary-color);" id="ccSumRows">—</div></div>
       <div class="cc-metric-card" style="background:#f0fdfa;"><div class="cc-metric-label" style="color:#0f766e;">Total size</div><div class="cc-metric-value" style="color:#0f766e;" id="ccSumSize">—</div></div>
@@ -2489,14 +2574,38 @@ function deleteTable(simple) {
 
       <!-- LEFT: WIDE TABLE LIST -->
       <div class="cc-list-panel">
-        <div class="cc-list-toolbar">
-          <div class="cc-search-wrap">
+        <div id="ccPanelSummary" style="padding:10px 14px;border-bottom:1px solid var(--panel-border);">
+          <div style="display:flex;gap:6px;margin-bottom:8px;">
+            <div style="flex:1;background:var(--bg-surface);border-radius:var(--radius-sm);padding:6px 8px;text-align:center;">
+              <div style="font-size:16px;font-weight:600;font-family:var(--mono);" id="ccSumTables2">&mdash;</div>
+              <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;">tables</div>
+            </div>
+            <div style="flex:1;background:var(--bg-surface);border-radius:var(--radius-sm);padding:6px 8px;text-align:center;">
+              <div style="font-size:16px;font-weight:600;font-family:var(--mono);" id="ccSumRows2">&mdash;</div>
+              <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;">rows</div>
+            </div>
+            <div style="flex:1;background:var(--bg-surface);border-radius:var(--radius-sm);padding:6px 8px;text-align:center;">
+              <div style="font-size:16px;font-weight:600;font-family:var(--mono);" id="ccSumSize2">&mdash;</div>
+              <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;">size</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;font-size:10px;justify-content:center;">
+            <span style="display:flex;align-items:center;gap:3px;"><span style="width:6px;height:6px;border-radius:50%;background:#059669;"></span><span style="color:#059669;font-weight:500;" id="ccSumFresh2">0</span></span>
+            <span style="display:flex;align-items:center;gap:3px;"><span style="width:6px;height:6px;border-radius:50%;background:#d97706;"></span><span style="color:#d97706;font-weight:500;" id="ccSumAging2">0</span></span>
+            <span style="display:flex;align-items:center;gap:3px;"><span style="width:6px;height:6px;border-radius:50%;background:#dc2626;"></span><span style="color:#dc2626;font-weight:500;" id="ccSumStale2">0</span></span>
+          </div>
+        </div>
+        <div class="cc-list-toolbar" style="flex-direction:column;gap:6px;padding:8px 10px;">
+          <div style="display:flex;align-items:center;gap:6px;width:100%;">
+            <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
+            <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);flex-shrink:0;">0</span>
+            <span style="flex:1;"></span>
+            <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh"><i class="fas fa-sync-alt"></i></button>
+          </div>
+          <div class="cc-search-wrap" style="width:100%;">
             <i class="fas fa-search"></i>
             <input id="ccTableFilter" placeholder="Filter tables…" oninput="ccRenderTableList(this.value)"/>
           </div>
-          <button class="cc-sys-toggle" id="ccSysToggle" onclick="ccToggleSystemTables()" title="Show/hide system tables (__*)"><i class="fas fa-eye-slash" style="font-size:9px;"></i> __sys</button>
-          <span id="ccTableCount" style="font-size:11px;font-weight:600;color:var(--text-secondary);flex-shrink:0;">0</span>
-          <button class="cc-icon-btn" id="ccRefreshBtn" onclick="ccRefreshMeta()" title="Refresh"><i class="fas fa-sync-alt"></i></button>
         </div>
         <div class="cc-table-list" id="ccTableList"></div>
       </div>

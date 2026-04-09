@@ -416,11 +416,29 @@ class MetaReader:
                 table_rows = sum(res.get("rows", 0) for res in resources if isinstance(res, dict))
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 
+                # Column count: count distinct column names across all resources
+                _col_names = set()
+                _col_int_max = 0
+                for res in resources:
+                    if isinstance(res, dict):
+                        _cols = res.get("columns")
+                        if isinstance(_cols, list):
+                            for cn in _cols:
+                                if isinstance(cn, str):
+                                    _col_names.add(cn)
+                                elif isinstance(cn, dict) and cn.get("name"):
+                                    _col_names.add(cn["name"])
+                        elif isinstance(_cols, (int, float)) and int(_cols) > _col_int_max:
+                            _col_int_max = int(_cols)
+                table_cols = len(_col_names) if _col_names else _col_int_max
+
                 simple_table_info.append({
                     "name": table,
                     "files": table_files,
                     "rows": table_rows,
                     "size": table_size,
+                    "cols_count": table_cols,
+                    "snapshot_version": (st_data or {}).get("snapshot_version", 0) if isinstance(st_data, dict) else 0,
                     "updated_utc": (st_data or {}).get("last_updated_ms", 0) if isinstance(st_data, dict) else 0,
                 })
 

@@ -264,21 +264,21 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .ops-mcard .ml{font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.03em;}
 
 /* reads layout: chart top, list+detail bottom */
-.reads-hdr{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);flex-wrap:wrap;}
-.reads-pills{display:flex;gap:3px;}
+.ops-hdr{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);flex-wrap:wrap;}
+.ops-pills{display:flex;gap:3px;}
 .src-btn{padding:4px 14px;border-radius:14px;font-size:11px;font-weight:600;border:1px solid var(--border);background:var(--bg-card);color:var(--text-muted);cursor:pointer;transition:var(--transition);}
 .src-btn[data-src="all"].active{background:#e6f4fa;color:#1c96ca;border-color:#1c96ca;}
 .src-btn[data-src="user"].active{background:#eaf3de;color:#3b6d11;border-color:#639922;}
 .src-btn[data-src="system"].active{background:#eeedfe;color:#534ab7;border-color:#7f77dd;}
-.reads-metrics{display:flex;gap:6px;margin-left:auto;}
-.reads-metric{padding:4px 12px;border-radius:6px;background:var(--bg-surface);text-align:center;min-width:60px;}
-.reads-metric .rv{font-size:16px;font-weight:800;font-family:var(--mono);line-height:1.3;}
-.reads-metric .rl{font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;}
-.reads-bottom{flex:1;display:flex;overflow:hidden;min-height:0;}
-.reads-bottom-list{flex:0 0 250px;width:250px;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden;}
-.reads-search{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-muted);}
-.reads-search input{flex:1;border:none;background:transparent;outline:none;font-size:11px;color:var(--text);}
-.reads-bottom-detail{flex:1;overflow-y:auto;padding:14px 16px;}
+.ops-metrics{display:flex;gap:6px;margin-left:auto;}
+.ops-metric{padding:4px 12px;border-radius:6px;background:var(--bg-surface);text-align:center;min-width:60px;}
+.ops-metric .rv{font-size:16px;font-weight:800;font-family:var(--mono);line-height:1.3;}
+.ops-metric .rl{font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;}
+.ops-split{flex:1;display:flex;overflow:hidden;min-height:0;}
+.ops-split-list{flex:0 0 300px;width:300px;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden;}
+.ops-search{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-muted);}
+.ops-search input{flex:1;border:none;background:transparent;outline:none;font-size:11px;color:var(--text);}
+.ops-split-center{flex:1;overflow-y:auto;padding:14px 16px;}
 /* Design C: cards + unified bars + side info */
 .rd-top{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;}
 .rd-card{background:var(--bg-surface);border-radius:var(--radius-sm);padding:7px 10px;}
@@ -310,6 +310,8 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
 .rd-split{display:flex;gap:14px;}
 .rd-split-left{flex:1;min-width:0;}
 .rd-split-right{flex:0 0 220px;display:flex;flex-direction:column;gap:8px;}
+.ops-split-center .rd-split-right{display:none;}
+.ops-split-right{flex:0 0 300px;width:300px;border-left:1px solid var(--border);background:var(--bg-card);display:flex;flex-direction:column;gap:8px;overflow-y:auto;padding:14px 14px;}
 .rd-info-group{background:var(--bg-surface);border-radius:var(--radius);padding:10px 12px;}
 .rd-info-title{font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.03em;}
 .rd-info-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-size:12px;}
@@ -379,15 +381,15 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <div class="bar-row">
     <div class="section-node active" data-section="summary"><span class="sicon" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);color:var(--purple);"><i class="fas fa-mountain-sun"></i></span>Landscape</div>
     <div class="bar-sep"></div>
-    <div class="section-node" data-section="infra"><span class="sicon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warn);"><i class="fas fa-server"></i></span>Infra</div>
+    <div class="section-node" data-section="reads"><span class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-book-open"></i></span>Reads</div>
+    <div class="bar-sep"></div>
+    <div class="section-node" data-section="writes"><span class="sicon" style="background:rgba(122,107,165,.08);border:1px solid rgba(122,107,165,.2);color:#7a6ba5;"><i class="fas fa-pen-to-square"></i></span>Writes</div>
+    <div class="bar-sep"></div>
+    <div class="section-node" data-section="errors"><span class="sicon" style="background:rgba(229,72,77,.08);border:1px solid rgba(229,72,77,.2);color:var(--error);"><i class="fas fa-circle-exclamation"></i></span>Errors</div>
     <div class="bar-sep"></div>
     <div class="section-node" data-section="catalog"><span class="sicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-database"></i></span>Catalog</div>
     <div class="bar-sep"></div>
-    <div class="section-node" data-section="reads"><span class="sicon" style="background:rgba(41,181,232,.08);border:1px solid rgba(41,181,232,.2);color:var(--primary);"><i class="fas fa-book-open"></i></span>Reads<span class="scount" id="countReads"></span></div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="writes"><span class="sicon" style="background:rgba(47,200,159,.08);border:1px solid rgba(47,200,159,.2);color:var(--success);"><i class="fas fa-pen-to-square"></i></span>Writes<span class="scount" id="countWrites"></span></div>
-    <div class="bar-sep"></div>
-    <div class="section-node" data-section="errors"><span class="sicon" style="background:rgba(229,72,77,.08);border:1px solid rgba(229,72,77,.2);color:var(--error);"><i class="fas fa-circle-exclamation"></i></span>Errors<span class="scount" id="countErrors"></span></div>
+    <div class="section-node" data-section="infra"><span class="sicon" style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--warn);"><i class="fas fa-server"></i></span>Infra</div>
   </div>
 
   <!-- SUMMARY — Data Landscape -->
@@ -410,7 +412,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         </div>
       </div>
       <div style="position:relative;">
-        <canvas id="sumLineChart" style="width:100%;height:112px;display:block;cursor:crosshair;"></canvas>
+        <canvas id="sumLineChart" style="width:100%;height:224px;display:block;cursor:crosshair;"></canvas>
         <div id="sumChartTooltip" style="display:none;position:absolute;pointer-events:none;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;font-size:11px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:10;white-space:nowrap;"></div>
       </div>
       <div id="sumChartLabels" style="display:flex;margin-top:4px;"></div>
@@ -577,76 +579,97 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
   <!-- TIMELINE -->
   <!-- READS -->
   <div id="viewReads" class="section-body hidden">
-    <div class="reads-hdr">
-      <div class="reads-pills">
-        <button class="gran-btn active" data-gran="1h" data-op="read">1h</button>
+    <div class="ops-hdr">
+      <div class="ops-pills">
+        <button class="gran-btn" data-gran="1h" data-op="read">1h</button>
         <button class="gran-btn" data-gran="6h" data-op="read">6h</button>
-        <button class="gran-btn" data-gran="24h" data-op="read">24h</button>
+        <button class="gran-btn active" data-gran="24h" data-op="read">24h</button>
         <button class="gran-btn" data-gran="7d" data-op="read">7d</button>
         <button class="gran-btn" data-gran="14d" data-op="read">14d</button>
         <button class="gran-btn" data-gran="28d" data-op="read">28d</button>
       </div>
-      <div class="reads-pills" id="readSourcePills">
+      <div class="ops-pills" id="readSourcePills">
         <button class="src-btn active" data-src="all">All</button>
         <button class="src-btn" data-src="user">User</button>
         <button class="src-btn" data-src="system">System</button>
       </div>
-      <div class="reads-metrics" id="readMetricsStrip"></div>
+      <div id="readOpsCount" style="margin-left:auto;display:flex;align-items:center;gap:7px;background:#e6f4fa;border:1px solid #29B5E8;border-radius:20px;padding:5px 14px 5px 10px;"><span style="width:7px;height:7px;border-radius:50%;background:#29B5E8;box-shadow:0 0 0 3px rgba(41,181,232,.2);flex-shrink:0;"></span><span id="readOpsNum" style="font-size:15px;font-weight:500;color:#147ba3;font-family:var(--mono);"></span><span style="font-size:11px;font-weight:500;color:#1c96ca;">ops</span></div>
     </div>
-    <div id="readChart" style="padding:0 12px;flex-shrink:0;"></div>
-    <div class="reads-bottom">
-      <div class="reads-bottom-list">
-        <div class="reads-search"><i class="fas fa-search"></i><input id="readSearch" placeholder="Query ID, table, role, engine…"/></div>
+    <div id="readChart" style="padding:0 12px;flex-shrink:0;overflow:hidden;"></div>
+    <div class="ops-split">
+      <div class="ops-split-list">
+        <div class="ops-search"><i class="fas fa-search"></i><input id="readSearch" placeholder="Query ID, table, role, engine…"/></div>
         <div class="ops-list" id="readList"></div>
       </div>
-      <div class="reads-bottom-detail">
+      <div class="ops-split-center">
         <div id="readDetailEmpty" style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:12px;">Click a query to inspect</div>
         <div id="readDetailContent" style="overflow-y:auto;height:100%;"></div>
       </div>
+      <div class="ops-split-right" id="readRightPanel"></div>
     </div>
   </div>
 
   <!-- WRITES -->
   <div id="viewWrites" class="section-body hidden">
-    <div class="ops-ctrl-bar">
-      <div class="ops-gran-pills">
-        <button class="gran-btn" data-gran="1h" data-op="write">Last Hour</button>
+    <div class="ops-hdr">
+      <div class="ops-pills">
+        <button class="gran-btn" data-gran="1h" data-op="write">1h</button>
+        <button class="gran-btn" data-gran="6h" data-op="write">6h</button>
         <button class="gran-btn active" data-gran="24h" data-op="write">24h</button>
-        <button class="gran-btn" data-gran="30d" data-op="write">30d</button>
-        <button class="gran-btn" data-gran="1yr" data-op="write">1yr</button>
+        <button class="gran-btn" data-gran="7d" data-op="write">7d</button>
+        <button class="gran-btn" data-gran="14d" data-op="write">14d</button>
+        <button class="gran-btn" data-gran="28d" data-op="write">28d</button>
       </div>
-      <span id="writeBucketChip" class="hidden" style="font-size:10px;background:rgba(47,200,159,.12);color:var(--success);padding:2px 8px;border-radius:10px;cursor:pointer;margin-left:auto;" onclick="clearOpsBucket('write')">Bucket ×</span>
+      <div class="ops-pills" id="writeSourcePills">
+        <button class="src-btn active" data-src="all">All</button>
+        <button class="src-btn" data-src="user">User</button>
+        <button class="src-btn" data-src="system">System</button>
+      </div>
+      <div id="writeOpsCount" style="margin-left:auto;display:flex;align-items:center;gap:7px;background:#e8e4f0;border:1px solid #7a6ba5;border-radius:20px;padding:5px 14px 5px 10px;"><span style="width:7px;height:7px;border-radius:50%;background:#7a6ba5;box-shadow:0 0 0 3px rgba(122,107,165,.2);flex-shrink:0;"></span><span id="writeOpsNum" style="font-size:15px;font-weight:500;color:#3e3260;font-family:var(--mono);"></span><span style="font-size:11px;font-weight:500;color:#7a6ba5;">ops</span></div>
     </div>
-    <div class="ops-metric-cards" id="writeMetricCards"></div>
-    <div id="writeChart" style="padding:0 12px;"></div>
-    <div class="ops-bottom">
-      <div class="ops-list-panel">
-        <div class="swrap"><i class="fas fa-search"></i><input id="writeSearch" placeholder="Query ID, table, role, source…"/></div>
+    <div id="writeChart" style="padding:0 12px;flex-shrink:0;overflow:hidden;"></div>
+    <div class="ops-split">
+      <div class="ops-split-list">
+        <div class="ops-search"><i class="fas fa-search"></i><input id="writeSearch" placeholder="Query ID, table, role, source…"/></div>
         <div class="ops-list" id="writeList"></div>
       </div>
-      <div class="ops-detail-panel">
-        <div id="writeDetailEmpty" style="display:flex;align-items:center;justify-content:center;flex:1;color:var(--text-muted);font-size:12px;">Click a write to inspect</div>
-        <div id="writeDetailContent" style="overflow-y:auto;"></div>
+      <div class="ops-split-center">
+        <div id="writeDetailEmpty" style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:12px;">Click a write to inspect</div>
+        <div id="writeDetailContent" style="overflow-y:auto;height:100%;"></div>
       </div>
+      <div class="ops-split-right" id="writeRightPanel"></div>
     </div>
   </div>
 
   <!-- ERRORS -->
   <div id="viewErrors" class="section-body hidden">
-    <div class="ops-ctrl-bar">
-      <div class="ops-gran-pills">
-        <button class="gran-btn" data-gran="1h" data-op="err">Last Hour</button>
+    <div class="ops-hdr">
+      <div class="ops-pills">
+        <button class="gran-btn" data-gran="1h" data-op="err">1h</button>
+        <button class="gran-btn" data-gran="6h" data-op="err">6h</button>
         <button class="gran-btn active" data-gran="24h" data-op="err">24h</button>
-        <button class="gran-btn" data-gran="30d" data-op="err">30d</button>
-        <button class="gran-btn" data-gran="1yr" data-op="err">1yr</button>
+        <button class="gran-btn" data-gran="7d" data-op="err">7d</button>
+        <button class="gran-btn" data-gran="14d" data-op="err">14d</button>
+        <button class="gran-btn" data-gran="28d" data-op="err">28d</button>
       </div>
+      <div class="ops-pills" id="errSourcePills">
+        <button class="src-btn active" data-src="all">All</button>
+        <button class="src-btn" data-src="user">User</button>
+        <button class="src-btn" data-src="system">System</button>
+      </div>
+      <div id="errOpsCount" style="margin-left:auto;display:flex;align-items:center;gap:7px;background:rgba(229,72,77,.08);border:1px solid #E5484D;border-radius:20px;padding:5px 14px 5px 10px;"><span style="width:7px;height:7px;border-radius:50%;background:#E5484D;box-shadow:0 0 0 3px rgba(229,72,77,.2);flex-shrink:0;"></span><span id="errOpsNum" style="font-size:15px;font-weight:500;color:#A32D2D;font-family:var(--mono);"></span><span style="font-size:11px;font-weight:500;color:#E5484D;">errors</span></div>
     </div>
-    <div class="ops-stats-strip" id="errStatsStrip"></div>
-    <div class="ops-bottom">
-      <div class="ops-list-panel">
-        <div class="swrap"><i class="fas fa-search"></i><input id="errSearch" placeholder="Table, type, error text…"/></div>
+    <div id="errChart" style="padding:0 12px;flex-shrink:0;overflow:hidden;"></div>
+    <div class="ops-split">
+      <div class="ops-split-list">
+        <div class="ops-search"><i class="fas fa-search"></i><input id="errSearch" placeholder="Table, type, error text…"/></div>
         <div class="ops-list" id="errList"></div>
       </div>
+      <div class="ops-split-center">
+        <div id="errDetailEmpty" style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:12px;">Click an error to inspect</div>
+        <div id="errDetailContent" style="overflow-y:auto;height:100%;"></div>
+      </div>
+      <div class="ops-split-right" id="errRightPanel"></div>
     </div>
   </div>
 
@@ -804,10 +827,11 @@ var infraData=null,catalogData=null,timelineData=[],locksData=[],instancesData=[
 var selRead=null,selWrite=null,selMcp=null,selErr=null,selOdata=null;
 var srchRead="",srchWrite="",srchMcp="",srchErr="",srchOdata="";
 // Reads/writes/errors/mcp/odata granularity state
-var readGran="1h",writeGran="24h",errGran="24h",mcpGran="24h",odataGran="24h";
+var readGran="24h",writeGran="24h",errGran="24h",mcpGran="24h",odataGran="24h";
 var readMetric="count",writeMetric="count",errMetric="count",mcpMetric="count",odataMetric="count";
 var readBucket=null,writeBucket=null,errBucket=null,mcpBucket=null,odataBucket=null;
-var readBand=null; // duration band filter: 0=<50ms, 1=50-500, 2=500-1000, 3=1-5s, 4=>5s
+var readBand=null,writeBand=null,errBand=null; // duration band filter
+var _readSourceFilter="all",_writeSourceFilter="all",_errSourceFilter="all";
 var GRAN={
   "1h":  {window_ms:3600000,     bucket_ms:60000,      label:"1h",  limit:500},
   "6h":  {window_ms:21600000,    bucket_ms:600000,     label:"6h",  limit:1000},
@@ -836,7 +860,6 @@ function winHours(){
 
 // ─── Section routing ─────────────────────────────────────────────────────
 var VIEWS={summary:"viewSummary",infra:"viewInfra",catalog:"viewCatalog",errors:"viewErrors",reads:"viewReads",writes:"viewWrites",mcp:"viewMcp",odata:"viewOdata"};
-var _readSourceFilter="all"; // "all", "user", "system"
 function renderSection(){
   document.querySelectorAll(".bar-row:first-of-type .section-node").forEach(function(n){
     n.classList.toggle("active",n.dataset.section===section);
@@ -872,8 +895,13 @@ function _inBucket(it,idx,gran){
   var s=from+idx*g.bucket_ms;
   var ts=_iTs(it);return ts!==null&&ts>=s&&ts<s+g.bucket_ms;
 }
-var _PCT_LEVELS=[10,30,50,80,90,99,100];
-var _PCT_COLORS=['#B5D4F4','#85B7EB','#378ADD','#185FA5','#D85A30','#A32D2D','#791F1F'];
+var _PCT_LEVELS=[10,30,50,80,90,95,100];
+var _PCT_COLORS=['#d0e8f7','#b3d9f2','#8ec5eb','#6aafe3','#4a96d4','#3578b5','#245a8c'];
+var _PCT_TEXT=['#1B2559','#1B2559','#1a3a5c','#ffffff','#ffffff','#ffffff','#ffffff'];
+var _PCT_COLORS_WRITE=['#e8e4f0','#d5cfe6','#b8aed4','#9a8cbf','#7a6ba5','#5c4d87','#3e3260'];
+var _PCT_TEXT_WRITE=['#1B2559','#1B2559','#1B2559','#ffffff','#ffffff','#ffffff','#ffffff'];
+var _PCT_COLORS_ERR=['#f5e0e4','#ecc4cc','#dfa3b0','#cf8090','#b85c70','#993d54','#73243e'];
+var _PCT_TEXT_ERR=['#1B2559','#1B2559','#1B2559','#ffffff','#ffffff','#ffffff','#ffffff'];
 var _lastPctBands=null; // cached from last render
 function _computePctBands(items){
   var durs=[];items.forEach(function(it){var d=durMs(it);if(d!==null&&d>=0)durs.push(d);});
@@ -902,7 +930,14 @@ function fReads(){
   return items.filter(function(i){return(i.query_id||"").toLowerCase().includes(q)||(i.table_name||"").toLowerCase().includes(q)||(i.role_name||"").toLowerCase().includes(q)||(i.engine||"").toLowerCase().includes(q)||(i.source_type||"").toLowerCase().includes(q);});
 }
 function fWrites(){
-  var items=writeBucket!==null?allWrites.filter(function(i){return _inBucket(i,writeBucket,writeGran);}):allWrites;
+  var base=_writeItems();
+  var items=writeBand!==null&&_lastPctBands?base.filter(function(it){
+    var d=durMs(it);if(d===null)return false;
+    var b=_lastPctBands[writeBand];if(!b)return false;
+    if(writeBand===0)return d<=b.hi;
+    if(writeBand===_lastPctBands.length-1)return d>b.lo;
+    return d>b.lo&&d<=b.hi;
+  }):base;
   if(!srchWrite)return items;
   var q=srchWrite.toLowerCase();
   return items.filter(function(i){return(i.query_id||"").toLowerCase().includes(q)||(i.table_name||i.target_table||"").toLowerCase().includes(q)||(i.role_name||"").toLowerCase().includes(q)||(i.instance_id||"").toLowerCase().includes(q);});
@@ -920,7 +955,14 @@ function fMcp(){
   return items.filter(function(i){return(i.tool||"").toLowerCase().includes(q)||(i.role||"").toLowerCase().includes(q)||(i.instance_id||"").toLowerCase().includes(q);});
 }
 function fErr(){
-  var items=errBucket!==null?allErrors.filter(function(i){return _inBucket(i,errBucket,errGran);}):allErrors;
+  var base=_errItems();
+  var items=errBand!==null&&_lastPctBands?base.filter(function(it){
+    var d=durMs(it);if(d===null)return false;
+    var b=_lastPctBands[errBand];if(!b)return false;
+    if(errBand===0)return d<=b.hi;
+    if(errBand===_lastPctBands.length-1)return d>b.lo;
+    return d>b.lo&&d<=b.hi;
+  }):base;
   if(!srchErr)return items;
   var q=srchErr.toLowerCase();
   return items.filter(function(i){return(i.op_type||"").includes(q)||(i.table_name||i.target_table||"").toLowerCase().includes(q)||(i.error||"").toLowerCase().includes(q)||(i.tool||"").toLowerCase().includes(q);});
@@ -1075,7 +1117,7 @@ function renderOpsList(elId,items,selIdx,onClickFn,rowField,accentColor){
 // ─── Ops detail renderer ─────────────────────────────────────────────────
 function renderOpsDetail(contentId,emptyId,it,isWrite){
   var content=document.getElementById(contentId);var empty=document.getElementById(emptyId);
-  if(!it){if(content)content.innerHTML="";if(empty)empty.style.display="flex";return;}
+  if(!it){if(content)content.innerHTML="";if(empty)empty.style.display="flex";if(isWrite){var _wrp=document.getElementById("writeRightPanel");if(_wrp)_wrp.innerHTML="";}return;}
   if(empty)empty.style.display="none";
   var ok=!it.error&&String(it.status||"").toUpperCase()!=="ERROR"&&String(it.status||"").toUpperCase()!=="FAIL";
   var d=durMs(it);
@@ -1194,27 +1236,101 @@ function renderOpsDetail(contentId,emptyId,it,isWrite){
     h+='</div></div>';
 
   } else {
-    // ── WRITES ──
-    h+='<div class="config-grid">';
-    h+='<div class="config-card"><div class="cl">Status</div><div class="cv" style="color:'+(ok?"var(--success)":"var(--error)")+';"><i class="fas '+(ok?"fa-check-circle":"fa-times-circle")+'"></i> '+(ok?"Success":"Error")+'</div></div>';
-    h+='<div class="config-card"><div class="cl">Duration</div><div class="cv">'+esc(d!==null?fmtMs(d):"\u2014")+'</div></div>';
-    if(it.table_name||it.target_table)h+='<div class="config-card"><div class="cl">Table</div><div class="cv">'+esc(it.table_name||it.target_table)+'</div></div>';
-    if(it.role_name||it.role)h+='<div class="config-card"><div class="cl">Role</div><div class="cv">'+esc(it.role_name||it.role)+'</div></div>';
-    var ts=_iTs(it);if(ts)h+='<div class="config-card"><div class="cl">Recorded At</div><div class="cv" style="font-size:11px;">'+esc(fmtDate(ts))+'</div></div>';
-    if(it.instance_id)h+='<div class="config-card"><div class="cl">Instance</div><div class="cv" style="font-size:11px;">'+esc(it.instance_id)+'</div></div>';
-    h+='<div class="config-card"><div class="cl">Inserted</div><div class="cv" style="color:var(--success);">'+esc(fmtRows(it.inserted))+'</div></div>';
-    h+='<div class="config-card"><div class="cl">Deleted</div><div class="cv" style="color:'+(Number(it.deleted)>0?"var(--warn)":"var(--text-muted)")+';">'+esc(fmtRows(it.deleted||0))+'</div></div>';
-    if(it.incoming_rows!=null)h+='<div class="config-card"><div class="cl">Incoming</div><div class="cv">'+esc(fmtRows(it.incoming_rows))+'</div></div>';
-    if(it.total_rows!=null)h+='<div class="config-card"><div class="cl">Total After</div><div class="cv">'+esc(fmtRows(it.total_rows))+'</div></div>';
-    if(it.error)h+='<div class="config-card full"><div class="cl">Error</div><div class="cv" style="color:var(--error);font-size:12px;">'+esc(it.error)+'</div></div>';
+    // ── WRITES — Hero banner + stat strip ──
+    var ts=_iTs(it);
+    var tName=it.table_name||it.target_table||"\u2014";
+    var rName=it.role_name||it.role||"\u2014";
+    // Hero banner
+    h+='<div style="background:var(--bg-surface);border-radius:var(--radius);overflow:hidden;border:1px solid var(--border-light);">';
+    h+='<div style="padding:12px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border-light);">';
+    h+='<div style="width:32px;height:32px;border-radius:8px;background:'+(ok?"var(--success-bg)":"var(--error-bg)")+';display:flex;align-items:center;justify-content:center;"><i class="fas '+(ok?"fa-check":"fa-times")+'" style="font-size:12px;color:'+(ok?"var(--success)":"var(--error)")+';"></i></div>';
+    h+='<div style="flex:1;min-width:0;"><div style="font-size:14px;font-weight:600;color:var(--text);">'+esc(tName)+'</div>';
+    h+='<div style="font-size:11px;color:var(--text-muted);">'+esc(rName);
+    if(ts)h+=' \u00b7 '+esc(fmtDate(ts));
+    h+='</div></div>';
+    h+='<div style="text-align:right;"><div style="font-size:20px;font-weight:600;font-family:var(--mono);color:var(--text);">'+esc(d!==null?fmtMs(d):"\u2014")+'</div>';
+    h+='<div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;">duration</div></div>';
     h+='</div>';
+    // Stat strip
+    h+='<div style="display:flex;border-bottom:1px solid var(--border-light);">';
+    h+='<div style="flex:1;padding:10px 14px;text-align:center;border-right:1px solid var(--border-light);"><div style="font-size:18px;font-weight:600;font-family:var(--mono);color:var(--success);">'+esc(fmtRows(it.inserted))+'</div><div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:2px;">inserted</div></div>';
+    h+='<div style="flex:1;padding:10px 14px;text-align:center;border-right:1px solid var(--border-light);"><div style="font-size:18px;font-weight:600;font-family:var(--mono);color:'+(Number(it.deleted)>0?"var(--warn)":"var(--text-muted)")+';">'+esc(fmtRows(it.deleted||0))+'</div><div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:2px;">deleted</div></div>';
+    var trVal=it.total_rows!=null?fmtRows(it.total_rows):"\u2014";
+    h+='<div style="flex:1;padding:10px 14px;text-align:center;border-right:1px solid var(--border-light);"><div style="font-size:18px;font-weight:600;font-family:var(--mono);">'+esc(trVal)+'</div><div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:2px;">total rows</div></div>';
+    var colVal=it.total_columns!=null?String(it.total_columns):"\u2014";
+    h+='<div style="flex:1;padding:10px 14px;text-align:center;"><div style="font-size:18px;font-weight:600;font-family:var(--mono);">'+esc(colVal)+'</div><div style="font-size:9px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:2px;">columns</div></div>';
+    h+='</div>';
+    // Footer row: incoming + files + compression + overwrite pills
+    var footParts=[];
+    if(it.incoming_rows!=null)footParts.push(esc(fmtRows(it.incoming_rows))+' incoming');
+    if(it.incoming_columns!=null)footParts.push(esc(String(it.incoming_columns))+' incoming cols');
+    if(it.new_resources!=null&&it.new_resources>0)footParts.push(esc(String(it.new_resources))+' new file'+(it.new_resources>1?'s':''));
+    if(it.sunset_files!=null&&it.sunset_files>0)footParts.push(esc(String(it.sunset_files))+' sunset');
+    if(it.skipped_stale>0)footParts.push(esc(String(it.skipped_stale))+' skipped');
+    if(it.compression_level!=null)footParts.push('compress '+esc(String(it.compression_level)));
+    if(it.newer_than)footParts.push('newer: '+esc(String(it.newer_than)));
+    if(it.delete_only)footParts.push('delete-only');
+    h+='<div style="padding:9px 16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);">';
+    if(footParts.length)h+=footParts.join(' \u00b7 ');
+    // Overwrite pills
+    if(it.overwrite_columns&&(!Array.isArray(it.overwrite_columns)||it.overwrite_columns.length)){
+      var owCols=Array.isArray(it.overwrite_columns)?it.overwrite_columns:[it.overwrite_columns];
+      if(footParts.length)h+='<span style="width:1px;height:14px;background:var(--border);flex-shrink:0;"></span>';
+      h+='<span style="font-size:10px;color:var(--text-muted);">Overwrite:</span>';
+      owCols.forEach(function(c){h+='<span style="padding:2px 9px;border-radius:12px;background:var(--primary-light);color:var(--primary);font-size:10px;font-weight:600;font-family:var(--mono);">'+esc(c)+'</span>';});
+    }
+    h+='</div></div>';
+    // Error
+    if(it.error)h+='<div style="margin-top:10px;padding:8px 10px;background:var(--bg-surface);border-left:3px solid var(--error);border-radius:0;font-size:12px;color:var(--error);">'+esc(it.error)+'</div>';
+    // Lineage flow diagram (center panel)
     if(it.lineage){var rawL=it.lineage;var ln=typeof rawL==="string"?null:rawL;if(typeof rawL==="string"){try{ln=JSON.parse(rawL);}catch(e){}}
-      if(ln&&typeof ln==="object"&&Object.keys(ln).length){h+='<div class="detail-section"><div class="detail-section-title"><i class="fas fa-diagram-project"></i>Lineage</div><pre style="font-size:11px;font-family:var(--mono);background:var(--bg-surface);border:1px solid var(--border-light);border-radius:6px;padding:12px;overflow-x:auto;max-height:300px;overflow-y:auto;line-height:1.5;color:var(--text);margin:0;">'+esc(JSON.stringify(ln,null,2))+'</pre></div>';}}
+      if(ln&&typeof ln==="object"&&Object.keys(ln).length){
+        var srcTables=ln.source_tables||[];var srcType=ln.source_type||"unknown";var srcId=ln.source_id||"";var tags=ln.tags||{};
+        h+='<div style="margin-top:10px;background:var(--bg-surface);border-radius:var(--radius);padding:12px 16px;border:1px solid var(--border-light);">';
+        h+='<div style="font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:10px;display:flex;align-items:center;gap:6px;"><i class="fas fa-diagram-project" style="opacity:.5;font-size:10px;"></i>Lineage</div>';
+        h+='<div style="display:flex;align-items:center;gap:0;flex-wrap:wrap;">';
+        h+='<div style="display:flex;flex-direction:column;gap:4px;">';
+        if(srcTables.length){srcTables.forEach(function(t){
+          h+='<div style="background:#e6f1fb;border:1px solid #b5d4f4;border-radius:8px;padding:8px 12px;display:flex;align-items:center;gap:7px;">';
+          h+='<div style="width:22px;height:22px;border-radius:5px;background:#b5d4f4;display:flex;align-items:center;justify-content:center;"><i class="fas fa-table" style="font-size:9px;color:#185FA5;"></i></div>';
+          h+='<div><div style="font-size:12px;font-weight:600;color:#0C447C;">'+esc(t)+'</div><div style="font-size:9px;color:#378ADD;">source table</div></div></div>';
+        });}
+        h+='</div>';
+        h+='<div style="width:36px;display:flex;align-items:center;justify-content:center;"><svg width="28" height="10" viewBox="0 0 28 10"><line x1="0" y1="5" x2="20" y2="5" stroke="#b5d4f4" stroke-width="2"/><polygon points="20,1.5 28,5 20,8.5" fill="#b5d4f4"/></svg></div>';
+        h+='<div style="background:#eeedfe;border:1px solid #cecbf6;border-radius:8px;padding:8px 12px;display:flex;align-items:center;gap:7px;">';
+        h+='<div style="width:22px;height:22px;border-radius:5px;background:#cecbf6;display:flex;align-items:center;justify-content:center;"><i class="fas fa-bolt" style="font-size:9px;color:#534AB7;"></i></div>';
+        h+='<div><div style="font-size:12px;font-weight:600;color:#3C3489;">'+esc(srcType)+'</div><div style="font-size:9px;color:#7F77DD;">operation</div></div></div>';
+        var tagKeys=Object.keys(tags);
+        if(tagKeys.length){
+          h+='<div style="margin-left:14px;display:flex;gap:5px;flex-wrap:wrap;">';
+          tagKeys.forEach(function(k){h+='<span style="padding:3px 10px;border-radius:12px;font-size:10px;font-weight:600;background:#eeedfe;color:#534AB7;border:1px solid #cecbf6;">'+esc(k)+': '+esc(String(tags[k]))+'</span>';});
+          h+='</div>';
+        }
+        h+='</div>';
+        if(srcId)h+='<div style="margin-top:8px;font-size:9px;color:var(--text-muted);font-family:var(--mono);">'+esc(srcId)+'</div>';
+        h+='</div>';
+      }}
   }
   if(content){
     content.innerHTML=h;
     var sqBtn=document.getElementById("rdShowQueryBtn");
     if(sqBtn)sqBtn.addEventListener("click",function(){showSqlPopup(window._lastDetailSql);});
+  }
+  // ── Write right panel: Metadata only ──
+  if(isWrite&&it){
+    var wrp=document.getElementById("writeRightPanel");
+    if(wrp){
+      var rh='';
+      rh+='<div class="rd-info-group"><div class="rd-info-title">Metadata</div><div class="rd-info-list">';
+      var ts2=_iTs(it);
+      if(ts2)rh+='<div><span class="rd-ik">Recorded</span><div class="rd-iv">'+esc(fmtDate(ts2))+'</div></div>';
+      if(it.instance_id)rh+='<div><span class="rd-ik">Instance</span><div class="rd-iv" style="font-size:11px;">'+esc(it.instance_id)+'</div></div>';
+      if(it.query_id)rh+='<div><span class="rd-ik">Query ID</span><div class="rd-iv" style="font-size:10px;">'+esc(it.query_id)+'</div></div>';
+      rh+='</div></div>';
+      wrp.innerHTML=rh;
+    }
+  } else if(isWrite){
+    var wrp2=document.getElementById("writeRightPanel");if(wrp2)wrp2.innerHTML="";
   }
   setTimeout(function(){document.querySelectorAll(".rd-bar-row").forEach(function(r,i){setTimeout(function(){r.style.opacity="1";r.style.transform="none";},i*30);});},30);
 }
@@ -1223,8 +1339,8 @@ function renderOpsDetail(contentId,emptyId,it,isWrite){
 // ─── clearOpsBucket — exposed globally for onclick attributes ─────────────
 function clearOpsBucket(op){
   if(op==="read"){readBand=null;renderReads();}
-  else if(op==="write"){writeBucket=null;var c=document.getElementById("writeBucketChip");if(c)c.classList.add("hidden");renderWrites();}
-  else if(op==="err"){errBucket=null;var c=document.getElementById("errBucketChip");if(c)c.classList.add("hidden");renderErrors();}
+  else if(op==="write"){writeBand=null;renderWrites();}
+  else if(op==="err"){errBand=null;renderErrors();}
   else if(op==="mcp"){mcpBucket=null;var c=document.getElementById("mcpBucketChip");if(c)c.classList.add("hidden");renderMcp();}
   else if(op==="odata"){odataBucket=null;var c=document.getElementById("odataBucketChip");if(c)c.classList.add("hidden");renderOdata();}
 }
@@ -1259,6 +1375,20 @@ function _readItems(){
     if(s==="ERROR"||s==="FAIL"||s==="FAILED"||i.error)return false;
     if(_readSourceFilter==="user")return(i.source_type||"api")!=="system";
     if(_readSourceFilter==="system")return(i.source_type||"api")==="system";
+    return true;
+  });
+}
+function _writeItems(){
+  return allWrites.filter(function(i){
+    if(_writeSourceFilter==="user")return(i.source_type||"api")!=="system";
+    if(_writeSourceFilter==="system")return(i.source_type||"api")==="system";
+    return true;
+  });
+}
+function _errItems(){
+  return allErrors.filter(function(i){
+    if(_errSourceFilter==="user")return(i.source_type||i.op_type||"api")!=="system";
+    if(_errSourceFilter==="system")return(i.source_type||i.op_type||"api")==="system";
     return true;
   });
 }
@@ -1298,52 +1428,63 @@ function renderReadMetrics(items){
     {l:"max",v:fmtMs(stats.p100_ms),c:stats.p100_ms>=2000?"color:var(--error);":stats.p100_ms>=500?"color:var(--warn);":""},
   ];
   el.innerHTML=cards.map(function(c){
-    return '<div class="reads-metric"><div class="rv" style="'+c.c+'">'+esc(c.v)+'</div><div class="rl">'+esc(c.l)+'</div></div>';
+    return '<div class="ops-metric"><div class="rv" style="'+c.c+'">'+esc(c.v)+'</div><div class="rl">'+esc(c.l)+'</div></div>';
   }).join("");
 }
 
 // ─── Percentile ribbon chart (canvas) ─────────────────────────────────────
-function renderPercentileRibbon(elId,items,selBand,onClickFn){
+function renderPercentileRibbon(elId,items,selBand,onClickFn,colors,textColors){
+  var _colors=colors||_PCT_COLORS;
+  var _textColors=textColors||_PCT_TEXT;
   var el=document.getElementById(elId);if(!el)return;
   var bands=_computePctBands(items);_lastPctBands=bands;
   if(!bands||!bands.length){el.innerHTML='<div style="padding:14px;text-align:center;color:var(--text-muted);font-size:11px;">No data</div>';return;}
   var total=bands.reduce(function(s,b){return s+b.count;},0);
   if(!total){el.innerHTML='<div style="padding:14px;text-align:center;color:var(--text-muted);font-size:11px;">No data</div>';return;}
-  // Canvas setup
-  var W=el.clientWidth||600;var H=72;
-  el.innerHTML='<canvas id="pctRibbonCv"></canvas>';
-  var cv=document.getElementById("pctRibbonCv");
+  var W=Math.max(200,(el.clientWidth||600)-24);var H=100;
+  var cvId=elId+"_cv";
+  el.innerHTML='<canvas id="'+cvId+'"></canvas>';
+  var cv=document.getElementById(cvId);
   cv.width=W*2;cv.height=H*2;cv.style.width=W+"px";cv.style.height=H+"px";cv.style.display="block";cv.style.cursor="pointer";
   var cx=cv.getContext("2d");cx.scale(2,2);
-  var PT=18,barH=28,PB=22;
-  var pw=W;var x=0;
+  var PT=26,barH=36;
+  var startX=5,pw=W-10;var x=startX;
   var segments=[];
+  var MIN_W=36;
   function fms(ms){return ms>=1000?(ms/1000).toFixed(1)+"s":Math.round(ms)+"ms";}
+  // Two-pass width: reserve minimums, distribute remainder proportionally
+  var n=bands.length;
+  var reserved=n*MIN_W;
+  var flex=Math.max(0,pw-reserved);
+  var widths=bands.map(function(b){return MIN_W+Math.round((b.count/total)*flex);});
+  // Adjust last band to fill remainder exactly
+  var usedW=widths.reduce(function(s,w){return s+w;},0);
+  widths[n-1]=Math.max(MIN_W,widths[n-1]+(pw-usedW));
   bands.forEach(function(b,i){
-    var w=Math.max(4,Math.round((b.count/total)*pw));
-    if(i===bands.length-1)w=pw-x; // fill remainder
+    var w=widths[i];
     var isSel=(selBand===i);
-    var opacity=(selBand!==null&&!isSel)?0.2:0.82;
-    // Rounded ends
-    var r1=i===0?6:0;var r2=i===bands.length-1?6:0;
-    cx.fillStyle=_PCT_COLORS[i];cx.globalAlpha=opacity;
+    var opacity=(selBand!==null&&!isSel)?0.18:0.88;
+    var r1=i===0?8:0;var r2=i===bands.length-1?8:0;
+    cx.fillStyle=_colors[i];cx.globalAlpha=opacity;
     cx.beginPath();cx.roundRect(x,PT,w,barH,[r1,r2,r2,r1]);cx.fill();
-    if(isSel){cx.globalAlpha=1;cx.strokeStyle=_PCT_COLORS[i];cx.lineWidth=2;cx.beginPath();cx.roundRect(x-1,PT-1,w+2,barH+2,[r1+1,r2+1,r2+1,r1+1]);cx.stroke();}
+    if(i>0){cx.globalAlpha=1;cx.fillStyle="#fff";cx.fillRect(x,PT,1.5,barH);}
+    if(isSel){cx.globalAlpha=1;cx.strokeStyle=_colors[i];cx.lineWidth=2;cx.beginPath();cx.roundRect(x-1,PT-1,w+2,barH+2,[r1+1,r2+1,r2+1,r1+1]);cx.stroke();}
     cx.globalAlpha=1;
-    // Label above
-    cx.font="500 11px Inter,system-ui,sans-serif";cx.textAlign="center";
-    cx.fillStyle=_PCT_COLORS[i];
-    if(w>24)cx.fillText(b.label,x+w/2,PT-5);
-    // Count inside bar
-    if(w>22){cx.font="500 10px monospace";cx.fillStyle="#fff";cx.fillText(String(b.count),x+w/2,PT+barH/2+4);}
-    // Duration below
-    cx.font="10px monospace";cx.fillStyle=_PCT_COLORS[i];cx.globalAlpha=0.7;
-    if(w>30)cx.fillText(fms(b.hi),x+w/2,PT+barH+14);
-    cx.globalAlpha=1;
+    var mid=x+w/2;
+    cx.strokeStyle=_colors[i];cx.lineWidth=1.5;
+    cx.beginPath();cx.moveTo(mid,PT-2);cx.lineTo(mid,PT-8);cx.stroke();
+    cx.font="500 11px Inter,system-ui,sans-serif";cx.textAlign="center";cx.fillStyle=_colors[i];
+    if(w>18)cx.fillText(b.label,mid,PT-12);
+    if(w>20){cx.font="500 12px 'IBM Plex Mono',monospace";cx.fillStyle=_textColors[i];cx.fillText(String(b.count),mid,PT+barH/2+4.5);}
+    if(w>26){
+      cx.strokeStyle="rgba(0,0,0,.08)";cx.lineWidth=0.5;
+      cx.beginPath();cx.moveTo(mid,PT+barH);cx.lineTo(mid,PT+barH+6);cx.stroke();
+      cx.font="500 12px Inter,system-ui,sans-serif";cx.fillStyle="#1B2559";
+      cx.fillText(fms(b.hi),mid,PT+barH+18);
+    }
     segments.push({x:x,w:w,idx:i,count:b.count});
     x+=w;
   });
-  // Click handler
   cv.onclick=function(e){
     var rect=cv.getBoundingClientRect();
     var mx=(e.clientX-rect.left)*(W/rect.width);
@@ -1357,9 +1498,7 @@ function renderPercentileRibbon(elId,items,selBand,onClickFn){
 function renderReads(){
   var baseItems=_readItems();
   var items=fReads();
-  var cntBadge=document.getElementById("countReads");
-  if(cntBadge)cntBadge.textContent=baseItems.length?" ("+baseItems.length+")":"";
-  renderReadMetrics(items);
+  var opsCountEl=document.getElementById("readOpsNum");if(opsCountEl)opsCountEl.textContent=items.length;
   // Percentile ribbon chart
   renderPercentileRibbon("readChart",baseItems,readBand,function(b){
     readBand=(readBand===b)?null:b;
@@ -1376,7 +1515,15 @@ function renderReads(){
     }
   } else {
     renderOpsDetail("readDetailContent","readDetailEmpty",null,false);
+    var rp=document.getElementById("readRightPanel");if(rp)rp.innerHTML="";
   }
+}
+
+function _moveReadRightPanel(){
+  var src=document.querySelector("#readDetailContent .rd-split-right");
+  var rp=document.getElementById("readRightPanel");
+  if(src&&rp){rp.innerHTML="";while(src.firstChild)rp.appendChild(src.firstChild);}
+  else if(rp){rp.innerHTML="";}
 }
 
 
@@ -1387,6 +1534,7 @@ async function _fetchReadDetail(qid){
   if(empty)empty.style.display="none";
   content.dataset.loadedQid=qid;
   content.innerHTML='<div style="color:var(--text-muted);font-size:11px;"><i class="fas fa-spinner fa-spin"></i> Loading detail…</div>';
+  var rp=document.getElementById("readRightPanel");if(rp)rp.innerHTML='<div style="color:var(--text-muted);font-size:11px;padding:10px;"><i class="fas fa-spinner fa-spin"></i></div>';
   try{
     var c=ctx();
     var url="/api/v1/monitoring/reads/detail?org="+enc(c.org)+"&sup="+enc(c.sup)+"&query_id="+enc(qid);
@@ -1396,33 +1544,32 @@ async function _fetchReadDetail(qid){
     if(content.dataset.loadedQid!==qid)return; // stale response
     if(r.ok&&d&&d.item){
       renderOpsDetail("readDetailContent","readDetailEmpty",d.item,false);
+      _moveReadRightPanel();
     } else if(r.status===404){
       content.innerHTML='<div style="color:var(--text-muted);font-size:11px;">Query detail no longer in cache (expired from Redis list)</div>';
+      var rp2=document.getElementById("readRightPanel");if(rp2)rp2.innerHTML="";
     } else {
       content.innerHTML='<div style="color:var(--error);font-size:11px;">Detail load failed: '+(d&&d.detail?esc(d.detail):"HTTP "+r.status)+'</div>';
+      var rp3=document.getElementById("readRightPanel");if(rp3)rp3.innerHTML="";
     }
   }catch(e){
     if(content.dataset.loadedQid===qid){
       content.innerHTML='<div style="color:var(--error);font-size:11px;">Detail load failed: '+esc(e.message||"network error")+'</div>';
+      var rp4=document.getElementById("readRightPanel");if(rp4)rp4.innerHTML="";
     }
   }
 }
 
 // ─── WRITES section ───────────────────────────────────────────────────────
 function renderWrites(){
-  var bkts=computeBuckets(allWrites,writeGran,"inserted");
-  var stats=statsFromItems(allWrites,"inserted");
-  var cntBadge=document.getElementById("countWrites");
-  if(cntBadge)cntBadge.textContent=allWrites.length?" ("+allWrites.length+")":"";
-  renderMetricCards("writeMetricCards",stats,writeMetric,"#2FC89F",function(m){writeMetric=m;renderWrites();});
-  renderOpsChart("writeChart",bkts,writeMetric,"#2FC89F",writeGran,writeBucket,function(idx){
-    writeBucket=(writeBucket===idx)?null:idx;
-    var chip=document.getElementById("writeBucketChip");
-    if(chip)chip.classList.toggle("hidden",writeBucket===null);
+  var baseItems=_writeItems();
+  var items=fWrites();
+  var opsNum=document.getElementById("writeOpsNum");if(opsNum)opsNum.textContent=items.length;
+  renderPercentileRibbon("writeChart",baseItems,writeBand,function(b){
+    writeBand=(writeBand===b)?null:b;
     selWrite=null;
     renderWrites();
-  });
-  var items=fWrites();
+  },_PCT_COLORS_WRITE,_PCT_TEXT_WRITE);
   renderOpsList("writeList",items,selWrite,function(i){
     selWrite=i;
     renderWrites();
@@ -1562,6 +1709,22 @@ document.getElementById("readSourcePills").querySelectorAll(".src-btn").forEach(
     renderReads();
   });
 });
+document.getElementById("writeSourcePills").querySelectorAll(".src-btn").forEach(function(btn){
+  btn.addEventListener("click",function(){
+    _writeSourceFilter=btn.dataset.src;
+    document.getElementById("writeSourcePills").querySelectorAll(".src-btn").forEach(function(b){b.classList.toggle("active",b===btn);});
+    writeBand=null;selWrite=null;
+    renderWrites();
+  });
+});
+document.getElementById("errSourcePills").querySelectorAll(".src-btn").forEach(function(btn){
+  btn.addEventListener("click",function(){
+    _errSourceFilter=btn.dataset.src;
+    document.getElementById("errSourcePills").querySelectorAll(".src-btn").forEach(function(b){b.classList.toggle("active",b===btn);});
+    errBand=null;selErr=null;
+    renderErrors();
+  });
+});
 // Gran buttons
 document.querySelectorAll(".gran-btn").forEach(function(btn){
   btn.addEventListener("click",function(){
@@ -1569,9 +1732,9 @@ document.querySelectorAll(".gran-btn").forEach(function(btn){
     document.querySelectorAll(".gran-btn[data-op='"+op+"']").forEach(function(b){b.classList.toggle("active",b===btn);});
     if(op==="read"){readGran=g;readBand=null;selRead=null;
       loadReads().then(function(){if(section==="reads")renderReads();});}
-    else if(op==="write"){writeGran=g;writeBucket=null;selWrite=null;var c=document.getElementById("writeBucketChip");if(c)c.classList.add("hidden");
+    else if(op==="write"){writeGran=g;writeBand=null;selWrite=null;
       loadWrites().then(function(){if(section==="writes")renderWrites();});}
-    else if(op==="err"){errGran=g;errBucket=null;selErr=null;var c=document.getElementById("errBucketChip");if(c)c.classList.add("hidden");
+    else if(op==="err"){errGran=g;errBand=null;selErr=null;
       loadErrors().then(function(){if(section==="errors")renderErrors();});}
     else if(op==="mcp"){mcpGran=g;mcpBucket=null;selMcp=null;var c=document.getElementById("mcpBucketChip");if(c)c.classList.add("hidden");
       loadMcp().then(function(){if(section==="mcp")renderMcp();});}
@@ -2126,40 +2289,90 @@ function renderTimeline(){
 
 // ─── ERRORS section ───────────────────────────────────────────────────────
 function renderErrors(){
-  var bkts=computeBuckets(allErrors,errGran,"result_rows");
-  var stats=statsFromItems(allErrors,"result_rows");
-  var cntBadge=document.getElementById("countErrors");
-  if(cntBadge)cntBadge.textContent=allErrors.length?" ("+allErrors.length+")":"";
-  renderStatsStrip("errStatsStrip",stats,"—","#E5484D");
-  renderOpsChart("errChart",bkts,errMetric,"#E5484D",errGran,errBucket,function(idx){
-    errBucket=(errBucket===idx)?null:idx;
-    var chip=document.getElementById("errBucketChip");
-    if(chip)chip.classList.toggle("hidden",errBucket===null);
-    selErr=null;renderErrors();
-  });
+  var baseItems=_errItems();
   var items=fErr();
+  var opsNum=document.getElementById("errOpsNum");if(opsNum)opsNum.textContent=items.length;
+  renderPercentileRibbon("errChart",baseItems,errBand,function(b){
+    errBand=(errBand===b)?null:b;
+    selErr=null;renderErrors();
+  },_PCT_COLORS_ERR,_PCT_TEXT_ERR);
   renderOpsList("errList",items,selErr,function(i){selErr=i;renderErrors();},"result_rows","#E5484D");
   _renderErrDetail(items[selErr]||null);
 }
 function _renderErrDetail(it){
   var content=document.getElementById("errDetailContent");var empty=document.getElementById("errDetailEmpty");
-  if(!it){if(content)content.innerHTML="";if(empty)empty.style.display="flex";return;}
+  var rp=document.getElementById("errRightPanel");
+  if(!it){if(content)content.innerHTML="";if(empty)empty.style.display="flex";if(rp)rp.innerHTML="";return;}
   if(empty)empty.style.display="none";
-  var type=it.op_type||"read";
-  var h='<div class="config-grid">';
-  h+='<div class="config-card"><div class="cl">Type</div><div class="cv"><span class="err-badge '+esc(type)+'">'+esc(type)+'</span></div></div>';
-  var ts=_iTs(it);if(ts)h+='<div class="config-card"><div class="cl">Time</div><div class="cv" style="font-size:11px;">'+esc(fmtDate(ts))+'</div></div>';
-  var d=durMs(it);if(d!==null)h+='<div class="config-card"><div class="cl">Duration</div><div class="cv">'+esc(fmtMs(d))+'</div></div>';
-  if(it.table_name||it.target_table)h+='<div class="config-card"><div class="cl">Table</div><div class="cv">'+esc(it.table_name||it.target_table)+'</div></div>';
-  if(it.role_name||it.role)h+='<div class="config-card"><div class="cl">Role</div><div class="cv">'+esc(it.role_name||it.role)+'</div></div>';
-  if(it.tool)h+='<div class="config-card"><div class="cl">Tool</div><div class="cv">'+esc(it.tool)+'</div></div>';
-  if(it.query_id)h+='<div class="config-card full"><div class="cl">Query ID</div><div class="cv" style="font-size:11px;">'+esc(it.query_id)+'</div></div>';
-  if(it.instance_id)h+='<div class="config-card"><div class="cl">Instance</div><div class="cv" style="font-size:11px;">'+esc(it.instance_id)+'</div></div>';
-  if(it.error)h+='<div class="config-card full"><div class="cl">Error</div><div class="cv" style="color:var(--error);font-size:12px;">'+esc(it.error)+'</div></div>';
-  if(it.incoming_rows!=null)h+='<div class="config-card"><div class="cl">Incoming Rows</div><div class="cv">'+fmtRows(it.incoming_rows)+'</div></div>';
+  var opType=it.op_type||it.source||"read";
+  var srcType=it.source_type||"api";
+  var ts=_iTs(it);
+  var d=durMs(it);
+  var tName=it.table_name||it.target_table||"";
+  var rName=it.role_name||it.role||"";
+  var errMsg=it.message||it.error||"";
+  var _sql=it.sql||it.query||"";
+  window._lastDetailSql=_sql;
+
+  // ── CENTER: error + timings + SQL ──
+  var h='<div style="display:flex;flex-direction:column;gap:10px;">';
+  if(errMsg){
+    h+='<div style="background:var(--error-bg);border-radius:var(--radius);padding:14px 16px;border-left:4px solid var(--error);">';
+    h+='<div style="font-size:10px;color:var(--error);text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:5px;">Error message</div>';
+    h+='<div style="font-size:13px;color:#791F1F;line-height:1.5;font-weight:500;">'+esc(errMsg)+'</div>';
+    h+='</div>';
+  }
+  var rawT=it.execution_timings;var tm=null;
+  if(rawT){try{tm=typeof rawT==="string"?JSON.parse(rawT):rawT;}catch(e){}}
+  if(tm){
+    var phases=[];
+    if(Array.isArray(tm)){tm.forEach(function(obj){var k=Object.keys(obj||{})[0];if(k){var v=parseFloat(obj[k])||0;if(v>0)phases.push({k:k,v:v});}});}
+    else if(typeof tm==="object"){Object.keys(tm).forEach(function(k){var v=parseFloat(tm[k])||0;if(v>0)phases.push({k:k,v:v});});}
+    if(phases.length){
+      var totalT=phases.reduce(function(s,p){return s+p.v;},0);
+      h+='<div style="background:var(--bg-surface);border-radius:var(--radius-sm);padding:10px 14px;">';
+      phases.forEach(function(p){
+        var pp=totalT>0?Math.round(p.v/totalT*100):0;
+        h+='<div style="display:flex;align-items:center;gap:8px;">';
+        h+='<span style="font-size:11px;color:var(--text-muted);flex-shrink:0;">'+esc(p.k)+'</span>';
+        h+='<div style="flex:1;height:4px;background:var(--bg-hover);border-radius:2px;overflow:hidden;"><div style="width:'+pp+'%;height:100%;background:var(--error);opacity:0.3;border-radius:2px;"></div></div>';
+        h+='<span style="font-size:10px;font-family:var(--mono);color:var(--text-muted);">'+esc(fmtMs(p.v*1000))+'</span>';
+        h+='</div>';
+      });
+      h+='</div>';
+    }
+  }
+  if(_sql){
+    h+='<div style="background:var(--bg-surface);border-radius:var(--radius);padding:14px 16px;">';
+    h+='<div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:6px;">SQL query</div>';
+    h+='<div style="background:var(--bg-card);border:1px solid var(--border-light);border-left:3px solid var(--error);border-radius:0 var(--radius-sm) var(--radius-sm) 0;padding:10px 12px;font-family:var(--mono);font-size:11px;color:var(--text);line-height:1.6;max-height:100px;overflow:auto;white-space:pre-wrap;word-break:break-all;">'+esc(_sql)+'</div>';
+    h+='</div>';
+  }
   h+='</div>';
-  if(it.sql||it.query)h+='<div class="detail-section"><div class="detail-section-title"><i class="fas fa-code"></i>SQL</div><div class="sql-block">'+esc(it.sql||it.query)+'</div></div>';
   if(content)content.innerHTML=h;
+
+  // ── RIGHT PANEL: context + when + IDs ──
+  if(rp){
+    var r='';
+    r+='<div class="rd-info-group"><div class="rd-info-title">Context</div><div style="display:flex;flex-direction:column;gap:5px;font-size:12px;">';
+    if(rName)r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Role</span><span style="font-weight:600;">'+esc(rName)+'</span></div>';
+    r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Source</span><span style="font-weight:600;">'+esc(srcType)+'</span></div>';
+    r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Op type</span><span style="font-weight:600;">'+esc(opType)+'</span></div>';
+    if(tName)r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Table</span><span style="font-weight:600;">'+esc(tName)+'</span></div>';
+    if(it.super_name)r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">SuperTable</span><span style="font-weight:600;">'+esc(it.super_name)+'</span></div>';
+    if(it.engine)r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Engine</span><span style="font-weight:600;">'+esc(it.engine)+'</span></div>';
+    if(d!==null)r+='<div style="display:flex;justify-content:space-between;"><span style="color:var(--text-muted);">Duration</span><span style="font-weight:600;font-family:var(--mono);">'+esc(fmtMs(d))+'</span></div>';
+    r+='</div></div>';
+    r+='<div class="rd-info-group"><div class="rd-info-title">When &amp; where</div>';
+    if(ts)r+='<div style="font-size:11px;color:var(--text-muted);">'+esc(fmtDate(ts))+'</div>';
+    if(it.instance_id)r+='<div style="font-size:10px;font-family:var(--mono);color:var(--text-muted);margin-top:2px;">'+esc(it.instance_id)+'</div>';
+    r+='</div>';
+    r+='<div class="rd-info-group"><div class="rd-info-title">IDs</div>';
+    if(it.query_id)r+='<div style="font-size:9px;font-family:var(--mono);color:var(--text-muted);word-break:break-all;line-height:1.6;">'+esc(it.query_id)+'</div>';
+    if(it.query_hash)r+='<div style="font-size:9px;font-family:var(--mono);color:var(--text-muted);margin-top:2px;">hash: '+esc(it.query_hash)+'</div>';
+    r+='</div>';
+    rp.innerHTML=r;
+  }
 }
 
 // ─── MCP section ──────────────────────────────────────────────────────────

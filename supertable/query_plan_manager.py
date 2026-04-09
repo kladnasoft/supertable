@@ -39,6 +39,8 @@ class QueryPlanManager:
         self.identity = "queries"
         self.organization = organization
         self.super_name = super_name
+        self.query = query
+        self.original_table = ""
 
         # Build an absolute temp directory rooted under the app home.
         # Matches the resolution logic in engine_common.init_connection()
