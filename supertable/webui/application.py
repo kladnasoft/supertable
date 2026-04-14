@@ -353,6 +353,19 @@ def login_post(
                 if p_org != org:
                     continue
                 user_doc_key = f"supertable:{org}:{p_sup}:rbac:users:doc:{user_id}"
+                # Check if user account is disabled
+                enabled_raw = catalog.r.hget(user_doc_key, "enabled")
+                if enabled_raw is not None:
+                    ev = enabled_raw if isinstance(enabled_raw, str) else enabled_raw.decode("utf-8")
+                    if ev.lower() in ("false", "0"):
+                        _audit(
+                            category=EventCategory.AUTHENTICATION, action=Actions.LOGIN_FAILURE,
+                            organization=org, actor_ip=request.client.host if request.client else "",
+                            actor_username=username, severity=Severity.WARNING,
+                            outcome=Outcome.FAILURE, reason="account_disabled",
+                            detail=make_detail(method="token", username_attempted=username), server="webui",
+                        )
+                        return _render_login(request, message="Account is disabled. Contact your administrator.", clear_cookie=True)
                 raw_roles = catalog.r.hget(user_doc_key, "roles")
                 if not raw_roles:
                     continue

@@ -452,7 +452,7 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         '<div class="conn-panel active" id="cpPbi"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Get Data → OData Feed → paste this URL:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Authentication: <strong>Organizational account</strong> → set Header: <span style="font-family:var(--mono);">Authorization</span> = <span style="font-family:var(--mono);">Bearer &lt;token&gt;</span></div></div>'+
         '<div class="conn-panel" id="cpExcel"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Data → Get Data → From OData Feed → paste URL:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Or use this formula in Power Query:<code>=OData.Feed("'+esc(host+fullUrl)+'", null, [Headers=[Authorization="Bearer &lt;token&gt;"]])</code></div></div>'+
         '<div class="conn-panel" id="cpTableau"><div style="font-size:11px;color:var(--text-sec);margin-bottom:4px;">Connect → OData → Server:</div><code>'+esc(host+fullUrl)+'</code><div style="font-size:11px;color:var(--text-sec);margin-top:8px;">Authentication: select <strong>None</strong> and configure an Initial SQL or Custom HTTP header with <span style="font-family:var(--mono);">Authorization: Bearer &lt;token&gt;</span></div></div>'+
-        '<div style="margin-top:12px;"><button class="btn-sm" id="dTest" style="gap:6px;"><i class="fas fa-play"></i> Test $metadata</button><div id="testResult"></div></div>';
+        '<div style="margin-top:12px;"><button class="btn-sm" id="dTest" style="gap:6px;"><i class="fas fa-satellite-dish"></i> Test OData Service</button><div id="testResult"></div></div>';
 
       document.getElementById("dRegen").onclick=function(){regenerateEndpointToken(selected);};
       // Connection string tabs
@@ -463,15 +463,19 @@ html,body{font-family:var(--font);background:var(--bg);color:var(--text);font-si
         var target=tab.getAttribute("data-ct");
         document.getElementById("cp"+(target==="pbi"?"Pbi":target==="excel"?"Excel":"Tableau")).classList.add("active");
       });});
-      // Test $metadata
+      // Test OData service health
       document.getElementById("dTest").addEventListener("click",async function(){
-        var resEl=document.getElementById("testResult");resEl.innerHTML='<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">Testing…</div>';
+        var resEl=document.getElementById("testResult");resEl.innerHTML='<div style="margin-top:8px;font-size:11px;color:var(--text-muted);"><i class="fas fa-spinner fa-spin"></i> Checking OData service…</div>';
         try{
           var t0=performance.now();
-          var r=await fetch(metaUrl,{headers:{"Accept":"application/xml"}});
+          var r=await apiGet("/api/v1/odata/health");
           var ms=Math.round(performance.now()-t0);
-          if(r.ok)resEl.innerHTML='<div class="test-result test-ok"><i class="fas fa-check-circle"></i> '+r.status+' OK — '+ms+'ms</div>';
-          else resEl.innerHTML='<div class="test-result test-fail"><i class="fas fa-times-circle"></i> '+r.status+' — '+ms+'ms</div>';
+          if(r&&r.ok&&r.status==="online"){
+            resEl.innerHTML='<div class="test-result test-ok"><i class="fas fa-check-circle"></i> OData service online — port '+r.port+' — '+ms+'ms</div>';
+          }else{
+            var detail=(r&&r.detail)?r.detail:((r&&r.status)?r.status:"unreachable");
+            resEl.innerHTML='<div class="test-result test-fail"><i class="fas fa-times-circle"></i> '+esc(detail)+' — port '+(r&&r.port||"8052")+'</div>';
+          }
         }catch(e){resEl.innerHTML='<div class="test-result test-fail"><i class="fas fa-times-circle"></i> '+esc(e.message)+'</div>';}
       });
     }

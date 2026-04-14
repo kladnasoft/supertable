@@ -4167,6 +4167,61 @@ def odata_endpoint_delete(
     return JSONResponse({"ok": True, "data": {"deleted": deleted}})
 
 
+@router.get("/api/v1/odata/health")
+def odata_health_check(
+    _=Depends(admin_guard_api),
+):
+    """Ping the standalone OData service healthz endpoint.
+
+    Returns the service status so the WebUI can show whether OData is reachable.
+    Uses stdlib urllib so there is no dependency on httpx in the dev venv.
+    """
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    odata_host = getattr(settings, "SUPERTABLE_ODATA_HOST", "0.0.0.0")
+    # 0.0.0.0 means "all interfaces" — ping via localhost instead
+    if odata_host in ("0.0.0.0", "::"):
+        odata_host = "127.0.0.1"
+    odata_port = getattr(settings, "SUPERTABLE_ODATA_PORT", 8052)
+    url = f"http://{odata_host}:{odata_port}/healthz"
+
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            data = _json.loads(body) if body else {}
+        return JSONResponse({
+            "ok": True,
+            "status": "online",
+            "service": data.get("service", "odata"),
+            "port": odata_port,
+            "url": url,
+        })
+    except urllib.error.HTTPError as e:
+        return JSONResponse({
+            "ok": False,
+            "status": "unhealthy",
+            "http_status": e.code,
+            "port": odata_port,
+        })
+    except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        return JSONResponse({
+            "ok": False,
+            "status": "offline",
+            "detail": f"OData service not reachable on port {odata_port}",
+            "port": odata_port,
+        })
+    except Exception as e:
+        return JSONResponse({
+            "ok": False,
+            "status": "error",
+            "detail": str(e)[:200],
+            "port": odata_port,
+        })
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #   DATA QUALITY endpoints
 # ═══════════════════════════════════════════════════════════════════════════

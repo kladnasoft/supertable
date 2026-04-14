@@ -61,10 +61,20 @@ def _validate_identifier(name: str) -> str:
 # Table + schema discovery (RBAC-scoped)
 # ---------------------------------------------------------------------------
 
+def _is_system_table(name: str) -> bool:
+    """Return True for internal/system tables (e.g. __data_quality__)."""
+    return name.startswith("__") and name.endswith("__")
+
+
 def get_tables(super_name: str, organization: str, role_name: str) -> Tuple[List[str], MetaReader]:
-    """Return the list of tables visible to the given role."""
+    """Return the list of user tables visible to the given role.
+
+    System tables (``__*__``) are excluded — they are internal to the
+    platform and must not be exposed via OData feeds.
+    """
     meta_reader = MetaReader(super_name=super_name, organization=organization)
     tables = meta_reader.get_tables(role_name=role_name)
+    tables = [t for t in tables if not _is_system_table(t)]
     return tables, meta_reader
 
 

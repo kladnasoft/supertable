@@ -279,6 +279,11 @@ def odata_query(
     _enforce_scope(ctx, organization, super_name)
     role_name = ctx.get("role_name", "")
 
+    # Block access to system/internal tables
+    from supertable.odata.odata_handler import _is_system_table
+    if _is_system_table(entity_set_name):
+        raise HTTPException(status_code=404, detail=f"Entity set '{entity_set_name}' not found")
+
     # Build safe SQL from OData query options
     from supertable.odata.odata_handler import build_query, format_odata_response
 

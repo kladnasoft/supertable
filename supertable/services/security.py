@@ -96,6 +96,11 @@ def _decode_role(raw: Dict, role_id: str) -> Dict[str, Any]:
                 data[field] = json.loads(data[field])
             except Exception:
                 pass
+    # Normalize enabled to boolean (default True for backward compat)
+    if "enabled" in data:
+        data["enabled"] = data["enabled"] not in ("false", "0", "")
+    else:
+        data["enabled"] = True
     return data
 
 
@@ -258,6 +263,11 @@ def _decode_user(raw: Dict, user_id: str) -> Dict[str, Any]:
             data["roles"] = json.loads(data["roles"])
         except Exception:
             data["roles"] = []
+    # Normalize enabled to boolean (default True for backward compat)
+    if "enabled" in data:
+        data["enabled"] = data["enabled"] not in ("false", "0", "")
+    else:
+        data["enabled"] = True
     return data
 
 

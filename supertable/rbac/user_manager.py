@@ -126,7 +126,7 @@ class UserManager:
         return self.get_user(user_id)
 
     def modify_user(self, user_id: str, data: dict) -> None:
-        """Modify an existing user.  Supported fields: ``username``, ``roles``."""
+        """Modify an existing user.  Supported fields: ``username``, ``display_name``, ``roles``."""
         org, sup = self.organization, self.super_name
         existing = self._catalog.get_user_details(org, sup, user_id)
         if existing is None:
@@ -149,6 +149,9 @@ class UserManager:
                     raise ValueError(f"Username '{new_username}' is already taken")
                 self._catalog.rbac_rename_user(org, sup, user_id, old_username, new_username)
             update_fields["username"] = new_username
+
+        if "display_name" in data:
+            update_fields["display_name"] = str(data["display_name"]).strip()
 
         if update_fields:
             self._catalog.rbac_update_user(org, sup, user_id, update_fields)

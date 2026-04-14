@@ -20,6 +20,10 @@ Environment:
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 # ---------------------------------------------------------------------------
@@ -30,6 +34,54 @@ from supertable.logging import configure_logging, RequestLoggingMiddleware
 
 configure_logging(service="odata")
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Instance registration via shared ServiceRegistry
+# ---------------------------------------------------------------------------
+from supertable.service_registry import ServiceRegistry
+
+_registry = ServiceRegistry("odata", metadata={
+    "port": getattr(settings, "SUPERTABLE_ODATA_PORT", 8052),
+})
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Manage service registration heartbeat + startup audit event."""
+    port = getattr(settings, "SUPERTABLE_ODATA_PORT", 8052)
+    logger.info("OData service starting on port %s", port)
+
+    # Audit: service start
+    try:
+        from supertable.audit import emit as _audit, EventCategory, Actions, Severity, make_detail
+        _audit(
+            category=EventCategory.SYSTEM,
+            action=Actions.SERVICE_START,
+            organization="",
+            super_name="",
+            resource_type="service",
+            resource_id="odata",
+            severity=Severity.INFO,
+            detail=make_detail(port=port),
+        )
+    except Exception:
+        pass
+
+    # Start registry heartbeat
+    await _registry.astart()
+    task = asyncio.create_task(_registry.aheartbeat(), name="registry-odata")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        _registry.astop()
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
@@ -38,6 +90,19 @@ app = FastAPI(
     title="SuperTable OData Service",
     version="1.0.0",
     description="SuperTable OData 4.0 feed server — independent service with bearer token auth",
+    lifespan=_lifespan,
+)
+
+# CORS — OData clients (Power BI Web, Excel Online, simulators) make
+# cross-origin requests.  Auth is via Bearer token, not cookies, so
+# allow_origins=["*"] is safe here.
+from starlette.middleware.cors import CORSMiddleware  # noqa: E402
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS", "HEAD"],
+    allow_headers=["Authorization", "Accept", "Content-Type", "OData-Version", "OData-MaxVersion"],
+    expose_headers=["OData-Version", "Content-Type"],
 )
 
 app.add_middleware(RequestLoggingMiddleware, service="odata")
@@ -55,41 +120,14 @@ app.include_router(odata_router)
 
 
 # ---------------------------------------------------------------------------
-# Startup event — log service start
-# ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def _on_startup():
-    import logging
-    log = logging.getLogger("supertable.odata")
-    port = settings.SUPERTABLE_ODATA_PORT
-    log.info("OData service starting on port %s", port)
-
-    try:
-        from supertable.audit import emit as _audit, EventCategory, Actions, Severity, make_detail
-        _audit(
-            category=EventCategory.SYSTEM,
-            action=Actions.SERVICE_START,
-            organization="",
-            super_name="",
-            resource_type="service",
-            resource_id="odata",
-            severity=Severity.INFO,
-            detail=make_detail(port=port),
-        )
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
 
-    host = settings.SUPERTABLE_ODATA_HOST
-    port = settings.SUPERTABLE_ODATA_PORT
+    host = getattr(settings, "SUPERTABLE_ODATA_HOST", "0.0.0.0")
+    port = getattr(settings, "SUPERTABLE_ODATA_PORT", 8052)
 
     uvicorn.run(
         "supertable.odata.application:app",

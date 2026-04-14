@@ -2186,9 +2186,10 @@ function renderInstances(){
   var wrap=document.getElementById("instancesTableWrap");
   var cntEl=document.getElementById("instanceCount");if(!wrap)return;
   var alive=instancesData.filter(function(i){return i.alive;});
-  var apiCount=alive.filter(function(i){return(i.server_type||"api")==="api";}).length;
-  var mcpCount=alive.filter(function(i){return i.server_type==="mcp";}).length;
-  if(cntEl)cntEl.textContent=" ("+apiCount+" API"+(mcpCount?", "+mcpCount+" MCP":"")+(instancesData.length>alive.length?", "+(instancesData.length-alive.length)+" expired":"")+")" ;
+  var apiCount=alive.filter(function(i){return(i.service_type||"api")==="api";}).length;
+  var mcpCount=alive.filter(function(i){return i.service_type==="mcp";}).length;
+  var odataCount=alive.filter(function(i){return i.service_type==="odata";}).length;
+  if(cntEl)cntEl.textContent=" ("+apiCount+" API"+(mcpCount?", "+mcpCount+" MCP":"")+(odataCount?", "+odataCount+" OData":"")+(instancesData.length>alive.length?", "+(instancesData.length-alive.length)+" expired":"")+")" ;
   if(!instancesData.length){
     wrap.innerHTML='<div class="locks-empty"><i class="fas fa-cubes"></i>No instances registered yet.<div style="font-size:11px;margin-top:4px;">Instances appear here within 15s of starting.</div></div>';
     return;
@@ -2196,9 +2197,11 @@ function renderInstances(){
   var now=Date.now();
   var rows=instancesData.map(function(inst){
     var alive=inst.alive;
-    var stype=inst.server_type||"api";
+    var stype=inst.service_type||"api";
     var typeBadge=stype==="mcp"
       ?'<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;background:rgba(124,58,237,.08);color:var(--purple);border:1px solid rgba(124,58,237,.2);">MCP</span>'
+      :stype==="odata"
+      ?'<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;background:rgba(16,185,129,.08);color:var(--success);border:1px solid rgba(16,185,129,.2);">OData</span>'
       :'<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;background:rgba(41,181,232,.08);color:var(--primary);border:1px solid rgba(41,181,232,.2);">API</span>';
     var uptime=inst.started_at?Math.floor((now/1000)-inst.started_at):null;
     var uptimeStr=uptime===null?"—":uptime<60?uptime+"s":uptime<3600?Math.floor(uptime/60)+"m "+String(uptime%60).padStart(2,"0")+"s":Math.floor(uptime/3600)+"h "+String(Math.floor((uptime%3600)/60)).padStart(2,"0")+"m";
@@ -2206,7 +2209,9 @@ function renderInstances(){
     var lastStr=lastSeenAgo===null?"—":lastSeenAgo<5?"just now":lastSeenAgo+"s ago";
     var ttlPct=alive?Math.min(100,Math.round((inst.ttl_ms||0)/30000*100)):0;
     var ttlCol=ttlPct>60?"var(--success)":ttlPct>25?"var(--warn)":"var(--error)";
-    var extra=stype==="mcp"&&inst.transport?' <span style="font-size:9px;color:var(--text-muted);">('+esc(inst.transport)+(inst.port&&inst.transport!=="stdio"?":"+inst.port:"")+')</span>':"";
+    var extra=stype==="mcp"&&inst.transport?' <span style="font-size:9px;color:var(--text-muted);">('+esc(inst.transport)+(inst.port&&inst.transport!=="stdio"?":"+inst.port:"")+')</span>'
+      :stype==="odata"&&inst.port?' <span style="font-size:9px;color:var(--text-muted);">(:'+inst.port+')</span>'
+      :"";
     return'<tr>'
       +'<td>'+typeBadge+'</td>'
       +'<td><span style="display:inline-flex;align-items:center;gap:5px;">'

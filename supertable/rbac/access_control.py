@@ -13,12 +13,22 @@ from supertable.utils.sql_parser import SQLParser
 def _resolve_role(role_manager: RoleManager, role_name: str) -> dict:
     """Resolve a role_name to its role document.
 
-    Raises ``PermissionError`` if the role does not exist.
+    Raises ``PermissionError`` if the role does not exist or is disabled.
     """
     role_info = role_manager.get_role_by_name(role_name)
     if not role_info:
         logger.error(f"Role not found: {role_name}")
         raise PermissionError(f"Invalid or nonexistent role: {role_name}")
+    # Check if role is disabled (enabled field missing = enabled for backward compat)
+    enabled_val = role_info.get("enabled")
+    if isinstance(enabled_val, bytes):
+        enabled_val = enabled_val.decode("utf-8")
+    if isinstance(enabled_val, str) and enabled_val.lower() in ("false", "0"):
+        logger.warning(f"Role '{role_name}' is disabled")
+        raise PermissionError(f"Role '{role_name}' is disabled.")
+    if isinstance(enabled_val, bool) and not enabled_val:
+        logger.warning(f"Role '{role_name}' is disabled")
+        raise PermissionError(f"Role '{role_name}' is disabled.")
     return role_info
 
 

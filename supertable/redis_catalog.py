@@ -661,9 +661,10 @@ return 1
                 for uid in uids:
                     pipe.hgetall(_rbac_user_doc_key(org, sup, uid))
                 results = pipe.execute()
-            for raw in results:
+            for uid, raw in zip(uids, results):
                 if raw:
                     data: Dict[str, Any] = dict(raw)
+                    data.setdefault("user_id", uid)
                     if "roles" in data:
                         try:
                             data["roles"] = json.loads(data["roles"])
@@ -687,9 +688,10 @@ return 1
                 for rid in rids:
                     pipe.hgetall(_rbac_role_doc_key(org, sup, rid))
                 results = pipe.execute()
-            for raw in results:
+            for rid, raw in zip(rids, results):
                 if raw:
                     data: Dict[str, Any] = dict(raw)
+                    data.setdefault("role_id", rid)
                     for field in ("tables", "columns", "filters"):
                         if field in data:
                             try:
@@ -708,6 +710,7 @@ return 1
             if not raw:
                 return None
             data: Dict[str, Any] = dict(raw)
+            data.setdefault("role_id", role_id)
             for field in ("tables", "columns", "filters"):
                 if field in data:
                     try:
@@ -726,6 +729,7 @@ return 1
             if not raw:
                 return None
             data: Dict[str, Any] = dict(raw)
+            data.setdefault("user_id", user_id)
             if "roles" in data:
                 try:
                     data["roles"] = json.loads(data["roles"])

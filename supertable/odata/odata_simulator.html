@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OData Simulator — SuperTable</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg: #0e1117;
+    --surface: #161b22;
+    --surface-2: #1c2129;
+    --border: #30363d;
+    --border-bright: #484f58;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #1c96ca;
+    --accent-dim: rgba(28,150,202,.15);
+    --accent-hover: #147ba3;
+    --green: #3fb950;
+    --green-dim: rgba(63,185,80,.12);
+    --red: #f85149;
+    --red-dim: rgba(248,81,73,.12);
+    --orange: #d29922;
+    --orange-dim: rgba(210,153,34,.12);
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'IBM Plex Sans', -apple-system, sans-serif;
+    --radius: 8px;
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    grid-template-columns: 340px 1fr;
+    gap: 0;
+  }
+
+  /* ── Header ── */
+  .header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .header-icon {
+    width: 36px; height: 36px;
+    background: var(--accent-dim);
+    border: 1px solid rgba(28,150,202,.3);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; color: var(--accent);
+  }
+  .header h1 { font-size: 18px; font-weight: 600; letter-spacing: -.02em; }
+  .header .sub { font-size: 12px; color: var(--text-muted); margin-left: auto; font-family: var(--mono); }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .dot-off { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot-on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  /* ── Left Panel ── */
+  .panel-left {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 20px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label {
+    font-size: 11px; font-weight: 600; color: var(--text-muted);
+  }
+  .field input, .field select, .field textarea {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--text);
+    outline: none;
+    transition: border-color .15s;
+  }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    border-color: var(--accent);
+  }
+  .field textarea { resize: vertical; min-height: 60px; }
+  .field-row { display: flex; gap: 8px; }
+  .field-row .field { flex: 1; }
+  .field .hint { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+
+  .btn {
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 16px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all .15s;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--border-bright); background: var(--border); }
+  .btn-sm { font-size: 11px; padding: 5px 10px; }
+  .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .sep {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 4px 0;
+  }
+
+  /* ── Quick Actions ── */
+  .quick-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .quick-btn {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--text-muted);
+    cursor: pointer;
+    text-align: left;
+    transition: all .15s;
+  }
+  .quick-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+  /* ── Right Panel ── */
+  .panel-right {
+    background: var(--bg);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Request URL bar ── */
+  .url-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .method-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: var(--green-dim);
+    color: var(--green);
+    border: 1px solid rgba(63,185,80,.2);
+    flex-shrink: 0;
+  }
+  .url-display {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .url-display .highlight { color: var(--accent); }
+  .url-display .param { color: var(--orange); }
+
+  /* ── Response ── */
+  .response-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .response-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 4px;
+  }
+  .badge-ok { background: var(--green-dim); color: var(--green); border: 1px solid rgba(63,185,80,.2); }
+  .badge-err { background: var(--red-dim); color: var(--red); border: 1px solid rgba(248,81,73,.2); }
+  .badge-pending { background: var(--orange-dim); color: var(--orange); border: 1px solid rgba(210,153,34,.2); }
+  .response-meta { font-size: 11px; color: var(--text-muted); font-family: var(--mono); }
+
+  .response-tabs {
+    display: flex;
+    gap: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    flex-shrink: 0;
+  }
+  .response-tab {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 8px 14px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: all .15s;
+  }
+  .response-tab:hover { color: var(--text); }
+  .response-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .response-body {
+    flex: 1;
+    overflow: auto;
+    padding: 16px 20px;
+  }
+  .response-body pre {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+  }
+  .response-body .xml-tag { color: var(--accent); }
+  .response-body .xml-attr { color: var(--orange); }
+  .response-body .json-key { color: var(--accent); }
+  .response-body .json-str { color: var(--green); }
+  .response-body .json-num { color: var(--orange); }
+  .response-body .json-bool { color: #d2a8ff; }
+
+  /* Table view */
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+  .data-table th {
+    text-align: left;
+    padding: 8px 12px;
+    background: var(--surface);
+    border-bottom: 2px solid var(--border);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  .data-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .data-table tr:hover td { background: var(--surface-2); }
+
+  /* Empty state */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted);
+    gap: 12px;
+    padding: 40px;
+  }
+  .empty-state i { font-size: 40px; opacity: .3; }
+  .empty-state p { font-size: 13px; text-align: center; max-width: 320px; line-height: 1.6; }
+
+  /* History */
+  .history-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-muted);
+    transition: all .15s;
+  }
+  .history-item:hover { background: var(--surface-2); color: var(--text); }
+  .history-item .hi-method { font-family: var(--mono); font-weight: 700; color: var(--green); font-size: 10px; width: 30px; flex-shrink: 0; }
+  .history-item .hi-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+  .history-item .hi-status { font-family: var(--mono); font-size: 10px; }
+  .hi-ok { color: var(--green); }
+  .hi-err { color: var(--red); }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+
+<!-- ── Header ── -->
+<div class="header">
+  <div class="header-icon"><i class="fas fa-plug"></i></div>
+  <div>
+    <h1>OData Simulator</h1>
+  </div>
+  <div class="sub">
+    <span class="status-dot dot-off" id="statusDot"></span>
+    <span id="statusText">Disconnected</span>
+  </div>
+</div>
+
+<!-- ── Left Panel ── -->
+<div class="panel-left">
+  <div>
+    <div class="section-title">Connection</div>
+    <div class="field">
+      <label>OData Service URL</label>
+      <input type="text" id="baseUrl" value="http://localhost:8052" placeholder="http://host:port">
+    </div>
+    <div class="field-row" style="margin-top:8px;">
+      <div class="field">
+        <label>Organization</label>
+        <input type="text" id="org" value="" placeholder="org-name">
+      </div>
+      <div class="field">
+        <label>SuperTable</label>
+        <input type="text" id="sup" value="" placeholder="super-name">
+      </div>
+    </div>
+    <div class="field" style="margin-top:8px;">
+      <label>Bearer Token</label>
+      <input type="password" id="token" value="" placeholder="st_od_...">
+      <div class="hint">Created in Security → OData Endpoints</div>
+    </div>
+    <div style="margin-top:8px;">
+      <button class="btn btn-primary" onclick="testHealth()" style="width:100%;">
+        <i class="fas fa-satellite-dish"></i> Test Connection
+      </button>
+    </div>
+  </div>
+
+  <hr class="sep">
+
+  <div>
+    <div class="section-title">Query</div>
+    <div class="field">
+      <label>Entity Set (table)</label>
+      <input type="text" id="entitySet" value="" placeholder="table_name">
+    </div>
+    <div class="field" style="margin-top:8px;">
+      <label>$select</label>
+      <input type="text" id="qSelect" value="" placeholder="col1,col2,col3">
+    </div>
+    <div class="field" style="margin-top:8px;">
+      <label>$filter</label>
+      <input type="text" id="qFilter" value="" placeholder="status eq 'active'">
+    </div>
+    <div class="field-row" style="margin-top:8px;">
+      <div class="field">
+        <label>$top</label>
+        <input type="number" id="qTop" value="100" min="1" max="100000">
+      </div>
+      <div class="field">
+        <label>$apply</label>
+        <input type="text" id="qApply" value="" placeholder="aggregate(...)">
+      </div>
+    </div>
+    <div class="btn-group" style="margin-top:12px;">
+      <button class="btn btn-primary" onclick="queryEntity()" style="flex:1;">
+        <i class="fas fa-play"></i> Query
+      </button>
+    </div>
+  </div>
+
+  <hr class="sep">
+
+  <div>
+    <div class="section-title">Quick Actions</div>
+    <div class="quick-grid">
+      <button class="quick-btn" onclick="fetchHealthz()">
+        <i class="fas fa-heart-pulse" style="margin-right:4px;"></i> /healthz
+      </button>
+      <button class="quick-btn" onclick="fetchServiceRoot()">
+        <i class="fas fa-list" style="margin-right:4px;"></i> Service Root
+      </button>
+      <button class="quick-btn" onclick="fetchMetadata()">
+        <i class="fas fa-code" style="margin-right:4px;"></i> $metadata
+      </button>
+      <button class="quick-btn" onclick="queryEntity()">
+        <i class="fas fa-table" style="margin-right:4px;"></i> Entity Set
+      </button>
+    </div>
+  </div>
+
+  <hr class="sep">
+
+  <div>
+    <div class="section-title">History</div>
+    <div id="history" style="display:flex;flex-direction:column;gap:2px;"></div>
+  </div>
+</div>
+
+<!-- ── Right Panel ── -->
+<div class="panel-right">
+  <div class="url-bar" id="urlBar">
+    <span class="method-tag">GET</span>
+    <span class="url-display" id="urlDisplay">—</span>
+  </div>
+  <div class="response-header" id="respHeader" style="display:none;">
+    <span class="response-badge badge-pending" id="respBadge">…</span>
+    <span class="response-meta" id="respMeta"></span>
+  </div>
+  <div class="response-tabs" id="respTabs" style="display:none;">
+    <div class="response-tab active" data-tab="formatted" onclick="switchTab(this)">Formatted</div>
+    <div class="response-tab" data-tab="raw" onclick="switchTab(this)">Raw</div>
+    <div class="response-tab" data-tab="table" onclick="switchTab(this)">Table</div>
+    <div class="response-tab" data-tab="headers" onclick="switchTab(this)">Headers</div>
+  </div>
+  <div class="response-body" id="respBody">
+    <div class="empty-state">
+      <i class="fas fa-plug"></i>
+      <p>Configure connection on the left and click <strong>Test Connection</strong> to start. Then use Quick Actions or the Query panel to explore your OData feed.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+var lastResponse = null;
+var lastHeaders = null;
+var lastUrl = '';
+var historyList = [];
+
+// ── Helpers ──
+function $(id) { return document.getElementById(id); }
+function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function getBase() { return ($('baseUrl').value || '').replace(/\/+$/, ''); }
+function getOrg() { return ($('org').value || '').trim(); }
+function getSup() { return ($('sup').value || '').trim(); }
+function getToken() { return ($('token').value || '').trim(); }
+function getHeaders() {
+  var h = { 'Accept': 'application/json' };
+  var t = getToken();
+  if (t) h['Authorization'] = 'Bearer ' + t;
+  return h;
+}
+function odataPath() {
+  var o = getOrg(), s = getSup();
+  if (!o || !s) return null;
+  return '/' + encodeURIComponent(o) + '/' + encodeURIComponent(s) + '/odata';
+}
+
+// ── URL display ──
+function showUrl(url) {
+  lastUrl = url;
+  try {
+    var u = new URL(url);
+    var path = u.pathname;
+    var search = u.search;
+    $('urlDisplay').innerHTML = '<span style="color:var(--text-muted);">' + esc(u.origin) + '</span>' +
+      '<span class="highlight">' + esc(path) + '</span>' +
+      (search ? '<span class="param">' + esc(search) + '</span>' : '');
+  } catch(e) {
+    $('urlDisplay').textContent = url;
+  }
+}
+
+// ── Status ──
+function setStatus(online) {
+  $('statusDot').className = 'status-dot ' + (online ? 'dot-on' : 'dot-off');
+  $('statusText').textContent = online ? 'Connected' : 'Disconnected';
+}
+
+// ── History ──
+function addHistory(method, path, status) {
+  historyList.unshift({ method: method, path: path, status: status, time: new Date() });
+  if (historyList.length > 20) historyList.length = 20;
+  renderHistory();
+}
+function renderHistory() {
+  var html = '';
+  historyList.forEach(function(h, i) {
+    var ok = h.status >= 200 && h.status < 300;
+    html += '<div class="history-item" onclick="replayHistory(' + i + ')">' +
+      '<span class="hi-method">' + h.method + '</span>' +
+      '<span class="hi-path">' + esc(h.path) + '</span>' +
+      '<span class="hi-status ' + (ok ? 'hi-ok' : 'hi-err') + '">' + h.status + '</span></div>';
+  });
+  $('history').innerHTML = html || '<div style="font-size:11px;color:var(--text-muted);padding:4px;">No requests yet</div>';
+}
+function replayHistory(i) {
+  // History items store the full URL — we just show the last response
+}
+
+// ── Response rendering ──
+function showResponse(status, data, headers, durationMs, contentType) {
+  lastResponse = data;
+  lastHeaders = headers;
+  $('respHeader').style.display = 'flex';
+  $('respTabs').style.display = 'flex';
+
+  var ok = status >= 200 && status < 300;
+  $('respBadge').className = 'response-badge ' + (ok ? 'badge-ok' : 'badge-err');
+  $('respBadge').textContent = status;
+  $('respMeta').textContent = durationMs + 'ms' + (contentType ? ' · ' + contentType.split(';')[0] : '');
+
+  // Default to formatted tab
+  document.querySelectorAll('.response-tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelector('[data-tab="formatted"]').classList.add('active');
+  renderFormatted(data, contentType);
+}
+
+function switchTab(el) {
+  document.querySelectorAll('.response-tab').forEach(function(t) { t.classList.remove('active'); });
+  el.classList.add('active');
+  var tab = el.getAttribute('data-tab');
+  if (tab === 'formatted') renderFormatted(lastResponse, '');
+  else if (tab === 'raw') renderRaw(lastResponse);
+  else if (tab === 'table') renderTable(lastResponse);
+  else if (tab === 'headers') renderHeaders(lastHeaders);
+}
+
+function renderFormatted(data, contentType) {
+  if (typeof data === 'string' && data.trim().startsWith('<')) {
+    // XML — simple syntax highlight
+    var highlighted = esc(data)
+      .replace(/(&lt;\/?[\w:-]+)/g, '<span class="xml-tag">$1</span>')
+      .replace(/([\w:-]+)(=)/g, '<span class="xml-attr">$1</span>$2');
+    $('respBody').innerHTML = '<pre>' + highlighted + '</pre>';
+  } else {
+    var obj = (typeof data === 'string') ? tryParse(data) : data;
+    if (obj !== null) {
+      $('respBody').innerHTML = '<pre>' + syntaxHighlight(obj) + '</pre>';
+    } else {
+      $('respBody').innerHTML = '<pre>' + esc(String(data)) + '</pre>';
+    }
+  }
+}
+
+function renderRaw(data) {
+  var text = (typeof data === 'string') ? data : JSON.stringify(data, null, 2);
+  $('respBody').innerHTML = '<pre>' + esc(text) + '</pre>';
+}
+
+function renderTable(data) {
+  var obj = (typeof data === 'string') ? tryParse(data) : data;
+  if (!obj || !obj.value || !Array.isArray(obj.value) || obj.value.length === 0) {
+    $('respBody').innerHTML = '<div class="empty-state"><i class="fas fa-table"></i><p>No tabular data in response. The <code>value</code> array is empty or missing.</p></div>';
+    return;
+  }
+  var rows = obj.value;
+  var cols = Object.keys(rows[0]);
+  var html = '<table class="data-table"><thead><tr>';
+  cols.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
+  html += '</tr></thead><tbody>';
+  rows.forEach(function(row) {
+    html += '<tr>';
+    cols.forEach(function(c) {
+      var v = row[c];
+      html += '<td title="' + esc(String(v)) + '">' + esc(v === null || v === undefined ? '' : String(v)) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  $('respBody').innerHTML = html;
+}
+
+function renderHeaders(headers) {
+  if (!headers) {
+    $('respBody').innerHTML = '<pre style="color:var(--text-muted);">No headers captured</pre>';
+    return;
+  }
+  var html = '';
+  headers.forEach(function(val, key) {
+    html += '<span class="json-key">' + esc(key) + '</span>: ' + esc(val) + '\n';
+  });
+  $('respBody').innerHTML = '<pre>' + html + '</pre>';
+}
+
+function tryParse(s) {
+  try { return JSON.parse(s); } catch(e) { return null; }
+}
+
+function syntaxHighlight(obj) {
+  var json = JSON.stringify(obj, null, 2);
+  return esc(json)
+    .replace(/"([^"]+)"(\s*:)/g, '<span class="json-key">"$1"</span>$2')
+    .replace(/: "([^"]*)"/g, ': <span class="json-str">"$1"</span>')
+    .replace(/: (-?\d+\.?\d*)/g, ': <span class="json-num">$1</span>')
+    .replace(/: (true|false|null)/g, ': <span class="json-bool">$1</span>');
+}
+
+function showError(msg) {
+  $('respHeader').style.display = 'flex';
+  $('respTabs').style.display = 'none';
+  $('respBadge').className = 'response-badge badge-err';
+  $('respBadge').textContent = 'ERR';
+  $('respMeta').textContent = '';
+  $('respBody').innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle" style="color:var(--red);"></i><p>' + esc(msg) + '</p></div>';
+}
+
+function showLoading(url) {
+  showUrl(url);
+  $('respHeader').style.display = 'flex';
+  $('respTabs').style.display = 'none';
+  $('respBadge').className = 'response-badge badge-pending';
+  $('respBadge').textContent = '…';
+  $('respMeta').textContent = '';
+  $('respBody').innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin" style="color:var(--accent);"></i><p>Sending request…</p></div>';
+}
+
+// ── API Calls ──
+async function doFetch(url, accept) {
+  showLoading(url);
+  var shortPath = url.replace(getBase(), '') || '/';
+  var t0 = performance.now();
+  try {
+    var h = getHeaders();
+    if (accept) h['Accept'] = accept;
+    var resp = await fetch(url, { headers: h });
+    var ms = Math.round(performance.now() - t0);
+    var ct = resp.headers.get('content-type') || '';
+    var body;
+    if (ct.includes('xml') || ct.includes('html')) {
+      body = await resp.text();
+    } else {
+      try { body = await resp.json(); } catch(e) { body = await resp.text(); }
+    }
+    showResponse(resp.status, body, resp.headers, ms, ct);
+    addHistory('GET', shortPath, resp.status);
+    return { status: resp.status, body: body };
+  } catch(e) {
+    var ms2 = Math.round(performance.now() - t0);
+    showError('Request failed: ' + e.message + '\n\nIs the OData service running at ' + getBase() + '?');
+    addHistory('GET', shortPath, 0);
+    return { status: 0, body: null };
+  }
+}
+
+async function testHealth() {
+  var url = getBase() + '/healthz';
+  var result = await doFetch(url, 'application/json');
+  setStatus(result.status === 200);
+  if (result.status === 200) {
+    // Auto-discover entity sets if org/sup are set
+    var p = odataPath();
+    if (p) fetchServiceRoot();
+  }
+}
+
+async function fetchHealthz() {
+  var url = getBase() + '/healthz';
+  var result = await doFetch(url, 'application/json');
+  setStatus(result.status === 200);
+}
+
+async function fetchServiceRoot() {
+  var p = odataPath();
+  if (!p) { showError('Organization and SuperTable are required'); return; }
+  var url = getBase() + p;
+  await doFetch(url, 'application/json');
+}
+
+async function fetchMetadata() {
+  var p = odataPath();
+  if (!p) { showError('Organization and SuperTable are required'); return; }
+  var url = getBase() + p + '/$metadata';
+  await doFetch(url, 'application/xml');
+}
+
+async function queryEntity() {
+  var p = odataPath();
+  if (!p) { showError('Organization and SuperTable are required'); return; }
+  var entity = ($('entitySet').value || '').trim();
+  if (!entity) { showError('Entity Set (table name) is required'); return; }
+
+  var url = getBase() + p + '/' + encodeURIComponent(entity);
+  var params = [];
+  var sel = ($('qSelect').value || '').trim();
+  var filt = ($('qFilter').value || '').trim();
+  var top = ($('qTop').value || '').trim();
+  var apply = ($('qApply').value || '').trim();
+  if (sel) params.push('$select=' + encodeURIComponent(sel));
+  if (filt) params.push('$filter=' + encodeURIComponent(filt));
+  if (top) params.push('$top=' + encodeURIComponent(top));
+  if (apply) params.push('$apply=' + encodeURIComponent(apply));
+  if (params.length > 0) url += '?' + params.join('&');
+
+  var result = await doFetch(url, 'application/json');
+  // Auto switch to table view if we got data
+  if (result.status === 200 && result.body && result.body.value && result.body.value.length > 0) {
+    document.querySelectorAll('.response-tab').forEach(function(t) { t.classList.remove('active'); });
+    document.querySelector('[data-tab="table"]').classList.add('active');
+    renderTable(result.body);
+  }
+}
+
+// ── Init ──
+renderHistory();
+</script>
+</body>
+</html>

@@ -101,7 +101,7 @@ class DataReader:
                 query=parser.original_query,
             )
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
-            self.query_plan_manager.original_table = ", ".join(physical_tables) if physical_tables else ""
+            self.query_plan_manager.original_table = ", ".join(t.simple_name for t in physical_tables) if physical_tables else ""
 
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
