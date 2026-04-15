@@ -52,6 +52,14 @@ async def _lifespan(application: FastAPI):
     """Manage the instance heartbeat background task."""
     await _registry.astart()
     task = asyncio.create_task(_registry.aheartbeat(), name="registry-api")
+
+    # Start the GC background scheduler (daemon thread — runs cron-based cleanup)
+    try:
+        from supertable.services.gc_scheduler import start_gc_scheduler
+        start_gc_scheduler()
+    except Exception as e:
+        logger.warning(f"[lifespan] GC scheduler failed to start: {e}")
+
     try:
         yield
     finally:

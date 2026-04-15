@@ -700,27 +700,97 @@ def process_delete_only(
 def write_parquet_and_collect_resources(
         write_df, overwrite_columns, data_dir, new_resources, compression_level=10
 ):
+    """Write a DataFrame as one or more Parquet files and append resource dicts.
+
+    Partitioning strategy:
+      - If ``__timestamp__`` is present and non-null, rows are split by
+        year/month/day and each partition is written into a Hive-style
+        subdirectory: ``data_dir/year=YYYY/month=MM/day=DD/``.
+      - Rows where ``__timestamp__`` is null (if any) are written to the
+        flat ``data_dir/`` for safety.
+      - If ``__timestamp__`` is absent (table has no dedup-on-read), the
+        entire DataFrame is written to the flat ``data_dir/`` as before.
+
+    The partition columns are derived from the path only — they are NOT
+    stored as extra columns inside the Parquet file.  This keeps full
+    backward compatibility: the resource ``file`` path is still the only
+    thing the read side needs.
+    """
+    if write_df.height == 0:
+        return
+
+    # --- Partitioned write path: split by __timestamp__ day ------------
+    if "__timestamp__" in write_df.columns:
+        # Add temporary partition-key columns derived from __timestamp__
+        partitioned = write_df.with_columns([
+            polars.col("__timestamp__").dt.year().alias("__p_year__"),
+            polars.col("__timestamp__").dt.month().alias("__p_month__"),
+            polars.col("__timestamp__").dt.day().alias("__p_day__"),
+        ])
+
+        # Separate rows with null timestamps (defensive — shouldn't happen
+        # in normal flow because data_writer always injects a non-null value)
+        null_mask = (
+            polars.col("__p_year__").is_null()
+            | polars.col("__p_month__").is_null()
+            | polars.col("__p_day__").is_null()
+        )
+        has_nulls = partitioned.filter(null_mask).height > 0
+
+        if has_nulls:
+            null_df = partitioned.filter(null_mask).drop(["__p_year__", "__p_month__", "__p_day__"])
+            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level)
+            partitioned = partitioned.filter(~null_mask)
+
+        if partitioned.height > 0:
+            # partition_by returns a list of DataFrames, one per unique (year, month, day)
+            groups = partitioned.partition_by(["__p_year__", "__p_month__", "__p_day__"], maintain_order=False)
+            for group_df in groups:
+                year = int(group_df["__p_year__"][0])
+                month = int(group_df["__p_month__"][0])
+                day = int(group_df["__p_day__"][0])
+                group_df = group_df.drop(["__p_year__", "__p_month__", "__p_day__"])
+
+                partition_dir = os.path.join(
+                    data_dir,
+                    f"year={year}",
+                    f"month={month:02d}",
+                    f"day={day:02d}",
+                )
+                _write_single_parquet_file(
+                    group_df, overwrite_columns, partition_dir, new_resources, compression_level,
+                )
+    else:
+        # --- Flat write path (no __timestamp__) — backward compatible ---
+        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level)
+
+
+def _write_single_parquet_file(
+        write_df, overwrite_columns, target_dir, new_resources, compression_level=10
+):
+    """Write a single Parquet file into *target_dir* and append a resource entry.
+
+    This is the low-level writer extracted from the original
+    ``write_parquet_and_collect_resources``.  All Parquet encoding settings
+    (zstd, dictionary, row-group size, statistics) are unchanged.
+    """
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    # UPDATED: collect stats for EVERY column (still min/max only; perf-friendly vectorization)
     stats = collect_column_statistics(write_df, overwrite_columns)
 
-    # Ensure target "directory" exists in the active storage (creates a marker or no-op)
+    # Ensure target directory exists (no-op on object storage)
     try:
-        if not _get_storage().exists(data_dir):
-            _get_storage().makedirs(data_dir)
+        if not _get_storage().exists(target_dir):
+            _get_storage().makedirs(target_dir)
     except Exception:
-        # Best-effort: some backends may not require explicit directory creation
         pass
 
     new_parquet_file = generate_filename("data", "parquet")
-    new_parquet_path = os.path.join(data_dir, new_parquet_file)
+    new_parquet_path = os.path.join(target_dir, new_parquet_file)
 
     # Sort before writing so each row group covers a tight min/max range.
     # DuckDB uses these zonemaps to skip entire row groups during filtered scans.
-    # Sort order: __timestamp__ first (most-queried filter), then overwrite_columns
-    # as a tiebreaker.  Sorting is a no-op when write_df is already empty.
     sort_cols = (
         (["__timestamp__"] if "__timestamp__" in write_df.columns else [])
         + [c for c in (overwrite_columns or []) if c in write_df.columns and c != "__timestamp__"]
@@ -728,11 +798,8 @@ def write_parquet_and_collect_resources(
     if sort_cols and write_df.height > 0:
         write_df = write_df.sort(sort_cols)
 
-    # Write to the active storage backend (MinIO/local/etc.) WITHOUT changing behavior:
-    # we keep zstd + compression_level + statistics exactly like before by generating
-    # the Parquet bytes ourselves and uploading them.
+    # Write to the active storage backend
     try:
-        # Create parquet bytes with the same settings the original code used
         arrow_tbl: pa.Table = write_df.to_arrow()
         buf = io.BytesIO()
         pq.write_table(
@@ -749,11 +816,8 @@ def write_parquet_and_collect_resources(
         if hasattr(_get_storage(), "write_bytes"):
             _get_storage().write_bytes(new_parquet_path, data)
         elif hasattr(_get_storage(), "write_parquet"):
-            # Fallback: some storage backends may only expose write_parquet(table, path)
-            # (may ignore compression level); we prefer bytes path above to preserve behavior.
             _get_storage().write_parquet(arrow_tbl, new_parquet_path)
         else:
-            # Last-resort local write identical to original behavior
             write_df.write_parquet(
                 file=new_parquet_path,
                 compression="zstd",
@@ -762,7 +826,6 @@ def write_parquet_and_collect_resources(
                 row_group_size=_PARQUET_ROW_GROUP_SIZE,
             )
     except Exception:
-        # As a safety net, do a local write if the storage upload path fails
         write_df.write_parquet(
             file=new_parquet_path,
             compression="zstd",
@@ -771,14 +834,13 @@ def write_parquet_and_collect_resources(
             row_group_size=_PARQUET_ROW_GROUP_SIZE,
         )
 
-    # size via storage if available
+    # Determine file size
     try:
         file_size = _get_storage().size(new_parquet_path)
     except Exception:
         try:
             file_size = os.path.getsize(new_parquet_path)
         except Exception:
-            # if we uploaded via bytes and path is virtual, fall back to len(data) if defined
             try:
                 file_size = len(data)  # type: ignore[name-defined]
             except Exception:

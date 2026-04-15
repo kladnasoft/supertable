@@ -36,6 +36,40 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Recursive file listing helper (supports partitioned data directories)
+# ---------------------------------------------------------------------------
+
+def _list_parquet_files_recursive(storage, data_dir: str) -> List[str]:
+    """Recursively list all ``.parquet`` files under *data_dir*.
+
+    Works with both flat layouts (``data/*.parquet``) and Hive-style
+    partitioned layouts (``data/year=YYYY/month=MM/day=DD/*.parquet``).
+
+    Uses ``get_directory_structure`` which every storage backend implements
+    as a recursive walk, then reconstructs full paths from the nested dict.
+    """
+    try:
+        tree = storage.get_directory_structure(data_dir)
+    except Exception:
+        return []
+
+    files: List[str] = []
+
+    def _walk(node: dict, prefix: str) -> None:
+        for name, subtree in node.items():
+            full_path = os.path.join(prefix, name)
+            if subtree is None:
+                # Leaf file
+                if name.endswith(".parquet"):
+                    files.append(full_path)
+            elif isinstance(subtree, dict):
+                _walk(subtree, full_path)
+
+    _walk(tree, data_dir)
+    return files
+
+
+# ---------------------------------------------------------------------------
 # Clone protection — collect file references held by clones
 # ---------------------------------------------------------------------------
 
@@ -228,7 +262,7 @@ def preview_obsolete_files(
             organization, super_name, "tables", simple_name, "data",
         )
         try:
-            storage_files = storage.list_files(data_dir, "*.parquet")
+            storage_files = _list_parquet_files_recursive(storage, data_dir)
         except Exception:
             storage_files = []
 
