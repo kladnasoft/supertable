@@ -1,224 +1,362 @@
-# Data Island Core — Data Writer
+# Data Writer
 
-## Overview
+## Business Context
 
-The data writer is the pipeline that takes incoming data (a PyArrow table), validates it, resolves overlaps with existing data, writes Parquet files to storage, updates the snapshot in Redis, and triggers downstream systems (monitoring, data quality, audit logging, mirroring). Every mutation to a table — append, overwrite, delete — flows through `DataWriter.write()` in `data_writer.py`.
+The Data Writer is the core write-path component of SuperTable. Every row that enters the data lake -- whether from an API upload, a staging area commit, or a pipe transformation -- flows through the `DataWriter` class. It is responsible for turning raw Arrow tables into versioned, deduplicated, compressed Parquet files while maintaining snapshot isolation, catalog consistency, and optional mirroring to downstream formats.
 
-The write path is designed for correctness under concurrency. A per-table Redis lock ensures that only one write can modify a table at a time. The lock is held only during the critical section (snapshot read → file write → pointer update). Monitoring, quality checks, and audit logging happen after the lock is released.
+The write pipeline is designed around three principles:
 
----
-
-## How it works
-
-### Write pipeline — step by step
-
-The `write()` method executes these steps in order:
-
-**1. Access control** — Calls `check_write_access()` from the RBAC module. Verifies the role has write permission on the target table. Raises `PermissionError` if denied.
-
-**2. Convert input** — Converts the PyArrow table to a Polars DataFrame for processing. Records incoming row and column counts.
-
-**3. Dedup timestamp injection** — If the table has `dedup_on_read` enabled in its config, injects a `__timestamp__` column (current UTC time) if not already present. This column is used by the dedup-on-read `ROW_NUMBER()` window to determine which row is "newest."
-
-**4. Validate** — Checks table name format (alphanumeric + underscore, 1–128 chars), verifies overwrite columns exist in the dataframe, validates `newer_than` and `delete_only` constraints.
-
-**5. Acquire lock** — Acquires a per-table Redis lock (`SET NX` with 30-second TTL, 60-second timeout). If the lock cannot be acquired within the timeout, raises `TimeoutError`. Only one writer can hold the lock at a time.
-
-**6. Read current snapshot** — Reads the current snapshot from the Redis leaf pointer (or falls back to storage if the payload is not cached). This is the table's state before the write.
-
-**7. Detect overlaps** — Calls `find_overlapping_files()` from `processing.py`. Scans the snapshot's file manifest to find Parquet files whose key columns overlap with the incoming data. Returns a set of file paths that must be rewritten.
-
-**8. Newer-than filtering** (optional) — If `newer_than` is set, reads the overlapping files and drops incoming rows where the `newer_than` column value is less than or equal to the existing value. This prevents replayed or stale data from overwriting newer data.
-
-**9. Process data** — Depending on the operation:
-   - **Append (no overwrite columns):** Writes the incoming data as new Parquet files. No existing files are touched.
-   - **Overwrite:** Reads overlapping files, merges with incoming data (incoming rows replace existing rows on matching key columns), writes merged results as new files, and marks old files for removal.
-   - **Delete-only with tombstones:** If `dedup_on_read` is enabled, records deleted key values in the snapshot's tombstone list (soft delete). No files are rewritten unless the tombstone count exceeds the compaction threshold.
-   - **Delete-only without tombstones:** Reads overlapping files, removes matching rows, writes remaining rows as new files.
-
-**10. Update snapshot** — Calls `simple_table.update()` which builds a new snapshot JSON (updated resource list, incremented version, new schema, previous snapshot link) and writes it to storage.
-
-**11. Update Redis pointer** — Atomically updates the Redis leaf pointer to reference the new snapshot. Also caches the snapshot payload in Redis for fast reads. Bumps the root version counter.
-
-**12. Mirror** — If mirroring is enabled for this SuperTable, writes the updated table in Delta/Iceberg/Parquet mirror format.
-
-**13. Release lock** — The per-table Redis lock is released in a `finally` block.
-
-**14. Post-lock operations** — After the lock is released (so writes are never blocked by downstream I/O):
-   - **Monitoring:** Enqueues a metrics payload to the MonitoringWriter.
-   - **Data quality:** Notifies the quality scheduler of the new data via `notify_ingest()`.
-   - **Audit:** Emits a `data_write` audit event.
-
-### Timing instrumentation
-
-Every step is timed via the internal `mark()` helper. The complete timing breakdown is logged at INFO level:
-
-```
-Timing(s): total=1.234 | convert=0.001 | dedup_ts=0.000 | validate=0.001 |
-lock=0.050 | snapshot=0.002 | overlap=0.100 | newer_than=0.000 |
-process=0.800 | update_simple=0.050 | bump_root=0.005 | mirror=0.100
-```
+1. **Atomicity** -- a write either succeeds completely (new snapshot, updated catalog, optional mirror) or fails without side-effects. A Redis-backed per-table lock serialises concurrent writers.
+2. **Idempotency** -- the `newer_than` parameter lets callers replay the same data safely; stale or duplicate rows are silently dropped.
+3. **Incremental merge** -- only files whose key ranges overlap with incoming data are rewritten. Non-overlapping small files accumulate until a compaction threshold is reached, at which point they are merged in memory-bounded chunks.
 
 ---
 
-## Parameters
+## Module Location
 
-The `write()` method signature:
+- **Primary module**: `supertable/data_writer.py`
+- **Processing engine**: `supertable/processing.py`
+
+---
+
+## DataWriter Class
+
+```python
+class DataWriter:
+    def __init__(self, super_name: str, organization: str)
+```
+
+### Constructor
+
+Creates a writer bound to a specific SuperTable within an organization. Internally instantiates:
+
+- `self.super_table` -- a `SuperTable(super_name, organization)` instance representing the logical dataset.
+- `self.catalog` -- a `RedisCatalog()` for metadata operations (lock acquisition, leaf pointer updates, root bumps).
+- `self._table_config_cache` -- an in-process dict that caches per-table dedup configuration to avoid repeated Redis round-trips.
+
+---
+
+## Write Pipeline
+
+The `write()` method orchestrates the entire write pipeline. Each step is timed individually and logged at the end for performance diagnostics.
+
+### Method Signature
 
 ```python
 def write(
     self,
-    role_name: str,            # RBAC role for access control
-    simple_name: str,          # Target table name
-    data: pa.Table,            # Incoming data (PyArrow table)
-    overwrite_columns: list,   # Key columns for overlap detection (empty = append)
-    compression_level: int = 1,  # Parquet compression level
-    newer_than: str = None,    # Column name for staleness filtering
-    delete_only: bool = False, # Delete matching rows instead of inserting
-    lineage: dict = None,      # Upstream origin metadata for monitoring
-) -> Tuple[int, int, int, int]:
-    # Returns: (total_columns, total_rows, inserted, deleted)
+    role_name,
+    simple_name,
+    data,               # PyArrow Table
+    overwrite_columns,  # list of column names forming the logical key
+    compression_level=1,
+    newer_than=None,
+    delete_only=False,
+    lineage=None,
+) -> tuple[total_columns, total_rows, inserted, deleted]
 ```
 
-### Overwrite columns
+### Pipeline Steps
 
-When `overwrite_columns` is a non-empty list, the writer performs a key-based merge:
+```
+access_check --> convert --> dedup_ts --> validate --> lock --> snapshot
+    --> overlap --> newer_than --> process --> update_simple
+    --> bump_root --> mirror --> unlock --> monitoring --> audit
+```
 
-- Incoming rows with keys matching existing rows **replace** the existing rows
-- Incoming rows with new keys are **appended**
-- Existing rows with no matching incoming rows are **preserved**
+#### 1. Access Control (`access`)
 
-This is the mechanism for upsert operations. The overwrite columns define the composite key.
+Calls `check_write_access()` from the RBAC module to verify the role has write permission on the target table. Raises immediately if denied.
 
-### newer_than
+#### 2. Convert Input (`convert`)
 
-The `newer_than` parameter names a column (typically a timestamp) that determines row freshness. When set, incoming rows are dropped if their `newer_than` value is less than or equal to the existing row's value for the same key. This prevents replayed data from overwriting newer updates.
+Converts the incoming PyArrow table to a Polars `DataFrame` using `polars.from_arrow(data)`. Captures `incoming_rows` and `incoming_columns` for monitoring.
 
-Requires `overwrite_columns` to be set (needs keys to match rows).
+#### 3. Dedup Timestamp Injection (`dedup_ts`)
 
-### delete_only
+If the table is configured with `dedup_on_read=True`, a `__timestamp__` column is injected (set to `datetime.now(timezone.utc)`) unless one already exists. The read side uses this column in a `ROW_NUMBER` window to return only the latest row per primary key.
 
-When `True`, the incoming data is treated as a deletion manifest — rows matching the overwrite columns are removed from the table. Two paths exist:
+#### 4. Validation (`validate`)
 
-- **Tombstone path** (when `dedup_on_read` is enabled): Key values are appended to the snapshot's tombstone list. No files are rewritten. Fast, O(1) regardless of table size. Tombstones are compacted when their count exceeds a configurable threshold.
-- **Physical delete path** (when `dedup_on_read` is disabled): Overlapping files are read, matching rows are removed, and remaining rows are written back. Slower, proportional to overlap set size.
+The `validation()` method enforces structural invariants:
 
-### lineage
+| Rule | Constraint |
+|---|---|
+| Table name length | 1--128 characters |
+| Name collision | `simple_name != super_name` |
+| Name pattern | `^[A-Za-z_][A-Za-z0-9_]*$` |
+| Overwrite columns type | Must be a list, not a string |
+| Overwrite columns presence | All columns must exist in the DataFrame |
+| Delete-only guard | `delete_only=True` requires `overwrite_columns` |
+| Newer-than guard | `newer_than` must be a valid column name string and `overwrite_columns` must be set |
 
-An optional dict describing where the data came from. Stored in the monitoring stats payload for data lineage tracing. Common keys: `source_type`, `source_id`, `staging_name`, `pipe_name`, `job_id`.
+#### 5. Lock Acquisition (`lock`)
+
+Acquires a per-SimpleTable Redis lock via `catalog.acquire_simple_lock()` with a 30-second TTL and 60-second timeout. The lock token is stored for release in the `finally` block. If the lock cannot be acquired, a `TimeoutError` is raised.
+
+```python
+token = self.catalog.acquire_simple_lock(
+    org, super_name, simple_name,
+    ttl_s=30, timeout_s=60
+)
+```
+
+#### 6. Read Last Snapshot (`snapshot`)
+
+Reads the current SimpleTable snapshot via `simple_table.get_simple_table_snapshot()`, returning a dict of resources (file paths, sizes, column stats) and tombstone metadata.
+
+#### 7. Overlap Detection (`overlap`)
+
+Calls `find_overlapping_files()` from `processing.py`. This function classifies every existing resource into one of three buckets:
+
+- **`has_overlap=True`** -- the file's per-column min/max statistics indicate that at least one incoming key value falls within the file's range, OR the file has no stats (conservative assumption).
+- **`has_overlap=False`** -- the file's key ranges do not overlap with incoming data but the file is small enough to be a compaction candidate.
+- **Not included** -- large files with no overlap are left untouched.
+
+The function then applies `prune_not_overlapping_files_by_threshold()` which gates compaction: non-overlapping small files are only included if either their total size exceeds `MAX_MEMORY_CHUNK_SIZE` or their count exceeds `MAX_OVERLAPPING_FILES`. These limits can be set per-table via `configure_table()` or fall back to global defaults.
+
+#### 8. Newer-Than Filtering (`newer_than`)
+
+When `newer_than` is specified, `filter_stale_incoming_rows()` joins incoming data against existing overlapping files on `overwrite_columns`, comparing the `newer_than` column. Rows where the existing value is >= the incoming value are dropped as stale/replayed. If all rows are stale, the write short-circuits (no file I/O), but still releases the lock and emits monitoring.
+
+A `file_cache` dict is populated during this step so that Parquet files read here are not re-read during the processing step.
+
+#### 9. Tombstone / Soft-Delete Logic
+
+When `dedup_on_read` is enabled and `primary_keys` are configured:
+
+**Delete-only with tombstones** (`delete_only=True` and `use_tombstones=True`):
+- Extracts key tuples from the incoming DataFrame via `extract_key_tuples()`.
+- Appends them to the existing tombstone list (deduplicated).
+- No Parquet files are read or written (purely metadata).
+- If the tombstone count reaches the compaction threshold (default 1000, configurable via `tombstone_compact_total`), `compact_tombstones()` physically removes the tombstoned rows from all affected Parquet files and clears the tombstone list.
+
+**Reconciliation on insert/overwrite**:
+- When incoming data has keys matching existing tombstones, those tombstone entries are removed via `reconcile_tombstones()` so the newly-written rows become visible.
+
+**Physical delete fallback** (`delete_only=True` without `dedup_on_read`):
+- Falls back to `process_delete_only()`, which rewrites each overlapping file independently with the matching rows removed.
+
+#### 10. Processing -- Merge and Rewrite (`process`)
+
+For non-delete writes, `process_overlapping_files()` executes a three-phase merge:
+
+**Phase 1 -- Compaction** (`process_files_without_overlap`): Reads all `has_overlap=False` files, concatenates them with schema alignment, and flushes in memory-bounded chunks when cumulative size exceeds `MAX_MEMORY_CHUNK_SIZE`.
+
+**Phase 2 -- Overlap merge** (`process_files_with_overlap`): For each `has_overlap=True` file, performs an anti-join on the composite overwrite key to drop rows being overwritten, then concatenates the survivors with the merged buffer. Uses `2x MAX_MEMORY_CHUNK_SIZE` as the spill threshold. Files where no rows are actually deleted (false positive from stats) are skipped and tracked separately.
+
+**Phase 3 -- Skipped-file compaction**: When the number of skipped files (overlap=True but zero actual matches) exceeds `MAX_OVERLAPPING_FILES`, they are all merged into the output buffer to prevent small-file accumulation.
+
+A final flush writes any remaining rows.
+
+#### 11. Update Snapshot (`update_simple`)
+
+Calls `simple_table.update()` which creates a new snapshot JSON on storage containing the new resource list (new files added, sunset files removed), schema, lineage, and tombstone metadata.
+
+#### 12. Catalog Update (`bump_root`)
+
+Two atomic Redis operations:
+
+1. **`set_leaf_payload_cas()`** -- stores the new snapshot payload and path for the SimpleTable leaf, using compare-and-swap semantics. Per-file stats are stripped from the Redis payload to reduce size (~934 to ~172 bytes per resource).
+2. **`bump_root()`** -- increments the root version timestamp so that readers see the new data.
+
+Falls back to `set_leaf_path_cas()` if the payload CAS method is unavailable (backward compatibility).
+
+#### 13. Schema and Table Name Registration
+
+Stores the table schema and name in Redis as permanent metadata:
+
+```python
+self.catalog.r.set(f"supertable:{org}:{sup}:schema:{simple_name}", schema_json)
+self.catalog.r.sadd(f"supertable:{org}:{sup}:table_names", simple_name)
+```
+
+#### 14. Mirroring (`mirror`)
+
+Calls `MirrorFormats.mirror_if_enabled()` to replicate the new snapshot into downstream formats (CSV, Iceberg, Delta, etc.) if mirroring is configured. Mirroring failures are logged but never fail the write.
+
+#### 15. Lock Release (`finally`)
+
+The per-table lock is released in the `finally` block via `catalog.release_simple_lock()` with the original token. Token mismatch (e.g., expired lock) is logged but does not raise.
+
+#### 16. Monitoring (after lock release)
+
+A `MonitoringWriter` context manager enqueues write statistics to Redis. This runs entirely outside the data lock to avoid holding the lock during I/O:
+
+```python
+with MonitoringWriter(super_name, organization, monitor_type="writes") as monitor:
+    monitor.log_metric(stats_payload)
+```
+
+The stats payload includes: `query_id`, `recorded_at`, `organization`, `super_name`, `role_name`, `table_name`, `overwrite_columns`, `compression_level`, `newer_than`, `delete_only`, `incoming_rows`, `incoming_columns`, `inserted`, `deleted`, `total_rows`, `total_columns`, `new_resources`, `sunset_files`, `skipped_stale`, `lineage`, `duration`.
+
+#### 17. Data Quality Notification
+
+Calls `notify_ingest()` to set a debounced "pending" flag in Redis. The Data Quality scheduler picks it up on the next tick. This never blocks or fails the write.
+
+#### 18. Audit Logging
+
+Emits a `DATA_WRITE` audit event with category `DATA_MUTATION` including row counts, durations, and role information. Failures are silently ignored.
 
 ---
 
-## Overlap detection
+## Table Configuration
 
-`find_overlapping_files()` in `processing.py` determines which existing Parquet files contain rows that overlap with the incoming data on the overwrite columns.
+### configure_table()
 
-The algorithm:
+```python
+def configure_table(
+    self,
+    role_name: str,
+    simple_name: str,
+    primary_keys: list,
+    dedup_on_read: bool = False,
+    max_memory_chunk_size: int | None = None,
+    max_overlapping_files: int | None = None,
+    tombstone_compact_total: int | None = None,
+) -> None
+```
 
-1. Extract distinct key column values from the incoming dataframe
-2. For each file in the current snapshot's resource list, read only the key columns from the Parquet file
-3. Check if any key values intersect with the incoming keys
-4. Return the set of overlapping file paths
+Persists table-level configuration in Redis via `catalog.set_table_config()`. The configuration controls:
 
-Optimization: `MAX_OVERLAPPING_FILES` (default: 100) limits how many files are checked. If a table has more files than this threshold, only the most recent files are scanned. This prevents overlap detection from becoming a bottleneck on large tables.
+| Parameter | Default | Purpose |
+|---|---|---|
+| `primary_keys` | (required) | Column names forming the logical primary key |
+| `dedup_on_read` | `False` | Enables ROW_NUMBER dedup on read and `__timestamp__` injection on write |
+| `max_memory_chunk_size` | 16 MB | Maximum in-memory buffer size before flushing a Parquet chunk |
+| `max_overlapping_files` | 100 | File-count threshold that triggers compaction of small files |
+| `tombstone_compact_total` | 1000 | Maximum tombstone entries before physical compaction is triggered |
+
+Configuration is cached locally in `_table_config_cache` so that subsequent `write()` calls avoid extra Redis round-trips.
 
 ---
 
-## Tombstone management
+## Overlap Detection Details
 
-Tombstones are soft deletes for tables with `dedup_on_read` enabled. Instead of rewriting Parquet files to remove rows, the deleted key values are recorded in the snapshot metadata.
+The `find_overlapping_files()` function in `processing.py` uses per-column min/max statistics stored in each resource's `stats` dict:
+
+```python
+def find_overlapping_files(
+    last_simple_table: dict,
+    df: polars.DataFrame,
+    overwrite_columns: List[str],
+    locking: object = None,     # deprecated
+    table_config: Optional[dict] = None,
+) -> Set[Tuple[str, bool, int]]
+```
+
+**Algorithm**:
+
+1. For each resource, extract per-column stats (min/max values).
+2. For each overwrite column, check if any incoming unique value falls within `[min, max]`.
+3. If stats are missing for a column, conservatively mark the file as overlapping.
+4. Date/DateTime columns are normalized from ISO strings before comparison.
+5. Non-overlapping small files (below `MAX_MEMORY_CHUNK_SIZE`) are included as compaction candidates with `has_overlap=False`.
+6. The `prune_not_overlapping_files_by_threshold()` function gates inclusion of non-overlapping files: they are only merged when their total size exceeds `MAX_MEMORY_CHUNK_SIZE` or their count reaches `MAX_OVERLAPPING_FILES`.
+
+---
+
+## Schema Alignment
+
+The `concat_with_union()` function in `processing.py` handles DataFrames with different schemas:
+
+```python
+def concat_with_union(a: polars.DataFrame, b: polars.DataFrame) -> polars.DataFrame
+```
+
+It computes a union schema via `_union_schema()` and aligns both DataFrames before concatenation:
+
+- Missing columns are filled with `null`.
+- Type conflicts are resolved by `_resolve_unified_dtype()`:
+  - If any type is `Utf8` (string), the unified type is `Utf8`.
+  - Mixed integer + float becomes `Float64`.
+  - Mixed integers become `Int64`.
+  - `Datetime` types unify to `Datetime("us", None)`.
+  - Fallback is `Utf8`.
+
+---
+
+## Row-Group Optimization
+
+All Parquet writes use a fixed row-group size defined in `processing.py`:
+
+```python
+_PARQUET_ROW_GROUP_SIZE = 122_880  # ~120K rows
+```
+
+This value sits in the recommended 100K--1M range. The trade-off:
+
+- **Smaller groups** produce tighter min/max statistics, allowing DuckDB to skip more row groups during filtered scans.
+- **Larger groups** reduce metadata overhead.
+- **122,880 rows** is the balance chosen for the incremental-merge write pattern.
+
+Before writing, data is sorted by `__timestamp__` (if present) followed by the overwrite columns. This ensures each row group covers a tight value range, maximising the effectiveness of DuckDB's zonemap-based predicate pushdown.
+
+All Parquet files are written with:
+
+- **Compression**: zstd at the caller-specified `compression_level` (default 1).
+- **Dictionary encoding**: enabled.
+- **Statistics**: enabled (write_statistics=True).
+- **Partitioning**: when `__timestamp__` is present, rows are partitioned by `year/month/day` into Hive-style subdirectories.
+
+---
+
+## Tombstone System
+
+Tombstones provide soft-delete semantics for tables with `dedup_on_read` enabled.
+
+### Key Functions
+
+| Function | Purpose |
+|---|---|
+| `extract_key_tuples(df, primary_keys)` | Extracts unique composite-key tuples from a DataFrame for tombstone storage |
+| `reconcile_tombstones(tombstone_keys, incoming_keys)` | Removes tombstone entries that match newly-written keys (resurrection) |
+| `compact_tombstones(snapshot, primary_keys, data_dir, compression_level, table_config)` | Physically removes tombstoned rows from Parquet files when the threshold is breached |
+| `_tombstone_threshold(table_config)` | Returns the compaction threshold (default: `_DEFAULT_TOMBSTONE_COMPACT_TOTAL = 1000`) |
+| `_tombstone_overlaps_stats(tombstone_df, primary_keys, stats)` | Uses column stats to skip files that provably cannot contain tombstoned keys |
+
+### Lifecycle
+
+1. **Soft delete**: Key tuples are appended to the `tombstones.deleted_keys` list in the snapshot metadata. No Parquet files are touched.
+2. **Read filtering**: The read side excludes tombstoned keys when building query results.
+3. **Reconciliation**: When new data arrives for a previously-deleted key, the tombstone entry is removed so the new row becomes visible.
+4. **Compaction**: When `len(deleted_keys) >= tombstone_compact_total`, all affected Parquet files are rewritten with the tombstoned rows physically removed, and the tombstone list is cleared.
+
+### Tombstone Storage Format
+
+Tombstones are stored in the snapshot JSON:
 
 ```json
-"tombstones": {
-  "primary_keys": ["order_id"],
-  "deleted_keys": [[101], [202], [303]],
-  "total_tombstones": 3
+{
+  "tombstones": {
+    "primary_keys": ["customer_id", "order_id"],
+    "deleted_keys": [
+      ["CUST-001", "ORD-100"],
+      ["CUST-002", "ORD-200"]
+    ],
+    "total_tombstones": 2
+  }
 }
 ```
 
-At read time, the query engine adds a `WHERE order_id NOT IN (101, 202, 303)` filter.
-
-**Compaction:** When the tombstone count exceeds the threshold (configurable via table config, default defined in `_tombstone_threshold()`), the writer triggers compaction: all data files are rewritten without the tombstoned rows, and the tombstone list is cleared.
-
-**Reconciliation:** When new data is written with keys that match existing tombstones, those tombstones are removed — the new rows "resurrect" the deleted keys.
-
 ---
 
-## Validation rules
+## Lineage Tracking
 
-The `validation()` method enforces:
+Every write records lineage metadata in the monitoring payload. Callers can pass a `lineage` dict with conventional keys:
 
-- Table name is 1–128 characters, starts with a letter or underscore, contains only alphanumeric and underscore characters
-- Table name does not match the SuperTable name (would cause path conflicts)
-- `overwrite_columns` is a list (not a string)
-- All overwrite column names exist in the incoming dataframe
-- `delete_only` requires `overwrite_columns` (needs keys to identify rows)
-- `newer_than` must be a column name present in the dataframe, and requires `overwrite_columns`
-
----
-
-## Locking
-
-Each table has its own Redis lock key: `supertable:{org}:{sup}:lock:{simple}`. The lock is a Redis key set with `NX` (only if not exists) and `EX` (TTL of 30 seconds).
-
-The lock token is a random UUID. Only the holder can release the lock — `release_simple_lock()` uses a Lua script to atomically check-and-delete the key only if the value matches the token.
-
-If the lock holder crashes or the process is killed, the lock expires after 30 seconds (the TTL). Other writers will be able to acquire the lock after expiry.
-
-See the Locking documentation for full details.
-
----
-
-## Configuration
-
-| Setting | Default | Description |
-|---|---|---|
-| `MAX_MEMORY_CHUNK_SIZE` | 16 MB | Maximum chunk size for in-memory processing |
-| `MAX_OVERLAPPING_FILES` | 100 | Maximum files scanned during overlap detection |
-| `DEFAULT_LOCK_DURATION_SEC` | 30 | Per-table write lock TTL |
-| `DEFAULT_TIMEOUT_SEC` | 60 | Lock acquisition timeout |
-
-Per-table configuration (stored in Redis via `set_table_config()`):
-
-| Field | Description |
+| Key | Description |
 |---|---|
-| `dedup_on_read` | Enable dedup-on-read (ROW_NUMBER window at query time) |
-| `primary_keys` | Key columns for dedup and tombstone operations |
-| `max_memory_chunk_size` | Per-table override for chunk size |
-| `max_overlapping_files` | Per-table override for overlap scan limit |
+| `source_type` | Origin type: `staging_ingest`, `pipe_transform`, `api_upload`, `spark_job`, `backfill`, `manual` |
+| `source_id` | Identifier of the upstream source |
+| `source_tables` | List of upstream table names |
+| `source_query` | SQL/transform that produced this data |
+| `staging_name` | Staging area name (ingest path) |
+| `pipe_name` | Pipe name (ingest path) |
+| `job_id` | Batch job correlation ID |
+| `run_id` | Batch run correlation ID |
+| `source_files` | List of upstream file paths/URIs |
+| `schema_version` | Version tag of the incoming schema |
+| `tags` | Free-form dict for filtering/grouping |
 
----
-
-## Module structure
-
-```
-supertable/
-  data_writer.py       DataWriter class — write pipeline, validation (565 lines)
-  processing.py        Overlap detection, merge, delete, tombstones, Parquet I/O (1,069 lines)
-  simple_table.py      SimpleTable entity — snapshot read/update (269 lines)
-  locking/
-    redis_lock.py      Redis-based distributed locks
-    file_lock.py       File-based fallback locks
-```
-
----
-
-## Frequently asked questions
-
-**Can multiple processes write to the same table concurrently?**
-No. The per-table Redis lock ensures mutual exclusion. Concurrent writes to *different* tables within the same SuperTable are fully parallel — each table has its own lock.
-
-**What happens if the writer crashes while holding the lock?**
-The lock has a 30-second TTL. After expiry, the next writer can acquire it. The Redis leaf pointer is unchanged (the last successful write's snapshot is still current), so no data corruption occurs. Orphaned Parquet files from the partial write may exist on storage.
-
-**How large can a single write be?**
-Limited by available memory. The incoming PyArrow table is converted to a Polars DataFrame in memory. For very large writes, use the ingestion pipeline (which handles chunking) rather than calling `DataWriter` directly.
-
-**Does the writer support transactions across multiple tables?**
-No. Each `write()` call is atomic for a single table. There is no cross-table transaction mechanism.
-
-**How does the write path interact with RBAC?**
-`check_write_access()` is called before any data processing. If the role doesn't have write permission on the target table, the write fails with `PermissionError` before any lock is acquired or data is read.
-
-**What Parquet compression is used?**
-Snappy by default (PyArrow's default). The `compression_level` parameter controls the compression effort but does not change the codec.
+If no lineage is provided, the writer auto-generates a minimal lineage dict with the role name, overwrite columns, and query ID.
