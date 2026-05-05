@@ -86,7 +86,7 @@ def is_legal_hold_active(organization: str) -> bool:
     """
     # Try Redis first (runtime override)
     try:
-        from supertable.server_common import redis_client
+        from supertable.redis_infra import redis_client
         val = redis_client.get(_legal_hold_key(organization))
         if val is not None:
             decoded = val if isinstance(val, str) else val.decode("utf-8")
@@ -128,7 +128,7 @@ def set_legal_hold(enabled: bool, organization: str = "") -> Dict[str, Any]:
 
     # Persist to Redis
     try:
-        from supertable.server_common import redis_client
+        from supertable.redis_infra import redis_client
         redis_client.set(_legal_hold_key(organization), "1" if enabled else "0")
     except Exception as e:
         logger.error("[audit-retention] Failed to persist legal hold to Redis: %s", e)

@@ -93,7 +93,7 @@ def _query_redis(
 ) -> List[Dict[str, Any]]:
     """Query recent events from the Redis Stream."""
     try:
-        from supertable.server_common import redis_client
+        from supertable.redis_infra import redis_client
         from supertable.audit.writer_redis import RedisAuditWriter
         writer = RedisAuditWriter(redis_client, organization, "", maxlen=0)
         return writer.query(start_ms=start_ms, end_ms=end_ms, count=limit)

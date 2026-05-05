@@ -132,7 +132,7 @@ class AuditLogger:
     def _init_redis(self) -> None:
         """Initialize Redis Stream writer."""
         try:
-            from supertable.server_common import redis_client
+            from supertable.redis_infra import redis_client
             from supertable.audit.writer_redis import RedisAuditWriter
             self._redis_writer = RedisAuditWriter(
                 redis_client=redis_client,

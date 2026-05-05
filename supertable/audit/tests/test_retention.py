@@ -83,7 +83,7 @@ class TestIsLegalHoldActive:
     ) -> None:
         fake_client = _make_redis_client(get_value=redis_value)
         fake_module = SimpleNamespace(redis_client=fake_client)
-        monkeypatch.setitem(__import__("sys").modules, "supertable.server_common", fake_module)
+        monkeypatch.setitem(__import__("sys").modules, "supertable.redis_infra", fake_module)
         assert retention.is_legal_hold_active("acme") is True
 
     @pytest.mark.parametrize("redis_value", [b"0", "false", b"no"])
@@ -92,7 +92,7 @@ class TestIsLegalHoldActive:
     ) -> None:
         fake_client = _make_redis_client(get_value=redis_value)
         fake_module = SimpleNamespace(redis_client=fake_client)
-        monkeypatch.setitem(__import__("sys").modules, "supertable.server_common", fake_module)
+        monkeypatch.setitem(__import__("sys").modules, "supertable.redis_infra", fake_module)
         assert retention.is_legal_hold_active("acme") is False
 
     def test_falls_back_to_settings_when_redis_returns_none(
@@ -102,7 +102,7 @@ class TestIsLegalHoldActive:
         fake_server_common = SimpleNamespace(redis_client=fake_client)
         monkeypatch.setitem(
             __import__("sys").modules,
-            "supertable.server_common",
+            "supertable.redis_infra",
             fake_server_common,
         )
 
@@ -125,7 +125,7 @@ class TestIsLegalHoldActive:
                 raise RuntimeError("redis unreachable")
 
         monkeypatch.setitem(
-            __import__("sys").modules, "supertable.server_common", BoomModule()
+            __import__("sys").modules, "supertable.redis_infra", BoomModule()
         )
 
         # Make settings import fail by removing the attribute
@@ -155,7 +155,7 @@ class TestSetLegalHold:
     ) -> None:
         fake_client = _make_redis_client()
         fake_module = SimpleNamespace(redis_client=fake_client)
-        monkeypatch.setitem(__import__("sys").modules, "supertable.server_common", fake_module)
+        monkeypatch.setitem(__import__("sys").modules, "supertable.redis_infra", fake_module)
 
         # Stub out the audit emit chain so the test never touches the real logger.
         import supertable.audit as audit_pkg
@@ -181,7 +181,7 @@ class TestSetLegalHold:
         fake_client = MagicMock()
         fake_client.set.side_effect = RuntimeError("redis down")
         fake_module = SimpleNamespace(redis_client=fake_client)
-        monkeypatch.setitem(__import__("sys").modules, "supertable.server_common", fake_module)
+        monkeypatch.setitem(__import__("sys").modules, "supertable.redis_infra", fake_module)
 
         result = retention.set_legal_hold(False, organization="acme")
         assert result["ok"] is False
