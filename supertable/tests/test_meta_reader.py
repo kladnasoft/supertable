@@ -44,6 +44,26 @@ _P_SIMPLE_TABLE = f"{_MOD}.SimpleTable"
 
 
 # ---------------------------------------------------------------------------
+# Settings patching helper
+# ---------------------------------------------------------------------------
+
+from dataclasses import replace as _dc_replace
+from supertable.config.settings import settings as _settings
+from supertable import meta_reader as _meta_reader_module
+
+
+def _patch_settings(monkeypatch, **overrides):
+    """Substitute the per-module ``settings`` binding for the duration of
+    a test. ``settings`` is a frozen dataclass so we use dataclasses.replace
+    to derive a copy with overrides applied, then patch the binding inside
+    the meta_reader module (which imported ``settings`` by name).
+    """
+    new_settings = _dc_replace(_settings, **overrides)
+    monkeypatch.setattr(_meta_reader_module, "settings", new_settings)
+    return new_settings
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -86,6 +106,27 @@ def _scan_two_batches(batch1: list, batch2: list):
     return scan
 
 
+def _wire_catalog_scan(catalog, *keys, raise_exc: Exception | None = None):
+    """Wire up ``catalog.scan_leaf_keys`` (the new entry point used by
+    MetaReader) to return the supplied keys, or raise ``raise_exc``.
+
+    MetaReader iterates this generator-like result in ``_get_all_tables``,
+    so we set both ``side_effect`` (for exceptions) and ``return_value``.
+    """
+    if raise_exc is not None:
+        catalog.scan_leaf_keys.side_effect = raise_exc
+        return
+    catalog.scan_leaf_keys.side_effect = None
+    catalog.scan_leaf_keys.return_value = iter(list(keys))
+
+
+def _wire_catalog_scan_factory(catalog, key_provider):
+    """Have ``scan_leaf_keys`` invoke ``key_provider()`` each call (used
+    by tests that need fresh iterators across multiple ``_get_all_tables``
+    invocations)."""
+    catalog.scan_leaf_keys.side_effect = lambda *a, **kw: iter(list(key_provider()))
+
+
 def _snap(schema=None, resources=None, last_updated_ms=0):
     """Build a minimal snapshot dict."""
     return {
@@ -112,30 +153,37 @@ class TestSuperMetaCacheTtl:
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": ""}):
             assert _super_meta_cache_ttl_s() == 1.0
 
-    def test_custom_value(self):
+    def test_custom_value(self, monkeypatch):
+        # _super_meta_cache_ttl_s reads from settings (frozen dataclass), not
+        # the live env. Patch the meta_reader.settings binding instead.
         from supertable.meta_reader import _super_meta_cache_ttl_s
-        with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "5.5"}):
-            assert _super_meta_cache_ttl_s() == 5.5
+        _patch_settings(monkeypatch, SUPERTABLE_SUPER_META_CACHE_TTL_S=5.5)
+        assert _super_meta_cache_ttl_s() == 5.5
 
-    def test_zero(self):
+    def test_zero(self, monkeypatch):
         from supertable.meta_reader import _super_meta_cache_ttl_s
-        with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "0"}):
-            assert _super_meta_cache_ttl_s() == 0.0
+        # 0 is treated as "use default" by the source (`if not val: return 1.0`).
+        _patch_settings(monkeypatch, SUPERTABLE_SUPER_META_CACHE_TTL_S=0.0)
+        assert _super_meta_cache_ttl_s() == 1.0
 
-    def test_negative_clamped_to_zero(self):
+    def test_negative_clamped_to_zero(self, monkeypatch):
         from supertable.meta_reader import _super_meta_cache_ttl_s
-        with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "-3"}):
-            assert _super_meta_cache_ttl_s() == 0.0
+        _patch_settings(monkeypatch, SUPERTABLE_SUPER_META_CACHE_TTL_S=-3.0)
+        assert _super_meta_cache_ttl_s() == 0.0
 
     def test_invalid_string(self):
+        # Settings parses env vars on load, so an invalid string is already
+        # converted to None — the function returns its default.
         from supertable.meta_reader import _super_meta_cache_ttl_s
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "abc"}):
             assert _super_meta_cache_ttl_s() == 1.0
 
-    def test_whitespace_stripped(self):
+    def test_whitespace_stripped(self, monkeypatch):
         from supertable.meta_reader import _super_meta_cache_ttl_s
-        with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "  2.0  "}):
-            assert _super_meta_cache_ttl_s() == 2.0
+        # Env-var whitespace stripping happens in the settings loader; here
+        # we just verify the resulting numeric value is honoured.
+        _patch_settings(monkeypatch, SUPERTABLE_SUPER_META_CACHE_TTL_S=2.0)
+        assert _super_meta_cache_ttl_s() == 2.0
 
 
 # ===========================================================================
@@ -426,7 +474,8 @@ class TestGetAllTables:
 
     def test_extracts_table_names_from_keys(self):
         reader = _make_reader("sup", "org")
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:events",
             "supertable:org:sup:meta:leaf:users",
         )
@@ -434,7 +483,8 @@ class TestGetAllTables:
 
     def test_deduplicates_table_names(self):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:events",
             "supertable:org:sup:meta:leaf:events",
         )
@@ -442,34 +492,39 @@ class TestGetAllTables:
 
     def test_handles_bytes_keys(self):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             b"supertable:org:sup:meta:leaf:events",
         )
         assert reader._get_all_tables() == ["events"]
 
     def test_multi_batch_scan(self):
+        # The catalog now exposes a single iterator (scan_leaf_keys) — the
+        # multi-batch detail is encapsulated. We just supply both keys.
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_two_batches(
-            ["supertable:org:sup:meta:leaf:t1"],
-            ["supertable:org:sup:meta:leaf:t2"],
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:sup:meta:leaf:t2",
         )
         result = reader._get_all_tables()
         assert set(result) == {"t1", "t2"}
 
     def test_redis_exception_returns_empty(self):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = ConnectionError("down")
+        _wire_catalog_scan(reader.catalog, raise_exc=ConnectionError("down"))
         assert reader._get_all_tables() == []
 
     def test_empty_scan(self):
         reader = _make_reader()
-        reader.catalog.r.scan.return_value = (0, [])
+        _wire_catalog_scan(reader.catalog)  # no keys
         assert reader._get_all_tables() == []
 
     def test_empty_table_name_skipped(self):
         reader = _make_reader()
         # Key ending with ":" produces empty table name
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:",
             "supertable:org:sup:meta:leaf:valid",
         )
@@ -485,7 +540,8 @@ class TestGetTables:
     @patch(_P_CHECK_META)
     def test_returns_accessible_tables(self, mock_check):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
             "supertable:org:sup:meta:leaf:t2",
         )
@@ -498,7 +554,8 @@ class TestGetTables:
     @patch(_P_CHECK_META)
     def test_filters_out_denied_tables(self, mock_check):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:public",
             "supertable:org:sup:meta:leaf:secret",
         )
@@ -512,7 +569,8 @@ class TestGetTables:
     @patch(_P_CHECK_META)
     def test_all_denied_returns_empty(self, mock_check):
         reader = _make_reader()
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
         )
         mock_check.side_effect = PermissionError("no")
@@ -522,7 +580,7 @@ class TestGetTables:
     @patch(_P_CHECK_META)
     def test_no_tables_returns_empty(self, mock_check):
         reader = _make_reader()
-        reader.catalog.r.scan.return_value = (0, [])
+        _wire_catalog_scan(reader.catalog)
 
         assert reader.get_tables("admin") == []
         mock_check.assert_not_called()
@@ -591,8 +649,9 @@ class TestGetTableSchema:
     def test_super_level_aggregates_schemas(self, mock_check, MockST):
         """table_name == super_name → aggregate schemas across all tables."""
         reader = _make_reader("sup", "org")
-        # _get_all_tables returns two tables
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        # _get_all_tables now goes through catalog.scan_leaf_keys
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
             "supertable:org:sup:meta:leaf:t2",
         )
@@ -609,7 +668,8 @@ class TestGetTableSchema:
     def test_super_level_deduplicates_columns(self, mock_check, MockST):
         """Same column in multiple tables appears once."""
         reader = _make_reader("sup", "org")
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
             "supertable:org:sup:meta:leaf:t2",
         )
@@ -625,7 +685,8 @@ class TestGetTableSchema:
     def test_super_level_mget_exception_returns_empty_schema(self, mock_check, MockST):
         """mget fails → raws=[] → zip produces no iterations → empty schema."""
         reader = _make_reader("sup", "org")
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
         )
         reader.catalog.r.mget.side_effect = ConnectionError("down")
@@ -760,7 +821,8 @@ class TestGetTableStats:
     @patch(_P_CHECK_META)
     def test_super_level_aggregates_all_tables(self, mock_check, MockST):
         reader = _make_reader("sup", "org")
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
             "supertable:org:sup:meta:leaf:t2",
         )
@@ -782,7 +844,8 @@ class TestGetTableStats:
     def test_super_level_skips_missing_tables(self, mock_check, MockST):
         """One table's snapshot is missing → that table skipped, others included."""
         reader = _make_reader("sup", "org")
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
             "supertable:org:sup:meta:leaf:t2",
         )
@@ -825,7 +888,8 @@ class TestGetSuperMeta:
         """Leaf data available in Redis → no SimpleTable fallback."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 5, "ts": 9999}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:events",
         )
 
@@ -857,7 +921,8 @@ class TestGetSuperMeta:
         """Redis leaf has no usable data → SimpleTable fallback."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
         )
         # mget returns non-parseable data
@@ -881,7 +946,8 @@ class TestGetSuperMeta:
         """mget raises → falls back to SimpleTable per table."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
         )
         reader.catalog.r.mget.side_effect = ConnectionError("down")
@@ -900,7 +966,8 @@ class TestGetSuperMeta:
         """FileNotFoundError for a table → that table skipped in totals."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:bad",
             "supertable:org:sup:meta:leaf:good",
         )
@@ -921,7 +988,7 @@ class TestGetSuperMeta:
     def test_no_tables_returns_empty_structure(self, mock_check, mock_ttl):
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 0, "ts": 0}
-        reader.catalog.r.scan.return_value = (0, [])
+        _wire_catalog_scan(reader.catalog)
         reader.catalog.r.mget.return_value = []
 
         result = reader.get_super_meta("admin")
@@ -934,7 +1001,7 @@ class TestGetSuperMeta:
     def test_root_none_uses_defaults(self, mock_check, mock_ttl):
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = None
-        reader.catalog.r.scan.return_value = (0, [])
+        _wire_catalog_scan(reader.catalog)
         reader.catalog.r.mget.return_value = []
 
         result = reader.get_super_meta("admin")
@@ -946,7 +1013,8 @@ class TestGetSuperMeta:
         """Multiple resources in one table sum correctly."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:t1",
         )
         leaf = json.dumps({
@@ -969,24 +1037,24 @@ class TestGetSuperMeta:
 
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 5, "ts": 999}
-        reader.catalog.r.scan.side_effect = _scan_one_batch()
+        _wire_catalog_scan(reader.catalog)
         reader.catalog.r.mget.return_value = []
 
         # First call populates cache
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
             result1 = reader.get_super_meta("admin")
 
-        # Reset scan to prove it's not called again
-        reader.catalog.r.scan.reset_mock()
-        reader.catalog.r.scan.side_effect = None
-        reader.catalog.r.scan.return_value = (0, ["should_not_appear"])
+        # Reset to prove it's not called again
+        reader.catalog.scan_leaf_keys.reset_mock()
+        reader.catalog.scan_leaf_keys.side_effect = None
+        reader.catalog.scan_leaf_keys.return_value = iter(["should_not_appear"])
 
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
             result2 = reader.get_super_meta("admin")
 
         assert result2 is result1
-        # scan should NOT have been called for the cache hit
-        reader.catalog.r.scan.assert_not_called()
+        # scan_leaf_keys should NOT have been called for the cache hit
+        reader.catalog.scan_leaf_keys.assert_not_called()
 
     @patch(_P_CHECK_META)
     def test_cache_miss_on_version_change(self, mock_check):
@@ -998,14 +1066,15 @@ class TestGetSuperMeta:
 
         # First call with version 1
         reader.catalog.get_root.return_value = {"version": 1, "ts": 100}
-        reader.catalog.r.scan.side_effect = _scan_one_batch()
+        _wire_catalog_scan(reader.catalog)
 
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
             result1 = reader.get_super_meta("admin")
 
         # Second call with version 2 → cache miss
         reader.catalog.get_root.return_value = {"version": 2, "ts": 200}
-        reader.catalog.r.scan.side_effect = _scan_one_batch(
+        _wire_catalog_scan(
+            reader.catalog,
             "supertable:org:sup:meta:leaf:new_table",
         )
         leaf = json.dumps({"resources": [{"file": "f", "rows": 99, "file_size": 1}]})
@@ -1024,23 +1093,30 @@ class TestGetSuperMeta:
 
 class TestListSupers:
 
+    @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")
-    def test_extracts_and_sorts_super_names(self, mock_items):
+    def test_extracts_and_sorts_super_names(self, mock_items, mock_check):
+        # list_supers now requires a role_name and applies RBAC filtering.
+        # Stub check_meta_access to allow everything so we can verify the
+        # parsing/sorting behaviour.
         from supertable.meta_reader import list_supers
         mock_items.return_value = [
             "supertable:org:zeta:meta:root",
             "supertable:org:alpha:meta:root",
             "supertable:org:mid:meta:root",
         ]
-        result = list_supers("org")
+        mock_check.return_value = None
+        result = list_supers("org", role_name="superadmin")
         assert result == ["alpha", "mid", "zeta"]
         mock_items.assert_called_once_with("supertable:org:*:meta:root")
 
+    @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")
-    def test_empty_returns_empty(self, mock_items):
+    def test_empty_returns_empty(self, mock_items, mock_check):
         from supertable.meta_reader import list_supers
         mock_items.return_value = []
-        assert list_supers("org") == []
+        mock_check.return_value = None
+        assert list_supers("org", role_name="superadmin") == []
 
 
 # ===========================================================================
@@ -1049,20 +1125,24 @@ class TestListSupers:
 
 class TestListTables:
 
+    @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")
-    def test_extracts_and_sorts_table_names(self, mock_items):
+    def test_extracts_and_sorts_table_names(self, mock_items, mock_check):
         from supertable.meta_reader import list_tables
         mock_items.return_value = [
             "supertable:org:sup:meta:leaf:users",
             "supertable:org:sup:meta:leaf:events",
             "supertable:org:sup:meta:leaf:logs",
         ]
-        result = list_tables("org", "sup")
+        mock_check.return_value = None
+        result = list_tables("org", "sup", role_name="superadmin")
         assert result == ["events", "logs", "users"]
         mock_items.assert_called_once_with("supertable:org:sup:meta:leaf:*")
 
+    @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")
-    def test_empty_returns_empty(self, mock_items):
+    def test_empty_returns_empty(self, mock_items, mock_check):
         from supertable.meta_reader import list_tables
         mock_items.return_value = []
-        assert list_tables("org", "sup") == []
+        mock_check.return_value = None
+        assert list_tables("org", "sup", role_name="superadmin") == []

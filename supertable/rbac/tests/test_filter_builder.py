@@ -76,22 +76,24 @@ class TestSimpleFilters(unittest.TestCase):
             "status": {"operation": "=", "value": "active", "type": "value"},
         }}
         fb = FilterBuilder("users", ["*"], role_info)
+        # FilterBuilder always double-quotes column identifiers to handle
+        # reserved keywords; literal values keep single quotes.
         self.assertEqual(fb.filter_query,
-                         "SELECT *\nFROM users\nWHERE status = 'active'")
+                         'SELECT *\nFROM users\nWHERE "status" = \'active\'')
 
     def test_not_equal(self):
         role_info = {"filters": {
             "status": {"operation": "!=", "value": "deleted", "type": "value"},
         }}
         fb = FilterBuilder("users", ["*"], role_info)
-        self.assertIn("status != 'deleted'", fb.filter_query)
+        self.assertIn('"status" != \'deleted\'', fb.filter_query)
 
     def test_greater_than(self):
         role_info = {"filters": {
             "age": {"operation": ">", "value": "18", "type": "value"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("age > '18'", fb.filter_query)
+        self.assertIn('"age" > \'18\'', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -106,8 +108,8 @@ class TestMultipleFields(unittest.TestCase):
             "col2": {"operation": ">", "value": "5", "type": "value"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("col1 = 'x'", fb.filter_query)
-        self.assertIn("col2 > '5'", fb.filter_query)
+        self.assertIn('"col1" = \'x\'', fb.filter_query)
+        self.assertIn('"col2" > \'5\'', fb.filter_query)
         self.assertIn(" AND ", fb.filter_query)
 
     def test_three_fields(self):
@@ -134,7 +136,7 @@ class TestLogicalOperators(unittest.TestCase):
             {"col2": {"operation": "=", "value": "b", "type": "value"}},
         ]}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("(col1 = 'a') AND (col2 = 'b')", fb.filter_query)
+        self.assertIn('("col1" = \'a\') AND ("col2" = \'b\')', fb.filter_query)
 
     def test_explicit_or(self):
         role_info = {"filters": {"OR": [
@@ -142,7 +144,7 @@ class TestLogicalOperators(unittest.TestCase):
             {"col2": {"operation": "=", "value": "b", "type": "value"}},
         ]}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("(col1 = 'a') OR (col2 = 'b')", fb.filter_query)
+        self.assertIn('("col1" = \'a\') OR ("col2" = \'b\')', fb.filter_query)
 
     def test_and_with_three_conditions(self):
         role_info = {"filters": {"AND": [
@@ -166,7 +168,7 @@ class TestNotOperator(unittest.TestCase):
             "status": {"operation": "=", "value": "deleted", "type": "value"},
         }}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("NOT (status = 'deleted')", fb.filter_query)
+        self.assertIn('NOT ("status" = \'deleted\')', fb.filter_query)
 
     def test_not_with_or(self):
         role_info = {"filters": {"NOT": {"OR": [
@@ -174,7 +176,7 @@ class TestNotOperator(unittest.TestCase):
             {"b": {"operation": "=", "value": "2", "type": "value"}},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("NOT ((a = '1') OR (b = '2'))", fb.filter_query)
+        self.assertIn('NOT (("a" = \'1\') OR ("b" = \'2\'))', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -189,7 +191,7 @@ class TestRangeFilters(unittest.TestCase):
             {"operation": "<=", "value": "65", "type": "value"},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("age >= '18' AND age <= '65'", fb.filter_query)
+        self.assertIn('"age" >= \'18\' AND "age" <= \'65\'', fb.filter_query)
 
     def test_range_with_reference_type(self):
         role_info = {"filters": {"price": {"range": [
@@ -197,14 +199,15 @@ class TestRangeFilters(unittest.TestCase):
             {"operation": "<=", "value": "max_price", "type": "reference"},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("price >= min_price AND price <= max_price", fb.filter_query)
+        # The LHS column is quoted; reference values stay unquoted.
+        self.assertIn('"price" >= min_price AND "price" <= max_price', fb.filter_query)
 
     def test_single_bound_range(self):
         role_info = {"filters": {"score": {"range": [
             {"operation": ">", "value": "0", "type": "value"},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("score > '0'", fb.filter_query)
+        self.assertIn('"score" > \'0\'', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -218,14 +221,14 @@ class TestNullType(unittest.TestCase):
             "deleted_at": {"operation": "IS", "value": "", "type": "null"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("deleted_at IS NULL", fb.filter_query)
+        self.assertIn('"deleted_at" IS NULL', fb.filter_query)
 
     def test_is_not_null(self):
         role_info = {"filters": {
             "email": {"operation": "IS NOT", "value": "", "type": "null"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("email IS NOT NULL", fb.filter_query)
+        self.assertIn('"email" IS NOT NULL', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -239,8 +242,9 @@ class TestReferenceType(unittest.TestCase):
             "start_date": {"operation": "<", "value": "end_date", "type": "reference"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("start_date < end_date", fb.filter_query)
-        # Reference should NOT be quoted
+        # LHS column is quoted; reference RHS stays unquoted (literal SQL).
+        self.assertIn('"start_date" < end_date', fb.filter_query)
+        # Reference should NOT be string-literal quoted
         self.assertNotIn("'end_date'", fb.filter_query)
 
 
@@ -255,7 +259,7 @@ class TestIlikeEscape(unittest.TestCase):
             "name": {"operation": "ILIKE", "value": "%test%", "type": "value", "escape": "\\"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("name ILIKE '%test%'", fb.filter_query)
+        self.assertIn('"name" ILIKE \'%test%\'', fb.filter_query)
         self.assertIn("ESCAPE", fb.filter_query)
 
     def test_ilike_without_escape(self):
@@ -263,7 +267,7 @@ class TestIlikeEscape(unittest.TestCase):
             "name": {"operation": "ILIKE", "value": "%test%", "type": "value"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("name ILIKE '%test%'", fb.filter_query)
+        self.assertIn('"name" ILIKE \'%test%\'', fb.filter_query)
         self.assertNotIn("ESCAPE", fb.filter_query)
 
     def test_non_ilike_ignores_escape_key(self):
@@ -286,8 +290,8 @@ class TestListOfFilters(unittest.TestCase):
             {"col2": {"operation": "=", "value": "b", "type": "value"}},
         ]}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("col1 = 'a'", fb.filter_query)
-        self.assertIn("col2 = 'b'", fb.filter_query)
+        self.assertIn('"col1" = \'a\'', fb.filter_query)
+        self.assertIn('"col2" = \'b\'', fb.filter_query)
         self.assertIn(" AND ", fb.filter_query)
 
     def test_list_of_one_dict(self):
@@ -295,7 +299,7 @@ class TestListOfFilters(unittest.TestCase):
             {"col1": {"operation": "=", "value": "a", "type": "value"}},
         ]}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("col1 = 'a'", fb.filter_query)
+        self.assertIn('"col1" = \'a\'', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -322,8 +326,8 @@ class TestNestedCombinations(unittest.TestCase):
             {"y": {"operation": ">", "value": "0", "type": "value"}},
         ]}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("NOT (x = 'bad')", fb.filter_query)
-        self.assertIn("y > '0'", fb.filter_query)
+        self.assertIn('NOT ("x" = \'bad\')', fb.filter_query)
+        self.assertIn('"y" > \'0\'', fb.filter_query)
 
     def test_range_plus_equality(self):
         """Dict with a range field and a simple equality field."""
@@ -335,8 +339,8 @@ class TestNestedCombinations(unittest.TestCase):
             "status": {"operation": "=", "value": "active", "type": "value"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertIn("age >= '18' AND age <= '65'", fb.filter_query)
-        self.assertIn("status = 'active'", fb.filter_query)
+        self.assertIn('"age" >= \'18\' AND "age" <= \'65\'', fb.filter_query)
+        self.assertIn('"status" = \'active\'', fb.filter_query)
         # The two clauses should be AND-joined
         where = fb.filter_query.split("WHERE ", 1)[1]
         parts = where.split(" AND ")
@@ -372,7 +376,7 @@ class TestEdgeCases(unittest.TestCase):
         fb = FilterBuilder("t1", ["a", "b"], role_info)
         self.assertIn('"a" as "a"', fb.filter_query)
         self.assertIn('"b" as "b"', fb.filter_query)
-        self.assertIn("WHERE x = '1'", fb.filter_query)
+        self.assertIn('WHERE "x" = \'1\'', fb.filter_query)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

@@ -159,23 +159,23 @@ class TestDataReaderInit:
 
     @patch(_PATCH_GET_STORAGE)
     @patch(_PATCH_SQL_PARSER)
-    def test_init_creates_parser_and_storage(self, MockParser, mock_get_storage):
+    def test_init_creates_storage(self, MockParser, mock_get_storage):
+        # DataReader.__init__ now defers SQLParser construction to execute()
+        # (the parser needs the engine's dialect, which isn't known at init
+        # time). Init just stashes inputs and grabs the storage handle.
         mock_storage = MagicMock()
         mock_get_storage.return_value = mock_storage
-
-        mock_parser_inst = MagicMock()
-        mock_parser_inst.get_table_tuples.return_value = []
-        MockParser.return_value = mock_parser_inst
 
         from supertable.data_reader import DataReader
         dr = DataReader("my_super", "my_org", "SELECT * FROM tbl")
 
-        MockParser.assert_called_once_with(super_name="my_super", query="SELECT * FROM tbl")
+        # Parser is not constructed in __init__ anymore.
+        MockParser.assert_not_called()
         mock_get_storage.assert_called_once()
         assert dr.super_name == "my_super"
         assert dr.organization == "my_org"
+        assert dr.query == "SELECT * FROM tbl"
         assert dr.storage is mock_storage
-        assert dr.tables == []
         assert dr.timer is None
         assert dr.plan_stats is None
         assert dr.query_plan_manager is None
@@ -183,28 +183,41 @@ class TestDataReaderInit:
 
     @patch(_PATCH_GET_STORAGE)
     @patch(_PATCH_SQL_PARSER)
-    def test_init_stores_table_tuples_from_parser(self, MockParser, mock_get_storage):
-        mock_get_storage.return_value = MagicMock()
-
-        from supertable.data_classes import TableDefinition
-        tables = [TableDefinition(super_name="s", simple_name="t", alias="t", columns=["id"])]
-        mock_parser_inst = MagicMock()
-        mock_parser_inst.get_table_tuples.return_value = tables
-        MockParser.return_value = mock_parser_inst
-
-        from supertable.data_reader import DataReader
-        dr = DataReader("s", "o", "SELECT id FROM t")
-        assert dr.tables is tables
-
-    @patch(_PATCH_GET_STORAGE)
-    @patch(_PATCH_SQL_PARSER)
-    def test_init_parser_raises_propagates(self, MockParser, mock_get_storage):
+    def test_init_does_not_eagerly_parse(self, MockParser, mock_get_storage):
+        # The parser is built lazily inside execute(), so a bad SQL string
+        # does not raise from __init__.
         mock_get_storage.return_value = MagicMock()
         MockParser.side_effect = ValueError("bad sql")
 
         from supertable.data_reader import DataReader
+        # Should NOT raise — parser is not invoked here.
+        dr = DataReader("s", "o", "NOT VALID SQL")
+        assert dr.query == "NOT VALID SQL"
+        MockParser.assert_not_called()
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_init_parser_raises_propagates(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+    ):
+        # Parser errors are now surfaced during execute(), not __init__.
+        mock_get_storage.return_value = MagicMock()
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockParser.side_effect = ValueError("bad sql")
+
+        from supertable.data_reader import DataReader, engine
+        dr = DataReader("s", "o", "NOT VALID SQL")
         with pytest.raises(ValueError, match="bad sql"):
-            DataReader("s", "o", "NOT VALID SQL")
+            dr.execute("admin", engine=engine.AUTO)
 
 
 # ====================================================================
@@ -325,11 +338,15 @@ class TestExecuteHappyPath:
         dr = DataReader("s1", "o1", "SELECT 1")
         dr.execute("reader_role", engine=engine.AUTO)
 
+        # restrict_read_access is now invoked with both ``tables`` (parser
+        # alias-level tuples) and ``physical_tables`` (post-CTE physical
+        # tables). The parser mock returns MagicMock for get_physical_tables.
         mock_restrict.assert_called_once_with(
             super_name="s1",
             organization="o1",
             role_name="reader_role",
             tables=["table_def_1"],
+            physical_tables=mock_parser.get_physical_tables.return_value,
         )
 
     @patch(_PATCH_EXTEND_PLAN)
@@ -1408,8 +1425,10 @@ class TestExecuteExecutorArgs:
 
         from supertable.data_classes import TableDefinition
         tables = [TableDefinition("s", "t", "t", ["id"])]
+        physical_tables = [TableDefinition("s", "t", "t", ["id"])]
         mock_parser = MagicMock()
         mock_parser.get_table_tuples.return_value = tables
+        mock_parser.get_physical_tables.return_value = physical_tables
         mock_parser.original_query = "Q"
         MockParser.return_value = mock_parser
 
@@ -1429,10 +1448,12 @@ class TestExecuteExecutorArgs:
         dr = DataReader("s", "my_org", "Q")
         dr.execute("admin", engine=engine.AUTO)
 
+        # DataEstimator now receives physical_tables (post-CTE), which the
+        # parser exposes via get_physical_tables().
         MockEstimator.assert_called_once_with(
             organization="my_org",
             storage=mock_storage,
-            tables=tables,
+            tables=physical_tables,
         )
 
 

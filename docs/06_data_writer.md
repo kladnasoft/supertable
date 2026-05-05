@@ -173,7 +173,7 @@ self.catalog.r.sadd(f"supertable:{org}:{sup}:table_names", simple_name)
 
 #### 14. Mirroring (`mirror`)
 
-Calls `MirrorFormats.mirror_if_enabled()` to replicate the new snapshot into downstream formats (CSV, Iceberg, Delta, etc.) if mirroring is configured. Mirroring failures are logged but never fail the write.
+Calls `MirrorFormats.mirror_if_enabled()` to replicate the new snapshot into downstream formats (Delta Lake, Iceberg, Parquet) if mirroring is configured. Mirroring failures are logged but never fail the write.
 
 #### 15. Lock Release (`finally`)
 

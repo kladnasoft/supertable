@@ -35,12 +35,12 @@ _PATCH_SIMPLE_TABLE = f"{_MOD}.SimpleTable"
 _PATCH_REDIS_CATALOG = f"{_MOD}.RedisCatalog"
 _PATCH_TIMER = f"{_MOD}.Timer"
 _PATCH_POLARS_FROM_ARROW = f"{_MOD}.polars.from_arrow"
-_PATCH_FIND_OVERLAP = f"{_MOD}.find_and_lock_overlapping_files"
+_PATCH_FIND_OVERLAP = f"{_MOD}.find_overlapping_files"
 _PATCH_FILTER_STALE = f"{_MOD}.filter_stale_incoming_rows"
 _PATCH_PROCESS_OVERLAP = f"{_MOD}.process_overlapping_files"
 _PATCH_PROCESS_DELETE = f"{_MOD}.process_delete_only"
 _PATCH_MIRROR = f"{_MOD}.MirrorFormats"
-_PATCH_GET_MON_LOGGER = f"{_MOD}.get_monitoring_logger"
+_PATCH_GET_MON_LOGGER = f"{_MOD}.MonitoringWriter"
 _PATCH_UUID4 = f"{_MOD}.uuid.uuid4"
 
 
@@ -380,8 +380,11 @@ class TestWriteHappyPath:
         sunset = {"old.parquet"}
         mock_process.return_value = (2, 0, 2, 2, new_res, sunset)
 
+        # MonitoringWriter is used as a context manager:
+        #   with MonitoringWriter(...) as monitor: monitor.log_metric(...)
+        # so the in-block instance is .return_value.__enter__.return_value
         mock_mon = MagicMock()
-        mock_get_mon.return_value = mock_mon
+        mock_get_mon.return_value.__enter__.return_value = mock_mon
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s1", "o1")
@@ -1006,8 +1009,10 @@ class TestWriteMonitoring:
         mock_find_overlap.return_value = set()
         mock_process.return_value = (1, 0, 1, 1, [], set())
 
+        # MonitoringWriter is a context manager; in-block instance is
+        # accessed via __enter__.return_value
         mock_mon = MagicMock()
-        mock_get_mon.return_value = mock_mon
+        mock_get_mon.return_value.__enter__.return_value = mock_mon
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s", "o")
@@ -1309,8 +1314,10 @@ class TestWriteMonitoringPayload:
         mock_find_overlap.return_value = set()
         mock_process.return_value = (2, 1, 5, 2, new_res, sunset)
 
+        # MonitoringWriter is a context manager; in-block instance is
+        # accessed via __enter__.return_value
         mock_mon = MagicMock()
-        mock_get_mon.return_value = mock_mon
+        mock_get_mon.return_value.__enter__.return_value = mock_mon
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("sup", "org")

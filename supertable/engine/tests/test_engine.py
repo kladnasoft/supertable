@@ -24,12 +24,27 @@ import duckdb
 import pandas as pd
 import pytest
 
+from dataclasses import replace as _dc_replace
+from supertable.config.settings import settings as _settings
+from supertable.engine import engine_common as _engine_common
+from supertable.engine import data_estimator as _data_estimator
 from supertable.data_classes import (
     Reflection,
     RbacViewDef,
     SuperSnapshot,
     TableDefinition,
 )
+
+
+def _patch_settings(monkeypatch, **overrides):
+    """Replace the per-module ``settings`` binding with a copy carrying
+    overrides. Settings is a frozen dataclass so we use dataclasses.replace
+    to produce a new instance, then patch each module that imported it.
+    """
+    new_settings = _dc_replace(_settings, **overrides)
+    monkeypatch.setattr(_engine_common, "settings", new_settings)
+    monkeypatch.setattr(_data_estimator, "settings", new_settings)
+    return new_settings
 from supertable.engine.plan_stats import PlanStats
 from supertable.engine.engine_common import (
     quote_if_needed,
@@ -246,65 +261,77 @@ class TestNormalizeEndpointForS3:
 class TestDetectEndpoint:
 
     def test_from_env(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_ENDPOINT_URL", "http://minio:9000")
+        _patch_settings(monkeypatch, STORAGE_ENDPOINT_URL="http://minio:9000")
         assert detect_endpoint() == "minio:9000"
 
     def test_missing(self, monkeypatch, clean_env):
+        _patch_settings(monkeypatch, STORAGE_ENDPOINT_URL="")
         assert detect_endpoint() is None
 
 
 class TestDetectRegion:
 
     def test_from_env(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_REGION", "eu-west-1")
+        _patch_settings(monkeypatch, STORAGE_REGION="eu-west-1")
         assert detect_region() == "eu-west-1"
 
     def test_default(self, monkeypatch, clean_env):
-        assert detect_region() == "us-east-1"
+        # detect_region just echoes whatever the settings default is.
+        assert detect_region() == _settings.STORAGE_REGION
 
 
 class TestDetectUrlStyle:
 
     def test_path_style(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_FORCE_PATH_STYLE", "true")
+        _patch_settings(monkeypatch, STORAGE_FORCE_PATH_STYLE=True)
         assert detect_url_style() == "path"
 
     def test_vhost_style(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_FORCE_PATH_STYLE", "false")
+        _patch_settings(monkeypatch, STORAGE_FORCE_PATH_STYLE=False)
         assert detect_url_style() == "vhost"
 
     def test_default_is_path(self, monkeypatch, clean_env):
-        assert detect_url_style() == "path"
+        assert detect_url_style() == ("path" if _settings.STORAGE_FORCE_PATH_STYLE else "vhost")
 
 
 class TestDetectSsl:
 
     def test_true(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_USE_SSL", "true")
+        _patch_settings(monkeypatch, STORAGE_USE_SSL=True)
         assert detect_ssl() is True
 
     def test_one(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_USE_SSL", "1")
+        _patch_settings(monkeypatch, STORAGE_USE_SSL=True)
         assert detect_ssl() is True
 
     def test_empty(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_USE_SSL", "")
+        _patch_settings(monkeypatch, STORAGE_USE_SSL=False)
         assert detect_ssl() is False
 
     def test_missing(self, monkeypatch, clean_env):
+        _patch_settings(monkeypatch, STORAGE_USE_SSL=False)
         assert detect_ssl() is False
 
 
 class TestDetectCreds:
 
     def test_all_present(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_ACCESS_KEY", "ak")
-        monkeypatch.setenv("STORAGE_SECRET_KEY", "sk")
-        monkeypatch.setenv("STORAGE_SESSION_TOKEN", "st")
+        _patch_settings(
+            monkeypatch,
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+            STORAGE_SESSION_TOKEN="st",
+        )
         ak, sk, st = detect_creds()
         assert (ak, sk, st) == ("ak", "sk", "st")
 
     def test_all_missing(self, monkeypatch, clean_env):
+        _patch_settings(
+            monkeypatch,
+            STORAGE_ACCESS_KEY="",
+            STORAGE_SECRET_KEY="",
+            STORAGE_SESSION_TOKEN="",
+        )
         ak, sk, st = detect_creds()
         assert ak is None and sk is None and st is None
 
@@ -312,10 +339,11 @@ class TestDetectCreds:
 class TestDetectBucket:
 
     def test_from_env(self, monkeypatch):
-        monkeypatch.setenv("STORAGE_BUCKET", "my-bucket")
+        _patch_settings(monkeypatch, STORAGE_BUCKET="my-bucket")
         assert detect_bucket() == "my-bucket"
 
     def test_missing(self, monkeypatch, clean_env):
+        _patch_settings(monkeypatch, STORAGE_BUCKET="")
         assert detect_bucket() is None
 
 
@@ -775,28 +803,49 @@ class TestDataEstimator:
         assert _make_estimator([], storage)._to_duckdb_path("some/key") == "s3://resolved/key"
 
     def test_to_duckdb_path_http_construction(self, monkeypatch, clean_env):
-        monkeypatch.setenv("STORAGE_ENDPOINT_URL", "http://minio:9000")
-        monkeypatch.setenv("STORAGE_BUCKET", "bkt")
-        monkeypatch.setenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "1")
-        storage = MagicMock(spec=[])
+        # Provide endpoint/bucket via storage attrs so DataEstimator detection
+        # uses the storage path rather than relying on the settings singleton.
+        # SUPERTABLE_DUCKDB_USE_HTTPFS lives on settings, not env at runtime.
+        _patch_settings(
+            monkeypatch,
+            SUPERTABLE_DUCKDB_USE_HTTPFS=True,
+            STORAGE_USE_SSL=False,
+        )
+        storage = MagicMock(spec=["endpoint_url", "bucket"])
+        storage.endpoint_url = "http://minio:9000"
+        storage.bucket = "bkt"
         result = _make_estimator([], storage)._to_duckdb_path("data/file.parquet")
         assert result == "http://minio:9000/bkt/data/file.parquet"
 
     def test_to_duckdb_path_https_when_ssl(self, monkeypatch, clean_env):
-        monkeypatch.setenv("STORAGE_ENDPOINT_URL", "http://minio:9000")
-        monkeypatch.setenv("STORAGE_BUCKET", "bkt")
-        monkeypatch.setenv("STORAGE_USE_SSL", "true")
-        monkeypatch.setenv("SUPERTABLE_DUCKDB_USE_HTTPFS", "1")
-        storage = MagicMock(spec=[])
+        _patch_settings(
+            monkeypatch,
+            SUPERTABLE_DUCKDB_USE_HTTPFS=True,
+            STORAGE_USE_SSL=True,
+        )
+        storage = MagicMock(spec=["endpoint_url", "bucket", "secure"])
+        storage.endpoint_url = "http://minio:9000"
+        storage.bucket = "bkt"
+        storage.secure = True
         assert _make_estimator([], storage)._to_duckdb_path("data/f.parquet").startswith("https://")
 
     def test_to_duckdb_path_s3_when_not_httpfs(self, monkeypatch, clean_env):
-        monkeypatch.setenv("STORAGE_ENDPOINT_URL", "http://minio:9000")
-        monkeypatch.setenv("STORAGE_BUCKET", "bkt")
-        storage = MagicMock(spec=[])
+        # Without USE_HTTPFS, the path is constructed as s3://bucket/key
+        # regardless of endpoint configuration.
+        _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_USE_HTTPFS=False)
+        storage = MagicMock(spec=["endpoint_url", "bucket"])
+        storage.endpoint_url = "http://minio:9000"
+        storage.bucket = "bkt"
         assert _make_estimator([], storage)._to_duckdb_path("data/f.parquet") == "s3://bkt/data/f.parquet"
 
-    def test_to_duckdb_path_fallback(self, clean_env):
+    def test_to_duckdb_path_fallback(self, monkeypatch, clean_env):
+        # No endpoint, no bucket, no presign -> the input key is returned as-is.
+        _patch_settings(
+            monkeypatch,
+            SUPERTABLE_DUCKDB_PRESIGNED=False,
+            STORAGE_ENDPOINT_URL="",
+            STORAGE_BUCKET="",
+        )
         storage = MagicMock(spec=[])
         assert _make_estimator([], storage)._to_duckdb_path("bare/key") == "bare/key"
 

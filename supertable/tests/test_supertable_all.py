@@ -1315,10 +1315,10 @@ class TestDataWriterValidation:
 class TestDataWriterWrite:
     """Tests for DataWriter.write method."""
 
-    @patch("supertable.data_writer.get_monitoring_logger")
+    @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.process_overlapping_files")
-    @patch("supertable.data_writer.find_and_lock_overlapping_files")
+    @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
@@ -1417,10 +1417,10 @@ class TestDataWriterWrite:
 
         mock_catalog.acquire_simple_lock.assert_not_called()
 
-    @patch("supertable.data_writer.get_monitoring_logger")
+    @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.process_overlapping_files")
-    @patch("supertable.data_writer.find_and_lock_overlapping_files")
+    @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
@@ -1464,10 +1464,10 @@ class TestDataWriterWrite:
         # Lock MUST be released in finally block
         mock_catalog.release_simple_lock.assert_called_once()
 
-    @patch("supertable.data_writer.get_monitoring_logger")
+    @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.process_overlapping_files")
-    @patch("supertable.data_writer.find_and_lock_overlapping_files")
+    @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
@@ -1518,10 +1518,10 @@ class TestDataWriterWrite:
         # Write should still succeed
         assert result is not None
 
-    @patch("supertable.data_writer.get_monitoring_logger")
+    @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.process_overlapping_files")
-    @patch("supertable.data_writer.find_and_lock_overlapping_files")
+    @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
@@ -1569,10 +1569,10 @@ class TestDataWriterWrite:
         assert result is not None
         mock_catalog.set_leaf_path_cas.assert_called_once()
 
-    @patch("supertable.data_writer.get_monitoring_logger")
+    @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.process_overlapping_files")
-    @patch("supertable.data_writer.find_and_lock_overlapping_files")
+    @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
@@ -1665,19 +1665,18 @@ class TestDataReaderInit:
     def test_init_sets_attributes(self, mock_parser_cls, mock_get_storage):
         from supertable.data_reader import DataReader
 
-        mock_parser = MagicMock()
-        mock_parser.get_table_tuples.return_value = [("super", "table1", "t1")]
-        mock_parser.original_query = "SELECT * FROM table1"
-        mock_parser_cls.return_value = mock_parser
-
         mock_get_storage.return_value = MagicMock()
 
         dr = DataReader("my_super", "my_org", "SELECT * FROM table1")
         assert dr.super_name == "my_super"
         assert dr.organization == "my_org"
+        assert dr.query == "SELECT * FROM table1"
         assert dr.timer is None
         assert dr.plan_stats is None
-        assert dr.tables == [("super", "table1", "t1")]
+        # DataReader.__init__ no longer eagerly parses the query — the
+        # parser is built lazily inside execute() once the engine dialect
+        # is known.
+        mock_parser_cls.assert_not_called()
 
 
 class TestDataReaderExecute:

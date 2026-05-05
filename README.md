@@ -1,115 +1,171 @@
 # SuperTable
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: STPUL](https://img.shields.io/badge/license-STPUL-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-brightgreen)
 
-**SuperTable — The simplest data warehouse & cataloging system.**
+**SuperTable — versioned data lake library for SQL analytics.**
 
-SuperTable is a data warehouse and cataloging platform that stores structured data on object storage (S3, MinIO, Azure Blob, GCP Cloud Storage, or local filesystem), manages metadata in Redis, and queries everything through DuckDB or Spark SQL. It is the engine behind the Data Island product line, published as the `supertable` Python package.
+SuperTable stores structured data as immutable Parquet snapshots on object
+storage (S3, MinIO, Azure Blob, GCP Cloud Storage, or local disk), keeps
+metadata, locks, and audit state in Redis, and queries everything through
+DuckDB (embedded) or Spark SQL. It is a Python library — there is no
+separate server process.
 
-The platform serves three roles simultaneously. It is a **storage layer** that organizes data into versioned, append-only tables with snapshot isolation. It is a **query engine** that routes SQL to the fastest available backend (DuckDB for small-to-medium, Spark for large). And it is an **operational control plane** with built-in RBAC, audit logging, data quality checks, and monitoring — everything a team needs to run a production data platform without assembling a dozen tools.
+## Installation
+
+```bash
+pip install supertable                # core + local storage
+pip install "supertable[s3]"          # AWS S3
+pip install "supertable[minio]"       # MinIO
+pip install "supertable[azure]"       # Azure Blob
+pip install "supertable[gcp]"         # Google Cloud Storage
+pip install "supertable[all]"         # everything
+```
+
+Requirements: Python 3.10+, a reachable Redis 6+, and a configured storage
+backend (or local disk for development). See
+[docs/02_configuration.md](docs/02_configuration.md) for environment
+variables.
 
 ---
 
 ## Architecture
 
-SuperTable runs as a set of independent FastAPI servers sharing the same Redis catalog and storage backend. There is no single monolithic process — each server can scale independently, and all state lives in Redis + object storage.
-
 ```
-Browser  → WebUI (:8050) ──httpx proxy──→ API (:8051)
-AI tools → MCP (stdio or :8070) ──────→ DataReader / MetaReader
-BI tools → OData (:8052) ─────────────→ DataReader (RBAC-scoped)
-Scripts  → API (:8051) ──bearer token──→ JSON endpoints
+┌──────────────────────────────────────────────────┐
+│                Python application                 │
+│   (notebooks, ETL jobs, FastAPI handlers, etc.)   │
+└──────────┬─────────────────────────┬──────────────┘
+           │ DataWriter / DataReader │
+           ▼                         ▼
+   ┌───────────────┐        ┌────────────────────┐
+   │  RedisCatalog │        │  StorageInterface  │
+   │  metadata     │        │  Parquet files     │
+   │  locks        │        │  S3 / MinIO /      │
+   │  audit chain  │        │  Azure / GCP /     │
+   └───────────────┘        │  Local             │
+                            └────────────────────┘
 ```
 
-| Component | Technology | Purpose |
-|---|---|---|
-| Application framework | FastAPI (Python 3.11+) | HTTP servers, routing, middleware |
-| Metadata store | Redis 6+ | Catalog, locks, sessions, metrics, audit streams |
-| Query engine (primary) | DuckDB | Embedded SQL on Parquet via httpfs |
-| Query engine (large) | Spark SQL (optional) | Distributed SQL for large datasets |
-| Data format | Apache Parquet | Columnar storage on object storage |
-| Object storage | MinIO / S3 / Azure / GCP / local | Data file persistence |
-| Mirror formats | Delta Lake, Apache Iceberg | Optional export after writes |
-| Audit storage | Redis Streams + Parquet | Compliance logging (DORA, SOC 2) |
+Data is organised as **Organization → SuperTable → SimpleTable**. Each
+`SimpleTable` is a versioned, append-only collection of Parquet files
+backed by a snapshot linked list — every write produces a new immutable
+snapshot whose `previous_snapshot` points at the predecessor.
 
-### Data model
-
-Data is organized in a three-level hierarchy: **Organization** → **SuperTable** → **SimpleTable**.
-
-An organization is a tenant namespace. A SuperTable is a virtual database that groups related tables. A SimpleTable is a versioned, append-only data table backed by Parquet files on object storage and metadata in Redis. Each write creates a new immutable snapshot — reads always see a consistent view.
+| Layer | Technology |
+|---|---|
+| Language | Python 3.10+ |
+| Metadata store | Redis 6+ (standalone or Sentinel HA) |
+| Query engine (primary) | DuckDB |
+| Query engine (large) | Spark SQL via Thrift |
+| Data format | Apache Parquet |
+| Object storage | MinIO / S3 / Azure / GCP / local |
+| Mirror formats | Delta Lake, Apache Iceberg, Parquet |
+| Audit storage | Redis Streams + Parquet |
 
 ---
 
-## Quick start
+## Quick example
 
-### Docker (recommended)
+```python
+from supertable import SuperTable, DataWriter, DataReader, engine
 
-```bash
-git clone https://github.com/kladnasoft/supertable.git
-cd supertable
-cp .env.example .env
-# Edit .env — set SUPERTABLE_SUPERUSER_TOKEN to a strong value
+# Bootstrap catalogue + storage
+SuperTable(super_name="example", organization="my-org")
 
-docker compose --profile infra --profile webui up -d
-# Open http://localhost:8050
+# Write
+dw = DataWriter(super_name="example", organization="my-org")
+columns, rows, inserted, deleted = dw.write(
+    role_name="superadmin",
+    simple_name="facts",
+    data=arrow_table,
+    overwrite_columns=["day", "client"],
+    lineage={"source_type": "manual", "source_id": "my-job"},
+)
+
+# Read
+dr = DataReader(
+    super_name="example",
+    organization="my-org",
+    query="SELECT day, sum(value) FROM facts GROUP BY day LIMIT 10",
+)
+df, status, message = dr.execute(role_name="superadmin", engine=engine.AUTO)
 ```
 
-### Python package
+---
+
+## Demos
+
+The package ships two runnable demos under `supertable.demo`:
 
 ```bash
-pip install supertable
+# Numbered tutorial — runs the full lifecycle end-to-end.
+supertable-demo-quickstart
+# or
+python -m supertable.demo.quickstart
+
+# Synthetic webshop dataset.
+supertable-demo-webshop-generate    # build ~1.2M rows on disk
+supertable-demo-webshop-load        # load them into SuperTable
+supertable-demo-webshop-topup       # continuous incremental refresh
 ```
 
-See [PYPI.md](PYPI.md) for SDK usage examples.
-
-### Docker Hub
+Both demos are also runnable as module steps. Examples:
 
 ```bash
-docker pull kladnasoft/supertable:latest
+python -m supertable.demo.quickstart.s01_01_01_create_super_table
+python -m supertable.demo.quickstart.s03_08_read_snapshot_history
+python -m supertable.demo.webshop.generate
 ```
 
-See [DOCKERHUB.md](DOCKERHUB.md) for deployment guide.
+See [supertable/demo/README.md](supertable/demo/README.md) for the full
+script index.
 
 ---
 
 ## What's included
 
-- **Versioned tables** with snapshot isolation, upsert, soft deletes, and staleness filtering
+- **Versioned tables** with snapshot isolation, upsert (`overwrite_columns`),
+  soft deletes (`delete_only=True`), schema evolution, and staleness filtering
 - **DuckDB query engine** — embedded, zero-copy reads from object storage
-- **Spark SQL** — optional, for queries exceeding DuckDB memory limits
-- **RBAC** — role types (superadmin, admin, writer, reader) with row-level and column-level security
-- **Audit logging** — tamper-evident SHA-256 hash chain, 7-year Parquet retention, DORA / SOC 2 ready
-- **Data quality** — 16 built-in checks with statistical anomaly detection
-- **Monitoring** — read/write/MCP metrics with latency percentiles
-- **Ingestion** — file upload (CSV, JSON, Parquet) with staging areas and automated pipes
-- **Delta Lake & Iceberg mirroring** — optional export after every write
-- **MCP server** — 16+ AI tools for Claude Desktop, Cursor, and other LLM clients
-- **OData 4.0** — role-scoped feeds for Excel, Power BI, and other BI tools
-- **REST API** — 82+ JSON endpoints for all data operations
+- **Spark SQL via Thrift** — for queries exceeding DuckDB memory limits
+- **RBAC** — role types (superadmin, admin, writer, reader, meta) with
+  row-level and column-level security enforced through view chains
+- **Audit logging** — tamper-evident SHA-256 hash chain in Redis Streams with
+  Parquet export
+- **Monitoring** — `MonitoringWriter` pushes read/write/metric payloads to
+  Redis lists; structured JSON logging with correlation IDs
+- **Ingestion** — staging areas (`Staging`) and automated ingestion pipes
+  (`SuperPipe`)
+- **Mirroring** — optional Delta Lake / Iceberg / Parquet export after every
+  write
+- **Snapshot history** — every write chains to `previous_snapshot`, enabling
+  point-in-time inspection without separate historical tables
 
 ---
 
 ## Documentation
 
+See [docs/00_index.md](docs/00_index.md) for the full table of contents.
+
 | # | Document | Description |
 |---|---|---|
-| 01 | [Platform Overview](docs/01_platform_overview.md) | Architecture, deployment, directory structure |
-| 02 | [Configuration](docs/02_configuration.md) | All 100+ environment variables |
-| 03 | [Storage Backends](docs/03_storage.md) | S3, MinIO, Azure, GCP, local setup |
-| 04 | [Redis Catalog](docs/04_redis_catalog.md) | Metadata store, key naming, operations |
-| 05 | [Data Model](docs/05_data_model.md) | Organization → SuperTable → SimpleTable |
+| 01 | [Platform Overview](docs/01_platform_overview.md) | Architecture, package layout, deployment, data flow |
+| 02 | [Configuration](docs/02_configuration.md) | Environment variables and runtime settings |
+| 03 | [Data Model](docs/03_data_model.md) | Organization → SuperTable → SimpleTable hierarchy |
+| 04 | [Storage Backends](docs/04_storage.md) | StorageInterface, S3, MinIO, Azure, GCP, local |
+| 05 | [Redis Catalog](docs/05_redis_catalog.md) | Metadata store, key naming, operations, CAS |
 | 06 | [Data Writer](docs/06_data_writer.md) | Write pipeline, locking, dedup, tombstones |
-| 07 | [Query Engine](docs/07_query_engine.md) | DuckDB, Spark, engine selection |
-| 08 | [Ingestion](docs/08_ingestion.md) | File upload, staging areas, pipes |
-| 09 | [RBAC](docs/09_rbac.md) | Roles, users, row/column security |
-| 10 | [Audit Log](docs/10_audit_log.md) | DORA/SOC 2 compliance, hash chain |
-| 11 | [REST API](docs/11_rest_api.md) | All 82+ JSON endpoints |
-| 12 | [MCP Server](docs/12_mcp.md) | AI tool integration |
-| 13 | [Monitoring](docs/13_monitoring.md) | Metrics, structured logging |
-| 14 | [Data Quality](docs/14_data_quality.md) | 16 checks, anomaly detection |
-| 15 | [Mirroring](docs/15_mirroring.md) | Delta Lake, Iceberg export |
-| 16 | [Locking](docs/16_locking.md) | Redis distributed locks |
+| 07 | [Ingestion & Pipes](docs/07_ingestion.md) | Staging areas, automated ingestion pipes |
+| 08 | [Distributed Locking](docs/08_locking.md) | Redis locks, file locks, deadlock prevention |
+| 09 | [Query Engine](docs/09_query_engine.md) | DuckDB Lite/Pro, Spark SQL, auto selection |
+| 10 | [Data Reader](docs/10_data_reader.md) | Read facade, snapshot history, view chain |
+| 11 | [RBAC & Access Control](docs/11_rbac.md) | Roles, users, row/column security |
+| 12 | [Audit Logging](docs/12_audit.md) | SHA-256 hash chain, DORA/SOC 2, SIEM |
+| 13 | [Table Mirroring](docs/13_mirroring.md) | Delta Lake, Iceberg, Parquet export |
+| 14 | [Monitoring](docs/14_monitoring.md) | Metrics writer, structured logging |
+| 15 | [Python SDK](docs/15_python_sdk.md) | Core classes, demos, example index |
 
 ---
 

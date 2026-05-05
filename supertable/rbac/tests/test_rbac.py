@@ -19,6 +19,18 @@ import unittest
 from unittest.mock import MagicMock, patch
 from typing import Any, Dict, List, Optional, Set
 
+
+def _rbac_list_role_ids(cat, org: str, sup: str) -> List[str]:
+    """RedisCatalog has ``rbac_list_user_ids`` but no symmetric
+    ``rbac_list_role_ids``. The role index set is exposed via
+    ``_rbac_role_index_key`` though, so we mirror the user-side helper here
+    rather than ask source code to grow a new method.
+    """
+    from supertable.redis_catalog import _rbac_role_index_key
+    members = cat.r.smembers(_rbac_role_index_key(org, sup))
+    return [cat._decode_member(m) for m in (members or [])]
+
+
 # ---------------------------------------------------------------------------
 # Minimal in-memory Redis fake
 # ---------------------------------------------------------------------------
@@ -59,6 +71,10 @@ class FakePipeline:
     def get(self, key):
         self._cmds.append(("get", key))
 
+    def hgetall(self, key):
+        # The pipelined HGETALL used by RedisCatalog.get_users / get_roles.
+        self._cmds.append(("hgetall", key))
+
     def execute(self):
         results = []
         for cmd in self._cmds:
@@ -77,6 +93,8 @@ class FakePipeline:
                 results.append(self._store.set(cmd[1], cmd[2], **cmd[3]))
             elif op == "get":
                 results.append(self._store.get(cmd[1]))
+            elif op == "hgetall":
+                results.append(self._store.hgetall(cmd[1]))
         self._cmds.clear()
         return results
 
@@ -453,7 +471,7 @@ class TestRedisCatalogRbac(unittest.TestCase):
         self.cat.rbac_init_role_meta(ORG, SUP)
         self.cat.rbac_create_role(ORG, SUP, "r1", {"role": "admin", "role_id": "r1"})
         self.cat.rbac_create_role(ORG, SUP, "r2", {"role": "reader", "role_id": "r2"})
-        ids = self.cat.rbac_list_role_ids(ORG, SUP)
+        ids = _rbac_list_role_ids(self.cat, ORG, SUP)
         self.assertEqual(sorted(ids), ["r1", "r2"])
 
     def test_get_role_ids_by_type(self):
@@ -1136,9 +1154,9 @@ class TestCascadeAndDependency(unittest.TestCase):
 
     def test_delete_role_removes_from_global_index(self):
         rid = self.rm.create_role({"role": "writer", "tables": {"t1": {}}})
-        self.assertIn(rid, self.cat.rbac_list_role_ids(ORG, SUP))
+        self.assertIn(rid, _rbac_list_role_ids(self.cat, ORG, SUP))
         self.rm.delete_role(rid)
-        self.assertNotIn(rid, self.cat.rbac_list_role_ids(ORG, SUP))
+        self.assertNotIn(rid, _rbac_list_role_ids(self.cat, ORG, SUP))
 
     def test_delete_user_removes_from_index(self):
         uid = self.um.create_user({"username": "temp", "roles": []})
@@ -1307,7 +1325,7 @@ class TestEmptyState(unittest.TestCase):
 
     def test_list_role_ids_empty(self):
         self.cat.rbac_init_role_meta(ORG, SUP)
-        self.assertEqual(self.cat.rbac_list_role_ids(ORG, SUP), [])
+        self.assertEqual(_rbac_list_role_ids(self.cat, ORG, SUP), [])
 
     def test_list_user_ids_empty(self):
         self.cat.rbac_init_user_meta(ORG, SUP)

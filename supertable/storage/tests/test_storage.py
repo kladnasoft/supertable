@@ -22,14 +22,32 @@ from unittest import mock
 from unittest.mock import MagicMock, PropertyMock, patch, call
 
 # ---------------------------------------------------------------------------
+# Pre-import packages that supertable.* transitively depends on (pandas pulls
+# in pyarrow at import time and reads pa.__version__). Doing this BEFORE the
+# stub bootstrap guarantees we don't shadow real packages with our test stubs.
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover - environmental
+    import pandas  # noqa: F401
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
 # Bootstrap: create stub modules so imports don't fail without real packages
 # ---------------------------------------------------------------------------
 
 def _ensure_stub(name, attrs=None):
-    """Insert a stub module into sys.modules if it isn't already importable."""
+    """Insert a stub module into sys.modules if it isn't already importable.
+
+    Also gives the stub a non-None ``__spec__`` so that
+    :func:`importlib.util.find_spec` (used by ``storage_factory._require``)
+    treats it as an installed package rather than raising ``ValueError``.
+    """
+    import importlib.machinery as _machinery
+
     if name in sys.modules:
         return sys.modules[name]
     mod = types.ModuleType(name)
+    mod.__spec__ = _machinery.ModuleSpec(name, loader=None)
     if attrs:
         for k, v in attrs.items():
             setattr(mod, k, v)
@@ -39,7 +57,9 @@ def _ensure_stub(name, attrs=None):
     for i in range(1, len(parts)):
         parent = ".".join(parts[:i])
         if parent not in sys.modules:
-            sys.modules[parent] = types.ModuleType(parent)
+            pmod = types.ModuleType(parent)
+            pmod.__spec__ = _machinery.ModuleSpec(parent, loader=None)
+            sys.modules[parent] = pmod
     return mod
 
 
@@ -105,6 +125,27 @@ from supertable.storage.minio_storage import MinioStorage
 from supertable.storage.s3_storage import S3Storage
 from supertable.storage.storage_factory import get_storage, _require
 from supertable.config.defaults import default
+from supertable.config.settings import settings as _settings
+from supertable.storage import minio_storage as _minio_module
+from supertable.storage import s3_storage as _s3_module
+from supertable.storage import storage_factory as _factory_module
+from dataclasses import replace as _dc_replace
+
+
+def _patch_settings(test_case, **overrides):
+    """Substitute the per-module ``settings`` binding for the duration of
+    the test. ``settings`` is a frozen dataclass so we use dataclasses.replace
+    to derive a copy with the overrides applied, then patch every module
+    that imported it via ``from supertable.config.settings import settings``.
+
+    Restoration is registered with ``addCleanup`` so each test gets isolation.
+    """
+    new_settings = _dc_replace(_settings, **overrides)
+    for mod in (_minio_module, _s3_module, _factory_module):
+        original = getattr(mod, "settings")
+        setattr(mod, "settings", new_settings)
+        test_case.addCleanup(setattr, mod, "settings", original)
+    return new_settings
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -712,18 +753,20 @@ class TestMinioStorage(unittest.TestCase):
     # ---- from_env ----
 
     def test_from_env_success(self):
-        env = {
-            "STORAGE_BUCKET": "mybucket",
-            "STORAGE_ENDPOINT_URL": "http://minio:9000",
-            "STORAGE_ACCESS_KEY": "ak",
-            "STORAGE_SECRET_KEY": "sk",
-            "STORAGE_REGION": "us-west-2",
-            "STORAGE_FORCE_PATH_STYLE": "true",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
-                with patch.object(MinioStorage, "_ensure_bucket_exists"):
-                    s = MinioStorage.from_env()
+        # ``from_env`` reads from the frozen ``settings`` singleton, not the
+        # live environment. Patch settings instead of os.environ.
+        _patch_settings(
+            self,
+            STORAGE_BUCKET="mybucket",
+            STORAGE_ENDPOINT_URL="http://minio:9000",
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+            STORAGE_REGION="us-west-2",
+            STORAGE_FORCE_PATH_STYLE=True,
+        )
+        with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
+            with patch.object(MinioStorage, "_ensure_bucket_exists"):
+                s = MinioStorage.from_env()
         self.assertEqual(s.bucket_name, "mybucket")
         self.assertEqual(s.endpoint_url, "http://minio:9000")
         self.assertEqual(s.region, "us-west-2")
@@ -734,56 +777,71 @@ class TestMinioStorage(unittest.TestCase):
         self.assertEqual(s._secret_key, "sk")
 
     def test_from_env_https(self):
-        env = {
-            "STORAGE_ENDPOINT_URL": "https://s3.example.com",
-            "STORAGE_ACCESS_KEY": "ak",
-            "STORAGE_SECRET_KEY": "sk",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
-                with patch.object(MinioStorage, "_ensure_bucket_exists"):
-                    s = MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_ENDPOINT_URL="https://s3.example.com",
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+        )
+        with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
+            with patch.object(MinioStorage, "_ensure_bucket_exists"):
+                s = MinioStorage.from_env()
         self.assertTrue(s.secure)
 
     def test_from_env_defaults_bucket(self):
-        env = {
-            "STORAGE_ENDPOINT_URL": "http://localhost:9000",
-            "STORAGE_ACCESS_KEY": "ak",
-            "STORAGE_SECRET_KEY": "sk",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch.dict(os.environ, {"STORAGE_BUCKET": ""}, clear=False):
-                with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
-                    with patch.object(MinioStorage, "_ensure_bucket_exists"):
-                        s = MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_BUCKET="supertable",  # default value
+            STORAGE_ENDPOINT_URL="http://localhost:9000",
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+        )
+        with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
+            with patch.object(MinioStorage, "_ensure_bucket_exists"):
+                s = MinioStorage.from_env()
         self.assertEqual(s.bucket_name, "supertable")
 
     def test_from_env_missing_endpoint(self):
-        with patch.dict(os.environ, {"STORAGE_ENDPOINT_URL": "", "STORAGE_ACCESS_KEY": "a", "STORAGE_SECRET_KEY": "s"}, clear=False):
-            with self.assertRaises(RuntimeError):
-                MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_ENDPOINT_URL="",
+            STORAGE_ACCESS_KEY="a",
+            STORAGE_SECRET_KEY="s",
+        )
+        with self.assertRaises(RuntimeError):
+            MinioStorage.from_env()
 
     def test_from_env_missing_access_key(self):
-        with patch.dict(os.environ, {"STORAGE_ENDPOINT_URL": "http://x", "STORAGE_ACCESS_KEY": "", "STORAGE_SECRET_KEY": "s"}, clear=False):
-            with self.assertRaises(RuntimeError):
-                MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_ENDPOINT_URL="http://x",
+            STORAGE_ACCESS_KEY="",
+            STORAGE_SECRET_KEY="s",
+        )
+        with self.assertRaises(RuntimeError):
+            MinioStorage.from_env()
 
     def test_from_env_missing_secret_key(self):
-        with patch.dict(os.environ, {"STORAGE_ENDPOINT_URL": "http://x", "STORAGE_ACCESS_KEY": "a", "STORAGE_SECRET_KEY": ""}, clear=False):
-            with self.assertRaises(RuntimeError):
-                MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_ENDPOINT_URL="http://x",
+            STORAGE_ACCESS_KEY="a",
+            STORAGE_SECRET_KEY="",
+        )
+        with self.assertRaises(RuntimeError):
+            MinioStorage.from_env()
 
     def test_from_env_vhost_default(self):
-        env = {
-            "STORAGE_ENDPOINT_URL": "http://localhost:9000",
-            "STORAGE_ACCESS_KEY": "ak",
-            "STORAGE_SECRET_KEY": "sk",
-            "STORAGE_FORCE_PATH_STYLE": "",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
-                with patch.object(MinioStorage, "_ensure_bucket_exists"):
-                    s = MinioStorage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_ENDPOINT_URL="http://localhost:9000",
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+            STORAGE_FORCE_PATH_STYLE=False,
+        )
+        with patch.object(MinioStorage, "_build_client", return_value=MagicMock()):
+            with patch.object(MinioStorage, "_ensure_bucket_exists"):
+                s = MinioStorage.from_env()
         self.assertEqual(s.url_style, "vhost")
 
     # ---- to_duckdb_path ----
@@ -812,10 +870,12 @@ class TestMinioStorage(unittest.TestCase):
         self.assertEqual(result, "https://s3.example.com/test-bucket/key.parquet")
 
     def test_to_duckdb_path_env_fallback(self):
+        # to_duckdb_path consults settings.SUPERTABLE_DUCKDB_USE_HTTPFS, not
+        # the live env var, so we patch the settings binding here too.
+        _patch_settings(self, SUPERTABLE_DUCKDB_USE_HTTPFS=True)
         s, _ = self._make_storage()
-        with patch.dict(os.environ, {"SUPERTABLE_DUCKDB_USE_HTTPFS": "1"}):
-            s.endpoint_url = "http://minio:9000"
-            result = s.to_duckdb_path("key.parquet")
+        s.endpoint_url = "http://minio:9000"
+        result = s.to_duckdb_path("key.parquet")
         self.assertIn("http://minio:9000", result)
 
     def test_to_duckdb_path_empty_key(self):
@@ -1228,54 +1288,61 @@ class TestS3Storage(unittest.TestCase):
     # ---- from_env ----
 
     def test_from_env_success(self):
-        env = {
-            "STORAGE_BUCKET": "mybucket",
-            "STORAGE_ENDPOINT_URL": "https://s3.us-west-2.amazonaws.com",
-            "STORAGE_ACCESS_KEY": "ak",
-            "STORAGE_SECRET_KEY": "sk",
-            "STORAGE_REGION": "us-west-2",
-            "STORAGE_SESSION_TOKEN": "token",
-            "STORAGE_FORCE_PATH_STYLE": "true",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch("supertable.storage.s3_storage.boto3") as mock_boto3:
-                mock_client = MagicMock()
-                mock_client.meta.endpoint_url = "https://s3.us-west-2.amazonaws.com"
-                mock_client.meta.region_name = "us-west-2"
-                mock_boto3.client.return_value = mock_client
-                s = S3Storage.from_env()
+        # ``from_env`` reads from the frozen ``settings`` singleton, not
+        # the live environment. Patch settings instead.
+        _patch_settings(
+            self,
+            STORAGE_BUCKET="mybucket",
+            STORAGE_ENDPOINT_URL="https://s3.us-west-2.amazonaws.com",
+            STORAGE_ACCESS_KEY="ak",
+            STORAGE_SECRET_KEY="sk",
+            STORAGE_REGION="us-west-2",
+            STORAGE_SESSION_TOKEN="token",
+            STORAGE_FORCE_PATH_STYLE=True,
+        )
+        with patch("supertable.storage.s3_storage.boto3") as mock_boto3:
+            mock_client = MagicMock()
+            mock_client.meta.endpoint_url = "https://s3.us-west-2.amazonaws.com"
+            mock_client.meta.region_name = "us-west-2"
+            mock_boto3.client.return_value = mock_client
+            s = S3Storage.from_env()
         self.assertEqual(s.bucket_name, "mybucket")
         self.assertEqual(s.url_style, "path")
 
     def test_from_env_defaults(self):
-        env = {
-            "STORAGE_BUCKET": "",
-            "STORAGE_ENDPOINT_URL": "",
-            "STORAGE_ACCESS_KEY": "",
-            "STORAGE_SECRET_KEY": "",
-            "STORAGE_REGION": "",
-            "STORAGE_SESSION_TOKEN": "",
-            "STORAGE_FORCE_PATH_STYLE": "",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch("supertable.storage.s3_storage.boto3") as mock_boto3:
-                mock_client = MagicMock()
-                mock_client.meta.endpoint_url = "https://s3.amazonaws.com"
-                mock_client.meta.region_name = "us-east-1"
-                mock_boto3.client.return_value = mock_client
-                s = S3Storage.from_env()
+        _patch_settings(
+            self,
+            STORAGE_BUCKET="supertable",  # default
+            STORAGE_ENDPOINT_URL="",
+            STORAGE_ACCESS_KEY="",
+            STORAGE_SECRET_KEY="",
+            STORAGE_REGION="",
+            STORAGE_SESSION_TOKEN="",
+            STORAGE_FORCE_PATH_STYLE=False,
+        )
+        with patch("supertable.storage.s3_storage.boto3") as mock_boto3:
+            mock_client = MagicMock()
+            mock_client.meta.endpoint_url = "https://s3.amazonaws.com"
+            mock_client.meta.region_name = "us-east-1"
+            mock_boto3.client.return_value = mock_client
+            s = S3Storage.from_env()
         self.assertEqual(s.bucket_name, "supertable")
         self.assertEqual(s.url_style, "vhost")
 
     def test_from_env_no_aws_fallbacks(self):
         """Verify AWS_* env vars are NOT used as fallbacks."""
+        # All STORAGE_* are blank in the patched settings; AWS_* env vars
+        # exist but should be ignored.
+        _patch_settings(
+            self,
+            STORAGE_BUCKET="",
+            STORAGE_ENDPOINT_URL="",
+            STORAGE_ACCESS_KEY="",
+            STORAGE_SECRET_KEY="",
+            STORAGE_REGION="",
+            STORAGE_SESSION_TOKEN="",
+        )
         env = {
-            "STORAGE_BUCKET": "",
-            "STORAGE_ENDPOINT_URL": "",
-            "STORAGE_ACCESS_KEY": "",
-            "STORAGE_SECRET_KEY": "",
-            "STORAGE_REGION": "",
-            "STORAGE_SESSION_TOKEN": "",
             "AWS_DEFAULT_REGION": "eu-west-1",
             "AWS_ACCESS_KEY_ID": "aws-ak",
             "AWS_SECRET_ACCESS_KEY": "aws-sk",
@@ -1320,10 +1387,11 @@ class TestS3Storage(unittest.TestCase):
         self.assertEqual(result, "s3://test-bucket/key.parquet")
 
     def test_to_duckdb_path_env_fallback(self):
+        # to_duckdb_path consults settings.SUPERTABLE_DUCKDB_USE_HTTPFS.
+        _patch_settings(self, SUPERTABLE_DUCKDB_USE_HTTPFS=True)
         s, _ = self._make_storage()
         s.endpoint_url = "http://localhost:4566"
-        with patch.dict(os.environ, {"SUPERTABLE_DUCKDB_USE_HTTPFS": "true"}):
-            result = s.to_duckdb_path("key.parquet")
+        result = s.to_duckdb_path("key.parquet")
         self.assertIn("http://", result)
 
     # ---- presign ----
@@ -2054,22 +2122,31 @@ class TestStorageFactory(unittest.TestCase):
         self.assertIsInstance(s, LocalStorage)
 
     def test_get_storage_local_from_env(self):
-        with patch.dict(os.environ, {"STORAGE_TYPE": "LOCAL"}):
-            s = get_storage()
+        # get_storage reads settings.STORAGE_TYPE (the frozen singleton),
+        # not the live os.environ value.
+        _patch_settings(self, STORAGE_TYPE="LOCAL")
+        s = get_storage()
         self.assertIsInstance(s, LocalStorage)
 
     def test_get_storage_local_default_fallback(self):
-        with patch.dict(os.environ, {"STORAGE_TYPE": ""}):
-            default.STORAGE_TYPE = "LOCAL"
+        _patch_settings(self, STORAGE_TYPE="")
+        original = default.STORAGE_TYPE
+        default.STORAGE_TYPE = "LOCAL"
+        try:
             s = get_storage()
+        finally:
+            default.STORAGE_TYPE = original
         self.assertIsInstance(s, LocalStorage)
 
     def test_get_storage_default_when_no_config(self):
-        with patch.dict(os.environ, {"STORAGE_TYPE": ""}):
-            default.STORAGE_TYPE = None
+        _patch_settings(self, STORAGE_TYPE="")
+        original = default.STORAGE_TYPE
+        default.STORAGE_TYPE = None
+        try:
             s = get_storage()
+        finally:
+            default.STORAGE_TYPE = original
         self.assertIsInstance(s, LocalStorage)
-        default.STORAGE_TYPE = "LOCAL"  # restore
 
     # ---- get_storage S3 ----
 
@@ -2193,11 +2270,16 @@ class TestStorageFactory(unittest.TestCase):
         self.assertIsInstance(s, LocalStorage)
 
     def test_get_storage_env_overrides_default(self):
+        # When settings.STORAGE_TYPE is set, it takes precedence over
+        # default.STORAGE_TYPE (which is the lowest-priority fallback).
+        original = default.STORAGE_TYPE
         default.STORAGE_TYPE = "S3"
-        with patch.dict(os.environ, {"STORAGE_TYPE": "LOCAL"}):
+        _patch_settings(self, STORAGE_TYPE="LOCAL")
+        try:
             s = get_storage()
+        finally:
+            default.STORAGE_TYPE = original
         self.assertIsInstance(s, LocalStorage)
-        default.STORAGE_TYPE = "LOCAL"  # restore
 
 
 if __name__ == "__main__":

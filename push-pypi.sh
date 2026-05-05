@@ -1,23 +1,51 @@
 #!/usr/bin/env bash
 # publish.sh — bump version, build, test, and upload to (Test)PyPI
 # Usage:
-#   ./publish.sh                 # uses default VERSION=1.2.0, uploads to PyPI
-#   ./publish.sh 1.2.3           # set custom version, uploads to PyPI
-#   ./publish.sh --testpypi      # upload to TestPyPI
+#   ./publish.sh                 # auto-bump patch from current pyproject.toml version
+#   ./publish.sh 1.2.3           # set explicit version, uploads to PyPI
+#   ./publish.sh patch|minor|major  # bump that segment from current version
+#   ./publish.sh --testpypi      # upload to TestPyPI (default bump = patch)
 #   ./publish.sh 1.2.3 --no-tests
 # Env:
 #   PYPI_TOKEN   (required for upload)
 #   NO_GIT=1     (optional: skip git tag/push)
-#   SKIP_TESTS=1 (optional: skip local install tests)
+#   SKIP_TESTS=1 (optional: skip BOTH the unit-test run and local install tests)
 
 set -euo pipefail
 
-# ---- parse args ----
-VERSION="1.2.5"
-REPO="pypi"  # or "testpypi"
-NO_TESTS_FLAG=0
+# ---- locate script + project dir ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
+# ---- helper: read current version from pyproject.toml ----
+current_version() {
+  grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+# ---- helper: bump a SemVer X.Y.Z by segment ----
+bump_version() {
+  local cur="$1" segment="$2"
+  if ! [[ "${cur}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    echo "ERROR: Cannot bump non-SemVer version '${cur}'." >&2
+    exit 6
+  fi
+  local maj="${BASH_REMATCH[1]}" min="${BASH_REMATCH[2]}" pat="${BASH_REMATCH[3]}"
+  case "${segment}" in
+    major) echo "$((maj + 1)).0.0" ;;
+    minor) echo "${maj}.$((min + 1)).0" ;;
+    patch|"") echo "${maj}.${min}.$((pat + 1))" ;;
+    *) echo "ERROR: Unknown bump segment '${segment}'." >&2; exit 6 ;;
+  esac
+}
+
+# ---- parse args ----
+[[ -f "pyproject.toml" ]] || { echo "ERROR: pyproject.toml not found in ${SCRIPT_DIR}."; exit 3; }
+CURRENT_VERSION="$(current_version)"
+VERSION=""              # resolved below
+REPO="pypi"             # or "testpypi"
+NO_TESTS_FLAG=0
 arg_version_set=0
+
 for arg in "$@"; do
   case "$arg" in
     --testpypi) REPO="testpypi" ;;
@@ -25,6 +53,14 @@ for arg in "$@"; do
     --help|-h)
       sed -n '1,80p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
+      ;;
+    major|minor|patch)
+      if [[ $arg_version_set -eq 0 ]]; then
+        VERSION="$(bump_version "${CURRENT_VERSION}" "${arg}")"
+        arg_version_set=1
+      else
+        echo "Unknown argument: $arg" >&2; exit 1
+      fi
       ;;
     *)
       if [[ $arg_version_set -eq 0 ]]; then
@@ -38,8 +74,21 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> Target version: ${VERSION}"
+# Default behaviour: auto-bump the patch segment so each invocation
+# produces a new release without requiring an explicit number.
+if [[ -z "${VERSION}" ]]; then
+  VERSION="$(bump_version "${CURRENT_VERSION}" patch)"
+  echo "==> No version specified — auto-bumping patch: ${CURRENT_VERSION} -> ${VERSION}"
+fi
+
+echo "==> Current version: ${CURRENT_VERSION}"
+echo "==> Target  version: ${VERSION}"
 echo "==> Target repository: ${REPO}"
+
+if [[ "${VERSION}" == "${CURRENT_VERSION}" ]]; then
+  echo "ERROR: Target version equals current version (${VERSION}). Aborting." >&2
+  exit 7
+fi
 
 # ---- load TOKEN file if present ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,9 +106,23 @@ if [[ -z "${PYPI_TOKEN:-}" ]]; then
   exit 2
 fi
 
-# ---- bump versions in pyproject.toml and setup.py ----
-[[ -f "pyproject.toml" ]] || { echo "ERROR: pyproject.toml not found."; exit 3; }
+# ---- run full test suite BEFORE bumping anything ----
+# Honours --no-tests / SKIP_TESTS=1 (same flags as the post-build install
+# smoke test). Aborts the publish on any failure so we never ship a broken
+# release.
+if [[ "${SKIP_TESTS:-0}" == "1" || "${NO_TESTS_FLAG}" == "1" ]]; then
+  echo "==> Tests disabled (SKIP_TESTS/--no-tests). Skipping pytest run."
+else
+  echo "==> Running unit test suite (pytest supertable/)"
+  if ! python -m pytest supertable/ -q --no-header; then
+    echo "ERROR: Tests failed. Aborting publish." >&2
+    exit 8
+  fi
+fi
+
+# ---- bump versions in pyproject.toml, setup.py, and supertable/__init__.py ----
 [[ -f "setup.py" ]] || echo "WARN: setup.py not found; continuing."
+[[ -f "supertable/__init__.py" ]] || { echo "ERROR: supertable/__init__.py not found."; exit 3; }
 
 echo "==> Bumping version in pyproject.toml to ${VERSION}"
 sed -i -E "0,/^version\s*=\s*\"[^\"]+\"/s//version = \"${VERSION}\"/" pyproject.toml
@@ -67,6 +130,29 @@ sed -i -E "0,/^version\s*=\s*\"[^\"]+\"/s//version = \"${VERSION}\"/" pyproject.
 if [[ -f "setup.py" ]]; then
   echo "==> Bumping version in setup.py to ${VERSION}"
   sed -i -E "s/version\s*=\s*['\"][^'\"]+['\"]/version=\"${VERSION}\"/" setup.py
+fi
+
+echo "==> Bumping __version__ in supertable/__init__.py to ${VERSION}"
+sed -i -E "s/^__version__\s*=\s*['\"][^'\"]+['\"]/__version__ = \"${VERSION}\"/" supertable/__init__.py
+
+# Verify the three sources agree
+echo "==> Verifying version consistency"
+PY_VER=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+INIT_VER=$(grep -E '^__version__\s*=' supertable/__init__.py | head -1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
+SETUP_VER=""
+if [[ -f "setup.py" ]]; then
+  SETUP_VER=$(grep -E "version\s*=" setup.py | head -1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
+fi
+echo "    pyproject.toml         = ${PY_VER}"
+echo "    supertable/__init__.py = ${INIT_VER}"
+[[ -n "${SETUP_VER}" ]] && echo "    setup.py               = ${SETUP_VER}"
+if [[ "${PY_VER}" != "${VERSION}" || "${INIT_VER}" != "${VERSION}" ]]; then
+  echo "ERROR: Version files disagree. Aborting." >&2
+  exit 5
+fi
+if [[ -n "${SETUP_VER}" && "${SETUP_VER}" != "${VERSION}" ]]; then
+  echo "ERROR: setup.py version disagrees. Aborting." >&2
+  exit 5
 fi
 
 # ---- clean build artifacts ----
@@ -139,11 +225,15 @@ else
     pip install "${WHEEL_PATH}"
 
     echo "==> Import sanity checks"
-    python - <<'PY'
+    python - <<PY
 import importlib
+import supertable
+assert supertable.__version__ == "${VERSION}", (
+    f"installed __version__={supertable.__version__} != expected ${VERSION}"
+)
 for mod in ("supertable","dotenv","colorlog","polars","sqlglot","duckdb"):
     importlib.import_module(mod)
-print("Local import smoke test: OK")
+print(f"Local import smoke test: OK (supertable {supertable.__version__})")
 PY
 
     deactivate

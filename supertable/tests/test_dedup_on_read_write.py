@@ -85,14 +85,16 @@ def _make_writer_for_write():
         "super": patch(f"{_DW_MOD}.SuperTable"),
         "catalog": patch(f"{_DW_MOD}.RedisCatalog"),
         "access": patch(f"{_DW_MOD}.check_write_access"),
-        "find_overlap": patch(f"{_DW_MOD}.find_and_lock_overlapping_files"),
+        "find_overlap": patch(f"{_DW_MOD}.find_overlapping_files"),
         "process_overlap": patch(f"{_DW_MOD}.process_overlapping_files"),
         "simple": patch(f"{_DW_MOD}.SimpleTable"),
         "mirror": patch(f"{_DW_MOD}.MirrorFormats"),
-        "monitor": patch(f"{_DW_MOD}.get_monitoring_logger"),
+        "monitor": patch(f"{_DW_MOD}.MonitoringWriter"),
     }
 
     mocks = {k: p.start() for k, p in patches.items()}
+    # MonitoringWriter is used as a context manager: pipe through __enter__.
+    mocks["monitor"].return_value.__enter__.return_value = MagicMock()
 
     mock_super = MagicMock()
     mock_super.super_name = "test_super"

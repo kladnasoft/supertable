@@ -149,13 +149,17 @@ def _make_writer(fake_catalog, fake_monitor, table_config=None,
         patch("supertable.data_writer.RedisCatalog", return_value=fake_catalog),
         patch("supertable.data_writer.check_write_access"),
         patch("supertable.data_writer.SimpleTable") as MockSimpleTable,
-        patch("supertable.data_writer.find_and_lock_overlapping_files", return_value=set()),
+        patch("supertable.data_writer.find_overlapping_files", return_value=set()),
         patch("supertable.data_writer.process_overlapping_files") as mock_process,
         patch("supertable.data_writer.process_delete_only") as mock_delete,
         patch("supertable.data_writer.filter_stale_incoming_rows") as mock_filter_stale,
-        patch("supertable.data_writer.get_monitoring_logger", return_value=fake_monitor),
+        # MonitoringWriter is used via `with MonitoringWriter(...) as mon:`,
+        # so the in-block monitor is the __enter__ return value.
+        patch("supertable.data_writer.MonitoringWriter") as MockMonitorCls,
         patch("supertable.data_writer.MirrorFormats") as MockMirror,
     ):
+        # Wire the fake monitor as the context-manager result.
+        MockMonitorCls.return_value.__enter__.return_value = fake_monitor
         st_instance = MockSuperTable.return_value
         st_instance.super_name = "testsuper"
         st_instance.organization = "testorg"
@@ -178,7 +182,9 @@ def _make_writer(fake_catalog, fake_monitor, table_config=None,
         simple_inst.snapshot_dir = "testorg/testsuper/tables/t1/snapshots"
 
         # update() returns the snapshot dict it receives (mutated) + a new path
-        def fake_update(new_res, sunset, model_df, last_snapshot=None, last_snapshot_path=None):
+        def fake_update(new_res, sunset, model_df, last_snapshot=None, last_snapshot_path=None, **kwargs):
+            # Accept any extra kwargs (e.g. ``lineage``) added in newer
+            # versions of SimpleTable.update.
             snap = last_snapshot if last_snapshot is not None else initial_snapshot
             return snap, "testorg/testsuper/tables/t1/snapshots/new.json"
         simple_inst.update.side_effect = fake_update

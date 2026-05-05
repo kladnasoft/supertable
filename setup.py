@@ -1,41 +1,33 @@
 from pathlib import Path
 from setuptools import setup, find_packages
 
+
 def read_requirements() -> list[str]:
     req_file = Path(__file__).parent / "requirements.txt"
     if not req_file.exists():
         return []
-    lines = req_file.read_text(encoding="utf-8").splitlines()
     reqs = []
-    for ln in lines:
+    for ln in req_file.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
-        if not ln or ln.startswith("#"):
-            continue
-        reqs.append(ln)
+        if ln and not ln.startswith("#"):
+            reqs.append(ln)
     return reqs
 
-readme = (Path(__file__).parent / "README.md")
+
+readme = Path(__file__).parent / "README.md"
 long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
     name="supertable",
-    version="1.9.5",
-    description="SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework.",
+    version="2.0.0",
+    description="SuperTable — versioned data lake library for SQL analytics on Parquet + Redis.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Levente Kupas",
     author_email="lkupas@kladnasoft.com",
     license="Super Table Public Use License (STPUL) v1.0",
     python_requires=">=3.10",
-    packages=find_packages(
-        include=["supertable", "supertable.*"],
-        exclude=[
-            "supertable.mcp", "supertable.mcp.*",
-            "supertable.api", "supertable.api.*",
-            "supertable.webui", "supertable.webui.*",
-            "supertable.odata", "supertable.odata.*",
-        ],
-    ),
+    packages=find_packages(include=["supertable", "supertable.*"]),
     include_package_data=True,
     install_requires=read_requirements(),
     classifiers=[
@@ -64,7 +56,10 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "supertable=supertable.config.cli:main",
+            "supertable-demo-quickstart=supertable.demo.quickstart.controller:main",
+            "supertable-demo-webshop-generate=supertable.demo.webshop.generate:main",
+            "supertable-demo-webshop-load=supertable.demo.webshop.load:main",
+            "supertable-demo-webshop-topup=supertable.demo.webshop.topup:main",
         ],
     },
 )

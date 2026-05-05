@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supertable"
-version = "1.9.5"
-description = "SuperTable revolutionizes data management by integrating multiple basic tables into a single, cohesive framework."
-readme = "PYPI.md"
+version = "2.0.0"
+description = "SuperTable — versioned data lake library for SQL analytics on Parquet + Redis."
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Super Table Public Use License (STPUL) v1.0" }
 authors = [{ name = "Levente Kupas", email = "lkupas@kladnasoft.com" }]
@@ -38,19 +38,16 @@ all = ["supertable[all-cloud]"]
 Homepage = "https://github.com/kladnasoft/supertable"
 
 [project.scripts]
-supertable = "supertable.config.cli:main"
+supertable-demo-quickstart       = "supertable.demo.quickstart.controller:main"
+supertable-demo-webshop-generate = "supertable.demo.webshop.generate:main"
+supertable-demo-webshop-load     = "supertable.demo.webshop.load:main"
+supertable-demo-webshop-topup    = "supertable.demo.webshop.topup:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["supertable", "supertable.*"]
-exclude = [
-  "supertable.mcp",    "supertable.mcp.*",
-  "supertable.api",    "supertable.api.*",
-  "supertable.webui",  "supertable.webui.*",
-  "supertable.odata",  "supertable.odata.*",
-]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
