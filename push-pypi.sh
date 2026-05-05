@@ -7,9 +7,10 @@
 #   ./publish.sh --testpypi      # upload to TestPyPI (default bump = patch)
 #   ./publish.sh 1.2.3 --no-tests
 # Env:
-#   PYPI_TOKEN   (required for upload)
-#   NO_GIT=1     (optional: skip git tag/push)
-#   SKIP_TESTS=1 (optional: skip BOTH the unit-test run and local install tests)
+#   PYPI_TOKEN       (required for PyPI uploads; used as fallback for TestPyPI)
+#   TESTPYPI_TOKEN   (optional: dedicated TestPyPI token; preferred for --testpypi)
+#   NO_GIT=1         (optional: skip git tag/push)
+#   SKIP_TESTS=1     (optional: skip BOTH the unit-test run and local install tests)
 
 set -euo pipefail
 
@@ -91,20 +92,48 @@ if [[ "${VERSION}" == "${CURRENT_VERSION}" ]]; then
 fi
 
 # ---- load TOKEN file if present ----
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -z "${PYPI_TOKEN:-}" && -f "${SCRIPT_DIR}/TOKEN" ]]; then
-  echo "==> Loading PYPI_TOKEN from TOKEN file"
+# The TOKEN file may export either or both of:
+#   PYPI_TOKEN       — for production PyPI uploads
+#   TESTPYPI_TOKEN   — for TestPyPI uploads (separate account/token)
+if [[ -f "${SCRIPT_DIR}/TOKEN" ]] && [[ -z "${PYPI_TOKEN:-}" || -z "${TESTPYPI_TOKEN:-}" ]]; then
+  echo "==> Loading credentials from TOKEN file"
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/TOKEN"
 fi
 
-# ---- require PYPI_TOKEN for upload ----
-if [[ -z "${PYPI_TOKEN:-}" ]]; then
-  echo "ERROR: PYPI_TOKEN is not set in the environment." >&2
-  echo "Export it first, or create a TOKEN file next to this script containing:" >&2
-  echo "  export PYPI_TOKEN='pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'" >&2
-  exit 2
+# ---- pick the right token for the chosen repo ----
+# PyPI and TestPyPI are completely separate services with separate accounts
+# and separate API tokens. A token issued at pypi.org will return 403 from
+# test.pypi.org and vice-versa.
+if [[ "${REPO}" == "testpypi" ]]; then
+  if [[ -n "${TESTPYPI_TOKEN:-}" ]]; then
+    UPLOAD_TOKEN="${TESTPYPI_TOKEN}"
+    UPLOAD_TOKEN_SOURCE="TESTPYPI_TOKEN"
+  elif [[ -n "${PYPI_TOKEN:-}" ]]; then
+    UPLOAD_TOKEN="${PYPI_TOKEN}"
+    UPLOAD_TOKEN_SOURCE="PYPI_TOKEN (fallback)"
+    echo "WARN: TESTPYPI_TOKEN is not set; falling back to PYPI_TOKEN."
+    echo "      PyPI and TestPyPI tokens are NOT interchangeable — if upload"
+    echo "      fails with 403 you will need a dedicated TestPyPI token from"
+    echo "      https://test.pypi.org/manage/account/token/"
+  else
+    echo "ERROR: Neither TESTPYPI_TOKEN nor PYPI_TOKEN is set." >&2
+    echo "Create a TestPyPI token at https://test.pypi.org/manage/account/token/" >&2
+    echo "and export it (or add to TOKEN file) as:" >&2
+    echo "  export TESTPYPI_TOKEN='pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'" >&2
+    exit 2
+  fi
+else
+  if [[ -z "${PYPI_TOKEN:-}" ]]; then
+    echo "ERROR: PYPI_TOKEN is not set in the environment." >&2
+    echo "Export it first, or create a TOKEN file next to this script containing:" >&2
+    echo "  export PYPI_TOKEN='pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'" >&2
+    exit 2
+  fi
+  UPLOAD_TOKEN="${PYPI_TOKEN}"
+  UPLOAD_TOKEN_SOURCE="PYPI_TOKEN"
 fi
+echo "==> Using ${UPLOAD_TOKEN_SOURCE} for ${REPO} upload"
 
 # ---- run full test suite BEFORE bumping anything ----
 # Honours --no-tests / SKIP_TESTS=1 (same flags as the post-build install
@@ -248,12 +277,54 @@ fi
 # ---- upload ----
 echo "==> Uploading to ${REPO}"
 export TWINE_USERNAME="__token__"
-export TWINE_PASSWORD="${PYPI_TOKEN}"
+export TWINE_PASSWORD="${UPLOAD_TOKEN}"
+
+# Capture twine output so we can recognise common failure modes (the most
+# frequent ones are 403 "version already exists" and 403 "wrong token").
+UPLOAD_LOG="$(mktemp)"
+trap 'rm -f "${UPLOAD_LOG}"' EXIT
 
 if [[ "${REPO}" == "testpypi" ]]; then
-  twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+  set +e
+  twine upload --repository-url https://test.pypi.org/legacy/ dist/* 2>&1 | tee "${UPLOAD_LOG}"
+  rc=${PIPESTATUS[0]}
+  set -e
 else
-  twine upload dist/*
+  set +e
+  twine upload dist/* 2>&1 | tee "${UPLOAD_LOG}"
+  rc=${PIPESTATUS[0]}
+  set -e
+fi
+
+if [[ "${rc}" -ne 0 ]]; then
+  echo
+  echo "ERROR: twine upload failed (exit ${rc})." >&2
+  if grep -qE '403[[:space:]]*Forbidden|HTTPError:[[:space:]]*403' "${UPLOAD_LOG}"; then
+    echo "" >&2
+    echo "  HTTP 403 Forbidden from ${REPO}. The two common causes are:" >&2
+    echo "" >&2
+    echo "  1) Version ${VERSION} is already on ${REPO}." >&2
+    echo "     ${REPO^^} forbids re-uploading the same filename forever," >&2
+    echo "     even after yanking. Bump the version and try again:" >&2
+    if [[ "${REPO}" == "testpypi" ]]; then
+      echo "         ./push-pypi.sh patch --testpypi" >&2
+    else
+      echo "         ./push-pypi.sh patch" >&2
+    fi
+    echo "" >&2
+    echo "  2) Wrong token. PyPI and TestPyPI are separate services and" >&2
+    echo "     issue different tokens. The script used: ${UPLOAD_TOKEN_SOURCE}" >&2
+    if [[ "${REPO}" == "testpypi" ]]; then
+      echo "     Create a TestPyPI token at:" >&2
+      echo "         https://test.pypi.org/manage/account/token/" >&2
+      echo "     and export it as TESTPYPI_TOKEN (or add to TOKEN file)." >&2
+    else
+      echo "     Create a PyPI token at:" >&2
+      echo "         https://pypi.org/manage/account/token/" >&2
+      echo "     and export it as PYPI_TOKEN (or add to TOKEN file)." >&2
+    fi
+  fi
+  exit "${rc}"
 fi
 
 # ---- tag & push (optional) ----
