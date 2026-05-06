@@ -425,6 +425,14 @@ def _evict_oldest_monitor() -> None:
 
     Strategy: evict the first key (oldest insertion in dict-order, Python 3.7+).
     Signal the evicted logger's worker thread to stop so it doesn't leak.
+
+    Note: we intentionally do NOT close the evicted logger's Redis client.
+    Since supertable.redis_connector.create_redis_client caches one
+    redis.Redis (and one ConnectionPool) per effective RedisOptions, that
+    client is shared with every other monitor / catalog / writer in this
+    process.  Disconnecting it here would tear down their connections too.
+    Call supertable.redis_connector.close_all_redis_clients() at process
+    shutdown if a clean teardown is required.
     """
     if not _MONITORS:
         return

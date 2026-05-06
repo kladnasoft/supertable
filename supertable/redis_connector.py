@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 import redis
@@ -102,10 +103,47 @@ class RedisOptions:
         object.__setattr__(self, "sentinel_strict", sentinel_strict)
 
 
+# Process-level cache: identical RedisOptions → identical client (and pool).
+# Multiple writer/catalog instances share one ConnectionPool instead of each
+# constructing a new redis.Redis (which would leak its own pool until GC).
+_CLIENT_CACHE: Dict[Tuple[Any, ...], redis.Redis] = {}
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
+def _options_cache_key(opts: RedisOptions) -> Tuple[Any, ...]:
+    return (
+        opts.host,
+        opts.port,
+        opts.db,
+        opts.password,
+        opts.use_ssl,
+        opts.is_sentinel,
+        tuple(opts.sentinel_hosts),
+        opts.sentinel_master,
+        opts.sentinel_password,
+        opts.sentinel_strict,
+    )
+
+
 def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
     opts = options or RedisOptions()
     decode_responses = True
 
+    cache_key = _options_cache_key(opts)
+    cached = _CLIENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    with _CLIENT_CACHE_LOCK:
+        cached = _CLIENT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        client = _build_redis_client(opts, decode_responses)
+        _CLIENT_CACHE[cache_key] = client
+        return client
+
+
+def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Redis:
     # Decide between standard Redis and Sentinel-based Redis
     if opts.is_sentinel and opts.sentinel_hosts:
         logger.debug(
@@ -202,8 +240,39 @@ def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
     )
 
 
+def close_all_redis_clients() -> None:
+    """Close every cached Redis client and disconnect its pool.
+
+    Intended for clean process shutdown only.  After this call any subsequent
+    create_redis_client() will rebuild fresh clients on demand.
+    """
+    with _CLIENT_CACHE_LOCK:
+        clients = list(_CLIENT_CACHE.values())
+        _CLIENT_CACHE.clear()
+
+    for client in clients:
+        try:
+            pool = getattr(client, "connection_pool", None)
+            if pool is not None:
+                pool.disconnect()
+        except Exception as e:
+            logger.debug(f"[redis-connector] pool disconnect failed: {e}")
+        try:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+        except Exception as e:
+            logger.debug(f"[redis-connector] client close failed: {e}")
+
+
 class RedisConnector:
-    """Creates and holds a Redis client connection based on RedisOptions."""
+    """Returns a process-shared Redis client based on RedisOptions.
+
+    The underlying redis.Redis (and its ConnectionPool) is cached by the
+    effective options inside create_redis_client, so repeated construction
+    of RedisConnector / RedisCatalog / DataWriter / monitoring loggers does
+    not allocate new pools or sockets.
+    """
 
     def __init__(self, options: Optional[RedisOptions] = None):
         self.r = create_redis_client(options)
