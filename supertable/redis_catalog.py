@@ -862,12 +862,18 @@ return 1
             enabled: bool = True,
             username: str = "",
             user_id: str = "",
+            expires_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Create a new auth token.
 
         The plaintext token is returned ONLY once. Redis stores only token_id (sha256(token)).
         When ``username`` is provided, the token is linked to that user and
         login validation can enforce the username-token binding.
+
+        ``expires_ms`` is an optional absolute epoch-ms expiry.  After that
+        time, ``validate_auth_token_full`` returns None.  ``None`` (default)
+        means the token never expires by time alone — it can still be
+        disabled via ``enabled=False``.
         """
         token = secrets.token_urlsafe(24)
         token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -879,6 +885,7 @@ return 1
             "enabled": bool(enabled),
             "username": str(username or ""),
             "user_id": str(user_id or ""),
+            "expires_ms": int(expires_ms) if expires_ms else 0,
         }
         try:
             self.r.hset(RK.auth_tokens(org), token_id, json.dumps(meta))
@@ -912,7 +919,9 @@ return 1
         """Validate a plaintext auth token and return its metadata.
 
         Returns the token metadata dict (including ``username``, ``user_id``)
-        if valid, or None if invalid / not found.
+        if the token exists, is ``enabled=True``, and has not expired.
+        Returns ``None`` for any failure: missing, disabled, expired, or
+        malformed metadata.
         """
         if not token:
             return None
@@ -922,12 +931,25 @@ return 1
             if not raw:
                 return None
             raw_str = raw if isinstance(raw, str) else raw.decode("utf-8")
-            return json.loads(raw_str)
+            meta = json.loads(raw_str)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] validate_auth_token_full error: {e}")
             return None
         except (json.JSONDecodeError, TypeError):
             return None
+        if not isinstance(meta, dict):
+            return None
+        # enabled flag — if missing, treat as enabled (back-compat)
+        if "enabled" in meta and not bool(meta.get("enabled")):
+            return None
+        # expiry — 0 / missing means "never expires"
+        try:
+            exp = int(meta.get("expires_ms") or 0)
+        except (TypeError, ValueError):
+            exp = 0
+        if exp and exp < _now_ms():
+            return None
+        return meta
 
     # ------------- Listings via SCAN -------------
 
