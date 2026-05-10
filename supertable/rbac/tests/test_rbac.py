@@ -22,12 +22,12 @@ from typing import Any, Dict, List, Optional, Set
 
 def _rbac_list_role_ids(cat, org: str, sup: str) -> List[str]:
     """RedisCatalog has ``rbac_list_user_ids`` but no symmetric
-    ``rbac_list_role_ids``. The role index set is exposed via
-    ``_rbac_role_index_key`` though, so we mirror the user-side helper here
-    rather than ask source code to grow a new method.
+    ``rbac_list_role_ids``. The role index set key is owned by
+    ``redis_keys.rbac_role_index`` though, so we mirror the user-side helper
+    here rather than ask source code to grow a new method.
     """
-    from supertable.redis_catalog import _rbac_role_index_key
-    members = cat.r.smembers(_rbac_role_index_key(org, sup))
+    from supertable import redis_keys as RK
+    members = cat.r.smembers(RK.rbac_role_index(org, sup))
     return [cat._decode_member(m) for m in (members or [])]
 
 
@@ -120,16 +120,22 @@ class FakeScript:
         elif "SMEMBERS" in self._src and "DEL" in self._src and "SREM" in self._src:
             role_doc_key, role_index_key, role_type_index_key = keys[0], keys[1], keys[2]
             role_meta_key, user_index_key = keys[3], keys[4]
-            role_id, now_ms, org, sup = args[0], args[1], args[2], args[3]
+            rolename_to_id_key = keys[5] if len(keys) > 5 else None
+            # New ARGV layout: role_id, now_ms, role_name_lower, user_doc_key_prefix
+            role_id, now_ms = args[0], args[1]
+            role_name_lower = args[2] if len(args) > 2 else ""
+            user_doc_key_prefix = args[3] if len(args) > 3 else ""
             user_ids = self._store.smembers(user_index_key) or set()
             for uid in list(user_ids):
-                ukey = f"supertable:{org}:{sup}:rbac:users:doc:{uid}"
+                ukey = f"{user_doc_key_prefix}{uid}"
                 roles_json = self._store.hget(ukey, "roles")
                 if roles_json:
                     roles = json.loads(roles_json)
                     if role_id in roles:
                         roles.remove(role_id)
                         self._store.hset(ukey, mapping={"roles": json.dumps(roles), "modified_ms": now_ms})
+            if rolename_to_id_key and role_name_lower:
+                self._store.hdel(rolename_to_id_key, role_name_lower)
             self._store.delete(role_doc_key)
             self._store.srem(role_index_key, role_id)
             self._store.srem(role_type_index_key, role_id)
@@ -1362,11 +1368,13 @@ class TestVersionTracking(unittest.TestCase):
         self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
     def _get_role_meta_version(self):
-        raw = self.cat.r.hgetall(f"supertable:{ORG}:{SUP}:rbac:roles:meta")
+        from supertable import redis_keys as RK
+        raw = self.cat.r.hgetall(RK.rbac_role_meta(ORG, SUP))
         return int(raw.get("version", 0))
 
     def _get_user_meta_version(self):
-        raw = self.cat.r.hgetall(f"supertable:{ORG}:{SUP}:rbac:users:meta")
+        from supertable import redis_keys as RK
+        raw = self.cat.r.hgetall(RK.rbac_user_meta(ORG, SUP))
         return int(raw.get("version", 0))
 
     def test_role_create_bumps_version(self):
@@ -1639,48 +1647,40 @@ class TestRoleTypeUpdate(unittest.TestCase):
 class TestKeyNamespace(unittest.TestCase):
 
     def test_rbac_keys_use_rbac_prefix(self):
-        from supertable.redis_catalog import (
-            _rbac_user_meta_key, _rbac_user_index_key, _rbac_user_doc_key,
-            _rbac_username_to_id_key, _rbac_role_meta_key, _rbac_role_index_key,
-            _rbac_role_doc_key, _rbac_role_type_index_key,
-        )
+        from supertable import redis_keys as RK
         keys = [
-            _rbac_user_meta_key("o", "s"),
-            _rbac_user_index_key("o", "s"),
-            _rbac_user_doc_key("o", "s", "uid"),
-            _rbac_username_to_id_key("o", "s"),
-            _rbac_role_meta_key("o", "s"),
-            _rbac_role_index_key("o", "s"),
-            _rbac_role_doc_key("o", "s", "rid"),
-            _rbac_role_type_index_key("o", "s", "admin"),
+            RK.rbac_user_meta("o", "s"),
+            RK.rbac_user_index("o", "s"),
+            RK.rbac_user_doc("o", "s", "uid"),
+            RK.rbac_username_to_id("o", "s"),
+            RK.rbac_role_meta("o", "s"),
+            RK.rbac_role_index("o", "s"),
+            RK.rbac_role_doc("o", "s", "rid"),
+            RK.rbac_role_type_index("o", "s", "admin"),
         ]
         for k in keys:
             self.assertTrue(k.startswith("supertable:o:s:rbac:"), f"Bad key: {k}")
 
     def test_rbac_keys_do_not_collide(self):
         """All 8 key patterns for same org/sup produce distinct keys."""
-        from supertable.redis_catalog import (
-            _rbac_user_meta_key, _rbac_user_index_key, _rbac_user_doc_key,
-            _rbac_username_to_id_key, _rbac_role_meta_key, _rbac_role_index_key,
-            _rbac_role_doc_key, _rbac_role_type_index_key,
-        )
+        from supertable import redis_keys as RK
         keys = set()
-        keys.add(_rbac_user_meta_key("o", "s"))
-        keys.add(_rbac_user_index_key("o", "s"))
-        keys.add(_rbac_user_doc_key("o", "s", "id1"))
-        keys.add(_rbac_username_to_id_key("o", "s"))
-        keys.add(_rbac_role_meta_key("o", "s"))
-        keys.add(_rbac_role_index_key("o", "s"))
-        keys.add(_rbac_role_doc_key("o", "s", "id1"))
-        keys.add(_rbac_role_type_index_key("o", "s", "admin"))
+        keys.add(RK.rbac_user_meta("o", "s"))
+        keys.add(RK.rbac_user_index("o", "s"))
+        keys.add(RK.rbac_user_doc("o", "s", "id1"))
+        keys.add(RK.rbac_username_to_id("o", "s"))
+        keys.add(RK.rbac_role_meta("o", "s"))
+        keys.add(RK.rbac_role_index("o", "s"))
+        keys.add(RK.rbac_role_doc("o", "s", "id1"))
+        keys.add(RK.rbac_role_type_index("o", "s", "admin"))
         self.assertEqual(len(keys), 8)
 
     def test_user_doc_and_role_doc_different_namespace(self):
         """Same ID used as user_id and role_id should produce different keys."""
-        from supertable.redis_catalog import _rbac_user_doc_key, _rbac_role_doc_key
+        from supertable import redis_keys as RK
         self.assertNotEqual(
-            _rbac_user_doc_key("o", "s", "same_id"),
-            _rbac_role_doc_key("o", "s", "same_id"),
+            RK.rbac_user_doc("o", "s", "same_id"),
+            RK.rbac_role_doc("o", "s", "same_id"),
         )
 
 

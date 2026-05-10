@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any, Set, Tuple
 
 from supertable.rbac.access_control import check_meta_access
 from supertable.redis_catalog import RedisCatalog
+from supertable import redis_keys as RK
 
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
@@ -196,7 +197,7 @@ class MetaReader:
                 # Aggregate schema across all simple tables (prefer Redis leaf payload; fallback to storage).
                 tables = self._get_all_tables()
                 leaf_keys: List[str] = [
-                    f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{t}"
+                    RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
                     for t in tables
                 ]
                 try:
@@ -222,7 +223,7 @@ class MetaReader:
                 # Single table (prefer Redis leaf payload; fallback to storage).
                 try:
                     raw = self.catalog.r.get(
-                        f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{table_name}"
+                        RK.meta_leaf(self.super_table.organization, self.super_table.super_name, table_name)
                     )
                     leaf_meta = _try_parse_leaf_meta(raw)
                     st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
@@ -370,7 +371,7 @@ class MetaReader:
         # Best-effort bulk fetch leaf metadata in one Redis roundtrip.
         leaf_payloads: List[Optional[Dict[str, Any]]] = []
         leaf_keys: List[str] = [
-            f"supertable:{self.super_table.organization}:{self.super_table.super_name}:meta:leaf:{t}"
+            RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
             for t in tables
         ]
         t_mget0 = time.perf_counter()
@@ -502,7 +503,7 @@ def list_supers(organization: str, role_name: str) -> List[str]:
     Filters results to only include supers where *role_name* has META access.
     """
     result = []
-    pattern = f"supertable:{organization}:*:meta:root"
+    pattern = RK.meta_root_pattern_for_org(organization)
 
     items = _get_redis_items(pattern)
     for item in items:
@@ -530,7 +531,7 @@ def list_tables(organization: str, super_name: str, role_name: str) -> List[str]
     Filters results to only include tables where *role_name* has META access.
     """
     result = []
-    pattern = f"supertable:{organization}:{super_name}:meta:leaf:*"
+    pattern = RK.meta_leaf_pattern(organization, super_name)
 
     items = _get_redis_items(pattern)
     for item in items:

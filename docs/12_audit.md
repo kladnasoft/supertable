@@ -568,3 +568,33 @@ The audit subsystem provides:
 * **Long-term archival** -- Parquet files provide efficient columnar storage
   for years of audit data, with date-based partitioning for fast range
   queries.
+
+## 12.14  Enable / disable at runtime
+
+Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`).  Each
+organization can be toggled independently from the WebUI:
+
+> **WebUI → /ui/audit → Compliance tab → Audit logging card**
+
+Behind the toggle, the master switch and four sub-toggles (`log_queries`,
+`log_reads`, `hash_chain`, `siem_enabled`) are persisted in Redis at
+`supertable:{org}:audit:config` (HASH), and surfaced via:
+
+```
+GET  /api/v1/audit/config?organization=<org>
+POST /api/v1/audit/config   { "organization": "<org>", "enabled": true, ... }
+```
+
+Both endpoints require **superuser** authentication (same gate as legal
+hold).  Flipping the toggle:
+
+* **OFF → ON**: a new `AuditLogger` is lazily created on the next
+  `emit()` and starts writing to `supertable:{org}:audit:stream`.
+* **ON → OFF**: the running logger is drained and stopped, replaced
+  with a `NullAuditLogger`; subsequent emits are no-ops.
+
+Every config write emits a `CONFIG_CHANGE` audit event so that
+disabling auditing is itself recorded.  In a multi-instance
+deployment, a 30-second per-org cache TTL bounds how long peer
+instances take to pick up the change; the responding instance applies
+it immediately via cache invalidation.

@@ -12,6 +12,7 @@ from supertable.config.defaults import logger
 from supertable.storage.storage_factory import get_storage
 from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.access_control import check_write_access, check_meta_access
+from supertable import redis_keys as RK
 
 
 def _resolve_super_name(super_table: Any) -> Optional[str]:
@@ -180,7 +181,7 @@ class Staging:
 
     def _with_lock(self, fn):
         self._require_stage_mode()
-        lock_key = f"supertable:{self.organization}:{self.super_name}:lock:stage:{self.staging_name}"
+        lock_key = RK.lock_stage(self.organization, self.super_name, self.staging_name)
         token = uuid.uuid4().hex
 
         # Acquire lock (30s TTL)

@@ -21,20 +21,14 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from supertable import redis_keys as RK
+
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Key helpers
+# Key helpers — delegate to supertable.redis_keys for namespace consistency
 # ---------------------------------------------------------------------------
-
-def _stream_key(org: str) -> str:
-    return f"supertable:{org}:audit:stream"
-
-
-def _chain_head_key(org: str, instance_id: str) -> str:
-    return f"supertable:{org}:audit:chain_head:{instance_id}"
-
 
 ARCHIVAL_GROUP = "__archival__"
 
@@ -55,8 +49,8 @@ class RedisAuditWriter:
         self._org = org
         self._instance_id = instance_id
         self._maxlen = maxlen
-        self._stream = _stream_key(org)
-        self._chain_key = _chain_head_key(org, instance_id)
+        self._stream = RK.audit_stream(org)
+        self._chain_key = RK.audit_chain_head(org, instance_id)
         self._ensure_stream()
 
     def _ensure_stream(self) -> None:

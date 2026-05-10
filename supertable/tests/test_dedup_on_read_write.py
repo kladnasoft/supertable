@@ -755,8 +755,8 @@ class TestDedupEdgeCases:
             ctx.stop_all()
 
     def test_config_key_uses_correct_redis_key_pattern(self):
-        from supertable.redis_catalog import _table_config_key
-        key = _table_config_key("acme", "warehouse", "events")
+        from supertable import redis_keys as RK
+        key = RK.meta_table_config("acme", "warehouse", "events")
         assert key == "supertable:acme:warehouse:meta:table_config:events"
 
     def test_init_has_empty_cache(self):

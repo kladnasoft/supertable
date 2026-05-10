@@ -1,7 +1,7 @@
 # SuperTable
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License: STPUL](https://img.shields.io/badge/license-STPUL-blue)
+![License](https://img.shields.io/badge/license-FSL--1.1--ALv2-orange)
 ![Version](https://img.shields.io/badge/version-2.0.0-brightgreen)
 
 **SuperTable — versioned data lake library for SQL analytics.**
@@ -171,6 +171,28 @@ See [docs/00_index.md](docs/00_index.md) for the full table of contents.
 
 ## License
 
-Super Table Public Use License (STPUL) v1.0 — see [LICENSE](LICENSE).
+SuperTable is licensed under the **Functional Source License, Version 1.1,
+ALv2 Future License** (`FSL-1.1-ALv2`).
 
-Copyright © Kladna Soft Kft. All rights reserved.
+You may use, copy, modify, create derivative works, publicly perform, publicly
+display, and redistribute the software for any permitted purpose other than a
+**Competing Use**.
+
+A **Competing Use** means making the software available to others in a
+commercial product or service that:
+
+1. substitutes for SuperTable;
+2. substitutes for another product or service offered by Kladna Soft Kft. using
+   SuperTable; or
+3. offers the same or substantially similar functionality as SuperTable.
+
+Permitted purposes include internal use, non-commercial education,
+non-commercial research, and professional services provided to a licensee using
+the software in accordance with the license.
+
+Each version of the software becomes available under the **Apache License 2.0**
+on the second anniversary of the date that version is made available.
+
+See [LICENSE](LICENSE) for the full license terms.
+
+Copyright © 2024-2026 Kladna Soft Kft.

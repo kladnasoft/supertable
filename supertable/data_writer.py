@@ -13,6 +13,7 @@ from polars import DataFrame
 from supertable.config.defaults import logger
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
 from supertable.super_table import SuperTable
+from supertable import redis_keys as RK
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
 from supertable.processing import (
@@ -455,8 +456,8 @@ class DataWriter:
                     else:
                         schema_json = "{}"
                     _org, _sup = self.super_table.organization, self.super_table.super_name
-                    self.catalog.r.set(f"supertable:{_org}:{_sup}:schema:{simple_name}", schema_json)
-                    self.catalog.r.sadd(f"supertable:{_org}:{_sup}:table_names", simple_name)
+                    self.catalog.r.set(RK.schema(_org, _sup, simple_name), schema_json)
+                    self.catalog.r.sadd(RK.table_names(_org, _sup), simple_name)
                 except Exception as e:
                     logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
 

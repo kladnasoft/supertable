@@ -15,6 +15,7 @@ from redis.sentinel import MasterNotFoundError
 
 
 from supertable.config.settings import settings as _cfg
+from supertable import redis_keys as RK
 
 logger = logging.getLogger(__name__)
 # ------------------------------ Settings ------------------------------
@@ -78,38 +79,27 @@ def _now_ms() -> int:
 
 
 # ------------------------------ Catalog (import or fallback) ------------------------------
-
-def _root_key(org: str, sup: str) -> str:
-    return f"supertable:{org}:{sup}:meta:root"
-
-
-def _leaf_key(org: str, sup: str, simple: str) -> str:
-    return f"supertable:{org}:{sup}:meta:leaf:{simple}"
-
-
-def _mirrors_key(org: str, sup: str) -> str:
-    return f"supertable:{org}:{sup}:meta:mirrors"
-
+# All key strings come from supertable.redis_keys (RK).
 
 class _FallbackCatalog:
     def __init__(self, r: redis.Redis):
         self.r = r
 
     def ensure_root(self, org: str, sup: str) -> None:
-        key = _root_key(org, sup)
+        key = RK.meta_root(org, sup)
         if not self.r.exists(key):
             self.r.set(key, json.dumps({"version": 0, "ts": _now_ms()}))
 
     def get_root(self, org: str, sup: str) -> Optional[Dict]:
-        raw = self.r.get(_root_key(org, sup))
+        raw = self.r.get(RK.meta_root(org, sup))
         return json.loads(raw) if raw else None
 
     def get_leaf(self, org: str, sup: str, simple: str) -> Optional[Dict]:
-        raw = self.r.get(_leaf_key(org, sup, simple))
+        raw = self.r.get(RK.meta_leaf(org, sup, simple))
         return json.loads(raw) if raw else None
 
     def get_mirrors(self, org: str, sup: str) -> List[str]:
-        raw = self.r.get(_mirrors_key(org, sup))
+        raw = self.r.get(RK.meta_mirrors(org, sup))
         if not raw:
             return []
         try:
@@ -129,7 +119,7 @@ class _FallbackCatalog:
             fu = str(f).upper()
             if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in uniq:
                 uniq.append(fu)
-        self.r.set(_mirrors_key(org, sup), json.dumps({"formats": uniq, "ts": _now_ms()}))
+        self.r.set(RK.meta_mirrors(org, sup), json.dumps({"formats": uniq, "ts": _now_ms()}))
         return uniq
 
     def enable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
@@ -146,7 +136,7 @@ class _FallbackCatalog:
         return self.set_mirrors(org, sup, nxt)
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        pattern = f"supertable:{org}:{sup}:meta:leaf:*"
+        pattern = RK.meta_leaf_pattern(org, sup)
         cursor = 0
         while True:
             cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
@@ -194,11 +184,11 @@ class _FallbackCatalog:
     def get_users(self, org: str, sup: str) -> List[Dict]:
         users: List[Dict] = []
         try:
-            index_key = f"supertable:{org}:{sup}:rbac:users:index"
+            index_key = RK.rbac_user_index(org, sup)
             members = self.r.smembers(index_key)
             for uid_raw in (members or []):
                 uid = self._decode_member(uid_raw)
-                doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{uid}"
+                doc_key = RK.rbac_user_doc(org, sup, uid)
                 raw = self.r.hgetall(doc_key)
                 if raw:
                     data: Dict = dict(raw)
@@ -217,11 +207,11 @@ class _FallbackCatalog:
     def get_roles(self, org: str, sup: str) -> List[Dict]:
         roles: List[Dict] = []
         try:
-            index_key = f"supertable:{org}:{sup}:rbac:roles:index"
+            index_key = RK.rbac_role_index(org, sup)
             members = self.r.smembers(index_key)
             for rid_raw in (members or []):
                 rid = self._decode_member(rid_raw)
-                doc_key = f"supertable:{org}:{sup}:rbac:roles:doc:{rid}"
+                doc_key = RK.rbac_role_doc(org, sup, rid)
                 raw = self.r.hgetall(doc_key)
                 if raw:
                     data: Dict = dict(raw)
@@ -240,7 +230,7 @@ class _FallbackCatalog:
 
     def get_user_details(self, org: str, sup: str, user_id: str) -> Optional[Dict]:
         try:
-            doc_key = f"supertable:{org}:{sup}:rbac:users:doc:{user_id}"
+            doc_key = RK.rbac_user_doc(org, sup, user_id)
             raw = self.r.hgetall(doc_key)
             if not raw:
                 return None
@@ -257,7 +247,7 @@ class _FallbackCatalog:
 
     def get_role_details(self, org: str, sup: str, role_id: str) -> Optional[Dict]:
         try:
-            doc_key = f"supertable:{org}:{sup}:rbac:roles:doc:{role_id}"
+            doc_key = RK.rbac_role_doc(org, sup, role_id)
             raw = self.r.hgetall(doc_key)
             if not raw:
                 return None
@@ -275,7 +265,7 @@ class _FallbackCatalog:
 
     def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
         try:
-            name_map_key = f"supertable:{org}:{sup}:rbac:users:name_to_id"
+            name_map_key = RK.rbac_username_to_id(org, sup)
             val = self.r.hget(name_map_key, username.lower())
             if val is None:
                 return None

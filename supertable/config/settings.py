@@ -260,7 +260,10 @@ class Settings:
     SUPERTABLE_SUPER_META_CACHE_TTL_S: Optional[float] = None  # SUPERTABLE_SUPER_META_CACHE_TTL_S
 
     # ── Audit ────────────────────────────────────────────────────────
-    SUPERTABLE_AUDIT_ENABLED: bool = True                    # SUPERTABLE_AUDIT_ENABLED
+    # Audit is OFF by default.  Enable per-organization in the WebUI
+    # /ui/audit → Compliance tab (persisted at supertable:{org}:audit:config),
+    # or globally via the SUPERTABLE_AUDIT_ENABLED env var.
+    SUPERTABLE_AUDIT_ENABLED: bool = False                   # SUPERTABLE_AUDIT_ENABLED
     SUPERTABLE_AUDIT_RETENTION_DAYS: int = 2555              # SUPERTABLE_AUDIT_RETENTION_DAYS (~7 years)
     SUPERTABLE_AUDIT_BATCH_SIZE: int = 1000                  # SUPERTABLE_AUDIT_BATCH_SIZE
     SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC: int = 60            # SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC
@@ -508,7 +511,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
 
         # ── Audit ────────────────────────────────────────────────────
-        SUPERTABLE_AUDIT_ENABLED=_env_bool("SUPERTABLE_AUDIT_ENABLED", True),
+        SUPERTABLE_AUDIT_ENABLED=_env_bool("SUPERTABLE_AUDIT_ENABLED", False),
         SUPERTABLE_AUDIT_RETENTION_DAYS=_env_int("SUPERTABLE_AUDIT_RETENTION_DAYS", 2555),
         SUPERTABLE_AUDIT_BATCH_SIZE=_env_int("SUPERTABLE_AUDIT_BATCH_SIZE", 1000),
         SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC=_env_int("SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC", 60),

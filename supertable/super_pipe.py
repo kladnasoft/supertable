@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.access_control import check_write_access, check_meta_access
+from supertable import redis_keys as RK
 
 
 class SuperPipe:
@@ -28,7 +29,7 @@ class SuperPipe:
 
     def _with_lock(self, fn):
         # Lock against the staging area to prevent concurrent pipe/stage mutations
-        lock_key = f"supertable:{self.organization}:{self.super_name}:lock:stage:{self.staging_name}"
+        lock_key = RK.lock_stage(self.organization, self.super_name, self.staging_name)
         token = uuid.uuid4().hex
         acquired = self.catalog.r.set(lock_key, token, nx=True, ex=10)
         if not acquired:

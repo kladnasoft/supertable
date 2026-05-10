@@ -13,7 +13,12 @@ Design principles:
   - Two modes: threaded (for MCP, SDK, any non-async process) and
     async (for FastAPI lifespan).  Same Redis key, same payload.
 
-Redis key pattern:
+Scope: this registry is intentionally **global** (cross-organization).
+A single process serves every tenant in this codebase, so per-org
+duplication would be wrong.  Tenant attribution lives in the heartbeat
+payload, not in the key.  The key string is owned by
+``supertable.redis_keys.registry``:
+
     supertable:registry:{service_type}:{hostname}:{pid}
 
 TTL: 30 s, refreshed every 15 s.  If a process crashes, the key
@@ -31,6 +36,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from supertable import redis_keys as RK
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -38,7 +45,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _TTL_S: int = 30
 _INTERVAL_S: int = 15
-_KEY_PREFIX: str = "supertable:registry"
 
 
 def _default_identity() -> Dict[str, Any]:
@@ -48,10 +54,6 @@ def _default_identity() -> Dict[str, Any]:
         "pid": os.getpid(),
         "started_at": time.time(),
     }
-
-
-def _registry_key(service_type: str, hostname: str, pid: int) -> str:
-    return f"{_KEY_PREFIX}:{service_type}:{hostname}:{pid}"
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +101,7 @@ class ServiceRegistry:
         self.started_at = ident["started_at"]
         self.version = version
         self.fail_silent = fail_silent
-        self._key = _registry_key(service_type, self.hostname, self.pid)
+        self._key = RK.registry(service_type, self.hostname, self.pid)
 
         payload = {
             "instance_id": self.instance_id,
@@ -214,7 +216,7 @@ class ServiceRegistry:
         computed from the key's remaining TTL.  Used by the monitoring
         instances endpoint.
         """
-        pattern = f"{_KEY_PREFIX}:*"
+        pattern = RK.registry_pattern()
         instances: List[Dict[str, Any]] = []
         now_ms = int(time.time() * 1000)
 

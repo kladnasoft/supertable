@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
 from supertable.config.defaults import logger
+from supertable import redis_keys as RK
 
 # ---------------------------------------------------------------------------
 # Instance identity — stable for the lifetime of this process.
@@ -118,7 +119,9 @@ class _MonitorKey:
 
     @property
     def redis_list_key(self) -> str:
-        return f"monitor:{self.organization}:{self.super_name}:{self.monitor_type}"
+        # Namespaced under the supertable scope:
+        #   supertable:{org}:{sup}:monitor:{monitor_type}
+        return RK.monitor(self.organization, self.super_name, self.monitor_type)
 
 
 class _AsyncMonitoringLogger:

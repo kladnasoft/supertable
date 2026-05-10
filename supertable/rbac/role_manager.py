@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from supertable.rbac.row_column_security import RowColumnSecurity
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
+from supertable import redis_keys as RK
 
 try:
     from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
@@ -66,7 +67,7 @@ class RoleManager:
         """
         org, sup = self.organization, self.super_name
         # Fast path: meta key exists → roles are initialized
-        if self._catalog.r.exists(f"supertable:{org}:{sup}:rbac:roles:meta"):
+        if self._catalog.r.exists(RK.rbac_role_meta(org, sup)):
             if self._catalog.rbac_get_superadmin_role_id(org, sup):
                 return
 
@@ -195,7 +196,7 @@ class RoleManager:
         # If role_name changed, update the name_to_id mapping
         if new_name is not None and new_name != old_name:
             update_fields["role_name"] = new_name
-            name_key = f"supertable:{org}:{sup}:rbac:roles:name_to_id"
+            name_key = RK.rbac_rolename_to_id(org, sup)
             pipe = self._catalog.r.pipeline()
             if old_name:
                 pipe.hdel(name_key, old_name.lower())

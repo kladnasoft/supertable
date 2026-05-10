@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
+from supertable import redis_keys as RK
 
 
 class UserManager:
@@ -38,7 +39,7 @@ class UserManager:
         """
         org, sup = self.organization, self.super_name
         # Fast path: meta key exists + superuser exists → skip
-        if self._catalog.r.exists(f"supertable:{org}:{sup}:rbac:users:meta"):
+        if self._catalog.r.exists(RK.rbac_user_meta(org, sup)):
             if self._catalog.rbac_get_user_id_by_username(org, sup, "superuser"):
                 return
 

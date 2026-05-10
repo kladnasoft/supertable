@@ -49,3 +49,9 @@
 | # | Document | Description |
 |---|----------|-------------|
 | 15 | [Python SDK](15_python_sdk.md) | pip install, optional cloud extras, core classes, usage |
+
+## Reference
+
+| # | Document | Description |
+|---|----------|-------------|
+| 16 | [Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy: every key starts with `supertable:`, single source of truth in `redis_keys.py` |

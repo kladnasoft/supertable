@@ -35,17 +35,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AuditConfig:
-    enabled: bool = True
+    # Default to OFF.  Real values come from env (from_settings) and are
+    # overridden per-organization via the Redis-backed admin layer.
+    enabled: bool = False
     batch_size: int = 1000
     flush_interval_sec: int = 60
     redis_stream_ttl_hours: int = 24
     redis_stream_maxlen: int = 100_000
-    hash_chain: bool = True
-    log_queries: bool = True
-    log_reads: bool = True
+    hash_chain: bool = False
+    log_queries: bool = False
+    log_reads: bool = False
     alert_webhook: str = ""
     fernet_key: str = ""
-    siem_enabled: bool = True
+    siem_enabled: bool = False
     siem_max_consumers: int = 10
 
     @classmethod
@@ -53,21 +55,37 @@ class AuditConfig:
         try:
             from supertable.config.settings import settings as _cfg
             return cls(
-                enabled=getattr(_cfg, "SUPERTABLE_AUDIT_ENABLED", True),
+                enabled=getattr(_cfg, "SUPERTABLE_AUDIT_ENABLED", False),
                 batch_size=getattr(_cfg, "SUPERTABLE_AUDIT_BATCH_SIZE", 1000),
                 flush_interval_sec=getattr(_cfg, "SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC", 60),
                 redis_stream_ttl_hours=getattr(_cfg, "SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS", 24),
                 redis_stream_maxlen=getattr(_cfg, "SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN", 100_000),
-                hash_chain=getattr(_cfg, "SUPERTABLE_AUDIT_HASH_CHAIN", True),
-                log_queries=getattr(_cfg, "SUPERTABLE_AUDIT_LOG_QUERIES", True),
-                log_reads=getattr(_cfg, "SUPERTABLE_AUDIT_LOG_READS", True),
+                hash_chain=getattr(_cfg, "SUPERTABLE_AUDIT_HASH_CHAIN", False),
+                log_queries=getattr(_cfg, "SUPERTABLE_AUDIT_LOG_QUERIES", False),
+                log_reads=getattr(_cfg, "SUPERTABLE_AUDIT_LOG_READS", False),
                 alert_webhook=getattr(_cfg, "SUPERTABLE_AUDIT_ALERT_WEBHOOK", ""),
                 fernet_key=getattr(_cfg, "SUPERTABLE_AUDIT_FERNET_KEY", ""),
-                siem_enabled=getattr(_cfg, "SUPERTABLE_AUDIT_SIEM_ENABLED", True),
+                siem_enabled=getattr(_cfg, "SUPERTABLE_AUDIT_SIEM_ENABLED", False),
                 siem_max_consumers=getattr(_cfg, "SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS", 10),
             )
         except Exception:
             return cls()
+
+    def with_overrides(self, overrides: Dict[str, Any]) -> "AuditConfig":
+        """Return a copy with select fields replaced from a dict (e.g., from
+        the Redis-backed audit:config HASH).  Unknown keys are ignored."""
+        from dataclasses import replace
+        kw: Dict[str, Any] = {}
+        for k in (
+            "enabled",
+            "hash_chain",
+            "log_queries",
+            "log_reads",
+            "siem_enabled",
+        ):
+            if k in overrides and overrides[k] is not None:
+                kw[k] = bool(overrides[k])
+        return replace(self, **kw) if kw else self
 
 
 # ---------------------------------------------------------------------------
@@ -386,32 +404,77 @@ class AuditLogger:
 # Singleton cache (one logger per organization)
 # ---------------------------------------------------------------------------
 
-_LOGGERS: Dict[str, AuditLogger] = {}
+_LOGGERS: Dict[str, "AuditLogger | NullAuditLogger"] = {}
 _LOGGERS_LOCK = threading.Lock()
-_CONFIG: Optional[AuditConfig] = None
+
+# Per-org config cache: org → (config, expires_at_seconds).
+# Resolved against env defaults + Redis override (supertable:{org}:audit:config).
+_ORG_CFG_CACHE: Dict[str, "tuple[AuditConfig, float]"] = {}
+_ORG_CFG_TTL_S: float = 30.0  # toggle takes effect within this many seconds
 
 
-def _get_config() -> AuditConfig:
-    global _CONFIG
-    if _CONFIG is None:
-        _CONFIG = AuditConfig.from_settings()
-    return _CONFIG
+def _resolve_config_for(organization: str) -> AuditConfig:
+    """Resolve the effective AuditConfig for *organization*.
+
+    Merges the Redis override at ``supertable:{org}:audit:config`` over the
+    env-var defaults.  Cached for _ORG_CFG_TTL_S seconds.
+    """
+    now = time.time()
+    cached = _ORG_CFG_CACHE.get(organization)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+
+    base = AuditConfig.from_settings()
+    try:
+        from supertable.audit.admin import get_audit_config as _get_redis_cfg
+        overrides = _get_redis_cfg(organization)
+    except Exception:
+        overrides = {}
+
+    cfg = base.with_overrides(overrides) if overrides else base
+    _ORG_CFG_CACHE[organization] = (cfg, now + _ORG_CFG_TTL_S)
+    return cfg
+
+
+def invalidate_audit_config_cache(organization: Optional[str] = None) -> None:
+    """Drop the cached config for *organization* (or all orgs).  Called by the
+    admin endpoint after a toggle so the change takes effect immediately."""
+    if organization is None:
+        _ORG_CFG_CACHE.clear()
+    else:
+        _ORG_CFG_CACHE.pop(organization, None)
 
 
 def get_audit_logger(organization: str) -> "AuditLogger | NullAuditLogger":
     """Return a cached AuditLogger for the organization.
 
-    Thread-safe. Returns NullAuditLogger if auditing is disabled.
+    Thread-safe.  When auditing is disabled (env default OFF, or per-org
+    override set to ``enabled=false``), returns a NullAuditLogger.  When the
+    toggle is flipped from ON→OFF, the previously-running real logger is
+    stopped and replaced with a NullAuditLogger on the next call.
     """
-    config = _get_config()
-    if not config.enabled:
-        return NullAuditLogger()
+    config = _resolve_config_for(organization)
 
     with _LOGGERS_LOCK:
         existing = _LOGGERS.get(organization)
-        if existing is not None:
+
+        if not config.enabled:
+            # If we previously had a real logger, drain & stop it.
+            if existing is not None and not isinstance(existing, NullAuditLogger):
+                try:
+                    existing.stop()
+                except Exception as e:
+                    logger.warning("[audit] graceful stop failed for %s: %s", organization, e)
+                _LOGGERS[organization] = NullAuditLogger()
+            elif existing is None:
+                _LOGGERS[organization] = NullAuditLogger()
+            return _LOGGERS[organization]
+
+        # Audit is enabled.  Reuse a real logger if we have one.
+        if existing is not None and not isinstance(existing, NullAuditLogger):
             return existing
 
+        # Either no logger or the cached one was a Null — create a real one.
         audit_logger = AuditLogger(organization, config)
         _LOGGERS[organization] = audit_logger
         return audit_logger
