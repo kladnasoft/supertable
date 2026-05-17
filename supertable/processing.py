@@ -75,37 +75,129 @@ def _resolve_unified_dtype(dtypes: Set[polars.DataType]) -> polars.DataType:
     return polars.Utf8
 
 
-def _union_schema(a: polars.DataFrame, b: polars.DataFrame) -> Dict[str, polars.DataType]:
-    cols: List[str] = list(dict.fromkeys(a.columns + b.columns))
+def _union_schema_many(frames: List[polars.DataFrame]) -> Dict[str, polars.DataType]:
+    """Build a unified column-name → dtype mapping across N dataframes.
+
+    The output dict preserves first-appearance order: a column that first
+    appears in frame *i* takes position determined by frame *i*'s own order
+    relative to columns that appeared earlier.  Dtypes are widened via
+    ``_resolve_unified_dtype`` over the set of dtypes the column carries
+    across all frames that contain it.
+    """
+    seen: Set[str] = set()
+    cols: List[str] = []
+    for f in frames:
+        for c in f.columns:
+            if c not in seen:
+                seen.add(c)
+                cols.append(c)
     target: Dict[str, polars.DataType] = {}
     for c in cols:
         types: Set[polars.DataType] = set()
-        if c in a.columns:
-            types.add(a[c].dtype)
-        if c in b.columns:
-            types.add(b[c].dtype)
+        for f in frames:
+            if c in f.columns:
+                types.add(f[c].dtype)
         target[c] = _resolve_unified_dtype(types)
     return target
 
 
+def _union_schema(a: polars.DataFrame, b: polars.DataFrame) -> Dict[str, polars.DataType]:
+    return _union_schema_many([a, b])
+
+
 def _align_to_schema(df: polars.DataFrame, target_schema: Dict[str, polars.DataType]) -> polars.DataFrame:
-    exprs = []
+    """Project *df* into *target_schema*: same column names, same order, same dtypes.
+
+    For every column in *target_schema*:
+      - present in *df* with the target dtype → keep the existing series
+      - present in *df* with a different dtype → cast (strict=False, so unconvertible values become null)
+      - absent in *df*                          → fill with a typed null literal
+
+    The resulting frame's column order is **exactly** ``list(target_schema.keys())``.
+    This is the contract callers like :func:`concat_with_union` rely on:
+    ``polars.concat(..., how="vertical_relaxed")`` aligns frames *positionally*,
+    so it requires identical names at identical positions.
+
+    Implementation note: ``df.select(exprs)`` is used (not ``with_columns``).
+    ``with_columns`` preserves the input frame's column order and appends new
+    columns at the end, which silently breaks the positional-concat contract
+    when *df*'s order disagrees with *target_schema*'s order.
+    """
+    if not target_schema:
+        return df
+    # Zero-row defence: ``df.select([pl.lit(None), ...])`` on an empty frame
+    # broadcasts the literal to a single null row, which would silently turn
+    # a 0-row input into a 1-row output.  Materialise an explicit empty frame
+    # with the target schema instead.
+    if df.height == 0:
+        return polars.DataFrame(schema=target_schema)
+    exprs: List[polars.Expr] = []
     for col, dtype in target_schema.items():
         if col in df.columns:
-            if df[col].dtype != dtype:
+            if df.schema[col] != dtype:
                 exprs.append(polars.col(col).cast(dtype, strict=False))
+            else:
+                exprs.append(polars.col(col))
         else:
             exprs.append(polars.lit(None, dtype=dtype).alias(col))
-    return df.with_columns(exprs) if exprs else df
+    return df.select(exprs)
 
 
 def concat_with_union(a: polars.DataFrame, b: polars.DataFrame) -> polars.DataFrame:
+    """Vertically concatenate two frames with a unified schema.
+
+    Computes the union of *a*'s and *b*'s schemas, aligns both frames to it
+    (filling missing columns with nulls and widening conflicting dtypes), and
+    then concatenates positionally.  After the union both frames have
+    identical columns in identical positions, so the concat cannot fail with
+    ``schema names differ``.
+    """
     if a.height == 0:
         return b
     if b.height == 0:
         return a
-    target = _union_schema(a, b)
-    return polars.concat([_align_to_schema(a, target), _align_to_schema(b, target)], how="vertical_relaxed")
+    target = _union_schema_many([a, b])
+    return polars.concat(
+        [_align_to_schema(a, target), _align_to_schema(b, target)],
+        how="vertical_relaxed",
+    )
+
+
+def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
+    """Vertically concatenate N frames with a single unified schema.
+
+    Equivalent to repeated :func:`concat_with_union` but computes the union
+    schema once across all inputs (rather than re-deriving it pairwise), and
+    issues a single ``polars.concat``.  Use this when merging an arbitrary
+    set of parquet files with potentially different / dynamic column sets
+    (e.g. GA4-style ``param_*`` dynamic columns where each batch contains a
+    different subset of keys).
+
+    Semantics:
+      - Empty frames are skipped.
+      - If all frames are empty, an empty frame with the union schema is returned.
+      - If no frames are given, an empty zero-column frame is returned.
+
+    Note on memory: this materialises every input frame in memory at once.
+    For memory-bounded streaming compaction, callers should still iterate
+    with chunked flushes via :func:`concat_with_union` — this helper is for
+    callers that already have all frames in memory.
+    """
+    if not frames:
+        return polars.DataFrame()
+    non_empty = [f for f in frames if f.height > 0]
+    if not non_empty:
+        # All inputs are empty — return an empty frame carrying the union schema
+        target = _union_schema_many(frames)
+        return polars.DataFrame(schema=target)
+    if len(non_empty) == 1:
+        # Still project to its own schema explicitly so the output dtype map is
+        # the same shape as the multi-frame path (callers can rely on it).
+        target = _union_schema_many(non_empty)
+        return _align_to_schema(non_empty[0], target)
+    target = _union_schema_many(non_empty)
+    aligned = [_align_to_schema(f, target) for f in non_empty]
+    return polars.concat(aligned, how="vertical_relaxed")
 
 
 # =========================

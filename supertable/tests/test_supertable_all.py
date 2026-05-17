@@ -211,8 +211,8 @@ class TestConcatWithUnion:
 
     def test_union_different_schemas(self):
         from supertable.processing import concat_with_union
-        # Both share 'x' as first column; each has a unique extra column.
-        # _align_to_schema adds missing cols at the end, so order stays compatible.
+        # Each frame contributes a different column subset; _align_to_schema
+        # must project both into the union schema before the positional concat.
         a = _polars_df({"x": [1], "y": ["a"]})
         b = _polars_df({"x": [2], "y": [None], "z": [3.0]})
         result = concat_with_union(a, b)
