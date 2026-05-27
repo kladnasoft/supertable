@@ -109,19 +109,21 @@ class NullMonitoringLogger:
 @dataclass(frozen=True)
 class _MonitorKey:
     organization: str
-    super_name: str
     monitor_type: str
 
     @property
     def path_key(self) -> str:
-        # Matches your log style: "org/super/monitor_type"
-        return f"{self.organization}/{self.super_name}/{self.monitor_type}"
+        # Matches the log style: "org/monitor_type"
+        return f"{self.organization}/{self.monitor_type}"
 
     @property
     def redis_list_key(self) -> str:
-        # Namespaced under the supertable scope:
-        #   supertable:{org}:{sup}:monitor:{monitor_type}
-        return RK.monitor(self.organization, self.super_name, self.monitor_type)
+        # v2.2: org-wide monitoring lives at position 2.
+        #   supertable:{org}:monitor:{monitor_type}
+        # Cross-supertable queries record exactly one canonical entry
+        # here; attribution is preserved in the payload's
+        # ``supertables: [str]`` field.
+        return RK.monitor(self.organization, self.monitor_type)
 
 
 class _AsyncMonitoringLogger:
@@ -455,7 +457,6 @@ def _monitoring_enabled() -> bool:
 
 def get_monitoring_logger(
     *,
-    super_name: str,
     organization: str,
     monitor_type: str = "plans",
     redis_connector: Optional["RedisConnector"] = None,
@@ -464,11 +465,16 @@ def get_monitoring_logger(
     Return a monitoring logger (context manager + log_metric + request_flush + debug fields).
 
     This function never raises; on any failure it returns a NullMonitoringLogger.
+
+    Per-supertable attribution is encoded **in the payload**, not in
+    the Redis key — callers include a ``supertables: [str]`` field in
+    each payload passed to ``log_metric``. The org-level shape lets
+    cross-supertable queries record a single canonical entry.
     """
     if not _monitoring_enabled():
         return NullMonitoringLogger()
 
-    key = _MonitorKey(organization=organization, super_name=super_name, monitor_type=monitor_type)
+    key = _MonitorKey(organization=organization, monitor_type=monitor_type)
     cache_key = key.path_key
 
     try:
@@ -490,33 +496,38 @@ def get_monitoring_logger(
 
 class MonitoringWriter:
     """
-    Backwards-compatible facade.
+    Monitoring façade — org-level writer (SDK 2.2.0+).
 
-    Supported usage patterns:
-        mon = MonitoringWriter(...)
-        mon.log_metric({...})
+    Usage:
+        mon = MonitoringWriter(organization=org, monitor_type="plans")
+        mon.log_metric({"supertables": ["sales", "customers"], ...})
         mon.request_flush()
 
-    And context-manager style:
-        with MonitoringWriter(...) as mon:
-            mon.log_metric({...})
+    Context-manager style:
+        with MonitoringWriter(organization=org, monitor_type="writes") as mon:
+            mon.log_metric({"supertables": ["sales"], ...})
 
-    It also forwards debug attributes used in examples (queue_stats, etc.).
+    Per-supertable attribution: the Redis key is org-level
+    (``supertable:{org}:monitor:{monitor_type}``). Callers include a
+    ``supertables: [str]`` field in each payload — the full list of
+    supertables the event touches. Cross-supertable queries (JOINs,
+    multi-target writes) pass the full list. Events not tied to any
+    supertable pass ``supertables: []`` (or omit it — the writer
+    will default to an empty list).
+
+    Also forwards debug attributes used in examples (queue_stats, etc.).
     """
 
     def __init__(
         self,
         *,
-        super_name: str,
         organization: str,
         monitor_type: str = "plans",
         redis_connector: Optional["RedisConnector"] = None,
     ):
-        self.super_name = super_name
         self.organization = organization
         self.monitor_type = monitor_type
         self._logger: MonitoringLogger = get_monitoring_logger(
-            super_name=super_name,
             organization=organization,
             monitor_type=monitor_type,
             redis_connector=redis_connector,

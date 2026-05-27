@@ -3,112 +3,219 @@
 Single source of truth for every Redis key used by SuperTable + the
 platform layer (dataisland-core).
 
-Rule (enforced by tests/test_redis_key_prefix.py):
-  Every key constructed here MUST start with one of the two recognised
-  top-level prefixes:
-    * ``supertable:`` — SuperTable SDK state (catalog, RBAC, locks,
-                       audit, share federation, table meta, …).
-    * ``dataisland:`` — platform / dataisland-core state that is not
-                       SuperTable's concern (service registry, app
-                       bootstrap config, etc.).
-  Per-app config keys (lighthouse, gatekeeper, studio, …) live under
-  their own app-name prefix and are written via the MCP server's
-  ``store_app_config`` tool — they do **not** go through this module.
+This is the **v2 layout** (see ``docs/16_redis_layout.md``). v1 keys
+are not readable by this module and there is no migration shim.
 
-Hierarchy
----------
+Two root prefixes — and only two:
+
+    supertable:     SuperTable SDK state (catalog, RBAC, locks, audit,
+                    share federation, table meta, lakes / supertables).
+    dataisland:     Platform / dataisland-core state that is not the
+                    SDK's concern (service registry, app bootstrap).
+
+Hierarchy (v2)
+--------------
 
     dataisland:
-      apps:{app_name}:master_mcp                ← per-app bootstrap (one global key)
-      {org}:
-        registry:{service_type}:{host}:{pid}    ← service-instance heartbeats (TTL)
+      _apps_:                                       ← app-bootstrap sentinel (no org)
+        doc:{app_name}:
+          master_mcp                                 STRING  per-app master MCP
+      {org}:                                        ← organization scope
+        registry:
+          {service_type}:{host}:{pid}                STRING  heartbeat (TTL 30s)
 
     supertable:
-      {org}:                                   ← organization / company scope
-        _system_:                              ← reserved system scope (supertable-side)
-          auth:tokens                          ← organization login tokens
-        shares:doc:{share_id}
-        shares:index
-        audit:stream
-        audit:chain_head:{instance_id}
-        audit:config                           ← runtime toggle (per org)
-        spark:thrifts
-        spark:plugs
-        {sup}:                                 ← supertable scope
-          meta:root
-          meta:leaf:{simple}
-          meta:mirrors
-          meta:table_config:{simple}
-          meta:staging:{staging_name}
-          meta:staging:meta
-          meta:staging:{staging_name}:pipe:{pipe_name}
-          meta:staging:{staging_name}:pipe:meta
-          config:engine
-          lock:leaf:{simple}
-          lock:stage:{stage_name}
-          rbac:users:meta
-          rbac:users:index
-          rbac:users:doc:{user_id}
-          rbac:users:name_to_id
-          rbac:roles:meta
-          rbac:roles:index
-          rbac:roles:doc:{role_id}
-          rbac:roles:type:{role_type}
-          rbac:roles:name_to_id
-          schema:{simple}
-          table_names
-          linked_shares:doc:{link_id}
-          linked_shares:index
-          monitor:{monitor_type}
+      {org}:                                        ← organization scope
+        _system_:                                   ← system sentinel
+          auth:tokens                                HASH    org login tokens
+          audit:
+            stream                                   STREAM  audit events
+            chain_head:doc:{instance_id}             HASH    per-instance chain state
+            config                                   HASH    runtime audit toggle
+          shares:
+            doc:{share_id}                           STRING  share definition
+            index                                    SET     share IDs
+          spark:
+            thrifts                                  HASH    Spark Thrift clusters
+            plugs                                    HASH    Spark Plug runtimes
+        lakes:                                      ← user-data sentinel
+          {sup}:                                    ← supertable scope
+            meta:
+              root                                   STRING  root pointer
+              mirrors                                STRING  enabled mirror formats
+              table_names                            SET     all simple table names
+              leaf:
+                doc:{simple}                         STRING  leaf snapshot pointer
+              table_config:
+                doc:{simple}                         STRING  per-table config
+              staging:
+                index                                SET     staging names
+                doc:{staging_name}:                  ← per-staging scope
+                  meta                               STRING  staging metadata blob
+                  pipes:
+                    index                            SET     pipe names
+                    doc:{pipe_name}                  STRING  pipe definition
+            config:engine                            STRING  engine runtime config
+            lock:
+              leaf:
+                doc:{simple}                         STRING  per-table lock token
+              stage:
+                doc:{stage_name}                     STRING  per-staging lock token
+            rbac:
+              users:
+                meta                                 HASH    version, last_updated_ms
+                index                                SET     all user_ids
+                name_to_id                           HASH    username → user_id
+                doc:{user_id}                        HASH    user document
+              roles:
+                meta                                 HASH    version, last_updated_ms
+                index                                SET     all role_ids
+                name_to_id                           HASH    role_name → role_id
+                doc:{role_id}                        HASH    role document
+                type:
+                  doc:{role_type}                    SET     role IDs by type
+            schema:
+              doc:{simple}                           STRING  table schema JSON
+            linked_shares:
+              index                                  SET     linked share IDs
+              doc:{link_id}                          STRING  consumer-side linked share
+        monitor:                                    ← position-2 (org-wide, NOT per-sup)
+          {monitor_type}                             LIST    monitoring metrics
+                                                            (monitor_type ∈ closed set)
+                                                            Each entry payload carries a
+                                                            ``supertables: [str]`` field for
+                                                            attribution under cross-supertable
+                                                            queries.
 
-Reserved supertable names
--------------------------
+Design invariants (enforced by ``tests/test_redis_key_prefix.py``)
+------------------------------------------------------------------
 
-``_system_`` is reserved.  It MUST NOT be used as a supertable name and
-``SuperTable(..., super_name="_system_")`` raises ``ValueError``.  The
-name is reserved because we keep everything system-related — service
-registry heartbeats, organization-level auth tokens, future
-system-only scopes — under that prefix to avoid collisions with
-user-created supertables.
+1. Every key returned by this module starts with one of
+   ``_RECOGNISED_PREFIXES``.
+2. Position 2 under ``supertable:{org}:`` is *always* a literal
+   sentinel (``_system_`` or ``lakes``). User input never lives at
+   position 2 — it lives at position 3, behind a sentinel that
+   classifies it (``lakes:{sup}`` for supertables).
+3. Position 1 under ``dataisland:`` is *always* an org name or the
+   ``_apps_`` sentinel. The ``apps`` org name is reserved
+   (``RESERVED_ORG_NAMES``) as defence in depth.
+4. Where user input lives at the same level as a literal sibling, the
+   literal is wrapped in ``:doc:`` / ``:index`` to disambiguate.
+5. Underscore-wrapped names (``^_..._$``) are sentinels and are never
+   accepted as user-supplied identifiers.
+6. Every constructor validates its segments with ``_safe(label, value)``.
+7. The only file in the codebase that may construct keys under
+   ``supertable:`` or ``dataisland:`` is this one. The regression test
+   ``test_no_raw_fstring_keys_outside_redis_keys`` enforces it.
 """
 from __future__ import annotations
 
-from typing import FrozenSet
+import re
+from typing import FrozenSet, Optional, Tuple
 
-# The canonical SuperTable SDK prefix. Everything the SDK itself writes
-# lives under this.
+# --------------------------------------------------------------------------- #
+# Prefixes & sentinels (constants)
+# --------------------------------------------------------------------------- #
+
 SUPERTABLE_PREFIX: str = "supertable"
-
-# The platform-layer prefix. dataisland-core writes its own
-# infrastructure (service-registry heartbeats, app-bootstrap configs)
-# here. Per-app config keys (lighthouse:*, gatekeeper:*, …) live in
-# yet another set of namespaces and are not built through this module.
 DATAISLAND_PREFIX: str = "dataisland"
 
-# Recognised top-level prefixes for assert_prefixed(). Adding a new
-# layer to the platform → extend this set.
-_RECOGNISED_PREFIXES: FrozenSet[str] = frozenset({SUPERTABLE_PREFIX, DATAISLAND_PREFIX})
-
-# The org-level system scope.  Reserved as a supertable name (see
-# ``is_reserved_super_name`` below).  Everything system-related under an
-# organization lives here so user-supplied supertable names can never
-# collide with infrastructure keys.
+# Position-2 sentinel under ``supertable:{org}:`` for org-level platform
+# state (auth tokens, audit, shares, spark).
 SYSTEM_SCOPE: str = "_system_"
 
-# All names that may NOT be used for user-created supertables.
-RESERVED_SUPER_NAMES: FrozenSet[str] = frozenset({SYSTEM_SCOPE})
+# Position-2 sentinel under ``supertable:{org}:`` for user-supplied
+# supertables. Everything user-created lives at
+# ``supertable:{org}:lakes:{sup}:*``.
+LAKES_SCOPE: str = "lakes"
+
+# Position-2 literal under ``supertable:{org}:`` for org-wide runtime
+# telemetry. Lives at this level (not under ``_system_``) because
+# monitoring is high-volume runtime data, conceptually distinct from
+# the low-volume identity / federation / compliance state under
+# ``_system_``. Cross-supertable queries record exactly one entry per
+# query at the org level, carrying a ``supertables: [...]`` field for
+# attribution.
+MONITOR_SCOPE: str = "monitor"
+
+# Position-1 sentinel under ``dataisland:`` for per-app bootstrap
+# entries (one key per app, no org scope).
+APPS_SCOPE: str = "_apps_"
+
+# Recognised root prefixes. Adding a new layer to the platform → extend
+# this set + update the regression test.
+_RECOGNISED_PREFIXES: FrozenSet[str] = frozenset(
+    {SUPERTABLE_PREFIX, DATAISLAND_PREFIX}
+)
+
+# --------------------------------------------------------------------------- #
+# Naming rules (regexes)
+# --------------------------------------------------------------------------- #
+
+# A sentinel is any name wrapped in underscores. Sentinels are reserved
+# across every user-supplied identifier (org, sup, simple, staging_name,
+# pipe_name, app_name, share_id, link_id, user_id, role_id, role_type,
+# instance_id).
+SENTINEL_RE: re.Pattern[str] = re.compile(r"^_[a-z0-9][a-z0-9_-]*_$")
+
+# The universal safe-segment regex. Constructors call ``_safe(label,
+# value)`` for every user-supplied segment.
+_SAFE_SEGMENT: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# --------------------------------------------------------------------------- #
+# Explicit reservations
+# --------------------------------------------------------------------------- #
+#
+# Names that fail the user-input check on top of the sentinel pattern.
+# Keep these tight — the structural rules (sentinel pattern + position-2
+# sentinels) already prevent every documented collision class. These
+# explicit lists exist as belt-and-braces for high-risk literals.
+
+RESERVED_ORG_NAMES: FrozenSet[str] = frozenset({"apps"})
+RESERVED_SUPER_NAMES: FrozenSet[str] = frozenset()  # sentinel regex is sufficient
 
 
 # --------------------------------------------------------------------------- #
 # Guards
 # --------------------------------------------------------------------------- #
 
+def _safe(label: str, value: str) -> str:
+    """Validate a user-supplied key segment.
+
+    Raises ValueError if *value* is empty, longer than 64 chars,
+    contains a forbidden character, or matches the sentinel pattern.
+    Returns *value* unchanged on success so callers can use it inline::
+
+        f"…:{_safe('sup', sup)}:meta:root"
+    """
+    if value is None:
+        raise ValueError(
+            f"Invalid Redis key segment for {label!r}: None "
+            f"(must match {_SAFE_SEGMENT.pattern!r})"
+        )
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Invalid Redis key segment for {label!r}: {value!r} "
+            f"(must be a str, got {type(value).__name__})"
+        )
+    if not _SAFE_SEGMENT.match(value):
+        raise ValueError(
+            f"Invalid Redis key segment for {label!r}: {value!r} "
+            f"(must match {_SAFE_SEGMENT.pattern!r})"
+        )
+    if SENTINEL_RE.match(value):
+        raise ValueError(
+            f"Invalid Redis key segment for {label!r}: {value!r} "
+            f"(matches sentinel pattern {SENTINEL_RE.pattern!r} — reserved)"
+        )
+    return value
+
+
 def assert_prefixed(key: str) -> str:
     """Raise ValueError if *key* does not start with a recognised prefix.
 
-    Recognised prefixes: ``supertable:`` (SDK state) and
-    ``dataisland:`` (platform state). Returns the key unchanged so
-    callers can write::
+    Recognised prefixes: ``supertable:`` and ``dataisland:``. Returns
+    the key unchanged on success so callers can write::
 
         self.r.set(assert_prefixed(some_key), value)
     """
@@ -124,281 +231,559 @@ def assert_prefixed(key: str) -> str:
     return key
 
 
-def is_reserved_super_name(name: str) -> bool:
-    """Return True when *name* is reserved (cannot be a supertable name)."""
+def is_sentinel(name: str) -> bool:
+    """Return True when *name* matches the underscore-wrapped sentinel
+    pattern (``_foo_``). Used by callers that want to refuse sentinel
+    names before passing them to ``_safe()``."""
     if not isinstance(name, str):
         return False
-    return name.strip() in RESERVED_SUPER_NAMES
+    return bool(SENTINEL_RE.match(name.strip()))
+
+
+def is_reserved_org_name(name: str) -> bool:
+    """Return True when *name* is reserved as an organization name.
+
+    Reserved if either:
+      * it matches the sentinel pattern (``^_..._$``), or
+      * it appears in ``RESERVED_ORG_NAMES`` (currently ``{"apps"}``).
+    """
+    if not isinstance(name, str):
+        return False
+    stripped = name.strip()
+    return is_sentinel(stripped) or stripped in RESERVED_ORG_NAMES
+
+
+def is_reserved_super_name(name: str) -> bool:
+    """Return True when *name* may not be used as a supertable name.
+
+    Reserved iff it matches the sentinel pattern (``^_..._$``).
+    ``RESERVED_SUPER_NAMES`` is currently empty — the structural
+    sentinel check covers every collision case.
+    """
+    if not isinstance(name, str):
+        return False
+    return is_sentinel(name.strip())
 
 
 # --------------------------------------------------------------------------- #
-# Per-organization system scope (registry, auth tokens, future system keys)
+# Key parsers (for scanners that walk Redis SCAN output)
 # --------------------------------------------------------------------------- #
+
+def parse_lake_key(key: str) -> Optional[Tuple[str, str]]:
+    """Extract ``(org, sup)`` from a ``supertable:{org}:lakes:{sup}:*`` key.
+
+    Returns ``None`` when the key does not match the lakes-scoped shape.
+    This is the canonical way for scanners (gc, quality, summary,
+    monitoring) to walk SCAN output and recover (org, supertable_name)
+    tuples without re-implementing the parse rules.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split(":")
+    if (
+        len(parts) >= 4
+        and parts[0] == SUPERTABLE_PREFIX
+        and parts[2] == LAKES_SCOPE
+    ):
+        return parts[1], parts[3]
+    return None
+
+
+def parse_registry_key(key: str) -> Optional[Tuple[str, str, str, str]]:
+    """Extract ``(org, service_type, host, pid)`` from a registry key.
+
+    Returns ``None`` when the key does not match
+    ``dataisland:{org}:registry:{service_type}:{host}:{pid}``.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split(":")
+    if (
+        len(parts) >= 6
+        and parts[0] == DATAISLAND_PREFIX
+        and parts[2] == "registry"
+    ):
+        return parts[1], parts[3], parts[4], parts[5]
+    return None
+
+
+# =========================================================================== #
+# Per-org system scope (supertable:{org}:_system_:*)
+# =========================================================================== #
 
 def system_scope(org: str) -> str:
-    """Return the system-scope prefix for one organization."""
-    return f"{SUPERTABLE_PREFIX}:{org}:{SYSTEM_SCOPE}"
+    """The system-scope prefix for one organization (no trailing colon)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
 
 
 def system_scope_pattern(org: str) -> str:
     """SCAN pattern for everything under one org's system scope."""
-    return f"{SUPERTABLE_PREFIX}:{org}:{SYSTEM_SCOPE}:*"
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:*"
 
 
-# --------------------------------------------------------------------------- #
-# Service registry (per organization) — under the dataisland: prefix
-# --------------------------------------------------------------------------- #
-#
-# Service-instance heartbeats are a *platform* concern, not a SuperTable
-# concern. They live at:
-#
-#     dataisland:{org}:registry:{service_type}:{host}:{pid}
-#
-# (No ``_system_`` segment — that segment exists only inside
-# ``supertable:{org}:`` to avoid colliding with user-created supertable
-# names. Under ``dataisland:`` there are no user supertables, so the
-# extra segment is dropped.)
-
-def registry(org: str, service_type: str, host: str, pid: int) -> str:
-    """Per-organization service registry entry.
-
-    Example::
-
-        dataisland:kladna-soft:registry:api:host1:1234
-    """
-    return f"{DATAISLAND_PREFIX}:{org}:registry:{service_type}:{host}:{pid}"
-
-
-def registry_pattern_for_org(org: str) -> str:
-    """SCAN pattern for all service-registry entries in one organization."""
-    return f"{DATAISLAND_PREFIX}:{org}:registry:*"
-
-
-def registry_pattern() -> str:
-    """SCAN pattern for service-registry entries across every organization.
-
-    Matches ``dataisland:*:registry:*`` — the cross-org pattern that
-    scanners use when no org is supplied (e.g. fleet-wide monitoring).
-    """
-    return f"{DATAISLAND_PREFIX}:*:registry:*"
-
-
-# --------------------------------------------------------------------------- #
-# App bootstrap (per application — Lighthouse, Gatekeeper, Studio, …)
-# --------------------------------------------------------------------------- #
-#
-# The very first thing an app reads on boot is its master-MCP config.
-# That happens before any org context exists, so the key sits at a
-# single global location keyed only by app_name:
-#
-#     dataisland:apps:{app_name}:master_mcp
-#
-# Written via the platform REST API (``POST /api/v1/apps/{app}/master-mcp``,
-# admin-only) and read on every app boot.
-
-def app_master_mcp(app_name: str) -> str:
-    """The platform-side key holding an app's master-MCP coordinates."""
-    return f"{DATAISLAND_PREFIX}:apps:{app_name}:master_mcp"
-
-
-# --------------------------------------------------------------------------- #
-# Organization auth (login tokens) — also under _system_ for the same reason:
-# "auth" must not collide with a possible user-created supertable called "auth".
-# --------------------------------------------------------------------------- #
+# --- Org-level auth -------------------------------------------------------- #
 
 def auth_tokens(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{SYSTEM_SCOPE}:auth:tokens"
+    """Org-level login tokens (HASH)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:auth:tokens"
 
 
-# --------------------------------------------------------------------------- #
-# Organization scope (non-system)
-# --------------------------------------------------------------------------- #
-
-def share_doc(org: str, share_id: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:shares:doc:{share_id}"
-
-
-def share_index(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:shares:index"
-
+# --- Org-level audit ------------------------------------------------------- #
 
 def audit_stream(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:audit:stream"
+    """Audit event stream (STREAM)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:audit:stream"
 
 
 def audit_chain_head(org: str, instance_id: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:audit:chain_head:{instance_id}"
+    """Per-instance audit hash chain head (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":audit:chain_head:doc:{_safe('instance_id', instance_id)}"
+    )
 
 
 def audit_config(org: str) -> str:
-    """Per-organization runtime audit configuration (enable toggle, sub-flags)."""
-    return f"{SUPERTABLE_PREFIX}:{org}:audit:config"
+    """Per-org runtime audit configuration (HASH)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:audit:config"
 
+
+# --- Org-level shares ------------------------------------------------------ #
+
+def share_doc(org: str, share_id: str) -> str:
+    """Provider-side share definition (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":shares:doc:{_safe('share_id', share_id)}"
+    )
+
+
+def share_index(org: str) -> str:
+    """Index of all share IDs in this org (SET)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:shares:index"
+
+
+# --- Org-level Spark ------------------------------------------------------- #
 
 def spark_thrifts(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:spark:thrifts"
+    """Spark Thrift cluster registry (HASH)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:spark:thrifts"
 
 
 def spark_plugs(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:spark:plugs"
+    """Spark Plug runtime registry (HASH)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:spark:plugs"
 
 
-# --------------------------------------------------------------------------- #
-# SuperTable scope — meta
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Lakes scope (supertable:{org}:lakes:{sup}:*)
+# =========================================================================== #
+
+def lakes_scope(org: str) -> str:
+    """The lakes-scope prefix for one organization (no trailing colon)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+
+
+def lakes_pattern(org: str) -> str:
+    """SCAN pattern for every lake (supertable) in one org."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}:*"
+
+
+def super_table_pattern(org: str, sup: str) -> str:
+    """Matches every key for one supertable (used by ``delete_super_table``)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:*"
+    )
+
+
+# --- Meta ------------------------------------------------------------------ #
 
 def meta_root(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:root"
-
-
-def meta_leaf(org: str, sup: str, simple: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:leaf:{simple}"
-
-
-def meta_leaf_pattern(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:leaf:*"
+    """Root pointer + version (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:root"
+    )
 
 
 def meta_root_pattern_for_org(org: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:*:meta:root"
+    """SCAN pattern matching every supertable's root pointer in this org."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}:*:meta:root"
+    )
+
+
+def meta_root_pattern_all_orgs() -> str:
+    """SCAN pattern matching every supertable's root pointer across every org.
+
+    Used by GC, data-quality, and summary schedulers that walk the whole
+    deployment to discover ``(org, sup)`` pairs.
+    """
+    return f"{SUPERTABLE_PREFIX}:*:{LAKES_SCOPE}:*:meta:root"
 
 
 def meta_mirrors(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:mirrors"
+    """Enabled mirror formats (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:mirrors"
+    )
+
+
+def meta_table_names(org: str, sup: str) -> str:
+    """Set of all simple table names in this supertable (SET).
+
+    v1 used the flat key ``{sup}:table_names``; v2 folds it into the
+    ``meta:`` family for consistency with every other supertable-level
+    sub-namespace.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:table_names"
+    )
+
+
+def meta_leaf(org: str, sup: str, simple: str) -> str:
+    """Leaf snapshot pointer for one simple table (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:leaf:doc:{_safe('simple', simple)}"
+    )
+
+
+def meta_leaf_pattern(org: str, sup: str) -> str:
+    """SCAN pattern matching every leaf in this supertable."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:leaf:doc:*"
+    )
 
 
 def meta_table_config(org: str, sup: str, simple: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:table_config:{simple}"
+    """Per-table runtime config (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:table_config:doc:{_safe('simple', simple)}"
+    )
 
 
-# --------------------------------------------------------------------------- #
-# SuperTable scope — engine config
-# --------------------------------------------------------------------------- #
-
-def config_engine(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:config:engine"
-
-
-# --------------------------------------------------------------------------- #
-# SuperTable scope — locks
-# --------------------------------------------------------------------------- #
-
-def lock_leaf(org: str, sup: str, simple: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:lock:leaf:{simple}"
-
-
-def lock_stage(org: str, sup: str, stage_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:lock:stage:{stage_name}"
-
-
-# --------------------------------------------------------------------------- #
-# SuperTable scope — RBAC users
-# --------------------------------------------------------------------------- #
-
-def rbac_user_meta(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:users:meta"
-
-
-def rbac_user_index(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:users:index"
-
-
-def rbac_user_doc(org: str, sup: str, user_id: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:users:doc:{user_id}"
-
-
-def rbac_username_to_id(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:users:name_to_id"
-
-
-# --------------------------------------------------------------------------- #
-# SuperTable scope — RBAC roles
-# --------------------------------------------------------------------------- #
-
-def rbac_role_meta(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:roles:meta"
-
-
-def rbac_role_index(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:roles:index"
-
-
-def rbac_role_doc(org: str, sup: str, role_id: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:roles:doc:{role_id}"
-
-
-def rbac_role_type_index(org: str, sup: str, role_type: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:roles:type:{role_type}"
-
-
-def rbac_rolename_to_id(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:rbac:roles:name_to_id"
-
-
-# --------------------------------------------------------------------------- #
-# SuperTable scope — staging / pipes
-# --------------------------------------------------------------------------- #
-
-def staging(org: str, sup: str, staging_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:{staging_name}"
-
+# --- Staging + Pipes ------------------------------------------------------- #
 
 def staging_index(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:meta"
+    """Set of all staging names in this supertable (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:index"
+    )
+
+
+def staging_doc(org: str, sup: str, staging_name: str) -> str:
+    """Staging metadata blob (STRING).
+
+    Lives at ``…:meta:staging:doc:{name}:meta`` so the ``doc:{name}:``
+    prefix can simultaneously host the staging's children
+    (``doc:{name}:pipes:*``).
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc"
+        f":{_safe('staging_name', staging_name)}:meta"
+    )
 
 
 def staging_pattern(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:*"
+    """SCAN pattern matching every staging blob in this supertable."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc:*:meta"
+    )
 
 
 def staging_subkey_pattern(org: str, sup: str, staging_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:{staging_name}:*"
-
-
-def pipe(org: str, sup: str, staging_name: str, pipe_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}"
+    """SCAN pattern matching every child key under one staging."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc"
+        f":{_safe('staging_name', staging_name)}:*"
+    )
 
 
 def pipe_index(org: str, sup: str, staging_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:{staging_name}:pipe:meta"
+    """Set of pipe names belonging to one staging (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc"
+        f":{_safe('staging_name', staging_name)}:pipes:index"
+    )
+
+
+def pipe_doc(
+    org: str, sup: str, staging_name: str, pipe_name: str
+) -> str:
+    """One pipe definition (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc"
+        f":{_safe('staging_name', staging_name)}:pipes:doc"
+        f":{_safe('pipe_name', pipe_name)}"
+    )
 
 
 def pipe_pattern(org: str, sup: str, staging_name: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:meta:staging:{staging_name}:pipe:*"
+    """SCAN pattern matching every pipe in one staging."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:staging:doc"
+        f":{_safe('staging_name', staging_name)}:pipes:doc:*"
+    )
 
 
-# --------------------------------------------------------------------------- #
-# SuperTable scope — schema / table_names / linked shares
-# --------------------------------------------------------------------------- #
+# --- Engine config --------------------------------------------------------- #
+
+def config_engine(org: str, sup: str) -> str:
+    """Engine runtime config (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:config:engine"
+    )
+
+
+# --- Locks ----------------------------------------------------------------- #
+
+def lock_leaf(org: str, sup: str, simple: str) -> str:
+    """Per-table lock token (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:leaf:doc:{_safe('simple', simple)}"
+    )
+
+
+def lock_leaf_pattern(org: str, sup: str) -> str:
+    """SCAN pattern matching every per-table lock in this supertable."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:leaf:doc:*"
+    )
+
+
+def lock_leaf_prefix(org: str, sup: str) -> str:
+    """Trimmable prefix (no trailing ``*``) used by callers that strip the
+    leading bytes to recover the table name from each lock key."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:leaf:doc:"
+    )
+
+
+def lock_stage(org: str, sup: str, stage_name: str) -> str:
+    """Per-staging lock token (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:stage:doc:{_safe('stage_name', stage_name)}"
+    )
+
+
+# --- RBAC — users ---------------------------------------------------------- #
+
+def rbac_user_meta(org: str, sup: str) -> str:
+    """Users index version + last_updated_ms (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:users:meta"
+    )
+
+
+def rbac_user_index(org: str, sup: str) -> str:
+    """Set of all user_ids (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:users:index"
+    )
+
+
+def rbac_username_to_id(org: str, sup: str) -> str:
+    """username → user_id reverse index (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:users:name_to_id"
+    )
+
+
+def rbac_user_doc(org: str, sup: str, user_id: str) -> str:
+    """One user document (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:users:doc:{_safe('user_id', user_id)}"
+    )
+
+
+# --- RBAC — roles ---------------------------------------------------------- #
+
+def rbac_role_meta(org: str, sup: str) -> str:
+    """Roles index version + last_updated_ms (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:meta"
+    )
+
+
+def rbac_role_index(org: str, sup: str) -> str:
+    """Set of all role_ids (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:index"
+    )
+
+
+def rbac_rolename_to_id(org: str, sup: str) -> str:
+    """role_name → role_id reverse index (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:name_to_id"
+    )
+
+
+def rbac_role_doc(org: str, sup: str, role_id: str) -> str:
+    """One role document (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:doc:{_safe('role_id', role_id)}"
+    )
+
+
+def rbac_role_type_index(org: str, sup: str, role_type: str) -> str:
+    """Role IDs grouped by type (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:type:doc:{_safe('role_type', role_type)}"
+    )
+
+
+# --- Schema ---------------------------------------------------------------- #
 
 def schema(org: str, sup: str, simple: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:schema:{simple}"
+    """Schema JSON for one simple table (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:schema:doc:{_safe('simple', simple)}"
+    )
 
 
-def table_names(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:table_names"
+# --- Linked shares --------------------------------------------------------- #
+
+def linked_share_index(org: str, sup: str) -> str:
+    """Set of linked-share IDs (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:linked_shares:index"
+    )
 
 
 def linked_share_doc(org: str, sup: str, link_id: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:linked_shares:doc:{link_id}"
+    """One consumer-side linked share (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:linked_shares:doc:{_safe('link_id', link_id)}"
+    )
 
 
-def linked_share_index(org: str, sup: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:linked_shares:index"
+# --- Monitoring ------------------------------------------------------------ #
+
+_VALID_MONITOR_TYPES: FrozenSet[str] = frozenset(
+    {"plans", "writes", "mcp", "odata", "errors", "locks"}
+)
 
 
-# --------------------------------------------------------------------------- #
-# SuperTable scope — monitoring
-# --------------------------------------------------------------------------- #
+def monitor(org: str, monitor_type: str) -> str:
+    """Org-wide monitoring LIST.
 
-def monitor(org: str, sup: str, monitor_type: str) -> str:
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:monitor:{monitor_type}"
+    Lives at ``supertable:{org}:monitor:{monitor_type}`` — *one level
+    above* the supertable scope. A cross-supertable query (e.g. a
+    JOIN across ``sales`` and ``customers``) writes **one** canonical
+    entry; the affected supertables are recorded in the entry payload
+    under a ``supertables: List[str]`` field so per-supertable views
+    can filter at read time.
+
+    ``monitor_type`` comes from a closed SDK-defined set
+    (``plans | writes | mcp | odata | errors | locks``).
+    """
+    if monitor_type not in _VALID_MONITOR_TYPES:
+        raise ValueError(
+            f"Invalid monitor_type {monitor_type!r}; "
+            f"must be one of {sorted(_VALID_MONITOR_TYPES)}"
+        )
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:{monitor_type}"
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Wildcard / SCAN helpers used by deletes
-# --------------------------------------------------------------------------- #
+def monitor_pattern_for_org(org: str) -> str:
+    """SCAN pattern matching every monitor list in one org."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{MONITOR_SCOPE}:*"
 
-def super_table_pattern(org: str, sup: str) -> str:
-    """Matches every key for one supertable (used by delete_super_table)."""
-    return f"{SUPERTABLE_PREFIX}:{org}:{sup}:*"
+
+# =========================================================================== #
+# Platform (dataisland:) — service registry + app bootstrap
+# =========================================================================== #
+
+_VALID_SERVICE_TYPES: FrozenSet[str] = frozenset(
+    {"api", "webui", "odata", "mcp", "sdk", "lighthouse"}
+)
+
+
+def registry(
+    org: str, service_type: str, host: str, pid: int
+) -> str:
+    """One service-instance heartbeat key (STRING, TTL 30s).
+
+    ``service_type`` comes from a closed set
+    (``api | webui | odata | mcp | sdk | lighthouse``).
+    ``host`` is the OS hostname; ``pid`` is the process id.
+    """
+    if service_type not in _VALID_SERVICE_TYPES:
+        raise ValueError(
+            f"Invalid service_type {service_type!r}; "
+            f"must be one of {sorted(_VALID_SERVICE_TYPES)}"
+        )
+    if not isinstance(host, str) or not host or ":" in host:
+        raise ValueError(f"Invalid host: {host!r}")
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid pid: {pid!r}")
+    if pid_int <= 0:
+        raise ValueError(f"pid must be positive: {pid_int}")
+    return (
+        f"{DATAISLAND_PREFIX}:{_safe('org', org)}:registry"
+        f":{service_type}:{host}:{pid_int}"
+    )
+
+
+def registry_pattern_for_org(org: str) -> str:
+    """SCAN pattern for all service-registry entries in one org."""
+    return f"{DATAISLAND_PREFIX}:{_safe('org', org)}:registry:*"
+
+
+def registry_pattern() -> str:
+    """SCAN pattern for service-registry entries across every org."""
+    return f"{DATAISLAND_PREFIX}:*:registry:*"
+
+
+def app_master_mcp(app_name: str) -> str:
+    """Per-app master-MCP coordinates (STRING, global — no org scope).
+
+    Lives at ``dataisland:_apps_:doc:{app_name}:master_mcp``. The
+    ``_apps_:doc:`` discipline lets us add sibling per-app keys in
+    the future without restructuring.
+    """
+    return (
+        f"{DATAISLAND_PREFIX}:{APPS_SCOPE}:doc"
+        f":{_safe('app_name', app_name)}:master_mcp"
+    )
+
+
+def app_scope_pattern() -> str:
+    """SCAN pattern for every per-app bootstrap document."""
+    return f"{DATAISLAND_PREFIX}:{APPS_SCOPE}:doc:*"

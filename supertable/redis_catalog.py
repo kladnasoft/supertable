@@ -343,10 +343,10 @@ return 1
                 cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=500)
                 for k in keys:
                     ks = k if isinstance(k, str) else k.decode("utf-8")
-                    parts = ks.split(":")
-                    if len(parts) < 4:
+                    parsed = RK.parse_lake_key(ks)
+                    if parsed is None:
                         continue
-                    sup_name = parts[2]
+                    _, sup_name = parsed
                     if sup_name == source_sup:
                         continue
                     try:

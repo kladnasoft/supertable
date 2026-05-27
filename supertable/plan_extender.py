@@ -123,10 +123,12 @@ def extend_execution_plan(
         logger.error("Failed to build monitoring stats payload: %s", e)
         return  # nothing else to do safely
 
-    # Log the metric (buffered; background writer flushes)
+    # Log the metric (buffered; background writer flushes).
+    # Monitoring is org-wide as of SDK 2.2.0 — the touched supertable
+    # is recorded in the payload's ``supertables: [str]`` field.
     try:
+        stats["supertables"] = [query_plan_manager.super_name]
         with MonitoringWriter(
-            super_name=query_plan_manager.super_name,
             organization=query_plan_manager.organization,
             monitor_type="plans",
         ) as monitor:

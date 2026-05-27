@@ -84,79 +84,110 @@ A thin wrapper that holds the connected `redis.Redis` instance. Used by `RedisCa
 
 All keys follow a hierarchical namespace. Below is the complete list of key patterns found in the codebase.
 
+> **v2 layout (SDK ≥ 2.1.0).** Every user supertable lives under
+> `supertable:{org}:lakes:{sup}:`, and every org-level platform key
+> (audit, shares, spark, auth) lives under `supertable:{org}:_system_:`.
+> See `docs/16_redis_layout.md` for the canonical layout, design
+> invariants, and segment-validation contract.
+
 ### Core Metadata Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:{sup}:meta:root` | STRING (JSON) | SuperTable root pointer -- version, timestamp, clone flags |
-| `supertable:{org}:{sup}:meta:leaf:{simple}` | STRING (JSON) | SimpleTable leaf pointer -- version, timestamp, path, optional payload |
-| `supertable:{org}:{sup}:meta:mirrors` | STRING (JSON) | Enabled mirror export formats (DELTA, ICEBERG, PARQUET) |
-| `supertable:{org}:{sup}:meta:table_config:{simple}` | STRING (JSON) | Per-table config (dedup mode, primary keys, etc.) |
+| `supertable:{org}:lakes:{sup}:meta:root` | STRING (JSON) | SuperTable root pointer -- version, timestamp, clone flags |
+| `supertable:{org}:lakes:{sup}:meta:leaf:doc:{simple}` | STRING (JSON) | SimpleTable leaf pointer -- version, timestamp, path, optional payload |
+| `supertable:{org}:lakes:{sup}:meta:mirrors` | STRING (JSON) | Enabled mirror export formats (DELTA, ICEBERG, PARQUET) |
+| `supertable:{org}:lakes:{sup}:meta:table_config:doc:{simple}` | STRING (JSON) | Per-table config (dedup mode, primary keys, etc.) |
+| `supertable:{org}:lakes:{sup}:meta:table_names` | SET | All simple table names in this supertable |
 
 ### Lock Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:{sup}:lock:leaf:{simple}` | STRING (token) | Distributed write lock for a SimpleTable (SET NX EX) |
-| `supertable:{org}:{sup}:lock:stage:{stage_name}` | STRING (token) | Distributed lock for staging/pipe operations |
+| `supertable:{org}:lakes:{sup}:lock:leaf:doc:{simple}` | STRING (token) | Distributed write lock for a SimpleTable (SET NX EX) |
+| `supertable:{org}:lakes:{sup}:lock:stage:doc:{stage_name}` | STRING (token) | Distributed lock for staging/pipe operations |
 
 ### RBAC Keys (UUID-Based Identity)
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:{sup}:rbac:users:meta` | HASH | User meta -- version counter, last_updated_ms, initialized flag |
-| `supertable:{org}:{sup}:rbac:users:index` | SET | Set of all user_ids |
-| `supertable:{org}:{sup}:rbac:users:doc:{user_id}` | HASH | User document -- username, roles (JSON array), timestamps |
-| `supertable:{org}:{sup}:rbac:users:name_to_id` | HASH | Mapping: lowercase username -> user_id |
-| `supertable:{org}:{sup}:rbac:roles:meta` | HASH | Role meta -- version counter, last_updated_ms, initialized flag |
-| `supertable:{org}:{sup}:rbac:roles:index` | SET | Set of all role_ids |
-| `supertable:{org}:{sup}:rbac:roles:doc:{role_id}` | HASH | Role document -- role_name, role type, tables, columns, filters |
-| `supertable:{org}:{sup}:rbac:roles:type:{role_type}` | SET | Set of role_ids belonging to a specific role type (e.g., superadmin) |
-| `supertable:{org}:{sup}:rbac:roles:name_to_id` | HASH | Mapping: lowercase role_name -> role_id |
+| `supertable:{org}:lakes:{sup}:rbac:users:meta` | HASH | User meta -- version counter, last_updated_ms, initialized flag |
+| `supertable:{org}:lakes:{sup}:rbac:users:index` | SET | Set of all user_ids |
+| `supertable:{org}:lakes:{sup}:rbac:users:doc:{user_id}` | HASH | User document -- username, roles (JSON array), timestamps |
+| `supertable:{org}:lakes:{sup}:rbac:users:name_to_id` | HASH | Mapping: lowercase username -> user_id |
+| `supertable:{org}:lakes:{sup}:rbac:roles:meta` | HASH | Role meta -- version counter, last_updated_ms, initialized flag |
+| `supertable:{org}:lakes:{sup}:rbac:roles:index` | SET | Set of all role_ids |
+| `supertable:{org}:lakes:{sup}:rbac:roles:doc:{role_id}` | HASH | Role document -- role_name, role type, tables, columns, filters |
+| `supertable:{org}:lakes:{sup}:rbac:roles:type:doc:{role_type}` | SET | Set of role_ids belonging to a specific role type (e.g., superadmin) |
+| `supertable:{org}:lakes:{sup}:rbac:roles:name_to_id` | HASH | Mapping: lowercase role_name -> role_id |
 
 ### Auth Token Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:_system_:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata (created_ms, created_by, label, enabled, username, user_id). Lives under the reserved `_system_` scope so it can never collide with a user-supplied supertable named `auth`. |
+| `supertable:{org}:_system_:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata. Lives under the `_system_` sentinel so it can never collide with any user-named supertable. |
 
 ### Service Registry Keys (per organization)
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `dataisland:{org}:registry:{service_type}:{host}:{pid}` | STRING (JSON) | Heartbeat record for one running service instance (TTL 30s, refreshed every 15s). `service_type` is one of `api`, `webui`, `odata`, `mcp`, `sdk`, `lighthouse`. Lives under the `dataisland:` prefix because the service registry is a platform concern, not a SuperTable one. Written by `supertable.service_registry.ServiceRegistry` (api/webui/odata/mcp) or `lighthouse.bootstrap.ServiceRegistrar` (Lighthouse, via REST `POST /api/v1/services/register`). Scanned via `RK.registry_pattern_for_org(org)` (per-tenant) or `RK.registry_pattern()` (cross-tenant). |
-| `dataisland:apps:{app_name}:master_mcp` | STRING (JSON) | Bootstrap entry that tells an app (Lighthouse, Gatekeeper, …) which master MCP to connect to and with what shared service token. Single global key per app, set by an admin via the REST API (`POST /api/v1/apps/{app}/master-mcp`); read by the app on every boot via the matching GET. |
+| `dataisland:{org}:registry:{service_type}:{host}:{pid}` | STRING (JSON) | Heartbeat record for one running service instance (TTL 30s, refreshed every 15s). `service_type` ∈ `{api, webui, odata, mcp, sdk, lighthouse}`. |
+| `dataisland:_apps_:doc:{app_name}:master_mcp` | STRING (JSON) | Per-app bootstrap entry telling an app (Lighthouse, …) which master MCP to connect to. Written via `POST /api/v1/apps/{app}/master-mcp`. |
 
 ### Data Sharing Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:shares:doc:{share_id}` | STRING (JSON) | Share definition document (provider side) |
-| `supertable:{org}:shares:index` | SET | Set of share_ids for an organization |
-| `supertable:{org}:{sup}:linked_shares:doc:{link_id}` | STRING (JSON) | Linked share document (consumer side) |
-| `supertable:{org}:{sup}:linked_shares:index` | SET | Set of link_ids for a SuperTable |
+| `supertable:{org}:_system_:shares:doc:{share_id}` | STRING (JSON) | Share definition document (provider side) |
+| `supertable:{org}:_system_:shares:index` | SET | Set of share_ids for an organization |
+| `supertable:{org}:lakes:{sup}:linked_shares:doc:{link_id}` | STRING (JSON) | Linked share document (consumer side) |
+| `supertable:{org}:lakes:{sup}:linked_shares:index` | SET | Set of link_ids for a SuperTable |
+
+### Audit Keys
+
+| Pattern | Type | Purpose |
+|---------|------|---------|
+| `supertable:{org}:_system_:audit:stream` | STREAM | Audit event stream (hash-chained) |
+| `supertable:{org}:_system_:audit:chain_head:doc:{instance_id}` | HASH | Per-instance audit hash-chain state |
+| `supertable:{org}:_system_:audit:config` | HASH | Runtime audit toggle (enable, sub-flags) |
 
 ### Staging / Pipe Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:{sup}:meta:staging:{staging_name}` | STRING (JSON) | Staging area metadata |
-| `supertable:{org}:{sup}:meta:staging:meta` | SET | Set of staging names for fast listing |
-| `supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_name}` | STRING (JSON) | Pipe metadata within a staging area |
-| `supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta` | SET | Set of pipe names for a staging area |
+| `supertable:{org}:lakes:{sup}:meta:staging:index` | SET | Set of staging names for fast listing |
+| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:meta` | STRING (JSON) | Staging area metadata blob |
+| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:index` | SET | Set of pipe names for a staging area |
+| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:doc:{pipe_name}` | STRING (JSON) | Pipe metadata within a staging area |
 
 ### Spark Cluster Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `spark:{org}:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
-| `spark:{org}:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
+| `supertable:{org}:_system_:spark:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
+| `supertable:{org}:_system_:spark:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
 
 ### Engine Configuration Keys
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:{sup}:config:engine` | STRING (JSON) | DuckDB / engine runtime configuration (memory, threads, thresholds) |
+| `supertable:{org}:lakes:{sup}:config:engine` | STRING (JSON) | DuckDB / engine runtime configuration (memory, threads, thresholds) |
+
+### Schema Keys
+
+| Pattern | Type | Purpose |
+|---------|------|---------|
+| `supertable:{org}:lakes:{sup}:schema:doc:{simple}` | STRING (JSON) | Table schema JSON for one simple table |
+
+### Monitoring Keys (org-level, v2.2+)
+
+Monitoring is **org-wide telemetry**, not per-supertable. A
+cross-supertable query records one canonical entry whose payload
+includes a `supertables: [str]` field for attribution.
+
+| Pattern | Type | Purpose |
+|---------|------|---------|
+| `supertable:{org}:monitor:{monitor_type}` | LIST | Monitoring metrics. `monitor_type` ∈ closed set `{plans, writes, mcp, odata, errors, locks}`. Each entry's JSON payload carries `supertables: [str]` for per-supertable attribution. Per-sup views (`/api/v1/monitoring/reads?sup=demo`) filter the org list by membership. |
 
 ---
 
@@ -206,7 +237,7 @@ On initialization, the catalog:
 | `update_root_flags` | `(org, sup, flags) -> bool` | Merges flags (e.g., `read_only`, `cloned_from`) into the root document. |
 | `find_readonly_clones` | `(org, source_sup) -> List[str]` | Scans all roots to find SuperTables that are read-only clones of the source. |
 | `bump_root` | `(org, sup, now_ms=None) -> int` | Atomically increments the root version via Lua script. Returns new version. |
-| `delete_super_table` | `(org, sup, count=1000) -> int` | Deletes ALL Redis keys matching `supertable:{org}:{sup}:*` via SCAN. Returns count deleted. |
+| `delete_super_table` | `(org, sup, count=1000) -> int` | Deletes ALL Redis keys matching `supertable:{org}:lakes:{sup}:*` via SCAN. Returns count deleted. |
 
 ---
 

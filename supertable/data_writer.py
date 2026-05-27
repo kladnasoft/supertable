@@ -535,8 +535,12 @@ class DataWriter:
         # guaranteed to reach Redis before this scope closes.
         try:
             if stats_payload is not None:
+                # Monitoring is org-wide as of SDK 2.2.0 — record the
+                # touched supertable in the payload's ``supertables``
+                # field. A DataWriter only touches one supertable, but
+                # the list shape is uniform with cross-sup events.
+                stats_payload["supertables"] = [self.super_table.super_name]
                 with MonitoringWriter(
-                    super_name=self.super_table.super_name,
                     organization=self.super_table.organization,
                     monitor_type="writes",
                 ) as monitor:
