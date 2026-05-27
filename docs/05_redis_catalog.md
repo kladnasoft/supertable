@@ -118,7 +118,14 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata (created_ms, created_by, label, enabled, username, user_id) |
+| `supertable:{org}:_system_:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata (created_ms, created_by, label, enabled, username, user_id). Lives under the reserved `_system_` scope so it can never collide with a user-supplied supertable named `auth`. |
+
+### Service Registry Keys (per organization)
+
+| Pattern | Type | Purpose |
+|---------|------|---------|
+| `dataisland:{org}:registry:{service_type}:{host}:{pid}` | STRING (JSON) | Heartbeat record for one running service instance (TTL 30s, refreshed every 15s). `service_type` is one of `api`, `webui`, `odata`, `mcp`, `sdk`, `lighthouse`. Lives under the `dataisland:` prefix because the service registry is a platform concern, not a SuperTable one. Written by `supertable.service_registry.ServiceRegistry` (api/webui/odata/mcp) or `lighthouse.bootstrap.ServiceRegistrar` (Lighthouse, via REST `POST /api/v1/services/register`). Scanned via `RK.registry_pattern_for_org(org)` (per-tenant) or `RK.registry_pattern()` (cross-tenant). |
+| `dataisland:apps:{app_name}:master_mcp` | STRING (JSON) | Bootstrap entry that tells an app (Lighthouse, Gatekeeper, …) which master MCP to connect to and with what shared service token. Single global key per app, set by an admin via the REST API (`POST /api/v1/apps/{app}/master-mcp`); read by the app on every boot via the matching GET. |
 
 ### Data Sharing Keys
 

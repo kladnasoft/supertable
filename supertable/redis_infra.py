@@ -64,13 +64,25 @@ if settings.SUPERTABLE_LOGIN_MASK not in (1, 2, 3):
         f"Invalid SUPERTABLE_LOGIN_MASK (must be 1, 2, or 3): {settings.SUPERTABLE_LOGIN_MASK}"
     )
 
-_missing_envs: List[str] = []
-if not settings.SUPERTABLE_ORGANIZATION:
-    _missing_envs.append("SUPERTABLE_ORGANIZATION")
-if not (settings.SUPERTABLE_SUPERUSER_TOKEN or "").strip():
-    _missing_envs.append("SUPERTABLE_SUPERUSER_TOKEN")
-if _missing_envs:
-    raise RuntimeError("Missing required environment variables: " + ", ".join(_missing_envs))
+def _require_runtime_env() -> None:
+    """Validate the env vars needed to actually talk to Redis.
+
+    Called lazily by code paths that open a real Redis connection or
+    otherwise need the deployment's organization / superuser token.
+    Importing the SDK no longer fails when these are unset — only
+    running against Redis does. This keeps the module importable in
+    test, build, and inspection contexts where the runtime
+    credentials aren't (and shouldn't be) present.
+    """
+    missing: List[str] = []
+    if not settings.SUPERTABLE_ORGANIZATION:
+        missing.append("SUPERTABLE_ORGANIZATION")
+    if not (settings.SUPERTABLE_SUPERUSER_TOKEN or "").strip():
+        missing.append("SUPERTABLE_SUPERUSER_TOKEN")
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variables: " + ", ".join(missing)
+        )
 
 
 def _now_ms() -> int:
@@ -297,6 +309,11 @@ def _build_redis_client() -> redis.Redis:
       If SUPERTABLE_REDIS_SENTINEL is enabled and SUPERTABLE_REDIS_SENTINELS is set,
       use the same Sentinel connection behavior as RedisCatalog (ping-probe + optional fallback).
     """
+    # Gate runtime-credential validation here so that simply importing the
+    # module (e.g. to inspect ``redis_keys`` helpers or run unit tests
+    # against the public API) does not require an organization + token to
+    # be set. Anything that actually opens a connection still fails fast.
+    _require_runtime_env()
     settings = Settings()
     url = (settings.SUPERTABLE_REDIS_URL or "").strip() or None
 

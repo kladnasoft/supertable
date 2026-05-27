@@ -6,21 +6,39 @@ SuperTable.  It is the single source of truth that both the library
 
 ## 16.1  Rule
 
-> **Every Redis key MUST start with `supertable:`.**
+> **Every Redis key constructed via `supertable/redis_keys.py` MUST
+> start with one of two recognised top-level prefixes:**
 >
-> The only module allowed to construct a Redis key string is
-> `supertable/redis_keys.py`.  No other source file (in either repo) may
-> contain a literal `f"supertable:..."`, `f"monitor:..."`, `f"spark:..."`,
-> `f"audit:..."`, or `f"registry:..."` key.  The regression test
+> * `supertable:` — SuperTable SDK state (catalog, RBAC, locks, audit,
+>   share federation, table meta, …).
+> * `dataisland:` — platform / dataisland-core state that is not
+>   SuperTable's concern (service-registry heartbeats, app-bootstrap
+>   configs).
+>
+> Per-app config keys (`lighthouse:*`, `gatekeeper:*`, `studio:*`, …)
+> live under their own app-name prefix and are written via the MCP
+> server's `store_app_config` tool — they do **not** go through
+> `redis_keys.py`.
+>
+> The only module allowed to construct keys under `supertable:` or
+> `dataisland:` is `supertable/redis_keys.py`. No other source file
+> (in either repo) may contain a literal `f"supertable:..."`,
+> `f"dataisland:..."`, `f"monitor:..."`, `f"spark:..."`, `f"audit:..."`,
+> or `f"registry:..."` key. The regression test
 > `tests/test_redis_key_prefix.py` enforces this on CI.
 
 ## 16.2  Hierarchy
 
 ```
-supertable:
-  registry:{service_type}:{host}:{pid}      ── global service registry
+dataisland:                                  ── platform / dataisland-core
+  apps:{app_name}:master_mcp                 STRING  per-app bootstrap (master MCP info)
+  {org}:
+    registry:{service_type}:{host}:{pid}     STRING  service-instance heartbeat (TTL 30s)
+
+supertable:                                  ── SuperTable SDK state
   {org}:                                    ── organization scope
-    auth:tokens                              HASH  hashed login tokens
+    _system_:                               ── reserved system scope (SDK side)
+      auth:tokens                            HASH    hashed login tokens
     shares:doc:{share_id}                    STRING  share definitions (provider)
     shares:index                             SET     all share IDs
     audit:stream                             STREAM  audit events (org-wide)
@@ -58,20 +76,70 @@ supertable:
 
 ## 16.3  Scope discipline
 
-| Scope            | Pattern                                        | Reason |
-|------------------|------------------------------------------------|--------|
-| **Global**       | `supertable:registry:*`                        | Process-level, multi-tenant; tenant lives in payload. |
-| **Organization** | `supertable:{org}:auth:*`<br>`supertable:{org}:shares:*`<br>`supertable:{org}:audit:*`<br>`supertable:{org}:spark:*` | Tenant-wide concerns: auth, share federation, compliance audit feed, Spark cluster registry. |
-| **SuperTable**   | `supertable:{org}:{sup}:meta:*`<br>`supertable:{org}:{sup}:rbac:*`<br>`supertable:{org}:{sup}:lock:*`<br>`supertable:{org}:{sup}:config:*`<br>`supertable:{org}:{sup}:monitor:*`<br>`supertable:{org}:{sup}:linked_shares:*` | Per-supertable metadata, security, locking, runtime config, telemetry. |
-| **Entity**       | `supertable:{org}:{sup}:meta:leaf:{simple}`<br>`supertable:{org}:{sup}:rbac:users:doc:{user_id}` | One key per leaf table / user / role. |
+| Scope                  | Pattern                                              | Reason |
+|------------------------|------------------------------------------------------|--------|
+| **Platform (global)**  | `dataisland:apps:{app_name}:master_mcp`              | Per-app master-MCP bootstrap entries — read by every app on boot before any org context exists. |
+| **Platform (per org)** | `dataisland:{org}:registry:{service_type}:*`         | Service-instance heartbeats (TTL 30s). Written by `api`, `webui`, `odata`, `mcp`, `sdk`, plus SDK-driven apps like `lighthouse`. |
+| **System (per org, SDK side)** | `supertable:{org}:_system_:auth:tokens`     | Organization-level login tokens (stays under `_system_` so it can never collide with a user-created supertable named `auth`). |
+| **Organization**       | `supertable:{org}:shares:*`<br>`supertable:{org}:audit:*`<br>`supertable:{org}:spark:*` | Tenant-wide concerns: share federation, compliance audit feed, Spark cluster registry. |
+| **SuperTable**         | `supertable:{org}:{sup}:meta:*`<br>`supertable:{org}:{sup}:rbac:*`<br>`supertable:{org}:{sup}:lock:*`<br>`supertable:{org}:{sup}:config:*`<br>`supertable:{org}:{sup}:monitor:*`<br>`supertable:{org}:{sup}:linked_shares:*` | Per-supertable metadata, security, locking, runtime config, telemetry. |
+| **Entity**             | `supertable:{org}:{sup}:meta:leaf:{simple}`<br>`supertable:{org}:{sup}:rbac:users:doc:{user_id}` | One key per leaf table / user / role. |
+| **Per-app config**     | `lighthouse:{org}:config:*`<br>`gatekeeper:{org}:config:*`<br>… | Each SDK app's own state (runtime config, encrypted registries, user prefs). Written by the MCP `store_app_config` tool — never via `redis_keys.py`. |
+
+### 16.3.1  Reserved supertable names
+
+`_system_` is **reserved**. `SuperTable(..., super_name="_system_")`
+raises `ValueError`. The reservation guarantees that operational keys
+(service registry, organization auth tokens, any future system-only
+data) cannot ever clash with a user-supplied supertable name.
+
+The full reserved set is exported as
+`supertable.redis_keys.RESERVED_SUPER_NAMES`
+(`frozenset({"_system_"})`) and tested via
+`is_reserved_super_name()`.
+
+### 16.3.2  Scanning the registry
+
+Two helpers — pick depending on whether you want a single-tenant or
+cross-tenant view:
+
+```python
+from supertable import redis_keys as RK
+
+# One tenant — used by the per-org Monitoring tab:
+pattern_one = RK.registry_pattern_for_org("kladna-soft")
+# → "dataisland:kladna-soft:registry:*"
+
+# Every tenant — used by superuser-only fleet views:
+pattern_all = RK.registry_pattern()
+# → "dataisland:*:registry:*"
+```
+
+`ServiceRegistry.scan(redis_client, organization=None)` accepts an
+optional `organization` and dispatches to the right pattern.
 
 ## 16.4  Why these scopes
 
 - **Audit at org level (not supertable level).**  External SIEM consumers
   expect a single XREAD per tenant.  Per-supertable streams would explode
   consumer-group fan-out and make compliance reporting harder.
-- **Registry at root level (not org level).**  A single API/MCP/WebUI
-  process serves every tenant; per-org duplication would be wrong.
+- **Registry under `dataisland:` (was `supertable:_system_:registry`).**
+  The service registry is a platform / dataisland-core concern, not a
+  SuperTable SDK concern. Promoting it to its own top-level prefix
+  cleanly separates "SDK state" from "platform state" and removes the
+  `_system_` segment (which only existed to avoid colliding with user
+  supertable names — and there are no user supertables under
+  `dataisland:`).
+- **Auth tokens under `_system_` (still on the SuperTable side).** A
+  supertable literally named `auth` would have produced colliding
+  keys (`supertable:{org}:auth:*`). Login tokens are RBAC plumbing —
+  squarely SuperTable's responsibility — so they stay under
+  `supertable:{org}:_system_:auth:tokens`. The `_system_` segment
+  keeps the safety guarantee.
+- **App bootstrap as a single global key.** `dataisland:apps:{app}:master_mcp`
+  is intentionally not org-scoped: it's the first thing an app reads
+  on boot, before any org context exists. Once the app has the
+  response, every subsequent operation is org-scoped.
 - **Monitor at supertable level (was at root).**  Avoid collision with
   any other product using `monitor:*`; align with the rest of the schema.
 - **Spark at org level (was at root).**  Cluster configuration is per

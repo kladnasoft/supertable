@@ -38,8 +38,12 @@ PIPE = "pipe1"
 def _all_helpers() -> list[tuple[str, str]]:
     """Return (helper_name, sample_key) pairs for every key formatter."""
     return [
-        ("registry",                    RK.registry("api", "host", 1234)),
+        ("system_scope",                RK.system_scope(ORG)),
+        ("system_scope_pattern",        RK.system_scope_pattern(ORG)),
+        ("registry",                    RK.registry(ORG, "api", "host", 1234)),
+        ("registry_pattern_for_org",    RK.registry_pattern_for_org(ORG)),
         ("registry_pattern",            RK.registry_pattern()),
+        ("app_master_mcp",              RK.app_master_mcp("lighthouse")),
         ("auth_tokens",                 RK.auth_tokens(ORG)),
         ("share_doc",                   RK.share_doc(ORG, "share_1")),
         ("share_index",                 RK.share_index(ORG)),
@@ -83,22 +87,90 @@ def _all_helpers() -> list[tuple[str, str]]:
 
 
 @pytest.mark.parametrize("name,key", _all_helpers())
-def test_helpers_emit_supertable_prefix(name, key):
+def test_helpers_emit_recognised_prefix(name, key):
+    """Every constructor must emit a key under a recognised top-level prefix.
+
+    Recognised: ``supertable:`` (SDK state) or ``dataisland:`` (platform
+    state — service registry + app bootstrap). Per-app prefixes
+    (``lighthouse:``, ``gatekeeper:``, …) are not built through this
+    module — they go via the MCP ``store_app_config`` tool.
+    """
     assert isinstance(key, str), f"{name} returned non-str: {key!r}"
-    assert key.startswith("supertable:"), (
+    assert (
+        key.startswith("supertable:") or key.startswith("dataisland:")
+    ), (
         f"{name} returned {key!r} which violates the namespace policy "
-        f"(must start with 'supertable:')"
+        f"(must start with 'supertable:' or 'dataisland:')"
     )
 
 
-def test_assert_prefixed_accepts_valid_key():
+def test_assert_prefixed_accepts_supertable_key():
     assert RK.assert_prefixed("supertable:org:foo") == "supertable:org:foo"
 
 
+def test_assert_prefixed_accepts_dataisland_key():
+    assert RK.assert_prefixed("dataisland:org:foo") == "dataisland:org:foo"
+
+
 def test_assert_prefixed_rejects_bare_root_keys():
-    for bad in ("monitor:org:sup:plans", "spark:org:thrifts", "registry:api"):
+    for bad in ("monitor:org:sup:plans", "spark:org:thrifts", "registry:api",
+                "lighthouse:acme:config"):  # per-app prefixes not built here
         with pytest.raises(ValueError):
             RK.assert_prefixed(bad)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Layout invariants
+# ---------------------------------------------------------------------------
+
+def test_registry_key_lives_under_dataisland_prefix():
+    """Service-registry keys belong to the platform layer, not SuperTable."""
+    key = RK.registry(ORG, "api", "host1", 1234)
+    assert key == f"dataisland:{ORG}:registry:api:host1:1234"
+
+
+def test_app_master_mcp_lives_under_dataisland_prefix():
+    """Bootstrap key for an app's master MCP — global, not org-scoped."""
+    key = RK.app_master_mcp("lighthouse")
+    assert key == "dataisland:apps:lighthouse:master_mcp"
+
+
+def test_auth_tokens_still_lives_under_system_scope():
+    """Org auth tokens stay under supertable:{org}:_system_:auth:tokens
+    (managed by the SuperTable SDK's RBAC / auth subsystem)."""
+    key = RK.auth_tokens(ORG)
+    assert key == f"supertable:{ORG}:_system_:auth:tokens"
+
+
+def test_registry_pattern_targets_all_orgs():
+    """The cross-org SCAN pattern reaches every org's registry."""
+    assert RK.registry_pattern() == "dataisland:*:registry:*"
+
+
+def test_registry_pattern_for_org_is_scoped():
+    assert RK.registry_pattern_for_org(ORG) == f"dataisland:{ORG}:registry:*"
+
+
+# ---------------------------------------------------------------------------
+# 1c. Reserved supertable names
+# ---------------------------------------------------------------------------
+
+def test_system_scope_name_is_reserved():
+    assert RK.is_reserved_super_name("_system_") is True
+    assert "_system_" in RK.RESERVED_SUPER_NAMES
+
+
+def test_arbitrary_supertable_name_is_not_reserved():
+    for name in ("orders", "customers", "_system", "system_", "auth"):
+        assert RK.is_reserved_super_name(name) is False
+
+
+def test_super_table_refuses_reserved_name(monkeypatch):
+    """``SuperTable(super_name='_system_')`` must raise before touching Redis."""
+    # Import lazily so the regression also covers fresh imports.
+    from supertable.super_table import SuperTable
+    with pytest.raises(ValueError, match="reserved"):
+        SuperTable(super_name="_system_", organization=ORG)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +181,7 @@ def test_assert_prefixed_rejects_bare_root_keys():
 # redis_keys.py.  Note the search is restricted to source files in the
 # library itself.
 _FORBIDDEN_PATTERNS = re.compile(
-    r"""f["'](?:supertable|monitor|spark|registry|audit):"""
+    r"""f["'](?:supertable|dataisland|monitor|spark|registry|audit):"""
 )
 
 # Files / paths that are intentionally exempt from the scan:

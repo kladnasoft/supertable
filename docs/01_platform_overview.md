@@ -115,11 +115,20 @@ View Chain (transparent to caller):
 
 ## Service Registry
 
-Every long-lived process that uses the SDK can register itself in Redis with a
-30-second TTL key, refreshed every 15 seconds (`service_registry.py`). If the
-process crashes, the key expires automatically.
+Every long-lived process that uses the SDK can register itself in Redis
+with a 30-second TTL key, refreshed every 15 seconds
+(`service_registry.py`). If the process crashes, the key expires
+automatically.
 
-Key pattern: `supertable:registry:{service_type}:{hostname}:{pid}`
+Key pattern:
+`dataisland:{org}:registry:{service_type}:{hostname}:{pid}`
+
+The registry is a **platform concern**, not a SuperTable concern —
+every dataisland-core service plus any SDK-using app (Lighthouse,
+Gatekeeper, …) writes a heartbeat here. The `dataisland:` prefix
+keeps it cleanly separated from the SuperTable SDK's own state under
+`supertable:`. See [16 Redis Key Layout](16_redis_layout.md) for the
+full prefix policy.
 
 ## Cross-References
 

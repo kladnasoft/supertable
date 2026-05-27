@@ -13,6 +13,7 @@ from supertable.rbac.user_manager import UserManager
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.redis_catalog import RedisCatalog
+from supertable.redis_keys import is_reserved_super_name, RESERVED_SUPER_NAMES
 
 
 class SuperTable:
@@ -21,9 +22,20 @@ class SuperTable:
       - Ensures storage backend is available
       - Ensures Redis meta:root exists (no file-based meta)
       - Exposes helper to read heavy simple-table snapshots from MinIO/local via StorageInterface
+
+    Reserved supertable names (e.g. ``_system_``) are rejected up-front
+    so they can never collide with the org-level system scope where the
+    service registry, organization auth tokens, and other system-only
+    state live.
     """
 
     def __init__(self, super_name: str, organization: str):
+        if is_reserved_super_name(super_name):
+            raise ValueError(
+                f"SuperTable name {super_name!r} is reserved and cannot be created. "
+                f"Reserved names: {sorted(RESERVED_SUPER_NAMES)}"
+            )
+
         self.identity = "super"
         self.super_name = super_name
         self.organization = organization
