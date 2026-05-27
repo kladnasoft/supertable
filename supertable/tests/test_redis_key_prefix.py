@@ -124,6 +124,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         # ---- Linked shares ---------------------------------------------
         ("linked_share_index",           RK.linked_share_index(ORG, SUP),      f"{lake_pre}:linked_shares:index"),
         ("linked_share_doc",             RK.linked_share_doc(ORG, SUP, LINK),  f"{lake_pre}:linked_shares:doc:{LINK}"),
+        ("quality_prefix",               RK.quality_prefix(ORG, SUP),          f"{lake_pre}:quality:"),
 
         # ---- Monitoring (org-level, closed set) ------------------------
         ("monitor",                      RK.monitor(ORG, "plans"),             f"supertable:{ORG}:monitor:plans"),

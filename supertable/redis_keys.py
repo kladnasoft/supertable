@@ -709,6 +709,26 @@ def linked_share_doc(org: str, sup: str, link_id: str) -> str:
     )
 
 
+# --- Data Quality (dataisland-core quality module owns its sub-structure) #
+
+def quality_prefix(org: str, sup: str) -> str:
+    """Per-supertable data-quality namespace prefix (with trailing colon).
+
+    The dataisland-core quality module appends its own sub-keys to
+    this prefix (e.g. ``config:__global__``, ``rules:index``,
+    ``rules:doc:{rule_id}``, ``schedule:{table}``, ``latest:{table}``,
+    ``history``, ``pending:{table}``, ``running:{table}``,
+    ``cooldown:{table}``, ``run-all-progress``).
+
+    Centralised here so the lakes-scope prefix is enforced from a
+    single source.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:quality:"
+    )
+
+
 # --- Monitoring ------------------------------------------------------------ #
 
 _VALID_MONITOR_TYPES: FrozenSet[str] = frozenset(
