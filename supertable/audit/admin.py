@@ -9,7 +9,7 @@ Persistence
 -----------
 Stored in Redis as a HASH at:
 
-    supertable:{org}:_system_:audit:config
+    supertable:{org}:system:audit:config
 
 Fields
 ------

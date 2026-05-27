@@ -41,7 +41,7 @@ dataisland:                                    ── platform / dataisland-core
 
 supertable:                                    ── SuperTable SDK state
   {org}:                                       ── organization scope
-    _system_:                                  ── system sentinel (org-level)
+    system:                                    ── org-level system namespace
       auth:tokens                              HASH    org login tokens
       audit:
         stream                                 STREAM  audit events
@@ -105,7 +105,7 @@ supertable:                                    ── SuperTable SDK state
                                                        cross-supertable queries.
 ```
 
-### Why `monitor:` lives at position 2, not under `_system_`
+### Why `monitor:` lives at position 2, not under `system:`
 
 Monitoring is **org-wide runtime telemetry** — high-volume, append-only,
 event-stream-y. Audit / shares / spark / auth are **org-wide system
@@ -125,7 +125,7 @@ views filter the org list at read time.
    `dataisland:` (platform state). Both are enforced by
    `assert_prefixed()`.
 2. **Position 2 under `supertable:{org}:`** is *always* a literal
-   sentinel (`_system_` or `lakes`). User input never lives at
+   closed-set SDK literal (`system`, `lakes`, or `monitor`). User input never lives at
    position 2 — it lives at position 3, behind a sentinel that names
    it (`lakes:{sup}` for supertables).
 3. **Position 1 under `dataisland:`** is *always* an org name or the
@@ -162,13 +162,13 @@ id).
 
 ```python
 RESERVED_ORG_NAMES   = frozenset({"apps"})            # plus sentinel pattern
-RESERVED_SUPER_NAMES = frozenset({"_system_"})        # backward-compat
+RESERVED_SUPER_NAMES = frozenset()                    # sentinel regex covers it
 ```
 
 - `apps` as an org name would land at `dataisland:apps:registry:*`
   — same first three segments as `dataisland:_apps_:doc:*`. The
   reservation is defence in depth.
-- `_system_` as a super_name is rejected by the sentinel pattern;
+- Underscore-wrapped names (`_foo_`) are rejected as super_name by the sentinel pattern;
   it stays in the explicit list for backward compat with
   `SuperTable(super_name=...).` callers.
 
@@ -189,7 +189,7 @@ against their own enumerations, not via `_safe()`.
 
 Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`). A
 per-organization runtime override is persisted in
-`supertable:{org}:_system_:audit:config` (HASH) with fields:
+`supertable:{org}:system:audit:config` (HASH) with fields:
 
 ```
 enabled       "true" | "false"

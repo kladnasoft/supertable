@@ -6,7 +6,7 @@ Provides real-time queryability (XRANGE), consumer groups for external
 SIEM tools (Splunk, Sentinel, ELK), and TTL-based eviction.
 
 Each organization gets its own stream:
-    supertable:{org}:_system_:audit:stream
+    supertable:{org}:system:audit:stream
 
 The internal archival consumer group ("__archival__") is created
 automatically. External SIEM consumer groups are managed via the

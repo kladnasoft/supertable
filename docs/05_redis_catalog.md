@@ -86,7 +86,7 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 > **v2 layout (SDK ≥ 2.1.0).** Every user supertable lives under
 > `supertable:{org}:lakes:{sup}:`, and every org-level platform key
-> (audit, shares, spark, auth) lives under `supertable:{org}:_system_:`.
+> (audit, shares, spark, auth) lives under `supertable:{org}:system:`.
 > See `docs/16_redis_layout.md` for the canonical layout, design
 > invariants, and segment-validation contract.
 
@@ -125,7 +125,7 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:_system_:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata. Lives under the `_system_` sentinel so it can never collide with any user-named supertable. |
+| `supertable:{org}:system:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata. Lives under the `system` namespace; user lakes are under `lakes:` at the same level, so this never collides with a user-named supertable. |
 
 ### Service Registry Keys (per organization)
 
@@ -138,8 +138,8 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:_system_:shares:doc:{share_id}` | STRING (JSON) | Share definition document (provider side) |
-| `supertable:{org}:_system_:shares:index` | SET | Set of share_ids for an organization |
+| `supertable:{org}:system:shares:doc:{share_id}` | STRING (JSON) | Share definition document (provider side) |
+| `supertable:{org}:system:shares:index` | SET | Set of share_ids for an organization |
 | `supertable:{org}:lakes:{sup}:linked_shares:doc:{link_id}` | STRING (JSON) | Linked share document (consumer side) |
 | `supertable:{org}:lakes:{sup}:linked_shares:index` | SET | Set of link_ids for a SuperTable |
 
@@ -147,9 +147,9 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:_system_:audit:stream` | STREAM | Audit event stream (hash-chained) |
-| `supertable:{org}:_system_:audit:chain_head:doc:{instance_id}` | HASH | Per-instance audit hash-chain state |
-| `supertable:{org}:_system_:audit:config` | HASH | Runtime audit toggle (enable, sub-flags) |
+| `supertable:{org}:system:audit:stream` | STREAM | Audit event stream (hash-chained) |
+| `supertable:{org}:system:audit:chain_head:doc:{instance_id}` | HASH | Per-instance audit hash-chain state |
+| `supertable:{org}:system:audit:config` | HASH | Runtime audit toggle (enable, sub-flags) |
 
 ### Staging / Pipe Keys
 
@@ -164,8 +164,8 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:_system_:spark:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
-| `supertable:{org}:_system_:spark:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
+| `supertable:{org}:system:spark:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
+| `supertable:{org}:system:spark:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
 
 ### Engine Configuration Keys
 

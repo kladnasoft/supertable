@@ -1371,7 +1371,7 @@ return 1
             return 0
 
     # ========================================================================= #
-    # Spark Thrift cluster management (org-scoped: supertable:{org}:_system_:spark:thrifts)
+    # Spark Thrift cluster management (org-scoped: supertable:{org}:system:spark:thrifts)
     # ========================================================================= #
 
     def register_spark_cluster(self, org: str, cluster_id: str, config: Dict[str, Any]) -> None:
@@ -1467,7 +1467,7 @@ return 1
         return candidates[0]
 
     # ========================================================================= #
-    # Spark Plug management (org-scoped: supertable:{org}:_system_:spark:plugs)
+    # Spark Plug management (org-scoped: supertable:{org}:system:spark:plugs)
     # ========================================================================= #
 
     def register_spark_plug(self, org: str, plug_id: str, config: Dict[str, Any]) -> None:

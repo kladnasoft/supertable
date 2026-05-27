@@ -26,7 +26,7 @@ Hierarchy (v2)
 
     supertable:
       {org}:                                        ← organization scope
-        _system_:                                   ← system sentinel
+        system:                                   ← system sentinel
           auth:tokens                                HASH    org login tokens
           audit:
             stream                                   STREAM  audit events
@@ -93,7 +93,7 @@ Design invariants (enforced by ``tests/test_redis_key_prefix.py``)
 1. Every key returned by this module starts with one of
    ``_RECOGNISED_PREFIXES``.
 2. Position 2 under ``supertable:{org}:`` is *always* a literal
-   sentinel (``_system_`` or ``lakes``). User input never lives at
+   sentinel (``system`` or ``lakes``). User input never lives at
    position 2 — it lives at position 3, behind a sentinel that
    classifies it (``lakes:{sup}`` for supertables).
 3. Position 1 under ``dataisland:`` is *always* an org name or the
@@ -122,7 +122,7 @@ DATAISLAND_PREFIX: str = "dataisland"
 
 # Position-2 sentinel under ``supertable:{org}:`` for org-level platform
 # state (auth tokens, audit, shares, spark).
-SYSTEM_SCOPE: str = "_system_"
+SYSTEM_SCOPE: str = "system"
 
 # Position-2 sentinel under ``supertable:{org}:`` for user-supplied
 # supertables. Everything user-created lives at
@@ -130,10 +130,10 @@ SYSTEM_SCOPE: str = "_system_"
 LAKES_SCOPE: str = "lakes"
 
 # Position-2 literal under ``supertable:{org}:`` for org-wide runtime
-# telemetry. Lives at this level (not under ``_system_``) because
+# telemetry. Lives at this level (not under ``system``) because
 # monitoring is high-volume runtime data, conceptually distinct from
 # the low-volume identity / federation / compliance state under
-# ``_system_``. Cross-supertable queries record exactly one entry per
+# ``system``. Cross-supertable queries record exactly one entry per
 # query at the org level, carrying a ``supertables: [...]`` field for
 # attribution.
 MONITOR_SCOPE: str = "monitor"
@@ -308,7 +308,7 @@ def parse_registry_key(key: str) -> Optional[Tuple[str, str, str, str]]:
 
 
 # =========================================================================== #
-# Per-org system scope (supertable:{org}:_system_:*)
+# Per-org system scope (supertable:{org}:system:*)
 # =========================================================================== #
 
 def system_scope(org: str) -> str:
@@ -351,7 +351,7 @@ def audit_config(org: str) -> str:
 def audit_legal_hold(org: str) -> str:
     """Per-org audit legal-hold scopes (HASH).
 
-    Lives under the ``_system_:audit:`` namespace alongside the audit
+    Lives under the ``system:audit:`` namespace alongside the audit
     stream, chain head, and runtime config. The legal-hold record
     pins one or more (org, table, date-range) scopes whose audit
     partitions must not be deleted by the retention sweeper.

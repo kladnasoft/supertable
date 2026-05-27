@@ -23,10 +23,12 @@ class SuperTable:
       - Ensures Redis meta:root exists (no file-based meta)
       - Exposes helper to read heavy simple-table snapshots from MinIO/local via StorageInterface
 
-    Reserved supertable names (e.g. ``_system_``) are rejected up-front
-    so they can never collide with the org-level system scope where the
-    service registry, organization auth tokens, and other system-only
-    state live.
+    Reserved supertable names (any underscore-wrapped name like
+    ``_foo_`` — matched by ``redis_keys.SENTINEL_RE``) are rejected
+    up-front. Lakes live under ``supertable:{org}:lakes:{sup}``, so
+    structurally they could not collide with the org-level ``system:``
+    namespace anyway — the sentinel-pattern reservation is defence in
+    depth against future system labels.
     """
 
     def __init__(self, super_name: str, organization: str):

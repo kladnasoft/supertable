@@ -10,9 +10,9 @@ Rules (see ``docs/16_redis_layout.md``):
      ``f"dataisland:..."`` / ``f"monitor:..."`` / ``f"spark:..."`` /
      ``f"audit:..."`` / ``f"registry:..."`` / ``f"shares:..."`` /
      ``f"lakes:..."`` / ``f"_apps_:..."`` literals.
-  3. Position 2 under ``supertable:{org}:`` is always a literal
-     sentinel (``_system_`` or ``lakes``). User input lives at
-     position 3 behind one of those sentinels.
+  3. Position 2 under ``supertable:{org}:`` is always a closed-set
+     SDK literal (``system``, ``lakes``, or ``monitor``). User input
+     lives at position 3 under ``lakes:``.
   4. User-supplied segments are validated via ``_safe(...)``. Sentinel
      pattern (``^_..._$``) and explicit reserved sets reject reserved
      names.
@@ -55,12 +55,12 @@ APP = "lighthouse"
 
 def _all_helpers() -> list[tuple[str, str, str]]:
     """Return ``(name, actual, expected)`` triples for every key formatter."""
-    sys_pre = f"supertable:{ORG}:_system_"
+    sys_pre = f"supertable:{ORG}:system"
     lake_pre = f"supertable:{ORG}:lakes:{SUP}"
     return [
         # ---- System scope (org-level platform state) --------------------
-        ("system_scope",                 RK.system_scope(ORG),                 f"supertable:{ORG}:_system_"),
-        ("system_scope_pattern",         RK.system_scope_pattern(ORG),         f"supertable:{ORG}:_system_:*"),
+        ("system_scope",                 RK.system_scope(ORG),                 f"supertable:{ORG}:system"),
+        ("system_scope_pattern",         RK.system_scope_pattern(ORG),         f"supertable:{ORG}:system:*"),
         ("auth_tokens",                  RK.auth_tokens(ORG),                  f"{sys_pre}:auth:tokens"),
         ("audit_stream",                 RK.audit_stream(ORG),                 f"{sys_pre}:audit:stream"),
         ("audit_chain_head",             RK.audit_chain_head(ORG, INSTANCE),   f"{sys_pre}:audit:chain_head:doc:{INSTANCE}"),
@@ -316,9 +316,9 @@ def test_monitor_lives_at_org_level():
     """
     key = RK.monitor("acme", "writes")
     assert key == "supertable:acme:monitor:writes"
-    # No "lakes" or "_system_" segment, no super_name segment.
+    # No "lakes" or "system" segment, no super_name segment.
     assert ":lakes:" not in key
-    assert ":_system_:" not in key
+    assert ":system:" not in key
 
 
 def test_registry_rejects_unknown_service_type():
