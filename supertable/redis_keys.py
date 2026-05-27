@@ -152,15 +152,35 @@ _RECOGNISED_PREFIXES: FrozenSet[str] = frozenset(
 # Naming rules (regexes)
 # --------------------------------------------------------------------------- #
 
-# A sentinel is any name wrapped in underscores. Sentinels are reserved
-# across every user-supplied identifier (org, sup, simple, staging_name,
-# pipe_name, app_name, share_id, link_id, user_id, role_id, role_type,
-# instance_id).
+# A sentinel is a *single*-underscore-wrapped name (e.g. ``_apps_``,
+# ``_system_``). Sentinels are reserved across every user-supplied
+# identifier (org, sup, simple, staging_name, pipe_name, app_name,
+# share_id, link_id, user_id, role_id, role_type, instance_id).
+#
+# Note: this regex deliberately requires ``[a-z0-9]`` immediately
+# after the leading underscore, so *double*-underscore-wrapped names
+# (e.g. ``__data_quality__``) do NOT match. Double-underscore wrap is
+# the SDK-internal-table convention — those names are allowed by
+# ``_SAFE_SEGMENT`` below and hidden from user-facing feeds by the
+# OData handler's shape detection.
 SENTINEL_RE: re.Pattern[str] = re.compile(r"^_[a-z0-9][a-z0-9_-]*_$")
 
-# The universal safe-segment regex. Constructors call ``_safe(label,
-# value)`` for every user-supplied segment.
-_SAFE_SEGMENT: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# Universal safe-segment regex used by every key constructor.
+#
+# Accepts either:
+#   * a plain identifier ``[a-z0-9][a-z0-9_-]{0,63}`` — the common case
+#     for user-supplied names (org, sup, simple table, staging, pipe,
+#     user_id, role_id, etc.), and
+#   * a *double*-underscore-wrapped name ``__[a-z0-9][a-z0-9_-]{0,59}__``
+#     — the convention for SDK-internal tables (e.g. ``__data_quality__``)
+#     that users normally would not create but the SDK needs to write to.
+#
+# Single-underscore-wrapped names (``_foo_``) match SENTINEL_RE and are
+# rejected explicitly by ``_safe()``; they are reserved for SDK
+# sentinels at fixed positions (``_apps_`` under ``dataisland:``).
+_SAFE_SEGMENT: re.Pattern[str] = re.compile(
+    r"^(__[a-z0-9][a-z0-9_-]{0,59}__|[a-z0-9][a-z0-9_-]{0,63})$"
+)
 
 # --------------------------------------------------------------------------- #
 # Explicit reservations

@@ -256,7 +256,22 @@ def test_reserved_super_names_accepts_normal_names():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "good", ["acme", "my-org", "tenant_1", "a", "abc123", "x" * 64]
+    "good",
+    [
+        "acme",
+        "my-org",
+        "tenant_1",
+        "a",
+        "abc123",
+        "x" * 64,
+        # Double-underscore-wrapped names are the SDK-internal-table
+        # convention (e.g. __data_quality__). _safe() accepts them so
+        # the SDK can write to internal tables; single-underscore
+        # sentinels (_apps_) are still rejected below.
+        "__data_quality__",
+        "__audit__",
+        "__a__",
+    ],
 )
 def test_safe_accepts_good_segments(good):
     assert RK._safe("test", good) == good
@@ -271,10 +286,12 @@ def test_safe_accepts_good_segments(good):
         "ac:me",           # colon
         "ac/me",           # slash
         "ac.me",           # dot
-        "_system_",        # sentinel
+        "_system_",        # sentinel (single-underscore-wrap)
         "_foo_",           # sentinel
         "-leading-hyphen", # starts with hyphen
-        "_leading",        # starts with underscore (sentinel territory)
+        "_leading",        # starts with single underscore (not wrapped)
+        "__leading",       # starts with double underscore but no closing wrap
+        "____",            # only underscores, no name body
         "x" * 65,          # too long
     ]
 )
