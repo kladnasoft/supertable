@@ -618,6 +618,16 @@ def rbac_user_doc(org: str, sup: str, user_id: str) -> str:
     )
 
 
+def rbac_user_doc_prefix(org: str, sup: str) -> str:
+    """Trimmable prefix (ending with ``doc:``) used by Lua scripts that
+    concatenate a user_id at the tail — avoids the
+    ``rbac_user_doc(..., "")`` idiom which is rejected by ``_safe()``."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:users:doc:"
+    )
+
+
 # --- RBAC — roles ---------------------------------------------------------- #
 
 def rbac_role_meta(org: str, sup: str) -> str:

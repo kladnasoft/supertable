@@ -229,29 +229,29 @@ class TestGetRedisItems:
     def test_returns_string_keys(self, MockCat):
         from supertable.meta_reader import _get_redis_items
         mock_cat = MagicMock()
-        mock_cat.r.scan.side_effect = _scan_one_batch("supertable:org:s1:meta:root")
+        mock_cat.r.scan.side_effect = _scan_one_batch("supertable:org:lakes:s1:meta:root")
         MockCat.return_value = mock_cat
 
         result = _get_redis_items("supertable:org:*:meta:root")
-        assert result == ["supertable:org:s1:meta:root"]
+        assert result == ["supertable:org:lakes:s1:meta:root"]
 
     @patch(_P_REDIS_CAT)
     def test_decodes_bytes_keys(self, MockCat):
         from supertable.meta_reader import _get_redis_items
         mock_cat = MagicMock()
-        mock_cat.r.scan.side_effect = _scan_one_batch(b"supertable:org:s1:meta:root")
+        mock_cat.r.scan.side_effect = _scan_one_batch(b"supertable:org:lakes:s1:meta:root")
         MockCat.return_value = mock_cat
 
         result = _get_redis_items("pattern")
-        assert result == ["supertable:org:s1:meta:root"]
+        assert result == ["supertable:org:lakes:s1:meta:root"]
 
     @patch(_P_REDIS_CAT)
     def test_multiple_batches(self, MockCat):
         from supertable.meta_reader import _get_redis_items
         mock_cat = MagicMock()
         mock_cat.r.scan.side_effect = _scan_two_batches(
-            ["supertable:org:s1:meta:root"],
-            ["supertable:org:s2:meta:root"],
+            ["supertable:org:lakes:s1:meta:root"],
+            ["supertable:org:lakes:s2:meta:root"],
         )
         MockCat.return_value = mock_cat
 
@@ -476,8 +476,8 @@ class TestGetAllTables:
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:events",
-            "supertable:org:sup:meta:leaf:users",
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+            "supertable:org:lakes:sup:meta:leaf:doc:users",
         )
         assert reader._get_all_tables() == ["events", "users"]
 
@@ -485,8 +485,8 @@ class TestGetAllTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:events",
-            "supertable:org:sup:meta:leaf:events",
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
         )
         assert reader._get_all_tables() == ["events"]
 
@@ -494,7 +494,7 @@ class TestGetAllTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            b"supertable:org:sup:meta:leaf:events",
+            b"supertable:org:lakes:sup:meta:leaf:doc:events",
         )
         assert reader._get_all_tables() == ["events"]
 
@@ -504,8 +504,8 @@ class TestGetAllTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
         result = reader._get_all_tables()
         assert set(result) == {"t1", "t2"}
@@ -525,8 +525,8 @@ class TestGetAllTables:
         # Key ending with ":" produces empty table name
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:",
-            "supertable:org:sup:meta:leaf:valid",
+            "supertable:org:lakes:sup:meta:leaf:doc:",
+            "supertable:org:lakes:sup:meta:leaf:doc:valid",
         )
         assert reader._get_all_tables() == ["valid"]
 
@@ -542,8 +542,8 @@ class TestGetTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
         # All pass RBAC
         mock_check.return_value = None
@@ -556,8 +556,8 @@ class TestGetTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:public",
-            "supertable:org:sup:meta:leaf:secret",
+            "supertable:org:lakes:sup:meta:leaf:doc:public",
+            "supertable:org:lakes:sup:meta:leaf:doc:secret",
         )
         def side_effect(super_name, organization, role_name, table_name):
             if table_name == "secret":
@@ -571,7 +571,7 @@ class TestGetTables:
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
         mock_check.side_effect = PermissionError("no")
 
@@ -652,8 +652,8 @@ class TestGetTableSchema:
         # _get_all_tables now goes through catalog.scan_leaf_keys
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
         # mget returns leaf data for both
         leaf1 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}]})
@@ -670,8 +670,8 @@ class TestGetTableSchema:
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
         leaf1 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}]})
         leaf2 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}, {"name": "x", "type": "str"}]})
@@ -687,7 +687,7 @@ class TestGetTableSchema:
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
         reader.catalog.r.mget.side_effect = ConnectionError("down")
 
@@ -823,8 +823,8 @@ class TestGetTableStats:
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
 
         call_count = [0]
@@ -846,8 +846,8 @@ class TestGetTableStats:
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
-            "supertable:org:sup:meta:leaf:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
 
         call_count = [0]
@@ -890,7 +890,7 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 5, "ts": 9999}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:events",
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
         )
 
         leaf = json.dumps({
@@ -923,7 +923,7 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
         # mget returns non-parseable data
         reader.catalog.r.mget.return_value = [None]
@@ -948,7 +948,7 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
         reader.catalog.r.mget.side_effect = ConnectionError("down")
 
@@ -968,8 +968,8 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:bad",
-            "supertable:org:sup:meta:leaf:good",
+            "supertable:org:lakes:sup:meta:leaf:doc:bad",
+            "supertable:org:lakes:sup:meta:leaf:doc:good",
         )
         # First leaf → None (will fallback), second → valid
         reader.catalog.r.mget.return_value = [None, json.dumps({
@@ -1015,7 +1015,7 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
         leaf = json.dumps({
             "resources": [
@@ -1075,7 +1075,7 @@ class TestGetSuperMeta:
         reader.catalog.get_root.return_value = {"version": 2, "ts": 200}
         _wire_catalog_scan(
             reader.catalog,
-            "supertable:org:sup:meta:leaf:new_table",
+            "supertable:org:lakes:sup:meta:leaf:doc:new_table",
         )
         leaf = json.dumps({"resources": [{"file": "f", "rows": 99, "file_size": 1}]})
         reader.catalog.r.mget.return_value = [leaf.encode()]
@@ -1101,14 +1101,14 @@ class TestListSupers:
         # parsing/sorting behaviour.
         from supertable.meta_reader import list_supers
         mock_items.return_value = [
-            "supertable:org:zeta:meta:root",
-            "supertable:org:alpha:meta:root",
-            "supertable:org:mid:meta:root",
+            "supertable:org:lakes:zeta:meta:root",
+            "supertable:org:lakes:alpha:meta:root",
+            "supertable:org:lakes:mid:meta:root",
         ]
         mock_check.return_value = None
         result = list_supers("org", role_name="superadmin")
         assert result == ["alpha", "mid", "zeta"]
-        mock_items.assert_called_once_with("supertable:org:*:meta:root")
+        mock_items.assert_called_once_with("supertable:org:lakes:*:meta:root")
 
     @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")
@@ -1130,14 +1130,14 @@ class TestListTables:
     def test_extracts_and_sorts_table_names(self, mock_items, mock_check):
         from supertable.meta_reader import list_tables
         mock_items.return_value = [
-            "supertable:org:sup:meta:leaf:users",
-            "supertable:org:sup:meta:leaf:events",
-            "supertable:org:sup:meta:leaf:logs",
+            "supertable:org:lakes:sup:meta:leaf:doc:users",
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+            "supertable:org:lakes:sup:meta:leaf:doc:logs",
         ]
         mock_check.return_value = None
         result = list_tables("org", "sup", role_name="superadmin")
         assert result == ["events", "logs", "users"]
-        mock_items.assert_called_once_with("supertable:org:sup:meta:leaf:*")
+        mock_items.assert_called_once_with("supertable:org:lakes:sup:meta:leaf:doc:*")
 
     @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")

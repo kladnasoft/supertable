@@ -108,6 +108,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("rbac_user_index",              RK.rbac_user_index(ORG, SUP),         f"{lake_pre}:rbac:users:index"),
         ("rbac_username_to_id",          RK.rbac_username_to_id(ORG, SUP),     f"{lake_pre}:rbac:users:name_to_id"),
         ("rbac_user_doc",                RK.rbac_user_doc(ORG, SUP, USER_ID),  f"{lake_pre}:rbac:users:doc:{USER_ID}"),
+        ("rbac_user_doc_prefix",         RK.rbac_user_doc_prefix(ORG, SUP),    f"{lake_pre}:rbac:users:doc:"),
 
         # ---- RBAC — roles ----------------------------------------------
         ("rbac_role_meta",               RK.rbac_role_meta(ORG, SUP),          f"{lake_pre}:rbac:roles:meta"),

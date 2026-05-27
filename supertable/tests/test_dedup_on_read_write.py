@@ -567,7 +567,7 @@ class TestRedisCatalogTableConfig:
 
         # Verify key format
         key_arg = cat.r.set.call_args[0][0]
-        assert key_arg == "supertable:org:sup:meta:table_config:events"
+        assert key_arg == "supertable:org:lakes:sup:meta:table_config:doc:events"
 
         # Verify payload is valid JSON with expected fields
         payload = json.loads(cat.r.set.call_args[0][1])
@@ -598,7 +598,7 @@ class TestRedisCatalogTableConfig:
 
         assert result["primary_keys"] == ["cust_id", "order_id"]
         assert result["dedup_on_read"] is True
-        cat.r.get.assert_called_once_with("supertable:org:sup:meta:table_config:events")
+        cat.r.get.assert_called_once_with("supertable:org:lakes:sup:meta:table_config:doc:events")
 
     def test_get_table_config_not_found_returns_none(self):
         cat = self._make_catalog()
@@ -757,7 +757,7 @@ class TestDedupEdgeCases:
     def test_config_key_uses_correct_redis_key_pattern(self):
         from supertable import redis_keys as RK
         key = RK.meta_table_config("acme", "warehouse", "events")
-        assert key == "supertable:acme:warehouse:meta:table_config:events"
+        assert key == "supertable:acme:lakes:warehouse:meta:table_config:doc:events"
 
     def test_init_has_empty_cache(self):
         dw, _ = _make_writer()

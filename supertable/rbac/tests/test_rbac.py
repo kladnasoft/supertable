@@ -1659,7 +1659,7 @@ class TestKeyNamespace(unittest.TestCase):
             RK.rbac_role_type_index("o", "s", "admin"),
         ]
         for k in keys:
-            self.assertTrue(k.startswith("supertable:o:s:rbac:"), f"Bad key: {k}")
+            self.assertTrue(k.startswith("supertable:o:lakes:s:rbac:"), f"Bad key: {k}")
 
     def test_rbac_keys_do_not_collide(self):
         """All 8 key patterns for same org/sup produce distinct keys."""

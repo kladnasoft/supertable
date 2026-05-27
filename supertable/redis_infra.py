@@ -177,7 +177,7 @@ class _FallbackCatalog:
                 continue
             try:
                 obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-                simple = k.rsplit("meta:leaf:", 1)[-1]
+                simple = k.rsplit("meta:leaf:doc:", 1)[-1]
                 yield {
                     "simple": simple,
                     "version": int(obj.get("version", -1)),

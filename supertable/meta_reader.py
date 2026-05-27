@@ -154,7 +154,7 @@ class MetaReader:
                 count=1000,
             ):
                 key_str = key if isinstance(key, str) else key.decode('utf-8')
-                table_name = key_str.rsplit("meta:leaf:", 1)[-1]
+                table_name = key_str.rsplit("meta:leaf:doc:", 1)[-1]
                 if table_name and table_name not in seen:
                     seen.add(table_name)
                     tables.append(table_name)
@@ -507,7 +507,10 @@ def list_supers(organization: str, role_name: str) -> List[str]:
 
     items = _get_redis_items(pattern)
     for item in items:
-        super_name = item.split(':')[2]
+        parsed = RK.parse_lake_key(item)
+        if parsed is None:
+            continue
+        _, super_name = parsed
         try:
             check_meta_access(
                 super_name=super_name,

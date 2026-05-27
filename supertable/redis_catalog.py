@@ -685,8 +685,8 @@ return 1
         role_name = self.r.hget(key, "role_name") or ""
         if isinstance(role_name, bytes):
             role_name = role_name.decode("utf-8")
-        # rbac_user_doc(..., "") yields the canonical "...:rbac:users:doc:" prefix.
-        user_doc_key_prefix = RK.rbac_user_doc(org, sup, "")
+        # The Lua script appends each user_id to this prefix.
+        user_doc_key_prefix = RK.rbac_user_doc_prefix(org, sup)
         result = self._rbac_delete_role(
             keys=[
                 key,
@@ -967,7 +967,7 @@ return 1
                 for k in keys:
                     ks = k if isinstance(k, str) else k.decode('utf-8')
                     if allowed:
-                        simple = ks.rsplit("meta:leaf:", 1)[-1]
+                        simple = ks.rsplit("meta:leaf:doc:", 1)[-1]
                         if simple not in allowed:
                             continue
                     yield ks
@@ -1003,7 +1003,7 @@ return 1
                 continue
             try:
                 obj = json.loads(raw)
-                simple = k.rsplit("meta:leaf:", 1)[-1]
+                simple = k.rsplit("meta:leaf:doc:", 1)[-1]
                 yield {
                     "simple": simple,
                     "version": int(obj.get("version", -1)),

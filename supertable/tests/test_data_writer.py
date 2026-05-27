@@ -1019,13 +1019,15 @@ class TestWriteMonitoring:
         dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
 
         mock_get_mon.assert_called_once_with(
-            super_name="s", organization="o", monitor_type="writes",
+            organization="o", monitor_type="writes",
         )
         mock_mon.log_metric.assert_called_once()
         payload = mock_mon.log_metric.call_args[0][0]
         assert "query_id" in payload
         assert "duration" in payload
-        assert payload["super_name"] == "s"
+        # v2.2: attribution lives in the payload's `supertables` field,
+        # not in a top-level `super_name` and not in the Redis key.
+        assert payload["supertables"] == ["s"]
         assert payload["table_name"] == "tbl"
 
     @patch(_PATCH_GET_MON_LOGGER)
