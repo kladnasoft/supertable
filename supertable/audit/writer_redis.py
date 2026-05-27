@@ -50,8 +50,23 @@ class RedisAuditWriter:
         self._instance_id = instance_id
         self._maxlen = maxlen
         self._stream = RK.audit_stream(org)
-        self._chain_key = RK.audit_chain_head(org, instance_id)
+        # The chain-head key is lazy: read-only callers (e.g. the
+        # audit reader) instantiate this class purely to use
+        # ``query()`` and pass instance_id="". Building the
+        # chain-head key with an empty instance_id would fail v2's
+        # segment validator, so defer construction until a method
+        # that actually needs it is called.
         self._ensure_stream()
+
+    @property
+    def _chain_key(self) -> str:
+        if not self._instance_id:
+            raise RuntimeError(
+                "RedisAuditWriter._chain_key requires a non-empty "
+                "instance_id; this writer was instantiated for "
+                "read-only use (query) and cannot save/load chain head."
+            )
+        return RK.audit_chain_head(self._org, self._instance_id)
 
     def _ensure_stream(self) -> None:
         """Create the stream and archival consumer group if they don't exist."""
