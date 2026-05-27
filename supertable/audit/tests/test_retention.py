@@ -28,10 +28,13 @@ from supertable.audit import retention
 
 class TestLegalHoldKey:
     def test_template_substitution(self) -> None:
-        assert retention._legal_hold_key("acme") == "supertable:acme:audit:legal_hold"
+        assert retention._legal_hold_key("acme") == "supertable:acme:_system_:audit:legal_hold"
 
-    def test_handles_special_characters(self) -> None:
-        assert retention._legal_hold_key("acme-EU") == "supertable:acme-EU:audit:legal_hold"
+    def test_handles_hyphens(self) -> None:
+        # v2 _safe() requires the org-segment regex
+        # ^[a-z0-9][a-z0-9_-]{0,63}$ — uppercase letters are rejected,
+        # hyphens + lowercase alphanumerics are allowed.
+        assert retention._legal_hold_key("acme-eu") == "supertable:acme-eu:_system_:audit:legal_hold"
 
 
 class TestParsePartitionDate:
@@ -171,7 +174,7 @@ class TestSetLegalHold:
         assert result == {"ok": True, "legal_hold": True, "organization": "acme"}
 
         fake_client.set.assert_called_once_with(
-            "supertable:acme:audit:legal_hold", "1"
+            "supertable:acme:_system_:audit:legal_hold", "1"
         )
         assert audit_calls and audit_calls[0]["organization"] == "acme"
 

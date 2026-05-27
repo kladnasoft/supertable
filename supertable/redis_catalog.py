@@ -1216,37 +1216,15 @@ return 1
             return None
 
     def list_stagings(self, org: str, sup: str, *, count: int = 1000) -> List[str]:
-        """List staging names. Prefers the staging index set; falls back to SCAN."""
+        """List staging names from the staging index set."""
         if not (org and sup):
             return []
         try:
-            names = list(self.r.smembers(RK.staging_index(org, sup)) or [])
-            if names:
-                return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
+            names = self.r.smembers(RK.staging_index(org, sup)) or set()
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_stagings smembers error: {e}")
-
-        # Fallback (migration/back-compat): scan exact staging meta keys.
-        pattern = RK.staging_pattern(org, sup)
-        seen = set()
-        cursor = 0
-        try:
-            while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
-                for k in keys or []:
-                    kk = k if isinstance(k, str) else k.decode("utf-8")
-                    if ":pipe:" in kk:
-                        continue
-                    if kk.endswith(":meta"):
-                        continue
-                    name = kk.rsplit("meta:staging:", 1)[-1]
-                    if name:
-                        seen.add(name)
-                if cursor == 0:
-                    break
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] list_stagings scan error: {e}")
-        return sorted(seen)
+            return []
+        return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
 
     def delete_staging_meta(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> int:
         """Delete staging meta and *all* related keys under the staging prefix.

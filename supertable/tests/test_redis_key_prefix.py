@@ -65,6 +65,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("audit_stream",                 RK.audit_stream(ORG),                 f"{sys_pre}:audit:stream"),
         ("audit_chain_head",             RK.audit_chain_head(ORG, INSTANCE),   f"{sys_pre}:audit:chain_head:doc:{INSTANCE}"),
         ("audit_config",                 RK.audit_config(ORG),                 f"{sys_pre}:audit:config"),
+        ("audit_legal_hold",             RK.audit_legal_hold(ORG),             f"{sys_pre}:audit:legal_hold"),
         ("share_doc",                    RK.share_doc(ORG, SHARE),             f"{sys_pre}:shares:doc:{SHARE}"),
         ("share_index",                  RK.share_index(ORG),                  f"{sys_pre}:shares:index"),
         ("spark_thrifts",                RK.spark_thrifts(ORG),                f"{sys_pre}:spark:thrifts"),

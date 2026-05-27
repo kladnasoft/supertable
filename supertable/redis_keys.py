@@ -348,6 +348,17 @@ def audit_config(org: str) -> str:
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:audit:config"
 
 
+def audit_legal_hold(org: str) -> str:
+    """Per-org audit legal-hold scopes (HASH).
+
+    Lives under the ``_system_:audit:`` namespace alongside the audit
+    stream, chain head, and runtime config. The legal-hold record
+    pins one or more (org, table, date-range) scopes whose audit
+    partitions must not be deleted by the retention sweeper.
+    """
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:audit:legal_hold"
+
+
 # --- Org-level shares ------------------------------------------------------ #
 
 def share_doc(org: str, share_id: str) -> str:

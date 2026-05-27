@@ -25,17 +25,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from supertable import redis_keys as RK
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Redis key for legal hold runtime override
-# ---------------------------------------------------------------------------
-
-_LEGAL_HOLD_KEY_TEMPLATE = "supertable:{org}:audit:legal_hold"
 
 
 def _legal_hold_key(org: str) -> str:
-    return _LEGAL_HOLD_KEY_TEMPLATE.replace("{org}", org)
+    return RK.audit_legal_hold(org)
 
 
 # ---------------------------------------------------------------------------
