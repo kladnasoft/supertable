@@ -40,7 +40,7 @@ class MirrorFormats:
     Redis-backed format mirror configuration and dispatch.
 
     Storage:
-      - Redis key: supertable:{org}:{super}:meta:mirrors
+      - Redis key: supertable:{org}:lakes:{super}:meta:mirrors
         value: {"formats": ["DELTA", ...], "ts": <epoch_ms>}
     """
 

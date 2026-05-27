@@ -261,7 +261,7 @@ class Settings:
 
     # ── Audit ────────────────────────────────────────────────────────
     # Audit is OFF by default.  Enable per-organization in the WebUI
-    # /ui/audit → Compliance tab (persisted at supertable:{org}:audit:config),
+    # /ui/audit → Compliance tab (persisted at supertable:{org}:_system_:audit:config),
     # or globally via the SUPERTABLE_AUDIT_ENABLED env var.
     SUPERTABLE_AUDIT_ENABLED: bool = False                   # SUPERTABLE_AUDIT_ENABLED
     SUPERTABLE_AUDIT_RETENTION_DAYS: int = 2555              # SUPERTABLE_AUDIT_RETENTION_DAYS (~7 years)

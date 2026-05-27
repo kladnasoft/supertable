@@ -408,7 +408,7 @@ _LOGGERS: Dict[str, "AuditLogger | NullAuditLogger"] = {}
 _LOGGERS_LOCK = threading.Lock()
 
 # Per-org config cache: org → (config, expires_at_seconds).
-# Resolved against env defaults + Redis override (supertable:{org}:audit:config).
+# Resolved against env defaults + Redis override (supertable:{org}:_system_:audit:config).
 _ORG_CFG_CACHE: Dict[str, "tuple[AuditConfig, float]"] = {}
 _ORG_CFG_TTL_S: float = 30.0  # toggle takes effect within this many seconds
 
@@ -416,7 +416,7 @@ _ORG_CFG_TTL_S: float = 30.0  # toggle takes effect within this many seconds
 def _resolve_config_for(organization: str) -> AuditConfig:
     """Resolve the effective AuditConfig for *organization*.
 
-    Merges the Redis override at ``supertable:{org}:audit:config`` over the
+    Merges the Redis override at ``supertable:{org}:_system_:audit:config`` over the
     env-var defaults.  Cached for _ORG_CFG_TTL_S seconds.
     """
     now = time.time()

@@ -59,8 +59,8 @@ class Staging:
         {org}/{super}/staging/{stage_name}_files.json   (flat index)
 
     - Redis meta:
-        supertable:{org}:{sup}:meta:staging:{stage_name}
-        plus an index set for fast listing.
+        supertable:{org}:lakes:{sup}:meta:staging:doc:{stage_name}:meta
+        plus a staging:index SET for fast listing.
     """
 
     def __init__(

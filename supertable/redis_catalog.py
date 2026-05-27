@@ -117,7 +117,7 @@ return v
     #   ARGV[1] role_id
     #   ARGV[2] now_ms (string)
     #   ARGV[3] role_name_lower (or "")
-    #   ARGV[4] user_doc_key_prefix  (e.g. "supertable:{org}:{sup}:rbac:users:doc:")
+    #   ARGV[4] user_doc_key_prefix  (e.g. "supertable:{org}:lakes:{sup}:rbac:users:doc:")
     # KEYS layout:
     #   KEYS[1] role_doc_key
     #   KEYS[2] role_index_key
@@ -264,7 +264,7 @@ return 1
             timeout_s: int = 30,
     ) -> Optional[str]:
         """Acquire lock for staging/pipe operations:
-            supertable:{org}:{sup}:lock:stage:{stage_name}
+            supertable:{org}:lakes:{sup}:lock:stage:doc:{stage_name}
         """
         return self._locker.acquire(RK.lock_stage(org, sup, stage_name), ttl_s=ttl_s, timeout_s=timeout_s)
 
@@ -954,7 +954,7 @@ return 1
     # ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        """Yields full Redis keys: supertable:{org}:{sup}:meta:leaf:* (replica-aware)."""
+        """Yields full Redis keys: supertable:{org}:lakes:{sup}:meta:leaf:doc:* (replica-aware)."""
         info = self._resolve_replica_info(org, sup)
         effective_sup = info[0] if info else sup
         allowed = info[1] if info else None
@@ -1231,7 +1231,7 @@ return 1
 
         This removes the staging from the staging index set, deletes the staging meta key,
         and deletes any keys matching:
-            supertable:{org}:{sup}:meta:staging:{staging_name}:*
+            supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:*
         Returns number of keys deleted (best-effort; does not include SREM).
         """
         if not (org and sup and staging_name):
@@ -1371,7 +1371,7 @@ return 1
             return 0
 
     # ========================================================================= #
-    # Spark Thrift cluster management (org-scoped: supertable:{org}:spark:thrifts)
+    # Spark Thrift cluster management (org-scoped: supertable:{org}:_system_:spark:thrifts)
     # ========================================================================= #
 
     def register_spark_cluster(self, org: str, cluster_id: str, config: Dict[str, Any]) -> None:
@@ -1467,7 +1467,7 @@ return 1
         return candidates[0]
 
     # ========================================================================= #
-    # Spark Plug management (org-scoped: supertable:{org}:spark:plugs)
+    # Spark Plug management (org-scoped: supertable:{org}:_system_:spark:plugs)
     # ========================================================================= #
 
     def register_spark_plug(self, org: str, plug_id: str, config: Dict[str, Any]) -> None:
