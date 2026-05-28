@@ -1,4 +1,4 @@
-# 22. Monitoring
+# 14. Monitoring
 
 ## Overview
 
@@ -11,15 +11,28 @@ monitoring writer, providing correlation-ID-based request tracing.
 
 ## Monitored Operations
 
-| Category | Redis Key Pattern | Source | Key Fields |
-|----------|------------------|--------|------------|
-| **Reads** | `monitor:{org}:{sup}:plans` | Query execution | query_id, engine, table_name, result_rows, execution_timings, status |
-| **Writes** | `monitor:{org}:{sup}:writes` | Data ingestion | query_id, table_name, incoming_rows, inserted, deleted, duration |
-| **Stats** | `monitor:{org}:{sup}:stats` | Generic counters | table_name, operation, duration_ms, ... |
-| **Metrics** | `monitor:{org}:{sup}:metrics` | Application-defined metrics | Free-form payload |
+**As of SDK 2.2.0** monitoring lives at the **org level** — one list per
+`(org, monitor_type)` — *not* per supertable. A cross-supertable query
+(e.g. a join across `sales` and `customers`) writes exactly one entry
+whose payload carries `supertables: [...]` for per-supertable attribution
+at read time. The full key is built by `redis_keys.monitor(org, monitor_type)`:
+
+```
+supertable:{org}:monitor:{monitor_type}
+```
+
+| Category | `monitor_type` | Source | Key Fields |
+|----------|----------------|--------|------------|
+| **Reads** | `plans`  | Query execution                 | query_id, engine, table_name, result_rows, execution_timings, status, supertables |
+| **Writes** | `writes` | Data ingestion                  | query_id, table_name, incoming_rows, inserted, deleted, duration, supertables |
+| **MCP** | `mcp`    | MCP tool invocations            | tool, organization, rows, duration_ms, supertables |
+| **OData** | `odata`  | OData reads                     | endpoint_id, entity_set, rows_returned, role_name, supertables |
+| **Errors** | `errors` | Any handler that caught         | service, action, error_code, message, supertables |
+| **Locks** | `locks`  | Redis lock acquisitions / releases | lock_key, action, holder, supertables |
 
 The category is selected via the `monitor_type` argument when constructing the
-writer (`plans`, `writes`, `stats`, `metrics`).
+writer. The closed-set of valid `monitor_type` values is enforced inside
+`redis_keys.monitor(...)`; any other value raises at key-build time.
 
 ## Writing Metrics
 
@@ -149,8 +162,13 @@ cat ~/supertable/log/st.log | jq 'select(.correlation_id == "abc123")'
 ## Source Files
 
 - `supertable/monitoring_writer.py` — `MonitoringWriter` class, the
-  `get_monitoring_logger` singleton factory, batched flushing.
+  `get_monitoring_logger` singleton factory, batched flushing, plus
+  the `NullMonitoringLogger` no-op fallback.
 - `supertable/logging.py` — JSON / text formatters,
   `configure_logging`, `RequestLoggingMiddleware`, correlation propagation.
-- `supertable/service_registry.py` — process heartbeat keys for service
-  discovery.
+- `supertable/redis_keys.py` — `monitor(org, monitor_type)` and
+  `registry(org, service_type, host, pid)` key builders. The SDK
+  owns the **key shape** only; the actual heartbeat writer lives in
+  `dataisland-core/services/common/service_registry.py` (core
+  services) or in `lighthouse/bootstrap.py` (REST-mediated for
+  Lighthouse).

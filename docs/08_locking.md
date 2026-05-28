@@ -434,7 +434,10 @@ self.catalog.release_simple_lock(org, super_name, simple_name, token)
 The `Staging` and `SuperPipe` classes use inline Redis `SET NX EX` for lighter-weight locking:
 
 ```python
-lock_key = f"supertable:{org}:{sup}:lock:stage:{staging_name}"
+from supertable import redis_keys as RK
+
+lock_key = RK.lock_stage(org, sup, staging_name)
+# → supertable:{org}:lakes:{sup}:lock:stage:doc:{staging_name}
 token = uuid.uuid4().hex
 acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)
 # ... operation ...

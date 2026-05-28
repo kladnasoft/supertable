@@ -71,31 +71,43 @@ pip install supertable[all]         # all cloud backends
 
 ```
 supertable/
-├── audit/               # Audit logging & compliance
-├── config/              # Configuration (env vars, defaults, homedir, settings)
-├── engine/              # Query engines (DuckDB Lite/Pro, Spark Thrift)
-├── locking/             # Distributed locking (Redis + file)
-├── mirroring/           # Table format export (Delta, Iceberg, Parquet)
-├── rbac/                # Role-based access control
-├── storage/             # Storage backends (S3, MinIO, Azure, GCP, Local)
+├── audit/               # Audit logging & compliance (logger, chain, events,
+│                        #   writer_redis, writer_parquet, reader, retention,
+│                        #   admin, consumers, middleware, export, crypto)
+├── config/              # Configuration (settings, defaults, homedir)
+├── demo/                # Runnable quickstart + webshop demos
+├── engine/              # Query engines (DuckDB Lite/Pro, Spark Thrift,
+│                        #   executor, engine_enum, plan_stats, data_estimator)
+├── infra/               # Optional infra scaffolding (minio, redis assets)
+├── locking/             # Distributed locking (Redis + file fallback)
+├── mirroring/           # Table format export (Delta, Iceberg, Parquet,
+│                        #   mirror_formats dispatcher)
+├── rbac/                # Role-based access control (access_control,
+│                        #   filter_builder, permissions, role_manager,
+│                        #   user_manager, row_column_security)
+├── services/            # Reserved for future SDK-side service modules
+├── storage/             # Storage backends (Local, S3, MinIO, Azure, GCP,
+│                        #   storage_interface + storage_factory)
+├── tests/               # Pytest suite — including test_redis_key_prefix.py
+│                        #   which enforces §16 single-source-of-truth
 ├── utils/               # SQL parser, helpers, timer
 ├── super_table.py       # Core coordination class
 ├── simple_table.py      # Versioned append-only table
-├── data_reader.py       # Read interface
-├── data_writer.py       # Write interface
-├── meta_reader.py       # Metadata reading
+├── data_reader.py       # Read facade (engine selection + view chain)
+├── data_writer.py       # Write facade (lock → align → write → audit)
+├── meta_reader.py       # Metadata reading (MetaReader + list_supers / list_tables)
 ├── monitoring_writer.py # Metrics ingestion to Redis lists
-├── processing.py        # Parquet processing engine
-├── redis_catalog.py     # Redis metadata operations
-├── redis_connector.py   # Redis connection management
+├── processing.py        # Parquet processing engine (overlap + tombstones)
+├── redis_catalog.py     # Redis metadata operations + Lua scripts
+├── redis_connector.py   # Redis connection management (standalone + Sentinel)
+├── redis_infra.py       # Settings adapter + runtime-env validation
+├── redis_keys.py        # SINGLE source of truth for all Redis keys
 ├── staging_area.py      # Staging areas for ingestion
-├── super_pipe.py        # Automated ingestion pipes
-├── server_common.py     # Shared helpers
-├── service_registry.py  # Process heartbeat & discovery
-├── plan_extender.py     # Query plan augmentation
+├── super_pipe.py        # Redis-only ingestion pipe definitions
+├── plan_extender.py     # Query plan augmentation (RBAC / dedup / tombstone)
 ├── query_plan_manager.py# Plan persistence
-├── logging.py           # Structured logging
-└── data_classes.py      # Shared data structures
+├── logging.py           # Structured JSON / text logging + middleware
+└── data_classes.py      # Shared data structures (Reflection, *ViewDef, …)
 ```
 
 ## Data Flow
@@ -116,19 +128,21 @@ View Chain (transparent to caller):
 ## Service Registry
 
 Every long-lived process that uses the SDK can register itself in Redis
-with a 30-second TTL key, refreshed every 15 seconds
-(`service_registry.py`). If the process crashes, the key expires
-automatically.
+with a 30-second TTL key, refreshed every 15 seconds. If the process
+crashes, the key expires automatically.
 
-Key pattern:
+Key pattern (built by `redis_keys.registry(...)`):
 `dataisland:{org}:registry:{service_type}:{hostname}:{pid}`
 
-The registry is a **platform concern**, not a SuperTable concern —
-every dataisland-core service plus any SDK-using app (Lighthouse,
-Gatekeeper, …) writes a heartbeat here. The `dataisland:` prefix
-keeps it cleanly separated from the SuperTable SDK's own state under
-`supertable:`. See [16 Redis Key Layout](16_redis_layout.md) for the
-full prefix policy.
+The registry is a **platform concern**, not a SuperTable concern.
+The SDK only owns the **key shape** (in `supertable/redis_keys.py`);
+the actual heartbeat-writer lives in
+`dataisland-core/services/common/service_registry.py` (used by every
+core service — `api`, `webui`, `odata`, `mcp`, `sdk`) and in
+`lighthouse/bootstrap.py` (which heartbeats via the platform REST
+API). The `dataisland:` prefix keeps it cleanly separated from the
+SuperTable SDK's own state under `supertable:`. See
+[16 Redis Key Layout](16_redis_layout.md) for the full prefix policy.
 
 ## Cross-References
 

@@ -1,4 +1,4 @@
-# 19. Format Mirroring
+# 13. Format Mirroring
 
 ## Overview
 
@@ -21,9 +21,12 @@ Mirroring is triggered automatically after every successful write. It is a **lat
 Mirror formats are configured per-SuperTable and stored in Redis:
 
 ```
-Redis key: supertable:{org}:{super}:meta:mirrors
+Redis key: supertable:{org}:lakes:{super}:meta:mirrors
 Value:     {"formats": ["DELTA", "ICEBERG", "PARQUET"], "ts": <epoch_ms>}
 ```
+
+Built by `redis_keys.meta_mirrors(org, sup)`. See
+[16 Redis Key Layout](16_redis_layout.md) for the full hierarchy.
 
 The `MirrorFormats` class provides the configuration API:
 
@@ -144,7 +147,7 @@ Behavior:
 
 ## Source Files
 
-- `/home/kladnasoft/dev/supertable/supertable/mirroring/mirror_formats.py` -- Configuration, dispatch, `MirrorFormats` class.
-- `/home/kladnasoft/dev/supertable/supertable/mirroring/mirror_delta.py` -- Delta Lake writer with Spark schema normalization.
-- `/home/kladnasoft/dev/supertable/supertable/mirroring/mirror_iceberg.py` -- Iceberg-lite JSON writer and standard V2 Avro writer.
-- `/home/kladnasoft/dev/supertable/supertable/mirroring/mirror_parquet.py` -- Plain Parquet directory mirror with efficient copy strategies.
+- `supertable/mirroring/mirror_formats.py` -- Configuration, dispatch, `MirrorFormats` class.
+- `supertable/mirroring/mirror_delta.py` -- Delta Lake writer with Spark schema normalization.
+- `supertable/mirroring/mirror_iceberg.py` -- Iceberg-lite JSON writer and standard V2 Avro writer.
+- `supertable/mirroring/mirror_parquet.py` -- Plain Parquet directory mirror with efficient copy strategies.

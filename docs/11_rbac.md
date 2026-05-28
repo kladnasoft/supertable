@@ -67,7 +67,7 @@ RoleManager(super_name: str, organization: str, redis_catalog: Optional[RedisCat
 ```
 
 On construction, `_init_role_storage()` runs a fast-path check: if the Redis
-meta key `supertable:{org}:{sup}:rbac:roles:meta` already exists and a
+meta key `supertable:{org}:lakes:{sup}:rbac:roles:meta` already exists and a
 superadmin role is present, initialisation is skipped entirely (avoiding 2-3
 Redis round-trips).  Otherwise, a distributed lock (`acquire_simple_lock`) is
 taken and the default **superadmin** role is created:
@@ -408,14 +408,20 @@ All RBAC state lives in Redis under a structured key namespace:
 
 | Key Pattern | Type | Content |
 |-------------|------|---------|
-| `supertable:{org}:{sup}:rbac:roles:meta` | String | Initialisation marker. |
-| `supertable:{org}:{sup}:rbac:roles:index` | Set | All `role_id` values. |
-| `supertable:{org}:{sup}:rbac:roles:doc:{role_id}` | Hash | Role document fields. |
-| `supertable:{org}:{sup}:rbac:roles:name_to_id` | Hash | `role_name.lower()` to `role_id`. |
-| `supertable:{org}:{sup}:rbac:users:meta` | String | Initialisation marker. |
-| `supertable:{org}:{sup}:rbac:users:index` | Set | All `user_id` values. |
-| `supertable:{org}:{sup}:rbac:users:doc:{user_id}` | Hash | User document fields. |
-| `supertable:{org}:{sup}:rbac:users:name_to_id` | Hash | `username.lower()` to `user_id`. |
+| `supertable:{org}:lakes:{sup}:rbac:roles:meta` | Hash | Version + last_updated_ms. |
+| `supertable:{org}:lakes:{sup}:rbac:roles:index` | Set | All `role_id` values. |
+| `supertable:{org}:lakes:{sup}:rbac:roles:doc:{role_id}` | Hash | Role document fields. |
+| `supertable:{org}:lakes:{sup}:rbac:roles:name_to_id` | Hash | `role_name.lower()` to `role_id`. |
+| `supertable:{org}:lakes:{sup}:rbac:roles:type:doc:{role_type}` | Set | Role IDs grouped by type. |
+| `supertable:{org}:lakes:{sup}:rbac:users:meta` | Hash | Version + last_updated_ms. |
+| `supertable:{org}:lakes:{sup}:rbac:users:index` | Set | All `user_id` values. |
+| `supertable:{org}:lakes:{sup}:rbac:users:doc:{user_id}` | Hash | User document fields. |
+| `supertable:{org}:lakes:{sup}:rbac:users:name_to_id` | Hash | `username.lower()` to `user_id`. |
+
+Every key is built by the matching helper in
+`supertable/redis_keys.py` (`rbac_role_*`, `rbac_user_*`). The
+`tests/test_redis_key_prefix.py` regression suite enforces that no
+other module constructs these literals inline.
 
 ---
 

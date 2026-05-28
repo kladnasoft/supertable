@@ -248,14 +248,21 @@ The top-level query plan object. Aggregates all resolved SuperSnapshots with the
 
 ## Metadata-to-Redis Mapping
 
-All metadata is stored in Redis as JSON strings. The key schema follows a consistent namespace:
+All metadata is stored in Redis as JSON strings. The key schema follows the
+v2 hierarchy enforced by `supertable/redis_keys.py` (see
+[16 Redis Key Layout](16_redis_layout.md)):
 
 ```
-supertable:{organization}:{super_name}:meta:root
-supertable:{organization}:{super_name}:meta:leaf:{simple_name}
-supertable:{organization}:{super_name}:meta:mirrors
-supertable:{organization}:{super_name}:meta:table_config:{simple_name}
+supertable:{organization}:lakes:{super_name}:meta:root
+supertable:{organization}:lakes:{super_name}:meta:leaf:doc:{simple_name}
+supertable:{organization}:lakes:{super_name}:meta:mirrors
+supertable:{organization}:lakes:{super_name}:meta:table_config:doc:{simple_name}
+supertable:{organization}:lakes:{super_name}:meta:table_names
 ```
+
+Built by `meta_root()`, `meta_leaf()`, `meta_mirrors()`,
+`meta_table_config()`, and `meta_table_names()` in
+`supertable/redis_keys.py`.
 
 ### meta:root
 

@@ -31,9 +31,12 @@ A staging area is a named, temporary folder within a SuperTable's storage namesp
 ### Redis Metadata
 
 ```
-supertable:{org}:{sup}:meta:staging:{staging_name}     # per-stage metadata (JSON)
-supertable:{org}:{sup}:meta:staging:meta                # index set of all staging names
+supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:meta   # per-stage metadata (STRING)
+supertable:{org}:lakes:{sup}:meta:staging:index                     # index set of all staging names (SET)
 ```
+
+Built by `redis_keys.staging_doc(org, sup, staging_name)` and
+`redis_keys.staging_index(org, sup)`.
 
 ### Staging Class
 
@@ -261,8 +264,8 @@ Removes the pipe from Redis. Returns `True` if the pipe existed and was deleted.
 ### Redis Keys for Pipes
 
 ```
-supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:{pipe_id}    # pipe metadata
-supertable:{org}:{sup}:meta:staging:{staging_name}:pipe:meta          # index set of pipe names
+supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:doc:{pipe_name}   # pipe definition (STRING)
+supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:index             # index set of pipe names (SET)
 ```
 
 ---

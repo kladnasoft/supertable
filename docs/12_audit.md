@@ -335,14 +335,18 @@ recorded hash) to detect further tampering.
 Each organization gets its own Redis Stream:
 
 ```
-supertable:{org}:audit:stream
+supertable:{org}:system:audit:stream
 ```
+
+(built by `redis_keys.audit_stream(org)` — the `system:` segment
+groups every org-level system surface alongside `shares:`, `auth:`,
+and `spark:`).
 
 **`RedisAuditWriter`** manages writes and consumer groups:
 
 * `write_batch(events)` -- pipelined `XADD` with `MAXLEN~` (approximate
   trimming) for bounded memory.
-* Chain head is persisted at `supertable:{org}:audit:chain_head:{instance_id}`.
+* Chain head is persisted at `supertable:{org}:system:audit:chain_head:doc:{instance_id}` (built by `redis_keys.audit_chain_head(org, instance_id)`).
 * An `__archival__` consumer group is created automatically for the internal
   archival worker.
 * External SIEM consumer groups are created on demand (see Section 12.9).
@@ -449,8 +453,8 @@ Legal hold is a global kill switch that prevents **all** audit deletions for
 an organization.
 
 **Resolution order:**
-1. Redis runtime override at key `supertable:{org}:audit:legal_hold`
-   (set by `set_legal_hold()`).
+1. Redis runtime override at key `supertable:{org}:system:audit:legal_hold`
+   (built by `redis_keys.audit_legal_hold(org)`, set by `set_legal_hold()`).
 2. Settings default (`SUPERTABLE_AUDIT_LEGAL_HOLD`).
 
 **Fail-safe:** if both lookups fail, legal hold defaults to **active** (True)
@@ -578,7 +582,8 @@ organization can be toggled independently from the WebUI:
 
 Behind the toggle, the master switch and four sub-toggles (`log_queries`,
 `log_reads`, `hash_chain`, `siem_enabled`) are persisted in Redis at
-`supertable:{org}:audit:config` (HASH), and surfaced via:
+`supertable:{org}:system:audit:config` (HASH, built by
+`redis_keys.audit_config(org)`), and surfaced via:
 
 ```
 GET  /api/v1/audit/config?organization=<org>
@@ -589,7 +594,7 @@ Both endpoints require **superuser** authentication (same gate as legal
 hold).  Flipping the toggle:
 
 * **OFF → ON**: a new `AuditLogger` is lazily created on the next
-  `emit()` and starts writing to `supertable:{org}:audit:stream`.
+  `emit()` and starts writing to `supertable:{org}:system:audit:stream`.
 * **ON → OFF**: the running logger is drained and stopped, replaced
   with a `NullAuditLogger`; subsequent emits are no-ops.
 

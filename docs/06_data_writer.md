@@ -167,8 +167,9 @@ Falls back to `set_leaf_path_cas()` if the payload CAS method is unavailable (ba
 Stores the table schema and name in Redis as permanent metadata:
 
 ```python
-self.catalog.r.set(f"supertable:{org}:{sup}:schema:{simple_name}", schema_json)
-self.catalog.r.sadd(f"supertable:{org}:{sup}:table_names", simple_name)
+# Via redis_keys.schema(org, sup, simple_name) and redis_keys.meta_table_names(org, sup):
+self.catalog.r.set(RK.schema(org, sup, simple_name), schema_json)         # supertable:{org}:lakes:{sup}:schema:doc:{simple_name}
+self.catalog.r.sadd(RK.meta_table_names(org, sup), simple_name)           # supertable:{org}:lakes:{sup}:meta:table_names
 ```
 
 #### 14. Mirroring (`mirror`)
