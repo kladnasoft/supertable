@@ -115,6 +115,21 @@ Every write produces a new immutable snapshot file. Snapshots are never overwrit
 1. **Version 0** -- Created by `SimpleTable.init_simple_table()`. Empty `schema` and `resources`.
 2. **Version N+1** -- Created by `SimpleTable.update()`. Merges new resources, removes sunset files, updates schema from the model DataFrame.
 
+### Snapshot Retention
+
+By default the snapshot JSONs accumulate forever — every write's
+`previous_snapshot` field forms an unbounded linked list back to v0,
+and sunset parquet files (replaced during compaction) are left on
+storage. Set `SUPERTABLE_SNAPSHOT_RETENTION=N` to keep only the **N**
+most recent snapshots; set `SUPERTABLE_SUNSET_GC_ENABLED=true` to
+also queue sunset parquets for deletion. In both cases the writer
+pushes the deletion candidates onto a per-table Redis stream after
+the leaf-CAS commit, and a separate orchestrator
+(`GCCleaner.tick()` — chap. 17) physically deletes them after a
+safety delay window long enough that any in-flight reader has
+finished. Both flags are off by default; with neither set, behaviour
+is identical to a pre-GC SDK build.
+
 ### CAS (Compare-and-Swap) Pointer Update
 
 The Redis leaf pointer is updated atomically via a Lua script (`_LUA_LEAF_CAS_SET` or `_LUA_LEAF_PAYLOAD_CAS_SET` in `RedisCatalog`). The script reads the current version, increments it, and writes the new value in a single atomic Redis operation, preventing lost updates under concurrency.

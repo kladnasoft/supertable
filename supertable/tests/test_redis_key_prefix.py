@@ -132,14 +132,25 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("linked_share_doc",             RK.linked_share_doc(ORG, SUP, LINK),  f"{lake_pre}:linked_shares:doc:{LINK}"),
         ("quality_prefix",               RK.quality_prefix(ORG, SUP),          f"{lake_pre}:quality:"),
 
-        # ---- Monitoring (org-level, closed set) ------------------------
-        ("monitor",                      RK.monitor(ORG, "plans"),             f"supertable:{ORG}:monitor:plans"),
-        ("monitor_writes",               RK.monitor(ORG, "writes"),            f"supertable:{ORG}:monitor:writes"),
-        ("monitor_mcp",                  RK.monitor(ORG, "mcp"),               f"supertable:{ORG}:monitor:mcp"),
-        ("monitor_odata",                RK.monitor(ORG, "odata"),             f"supertable:{ORG}:monitor:odata"),
-        ("monitor_errors",               RK.monitor(ORG, "errors"),            f"supertable:{ORG}:monitor:errors"),
-        ("monitor_locks",                RK.monitor(ORG, "locks"),             f"supertable:{ORG}:monitor:locks"),
-        ("monitor_pattern_for_org",      RK.monitor_pattern_for_org(ORG),      f"supertable:{ORG}:monitor:*"),
+        # ---- Monitoring (org-level, closed set, daily-partitioned) ----
+        ("monitor_partition_plans",      RK.monitor_partition(ORG, "plans", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:plans:doc:2026-06-09"),
+        ("monitor_partition_writes",     RK.monitor_partition(ORG, "writes", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:writes:doc:2026-06-09"),
+        ("monitor_partition_mcp",        RK.monitor_partition(ORG, "mcp", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:mcp:doc:2026-06-09"),
+        ("monitor_partition_odata",      RK.monitor_partition(ORG, "odata", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:odata:doc:2026-06-09"),
+        ("monitor_partition_errors",     RK.monitor_partition(ORG, "errors", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:errors:doc:2026-06-09"),
+        ("monitor_partition_locks",      RK.monitor_partition(ORG, "locks", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:locks:doc:2026-06-09"),
+        ("monitor_partition_drain",      RK.monitor_partition_drain(ORG, "writes", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:writes:doc:2026-06-09:_drain"),
+        ("monitor_partition_pattern",    RK.monitor_partition_pattern(ORG, "writes"),
+                                                                               f"supertable:{ORG}:monitor:writes:doc:*"),
+        ("monitor_partition_pattern_for_org", RK.monitor_partition_pattern_for_org(ORG),
+                                                                               f"supertable:{ORG}:monitor:*:doc:*"),
 
         # ---- Platform: dataisland: --------------------------------------
         ("registry",                     RK.registry(ORG, "api", "host1", 1234), f"dataisland:{ORG}:registry:api:host1:1234"),
@@ -326,20 +337,21 @@ def test_constructors_reject_unsafe_sup():
         RK.meta_root("acme", "with:colon")
 
 
-def test_monitor_rejects_unknown_type():
+def test_monitor_partition_rejects_unknown_type():
     with pytest.raises(ValueError):
-        RK.monitor("acme", "bogus")
+        RK.monitor_partition("acme", "bogus", "2026-06-09")
 
 
-def test_monitor_lives_at_org_level():
+def test_monitor_partition_lives_at_org_level():
     """Monitoring is org-wide; the supertable scope does not appear in the key.
 
     Cross-supertable queries record one canonical entry per query;
     attribution is preserved in the entry's ``supertables: [...]``
-    field, not in the Redis key.
+    field, not in the Redis key. The partition (date) suffix bounds
+    Redis growth to one day per (org, monitor_type).
     """
-    key = RK.monitor("acme", "writes")
-    assert key == "supertable:acme:monitor:writes"
+    key = RK.monitor_partition("acme", "writes", "2026-06-09")
+    assert key == "supertable:acme:monitor:writes:doc:2026-06-09"
     # No "lakes" or "system" segment, no super_name segment.
     assert ":lakes:" not in key
     assert ":system:" not in key
@@ -419,6 +431,44 @@ def test_parse_gc_pending_key_returns_none_for_other_keys():
     assert RK.parse_gc_pending_key("supertable:acme:lakes:demo:gc:pending:doc:") is None
     assert RK.parse_gc_pending_key("") is None
     assert RK.parse_gc_pending_key(None) is None  # type: ignore[arg-type]
+
+
+def test_parse_monitor_partition_key_extracts_fields():
+    key = RK.monitor_partition("acme", "writes", "2026-06-09")
+    assert RK.parse_monitor_partition_key(key) == ("acme", "writes", "2026-06-09")
+
+
+def test_parse_monitor_partition_key_returns_none_for_other_keys():
+    assert RK.parse_monitor_partition_key(RK.meta_root("acme", "demo")) is None
+    assert RK.parse_monitor_partition_key(RK.gc_pending("acme", "demo", "t")) is None
+    # Drain handle is rejected (7 segments, not 6)
+    assert RK.parse_monitor_partition_key(
+        RK.monitor_partition_drain("acme", "writes", "2026-06-09")
+    ) is None
+    # Invalid monitor_type
+    assert RK.parse_monitor_partition_key(
+        "supertable:acme:monitor:bogus:doc:2026-06-09"
+    ) is None
+    # Invalid date format
+    assert RK.parse_monitor_partition_key(
+        "supertable:acme:monitor:writes:doc:not-a-date"
+    ) is None
+    assert RK.parse_monitor_partition_key("") is None
+    assert RK.parse_monitor_partition_key(None) is None  # type: ignore[arg-type]
+
+
+def test_monitor_partition_rejects_invalid_monitor_type():
+    with pytest.raises(ValueError):
+        RK.monitor_partition("acme", "garbage", "2026-06-09")
+
+
+def test_monitor_partition_rejects_invalid_date():
+    with pytest.raises(ValueError):
+        RK.monitor_partition("acme", "writes", "not-a-date")
+    with pytest.raises(ValueError):
+        RK.monitor_partition("acme", "writes", "2026/06/09")
+    with pytest.raises(ValueError):
+        RK.monitor_partition("acme", "writes", "")
 
 
 # ---------------------------------------------------------------------------

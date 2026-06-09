@@ -6,9 +6,27 @@ from typing import Dict, Any, Tuple
 
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.engine.plan_stats import PlanStats
+from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter
 
 logger = logging.getLogger(__name__)
+
+
+def _query_targets_sink_table(original_table: str) -> bool:
+    """True if any of the comma-joined targets in ``original_table``
+    is a monitoring sink table.
+
+    ``original_table`` is built in ``data_reader.execute()`` as
+    ``", ".join(t.simple_name for t in physical_tables)``. We split it
+    back and check each name against :data:`MONITORING_SINK_TABLES`.
+    Defensive against whitespace and empty strings.
+    """
+    if not original_table:
+        return False
+    for name in original_table.split(","):
+        if name.strip() in MONITORING_SINK_TABLES:
+            return True
+    return False
 
 
 def _safe_json(obj: Any) -> str:
@@ -126,16 +144,25 @@ def extend_execution_plan(
     # Log the metric (buffered; background writer flushes).
     # Monitoring is org-wide as of SDK 2.2.0 — the touched supertable
     # is recorded in the payload's ``supertables: [str]`` field.
-    try:
-        stats["supertables"] = [query_plan_manager.super_name]
-        with MonitoringWriter(
-            organization=query_plan_manager.organization,
-            monitor_type="plans",
-        ) as monitor:
-            monitor.log_metric(stats)
-            logger.debug("Extended plan metrics queued for logging.")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Monitoring logging failed (non-fatal): %s", e)
+    #
+    # Loop guard: SELECTs that target a monitoring sink table
+    # (``__writes__``/``__reads__``/``__mcp__``/``__plans__``) skip
+    # the plans-metric emission. The orchestrator analysing the sink
+    # tables would otherwise generate fresh ``plans`` partitions for
+    # tomorrow's flush, leading to slow amplification.
+    if _query_targets_sink_table(stats.get("table_name", "")):
+        logger.debug("Skipping plans metric for sink-table query")
+    else:
+        try:
+            stats["supertables"] = [query_plan_manager.super_name]
+            with MonitoringWriter(
+                organization=query_plan_manager.organization,
+                monitor_type="plans",
+            ) as monitor:
+                monitor.log_metric(stats)
+                logger.debug("Extended plan metrics queued for logging.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Monitoring logging failed (non-fatal): %s", e)
 
     # Delete the raw plan JSON from local disk (best-effort)
     try:

@@ -1,40 +1,42 @@
 # route: supertable.gc.cleaner
 """
-Consumer side of the deferred-deletion GC pipeline.
+GC orchestration primitives — the **library** surface.
 
-A ``GCCleaner`` is a long-running daemon, one per organisation. On each
-tick it walks every per-table GC stream in its org, drains entries older
-than ``SUPERTABLE_GC_DELAY_SEC``, calls ``storage.delete()`` on each
-referenced path, and ``XDEL``s the processed entries. Then it sleeps for
-``SUPERTABLE_GC_SLEEP_SEC`` and starts again — the same shape as MSSQL's
-CHECKPOINT or PostgreSQL's autovacuum.
+This module exposes :class:`GCCleaner`, a pure orchestration object
+whose only state-modifying operation is :meth:`GCCleaner.tick`. One
+``tick()`` is one full pass over the org's per-table GC streams: drain
+entries older than the configured delay, ``storage.delete()`` each
+referenced path, ``XDEL`` the processed entries, return a stats dict.
 
-The delay window is the safety guarantee: by the time the cleaner
-touches a file, any in-flight reader that resolved the leaf payload
-before the writer committed has long since finished. We never delete a
-file that's still reachable from any reader's plan.
+The expected usage pattern is **caller-owned scheduling** — your
+service decides when to call ``tick()``:
 
-CLI
----
-Run as a process:
+    cleaner = GCCleaner(org="acme", catalog=catalog, storage=storage,
+                       delay_sec=1800, batch_size=500)
+    while not service.shutdown_requested:
+        stats = cleaner.tick()
+        service.publish_metrics(stats)
+        service.sleep(60)
 
-    python -m supertable.gc.cleaner --org acme
-    python -m supertable.gc.cleaner --all-orgs
+For deployments that don't already have a scheduler, the convenience
+daemon in :mod:`supertable.gc.daemon` wraps this class with a
+``run_forever`` loop and a CLI entrypoint. **Most deployments should
+prefer calling ``tick()`` directly from their own scheduler** —
+running ``run_forever`` is just here so that single-node installs
+have a one-command setup path.
 
-``--all-orgs`` discovers orgs by SCANning ``gc_pending_pattern_all_orgs``
-and spawns one cleaner thread per discovered org. New orgs that appear
-after startup are picked up at the next discovery refresh
-(``--discover-every-sec``).
+The delay window (``SUPERTABLE_GC_DELAY_SEC``) is the safety
+guarantee: by the time the cleaner touches a file, any in-flight
+reader that resolved the leaf payload before the writer committed has
+long since finished. We never delete a file that's still reachable
+from any reader's plan.
 """
 from __future__ import annotations
 
-import argparse
 import logging
-import signal
-import sys
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from supertable import redis_keys as RK
 from supertable.config.settings import settings
@@ -62,7 +64,16 @@ def _decode_fields(fields: Dict[Any, Any]) -> Dict[str, str]:
 
 
 class GCCleaner:
-    """Per-org cleaner daemon.
+    """Per-org cleaner — orchestration primitive.
+
+    Calling :meth:`tick` performs one full pass over the org's GC
+    streams. It is intentionally **pure orchestration**: no loops, no
+    threads, no signal handlers. The caller's service is expected to
+    own scheduling, retries, and shutdown.
+
+    For deployments that don't have an external scheduler, the
+    convenience wrapper in :mod:`supertable.gc.daemon` adds a
+    ``run_forever`` loop and a CLI entrypoint on top of this class.
 
     Parameters
     ----------
@@ -75,7 +86,8 @@ class GCCleaner:
     delay_sec, sleep_sec, batch_size:
         Override the corresponding ``settings.*`` defaults. Useful for
         tests; production code should leave these as ``None`` and pick
-        up the env-driven settings.
+        up the env-driven settings. ``sleep_sec`` is only consulted by
+        the daemon wrapper and has no effect on ``tick()`` itself.
     """
 
     def __init__(
@@ -103,41 +115,23 @@ class GCCleaner:
         if self.batch_size < 1:
             self.batch_size = 1
 
+        # ``_stop`` is consulted by :meth:`tick` between streams so the
+        # daemon wrapper (or a test) can interrupt a long-running tick.
+        # The library surface itself never touches it after init.
         self._stop = threading.Event()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Signal the daemon loop to exit at the next iteration."""
-        self._stop.set()
+        """Signal an in-progress :meth:`tick` to bail early.
 
-    def run_forever(self) -> None:
-        """Loop: tick, sleep, repeat — until ``stop()`` is called."""
-        logger.info(
-            "[gc-cleaner] org=%s starting (delay=%ds sleep=%ds batch=%d)",
-            self.org, self.delay_sec, self.sleep_sec, self.batch_size,
-        )
-        while not self._stop.is_set():
-            try:
-                stats = self.tick()
-                if stats["deleted"] or stats["streams_processed"]:
-                    logger.info(
-                        "[gc-cleaner] org=%s tick: streams=%d deleted=%d (parquet=%d snapshot=%d) errors=%d",
-                        self.org,
-                        stats["streams_processed"],
-                        stats["deleted"],
-                        stats["deleted_parquet"],
-                        stats["deleted_snapshot"],
-                        stats["errors"],
-                    )
-            except Exception as e:  # noqa: BLE001 — daemon must never die
-                logger.error("[gc-cleaner] org=%s tick failed: %s", self.org, e)
-            # Sleep in 1-second chunks so stop() interrupts promptly
-            for _ in range(self.sleep_sec):
-                if self._stop.is_set():
-                    break
-                time.sleep(1)
-        logger.info("[gc-cleaner] org=%s stopped", self.org)
+        Used by the daemon wrapper and tests. After calling ``stop()``,
+        a subsequent ``tick()`` returns as soon as the current stream
+        finishes. The stop flag is not auto-reset — to re-use the
+        cleaner after a stop, instantiate a new one (cheap; no
+        persistent state).
+        """
+        self._stop.set()
 
     # ── One pass ─────────────────────────────────────────────────────
 
@@ -146,6 +140,12 @@ class GCCleaner:
 
         Stats keys: ``streams_processed``, ``deleted``,
         ``deleted_parquet``, ``deleted_snapshot``, ``errors``.
+
+        Idempotent: re-calling produces the same effect if no new
+        entries appeared. Safe to call concurrently from multiple
+        processes — the worst case is two cleaners XDEL-ing the same
+        entry (Redis tolerates this) and double-attempting a
+        ``storage.delete`` (also idempotent via ``FileNotFoundError``).
         """
         stats = {
             "streams_processed": 0,
@@ -255,192 +255,4 @@ class GCCleaner:
         return deleted, by_kind
 
 
-# ── --all-orgs runner ────────────────────────────────────────────────
-
-
-def _discover_orgs(catalog: Any) -> Set[str]:
-    """SCAN across every org and return the set of orgs that have at
-    least one GC stream key."""
-    r = getattr(catalog, "r", None)
-    if r is None:
-        return set()
-    orgs: Set[str] = set()
-    pattern = RK.gc_pending_pattern_all_orgs()
-    try:
-        for key in r.scan_iter(match=pattern, count=512):
-            decoded = _decode(key)
-            parsed = RK.parse_gc_pending_key(decoded)
-            if parsed is not None:
-                orgs.add(parsed[0])
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[gc-cleaner] org discovery SCAN failed: %s", e)
-    return orgs
-
-
-def run_all_orgs(
-    catalog: Any,
-    storage: Any,
-    *,
-    delay_sec: Optional[int] = None,
-    sleep_sec: Optional[int] = None,
-    batch_size: Optional[int] = None,
-    discover_every_sec: int = 300,
-    stop_event: Optional[threading.Event] = None,
-) -> None:
-    """Spawn one ``GCCleaner`` thread per discovered org and re-scan
-    periodically to pick up new orgs.
-
-    Tenant isolation: each org gets its own thread; a slow storage
-    backend on one org cannot block deletes on another.
-
-    Args:
-        catalog, storage: as for ``GCCleaner``.
-        delay_sec, sleep_sec, batch_size: forwarded to each cleaner.
-        discover_every_sec: how often to re-scan for new orgs.
-        stop_event: external stop signal; one is created if omitted.
-    """
-    stop = stop_event or threading.Event()
-    threads: Dict[str, Tuple[GCCleaner, threading.Thread]] = {}
-
-    def _spawn(org: str) -> None:
-        c = GCCleaner(
-            org=org,
-            catalog=catalog,
-            storage=storage,
-            delay_sec=delay_sec,
-            sleep_sec=sleep_sec,
-            batch_size=batch_size,
-        )
-        t = threading.Thread(
-            target=c.run_forever,
-            name=f"gc-cleaner-{org}",
-            daemon=True,
-        )
-        threads[org] = (c, t)
-        t.start()
-        logger.info("[gc-cleaner-all] spawned thread for org=%s", org)
-
-    # Initial discovery
-    for org in _discover_orgs(catalog):
-        if org not in threads:
-            _spawn(org)
-
-    # Periodic re-discovery
-    while not stop.is_set():
-        slept = 0
-        while slept < discover_every_sec and not stop.is_set():
-            time.sleep(1)
-            slept += 1
-        if stop.is_set():
-            break
-        for org in _discover_orgs(catalog):
-            if org not in threads:
-                _spawn(org)
-
-    # Shutdown
-    logger.info("[gc-cleaner-all] stopping %d cleaner thread(s)", len(threads))
-    for c, _t in threads.values():
-        c.stop()
-    for _c, t in threads.values():
-        t.join(timeout=10)
-
-
-# ── CLI entrypoint ───────────────────────────────────────────────────
-
-
-def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="python -m supertable.gc.cleaner",
-        description=(
-            "Drain Redis GC streams and physically delete sunset parquets "
-            "+ pruned snapshot JSONs. Runs forever; one thread per org."
-        ),
-    )
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--org", help="Run a single cleaner for this organisation.")
-    group.add_argument(
-        "--all-orgs",
-        action="store_true",
-        help="Discover all orgs with pending GC entries and spawn one cleaner each.",
-    )
-    p.add_argument(
-        "--delay-sec", type=int, default=None,
-        help=f"Override SUPERTABLE_GC_DELAY_SEC (default {settings.SUPERTABLE_GC_DELAY_SEC}).",
-    )
-    p.add_argument(
-        "--sleep-sec", type=int, default=None,
-        help=f"Override SUPERTABLE_GC_SLEEP_SEC (default {settings.SUPERTABLE_GC_SLEEP_SEC}).",
-    )
-    p.add_argument(
-        "--batch-size", type=int, default=None,
-        help=f"Override SUPERTABLE_GC_BATCH_SIZE (default {settings.SUPERTABLE_GC_BATCH_SIZE}).",
-    )
-    p.add_argument(
-        "--discover-every-sec", type=int, default=300,
-        help="(--all-orgs only) Seconds between org re-discovery scans (default 300).",
-    )
-    p.add_argument(
-        "--log-level", default="INFO",
-        help="Logging level (DEBUG, INFO, WARNING, ERROR). Default INFO.",
-    )
-    return p
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-    # Late imports so unit tests can monkey-patch before main() runs and
-    # so the module can be imported without requiring storage credentials.
-    from supertable.redis_catalog import RedisCatalog
-    from supertable.storage.storage_factory import get_storage
-
-    catalog = RedisCatalog()
-    storage = get_storage()
-
-    stop_event = threading.Event()
-
-    def _on_signal(signum, _frame):  # noqa: ANN001
-        logger.info("[gc-cleaner] received signal %s — stopping", signum)
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
-
-    if args.all_orgs:
-        run_all_orgs(
-            catalog=catalog,
-            storage=storage,
-            delay_sec=args.delay_sec,
-            sleep_sec=args.sleep_sec,
-            batch_size=args.batch_size,
-            discover_every_sec=args.discover_every_sec,
-            stop_event=stop_event,
-        )
-    else:
-        cleaner = GCCleaner(
-            org=args.org,
-            catalog=catalog,
-            storage=storage,
-            delay_sec=args.delay_sec,
-            sleep_sec=args.sleep_sec,
-            batch_size=args.batch_size,
-        )
-        # Bridge signal → cleaner.stop
-        def _on_signal_single(signum, _frame):  # noqa: ANN001
-            logger.info("[gc-cleaner] received signal %s — stopping", signum)
-            cleaner.stop()
-            stop_event.set()
-        signal.signal(signal.SIGINT, _on_signal_single)
-        signal.signal(signal.SIGTERM, _on_signal_single)
-        cleaner.run_forever()
-
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+__all__ = ["GCCleaner"]

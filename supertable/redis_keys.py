@@ -827,39 +827,124 @@ def quality_prefix(org: str, sup: str) -> str:
 
 
 # --- Monitoring ------------------------------------------------------------ #
+#
+# Monitoring data is stored in **daily-partitioned** Redis LISTs. The
+# writer pushes to a key suffixed with the current UTC date; an external
+# orchestrator drains older partitions to internal sink tables
+# (``__writes__``, ``__reads__``, ``__mcp__``, ``__plans__``) and deletes
+# the source keys. This bounds Redis growth to roughly one day per
+# (org, monitor_type) and gives the orchestrator clean handles to grab.
+#
+# Key layout::
+#
+#     supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}    LIST  partition
+#     supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}:_drain
+#                                                                LIST  in-progress drain handle
+#
+# The ``:_drain`` suffix is the rename target used by chunked iteration
+# to take an atomic snapshot of a partition before reading it in pieces.
 
 _VALID_MONITOR_TYPES: FrozenSet[str] = frozenset(
     {"plans", "writes", "mcp", "odata", "errors", "locks"}
 )
 
+# ISO 8601 calendar date (``YYYY-MM-DD``). Anything else is rejected — the
+# date is part of the key, so a malformed value would land in storage as
+# a key we can't parse back.
+_DATE_RE: re.Pattern[str] = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-def monitor(org: str, monitor_type: str) -> str:
-    """Org-wide monitoring LIST.
 
-    Lives at ``supertable:{org}:monitor:{monitor_type}`` — *one level
-    above* the supertable scope. A cross-supertable query (e.g. a
-    JOIN across ``sales`` and ``customers``) writes **one** canonical
-    entry; the affected supertables are recorded in the entry payload
-    under a ``supertables: List[str]`` field so per-supertable views
-    can filter at read time.
-
-    ``monitor_type`` comes from a closed SDK-defined set
-    (``plans | writes | mcp | odata | errors | locks``).
-    """
+def _safe_monitor_type(monitor_type: str) -> str:
     if monitor_type not in _VALID_MONITOR_TYPES:
         raise ValueError(
             f"Invalid monitor_type {monitor_type!r}; "
             f"must be one of {sorted(_VALID_MONITOR_TYPES)}"
         )
+    return monitor_type
+
+
+def _safe_date(date: str) -> str:
+    if not isinstance(date, str) or not _DATE_RE.match(date):
+        raise ValueError(
+            f"Invalid date {date!r}; must be ISO 8601 YYYY-MM-DD"
+        )
+    return date
+
+
+def monitor_partition(org: str, monitor_type: str, date: str) -> str:
+    """Per-day monitoring LIST (STRING key, LIST value).
+
+    Lives at ``supertable:{org}:monitor:{type}:doc:{date}``. The writer
+    ``RPUSH``-es JSON payloads to ``date = today (UTC)``. An external
+    orchestrator drains older partitions via the helpers in
+    ``supertable.monitoring.partitions``.
+    """
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
-        f":{MONITOR_SCOPE}:{monitor_type}"
+        f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}"
+        f":doc:{_safe_date(date)}"
     )
 
 
-def monitor_pattern_for_org(org: str) -> str:
-    """SCAN pattern matching every monitor list in one org."""
-    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{MONITOR_SCOPE}:*"
+def monitor_partition_drain(org: str, monitor_type: str, date: str) -> str:
+    """Drain handle for chunked iteration over one partition.
+
+    During ``iter_partition_chunks`` the source key is ``RENAME``-d to
+    this handle. That gives the chunked iterator an atomic snapshot
+    while leaving the source key free for new writes (which would
+    otherwise be lost mid-iteration). The handle is deleted when the
+    iterator exhausts.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}"
+        f":doc:{_safe_date(date)}:_drain"
+    )
+
+
+def monitor_partition_pattern(org: str, monitor_type: str) -> str:
+    """SCAN pattern matching every partition for one (org, monitor_type)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}:doc:*"
+    )
+
+
+def monitor_partition_pattern_for_org(org: str) -> str:
+    """SCAN pattern matching every monitoring partition in one org."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:*:doc:*"
+    )
+
+
+def parse_monitor_partition_key(key: str) -> Optional[Tuple[str, str, str]]:
+    """Extract ``(org, monitor_type, date)`` from a monitor partition key.
+
+    Returns ``None`` when the key does not match the
+    ``supertable:{org}:monitor:{type}:doc:{date}`` shape. The ``:_drain``
+    handle variant is also rejected (it would round-trip back as a
+    six-segment key with ``_drain`` at the tail).
+
+    This is the canonical way for an orchestrator to walk SCAN output
+    and recover the per-day coordinates without re-implementing the
+    parse rules.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split(":")
+    # supertable : {org} : monitor : {type} : doc : {date}
+    if (
+        len(parts) == 6
+        and parts[0] == SUPERTABLE_PREFIX
+        and parts[2] == MONITOR_SCOPE
+        and parts[4] == "doc"
+        and parts[1]
+        and parts[3] in _VALID_MONITOR_TYPES
+        and _DATE_RE.match(parts[5] or "")
+    ):
+        return parts[1], parts[3], parts[5]
+    return None
 
 
 # =========================================================================== #

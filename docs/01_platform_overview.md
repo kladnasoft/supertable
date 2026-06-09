@@ -96,7 +96,10 @@ supertable/
 ├── data_reader.py       # Read facade (engine selection + view chain)
 ├── data_writer.py       # Write facade (lock → align → write → audit)
 ├── meta_reader.py       # Metadata reading (MetaReader + list_supers / list_tables)
-├── monitoring_writer.py # Metrics ingestion to Redis lists
+├── monitoring_writer.py # Daily-partitioned metric ingestion to Redis LISTs
+├── monitoring/          # Drain orchestration primitives + sink-table set
+├── gc/                  # Deferred-delete cleaner library + daemon wrapper
+├── errors.py            # Public exceptions (SuperTableNotFoundError, …)
 ├── processing.py        # Parquet processing engine (overlap + tombstones)
 ├── redis_catalog.py     # Redis metadata operations + Lua scripts
 ├── redis_connector.py   # Redis connection management (standalone + Sentinel)
@@ -160,5 +163,7 @@ SuperTable SDK's own state under `supertable:`. See
 | [11 RBAC](11_rbac.md) | Roles, users, row/column-level security |
 | [12 Audit](12_audit.md) | Compliance logging, hash chains, SIEM |
 | [13 Mirroring](13_mirroring.md) | Delta Lake, Iceberg, Parquet export |
-| [14 Monitoring](14_monitoring.md) | Metrics ingestion |
+| [14 Monitoring](14_monitoring.md) | Daily-partitioned metrics + drain orchestration |
 | [15 Python SDK](15_python_sdk.md) | pip package usage |
+| [16 Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy |
+| [17 Storage GC](17_gc.md) | Deferred deletion of sunset parquets + old snapshots |

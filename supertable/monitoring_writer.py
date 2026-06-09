@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from datetime import datetime, timezone
 
 from supertable.config.settings import settings
 import queue
@@ -106,6 +107,17 @@ class NullMonitoringLogger:
         return False
 
 
+def _today_utc_date() -> str:
+    """UTC ISO-8601 calendar date (``YYYY-MM-DD``).
+
+    Computed fresh on every call — never cached. Cheap (microseconds)
+    and avoids the edge case where a writer thread keeps writing to
+    yesterday's partition after midnight because the date was cached
+    at thread start.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 @dataclass(frozen=True)
 class _MonitorKey:
     organization: str
@@ -113,17 +125,25 @@ class _MonitorKey:
 
     @property
     def path_key(self) -> str:
-        # Matches the log style: "org/monitor_type"
+        # Matches the log style: "org/monitor_type". Used as the cache
+        # key for the singleton ``_MONITORS`` registry — the partition
+        # date is deliberately NOT part of this key so one logger per
+        # (org, type) handles the daily roll-over by recomputing the
+        # Redis key per push.
         return f"{self.organization}/{self.monitor_type}"
 
-    @property
-    def redis_list_key(self) -> str:
-        # v2.2: org-wide monitoring lives at position 2.
-        #   supertable:{org}:monitor:{monitor_type}
-        # Cross-supertable queries record exactly one canonical entry
-        # here; attribution is preserved in the payload's
-        # ``supertables: [str]`` field.
-        return RK.monitor(self.organization, self.monitor_type)
+    def redis_list_key_today(self) -> str:
+        """Resolve the Redis key for today's partition.
+
+        Layout: ``supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD}``.
+        Each batch ship computes this fresh so a writer that runs
+        across midnight naturally rolls into the new day's partition.
+        Yesterday's partition is left untouched for the external
+        orchestrator (``supertable.monitoring.partitions``) to drain.
+        """
+        return RK.monitor_partition(
+            self.organization, self.monitor_type, _today_utc_date(),
+        )
 
 
 class _AsyncMonitoringLogger:
@@ -373,14 +393,22 @@ class _AsyncMonitoringLogger:
         Ship a batch.  Only counts items as processed after successful delivery.
         On total failure (Redis down, fallback also fails), items are counted as
         dropped so stats remain accurate.
+
+        Each batch resolves the target Redis key fresh via
+        ``_MonitorKey.redis_list_key_today()`` — that picks today's
+        partition under the daily-partitioned key layout
+        (``supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD}``). A batch
+        that crosses the UTC day boundary lands on whichever side of
+        midnight the resolution runs; nothing is lost.
         """
         shipped = 0
         if self._ship_to_redis and self._redis is not None:
             try:
+                target_key = self._key.redis_list_key_today()
                 pipe = self._redis.r.pipeline()
                 for payload in batch:
                     s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                    pipe.rpush(self._key.redis_list_key, s)
+                    pipe.rpush(target_key, s)
                 pipe.execute()
                 shipped = len(batch)
             except Exception:
@@ -412,7 +440,7 @@ class _AsyncMonitoringLogger:
 
         s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         # RedisConnector in your code exposes "r" as the redis client.
-        self._redis.r.rpush(self._key.redis_list_key, s)
+        self._redis.r.rpush(self._key.redis_list_key_today(), s)
 
 
 # ---- singleton cache (one worker per key) ----

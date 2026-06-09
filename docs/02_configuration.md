@@ -259,6 +259,26 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 | `SUPERTABLE_SHARE_PRESIGN_TTL` | int | `14400` (4 hours) | Presigned URL TTL |
 | `SUPERTABLE_SHARE_REFRESH_BUFFER` | int | `600` (10 min) | Refresh buffer before expiry |
 
+### Storage GC
+
+Sunset parquet files (replaced during compaction) and old snapshot
+JSONs are never deleted by the writer directly. When either flag is
+enabled, the writer XADDs the paths onto a per-table Redis STREAM
+after a successful leaf-CAS commit. A separate orchestrator
+(`GCCleaner.tick()` — see chap. 17) drains entries older than the
+delay window and calls `storage.delete()`. The delay avoids the race
+where an in-flight reader's `parquet_scan([...])` resolves a path
+just before the writer deletes it. **All defaults preserve the
+pre-existing behaviour (off / unbounded).**
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERTABLE_SNAPSHOT_RETENTION` | int | `0` | Number of snapshot JSONs to keep per simple table. `0` = unlimited. With `N > 0`, snapshots older than the `N`-th most recent are queued for deletion. |
+| `SUPERTABLE_SUNSET_GC_ENABLED` | bool | `false` | When `true`, sunset parquet files are queued for deletion. When `false`, they remain on storage forever (pre-existing behaviour). |
+| `SUPERTABLE_GC_DELAY_SEC` | int | `1800` (30 min) | Minimum age before the cleaner deletes an entry. Wide enough that any in-flight DuckDB `parquet_scan` has finished. |
+| `SUPERTABLE_GC_SLEEP_SEC` | int | `60` | Cleaner-daemon loop sleep between ticks. Consulted only by the convenience daemon (`supertable.gc.daemon`); the `tick()` library primitive doesn't loop. |
+| `SUPERTABLE_GC_BATCH_SIZE` | int | `500` | Max entries the cleaner processes per stream per tick. |
+
 ## Fallback Chains
 
 Several settings have fallback logic for backward compatibility:

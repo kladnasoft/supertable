@@ -61,7 +61,8 @@ def write(
 ```
 access_check --> convert --> dedup_ts --> validate --> lock --> snapshot
     --> overlap --> newer_than --> process --> update_simple
-    --> bump_root --> mirror --> unlock --> monitoring --> audit
+    --> bump_root --> gc_enqueue --> mirror --> unlock --> monitoring
+    --> audit
 ```
 
 #### 1. Access Control (`access`)
@@ -162,6 +163,43 @@ Two atomic Redis operations:
 
 Falls back to `set_leaf_path_cas()` if the payload CAS method is unavailable (backward compatibility).
 
+#### 12.5. Deferred-Deletion Enqueue (`gc_enqueue`)
+
+Immediately after the leaf-CAS + root-bump (the new snapshot is now
+the authoritative state), the writer pushes deletion candidates onto
+the per-table GC stream. **Both checks are gated by env vars and are
+off by default** (chap. 17):
+
+```python
+# Sunset parquets (files that were replaced by this commit)
+if settings.SUPERTABLE_SUNSET_GC_ENABLED and sunset_files:
+    enqueue_deletions(self.catalog, org, sup, simple_name,
+                      "parquet", list(sunset_files), write_id=qid)
+
+# Old snapshot JSONs beyond the retention window
+if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
+    old_paths = collect_old_snapshot_paths(
+        new_snapshot_dict, self.super_table.storage,
+        settings.SUPERTABLE_SNAPSHOT_RETENTION,
+    )
+    if old_paths:
+        enqueue_deletions(self.catalog, org, sup, simple_name,
+                          "snapshot", old_paths, write_id=qid)
+```
+
+The whole block is wrapped in `try/except` — a GC enqueue failure
+must never fail a write (e.g. a transient Redis pipeline error leaves
+the files in place, which is identical to today's behaviour).
+
+**Strict ordering matters.** Enqueueing must happen **after** the
+leaf-CAS, never before. If XADD succeeded first and the CAS then
+failed in a retry, the stream would point at files still referenced
+by the live snapshot, and the cleaner would silently delete data. The
+reverse order (CAS first, XADD second) has only one failure mode —
+writer crashes between the two — which leaks files without losing
+any. See `data_writer.py` for the exact placement, and chap. 17 for
+the full lifecycle.
+
 #### 13. Schema and Table Name Registration
 
 Stores the table schema and name in Redis as permanent metadata:
@@ -182,14 +220,39 @@ The per-table lock is released in the `finally` block via `catalog.release_simpl
 
 #### 16. Monitoring (after lock release)
 
-A `MonitoringWriter` context manager enqueues write statistics to Redis. This runs entirely outside the data lock to avoid holding the lock during I/O:
+A `MonitoringWriter` context manager enqueues write statistics to a
+daily-partitioned Redis LIST. This runs entirely outside the data lock
+to avoid holding the lock during I/O. Today's partition key is
+`supertable:{org}:monitor:writes:doc:{YYYY-MM-DD}` (recomputed per
+ship so writes that cross midnight roll naturally — chap. 14).
 
 ```python
-with MonitoringWriter(super_name, organization, monitor_type="writes") as monitor:
-    monitor.log_metric(stats_payload)
+from supertable.monitoring.partitions import MONITORING_SINK_TABLES
+
+# Loop-guard: writes to a monitoring sink table are deliberately not
+# measured. The external orchestrator that drained the partition is
+# *writing back* the metric, and re-emitting it would create a 1:1
+# amplification cycle. The sink-table set is the single source of
+# truth in supertable/monitoring/partitions.py.
+if stats_payload is not None and simple_name not in MONITORING_SINK_TABLES:
+    stats_payload["supertables"] = [self.super_table.super_name]
+    with MonitoringWriter(
+        organization=self.super_table.organization,
+        monitor_type="writes",
+    ) as monitor:
+        monitor.log_metric(stats_payload)
 ```
 
-The stats payload includes: `query_id`, `recorded_at`, `organization`, `super_name`, `role_name`, `table_name`, `overwrite_columns`, `compression_level`, `newer_than`, `delete_only`, `incoming_rows`, `incoming_columns`, `inserted`, `deleted`, `total_rows`, `total_columns`, `new_resources`, `sunset_files`, `skipped_stale`, `lineage`, `duration`.
+`MONITORING_SINK_TABLES` =
+`{"__writes__", "__reads__", "__mcp__", "__plans__"}`. Writes
+targeting these tables skip the metric emission entirely.
+
+The stats payload includes: `query_id`, `recorded_at`, `organization`,
+`super_name`, `role_name`, `table_name`, `overwrite_columns`,
+`compression_level`, `newer_than`, `delete_only`, `incoming_rows`,
+`incoming_columns`, `inserted`, `deleted`, `total_rows`,
+`total_columns`, `new_resources`, `sunset_files`, `skipped_stale`,
+`lineage`, `duration`, `supertables`.
 
 #### 17. Data Quality Notification
 

@@ -94,11 +94,13 @@ supertable:                                    ── SuperTable SDK state
         linked_shares:
           index                                SET     linked share IDs
           doc:{link_id}                        STRING  consumer-side linked share
+        gc:                                    ── deferred-deletion queue (chap. 17)
+          pending:
+            doc:{simple}                       STREAM  paths scheduled for delete
     monitor:                                   ── org-wide telemetry (position 2)
-      {monitor_type}                           LIST    monitoring metrics
-                                                       monitor_type ∈
-                                                         {plans, writes, mcp,
-                                                          odata, errors, locks}
+      {monitor_type}:                          ── plans|writes|mcp|odata|errors|locks
+        doc:{YYYY-MM-DD}                       LIST    daily-partitioned metrics
+        doc:{YYYY-MM-DD}:_drain                LIST    in-progress drain handle
                                                        Each entry's payload carries
                                                        ``supertables: [str]`` for
                                                        per-sup attribution under
@@ -118,6 +120,27 @@ Cross-supertable queries are also why monitoring can't live under
 one event, not two. The org-level shape lets us record it once and
 attribute it via the `supertables` payload field. Per-supertable
 views filter the org list at read time.
+
+### Daily partitions under `monitor:`
+
+The writer pushes JSON payloads to a key suffixed with the current UTC
+date — `RPUSH supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD} <json>`.
+Once midnight passes the writer rolls into the new day's key
+automatically; yesterday's partition is frozen and safe for an
+external orchestrator to drain. The `:_drain` handle is created by
+`drain_partition` / `iter_partition_chunks` via `RENAME` so the
+drain is atomic against any straggler write (chap. 14). This bounds
+Redis growth to roughly one day per (org, monitor_type) rather than
+the unbounded append behaviour of the legacy single-LIST shape.
+
+### Why `gc:pending:doc:{simple}` lives under `lakes:{sup}:`
+
+The deferred-deletion stream is per-(super, simple) so dropping a
+supertable naturally nukes its child streams via the existing
+`super_table_pattern` SCAN, with no extra delete code needed. The
+producer is `DataWriter` (post-leaf-CAS, post-`bump_root`); the
+consumer is the `GCCleaner` orchestration primitive. Full lifecycle
+in chap. 17.
 
 ## 16.3  Design invariants
 
@@ -184,6 +207,11 @@ Applied to: `org`, `sup`, `simple`, `staging_name`, `pipe_name`,
 
 Closed-set inputs (`service_type`, `monitor_type`) are validated
 against their own enumerations, not via `_safe()`.
+
+The `monitor_partition` family additionally validates the `date`
+segment against `^\d{4}-\d{2}-\d{2}$` (`_DATE_RE`) — anything else is
+rejected at key-build time so a malformed value can't land in storage
+as a key the parser cannot recover.
 
 ## 16.5  Audit toggle (runtime)
 

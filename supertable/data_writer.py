@@ -13,6 +13,7 @@ from polars import DataFrame
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.gc.queue import collect_old_snapshot_paths, enqueue_deletions
+from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
 from supertable.super_table import SuperTable
 from supertable import redis_keys as RK
@@ -575,8 +576,14 @@ class DataWriter:
         # Monitoring enqueue + flush is fully outside any data locks.
         # MonitoringWriter.__exit__ calls request_flush() so the metric is
         # guaranteed to reach Redis before this scope closes.
+        #
+        # Loop guard: writes targeted at a monitoring sink table
+        # (``__writes__``/``__reads__``/``__mcp__``/``__plans__``)
+        # are deliberately not measured — the external orchestrator
+        # that drained the partition is *writing back* the metric,
+        # and re-emitting it would create a 1:1 amplification cycle.
         try:
-            if stats_payload is not None:
+            if stats_payload is not None and simple_name not in MONITORING_SINK_TABLES:
                 # Monitoring is org-wide as of SDK 2.2.0 — record the
                 # touched supertable in the payload's ``supertables``
                 # field. A DataWriter only touches one supertable, but

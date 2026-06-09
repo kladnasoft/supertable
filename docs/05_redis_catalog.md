@@ -179,15 +179,29 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 |---------|------|---------|
 | `supertable:{org}:lakes:{sup}:schema:doc:{simple}` | STRING (JSON) | Table schema JSON for one simple table |
 
-### Monitoring Keys (org-level, v2.2+)
+### Monitoring Keys (org-level, daily-partitioned)
 
 Monitoring is **org-wide telemetry**, not per-supertable. A
 cross-supertable query records one canonical entry whose payload
-includes a `supertables: [str]` field for attribution.
+includes a `supertables: [str]` field for attribution. The shape is
+**daily-partitioned** so Redis growth is bounded — yesterday's data
+is drained to internal sink tables (`__reads__`, `__writes__`,
+`__mcp__`) by an external orchestrator (chap. 14).
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:monitor:{monitor_type}` | LIST | Monitoring metrics. `monitor_type` ∈ closed set `{plans, writes, mcp, odata, errors, locks}`. Each entry's JSON payload carries `supertables: [str]` for per-supertable attribution. Per-sup views (`/api/v1/monitoring/reads?sup=demo`) filter the org list by membership. |
+| `supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}` | LIST | Today's monitoring partition. `monitor_type` ∈ closed set `{plans, writes, mcp, odata, errors, locks}`. Each entry's JSON payload carries `supertables: [str]`. The writer (`MonitoringWriter`) computes `today` per batch ship so writes that cross midnight UTC roll naturally. |
+| `supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}:_drain` | LIST | In-progress drain handle. Created by `drain_partition` / `iter_partition_chunks` via `RENAME` so the snapshot is atomic against any straggler write. Deleted when the drain completes. |
+
+### Storage GC Keys (per simple table)
+
+The deferred-deletion stream that backs the `GCCleaner` orchestration
+primitive (chap. 17). One stream per `(org, sup, simple)`; the writer
+XADDs paths to delete after a successful leaf-CAS commit.
+
+| Pattern | Type | Purpose |
+|---------|------|---------|
+| `supertable:{org}:lakes:{sup}:gc:pending:doc:{simple}` | STREAM | Per-table deferred-deletion queue. Fields: `kind` (`parquet`\|`snapshot`), `path` (storage path), `write_id` (optional tracing id). Cleaned up automatically by `RedisCatalog.delete_simple_table()` and `delete_super_table()`. |
 
 ---
 

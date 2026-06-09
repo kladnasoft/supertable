@@ -1,5 +1,5 @@
 """
-Tests for supertable/gc/cleaner.py — the deferred-deletion consumer daemon.
+Tests for supertable/gc/cleaner.py — the orchestration library.
 
 Covers:
   1. helpers
@@ -20,32 +20,24 @@ Covers:
      - separates parquet / snapshot counters
      - SCAN failure → tick returns gracefully
      - per-stream XRANGE failure → tick increments errors and continues
-  4. _discover_orgs
-     - SCAN gives keys → orgs deduped
-     - SCAN raises → returns empty set
-  5. run_all_orgs
-     - spawns one thread per discovered org
-     - stop_event causes shutdown
+
+Daemon-loop and CLI tests live in ``test_gc_daemon.py``.
 """
 from __future__ import annotations
 
 import os
-import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 os.environ.setdefault("SUPERTABLE_ORGANIZATION", "test_org")
 os.environ.setdefault("SUPERTABLE_SUPERUSER_TOKEN", "test_token")
 
-from supertable.gc import cleaner as cleaner_mod  # noqa: E402
 from supertable.gc.cleaner import (  # noqa: E402
     GCCleaner,
     _decode,
     _decode_fields,
-    _discover_orgs,
-    run_all_orgs,
 )
 from supertable import redis_keys as RK  # noqa: E402
 
@@ -336,94 +328,3 @@ class TestTick:
         assert r.xrange.call_count == 1
 
 
-# ---------------------------------------------------------------------------
-# 4. _discover_orgs
-# ---------------------------------------------------------------------------
-
-class TestDiscoverOrgs:
-
-    def test_dedupes_orgs(self):
-        catalog = MagicMock()
-        # Three keys spanning two orgs and two supertables
-        catalog.r.scan_iter.return_value = iter([
-            RK.gc_pending("acme", "sup1", "t1"),
-            RK.gc_pending("acme", "sup2", "t2"),
-            RK.gc_pending("brand", "sup1", "t1"),
-        ])
-        assert _discover_orgs(catalog) == {"acme", "brand"}
-
-    def test_returns_empty_on_scan_error(self):
-        catalog = MagicMock()
-        catalog.r.scan_iter.side_effect = RuntimeError("redis down")
-        assert _discover_orgs(catalog) == set()
-
-    def test_ignores_unrelated_keys(self):
-        catalog = MagicMock()
-        catalog.r.scan_iter.return_value = iter([
-            "supertable:acme:lakes:sup:meta:root",  # not gc_pending
-            RK.gc_pending("acme", "sup", "t1"),
-            "garbage:foo:bar",
-        ])
-        assert _discover_orgs(catalog) == {"acme"}
-
-    def test_no_r_returns_empty(self):
-        catalog = MagicMock()
-        catalog.r = None
-        assert _discover_orgs(catalog) == set()
-
-
-# ---------------------------------------------------------------------------
-# 5. run_all_orgs
-# ---------------------------------------------------------------------------
-
-class TestRunAllOrgs:
-
-    def test_spawns_thread_per_org_and_stops(self):
-        catalog = MagicMock()
-        catalog.r.scan_iter.return_value = iter([
-            RK.gc_pending("acme", "sup", "t"),
-            RK.gc_pending("brand", "sup", "t"),
-        ])
-        storage = MagicMock()
-
-        # Patch GCCleaner so run_forever returns immediately
-        instances: list = []
-
-        class _FakeCleaner:
-            def __init__(self, *, org, catalog, storage, delay_sec=None, sleep_sec=None, batch_size=None):
-                self.org = org
-                self._stopped = threading.Event()
-                instances.append(self)
-            def run_forever(self):
-                # Block until stop is called so the test can drive the lifecycle
-                while not self._stopped.is_set():
-                    time.sleep(0.01)
-            def stop(self):
-                self._stopped.set()
-
-        stop = threading.Event()
-
-        with patch.object(cleaner_mod, "GCCleaner", _FakeCleaner):
-            runner = threading.Thread(
-                target=run_all_orgs,
-                kwargs=dict(
-                    catalog=catalog,
-                    storage=storage,
-                    discover_every_sec=300,
-                    stop_event=stop,
-                ),
-                daemon=True,
-            )
-            runner.start()
-            # Give discovery a moment to spawn threads
-            deadline = time.time() + 2.0
-            while time.time() < deadline and len(instances) < 2:
-                time.sleep(0.05)
-            assert len(instances) == 2
-            assert {i.org for i in instances} == {"acme", "brand"}
-
-            stop.set()
-            runner.join(timeout=15)
-            assert not runner.is_alive()
-            for inst in instances:
-                assert inst._stopped.is_set()

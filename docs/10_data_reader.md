@@ -20,23 +20,72 @@ User SQL
 [2] RBAC check     -- restrict_read_access() validates permissions
     |
     v
-[3] Estimate       -- DataEstimator resolves files and byte totals
+[3] Pre-flight     -- _assert_targets_exist() refuses to create on read
     |
     v
-[4] Build views    -- dedup, tombstone, RBAC views attached to Reflection
+[4] Estimate       -- DataEstimator resolves files and byte totals
     |
     v
-[5] Select engine  -- AUTO picks Lite/Pro/Spark based on size + freshness
+[5] Build views    -- dedup, tombstone, RBAC views attached to Reflection
     |
     v
-[6] Execute        -- Executor runs query against chosen backend
+[6] Select engine  -- AUTO picks Lite/Pro/Spark based on size + freshness
     |
     v
-[7] Record plan    -- extend_execution_plan() writes timing + stats
+[7] Execute        -- Executor runs query against chosen backend
     |
     v
-[8] Return         -- (DataFrame, Status, message)
+[8] Record plan    -- extend_execution_plan() writes timing + stats
+    |
+    v
+[9] Return         -- (DataFrame, Status, message)
 ```
+
+## Reads Never Create Tables
+
+The SDK enforces an invariant: **reads never mint catalog entries**.
+Two layers protect this:
+
+1. **`DataReader._assert_targets_exist()`** runs immediately inside
+   the `try` block in `execute()`. For each `(super_name, simple_name)`
+   pair in `physical_tables`, it checks `catalog.root_exists(...)` and
+   `catalog.leaf_exists(...)` in Redis. A miss raises a typed
+   exception which the surrounding `except` turns into the standard
+   `(empty_df, Status.ERROR, "SuperTable not found: …")` /
+   `(empty_df, Status.ERROR, "Table not found: …")` tuple. No
+   side-effects land before the check.
+
+2. **Constructor opt-out:** `SuperTable.__init__` and
+   `SimpleTable.__init__` both accept `create_if_missing: bool = True`
+   (default preserves the writer's auto-create behaviour). Every
+   read-side caller — `DataEstimator`, `MetaReader.__init__`, every
+   `SimpleTable(...)` call in `meta_reader.py` — passes
+   `create_if_missing=False`. If any future code path forgets the
+   edge check, the constructor still refuses to materialise.
+
+### Public exceptions
+
+```python
+from supertable import (
+    SupertableLookupError,
+    SuperTableNotFoundError,
+    TableNotFoundError,
+)
+```
+
+All three live in `supertable/errors.py` and inherit from the stdlib
+`LookupError` (so legacy `except LookupError` / `except KeyError`
+callers keep working).
+
+| Class | When raised | Attributes |
+|-------|-------------|-----------|
+| `SupertableLookupError` | base class (do not instantiate directly) | `organization` |
+| `SuperTableNotFoundError` | the supertable's `meta:root` is missing | `organization`, `super_name` |
+| `TableNotFoundError` | the simple table's `meta:leaf:doc:{simple}` is missing | `organization`, `super_name`, `simple_name` |
+
+The string representation is the canonical form
+`SuperTable not found: org/super` or
+`Table not found: org/super/simple` — safe to surface in API responses.
 
 ## The DataReader Class
 
@@ -104,7 +153,27 @@ rbac_views = restrict_read_access(
 
 `restrict_read_access()` validates that the role has permission to read the requested tables and returns per-alias `RbacViewDef` objects describing column and row filters. If access is denied, this function raises an exception.
 
-**Step 3 -- Estimate Data Size**
+**Step 3 -- Pre-flight catalog check**
+
+```python
+self._assert_targets_exist(physical_tables)
+```
+
+Two Redis `EXISTS` calls per referenced `(super, simple)` pair —
+`root_exists(...)` and `leaf_exists(...)`. On a miss this raises
+`SuperTableNotFoundError` / `TableNotFoundError`, which the
+surrounding `except` turns into the same
+`(empty_df, Status.ERROR, message)` shape as every other read
+failure. Microseconds of cost; **zero catalog state is touched
+before the check.**
+
+This is the edge that guarantees the "reads never create tables"
+invariant — without it, the `SuperTable(super_name, organization)`
+construction inside `DataEstimator.estimate()` would silently
+bootstrap a missing supertable as a side effect of resolving the
+query.
+
+**Step 4 -- Estimate Data Size**
 
 ```python
 estimator = DataEstimator(
@@ -115,9 +184,16 @@ estimator = DataEstimator(
 reflection = estimator.estimate()
 ```
 
-The `DataEstimator` walks the Redis catalog to find the current snapshot for each table, collects parquet file paths, sums byte sizes, and produces a `Reflection` dataclass. Only `physical_tables` are passed (not CTE aliases) so the estimator resolves actual data files.
+The `DataEstimator` walks the Redis catalog to find the current
+snapshot for each table, collects parquet file paths, sums byte
+sizes, and produces a `Reflection` dataclass. Only `physical_tables`
+are passed (not CTE aliases) so the estimator resolves actual data
+files. Internally the estimator constructs `SuperTable(...,
+create_if_missing=False)` as defence in depth — even if a future
+code path skipped the edge check, the constructor would refuse to
+materialise.
 
-**Step 4 -- Build View Definitions**
+**Step 5 -- Build View Definitions**
 
 After estimation, the `DataReader` attaches view definitions to the `Reflection` object for the executor to consume:
 
@@ -168,7 +244,7 @@ if share_row_filter:
     )
 ```
 
-**Step 5 -- Select Engine and Execute**
+**Step 6 -- Select Engine and Execute**
 
 ```python
 executor = Executor(storage=self.storage, organization=self.organization)
@@ -185,7 +261,7 @@ result_df, engine_used = executor.execute(
 
 The `Executor` applies the AUTO selection logic (documented in the Query Engine chapter) and delegates to the chosen backend.
 
-**Step 6 -- Record Execution Plan**
+**Step 7 -- Record Execution Plan**
 
 ```python
 extend_execution_plan(
