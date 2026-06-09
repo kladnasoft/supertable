@@ -42,7 +42,7 @@
 | # | Document | Description |
 |---|----------|-------------|
 | 13 | [Table Mirroring](13_mirroring.md) | Delta Lake, Apache Iceberg, Parquet export after writes |
-| 14 | [Monitoring](14_monitoring.md) | Metrics writer, structured JSON logging, correlation IDs |
+| 14 | [Monitoring](14_monitoring.md) | Daily-partitioned metrics LISTs, drain orchestration, sink tables, structured JSON logging |
 
 ## SDK
 
@@ -55,3 +55,4 @@
 | # | Document | Description |
 |---|----------|-------------|
 | 16 | [Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy: every key starts with `supertable:`, single source of truth in `redis_keys.py` |
+| 17 | [Storage GC](17_gc.md) | Deferred deletion of sunset parquets + pruned snapshot JSONs via Redis streams + the `GCCleaner` orchestration primitive |
