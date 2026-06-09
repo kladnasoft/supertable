@@ -1017,13 +1017,21 @@ return 1
     # ------------- Deletions (dangerous) -------------
 
     def delete_simple_table(self, org: str, sup: str, simple: str) -> bool:
-        """Delete a simple table's Redis meta (leaf pointer + lock).
+        """Delete a simple table's Redis meta (leaf pointer + lock + GC stream).
 
         This does **not** delete storage. Callers should delete storage first, then call this.
         """
         if not (org and sup and simple):
             return False
-        keys = [RK.meta_leaf(org, sup, simple), RK.lock_leaf(org, sup, simple)]
+        keys = [
+            RK.meta_leaf(org, sup, simple),
+            RK.lock_leaf(org, sup, simple),
+            # Nuke the deferred-deletion queue too — once the table is gone
+            # there is no point draining pending deletions through the
+            # cleaner, and leaving the stream around makes
+            # SimpleTable.delete observably non-idempotent in Redis.
+            RK.gc_pending(org, sup, simple),
+        ]
         try:
             # DEL returns number of keys removed
             self.r.delete(*keys)

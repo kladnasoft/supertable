@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Any, List, Dict
 import pandas as pd
 
 from supertable.config.defaults import logger
+from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.utils.timer import Timer
@@ -59,6 +60,44 @@ class DataReader:
     def _lp(self, msg: str) -> str:
         return f"{self._log_ctx}{msg}"
 
+    def _assert_targets_exist(self, physical_tables) -> None:
+        """Fail fast if any referenced (super, simple) is missing in Redis.
+
+        The read path must never create catalog entries as a side effect
+        of resolving a query. ``SuperTable`` / ``SimpleTable``
+        constructors used to do exactly that for callers that didn't pass
+        ``create_if_missing=False`` — this guard is the SDK-level
+        invariant that says "reads cannot mint tables".
+
+        Raises:
+            SuperTableNotFoundError: when the supertable's
+                ``meta:root`` pointer is missing.
+            TableNotFoundError: when the simple table's
+                ``meta:leaf:doc:{simple}`` pointer is missing.
+        """
+        if not physical_tables:
+            return
+        # One catalog handle for the whole loop — cheaper than letting
+        # each .exists() call open a fresh connection.
+        catalog = RedisCatalog()
+        # Dedup by (super, simple) — SQL may mention the same table
+        # multiple times via different aliases.
+        seen = set()
+        for td in physical_tables:
+            super_name = td.super_name
+            simple_name = td.simple_name
+            if not super_name or not simple_name:
+                continue
+            key = (super_name, simple_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not catalog.root_exists(self.organization, super_name):
+                raise SuperTableNotFoundError(self.organization, super_name)
+            if not catalog.leaf_exists(self.organization, super_name, simple_name):
+                raise TableNotFoundError(
+                    self.organization, super_name, simple_name
+                )
 
     def execute(
         self,
@@ -90,6 +129,16 @@ class DataReader:
         )
 
         try:
+            # Read-path policy: reads never create. Verify every
+            # referenced (super, simple) exists in the Redis catalog
+            # *before* the estimator / executor get a chance to
+            # side-effect-bootstrap them via SuperTable constructor
+            # calls. On a miss this raises SuperTableNotFoundError /
+            # TableNotFoundError, which the surrounding ``except`` turns
+            # into the same (empty_df, Status.ERROR, message) tuple as
+            # every other read failure — no state is touched.
+            self._assert_targets_exist(physical_tables)
+
             # Make executor aware of storage for presign retry
             executor = Executor(storage=self.storage, organization=self.organization)
 

@@ -306,7 +306,15 @@ class DataEstimator:
 
             for simple_name in tables:
                 snapshots = self._filter_snapshots(super_name, simple_name, all_snapshots)
-                super_table = SuperTable(super_name, self.organization)
+                # Defence in depth: the read path must never bootstrap a
+                # missing supertable. ``DataReader._assert_targets_exist``
+                # is the primary guard at the entry point; this kwarg
+                # ensures any other caller of ``DataEstimator`` (or any
+                # future code path) cannot accidentally side-effect a
+                # creation through the SuperTable constructor.
+                super_table = SuperTable(
+                    super_name, self.organization, create_if_missing=False,
+                )
 
                 parquet_files: List[str] = []
                 schema: Set[str] = set()

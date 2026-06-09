@@ -282,6 +282,21 @@ class Settings:
     SUPERTABLE_SHARE_PRESIGN_TTL: int = 14400                # SUPERTABLE_SHARE_PRESIGN_TTL (seconds, default 4h)
     SUPERTABLE_SHARE_REFRESH_BUFFER: int = 600               # SUPERTABLE_SHARE_REFRESH_BUFFER (seconds, refresh 10min before expiry)
 
+    # ── Storage GC (deferred deletion of sunset parquets + old snapshot JSONs) ──
+    # Sunset parquet files and old snapshot JSONs are never deleted by the
+    # writer directly. When either flag is enabled, the writer XADDs paths
+    # to a per-table Redis STREAM after a successful leaf-CAS. A separate
+    # cleaner daemon (``python -m supertable.gc.cleaner``) drains entries
+    # older than ``SUPERTABLE_GC_DELAY_SEC`` and calls ``storage.delete()``.
+    # The delay window avoids the race where an in-flight reader's
+    # ``parquet_scan([...])`` resolves a file path right before the writer
+    # deletes it. Defaults below preserve today's behaviour (off, unlimited).
+    SUPERTABLE_SNAPSHOT_RETENTION: int = 0                   # SUPERTABLE_SNAPSHOT_RETENTION (0 = keep all snapshot JSONs)
+    SUPERTABLE_SUNSET_GC_ENABLED: bool = False               # SUPERTABLE_SUNSET_GC_ENABLED (delete sunset parquets via queue)
+    SUPERTABLE_GC_DELAY_SEC: int = 1800                      # SUPERTABLE_GC_DELAY_SEC (min age before cleaner deletes)
+    SUPERTABLE_GC_SLEEP_SEC: int = 60                        # SUPERTABLE_GC_SLEEP_SEC (cleaner loop sleep)
+    SUPERTABLE_GC_BATCH_SIZE: int = 500                      # SUPERTABLE_GC_BATCH_SIZE (max entries processed per table per tick)
+
 
     # ── Convenience properties ───────────────────────────────────────
 
@@ -528,6 +543,13 @@ def _build_settings() -> Settings:
         # Data Sharing
         SUPERTABLE_SHARE_PRESIGN_TTL=_env_int("SUPERTABLE_SHARE_PRESIGN_TTL", 14400),
         SUPERTABLE_SHARE_REFRESH_BUFFER=_env_int("SUPERTABLE_SHARE_REFRESH_BUFFER", 600),
+
+        # ── Storage GC ───────────────────────────────────────────────
+        SUPERTABLE_SNAPSHOT_RETENTION=_env_int("SUPERTABLE_SNAPSHOT_RETENTION", 0),
+        SUPERTABLE_SUNSET_GC_ENABLED=_env_bool("SUPERTABLE_SUNSET_GC_ENABLED", False),
+        SUPERTABLE_GC_DELAY_SEC=_env_int("SUPERTABLE_GC_DELAY_SEC", 1800),
+        SUPERTABLE_GC_SLEEP_SEC=_env_int("SUPERTABLE_GC_SLEEP_SEC", 60),
+        SUPERTABLE_GC_BATCH_SIZE=_env_int("SUPERTABLE_GC_BATCH_SIZE", 500),
     )
 
 

@@ -729,6 +729,83 @@ def linked_share_doc(org: str, sup: str, link_id: str) -> str:
     )
 
 
+# --- GC / Deferred deletion queue ------------------------------------------ #
+#
+# Per-table Redis STREAM holding paths scheduled for delayed physical
+# deletion (sunset parquet files, pruned snapshot JSONs). Producers
+# (``data_writer``) XADD entries after the leaf-CAS commit succeeds; the
+# org-level ``gc.cleaner`` daemon XRANGEs entries older than
+# ``SUPERTABLE_GC_DELAY_SEC`` and ``storage.delete()`` them, then XDELs.
+#
+# The stream lives under the lakes scope so a supertable-wide drop
+# (``catalog.delete_super_table``) naturally nukes it via the standard
+# ``super_table_pattern`` SCAN.
+
+def gc_pending(org: str, sup: str, simple: str) -> str:
+    """Per-table deferred-deletion stream (STREAM)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:gc:pending:doc:{_safe('simple', simple)}"
+    )
+
+
+def gc_pending_pattern(org: str, sup: str) -> str:
+    """SCAN pattern matching every GC stream in one supertable."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:gc:pending:doc:*"
+    )
+
+
+def gc_pending_pattern_for_org(org: str) -> str:
+    """SCAN pattern matching every GC stream across every supertable in one org.
+
+    Used by the per-org cleaner daemon to discover all per-table streams
+    it must drain.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":*:gc:pending:doc:*"
+    )
+
+
+def gc_pending_pattern_all_orgs() -> str:
+    """SCAN pattern matching every GC stream across every org.
+
+    Used by the ``--all-orgs`` cleaner mode to discover the full set of
+    orgs that have pending deletions.
+    """
+    return f"{SUPERTABLE_PREFIX}:*:{LAKES_SCOPE}:*:gc:pending:doc:*"
+
+
+def parse_gc_pending_key(key: str) -> Optional[Tuple[str, str, str]]:
+    """Extract ``(org, sup, simple)`` from a GC pending stream key.
+
+    Returns ``None`` when the key does not match the
+    ``supertable:{org}:lakes:{sup}:gc:pending:doc:{simple}`` shape.
+    This is the canonical way for the cleaner to walk SCAN output and
+    recover the per-table coordinates without re-implementing the parse
+    rules.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split(":")
+    # supertable : {org} : lakes : {sup} : gc : pending : doc : {simple}
+    if (
+        len(parts) == 8
+        and parts[0] == SUPERTABLE_PREFIX
+        and parts[2] == LAKES_SCOPE
+        and parts[4] == "gc"
+        and parts[5] == "pending"
+        and parts[6] == "doc"
+        and parts[1]
+        and parts[3]
+        and parts[7]
+    ):
+        return parts[1], parts[3], parts[7]
+    return None
+
+
 # --- Data Quality (dataisland-core quality module owns its sub-structure) #
 
 def quality_prefix(org: str, sup: str) -> str:

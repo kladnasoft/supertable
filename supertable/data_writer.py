@@ -11,6 +11,8 @@ import polars
 from polars import DataFrame
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
+from supertable.gc.queue import collect_old_snapshot_paths, enqueue_deletions
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
 from supertable.super_table import SuperTable
 from supertable import redis_keys as RK
@@ -441,6 +443,46 @@ class DataWriter:
 
                 self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
                 mark("bump_root")
+
+                # --- Enqueue deferred deletions (post-CAS, post-bump) ----------
+                # Strict ordering matters: leaf-CAS + root-bump have committed
+                # the new snapshot as the authoritative state. Only NOW is it
+                # safe to schedule physical deletion of files that the old
+                # snapshot still references — any reader that loaded the
+                # previous leaf payload will finish before the cleaner's delay
+                # window expires.
+                #
+                # Both blocks are best-effort: enqueue_deletions and
+                # collect_old_snapshot_paths swallow Redis/storage errors and
+                # log a warning. A GC failure must never fail the write.
+                try:
+                    _org = self.super_table.organization
+                    _sup = self.super_table.super_name
+                    if settings.SUPERTABLE_SUNSET_GC_ENABLED and sunset_files:
+                        enqueue_deletions(
+                            self.catalog,
+                            _org, _sup, simple_name,
+                            "parquet",
+                            list(sunset_files),
+                            write_id=qid,
+                        )
+                    if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
+                        old_paths = collect_old_snapshot_paths(
+                            new_snapshot_dict,
+                            self.super_table.storage,
+                            settings.SUPERTABLE_SNAPSHOT_RETENTION,
+                        )
+                        if old_paths:
+                            enqueue_deletions(
+                                self.catalog,
+                                _org, _sup, simple_name,
+                                "snapshot",
+                                old_paths,
+                                write_id=qid,
+                            )
+                except Exception as e:
+                    logger.warning(lp(f"GC enqueue failed (write still succeeded): {e}"))
+                mark("gc_enqueue")
 
                 # --- Store schema + table name in Redis (permanent, not cache) ---
                 try:

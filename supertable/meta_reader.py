@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
+from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.rbac.access_control import check_meta_access
 from supertable.redis_catalog import RedisCatalog
 from supertable import redis_keys as RK
@@ -138,8 +139,15 @@ class MetaReader:
     """
 
     def __init__(self, super_name: str, organization: str):
-        # Create a SuperTable object (which internally sets up the storage backend).
-        self.super_table = SuperTable(super_name=super_name, organization=organization)
+        # ``MetaReader`` is read-only by contract — opening one against a
+        # missing supertable must surface ``SuperTableNotFoundError``
+        # rather than silently bootstrap an empty supertable as a side
+        # effect of constructing this object.
+        self.super_table = SuperTable(
+            super_name=super_name,
+            organization=organization,
+            create_if_missing=False,
+        )
         self.catalog = RedisCatalog()
 
 
@@ -210,13 +218,15 @@ class MetaReader:
                         leaf_meta = _try_parse_leaf_meta(raw)
                         st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
                         if st_data is None:
-                            simple_table = SimpleTable(self.super_table, t)
+                            simple_table = SimpleTable(
+                                self.super_table, t, create_if_missing=False,
+                            )
                             st_data, _ = simple_table.get_simple_table_snapshot()
 
                         schema = _schema_to_dict((st_data or {}).get("schema", {}))
                         for key, value in schema.items():
                             schema_items.add((key, value))
-                    except (FileNotFoundError, KeyError) as e:
+                    except (FileNotFoundError, KeyError, TableNotFoundError) as e:
                         logger.debug("Failed to read schema for table %s: %s", t, e)
                         continue
             else:
@@ -229,13 +239,15 @@ class MetaReader:
                     st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
 
                     if st_data is None:
-                        simple_table = SimpleTable(self.super_table, table_name)
+                        simple_table = SimpleTable(
+                            self.super_table, table_name, create_if_missing=False,
+                        )
                         st_data, _ = simple_table.get_simple_table_snapshot()
 
                     schema = _schema_to_dict((st_data or {}).get("schema", {}))
                     for key, value in schema.items():
                         schema_items.add((key, value))
-                except (FileNotFoundError, KeyError) as e:
+                except (FileNotFoundError, KeyError, TableNotFoundError) as e:
                     logger.debug("Failed to read schema for table %s: %s", table_name, e)
                     return [{}]
 
@@ -258,9 +270,11 @@ class MetaReader:
             return
 
         try:
-            simple_table = SimpleTable(self.super_table, table_name)
+            simple_table = SimpleTable(
+                self.super_table, table_name, create_if_missing=False,
+            )
             simple_table_data, _ = simple_table.get_simple_table_snapshot()
-        except FileNotFoundError:
+        except (FileNotFoundError, TableNotFoundError):
             logger.debug("Simple table snapshot missing for %s", table_name)
             return
 
@@ -291,19 +305,23 @@ class MetaReader:
             tables = self._get_all_tables()
             for table in tables:
                 try:
-                    st = SimpleTable(self.super_table, table)
+                    st = SimpleTable(
+                        self.super_table, table, create_if_missing=False,
+                    )
                     st_data, _ = st.get_simple_table_snapshot()
                     stats.append(_prune_dict(st_data, keys_to_remove))
-                except (FileNotFoundError, KeyError):
+                except (FileNotFoundError, KeyError, TableNotFoundError):
                     logger.debug("Simple table snapshot missing for %s", table)
                     continue
         else:
             # Single table
             try:
-                st = SimpleTable(self.super_table, table_name)
+                st = SimpleTable(
+                    self.super_table, table_name, create_if_missing=False,
+                )
                 st_data, _ = st.get_simple_table_snapshot()
                 stats.append(_prune_dict(st_data, keys_to_remove))
-            except (FileNotFoundError, KeyError):
+            except (FileNotFoundError, KeyError, TableNotFoundError):
                 logger.debug("Simple table snapshot missing for %s", table_name)
                 return []
 
@@ -400,7 +418,9 @@ class MetaReader:
                 if st_data is None:
                     # Fallback: read the current snapshot from storage via SimpleTable.
                     t_st0 = time.perf_counter()
-                    st = SimpleTable(self.super_table, table)
+                    st = SimpleTable(
+                        self.super_table, table, create_if_missing=False,
+                    )
                     st_data, _ = st.get_simple_table_snapshot()
                     t_st1 = time.perf_counter()
 
@@ -447,7 +467,7 @@ class MetaReader:
                 total_rows += table_rows
                 total_size += table_size
 
-            except (FileNotFoundError, KeyError) as e:
+            except (FileNotFoundError, KeyError, TableNotFoundError) as e:
                 logger.debug("Failed to get stats for table %s: %s", table, e)
                 continue
 

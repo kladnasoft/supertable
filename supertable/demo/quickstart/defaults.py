@@ -20,7 +20,7 @@ defaults.default.IS_SHOW_TIMING = True
 
 # --- Identity ---------------------------------------------------------------
 organization = "kladna-soft"
-super_name = "example"
+super_name = "demo"
 simple_name = "facts"
 
 # --- Roles (must match those created in 1.2. create_roles.py) ---------------

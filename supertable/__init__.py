@@ -39,6 +39,11 @@ from supertable.super_pipe import SuperPipe
 from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
+from supertable.errors import (
+    SupertableLookupError,
+    SuperTableNotFoundError,
+    TableNotFoundError,
+)
 
 __all__ = [
     "__version__",
@@ -55,4 +60,7 @@ __all__ = [
     "RedisCatalog",
     "RoleManager",
     "UserManager",
+    "SupertableLookupError",
+    "SuperTableNotFoundError",
+    "TableNotFoundError",
 ]

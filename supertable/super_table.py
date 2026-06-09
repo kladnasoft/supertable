@@ -10,6 +10,7 @@ from supertable.config.homedir import app_home
 from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
+from supertable.errors import SuperTableNotFoundError
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.redis_catalog import RedisCatalog
@@ -29,9 +30,27 @@ class SuperTable:
     structurally they could not collide with the org-level ``system:``
     namespace anyway — the sentinel-pattern reservation is defence in
     depth against future system labels.
+
+    Args:
+        super_name: Name of the supertable (organization-scoped).
+        organization: Organization (tenant) name.
+        create_if_missing: When True (default), bootstrap the supertable
+            (storage mkdir, Redis ``meta:root``, RBAC scaffolding) if it
+            does not exist. When False, raise
+            ``SuperTableNotFoundError`` instead. Read-side callers
+            (``DataReader``, ``MetaReader``, ``DataEstimator``) pass
+            ``False`` so a missing supertable surfaces as an error
+            instead of being silently materialized as a side effect of
+            constructing the Python object.
     """
 
-    def __init__(self, super_name: str, organization: str):
+    def __init__(
+        self,
+        super_name: str,
+        organization: str,
+        *,
+        create_if_missing: bool = True,
+    ):
         if is_reserved_super_name(super_name):
             raise ValueError(
                 f"SuperTable name {super_name!r} is reserved and cannot be created. "
@@ -59,6 +78,13 @@ class SuperTable:
                 f"skipping storage mkdirs."
             )
             return
+
+        # Read-only opt-out: refuse to bootstrap as a side effect. This
+        # is the guarantee that lets ``DataReader`` / ``MetaReader`` open
+        # a session against a missing name and get a clean, named error
+        # back instead of silently creating an empty supertable.
+        if not create_if_missing:
+            raise SuperTableNotFoundError(organization, super_name)
 
         self.init_super_table()
 

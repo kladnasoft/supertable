@@ -460,7 +460,15 @@ class TestMetaReaderInit:
         MockCat.return_value = mock_cat
 
         reader = MetaReader("my_super", "my_org")
-        MockST.assert_called_once_with(super_name="my_super", organization="my_org")
+        # MetaReader is read-only by contract — it must pass
+        # create_if_missing=False so a missing supertable raises
+        # SuperTableNotFoundError instead of being bootstrapped as a
+        # side effect of opening the reader.
+        MockST.assert_called_once_with(
+            super_name="my_super",
+            organization="my_org",
+            create_if_missing=False,
+        )
         MockCat.assert_called_once()
         assert reader.super_table is mock_st
         assert reader.catalog is mock_cat

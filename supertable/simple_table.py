@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 
 from supertable.config.defaults import logger
+from supertable.errors import TableNotFoundError
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
@@ -89,9 +90,27 @@ from supertable.rbac.access_control import check_write_access
 class SimpleTable:
     """
     Simple-table layout on storage (heavy data) + Redis leaf pointer (meta).
+
+    Args:
+        super_table: Parent ``SuperTable`` (already constructed).
+        simple_name: Name of this simple table.
+        create_if_missing: When True (default), bootstrap the simple
+            table (mkdirs, initial empty snapshot JSON, Redis ``meta:leaf``
+            pointer) if it does not exist. When False, raise
+            ``TableNotFoundError`` instead. Read-side callers
+            (``MetaReader`` and friends) pass ``False`` so a missing
+            table surfaces as an error instead of being silently
+            materialized as a side effect of constructing the Python
+            object.
     """
 
-    def __init__(self, super_table: SuperTable, simple_name: str):
+    def __init__(
+        self,
+        super_table: SuperTable,
+        simple_name: str,
+        *,
+        create_if_missing: bool = True,
+    ):
         self.super_table = super_table
         self.identity = "tables"
         self.simple_name = simple_name
@@ -122,6 +141,18 @@ class SimpleTable:
                 f"skipping storage mkdirs and bootstrap."
             )
             return
+
+        # Read-only opt-out: refuse to bootstrap as a side effect. The
+        # writer leaves the default so the first write to a new table
+        # naturally creates it; readers opt out so a query against a
+        # missing name fails fast rather than materializing an empty
+        # table.
+        if not create_if_missing:
+            raise TableNotFoundError(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
 
         self.init_simple_table()
 
