@@ -845,7 +845,7 @@ def quality_prefix(org: str, sup: str) -> str:
 # to take an atomic snapshot of a partition before reading it in pieces.
 
 _VALID_MONITOR_TYPES: FrozenSet[str] = frozenset(
-    {"plans", "writes", "mcp", "odata", "errors", "locks"}
+    {"plans", "writes", "mcp", "odata", "errors", "locks", "compact"}
 )
 
 # ISO 8601 calendar date (``YYYY-MM-DD``). Anything else is rejected — the

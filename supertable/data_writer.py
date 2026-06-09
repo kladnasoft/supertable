@@ -12,6 +12,7 @@ from polars import DataFrame
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
+from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.gc.queue import collect_old_snapshot_paths, enqueue_deletions
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
@@ -26,6 +27,7 @@ from supertable.processing import (
     filter_stale_incoming_rows,
     extract_key_tuples,
     reconcile_tombstones,
+    compact_resources,
     compact_tombstones,
     _tombstone_threshold,
 )
@@ -143,6 +145,107 @@ class DataWriter:
             )
             self._table_config_cache[simple_name] = config or {}
         return self._table_config_cache[simple_name]
+
+    # ── Schema derivation for ``compact()`` ─────────────────────────────
+    #
+    # Helper used by ``compact()`` only — kept here so both ``compact``
+    # and the matching unit tests can monkey-patch the parquet-read step.
+
+    # Snapshot ``schema`` entries are Spark-style strings
+    # (``long``/``double``/``boolean``/...), polars dtypes are the
+    # canonical Python types. This map converts the former to the
+    # latter so ``_build_compact_model_df`` can reconstruct a Polars
+    # frame from the snapshot's existing schema as a fallback.
+    _SPARK_TYPE_TO_POLARS = {
+        "string":    "Utf8",
+        "boolean":   "Boolean",
+        "byte":      "Int8",
+        "short":     "Int16",
+        "integer":   "Int32",
+        "long":      "Int64",
+        "float":     "Float32",
+        "double":    "Float64",
+        "date":      "Date",
+        "timestamp": "Datetime",
+        "binary":    "Binary",
+    }
+
+    def _build_compact_model_df(
+        self, new_resources: list, last_snapshot: dict,
+    ) -> "DataFrame":
+        """Build a zero-row Polars DataFrame whose schema mirrors the
+        post-compaction file schema.
+
+        ``simple_table.update()`` derives the snapshot's ``schema``
+        field from this frame's dtypes — get this wrong and the
+        snapshot metadata gets corrupted (e.g. every column reported
+        as Utf8), even though the on-disk Parquet files are intact.
+
+        Resolution order:
+
+          1. Union the schemas of **every** new Parquet file. Within
+             one chunk ``concat_with_union`` guarantees one schema; but
+             ``compact_resources`` may produce **multiple chunks**
+             (one per ``max_memory_chunk_size`` worth of data) and each
+             chunk's schema is independent. Reading just the first
+             chunk would miss columns that only appear in later chunks
+             — a real risk with schema-evolving tables. We read **all**
+             new files' schemas and union them.
+          2. Reconstruct from the previous snapshot's ``schema``
+             field. Compaction preserves logical schema by definition,
+             so the pre-compaction schema is correct for the new
+             snapshot as well.
+          3. Empty frame — last resort.
+        """
+        # --- 1. Read the schemas of all new files and union them ------
+        # ``concat_with_union`` semantics: column order is "a's columns
+        # then b's new columns", types widened via _resolve_unified_dtype.
+        # We mirror that here.
+        if new_resources:
+            union_schema: dict = {}
+            success_count = 0
+            for r in new_resources:
+                first_path = r.get("file") if isinstance(r, dict) else None
+                if not first_path:
+                    continue
+                try:
+                    arrow_tbl = self.super_table.storage.read_parquet(first_path)
+                    sample = polars.from_arrow(arrow_tbl).limit(0)
+                except Exception as e:
+                    logger.debug(
+                        f"[compact] could not read schema from {first_path}: {e}"
+                    )
+                    continue
+                success_count += 1
+                for col, dtype in zip(sample.columns, sample.dtypes):
+                    if col not in union_schema:
+                        union_schema[col] = dtype
+                    # else: keep first-seen dtype (compaction-time dtypes
+                    # are already resolved by concat_with_union, so they
+                    # should be consistent across new files).
+            if success_count > 0 and union_schema:
+                return polars.DataFrame(schema=union_schema)
+            # If we got AT LEAST one successful read but the resulting
+            # schema is empty (zero-column files), fall through to the
+            # snapshot-schema fallback rather than returning empty.
+
+        # --- 2. Reconstruct from the prior snapshot's schema ------
+        prior_schema = (last_snapshot or {}).get("schema")
+        if isinstance(prior_schema, list) and prior_schema:
+            schema_dict: dict = {}
+            for col in prior_schema:
+                if not isinstance(col, dict):
+                    continue
+                name = col.get("name")
+                spark_type = (col.get("type") or "").lower()
+                pl_name = self._SPARK_TYPE_TO_POLARS.get(spark_type)
+                if name and pl_name and hasattr(polars, pl_name):
+                    schema_dict[name] = getattr(polars, pl_name)
+            if schema_dict:
+                return polars.DataFrame(schema=schema_dict)
+
+        # --- 3. Empty frame --------------------------------------
+        return polars.DataFrame()
 
     def write(self, role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False, lineage=None):
         """
@@ -631,6 +734,473 @@ class DataWriter:
             pass  # Never fail a write due to audit
 
         return result_tuple
+
+    def compact(
+        self,
+        role_name: str,
+        simple_name: str,
+        force_tombstones: bool = True,
+        small_only: bool = True,
+        compression_level: int = 1,
+        lineage: dict | None = None,
+    ) -> dict:
+        """Explicit, lock-protected compaction for one simple table.
+
+        Does the same things ``write()`` would do for an empty input
+        **without rewriting any file that doesn't need to be rewritten**:
+
+          1. Acquire the per-table Redis lock (same TTL as ``write``).
+          2. Read the current snapshot via the leaf pointer. The simple
+             table must already exist — compaction is **not** a
+             bootstrap.
+          3. If primary keys + tombstones are present:
+
+             * When ``force_tombstones=True`` (default), run
+               ``compact_tombstones`` unconditionally — this is the
+               whole point of calling ``compact()`` manually.
+             * When ``force_tombstones=False``, only run if the
+               natural ``tombstone_compact_total`` threshold is
+               breached (same gate as ``write``).
+
+             The compaction physically removes tombstoned rows from
+             the affected parquet files and clears the tombstone list.
+          4. Run ``compact_resources`` to merge small parquet files in
+             memory-bounded chunks. When ``small_only=True`` (default),
+             only files strictly smaller than ``max_memory_chunk_size``
+             qualify — large files are left untouched. ``small_only=False``
+             rewrites every resource regardless of size.
+          5. Commit the new snapshot via ``simple_table.update``,
+             leaf-CAS, ``bump_root``, and the same GC enqueue +
+             monitoring + audit pipeline as ``write``.
+
+        Concurrency: compaction is serialised against writes through
+        the same per-simple lock. A concurrent ``write()`` either
+        runs first (compaction sees the updated snapshot) or waits.
+
+        Args:
+            role_name: RBAC role performing the compaction. Must have
+                write access on the target table (checked via
+                ``check_write_access`` — same as ``write``).
+            simple_name: target table.
+            force_tombstones: bypass the ``tombstone_compact_total``
+                threshold and compact whatever tombstones exist now.
+                Set to False to honor the natural threshold.
+            small_only: only consider files smaller than
+                ``max_memory_chunk_size`` for compaction. Set to False
+                to rewrite every file (e.g. for a full-table re-encode).
+            compression_level: zstd compression level for new parquets.
+            lineage: optional provenance dict — same conventions as
+                ``write``. If omitted a minimal compaction lineage is
+                auto-generated.
+
+        Returns:
+            ``dict`` with keys mirroring the ``write`` stats_payload
+            plus a few compaction-specific fields. Safe to pass to
+            ``json.dumps`` / monitoring sinks.
+
+        Raises:
+            TimeoutError: lock could not be acquired within 60 s.
+            TableNotFoundError: the simple table does not exist.
+                Compaction never bootstraps a missing table.
+            PermissionError: RBAC check denied write access.
+        """
+        qid = str(uuid.uuid4())
+        lp = lambda msg: (
+            f"[compact][qid={qid}]"
+            f"[super={self.super_table.super_name}]"
+            f"[table={simple_name}] {msg}"
+        )
+
+        t0 = time.time()
+        t_last = t0
+        timings: dict = {}
+
+        def mark(stage: str):
+            nonlocal t_last
+            now = time.time()
+            timings[stage] = now - t_last
+            t_last = now
+
+        token = None
+        stats_payload: dict | None = None
+        result: dict = {
+            "query_id": qid,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "organization": self.super_table.organization,
+            "super_name": self.super_table.super_name,
+            "role_name": role_name,
+            "table_name": simple_name,
+            "compression_level": compression_level,
+            "force_tombstones": force_tombstones,
+            "small_only": small_only,
+            "files_before": 0,
+            "files_after": 0,
+            "files_compacted": 0,
+            "tombstone_rows_removed": 0,
+            "tombstone_files_rewritten": 0,
+            "new_resources": 0,
+            "sunset_files": 0,
+            "total_rows_written": 0,
+            "duration": 0.0,
+            "lineage": _safe_json(lineage or {}),
+        }
+
+        try:
+            logger.debug(lp(
+                f"➡️ Starting compact(force_tombstones={force_tombstones}, "
+                f"small_only={small_only}, compression={compression_level})"
+            ))
+
+            # --- Pre-flight: refuse to bootstrap on a missing table ----------
+            # Same invariant as ``DataReader``: compaction must NEVER
+            # mint catalog state on a missing target. ``check_write_access``
+            # (next) builds ``RoleManager`` which bootstraps RBAC role
+            # storage for the supertable if it doesn't exist. We must
+            # verify existence FIRST so a compact() call against a ghost
+            # name raises ``TableNotFoundError`` (or
+            # ``SuperTableNotFoundError``) without side effects.
+            org = self.super_table.organization
+            sup = self.super_table.super_name
+            if not self.catalog.root_exists(org, sup):
+                raise SuperTableNotFoundError(org, sup)
+            if not self.catalog.leaf_exists(org, sup, simple_name):
+                raise TableNotFoundError(org, sup, simple_name)
+
+            # --- Access control ------------------------------------------------
+            # Compaction is a mutation — same write-access check as ``write``.
+            # Safe to run now that we know the target exists.
+            check_write_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=simple_name,
+            )
+            mark("access")
+
+            # --- Per-simple Redis lock ----------------------------------------
+            token = self.catalog.acquire_simple_lock(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+                ttl_s=30,
+                timeout_s=60,
+            )
+            if not token:
+                raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
+            mark("lock")
+
+            # --- Read last snapshot — refuse to bootstrap ---------------------
+            # Compaction is an in-place operation on existing data, so we
+            # pass ``create_if_missing=False``. A missing leaf raises
+            # ``TableNotFoundError`` rather than silently creating a fresh
+            # empty table.
+            simple_table = SimpleTable(
+                self.super_table, simple_name, create_if_missing=False,
+            )
+            last_simple_table, last_simple_table_path = (
+                simple_table.get_simple_table_snapshot()
+            )
+            table_config = self._get_table_config(simple_name)
+            files_before = len(last_simple_table.get("resources") or [])
+            result["files_before"] = files_before
+            mark("snapshot")
+
+            # --- Phase A: tombstone compaction -------------------------------
+            # Physically remove soft-deleted rows from parquet files. Runs
+            # unconditionally when force_tombstones=True; otherwise only
+            # when the natural threshold is reached (same gate as the
+            # delete-only path in ``write``).
+            tomb_block = last_simple_table.get("tombstones") or {}
+            tomb_keys = tomb_block.get("deleted_keys") or []
+            primary_keys = (
+                tomb_block.get("primary_keys")
+                or table_config.get("primary_keys")
+                or []
+            )
+
+            tomb_new_resources: list = []
+            tomb_sunset: set = set()
+            tomb_compacted_rows = 0
+
+            should_run_tombstones = bool(tomb_keys) and bool(primary_keys) and (
+                force_tombstones or len(tomb_keys) >= _tombstone_threshold(table_config)
+            )
+            if should_run_tombstones:
+                tomb_compacted_rows, tomb_new_resources, tomb_sunset = compact_tombstones(
+                    snapshot=last_simple_table,
+                    primary_keys=primary_keys,
+                    data_dir=simple_table.data_dir,
+                    compression_level=compression_level,
+                    table_config=table_config,
+                )
+                logger.info(lp(
+                    f"tombstone compaction removed {tomb_compacted_rows} rows "
+                    f"from {len(tomb_sunset)} file(s)"
+                ))
+                # Apply the tombstone-step delta to the snapshot *in memory*
+                # so the small-file step works against the post-tombstone
+                # resource set.
+                current_resources = last_simple_table.get("resources") or []
+                survivors = [
+                    r for r in current_resources
+                    if r.get("file") not in tomb_sunset
+                ]
+                survivors.extend(tomb_new_resources)
+                last_simple_table["resources"] = survivors
+
+            result["tombstone_rows_removed"] = tomb_compacted_rows
+            result["tombstone_files_rewritten"] = len(tomb_sunset)
+            mark("tombstone_compact")
+
+            # --- Phase B: small-file compaction ------------------------------
+            considered, small_total_rows, small_new_resources, small_sunset = (
+                compact_resources(
+                    snapshot=last_simple_table,
+                    data_dir=simple_table.data_dir,
+                    compression_level=compression_level,
+                    table_config=table_config,
+                    small_only=small_only,
+                )
+            )
+            mark("small_file_compact")
+
+            # --- Aggregate the two phases ------------------------------------
+            #
+            # Critical filter: a file produced by Phase A (tombstone
+            # compaction) can be picked up as a small-file candidate
+            # by Phase B (compact_resources) and then sunset there.
+            # If we leave it in ``all_new_resources`` it lands in the
+            # new snapshot **and** in ``all_sunset`` (slated for GC
+            # deletion). 30 min later GC deletes the file while the
+            # snapshot still references it — readers fail with
+            # FileNotFoundError. Filter the file out of new_resources
+            # when it also appears in any sunset set.
+            all_sunset = set(tomb_sunset) | set(small_sunset)
+            all_new_resources = [
+                r for r in (list(tomb_new_resources) + list(small_new_resources))
+                if r.get("file") not in all_sunset
+            ]
+            result["files_compacted"] = considered
+            result["new_resources"] = len(all_new_resources)
+            result["sunset_files"] = len(all_sunset)
+            result["total_rows_written"] = small_total_rows
+
+            # Short-circuit: nothing to do, skip the snapshot rewrite
+            # and the leaf-CAS / root-bump / GC / mirror path. BUT do
+            # NOT return here — execution must fall through to the
+            # ``finally`` (which releases the lock) AND the monitoring
+            # + audit emission blocks after the try/finally so the
+            # compaction attempt is still observable.
+            if not all_new_resources and not all_sunset:
+                result["files_after"] = files_before
+                result["duration"] = round(time.time() - t0, 6)
+                stats_payload = dict(result)
+                logger.info(lp(
+                    f"compact: nothing to do (files_before={files_before})"
+                ))
+            else:
+                # --- Update snapshot on storage -------------------------------
+                eff_lineage = lineage if lineage and isinstance(lineage, dict) else {}
+                if not eff_lineage:
+                    eff_lineage = {
+                        "source_type": "compact",
+                        "role_name": role_name,
+                        "force_tombstones": force_tombstones,
+                        "small_only": small_only,
+                        "files_compacted": considered,
+                        "tombstone_rows_removed": tomb_compacted_rows,
+                        "write_id": qid,
+                    }
+
+                # Clear the tombstone list now that they've been physically
+                # applied (if applicable). ``simple_table.update`` is going
+                # to write the updated snapshot.
+                if should_run_tombstones:
+                    last_simple_table["tombstones"] = {
+                        "primary_keys": primary_keys,
+                        "deleted_keys": [],
+                        "total_tombstones": 0,
+                    }
+
+                # Derive the post-compaction schema for ``simple_table.update``.
+                # update() builds the new snapshot's ``schema`` field from
+                # the model_df's Polars dtypes, so we MUST hand it a frame
+                # whose dtypes match the actual compacted data — otherwise
+                # the snapshot's schema metadata gets corrupted (e.g. every
+                # column reported as Utf8) and downstream consumers
+                # (MetaReader, mirroring, query estimation) see a broken
+                # schema even though the Parquet files on disk are intact.
+                #
+                # Strategy: read the schema (no data — n_rows=0) of the
+                # first freshly-written compacted file. By construction
+                # every compacted file in this call has the same union
+                # schema (``concat_with_union`` enforces this in
+                # ``compact_resources``), so any of them is representative.
+                #
+                # Fallback chain on read failure:
+                #   1. Reconstruct from the previous snapshot's ``schema``
+                #      field — compaction preserves logical schema, so the
+                #      pre-compaction schema is the right answer.
+                #   2. Empty frame — last resort, only on a pre-compaction
+                #      schema that's already empty / missing.
+                model_df = self._build_compact_model_df(
+                    all_new_resources, last_simple_table,
+                )
+
+                new_snapshot_dict, new_snapshot_path = simple_table.update(
+                    all_new_resources,
+                    all_sunset,
+                    model_df,
+                    last_snapshot=last_simple_table,
+                    last_snapshot_path=last_simple_table_path,
+                    lineage=eff_lineage,
+                )
+                mark("update_simple")
+
+                # --- CAS set leaf pointer + atomic root bump ---------------------
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                payload = {
+                    **new_snapshot_dict,
+                    "resources": [
+                        {k: v for k, v in r.items() if k != "stats"}
+                        for r in (new_snapshot_dict.get("resources") or [])
+                    ],
+                }
+                try:
+                    self.catalog.set_leaf_payload_cas(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        simple_name,
+                        payload,
+                        new_snapshot_path,
+                        now_ms=now_ms,
+                    )
+                except Exception:
+                    self.catalog.set_leaf_path_cas(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        simple_name,
+                        new_snapshot_path,
+                        now_ms=now_ms,
+                    )
+                self.catalog.bump_root(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    now_ms=now_ms,
+                )
+                mark("bump_root")
+
+                # --- GC enqueue (same flags as write) ----------------------------
+                try:
+                    _org = self.super_table.organization
+                    _sup = self.super_table.super_name
+                    if settings.SUPERTABLE_SUNSET_GC_ENABLED and all_sunset:
+                        enqueue_deletions(
+                            self.catalog,
+                            _org, _sup, simple_name,
+                            "parquet",
+                            list(all_sunset),
+                            write_id=qid,
+                        )
+                    if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
+                        old_paths = collect_old_snapshot_paths(
+                            new_snapshot_dict,
+                            self.super_table.storage,
+                            settings.SUPERTABLE_SNAPSHOT_RETENTION,
+                        )
+                        if old_paths:
+                            enqueue_deletions(
+                                self.catalog,
+                                _org, _sup, simple_name,
+                                "snapshot",
+                                old_paths,
+                                write_id=qid,
+                            )
+                except Exception as e:
+                    logger.warning(lp(f"GC enqueue failed (compact still succeeded): {e}"))
+                mark("gc_enqueue")
+
+                # --- Mirroring ---------------------------------------------------
+                try:
+                    MirrorFormats.mirror_if_enabled(
+                        super_table=self.super_table,
+                        table_name=simple_name,
+                        simple_snapshot=new_snapshot_dict,
+                    )
+                except Exception as e:
+                    logger.error(lp(f"mirroring failed: {e}"))
+                mark("mirror")
+
+                # --- Final stats payload -----------------------------------------
+                new_resources_list = new_snapshot_dict.get("resources") or []
+                result["files_after"] = len(new_resources_list)
+                result["duration"] = round(time.time() - t0, 6)
+                stats_payload = dict(result)
+
+                logger.info(lp(
+                    f"compact: files {files_before} → {len(new_resources_list)} "
+                    f"(compacted={considered}, tomb_rows={tomb_compacted_rows}, "
+                    f"duration={result['duration']:.3f}s)"
+                ))
+
+        except Exception as e:
+            logger.error(lp(f"compact() failed: {e!s}"))
+            raise
+        finally:
+            # Release per-simple lock first
+            if token:
+                try:
+                    ok = self.catalog.release_simple_lock(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        simple_name,
+                        token,
+                    )
+                    if not ok:
+                        logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
+                except Exception:
+                    pass
+
+        # ---------- LOCK IS RELEASED HERE ----------
+        # Monitoring + audit run after the lock is released so a slow
+        # Redis ship doesn't hold up concurrent writers. Same loop
+        # guard as ``write``: compaction targeting a monitoring sink
+        # table skips the metric emission.
+        try:
+            if stats_payload is not None and simple_name not in MONITORING_SINK_TABLES:
+                stats_payload["supertables"] = [self.super_table.super_name]
+                with MonitoringWriter(
+                    organization=self.super_table.organization,
+                    monitor_type="compact",
+                ) as monitor:
+                    monitor.log_metric(stats_payload)
+        except Exception as me:
+            logger.error(lp(f"monitoring enqueue failed: {me}"))
+
+        # ---------- AUDIT LOG ----------
+        try:
+            _audit_emit(
+                category=EventCategory.DATA_MUTATION,
+                action=Actions.DATA_WRITE,
+                organization=self.super_table.organization,
+                super_name=self.super_table.super_name,
+                resource_type="table",
+                resource_id=simple_name,
+                detail=make_detail(
+                    table=simple_name,
+                    operation="compact",
+                    files_before=result["files_before"],
+                    files_after=result["files_after"],
+                    files_compacted=result["files_compacted"],
+                    tombstone_rows_removed=result["tombstone_rows_removed"],
+                    duration_ms=round((time.time() - t0) * 1000),
+                    role_name=role_name,
+                ),
+            )
+        except Exception:
+            pass
+
+        return result
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):
         if len(simple_name) == 0 or len(simple_name) > 128:

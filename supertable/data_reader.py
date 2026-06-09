@@ -119,7 +119,32 @@ class DataReader:
         tables = parser.get_table_tuples()
         physical_tables = parser.get_physical_tables()
 
-        # RBAC check — also returns per-alias column/row filter definitions
+        # Read-path policy: reads never create. Verify every referenced
+        # (super, simple) exists in the Redis catalog **before** anything
+        # downstream — RBAC, estimator, or the executor — gets a chance
+        # to side-effect-bootstrap them.
+        #
+        # ORDERING MATTERS: ``restrict_read_access`` (called next) builds
+        # ``RoleManager(super_name=..., organization=...)`` which boots
+        # RBAC role storage in Redis for the supertable if it doesn't
+        # exist. Running the RBAC check first against a missing
+        # supertable would silently mint the RBAC scaffold before our
+        # existence check fires. Pre-flight FIRST.
+        #
+        # The check runs in its own try block so SuperTable/TableNotFound
+        # convert to the standard (empty_df, Status.ERROR, message)
+        # return — we don't want to raise these into the caller, but we
+        # DO want to keep ``restrict_read_access``'s PermissionError
+        # raising naturally (legacy behaviour API layers depend on for
+        # 403 translation).
+        try:
+            self._assert_targets_exist(physical_tables)
+        except (SuperTableNotFoundError, TableNotFoundError) as e:
+            logger.warning(self._lp(f"target missing: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
+
+        # RBAC check — also returns per-alias column/row filter definitions.
+        # PermissionError propagates to the caller (legacy behaviour).
         rbac_views = restrict_read_access(
             super_name=self.super_name,
             organization=self.organization,
@@ -129,16 +154,6 @@ class DataReader:
         )
 
         try:
-            # Read-path policy: reads never create. Verify every
-            # referenced (super, simple) exists in the Redis catalog
-            # *before* the estimator / executor get a chance to
-            # side-effect-bootstrap them via SuperTable constructor
-            # calls. On a miss this raises SuperTableNotFoundError /
-            # TableNotFoundError, which the surrounding ``except`` turns
-            # into the same (empty_df, Status.ERROR, message) tuple as
-            # every other read failure — no state is touched.
-            self._assert_targets_exist(physical_tables)
-
             # Make executor aware of storage for presign retry
             executor = Executor(storage=self.storage, organization=self.organization)
 

@@ -90,9 +90,11 @@ class TestSinkTables:
         assert "_writes_" not in MONITORING_SINK_TABLES
 
     def test_mapping_keys_are_valid_monitor_types(self):
-        valid = {"plans", "writes", "mcp", "odata", "errors", "locks"}
+        # Pull the canonical closed set from redis_keys so this test
+        # automatically stays in sync when a new monitor_type is added.
+        from supertable.redis_keys import _VALID_MONITOR_TYPES
         for mt in MONITORING_SINK_TABLE_FOR.keys():
-            assert mt in valid
+            assert mt in _VALID_MONITOR_TYPES
 
     def test_mapping_values_appear_in_sink_tables(self):
         for sink in MONITORING_SINK_TABLE_FOR.values():
@@ -230,10 +232,10 @@ class TestDrainPartition:
         with pytest.raises(ValueError):
             drain_partition(cat, organization=ORG, monitor_type="writes", date="2026-06-09")
 
-    def test_happy_path_rename_lrange_del(self):
+    def test_happy_path_renamenx_lrange_del(self):
         cat = _mock_catalog()
-        # Rename succeeds (returns None on redis-py)
-        cat.r.rename.return_value = None
+        # RENAMENX succeeds (returns True / 1) — drain owns the data
+        cat.r.renamenx.return_value = 1
         cat.r.lrange.return_value = [
             json.dumps({"q": 1}).encode(),
             json.dumps({"q": 2}).encode(),
@@ -247,15 +249,18 @@ class TestDrainPartition:
         assert out == [{"q": 1}, {"q": 2}]
         src = RK.monitor_partition(ORG, "writes", "2026-06-09")
         drain = RK.monitor_partition_drain(ORG, "writes", "2026-06-09")
-        cat.r.rename.assert_called_once_with(src, drain)
+        cat.r.renamenx.assert_called_once_with(src, drain)
+        # Plain RENAME must NOT be used — it would silently destroy a
+        # previous crashed run's drain contents.
+        cat.r.rename.assert_not_called()
         cat.r.lrange.assert_called_once_with(drain, 0, -1)
         cat.r.delete.assert_called_once_with(drain)
 
     def test_source_missing_drain_missing_returns_empty(self):
         cat = _mock_catalog()
-        cat.r.rename.side_effect = Exception("no such key")  # source missing
+        # renamenx raises when src missing (Redis ResponseError)
+        cat.r.renamenx.side_effect = Exception("no such key")
         cat.r.lrange.return_value = []
-        # delete still safe to call but optional
         cat.r.delete.return_value = 0
         out = drain_partition(
             cat, organization=ORG, monitor_type="writes", date="2026-06-09",
@@ -264,10 +269,11 @@ class TestDrainPartition:
 
     def test_resumes_from_existing_drain_handle(self):
         """Crash-recovery path: previous attempt left a populated drain
-        key behind. The retry should still read it without a fresh rename."""
+        key behind. RENAMENX returns 0 / False (does NOT overwrite),
+        we fall through to read the existing drain — no data is lost."""
         cat = _mock_catalog()
-        # Rename fails because drain already exists
-        cat.r.rename.side_effect = Exception("drain already exists")
+        # RENAMENX returns 0 / False — destination already exists
+        cat.r.renamenx.return_value = 0
         cat.r.lrange.return_value = [json.dumps({"resumed": True}).encode()]
         cat.r.delete.return_value = 1
 
@@ -275,13 +281,39 @@ class TestDrainPartition:
             cat, organization=ORG, monitor_type="writes", date="2026-06-09",
         )
         assert out == [{"resumed": True}]
-        # Even though rename failed, drain was read and deleted
+        # Drain was read and deleted; src untouched (left for next call)
         cat.r.lrange.assert_called_once()
         cat.r.delete.assert_called_once()
+        # Critically: RENAME must NOT have been used (it would have
+        # overwritten the drain contents and lost the queued entries)
+        cat.r.rename.assert_not_called()
+
+    def test_renamenx_returns_false_drain_not_destroyed(self):
+        """Regression for the silent-data-loss bug: when renamenx
+        returns False (drain exists from a prior crashed run), the
+        drain contents are preserved."""
+        cat = _mock_catalog()
+        cat.r.renamenx.return_value = False  # drain already exists
+        # Drain handle holds 2 queued entries from a previous crash
+        cat.r.lrange.return_value = [
+            json.dumps({"prior_run_1": True}).encode(),
+            json.dumps({"prior_run_2": True}).encode(),
+        ]
+        cat.r.delete.return_value = 1
+
+        out = drain_partition(
+            cat, organization=ORG, monitor_type="writes", date="2026-06-09",
+        )
+
+        # Both prior-run entries recovered
+        assert out == [{"prior_run_1": True}, {"prior_run_2": True}]
+        # Source key was NOT touched by us (writer's new entries
+        # are still there for the next drain call)
+        cat.r.rename.assert_not_called()
 
     def test_rename_ok_but_lrange_empty_still_deletes_drain(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.lrange.return_value = []
         cat.r.delete.return_value = 1
 
@@ -294,7 +326,7 @@ class TestDrainPartition:
 
     def test_lrange_failure_leaves_drain_for_retry(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.lrange.side_effect = RuntimeError("transient")
 
         out = drain_partition(
@@ -306,7 +338,7 @@ class TestDrainPartition:
 
     def test_del_failure_after_read_returns_parsed_data(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.lrange.return_value = [json.dumps({"x": 1}).encode()]
         cat.r.delete.side_effect = RuntimeError("transient")
 
@@ -336,7 +368,7 @@ class TestIterPartitionChunks:
 
     def test_chunk_size_clamped_low(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 0
         cat.r.delete.return_value = 0
         # chunk_size=0 → clamped to 1, doesn't blow up
@@ -347,7 +379,7 @@ class TestIterPartitionChunks:
 
     def test_chunk_size_clamped_high(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 0
         # chunk_size > 1M → clamped, doesn't blow up
         list(iter_partition_chunks(
@@ -357,7 +389,7 @@ class TestIterPartitionChunks:
 
     def test_empty_partition_yields_nothing_deletes_drain(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 0
 
         chunks = list(iter_partition_chunks(
@@ -368,7 +400,7 @@ class TestIterPartitionChunks:
 
     def test_happy_path_yields_chunks_and_deletes(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 5
 
         # LRANGE returns slices of the right size
@@ -394,7 +426,7 @@ class TestIterPartitionChunks:
 
     def test_lrange_failure_mid_iteration_stops_leaves_drain(self):
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 10
 
         call_count = {"n": 0}
@@ -423,7 +455,7 @@ class TestIterPartitionChunks:
         intentional behaviour (replays already-yielded chunks, which
         the orchestrator must handle idempotently)."""
         cat = _mock_catalog()
-        cat.r.rename.return_value = None
+        cat.r.renamenx.return_value = 1
         cat.r.llen.return_value = 6
 
         def _lrange(_key, start, stop):

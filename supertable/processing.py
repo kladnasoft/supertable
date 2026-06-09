@@ -648,6 +648,153 @@ def process_files_with_overlap(
     return deleted, merged_df, total_rows, skipped_files
 
 
+# =========================
+# Public API: standalone compaction (no incoming data)
+# =========================
+
+def compact_resources(
+        snapshot: dict,
+        data_dir: str,
+        compression_level: int,
+        table_config: Optional[dict] = None,
+        small_only: bool = True,
+) -> Tuple[int, int, List[Dict], Set[str]]:
+    """Compact small parquet files in a snapshot's resources list.
+
+    This is the standalone counterpart to ``process_overlapping_files``:
+    it reads files and rewrites them in memory-bounded chunks, **without
+    needing any incoming data**. Used by ``DataWriter.compact()``.
+
+    Args:
+        snapshot: the current snapshot dict (read by the caller — must
+            contain a ``resources`` list of resource dicts with at least
+            ``file`` and ``file_size``).
+        data_dir: where to write the new compacted parquet files.
+        compression_level: zstd compression level.
+        table_config: per-table config dict (or None for global defaults);
+            used by ``_resolve_limits`` to pick up
+            ``max_memory_chunk_size`` and ``max_overlapping_files``.
+        small_only: when True (default), only files **strictly smaller**
+            than ``max_memory_chunk_size`` are considered for
+            compaction — large files are left untouched. When False,
+            every file is rewritten regardless of size.
+
+    Returns:
+        A 4-tuple ``(considered, total_rows, new_resources, sunset_files)``:
+
+          - ``considered`` — number of files that qualified for compaction
+            (i.e. that would be sunset if at least one new file was written).
+          - ``total_rows`` — total rows written into the new files.
+          - ``new_resources`` — list of resource dicts for the freshly
+            written files (matches the shape used by
+            ``simple_table.update``).
+          - ``sunset_files`` — set of file paths that were merged into
+            the new files. The caller passes this set to
+            ``simple_table.update`` so the resource list is correctly
+            replaced.
+
+    Value-preservation properties enforced here:
+
+      - Each source file is read **exactly once** via
+        ``_read_parquet_safe`` (which returns ``None`` for races where
+        another writer already sunset the file).
+      - The merge is a row-preserving ``concat_with_union`` — no
+        deduplication, no row drops. Tombstone-driven row removal is a
+        **separate** pre-step performed by ``compact_tombstones`` in
+        the caller (so this function only sees the post-tombstone
+        survivors when ``DataWriter.compact()`` invokes it).
+      - All columns from every source file are preserved: missing
+        columns in any input are filled with ``null`` via
+        ``concat_with_union``, never silently dropped.
+      - Source files are added to ``sunset_files`` **only after** their
+        rows have been successfully buffered into ``merged_df``. If a
+        read fails (``_read_parquet_safe`` returns ``None``), the file
+        is left in the snapshot — the next compaction retries it.
+    """
+    resources = snapshot.get("resources") or []
+    if not resources:
+        return 0, 0, [], set()
+
+    max_mem, _max_files = _resolve_limits(table_config)
+
+    # Classify candidates. Per ``small_only``, a file is a compaction
+    # candidate when its ``file_size`` is < max_mem (small files create
+    # the small-file accumulation problem this method exists to fix).
+    # When ``small_only=False`` every file is a candidate.
+    candidates: List[Tuple[str, int]] = []
+    for resource in resources:
+        file_path = resource.get("file")
+        if not file_path:
+            continue
+        file_size = int(resource.get("file_size") or 0)
+        if small_only and file_size >= max_mem:
+            continue
+        candidates.append((file_path, file_size))
+
+    if not candidates:
+        return 0, 0, [], set()
+
+    new_resources: List[Dict] = []
+    sunset_files: Set[str] = set()
+    total_rows = 0
+    chunk_size_bytes = 0
+    chunk_df: Optional[polars.DataFrame] = None
+
+    for file_path, file_size in candidates:
+        existing_df = _read_parquet_safe(file_path)
+        if existing_df is None:
+            # Race: another writer already sunset this file. Skip and
+            # leave it out of sunset_files — the snapshot still
+            # references it; the next compaction will retry.
+            continue
+
+        if chunk_df is None or chunk_df.height == 0:
+            # Seed the buffer with the first survivor. Using
+            # ``concat_with_union`` even for the seed keeps the schema
+            # behaviour identical to the merge path (no column drop on
+            # the first file).
+            chunk_df = (
+                existing_df if chunk_df is None
+                else concat_with_union(chunk_df, existing_df)
+            )
+        else:
+            chunk_df = concat_with_union(chunk_df, existing_df)
+
+        sunset_files.add(file_path)
+        chunk_size_bytes += int(file_size or 0)
+
+        # Flush when the buffered chunk exceeds the per-table memory cap.
+        # The same threshold ``process_files_without_overlap`` uses.
+        if chunk_size_bytes >= max_mem:
+            total_rows += chunk_df.shape[0]
+            # No overwrite columns for plain compaction — the resource
+            # stats will be re-collected by
+            # ``collect_column_statistics`` inside the writer; we don't
+            # need to pin a specific key for the resulting file.
+            write_parquet_and_collect_resources(
+                write_df=chunk_df,
+                overwrite_columns=[],
+                data_dir=data_dir,
+                new_resources=new_resources,
+                compression_level=compression_level,
+            )
+            chunk_df = None
+            chunk_size_bytes = 0
+
+    # Final flush — if anything remains in the buffer, write it out.
+    if chunk_df is not None and chunk_df.height > 0:
+        total_rows += chunk_df.shape[0]
+        write_parquet_and_collect_resources(
+            write_df=chunk_df,
+            overwrite_columns=[],
+            data_dir=data_dir,
+            new_resources=new_resources,
+            compression_level=compression_level,
+        )
+
+    return len(sunset_files), total_rows, new_resources, sunset_files
+
+
 def process_files_without_overlap(
         empty_df,
         data_dir,

@@ -264,6 +264,116 @@ Emits a `DATA_WRITE` audit event with category `DATA_MUTATION` including row cou
 
 ---
 
+## Explicit Compaction — `DataWriter.compact()`
+
+`write()` does opportunistic compaction in three places (Phase 1 small-file
+roll-up, Phase 3 skipped-file roll-up, tombstone threshold breach). For
+deployments that want **scheduled, manual** compaction outside the
+natural write cadence, `DataWriter.compact()` is the explicit entry
+point — it does the same work `write()` would do for an empty input,
+without rewriting any file that doesn't need to be rewritten.
+
+```python
+dw = DataWriter("warehouse", "acme")
+stats = dw.compact(
+    role_name="admin",
+    simple_name="orders",
+    force_tombstones=True,   # default: physically clean tombstones now
+    small_only=True,         # default: only touch files < max_memory_chunk_size
+    compression_level=1,
+)
+print(stats["files_before"], "→", stats["files_after"])
+```
+
+### What the call does
+
+1. **Access check** — `check_write_access` against the target table.
+2. **Per-simple lock** — same TTL (30 s) and timeout (60 s) as `write()`,
+   so concurrent writes and compactions serialise.
+3. **Snapshot read** — uses `SimpleTable(..., create_if_missing=False)`
+   so a missing table raises `TableNotFoundError` instead of being
+   bootstrapped. Compaction never creates a table.
+4. **Tombstone compaction** — runs `compact_tombstones()` to physically
+   remove soft-deleted rows from affected parquet files.
+   - `force_tombstones=True` (default) bypasses
+     `tombstone_compact_total`: clean *now* regardless of count.
+   - `force_tombstones=False` honors the natural threshold (same gate
+     as the delete-only path in `write()`).
+   - Skipped entirely when no primary keys / no tombstones.
+5. **Small-file compaction** — calls `processing.compact_resources()`:
+   - `small_only=True` (default): only files strictly smaller than
+     `max_memory_chunk_size` are considered. Large files are
+     left untouched.
+   - `small_only=False`: rewrite every resource regardless of size
+     (useful for a full-table re-encode / compression change).
+6. **Schema preservation** — derives the post-compaction schema for
+   `simple_table.update()` by reading the first new parquet file's
+   footer. Falls back to reconstructing from the prior snapshot's
+   `schema` field (compaction by definition preserves schema). This
+   guards against the silent corruption that would occur if `update()`
+   was handed an empty / wrong-typed model_df.
+7. **Snapshot commit** — `simple_table.update()` → `set_leaf_payload_cas`
+   → `bump_root`. Same atomic-CAS pattern as `write()`.
+8. **GC enqueue** — same `SUPERTABLE_SUNSET_GC_ENABLED` and
+   `SUPERTABLE_SNAPSHOT_RETENTION` flags (chap. 17). Sunset
+   parquets and pruned snapshot JSONs land on the per-table GC
+   stream just like a normal write.
+9. **Mirroring** — Delta / Iceberg / Parquet mirrors are refreshed.
+10. **Monitoring + audit** — emits a `monitor_type="compact"` metric
+    (own daily partition, own sink table `__compact__`) and a
+    `DATA_WRITE` audit event with `operation="compact"`.
+
+### Concurrency
+
+Compaction takes the same per-simple Redis lock as `write()`. A
+concurrent writer either runs first (compaction sees the updated
+snapshot) or waits. No corruption window — the leaf-CAS + bump-root
+sequence is identical.
+
+### Short-circuit
+
+When `compact_resources` finds nothing to merge **and** tombstones
+either don't run or don't produce work, the method returns early
+without writing a new snapshot. `files_before == files_after` and
+no leaf-CAS / root-bump / mirror calls are made.
+
+### Return value
+
+A stats dict (safe to JSON-encode) with the same shape monitoring
+emits:
+
+| Key | Meaning |
+|---|---|
+| `query_id` | Per-compaction UUID. Correlates the monitoring/audit entries. |
+| `files_before` / `files_after` | Resource count before/after the commit. |
+| `files_compacted` | Number of small files that were merged. |
+| `tombstone_rows_removed` | Rows physically deleted from parquets in Phase 4. |
+| `tombstone_files_rewritten` | Files rewritten by tombstone compaction. |
+| `new_resources` / `sunset_files` | Counts of files written / removed. |
+| `total_rows_written` | Rows written into the new compacted files. |
+| `duration` | Wall-clock seconds. |
+| `lineage` | JSON-encoded provenance dict. |
+| `supertables` | Always `[<super_name>]` — added before monitoring emit. |
+
+### Value-preservation invariants
+
+`processing.compact_resources()` provides these guarantees, verified
+by the `test_processing_compact_resources` suite (real Parquet I/O
+in a tempdir):
+
+- **No row loss** — multiset of input rows == multiset of output rows.
+- **No row duplication** — same.
+- **No column loss** — every column from any source file survives.
+- **No phantom columns** — no columns added that weren't in any source.
+- **Schema evolution preserved** — when source files have different
+  column sets, the union schema is used; missing columns become null.
+- **Dtypes preserved** — Int / Float / String / Boolean / Date round-trip
+  through Parquet without coercion.
+- **Race-tolerant** — if a source file is sunset by another writer
+  mid-compaction (`_read_parquet_safe` returns None), the file is
+  **not** added to `sunset_files`, so the snapshot still references
+  it and the next compaction retries. No silent data loss.
+
 ## Table Configuration
 
 ### configure_table()

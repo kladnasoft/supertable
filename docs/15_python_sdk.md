@@ -127,6 +127,29 @@ Optional kwargs: `compression_level=1`, `newer_than=None`, `delete_only=False`,
 `lineage=None` (dict with conventional keys — see the
 `DataWriter.write` docstring).
 
+#### `DataWriter.compact()` — explicit manual compaction
+
+For scheduled / on-demand compaction outside the natural write
+cadence (chap. 06 §Explicit Compaction):
+
+```python
+stats = dw.compact(
+    role_name="admin",
+    simple_name="orders",
+    force_tombstones=True,   # default — physically clean tombstones now
+    small_only=True,         # default — only touch files < max_memory_chunk_size
+    compression_level=1,
+)
+# stats: dict with files_before/after, files_compacted,
+# tombstone_rows_removed, new_resources, sunset_files,
+# total_rows_written, duration, lineage, query_id, …
+```
+
+Same lock, same atomic-CAS commit pattern, same GC enqueue and
+monitoring as `write()` — but with no incoming data. Refuses to
+bootstrap a missing table (raises `TableNotFoundError`). Emits
+`monitor_type="compact"` metrics; sink table is `__compact__`.
+
 ### DataReader
 
 Executes SQL queries against the SuperTable.

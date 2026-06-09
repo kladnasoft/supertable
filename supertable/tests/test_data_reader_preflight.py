@@ -222,6 +222,43 @@ class TestExecuteSurfacesNotFoundError:
     @patch(_P_REDIS_CATALOG)
     @patch(_P_SQL_PARSER)
     @patch(_P_GET_STORAGE)
+    def test_preflight_runs_before_rbac_does_not_side_effect_bootstrap(
+        self, mock_get_storage, MockParser, MockCat, mock_restrict,
+    ):
+        """Regression: ``restrict_read_access`` builds RoleManager
+        which would bootstrap RBAC role storage for a missing
+        supertable. The pre-flight MUST fire before RBAC so a SELECT
+        against a nonexistent supertable doesn't silently mint role
+        scaffolding in Redis.
+        """
+        mock_get_storage.return_value = MagicMock()
+        parser = MagicMock()
+        parser.get_table_tuples.return_value = []
+        parser.get_physical_tables.return_value = [_td("ghost_sup", "tbl")]
+        parser.original_query = "SELECT 1 FROM ghost_sup.tbl"
+        MockParser.return_value = parser
+
+        cat = MagicMock()
+        cat.root_exists.return_value = False
+        MockCat.return_value = cat
+
+        from supertable.engine.engine_enum import Engine
+        reader = DataReader("orig_sup", "org", "SELECT 1 FROM ghost_sup.tbl")
+        df, status, message = reader.execute(role_name="r", engine=Engine.AUTO)
+
+        # Pre-flight raised → Status.ERROR returned
+        assert status == Status.ERROR
+        assert "SuperTable not found" in (message or "")
+
+        # CRITICAL: restrict_read_access (which would bootstrap RBAC for
+        # the supertable as a side effect of building RoleManager) MUST
+        # NOT have been called when the pre-flight failed.
+        mock_restrict.assert_not_called()
+
+    @patch(_P_RESTRICT_READ)
+    @patch(_P_REDIS_CATALOG)
+    @patch(_P_SQL_PARSER)
+    @patch(_P_GET_STORAGE)
     def test_missing_leaf_returns_error_status(
         self, mock_get_storage, MockParser, MockCat, mock_restrict,
     ):

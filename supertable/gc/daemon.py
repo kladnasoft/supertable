@@ -62,7 +62,11 @@ def run_forever(cleaner: GCCleaner) -> None:
     while not cleaner._stop.is_set():
         try:
             stats = cleaner.tick()
-            if stats["deleted"] or stats["streams_processed"]:
+            # Log when we did work OR when something errored. The
+            # ``or stats["errors"]`` guard is important: a tick with
+            # no work but transient SCAN/XRANGE errors must surface,
+            # otherwise infra incidents stay invisible.
+            if stats["deleted"] or stats["streams_processed"] or stats["errors"]:
                 logger.info(
                     "[gc-daemon] org=%s tick: streams=%d deleted=%d (parquet=%d snapshot=%d) errors=%d",
                     cleaner.org,

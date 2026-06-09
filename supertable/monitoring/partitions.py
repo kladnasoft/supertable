@@ -69,12 +69,14 @@ _MAX_READ_RECENT_DAYS_BACK = 90
 #: ``__writes__`` does not generate a fresh ``writes`` metric for
 #: tomorrow's flush.
 MONITORING_SINK_TABLE_FOR: Dict[str, str] = {
-    "plans":  "__reads__",
-    "writes": "__writes__",
-    "mcp":    "__mcp__",
-    # The remaining monitor types do not yet have agreed sink tables.
-    # An orchestrator that wants to persist them can extend this mapping
-    # at call time — the SDK only uses it as a hint.
+    "plans":   "__reads__",
+    "writes":  "__writes__",
+    "mcp":     "__mcp__",
+    "compact": "__compact__",
+    # The remaining monitor types (``odata``/``errors``/``locks``) do
+    # not yet have agreed sink tables. An orchestrator that wants to
+    # persist them can extend this mapping at call time — the SDK
+    # only uses it as a hint.
 }
 
 
@@ -90,6 +92,7 @@ MONITORING_SINK_TABLE_FOR: Dict[str, str] = {
 #: rename target) can be added here without touching the mapping.
 MONITORING_SINK_TABLES: frozenset = frozenset(MONITORING_SINK_TABLE_FOR.values()) | {
     "__plans__",
+    "__compact__",
 }
 
 
@@ -201,6 +204,16 @@ def list_drainable_partitions(
     if not organization:
         return []
 
+    # Validate monitor_type against the closed set so a bad input
+    # returns [] cleanly instead of raising ValueError out of
+    # ``RK.monitor_partition_pattern`` (which would violate the
+    # "never raises" contract documented above). ``None`` means
+    # "every type" and uses the wildcard pattern.
+    if monitor_type is not None:
+        from supertable.redis_keys import _VALID_MONITOR_TYPES
+        if monitor_type not in _VALID_MONITOR_TYPES:
+            return []
+
     try:
         r = _get_redis(catalog)
     except ValueError:
@@ -250,12 +263,22 @@ def drain_partition(
 ) -> List[Dict[str, Any]]:
     """Atomically take a snapshot of one partition and delete the source.
 
-    The implementation uses ``RENAME`` (atomic in Redis) to move the
-    source key out from under any concurrent writer (in the rare day-
-    boundary race where a writer started a batch before midnight UTC).
-    After the rename, no writer can hit the old key again — they'd
-    create a fresh empty one for the new day. We then ``LRANGE 0 -1``
-    the renamed handle and ``DEL`` it.
+    The implementation uses ``RENAMENX`` (atomic in Redis, **does not
+    overwrite**) to move the source key out from under any concurrent
+    writer in the rare day-boundary race where a writer started a batch
+    before midnight UTC. After the rename, no writer can hit the old
+    key again — they'd create a fresh empty one for the new day. We
+    then ``LRANGE 0 -1`` the renamed handle and ``DEL`` it.
+
+    **Crash recovery via RENAMENX.** Using ``RENAME`` here would be a
+    silent-data-loss bug: a previous run crashing between LRANGE and
+    DEL leaves the drain handle populated. The next call's ``RENAME``
+    would overwrite the existing drain contents (Redis ``RENAME`` does
+    an implicit DEL of the destination), destroying entries that were
+    queued but not yet processed. ``RENAMENX`` returns 0 / False
+    instead — we fall through to LRANGE the *existing* drain handle,
+    so the earlier run's entries are still recovered. The fresh source
+    is left in place and picked up by the next call.
 
     If the partition does not exist (e.g. another orchestrator drained
     it first, or no writes happened that day), returns an empty list
@@ -280,22 +303,26 @@ def drain_partition(
     src = RK.monitor_partition(organization, monitor_type, date)
     drain = RK.monitor_partition_drain(organization, monitor_type, date)
 
-    # Atomically: if src exists, move it to drain; if drain already
-    # exists from an earlier crashed attempt, keep the existing drain
-    # and discard src (it can only contain entries from a fresh write
-    # to the old date which is impossible after midnight — and if we're
-    # here, the previous run crashed *after* the rename but before the
-    # DEL, so the drain has authoritative data).
+    # Atomic non-overwriting rename. Three outcomes:
+    #   1. src exists, drain does not  →  renamenx returns truthy.
+    #                                     We own the drain handle.
+    #   2. src exists, drain also exists (previous run crashed mid-process)
+    #      →  renamenx returns falsy. We DON'T destroy the existing
+    #         drain contents. We LRANGE the drain handle to recover the
+    #         earlier run's entries; the new src is left in place and
+    #         the *next* call to drain_partition picks it up.
+    #   3. src does not exist           →  renamenx raises ResponseError.
+    #                                     LRANGE drain still works (it
+    #                                     may be empty or hold prior data).
+    renamed = False
     try:
-        r.rename(src, drain)
-        renamed = True
+        # redis-py returns True/False or 1/0 depending on encoding mode
+        renamed = bool(r.renamenx(src, drain))
     except Exception:
+        # ResponseError when src missing, network blip, etc. Either way
+        # try the drain key — it may legitimately hold data from a
+        # crashed previous run.
         renamed = False
-        # Two reasons rename can fail:
-        #   1. src does not exist — nothing to drain (return what's at drain).
-        #   2. drain already exists — pick up the earlier crashed attempt.
-        # In both cases we proceed to LRANGE the drain handle, which
-        # works whether or not the rename succeeded.
 
     try:
         raw_entries = r.lrange(drain, 0, -1)
@@ -389,11 +416,14 @@ def iter_partition_chunks(
     src = RK.monitor_partition(organization, monitor_type, date)
     drain = RK.monitor_partition_drain(organization, monitor_type, date)
 
-    # Atomically rename source → drain. Same semantics as
-    # ``drain_partition``: on failure, we proceed to LRANGE the drain
-    # handle in case a previous run crashed mid-iteration.
+    # Atomic non-overwriting rename. Same semantics as
+    # ``drain_partition``: if the drain key already exists from a
+    # previous crashed run, RENAMENX returns False (does NOT overwrite),
+    # we fall through to LRANGE the existing drain handle, the earlier
+    # run's entries are recovered, and the new src is left in place for
+    # the next call. Plain RENAME would silently destroy queued data.
     try:
-        r.rename(src, drain)
+        r.renamenx(src, drain)
     except Exception:
         pass
 
@@ -511,9 +541,12 @@ def read_recent(
         max_days_back = 1
     elif max_days_back > _MAX_READ_RECENT_DAYS_BACK:
         max_days_back = _MAX_READ_RECENT_DAYS_BACK
-    if not organization or monitor_type not in {
-        "plans", "writes", "mcp", "odata", "errors", "locks",
-    }:
+    # Validate the monitor_type against the same closed set
+    # ``redis_keys.monitor_partition`` enforces — keeping the two in
+    # sync via the import (not a hardcoded literal) means adding a new
+    # type (e.g. ``"compact"``) lights up here automatically.
+    from supertable.redis_keys import _VALID_MONITOR_TYPES
+    if not organization or monitor_type not in _VALID_MONITOR_TYPES:
         return []
 
     try:

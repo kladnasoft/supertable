@@ -30,12 +30,13 @@ automatically — the date is recomputed per batch ship, never cached.
 
 | Category | `monitor_type` | Source | Sink Table | Key Fields |
 |----------|----------------|--------|-----------|------------|
-| **Reads**  | `plans`  | Query execution                 | `__reads__`  | query_id, engine, table_name, result_rows, execution_timings, status, supertables |
-| **Writes** | `writes` | Data ingestion                  | `__writes__` | query_id, table_name, incoming_rows, inserted, deleted, duration, supertables |
-| **MCP**    | `mcp`    | MCP tool invocations            | `__mcp__`    | tool, organization, rows, duration_ms, supertables |
-| **OData**  | `odata`  | OData reads                     | _(none)_     | endpoint_id, entity_set, rows_returned, role_name, supertables |
-| **Errors** | `errors` | Any handler that caught         | _(none)_     | service, action, error_code, message, supertables |
-| **Locks**  | `locks`  | Redis lock acquisitions / releases | _(none)_  | lock_key, action, holder, supertables |
+| **Reads**     | `plans`   | Query execution                    | `__reads__`   | query_id, engine, table_name, result_rows, execution_timings, status, supertables |
+| **Writes**    | `writes`  | Data ingestion (`DataWriter.write`)| `__writes__`  | query_id, table_name, incoming_rows, inserted, deleted, duration, supertables |
+| **MCP**       | `mcp`     | MCP tool invocations               | `__mcp__`     | tool, organization, rows, duration_ms, supertables |
+| **Compaction**| `compact` | Explicit compaction (`DataWriter.compact`) | `__compact__` | query_id, table_name, files_before, files_after, files_compacted, tombstone_rows_removed, duration, supertables |
+| **OData**     | `odata`   | OData reads                        | _(none)_      | endpoint_id, entity_set, rows_returned, role_name, supertables |
+| **Errors**    | `errors`  | Any handler that caught            | _(none)_      | service, action, error_code, message, supertables |
+| **Locks**     | `locks`   | Redis lock acquisitions / releases | _(none)_      | lock_key, action, holder, supertables |
 
 The category is selected via the `monitor_type` argument when
 constructing the writer. The closed-set of valid `monitor_type` values

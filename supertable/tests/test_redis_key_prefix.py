@@ -145,6 +145,8 @@ def _all_helpers() -> list[tuple[str, str, str]]:
                                                                                f"supertable:{ORG}:monitor:errors:doc:2026-06-09"),
         ("monitor_partition_locks",      RK.monitor_partition(ORG, "locks", "2026-06-09"),
                                                                                f"supertable:{ORG}:monitor:locks:doc:2026-06-09"),
+        ("monitor_partition_compact",    RK.monitor_partition(ORG, "compact", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:compact:doc:2026-06-09"),
         ("monitor_partition_drain",      RK.monitor_partition_drain(ORG, "writes", "2026-06-09"),
                                                                                f"supertable:{ORG}:monitor:writes:doc:2026-06-09:_drain"),
         ("monitor_partition_pattern",    RK.monitor_partition_pattern(ORG, "writes"),
