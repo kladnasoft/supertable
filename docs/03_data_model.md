@@ -115,6 +115,104 @@ Every write produces a new immutable snapshot file. Snapshots are never overwrit
 1. **Version 0** -- Created by `SimpleTable.init_simple_table()`. Empty `schema` and `resources`.
 2. **Version N+1** -- Created by `SimpleTable.update()`. Merges new resources, removes sunset files, updates schema from the model DataFrame.
 
+### Schema Field Semantics — "Last Write Wins" (Intentional)
+
+The snapshot's `schema` field follows a **"writer is the schema authority"**
+contract. Each call to `SimpleTable.update` **unconditionally overwrites** the
+new snapshot's `schema` field with the schema of the `model_df` passed in.
+It does **not** union with the prior snapshot's schema, and it does **not**
+preserve columns that aren't in the incoming `model_df`. This is deliberate
+— it just hadn't been documented anywhere outside the code, so reproducing
+it correctly without reading the source was effectively impossible.
+
+#### Where this lives in code
+
+`supertable/simple_table.py`, inside `SimpleTable.update` (≈ lines 290–299):
+
+```python
+schema_list = collect_schema(model_df)
+if not schema_list:
+    # Fallback: derive schema from Polars dtypes if helper returns empty.
+    schema_list = _schema_list_from_polars_df(model_df)
+last_simple_table["schema"] = schema_list                  # ← overwrite, no union
+# Also store a Spark StructType JSON for downstream Delta mirrors.
+try:
+    last_simple_table["schemaString"] = json.dumps(
+        {"type": "struct", "fields": schema_list},
+        separators=(",", ":"),
+    )
+except Exception:
+    pass
+```
+
+Step by step:
+
+1. `collect_schema(model_df)` (from `supertable/utils/helper.py`) turns the
+   incoming Polars DataFrame into a list of `{name, type, nullable, metadata}`
+   field dicts.
+2. If that returns empty (e.g. the helper can't introspect the dtype),
+   `_schema_list_from_polars_df` (local to `simple_table.py`) falls back to
+   walking `model_df.schema` and mapping each Polars dtype to a Spark/Delta
+   type string.
+3. The result is assigned directly onto `last_simple_table["schema"]` —
+   replacing whatever was there in the previous snapshot. There is no read
+   of the prior `schema` field at any point in this method.
+4. A Spark `StructType` mirror is written to `schemaString` so Delta-shaped
+   readers see the same fields.
+
+Because `last_simple_table` was built by mutating the previous snapshot
+dict, every other field (`resources`, `previous_snapshot`, etc.) carries
+forward — only `schema` and `schemaString` are wholesale-replaced.
+
+#### Caller contract
+
+- Every caller of `SimpleTable.update` must pass a `model_df` whose schema
+  is exactly the schema the new snapshot should record.
+- For `DataWriter.write(...)`, that's the incoming Arrow/Polars data the
+  caller supplied. Sending a DataFrame missing columns that exist in older
+  parquet files will shrink the snapshot's `schema` even though the columns
+  are still present on disk.
+- For `DataWriter.compact(...)` and `SimpleTable.repair_schema()`, the
+  internal helpers derive `model_df` by reading the actual parquet files on
+  storage, so the schema reflects what's physically present.
+
+#### Why this design (and not append-only union)
+
+An alternative would have been "schema is the union of every column ever
+written, columns can only be added, never removed" (Iceberg and Delta lean
+that way). The chosen design instead lets the writer declare the canonical
+schema explicitly:
+
+| Design | Pros | Cons |
+|--------|------|------|
+| **"Last write wins" (the choice)** | Writer owns the schema; column drops and dtype changes are first-class operations expressed by passing a different `model_df`. No accumulating-forever metadata. Simple update semantics. | Caller must always pass a full-shape `model_df`. A partial `model_df` shrinks the snapshot metadata even though older parquet files still contain the missing columns. |
+| Append-only union | Snapshot metadata always reflects every column the table has ever had. Cannot be silently shrunk. | Need an explicit "drop column" operation to ever shrink the schema. More complex update semantics. |
+
+#### Read-time fallbacks
+
+A `SELECT col` against a column not in the snapshot's `schema` field will
+fail with `Missing required column(s):` because
+`DataEstimator.get_missing_columns` validates the requested columns against
+this field. That's the contract working as designed.
+
+To keep queries working when the snapshot `schema` has drifted from the
+parquet files (e.g. a caller passed a partial `model_df`, or the field was
+written empty by an older buggy code path), the SDK has two defensive
+fallbacks:
+
+1. **`DataEstimator` self-heal.** When the snapshot's schema is empty or
+   doesn't list a requested column, the estimator reads the first parquet
+   file's schema and augments the in-memory column set. Queries succeed
+   without anyone having to repair anything. A `WARNING` log line surfaces
+   the drift so it's not silent.
+2. **`SimpleTable.repair_schema()`.** A one-shot helper that derives the
+   schema from the first parquet file and rewrites the snapshot with it.
+   Use when you want to persistently fix the metadata rather than rely on
+   the self-heal at every read.
+
+These are recovery paths, not part of the contract — they keep queries
+running while the caller fixes the upstream `model_df`.
+
 ### Snapshot Retention
 
 By default the snapshot JSONs accumulate forever — every write's
