@@ -27,7 +27,7 @@ def _make_overlapping_set(paths):
 
 def _mock_reader(file_map: dict):
     """Return a side_effect function for _read_parquet_safe that serves from file_map."""
-    def _read(path):
+    def _read(path, *args, **kwargs):
         return file_map.get(path)
     return _read
 

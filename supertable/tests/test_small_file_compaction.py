@@ -47,12 +47,12 @@ class _FakeStorage:
         self.written_resources: List[Dict] = []
 
     # -- read side --
-    def read(self, path: str) -> Optional[pl.DataFrame]:
+    def read(self, path: str, *args, **kwargs) -> Optional[pl.DataFrame]:
         return self.files.get(path)
 
     # -- write side (replaces write_parquet_and_collect_resources) --
     def fake_write(self, write_df, overwrite_columns, data_dir, new_resources,
-                   compression_level=10):
+                   compression_level=10, **kwargs):
         self.written_dfs.append(write_df.clone())
         new_resources.append({
             "file": f"{data_dir}/out_{len(self.written_resources)}.parquet",

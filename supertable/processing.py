@@ -3,6 +3,7 @@
 import logging
 import os
 import io
+import time
 from datetime import datetime, date
 from typing import Dict, List, Set, Tuple, Optional
 
@@ -13,6 +14,7 @@ import pyarrow.parquet as pq
 from supertable.utils.helper import generate_filename, collect_schema
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
+from supertable.utils.profiler import Profiler, get_null_profiler
 
 # Target row-group size for all Parquet writes.
 # 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
@@ -204,20 +206,33 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
 # Safe storage I/O helpers
 # =========================
 
-def _safe_exists(path: str) -> bool:
+def _safe_exists(path: str, profiler: Optional[Profiler] = None) -> bool:
+    p = profiler or get_null_profiler()
     try:
-        return _get_storage().exists(path)
+        with p.span("io.exists"):
+            return _get_storage().exists(path)
     except Exception:
         return False
 
 
-def _read_parquet_safe(path: str) -> Optional[polars.DataFrame]:
-    if not _safe_exists(path):
+def _read_parquet_safe(
+        path: str,
+        profiler: Optional[Profiler] = None,
+        file_size: int = 0,
+) -> Optional[polars.DataFrame]:
+    p = profiler or get_null_profiler()
+    if not _safe_exists(path, profiler=p):
         logging.info(f"[race] file already sunset by another writer: {path}")
         return None
     try:
-        tbl = _get_storage().read_parquet(path)  # -> pyarrow.Table
-        return polars.from_arrow(tbl)
+        with p.span("io.read_parquet"):
+            tbl = _get_storage().read_parquet(path)  # -> pyarrow.Table
+        with p.span("io.arrow_to_polars"):
+            df = polars.from_arrow(tbl)
+        p.add("files_read", 1)
+        p.add("bytes_read", int(file_size))
+        p.add("rows_read", int(df.height))
+        return df
     except FileNotFoundError:
         logging.info(f"[race] file vanished before read: {path}")
         return None
@@ -354,6 +369,7 @@ def find_overlapping_files(  # keep name/signature for compatibility
         overwrite_columns: List[str],
         locking: object = None,  # deprecated: kept for signature compatibility
         table_config: Optional[dict] = None,
+        profiler: Optional[Profiler] = None,
 ) -> Set[Tuple[str, bool, int]]:
     """
     Builds the candidate set:
@@ -367,19 +383,24 @@ def find_overlapping_files(  # keep name/signature for compatibility
       - No per-file locking here (consistent with new locking model).
       - Return: set of tuples (file_path, has_overlap: bool, file_size)
     """
+    p = profiler or get_null_profiler()
     resources = last_simple_table.get("resources", {}) or {}
     overlapping_files: Set[Tuple[str, bool, int]] = set()
+    p.add("resources_total", len(resources))
 
     if overwrite_columns:
         # ORIGINAL APPROACH - much faster
-        new_schema = collect_schema(df)
+        with p.span("overlap.schema"):
+            new_schema = collect_schema(df)
         new_data_columns: Dict[str, List] = {}
-        for col in overwrite_columns:
-            if col in df.columns:
-                # Use original unique values approach - it's actually faster for most cases
-                unique_values = df[col].unique().to_list()
-                new_data_columns[col] = unique_values
+        with p.span("overlap.unique_values"):
+            for col in overwrite_columns:
+                if col in df.columns:
+                    # Use original unique values approach - it's actually faster for most cases
+                    unique_values = df[col].unique().to_list()
+                    new_data_columns[col] = unique_values
 
+        t0 = time.perf_counter()
         for resource in resources:
             file = resource["file"]
             file_size = int(resource.get("file_size") or 0)
@@ -433,6 +454,7 @@ def find_overlapping_files(  # keep name/signature for compatibility
             else:
                 # Missing stats → treat as overlapping (be conservative)
                 overlapping_files.add((file, True, file_size))
+        p.mark("overlap.scan_resources", t0)
 
     else:
         # No overwrite columns → pure compaction path for small files
@@ -444,7 +466,12 @@ def find_overlapping_files(  # keep name/signature for compatibility
                 overlapping_files.add((file, False, file_size))
 
     # Apply pruning logic to trigger compaction when many/large small files accumulate
-    overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files, table_config=table_config)
+    with p.span("overlap.prune"):
+        overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files, table_config=table_config)
+
+    p.add("overlap_files_true", sum(1 for _, ov, _ in overlapping_files if ov))
+    p.add("overlap_files_false", sum(1 for _, ov, _ in overlapping_files if not ov))
+    p.add("overlap_files_total_bytes", sum(sz for _, _, sz in overlapping_files))
 
     # Per-file locks removed intentionally; higher-level simple/table lock handles concurrency
     return overlapping_files
@@ -462,6 +489,7 @@ def process_overlapping_files(
         compression_level: int,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         table_config: Optional[dict] = None,
+        profiler: Optional[Profiler] = None,
 ):
     """
     Merge implementation:
@@ -472,6 +500,7 @@ def process_overlapping_files(
 
     Limits are resolved per-table (table_config) with fallback to global default.
     """
+    p = profiler or get_null_profiler()
     inserted = df.shape[0]
     deleted = 0
     total_columns = df.shape[1]
@@ -485,36 +514,42 @@ def process_overlapping_files(
     empty_df = polars.DataFrame(schema=schema)
 
     # Phase 1: pull in non-overlapping (False) as compaction chunks
-    chunk_df = process_files_without_overlap(
-        empty_df=empty_df,
-        data_dir=data_dir,
-        new_resources=new_resources,
-        overlapping_files=overlapping_files,
-        overwrite_columns=overwrite_columns,
-        sunset_files=sunset_files,
-        compression_level=compression_level,
-        table_config=table_config,
-    )
+    with p.span("process.phase1_compact"):
+        chunk_df = process_files_without_overlap(
+            empty_df=empty_df,
+            data_dir=data_dir,
+            new_resources=new_resources,
+            overlapping_files=overlapping_files,
+            overwrite_columns=overwrite_columns,
+            sunset_files=sunset_files,
+            compression_level=compression_level,
+            table_config=table_config,
+            profiler=p,
+        )
 
     # Start merged with compaction chunk + incoming df
-    merged_df = concat_with_union(chunk_df, df)
+    with p.span("process.initial_concat"):
+        merged_df = concat_with_union(chunk_df, df)
 
     # Phase 2: process overlapping=True files (pull-forward non-overwritten rows)
-    deleted, merged_df, total_rows, skipped_files = process_files_with_overlap(
-        data_dir=data_dir,
-        deleted=deleted,
-        df=df,
-        empty_df=empty_df,
-        merged_df=merged_df,
-        new_resources=new_resources,
-        overlapping_files=overlapping_files,
-        overwrite_columns=overwrite_columns,
-        sunset_files=sunset_files,
-        total_rows=total_rows,
-        compression_level=compression_level,
-        file_cache=file_cache,
-        table_config=table_config,
-    )
+    with p.span("process.phase2"):
+        deleted, merged_df, total_rows, skipped_files = process_files_with_overlap(
+            data_dir=data_dir,
+            deleted=deleted,
+            df=df,
+            empty_df=empty_df,
+            merged_df=merged_df,
+            new_resources=new_resources,
+            overlapping_files=overlapping_files,
+            overwrite_columns=overwrite_columns,
+            sunset_files=sunset_files,
+            total_rows=total_rows,
+            compression_level=compression_level,
+            file_cache=file_cache,
+            table_config=table_config,
+            profiler=p,
+        )
+    p.add("phase2_skipped_files", len(skipped_files))
 
     # Phase 3: compact skipped small files when file count exceeds threshold.
     #
@@ -529,39 +564,46 @@ def process_overlapping_files(
     max_mem, max_files = _resolve_limits(table_config)
 
     if len(skipped_files) >= max_files:
-        compact_size = 0
-        for file, file_size in skipped_files:
-            existing_df = _read_parquet_safe(file)
-            if existing_df is None:
-                continue
+        p.add("phase3_compaction_triggered", 1)
+        with p.span("process.phase3_skipped_compact"):
+            compact_size = 0
+            for file, file_size in skipped_files:
+                existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
+                if existing_df is None:
+                    continue
 
-            merged_df = concat_with_union(merged_df, existing_df)
-            sunset_files.add(file)
-            compact_size += int(file_size or 0)
+                with p.span("process.phase3.concat"):
+                    merged_df = concat_with_union(merged_df, existing_df)
+                sunset_files.add(file)
+                compact_size += int(file_size or 0)
 
-            # Flush if chunk exceeds memory limit
-            if compact_size >= max_mem:
-                total_rows += merged_df.shape[0]
-                write_parquet_and_collect_resources(
-                    write_df=merged_df,
-                    overwrite_columns=overwrite_columns,
-                    data_dir=data_dir,
-                    new_resources=new_resources,
-                    compression_level=compression_level,
-                )
-                merged_df = empty_df.clone()
-                compact_size = 0
+                # Flush if chunk exceeds memory limit
+                if compact_size >= max_mem:
+                    total_rows += merged_df.shape[0]
+                    with p.span("process.phase3.flush"):
+                        write_parquet_and_collect_resources(
+                            write_df=merged_df,
+                            overwrite_columns=overwrite_columns,
+                            data_dir=data_dir,
+                            new_resources=new_resources,
+                            compression_level=compression_level,
+                            profiler=p,
+                        )
+                    merged_df = empty_df.clone()
+                    compact_size = 0
 
     # Final flush if anything remains
     if merged_df.shape[0] > 0:
         total_rows += merged_df.shape[0]
-        write_parquet_and_collect_resources(
-            write_df=merged_df,
-            overwrite_columns=overwrite_columns,
-            data_dir=data_dir,
-            new_resources=new_resources,
-            compression_level=compression_level,
-        )
+        with p.span("process.final_flush"):
+            write_parquet_and_collect_resources(
+                write_df=merged_df,
+                overwrite_columns=overwrite_columns,
+                data_dir=data_dir,
+                new_resources=new_resources,
+                compression_level=compression_level,
+                profiler=p,
+            )
 
     return inserted, deleted, total_rows, total_columns, new_resources, sunset_files
 
@@ -580,13 +622,16 @@ def process_files_with_overlap(
         compression_level,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         table_config: Optional[dict] = None,
+        profiler: Optional[Profiler] = None,
 ):
+    p = profiler or get_null_profiler()
     # Pre-compute unique values for overwrite columns (ORIGINAL FAST APPROACH)
     unique_values_map = {}
     if overwrite_columns:
-        for col in overwrite_columns:
-            if col in df.columns:
-                unique_values_map[col] = df[col].unique(maintain_order=False)
+        with p.span("process.phase2.unique_values"):
+            for col in overwrite_columns:
+                if col in df.columns:
+                    unique_values_map[col] = df[col].unique(maintain_order=False)
 
     # Track has_overlap=True files that had zero actual row matches (skipped).
     # These are candidates for small-file compaction when the total file count
@@ -595,11 +640,13 @@ def process_files_with_overlap(
 
     # Iterate only files where has_overlap is True
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if has_overlap):
+        p.add("phase2_files_seen", 1)
         # Use cached read if available (populated by filter_stale_incoming_rows)
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.pop(file)
+            p.add("phase2_cache_hits", 1)
         else:
-            existing_df = _read_parquet_safe(file)
+            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
         if existing_df is None:
             continue
 
@@ -613,8 +660,10 @@ def process_files_with_overlap(
 
             if key_cols_in_existing == list(overwrite_columns) and key_cols_in_incoming == list(overwrite_columns):
                 # Build a DataFrame of unique incoming key tuples for the join
-                incoming_keys = df.select(overwrite_columns).unique()
-                kept = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
+                with p.span("process.phase2.incoming_keys"):
+                    incoming_keys = df.select(overwrite_columns).unique()
+                with p.span("process.phase2.anti_join"):
+                    kept = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
                 difference = existing_df.shape[0] - kept.shape[0]
                 deleted += difference
                 filtered_df = kept
@@ -627,22 +676,27 @@ def process_files_with_overlap(
         if filtered_df.shape[0] == existing_df.shape[0] and overwrite_columns:
             # No rows deleted → keep original; record for potential compaction
             skipped_files.append((file, file_size))
+            p.add("phase2_files_skipped", 1)
             continue
 
-        merged_df = concat_with_union(merged_df, filtered_df)
+        with p.span("process.phase2.concat"):
+            merged_df = concat_with_union(merged_df, filtered_df)
         sunset_files.add(file)
+        p.add("phase2_files_touched", 1)
 
         # Spill chunk if too large (ORIGINAL APPROACH - 2x memory chunk)
         _max_mem, _ = _resolve_limits(table_config)
         if merged_df.estimated_size() > _max_mem * 2:
             total_rows += merged_df.shape[0]
-            write_parquet_and_collect_resources(
-                write_df=merged_df,
-                overwrite_columns=overwrite_columns,
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-            )
+            with p.span("process.phase2.flush"):
+                write_parquet_and_collect_resources(
+                    write_df=merged_df,
+                    overwrite_columns=overwrite_columns,
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
             merged_df = empty_df.clone()
 
     return deleted, merged_df, total_rows, skipped_files
@@ -804,7 +858,9 @@ def process_files_without_overlap(
         sunset_files,
         compression_level,
         table_config: Optional[dict] = None,
+        profiler: Optional[Profiler] = None,
 ):
+    p = profiler or get_null_profiler()
     # ORIGINAL COMPACTION APPROACH - simple and fast
     chunk_size = 0
     chunk_df = empty_df.clone()
@@ -812,23 +868,27 @@ def process_files_without_overlap(
 
     # Pull in has_overlap=False files (selected by threshold pruning) for compaction
     for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if not has_overlap):
-        existing_df = _read_parquet_safe(file)
+        existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
         if existing_df is None:
             continue
 
-        chunk_df = concat_with_union(chunk_df, existing_df)
+        with p.span("process.phase1.concat"):
+            chunk_df = concat_with_union(chunk_df, existing_df)
         sunset_files.add(file)
         chunk_size += int(file_size or 0)
+        p.add("phase1_files", 1)
 
         # If the chunk size exceeds the max memory chunk size, write it out
         if chunk_size >= max_mem:
-            write_parquet_and_collect_resources(
-                write_df=chunk_df,
-                overwrite_columns=overwrite_columns,
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-            )
+            with p.span("process.phase1.flush"):
+                write_parquet_and_collect_resources(
+                    write_df=chunk_df,
+                    overwrite_columns=overwrite_columns,
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
             chunk_size = 0
             chunk_df = empty_df.clone()
 
@@ -846,6 +906,7 @@ def process_delete_only(
         data_dir: str,
         compression_level: int,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        profiler: Optional[Profiler] = None,
 ):
     """
     Delete-only path: for each overlapping file, remove rows matching the
@@ -863,6 +924,7 @@ def process_delete_only(
         (inserted, deleted, total_rows, total_columns, new_resources, sunset_files)
     where inserted is always 0.
     """
+    p = profiler or get_null_profiler()
     deleted = 0
     total_rows = 0
     total_columns = 0
@@ -872,19 +934,22 @@ def process_delete_only(
 
     # Pre-compute unique key values for efficient is_in() filtering
     unique_values_map: Dict[str, polars.Series] = {}
-    for col in overwrite_columns:
-        if col in df.columns:
-            unique_values_map[col] = df[col].unique(maintain_order=False)
+    with p.span("delete.unique_values"):
+        for col in overwrite_columns:
+            if col in df.columns:
+                unique_values_map[col] = df[col].unique(maintain_order=False)
 
     for file, has_overlap, file_size in overlapping_files:
         if not has_overlap:
             continue
+        p.add("delete_files_seen", 1)
 
         # Use cached read if available (populated by filter_stale_incoming_rows)
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.pop(file)
+            p.add("delete_cache_hits", 1)
         else:
-            existing_df = _read_parquet_safe(file)
+            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
         if existing_df is None:
             continue
 
@@ -897,18 +962,22 @@ def process_delete_only(
             continue
 
         # Build a DataFrame of unique incoming key tuples for the join
-        incoming_keys = df.select(overwrite_columns).unique()
-        kept_df = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
+        with p.span("delete.incoming_keys"):
+            incoming_keys = df.select(overwrite_columns).unique()
+        with p.span("delete.anti_join"):
+            kept_df = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
         difference = existing_df.shape[0] - kept_df.shape[0]
 
         if difference == 0:
             # Nothing deleted from this file — leave it untouched
+            p.add("delete_files_skipped", 1)
             continue
 
         deleted += difference
 
         # Sunset the original file
         sunset_files.add(file)
+        p.add("delete_files_touched", 1)
 
         # Track total_columns from existing files (they have the full schema)
         if total_columns == 0:
@@ -917,13 +986,15 @@ def process_delete_only(
         # If there are remaining rows, write them as a standalone file
         if kept_df.shape[0] > 0:
             total_rows += kept_df.shape[0]
-            write_parquet_and_collect_resources(
-                write_df=kept_df,
-                overwrite_columns=overwrite_columns,
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-            )
+            with p.span("delete.write_kept"):
+                write_parquet_and_collect_resources(
+                    write_df=kept_df,
+                    overwrite_columns=overwrite_columns,
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
 
     # Fallback: if no files were touched, derive total_columns from the delete df
     if total_columns == 0:
@@ -937,7 +1008,8 @@ def process_delete_only(
 # =========================
 
 def write_parquet_and_collect_resources(
-        write_df, overwrite_columns, data_dir, new_resources, compression_level=10
+        write_df, overwrite_columns, data_dir, new_resources, compression_level=10,
+        profiler: Optional[Profiler] = None,
 ):
     """Write a DataFrame as one or more Parquet files and append resource dicts.
 
@@ -978,7 +1050,7 @@ def write_parquet_and_collect_resources(
 
         if has_nulls:
             null_df = partitioned.filter(null_mask).drop(["__p_year__", "__p_month__", "__p_day__"])
-            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level)
+            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler)
             partitioned = partitioned.filter(~null_mask)
 
         if partitioned.height > 0:
@@ -998,14 +1070,16 @@ def write_parquet_and_collect_resources(
                 )
                 _write_single_parquet_file(
                     group_df, overwrite_columns, partition_dir, new_resources, compression_level,
+                    profiler=profiler,
                 )
     else:
         # --- Flat write path (no __timestamp__) — backward compatible ---
-        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level)
+        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler)
 
 
 def _write_single_parquet_file(
-        write_df, overwrite_columns, target_dir, new_resources, compression_level=10
+        write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
+        profiler: Optional[Profiler] = None,
 ):
     """Write a single Parquet file into *target_dir* and append a resource entry.
 
@@ -1013,17 +1087,20 @@ def _write_single_parquet_file(
     ``write_parquet_and_collect_resources``.  All Parquet encoding settings
     (zstd, dictionary, row-group size, statistics) are unchanged.
     """
+    p = profiler or get_null_profiler()
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    stats = collect_column_statistics(write_df, overwrite_columns)
+    with p.span("write.collect_stats"):
+        stats = collect_column_statistics(write_df, overwrite_columns)
 
     # Ensure target directory exists (no-op on object storage)
-    try:
-        if not _get_storage().exists(target_dir):
-            _get_storage().makedirs(target_dir)
-    except Exception:
-        pass
+    with p.span("write.ensure_dir"):
+        try:
+            if not _get_storage().exists(target_dir):
+                _get_storage().makedirs(target_dir)
+        except Exception:
+            pass
 
     new_parquet_file = generate_filename("data", "parquet")
     new_parquet_path = os.path.join(target_dir, new_parquet_file)
@@ -1035,28 +1112,43 @@ def _write_single_parquet_file(
         + [c for c in (overwrite_columns or []) if c in write_df.columns and c != "__timestamp__"]
     )
     if sort_cols and write_df.height > 0:
-        write_df = write_df.sort(sort_cols)
+        with p.span("write.sort"):
+            write_df = write_df.sort(sort_cols)
 
     # Write to the active storage backend
     try:
-        arrow_tbl: pa.Table = write_df.to_arrow()
-        buf = io.BytesIO()
-        pq.write_table(
-            arrow_tbl,
-            buf,
-            compression="zstd",
-            compression_level=int(compression_level),
-            use_dictionary=True,
-            write_statistics=True,
-            row_group_size=_PARQUET_ROW_GROUP_SIZE,
-        )
-        data = buf.getvalue()
+        with p.span("write.to_arrow"):
+            arrow_tbl: pa.Table = write_df.to_arrow()
+        with p.span("write.parquet_encode"):
+            buf = io.BytesIO()
+            pq.write_table(
+                arrow_tbl,
+                buf,
+                compression="zstd",
+                compression_level=int(compression_level),
+                use_dictionary=True,
+                write_statistics=True,
+                row_group_size=_PARQUET_ROW_GROUP_SIZE,
+            )
+            data = buf.getvalue()
 
         if hasattr(_get_storage(), "write_bytes"):
-            _get_storage().write_bytes(new_parquet_path, data)
+            with p.span("write.upload_bytes"):
+                _get_storage().write_bytes(new_parquet_path, data)
         elif hasattr(_get_storage(), "write_parquet"):
-            _get_storage().write_parquet(arrow_tbl, new_parquet_path)
+            with p.span("write.upload_parquet"):
+                _get_storage().write_parquet(arrow_tbl, new_parquet_path)
         else:
+            with p.span("write.local_fallback"):
+                write_df.write_parquet(
+                    file=new_parquet_path,
+                    compression="zstd",
+                    compression_level=int(compression_level),
+                    statistics=True,
+                    row_group_size=_PARQUET_ROW_GROUP_SIZE,
+                )
+    except Exception:
+        with p.span("write.local_fallback"):
             write_df.write_parquet(
                 file=new_parquet_path,
                 compression="zstd",
@@ -1064,18 +1156,11 @@ def _write_single_parquet_file(
                 statistics=True,
                 row_group_size=_PARQUET_ROW_GROUP_SIZE,
             )
-    except Exception:
-        write_df.write_parquet(
-            file=new_parquet_path,
-            compression="zstd",
-            compression_level=int(compression_level),
-            statistics=True,
-            row_group_size=_PARQUET_ROW_GROUP_SIZE,
-        )
 
     # Determine file size
     try:
-        file_size = _get_storage().size(new_parquet_path)
+        with p.span("write.size_lookup"):
+            file_size = _get_storage().size(new_parquet_path)
     except Exception:
         try:
             file_size = os.path.getsize(new_parquet_path)
@@ -1084,6 +1169,10 @@ def _write_single_parquet_file(
                 file_size = len(data)  # type: ignore[name-defined]
             except Exception:
                 file_size = 0
+
+    p.add("files_written", 1)
+    p.add("rows_written", int(rows))
+    p.add("bytes_written", int(file_size))
 
     new_resources.append(
         {
@@ -1143,6 +1232,7 @@ def filter_stale_incoming_rows(
         overwrite_columns: List[str],
         newer_than_col: str,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        profiler: Optional[Profiler] = None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -1161,11 +1251,12 @@ def filter_stale_incoming_rows(
 
     Returns the filtered incoming DataFrame (potentially empty).
     """
+    p = profiler or get_null_profiler()
     if not overwrite_columns or not newer_than_col:
         return incoming_df
 
     # Collect only has_overlap=True files — those are the ones sharing keys with incoming data
-    overlap_true_files = [f for f, has_overlap, _ in overlapping_files if has_overlap]
+    overlap_true_files = [(f, sz) for f, has_overlap, sz in overlapping_files if has_overlap]
     if not overlap_true_files:
         # No overlapping files → all incoming rows are new
         return incoming_df
@@ -1175,8 +1266,8 @@ def filter_stale_incoming_rows(
 
     # Read and collect relevant rows from overlapping files
     existing_parts: List[polars.DataFrame] = []
-    for file_path in overlap_true_files:
-        part = _read_parquet_safe(file_path)
+    for file_path, file_size in overlap_true_files:
+        part = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
         if part is None:
             continue
         # Cache the full DataFrame for downstream reuse (avoids double-read)
@@ -1195,23 +1286,26 @@ def filter_stale_incoming_rows(
         # No existing data with the newer_than column → all incoming rows proceed
         return incoming_df
 
-    existing_combined = polars.concat(existing_parts, how="vertical_relaxed")
+    with p.span("newer_than.concat"):
+        existing_combined = polars.concat(existing_parts, how="vertical_relaxed")
 
     # Get max(newer_than_col) per key group from existing data
-    existing_max = existing_combined.group_by(overwrite_columns).agg(
-        polars.col(newer_than_col).max().alias("__existing_max__")
-    )
+    with p.span("newer_than.group_agg"):
+        existing_max = existing_combined.group_by(overwrite_columns).agg(
+            polars.col(newer_than_col).max().alias("__existing_max__")
+        )
 
     # Left join incoming against existing max
-    joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
+    with p.span("newer_than.join_filter"):
+        joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
 
-    # Keep rows where:
-    #   - no existing data for this key (null max → new key)
-    #   - incoming value > existing max   (genuine update)
-    filtered = joined.filter(
-        polars.col("__existing_max__").is_null()
-        | (polars.col(newer_than_col) > polars.col("__existing_max__"))
-    ).drop("__existing_max__")
+        # Keep rows where:
+        #   - no existing data for this key (null max → new key)
+        #   - incoming value > existing max   (genuine update)
+        filtered = joined.filter(
+            polars.col("__existing_max__").is_null()
+            | (polars.col(newer_than_col) > polars.col("__existing_max__"))
+        ).drop("__existing_max__")
 
     return filtered
 
@@ -1267,6 +1361,7 @@ def compact_tombstones(
         data_dir: str,
         compression_level: int,
         table_config: Optional[dict] = None,
+        profiler: Optional[Profiler] = None,
 ) -> Tuple[int, List[Dict], Set[str]]:
     """Physically remove tombstoned rows from parquet files.
 
@@ -1279,20 +1374,24 @@ def compact_tombstones(
     where compacted_rows is the total number of rows physically removed.
     After this call the caller should clear the tombstone list.
     """
+    p = profiler or get_null_profiler()
     tombstone_block = snapshot.get("tombstones") or {}
     deleted_keys = tombstone_block.get("deleted_keys") or []
     if not deleted_keys or not primary_keys:
         return 0, [], set()
 
     # Build a Polars DataFrame of the tombstone keys for anti-join
-    try:
-        tombstone_df = polars.DataFrame(
-            {pk: [row[i] for row in deleted_keys] for i, pk in enumerate(primary_keys)}
-        )
-    except Exception:
-        return 0, [], set()
+    with p.span("tombstone.build_df"):
+        try:
+            tombstone_df = polars.DataFrame(
+                {pk: [row[i] for row in deleted_keys] for i, pk in enumerate(primary_keys)}
+            )
+        except Exception:
+            return 0, [], set()
 
     resources = snapshot.get("resources") or []
+    p.add("tombstone_keys", len(deleted_keys))
+    p.add("tombstone_resources_total", len(resources))
     compacted = 0
     new_resources: List[Dict] = []
     sunset_files: Set[str] = set()
@@ -1301,13 +1400,18 @@ def compact_tombstones(
         file_path = resource.get("file")
         if not file_path:
             continue
+        file_size = int(resource.get("file_size") or 0)
 
         # Use stats to skip files that cannot contain any tombstoned key
         stats = resource.get("stats")
-        if stats and not _tombstone_overlaps_stats(tombstone_df, primary_keys, stats):
-            continue
+        if stats:
+            with p.span("tombstone.stats_check"):
+                overlaps = _tombstone_overlaps_stats(tombstone_df, primary_keys, stats)
+            if not overlaps:
+                p.add("tombstone_files_pruned", 1)
+                continue
 
-        existing_df = _read_parquet_safe(file_path)
+        existing_df = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
         if existing_df is None:
             continue
 
@@ -1315,23 +1419,28 @@ def compact_tombstones(
         if not all(c in existing_df.columns for c in primary_keys):
             continue
 
-        kept_df = existing_df.join(tombstone_df, on=primary_keys, how="anti")
+        with p.span("tombstone.anti_join"):
+            kept_df = existing_df.join(tombstone_df, on=primary_keys, how="anti")
         difference = existing_df.shape[0] - kept_df.shape[0]
 
         if difference == 0:
+            p.add("tombstone_files_skipped", 1)
             continue
 
         compacted += difference
         sunset_files.add(file_path)
+        p.add("tombstone_files_touched", 1)
 
         if kept_df.shape[0] > 0:
-            write_parquet_and_collect_resources(
-                write_df=kept_df,
-                overwrite_columns=primary_keys,
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-            )
+            with p.span("tombstone.write_kept"):
+                write_parquet_and_collect_resources(
+                    write_df=kept_df,
+                    overwrite_columns=primary_keys,
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
 
     return compacted, new_resources, sunset_files
 

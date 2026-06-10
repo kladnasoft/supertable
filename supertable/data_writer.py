@@ -20,6 +20,7 @@ from supertable.super_table import SuperTable
 from supertable import redis_keys as RK
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
+from supertable.utils.profiler import Profiler
 from supertable.processing import (
     process_overlapping_files,
     process_delete_only,
@@ -277,7 +278,11 @@ class DataWriter:
 
         t0 = time.time()
         t_last = t0
-        timings = {}
+        profiler = Profiler()
+        # Convenience view: top-level stages still indexed by the original
+        # short names ("lock", "snapshot", "overlap", ...) so the existing
+        # log line keeps working unchanged.
+        timings = profiler.timings
 
         def mark(stage: str):
             nonlocal t_last
@@ -338,6 +343,7 @@ class DataWriter:
             overlapping_files = find_overlapping_files(
                 last_simple_table, dataframe, overwrite_columns, locking=None,
                 table_config=table_config,
+                profiler=profiler,
             )
             mark("overlap")
 
@@ -354,6 +360,7 @@ class DataWriter:
                     overwrite_columns=overwrite_columns,
                     newer_than_col=newer_than,
                     file_cache=file_cache,
+                    profiler=profiler,
                 )
                 skipped = pre_filter_count - dataframe.height
                 if skipped > 0:
@@ -385,6 +392,8 @@ class DataWriter:
                         "skipped_stale": skipped,
                         "lineage": _safe_json(lineage or {}),
                         "duration": round(time.time() - t0, 6),
+                        "timings": profiler.emit_timings(),
+                        "counts": profiler.emit_counts(),
                     }
                     # Don't return here — fall through to finally (lock release)
                     # and the post-finally monitoring block.  Returning inside the
@@ -431,6 +440,7 @@ class DataWriter:
                             data_dir=simple_table.data_dir,
                             compression_level=compression_level,
                             table_config=table_config,
+                            profiler=profiler,
                         )
                         new_resources = compact_resources
                         sunset_files = compact_sunset
@@ -474,6 +484,7 @@ class DataWriter:
                             simple_table.data_dir,
                             compression_level,
                             file_cache=file_cache,
+                            profiler=profiler,
                         )
                     else:
                         inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
@@ -484,6 +495,7 @@ class DataWriter:
                             compression_level,
                             file_cache=file_cache,
                             table_config=table_config,
+                            profiler=profiler,
                         )
                     mark("process")
 
@@ -514,6 +526,7 @@ class DataWriter:
                     last_snapshot=last_simple_table,
                     last_snapshot_path=last_simple_table_path,
                     lineage=eff_lineage,
+                    profiler=profiler,
                 )
                 mark("update_simple")
 
@@ -534,26 +547,28 @@ class DataWriter:
                     ],
                 }
 
-                try:
-                    self.catalog.set_leaf_payload_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        payload,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
-                except Exception:
-                    # Backward compatible fallback.
-                    self.catalog.set_leaf_path_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
+                with profiler.span("redis.set_leaf"):
+                    try:
+                        self.catalog.set_leaf_payload_cas(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            payload,
+                            new_snapshot_path,
+                            now_ms=now_ms,
+                        )
+                    except Exception:
+                        # Backward compatible fallback.
+                        self.catalog.set_leaf_path_cas(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            new_snapshot_path,
+                            now_ms=now_ms,
+                        )
 
-                self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
+                with profiler.span("redis.bump_root"):
+                    self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
                 mark("bump_root")
 
                 # --- Enqueue deferred deletions (post-CAS, post-bump) ----------
@@ -649,6 +664,8 @@ class DataWriter:
                     "skipped_stale": 0,
                     "lineage": _safe_json(lineage or {}),
                     "duration": round(time.time() - t0, 6),
+                    "timings": profiler.emit_timings(),
+                    "counts": profiler.emit_counts(),
                 }
                 mark("prepare_monitor")
 

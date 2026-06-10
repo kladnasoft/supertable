@@ -10,8 +10,9 @@ from supertable.errors import TableNotFoundError
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
+from supertable.utils.profiler import Profiler, get_null_profiler
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def _spark_type_from_polars_dtype(dtype: Any) -> str:
@@ -259,7 +260,7 @@ class SimpleTable:
         data = self.storage.read_json(path)
         return data, path
 
-    def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None, lineage=None):
+    def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None, lineage=None, profiler: Optional[Profiler] = None):
         """
         Build and write a new heavy snapshot on storage.
         Returns: (snapshot_dict, snapshot_path)
@@ -277,17 +278,21 @@ class SimpleTable:
             lineage: Optional dict of data provenance metadata.  Stored in the
                 snapshot JSON so historical versions carry their origin.
         """
+        p = profiler or get_null_profiler()
         if last_snapshot is not None and last_snapshot_path is not None:
             last_simple_table = last_snapshot
             last_simple_table_path = last_snapshot_path
         else:
             # Fallback: read current snapshot (backward compatible)
-            last_simple_table, last_simple_table_path = self.get_simple_table_snapshot()
+            with p.span("simple_update.read_snapshot"):
+                last_simple_table, last_simple_table_path = self.get_simple_table_snapshot()
 
-        current_resources = last_simple_table.get("resources", [])
-        updated_resources = [res for res in current_resources if res.get("file") not in set(sunset_files)]
-        updated_resources.extend(new_resources)
-        last_simple_table["resources"] = updated_resources
+        with p.span("simple_update.merge_resources"):
+            current_resources = last_simple_table.get("resources", [])
+            sunset_set = set(sunset_files)
+            updated_resources = [res for res in current_resources if res.get("file") not in sunset_set]
+            updated_resources.extend(new_resources)
+            last_simple_table["resources"] = updated_resources
 
         # Update metadata
         last_simple_table["previous_snapshot"] = last_simple_table_path
@@ -301,16 +306,17 @@ class SimpleTable:
         # the table even though the delete-predicate dataframe only carries
         # the key columns.
         if model_df is not None:
-            schema_list = collect_schema(model_df)
-            if not schema_list:
-                # Fallback: derive schema from Polars dtypes if helper returns empty.
-                schema_list = _schema_list_from_polars_df(model_df)
-            last_simple_table["schema"] = schema_list
-            # Also store a Spark StructType JSON for downstream Delta mirrors.
-            try:
-                last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
-            except Exception:
-                pass
+            with p.span("simple_update.collect_schema"):
+                schema_list = collect_schema(model_df)
+                if not schema_list:
+                    # Fallback: derive schema from Polars dtypes if helper returns empty.
+                    schema_list = _schema_list_from_polars_df(model_df)
+                last_simple_table["schema"] = schema_list
+                # Also store a Spark StructType JSON for downstream Delta mirrors.
+                try:
+                    last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
+                except Exception:
+                    pass
         # else: leave last_simple_table["schema"] and ["schemaString"] untouched.
 
         # Data lineage — record provenance of this write
@@ -319,6 +325,11 @@ class SimpleTable:
 
         # Write new heavy snapshot file
         new_simple_path = os.path.join(self.snapshot_dir, generate_filename(alias=self.identity))
-        self.storage.write_json(new_simple_path, last_simple_table)
+        with p.span("simple_update.write_json"):
+            self.storage.write_json(new_simple_path, last_simple_table)
+
+        p.add("snapshot_resources_count", len(updated_resources))
+        p.add("snapshot_sunset_count", len(sunset_set))
+        p.add("snapshot_new_resources_count", len(new_resources))
 
         return last_simple_table, new_simple_path

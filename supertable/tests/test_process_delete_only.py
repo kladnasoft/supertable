@@ -47,10 +47,10 @@ class _ParquetStore:
         self.files: dict[str, polars.DataFrame] = {}
         self.written: list[dict] = []  # records of (path, df) for written files
 
-    def read(self, path: str):
+    def read(self, path: str, *args, **kwargs):
         return self.files.get(path)
 
-    def write_side_effect(self, write_df, overwrite_columns, data_dir, new_resources, compression_level):
+    def write_side_effect(self, write_df, overwrite_columns, data_dir, new_resources, compression_level, **kwargs):
         """
         Stand-in for write_parquet_and_collect_resources: just track what was written
         and append a synthetic resource entry.

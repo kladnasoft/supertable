@@ -10,7 +10,7 @@ Used by:
 
 # --- SuperTable connection settings ---
 organization: str = "kladna-soft"
-super_name: str = "example"
+super_name: str = "webshop"
 role_name: str = "superadmin"
 
 # --- Data generation / loading settings ---
