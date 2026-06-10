@@ -224,18 +224,11 @@ running while the caller fixes the upstream `model_df`.
 
 ### Snapshot Retention
 
-By default the snapshot JSONs accumulate forever — every write's
-`previous_snapshot` field forms an unbounded linked list back to v0,
-and sunset parquet files (replaced during compaction) are left on
-storage. Set `SUPERTABLE_SNAPSHOT_RETENTION=N` to keep only the **N**
-most recent snapshots; set `SUPERTABLE_SUNSET_GC_ENABLED=true` to
-also queue sunset parquets for deletion. In both cases the writer
-pushes the deletion candidates onto a per-table Redis stream after
-the leaf-CAS commit, and a separate orchestrator
-(`GCCleaner.tick()` — chap. 17) physically deletes them after a
-safety delay window long enough that any in-flight reader has
-finished. Both flags are off by default; with neither set, behaviour
-is identical to a pre-GC SDK build.
+Snapshot JSONs accumulate over time — every write's
+`previous_snapshot` field forms a linked list back to v0 — and
+sunset parquet files (replaced during compaction) are left on
+storage. SuperTable does not delete either automatically; prune them
+out-of-band if storage growth becomes a concern.
 
 ### CAS (Compare-and-Swap) Pointer Update
 

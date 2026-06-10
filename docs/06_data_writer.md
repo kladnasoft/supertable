@@ -61,7 +61,7 @@ def write(
 ```
 access_check --> convert --> dedup_ts --> validate --> lock --> snapshot
     --> overlap --> newer_than --> process --> update_simple
-    --> bump_root --> gc_enqueue --> mirror --> unlock --> monitoring
+    --> bump_root --> mirror --> unlock --> monitoring
     --> audit
 ```
 
@@ -162,43 +162,6 @@ Two atomic Redis operations:
 2. **`bump_root()`** -- increments the root version timestamp so that readers see the new data.
 
 Falls back to `set_leaf_path_cas()` if the payload CAS method is unavailable (backward compatibility).
-
-#### 12.5. Deferred-Deletion Enqueue (`gc_enqueue`)
-
-Immediately after the leaf-CAS + root-bump (the new snapshot is now
-the authoritative state), the writer pushes deletion candidates onto
-the per-table GC stream. **Both checks are gated by env vars and are
-off by default** (chap. 17):
-
-```python
-# Sunset parquets (files that were replaced by this commit)
-if settings.SUPERTABLE_SUNSET_GC_ENABLED and sunset_files:
-    enqueue_deletions(self.catalog, org, sup, simple_name,
-                      "parquet", list(sunset_files), write_id=qid)
-
-# Old snapshot JSONs beyond the retention window
-if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
-    old_paths = collect_old_snapshot_paths(
-        new_snapshot_dict, self.super_table.storage,
-        settings.SUPERTABLE_SNAPSHOT_RETENTION,
-    )
-    if old_paths:
-        enqueue_deletions(self.catalog, org, sup, simple_name,
-                          "snapshot", old_paths, write_id=qid)
-```
-
-The whole block is wrapped in `try/except` — a GC enqueue failure
-must never fail a write (e.g. a transient Redis pipeline error leaves
-the files in place, which is identical to today's behaviour).
-
-**Strict ordering matters.** Enqueueing must happen **after** the
-leaf-CAS, never before. If XADD succeeded first and the CAS then
-failed in a retry, the stream would point at files still referenced
-by the live snapshot, and the cleaner would silently delete data. The
-reverse order (CAS first, XADD second) has only one failure mode —
-writer crashes between the two — which leaks files without losing
-any. See `data_writer.py` for the exact placement, and chap. 17 for
-the full lifecycle.
 
 #### 13. Schema and Table Name Registration
 
@@ -314,14 +277,10 @@ print(stats["files_before"], "→", stats["files_after"])
    was handed an empty / wrong-typed model_df.
 7. **Snapshot commit** — `simple_table.update()` → `set_leaf_payload_cas`
    → `bump_root`. Same atomic-CAS pattern as `write()`.
-8. **GC enqueue** — same `SUPERTABLE_SUNSET_GC_ENABLED` and
-   `SUPERTABLE_SNAPSHOT_RETENTION` flags (chap. 17). Sunset
-   parquets and pruned snapshot JSONs land on the per-table GC
-   stream just like a normal write.
-9. **Mirroring** — Delta / Iceberg / Parquet mirrors are refreshed.
-10. **Monitoring + audit** — emits a `monitor_type="compact"` metric
-    (own daily partition, own sink table `__compact__`) and a
-    `DATA_WRITE` audit event with `operation="compact"`.
+8. **Mirroring** — Delta / Iceberg / Parquet mirrors are refreshed.
+9. **Monitoring + audit** — emits a `monitor_type="compact"` metric
+   (own daily partition, own sink table `__compact__`) and a
+   `DATA_WRITE` audit event with `operation="compact"`.
 
 ### Concurrency
 

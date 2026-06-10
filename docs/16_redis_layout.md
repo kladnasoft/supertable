@@ -133,15 +133,6 @@ drain is atomic against any straggler write (chap. 14). This bounds
 Redis growth to roughly one day per (org, monitor_type) rather than
 the unbounded append behaviour of the legacy single-LIST shape.
 
-### Why `gc:pending:doc:{simple}` lives under `lakes:{sup}:`
-
-The deferred-deletion stream is per-(super, simple) so dropping a
-supertable naturally nukes its child streams via the existing
-`super_table_pattern` SCAN, with no extra delete code needed. The
-producer is `DataWriter` (post-leaf-CAS, post-`bump_root`); the
-consumer is the `GCCleaner` orchestration primitive. Full lifecycle
-in chap. 17.
-
 ## 16.3  Design invariants
 
 1. **Two root prefixes only.** `supertable:` (SDK state) and
