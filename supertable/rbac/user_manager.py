@@ -6,7 +6,7 @@ import time
 from typing import Dict, List, Optional
 
 from supertable.config.defaults import logger
-from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import RedisCatalog, validate_username
 from supertable import redis_keys as RK
 
 
@@ -85,6 +85,10 @@ class UserManager:
 
         org, sup = self.organization, self.super_name
         username = data["username"]
+        # Validate up-front so callers get a clean error at the public
+        # API boundary instead of after the uniqueness lookup. Catalog
+        # layer re-checks on write as defense in depth.
+        validate_username(username)
 
         existing_id = self._catalog.rbac_get_user_id_by_username(org, sup, username)
         if existing_id:
@@ -146,6 +150,10 @@ class UserManager:
             new_username = data["username"]
             old_username = existing["username"]
             if new_username.lower() != old_username.lower():
+                # Validate format BEFORE the uniqueness lookup so the
+                # error message is the most informative one. Catalog
+                # layer re-checks on rbac_rename_user / rbac_update_user.
+                validate_username(new_username)
                 if self._catalog.rbac_get_user_id_by_username(org, sup, new_username):
                     raise ValueError(f"Username '{new_username}' is already taken")
                 self._catalog.rbac_rename_user(org, sup, user_id, old_username, new_username)

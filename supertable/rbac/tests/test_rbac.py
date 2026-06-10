@@ -769,6 +769,67 @@ class TestUserManager(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.um.create_user({"username": "bad", "roles": ["nonexistent_role"]})
 
+    def test_create_user_accepts_safe_usernames(self):
+        """Plain ASCII, hyphenated, dotted, and email-style usernames
+        must all round-trip — these are the shapes real IdPs emit."""
+        for name in ("alice", "bob_smith", "ops-lead", "team.alpha",
+                     "alice@acme.com", "_internal"):
+            uid = self.um.create_user({"username": name, "roles": []})
+            self.assertEqual(len(uid), 32, f"create_user should succeed for {name!r}")
+
+    def test_create_user_rejects_special_and_non_ascii_chars(self):
+        """``%``, ``$``, ``/``, ``|``, spaces, and accented Latin letters
+        stay banned — usernames get interpolated into Redis keys and log
+        lines so the safe set is intentionally small."""
+        for name in ("bad%name", "É_admin", "ops/team", "ad$min",
+                     "x|y", "alice bob", " leading", "trailing ", ""):
+            with self.assertRaises(ValueError, msg=f"should reject {name!r}"):
+                self.um.create_user({"username": name, "roles": []})
+
+    def test_create_user_rejects_leading_digit_and_dot(self):
+        """First character must be a letter or underscore — same rule
+        as role_name so the two safe sets are easy to reason about."""
+        for name in ("1alice", ".hidden", "-leading-dash", "@alice"):
+            with self.assertRaises(ValueError, msg=f"should reject {name!r}"):
+                self.um.create_user({"username": name, "roles": []})
+
+    def test_modify_user_validates_new_username(self):
+        """Renames are gated by the same rule — uniqueness check would
+        otherwise be the only barrier, leaving unsafe names reachable
+        via a rename of an existing safe user."""
+        uid = self.um.create_user({"username": "renamable", "roles": []})
+        with self.assertRaises(ValueError):
+            self.um.modify_user(uid, {"username": "bad%name"})
+        with self.assertRaises(ValueError):
+            self.um.modify_user(uid, {"username": ""})
+
+    def test_direct_catalog_write_cannot_bypass_username_validation(self):
+        """The catalog-layer ``rbac_create_user`` / ``rbac_update_user``
+        / ``rbac_rename_user`` re-check the rule so admin scripts and
+        tests that call the lower layer directly can't slip an unsafe
+        name past the validator."""
+        # Dotted / email-style names are now legal at the catalog layer.
+        self.cat.rbac_create_user(
+            ORG, SUP, "u-ok",
+            {"user_id": "u-ok", "username": "alice@acme.com", "roles": []},
+        )
+        # Special-char name is rejected at the catalog layer.
+        with self.assertRaises(ValueError):
+            self.cat.rbac_create_user(
+                ORG, SUP, "u-bad",
+                {"user_id": "u-bad", "username": "bad%name", "roles": []},
+            )
+        # Update path also gates on a renamed username.
+        with self.assertRaises(ValueError):
+            self.cat.rbac_update_user(
+                ORG, SUP, "u-ok", {"username": "É_admin"},
+            )
+        # Rename path is the third write door — gate it too.
+        with self.assertRaises(ValueError):
+            self.cat.rbac_rename_user(
+                ORG, SUP, "u-ok", "alice@acme.com", "bad name",
+            )
+
     def test_get_user_not_found_raises(self):
         with self.assertRaises(ValueError):
             self.um.get_user("bogus")
@@ -1292,20 +1353,32 @@ class TestUsernameEdgeCases(unittest.TestCase):
         self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
         self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
 
-    def test_username_with_spaces(self):
-        uid = self.um.create_user({"username": "john doe", "roles": []})
-        user = self.um.get_user_by_name("john doe")
-        self.assertEqual(user["user_id"], uid)
+    def test_username_with_spaces_rejected(self):
+        """Spaces in usernames are now rejected.
+
+        Spaceless usernames are safer to interpolate into Redis keys,
+        log lines, and CLI arguments. The previous permissive behavior
+        worked only because no validator existed; with one in place we
+        intentionally bar this shape. See ``SAFE_USERNAME_RE`` in
+        ``redis_catalog`` for the contract."""
+        with self.assertRaises(ValueError):
+            self.um.create_user({"username": "john doe", "roles": []})
 
     def test_username_with_special_chars(self):
         uid = self.um.create_user({"username": "user@domain.com", "roles": []})
         user = self.um.get_user_by_name("user@domain.com")
         self.assertEqual(user["user_id"], uid)
 
-    def test_username_unicode(self):
-        uid = self.um.create_user({"username": "用户名", "roles": []})
-        user = self.um.get_user_by_name("用户名")
-        self.assertEqual(user["user_id"], uid)
+    def test_username_unicode_rejected(self):
+        """Non-ASCII usernames are now rejected.
+
+        Accented Latin and CJK glyphs make audit trails ambiguous (the
+        same logical name can be encoded multiple ways) and complicate
+        safe Redis-key interpolation. The previous permissive behavior
+        worked only because no validator existed; with one in place we
+        intentionally restrict to the ASCII safe set."""
+        with self.assertRaises(ValueError):
+            self.um.create_user({"username": "用户名", "roles": []})
 
     def test_username_mixed_case_lookup(self):
         uid = self.um.create_user({"username": "MiXeD_CaSe", "roles": []})

@@ -56,6 +56,39 @@ def validate_role_name(role_name: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Username safety check
+# ---------------------------------------------------------------------------
+#
+# Usernames have the same Redis-key / log-line interpolation risk as role
+# names, plus the practical need to accept email-style identifiers when the
+# IdP emits them (``alice@acme.com``). So the safe set is the role-name set
+# minus space (CLIs and logs handle spaceless usernames much better) plus
+# ``@`` for email-style logins.
+#
+# Same first-character rule: ASCII letter or underscore. Same length cap
+# (1-127). Unlike role_name, an empty username is *always* invalid here
+# because usernames are required at every call site.
+SAFE_USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-.@]{0,126}$")
+
+
+def validate_username(username: str) -> None:
+    """Raise ``ValueError`` if ``username`` doesn't match :data:`SAFE_USERNAME_RE`.
+
+    Empty / ``None`` raises — unlike role_name, username is required by
+    every UserManager / catalog call site. Callers that genuinely don't
+    want to update the username field must skip calling this helper.
+    """
+    if not username:
+        raise ValueError("username is required and must be non-empty")
+    if not SAFE_USERNAME_RE.fullmatch(username):
+        raise ValueError(
+            f"Invalid username: {username!r}. Must be 1-127 characters, "
+            "start with a letter or underscore, contain only ASCII letters, "
+            "digits, underscores, hyphens, dots, and the '@' character."
+        )
+
+
 # All Redis key strings are constructed via `supertable.redis_keys` (RK).
 # This module deliberately contains no `f"supertable:..."` string literals;
 # any new key must be added to redis_keys.py first.
@@ -786,9 +819,15 @@ return 1
     # -- User CRUD --
 
     def rbac_create_user(self, org: str, sup: str, user_id: str, user_data: Dict[str, Any]) -> None:
-        """Persist a new user document and update indexes."""
-        key = RK.rbac_user_doc(org, sup, user_id)
+        """Persist a new user document and update indexes.
+
+        Validates ``username`` against :data:`SAFE_USERNAME_RE` before
+        writing — direct callers (tests, admin scripts, migrations) can't
+        bypass the rule by skipping ``UserManager.create_user``.
+        """
         username = user_data["username"]
+        validate_username(username)
+        key = RK.rbac_user_doc(org, sup, user_id)
         redis_data = {k: self._rbac_serialize(v) for k, v in user_data.items()}
         pipe = self.r.pipeline()
         pipe.hset(key, mapping=redis_data)
@@ -801,8 +840,12 @@ return 1
         """Update specific fields of an existing user in-place.
 
         Values are serialized the same way as ``rbac_create_user`` — callers
-        should pass raw Python objects, not pre-encoded JSON.
+        should pass raw Python objects, not pre-encoded JSON. Validates
+        ``username`` (when present in the update) so partial updates can't
+        slip an unsafe name past the rule.
         """
+        if "username" in fields:
+            validate_username(fields.get("username", ""))
         key = RK.rbac_user_doc(org, sup, user_id)
         if not self.r.exists(key):
             raise ValueError(f"User {user_id} does not exist")
@@ -812,7 +855,13 @@ return 1
         self._rbac_bump(RK.rbac_user_meta(org, sup))
 
     def rbac_rename_user(self, org: str, sup: str, user_id: str, old_username: str, new_username: str) -> None:
-        """Atomically update the username → user_id mapping."""
+        """Atomically update the username → user_id mapping.
+
+        Validates ``new_username`` — this is the third write path that can
+        touch the username index, so it must enforce the same rule as
+        ``rbac_create_user`` and ``rbac_update_user``.
+        """
+        validate_username(new_username)
         mapping_key = RK.rbac_username_to_id(org, sup)
         pipe = self.r.pipeline()
         pipe.hdel(mapping_key, old_username.lower())
