@@ -268,6 +268,12 @@ class SimpleTable:
         snapshot read (caller already holds the data under lock).
 
         Args:
+            model_df: Polars DataFrame whose schema becomes the new snapshot's
+                ``schema`` / ``schemaString`` ("last write wins" — see
+                docs/03_data_model.md "Schema Field Semantics").  Pass ``None``
+                to PRESERVE the previous snapshot's schema unchanged — used by
+                delete-only writes which must not alter the table shape.  Only
+                update paths are allowed to change schema; deletes never are.
             lineage: Optional dict of data provenance metadata.  Stored in the
                 snapshot JSON so historical versions carry their origin.
         """
@@ -287,16 +293,25 @@ class SimpleTable:
         last_simple_table["previous_snapshot"] = last_simple_table_path
         last_simple_table["last_updated_ms"] = int(datetime.now().timestamp() * 1000)
         last_simple_table["snapshot_version"] = int(last_simple_table.get("snapshot_version", 0)) + 1
-        schema_list = collect_schema(model_df)
-        if not schema_list:
-            # Fallback: derive schema from Polars dtypes if helper returns empty.
-            schema_list = _schema_list_from_polars_df(model_df)
-        last_simple_table["schema"] = schema_list
-        # Also store a Spark StructType JSON for downstream Delta mirrors.
-        try:
-            last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
-        except Exception:
-            pass
+
+        # Schema policy: only "update" callers (those that supply a model_df)
+        # may change the snapshot schema.  Delete-only writers pass
+        # model_df=None so the previous snapshot's schema / schemaString carry
+        # forward verbatim — a delete must never shrink the metadata view of
+        # the table even though the delete-predicate dataframe only carries
+        # the key columns.
+        if model_df is not None:
+            schema_list = collect_schema(model_df)
+            if not schema_list:
+                # Fallback: derive schema from Polars dtypes if helper returns empty.
+                schema_list = _schema_list_from_polars_df(model_df)
+            last_simple_table["schema"] = schema_list
+            # Also store a Spark StructType JSON for downstream Delta mirrors.
+            try:
+                last_simple_table["schemaString"] = json.dumps({"type": "struct", "fields": schema_list}, separators=(",", ":"))
+            except Exception:
+                pass
+        # else: leave last_simple_table["schema"] and ["schemaString"] untouched.
 
         # Data lineage — record provenance of this write
         if lineage and isinstance(lineage, dict):

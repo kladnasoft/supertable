@@ -96,7 +96,14 @@ class RoleManager:
 
     # ── CRUD ────────────────────────────────────────────────────────── #
 
-    _SAFE_ROLE_NAME_RE = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_\- ]{0,126}$")
+    # First character: ASCII letter or underscore (avoids leading digits / dots
+    # that look like hidden files). Remaining characters: ASCII letters and
+    # digits plus the punctuation we accept in real-world role-name
+    # conventions — underscore, hyphen, dot, space. Excludes accented Latin
+    # letters (e.g. ``É``) and shell-meaningful symbols (``%``, ``$``, ``/``,
+    # ``\``, quotes, etc.) so role names stay safe to interpolate into
+    # Redis keys, URLs, and log lines.
+    _SAFE_ROLE_NAME_RE = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_\-. ]{0,126}$")
 
     def create_role(self, data: dict) -> str:
         """
@@ -125,8 +132,8 @@ class RoleManager:
         if role_name and not self._SAFE_ROLE_NAME_RE.fullmatch(role_name):
             raise ValueError(
                 f"Invalid role_name: {role_name!r}. Must be 1-127 characters, "
-                "start with a letter or underscore, contain only letters, digits, "
-                "underscores, hyphens, and spaces."
+                "start with a letter or underscore, contain only ASCII letters, digits, "
+                "underscores, hyphens, dots, and spaces."
             )
 
         # If role_name given, check uniqueness (idempotent: return existing)
@@ -171,8 +178,8 @@ class RoleManager:
             if new_name and not self._SAFE_ROLE_NAME_RE.fullmatch(new_name):
                 raise ValueError(
                     f"Invalid role_name: {new_name!r}. Must be 1-127 characters, "
-                    "start with a letter or underscore, contain only letters, digits, "
-                    "underscores, hyphens, and spaces."
+                    "start with a letter or underscore, contain only ASCII letters, digits, "
+                    "underscores, hyphens, dots, and spaces."
                 )
             # Check uniqueness
             if new_name:

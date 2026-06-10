@@ -167,11 +167,20 @@ forward — only `schema` and `schemaString` are wholesale-replaced.
 #### Caller contract
 
 - Every caller of `SimpleTable.update` must pass a `model_df` whose schema
-  is exactly the schema the new snapshot should record.
-- For `DataWriter.write(...)`, that's the incoming Arrow/Polars data the
-  caller supplied. Sending a DataFrame missing columns that exist in older
-  parquet files will shrink the snapshot's `schema` even though the columns
-  are still present on disk.
+  is exactly the schema the new snapshot should record — **OR** pass
+  `model_df=None` to explicitly preserve the previous snapshot's schema.
+- For `DataWriter.write(...)` (non-delete), that's the incoming Arrow/Polars
+  data the caller supplied. Sending a DataFrame missing columns that exist
+  in older parquet files will shrink the snapshot's `schema` even though
+  the columns are still present on disk.
+- For `DataWriter.write(..., delete_only=True)`, the writer passes
+  `model_df=None`. **Deletes never change the schema** — only update paths
+  do. The incoming delete-predicate dataframe only carries the columns the
+  caller used to identify rows to remove (e.g. just the primary key); using
+  it as `model_df` would collapse `schema` / `schemaString` to that partial
+  shape, breaking every subsequent `SELECT col` against a column not in the
+  predicate. The on-disk parquet files written by `process_delete_only`
+  retain the full schema; the snapshot metadata must too.
 - For `DataWriter.compact(...)` and `SimpleTable.repair_schema()`, the
   internal helpers derive `model_df` by reading the actual parquet files on
   storage, so the schema reflects what's physically present.

@@ -967,6 +967,37 @@ class TestAccessControl(unittest.TestCase):
             check_write_access(SUP, ORG, "camelwriter", "t1")
             check_write_access(SUP, ORG, "CAMELWRITER", "t1")
 
+    def test_role_name_accepts_dot_hyphen_underscore_space(self):
+        """Dotted role names like ``Write.All`` (and other real-world
+        conventions) must round-trip through create + lookup. The
+        validator was tightened to reject ``.`` in a previous refactor,
+        which broke login-time provisioning for installs whose IdP emits
+        OAuth-scope-style role names."""
+        for name in ("Write.All", "Read.All", "ops-team_lead", "team a.b"):
+            rid = self.rm.create_role(
+                {"role": "writer", "role_name": name, "tables": {"t1": {}}},
+            )
+            self.assertTrue(rid, f"create_role should succeed for {name!r}")
+
+    def test_role_name_rejects_special_and_non_ascii_chars(self):
+        """``%``, ``$``, ``/`` and accented Latin letters stay banned —
+        role names get interpolated into Redis keys and log lines, so
+        the safe set is intentionally small."""
+        for name in ("Write%All", "É_admin", "ops/team", "ad$min", "x|y"):
+            with self.assertRaises(ValueError, msg=f"should reject {name!r}"):
+                self.rm.create_role(
+                    {"role": "writer", "role_name": name, "tables": {"t1": {}}},
+                )
+
+    def test_role_name_rejects_leading_digit_and_dot(self):
+        """First character must still be a letter or underscore — leading
+        digits / dots are too easy to confuse with IDs or hidden files."""
+        for name in ("1Writer", ".hidden", "-leading-dash"):
+            with self.assertRaises(ValueError, msg=f"should reject {name!r}"):
+                self.rm.create_role(
+                    {"role": "writer", "role_name": name, "tables": {"t1": {}}},
+                )
+
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  7. Integration / edge case tests                                          #

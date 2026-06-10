@@ -546,6 +546,121 @@ class TestPhysicalDeleteFallback:
 
         assert dw._mocks["delete"].called
 
+    # ----- Schema preservation on delete (regression) -----------------------
+    # Bug: data_writer.write(delete_only=True) was passing the delete-predicate
+    # dataframe as the model_df argument to simple_table.update, which under
+    # "last write wins" semantics collapsed the snapshot schema to the
+    # partial shape of the predicate (e.g. {id, timestamp}) — destroying
+    # downstream SELECT col queries even though every parquet file on disk
+    # still had the full schema.  Fix: pass model_df=None on delete_only.
+
+    def test_delete_only_physical_passes_model_df_none_to_update(self, fake_catalog, fake_monitor):
+        """Physical delete path must pass model_df=None to simple_table.update
+        so the previous snapshot's schema carries forward unchanged."""
+        config = {"primary_keys": ["id"], "dedup_on_read": False}
+        with _make_writer(fake_catalog, fake_monitor, table_config=config) as dw:
+            data = _simple_arrow(3)
+            dw.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
+
+        update_mock = dw._mocks["simple_inst"].update
+        assert update_mock.called, "simple_table.update was not called"
+        # Third positional arg is model_df.
+        _args, kwargs = update_mock.call_args
+        model_df = _args[2] if len(_args) >= 3 else kwargs.get("model_df")
+        assert model_df is None, (
+            "delete_only writes must pass model_df=None to preserve schema; "
+            f"got {type(model_df).__name__}"
+        )
+
+    def test_delete_only_soft_passes_model_df_none_to_update(self, fake_catalog, fake_monitor):
+        """Soft-delete (tombstone) path must also pass model_df=None."""
+        config = {"primary_keys": ["id"], "dedup_on_read": True}
+        with _make_writer(fake_catalog, fake_monitor, table_config=config) as dw:
+            data = _simple_arrow(3)
+            dw.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
+
+        update_mock = dw._mocks["simple_inst"].update
+        assert update_mock.called
+        _args, kwargs = update_mock.call_args
+        model_df = _args[2] if len(_args) >= 3 else kwargs.get("model_df")
+        assert model_df is None
+
+    def test_non_delete_write_still_passes_dataframe_to_update(self, fake_catalog, fake_monitor):
+        """Sanity check the inverse: a regular write must still pass the
+        incoming dataframe so 'last write wins' applies as designed."""
+        config = {"primary_keys": ["id"], "dedup_on_read": False}
+        with _make_writer(fake_catalog, fake_monitor, table_config=config) as dw:
+            data = _simple_arrow(3)
+            dw.write("admin", "t1", data, overwrite_columns=["id"], delete_only=False)
+
+        update_mock = dw._mocks["simple_inst"].update
+        assert update_mock.called
+        _args, kwargs = update_mock.call_args
+        model_df = _args[2] if len(_args) >= 3 else kwargs.get("model_df")
+        assert model_df is not None, (
+            "non-delete writes must pass the incoming dataframe as model_df"
+        )
+
+    def test_delete_only_soft_threshold_breach_passes_model_df_none(
+        self, fake_catalog, fake_monitor,
+    ):
+        """When a soft-delete trips the tombstone compaction threshold, the
+        auto-triggered compact_tombstones call rewrites parquet files with
+        the full schema and produces real new_resources/sunset_files — but
+        the snapshot schema must STILL be preserved (not derived from the
+        delete-predicate frame), because the table shape did not change."""
+        existing_tombstones = {
+            "primary_keys": ["id"],
+            "deleted_keys": [[10], [20], [30], [40]],
+            "total_tombstones": 4,
+        }
+        config = {
+            "primary_keys": ["id"],
+            "dedup_on_read": True,
+            "tombstone_compact_total": 5,  # crosses 5 once we add 2 more keys
+        }
+        with _make_writer(
+            fake_catalog, fake_monitor,
+            table_config=config,
+            snapshot_tombstones=existing_tombstones,
+        ) as dw:
+            with patch("supertable.data_writer.compact_tombstones") as mock_compact:
+                # Simulate compaction physically rewriting one file.
+                mock_compact.return_value = (
+                    6,                              # rows compacted
+                    [{"file": "new_compacted.parquet"}],  # new resources
+                    {"old.parquet"},                # sunset
+                )
+                data = _arrow_table({
+                    "id": [50, 60],
+                    "name": ["e", "f"],
+                    "value": [500.0, 600.0],
+                })
+                dw.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
+
+            # Threshold breach must have run compaction.
+            assert mock_compact.called, "compact_tombstones was not triggered"
+
+            update_mock = dw._mocks["simple_inst"].update
+            assert update_mock.called
+            _args, kwargs = update_mock.call_args
+            model_df = _args[2] if len(_args) >= 3 else kwargs.get("model_df")
+            # Even though Phase A produced new_resources/sunset_files via
+            # compact_tombstones, the delete still must not change the
+            # schema — model_df=None preserves it.
+            assert model_df is None, (
+                "soft-delete with threshold-breach compaction must still "
+                "pass model_df=None to preserve schema; got "
+                f"{type(model_df).__name__}"
+            )
+            # And the new_resources / sunset from compact_tombstones did
+            # flow into update — proving we tested the real branch, not a
+            # short-circuit.
+            new_resources_arg = _args[0]
+            sunset_arg = _args[1]
+            assert {r["file"] for r in new_resources_arg} == {"new_compacted.parquet"}
+            assert sunset_arg == {"old.parquet"}
+
 
 # ===========================================================================
 # Tests: configure_table with tombstone_compact_total

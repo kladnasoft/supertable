@@ -501,8 +501,16 @@ class DataWriter:
                         "write_id": qid,
                     }
 
+                # Schema policy: only true update paths change the snapshot
+                # schema.  A delete-only write must preserve the previous
+                # snapshot's schema because the incoming `dataframe` only
+                # carries the delete-predicate columns — passing it as
+                # model_df would shrink schema / schemaString to that partial
+                # shape even though all parquet files still have full schema.
+                # See docs/03_data_model.md "Schema Field Semantics".
+                schema_model_df = None if delete_only else dataframe
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
-                    new_resources, sunset_files, dataframe,
+                    new_resources, sunset_files, schema_model_df,
                     last_snapshot=last_simple_table,
                     last_snapshot_path=last_simple_table_path,
                     lineage=eff_lineage,

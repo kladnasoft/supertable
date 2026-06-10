@@ -871,3 +871,101 @@ class TestUpdate:
         # result IS the same dict
         assert result_snap is last_snap
         assert last_snap["snapshot_version"] == 1
+
+    # ----- Delete-only schema preservation (regression) ---------------------
+    # When called from a delete-only write, simple_table.update receives
+    # model_df=None and MUST preserve the previous snapshot's schema /
+    # schemaString verbatim.  Previously the writer passed the
+    # delete-predicate dataframe (only the key columns) as model_df, which
+    # caused "last write wins" to collapse the snapshot schema to that
+    # partial shape — breaking subsequent SELECT col queries even though
+    # the on-disk parquet files retained the full schema.
+
+    @patch(_P_GEN_FILENAME, return_value="snap.json")
+    def test_model_df_none_preserves_schema(self, mock_gen):
+        """model_df=None must NOT call collect_schema and must keep the
+        previous snapshot's schema/schemaString untouched."""
+        obj = _make_simple()
+        prior_schema = [
+            {"name": "id", "type": "long", "nullable": True, "metadata": {}},
+            {"name": "amount", "type": "double", "nullable": True, "metadata": {}},
+            {"name": "label", "type": "string", "nullable": True, "metadata": {}},
+        ]
+        prior_schema_string = json.dumps(
+            {"type": "struct", "fields": prior_schema}, separators=(",", ":")
+        )
+        last_snap = {
+            "simple_name": "events",
+            "snapshot_version": 7,
+            "resources": [{"file": "a.parquet"}],
+            "schema": prior_schema,
+            "schemaString": prior_schema_string,
+        }
+
+        with patch(_P_COLLECT_SCHEMA) as mock_schema:
+            result_snap, _ = obj.update(
+                new_resources=[],
+                sunset_files=set(),
+                model_df=None,
+                last_snapshot=last_snap,
+                last_snapshot_path="/old.json",
+            )
+            # collect_schema must NOT be invoked when model_df is None.
+            mock_schema.assert_not_called()
+
+        # Schema fields carry forward verbatim.
+        assert result_snap["schema"] == prior_schema
+        assert result_snap["schemaString"] == prior_schema_string
+        # Version still bumps — only schema is preserved.
+        assert result_snap["snapshot_version"] == 8
+
+    @patch(_P_COLLECT_SCHEMA, return_value=[
+        {"name": "id", "type": "long", "nullable": True, "metadata": {}},
+    ])
+    @patch(_P_GEN_FILENAME, return_value="snap.json")
+    def test_model_df_provided_still_overwrites_schema(self, mock_gen, mock_schema):
+        """Sanity check: passing a model_df still applies 'last write wins'."""
+        obj = _make_simple()
+        last_snap = {
+            "simple_name": "events",
+            "snapshot_version": 1,
+            "resources": [],
+            "schema": [{"name": "old", "type": "string", "nullable": True, "metadata": {}}],
+            "schemaString": '{"type":"struct","fields":[{"name":"old"}]}',
+        }
+        result_snap, _ = obj.update(
+            new_resources=[],
+            sunset_files=set(),
+            model_df=MagicMock(),
+            last_snapshot=last_snap,
+            last_snapshot_path="/old.json",
+        )
+        # Schema replaced by collect_schema's return value (the contract).
+        assert result_snap["schema"] == [
+            {"name": "id", "type": "long", "nullable": True, "metadata": {}},
+        ]
+        # schemaString rebuilt from the new schema.
+        assert "\"id\"" in result_snap["schemaString"]
+        assert "\"old\"" not in result_snap["schemaString"]
+
+    @patch(_P_GEN_FILENAME, return_value="snap.json")
+    def test_model_df_none_with_missing_prior_schema(self, mock_gen):
+        """If the previous snapshot has no schema field and model_df=None,
+        the new snapshot also has no schema field (we don't fabricate one)."""
+        obj = _make_simple()
+        last_snap = {
+            "simple_name": "events",
+            "snapshot_version": 0,
+            "resources": [],
+            # No "schema" / "schemaString" keys at all.
+        }
+        result_snap, _ = obj.update(
+            new_resources=[],
+            sunset_files=set(),
+            model_df=None,
+            last_snapshot=last_snap,
+            last_snapshot_path="/old.json",
+        )
+        # We did NOT introduce a bogus schema entry.
+        assert "schema" not in result_snap
+        assert "schemaString" not in result_snap
