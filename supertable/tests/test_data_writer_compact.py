@@ -38,8 +38,6 @@ _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
 _P_TOMB_THRESH   = f"{_MOD}._tombstone_threshold"
 _P_MIRROR        = f"{_MOD}.MirrorFormats"
 _P_MON_WRITER    = f"{_MOD}.MonitoringWriter"
-_P_ENQUEUE       = f"{_MOD}.enqueue_deletions"
-_P_COLLECT_OLD   = f"{_MOD}.collect_old_snapshot_paths"
 _P_AUDIT         = f"{_MOD}._audit_emit"
 _P_SETTINGS      = f"{_MOD}.settings"
 
@@ -85,12 +83,9 @@ def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
     return mock
 
 
-def _stub_settings(*, sunset=False, retention=0):
-    """Build a fake ``settings`` object with GC flags."""
-    s = MagicMock()
-    s.SUPERTABLE_SUNSET_GC_ENABLED = sunset
-    s.SUPERTABLE_SNAPSHOT_RETENTION = retention
-    return s
+def _stub_settings():
+    """Build a fake ``settings`` object for patching."""
+    return MagicMock()
 
 
 def _build_writer():
@@ -602,80 +597,6 @@ class TestSnapshotCommit:
 
         dw.catalog.set_leaf_payload_cas.assert_called_once()
         dw.catalog.bump_root.assert_called_once()
-
-
-# ===========================================================================
-# 6. GC enqueue gating (same flags as write)
-# ===========================================================================
-
-
-class TestGCEnqueue:
-
-    @patch(_P_AUDIT)
-    @patch(_P_MON_WRITER)
-    @patch(_P_MIRROR)
-    @patch(_P_ENQUEUE)
-    @patch(_P_COLLECT_OLD, return_value=[])
-    @patch(_P_COMPACT_RES)
-    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
-    @patch(_P_SETTINGS)
-    @patch(_P_SIMPLE_TABLE)
-    @patch(_P_CHECK_WRITE)
-    def test_sunset_gc_enqueue_when_flag_on(
-        self, mock_check_write, MockSimple, mock_settings_obj,
-        mock_compact_tomb, mock_compact_res, mock_collect_old,
-        mock_enqueue, MockMirror, MockMW, mock_audit,
-    ):
-        mock_settings_obj.SUPERTABLE_SUNSET_GC_ENABLED = True
-        mock_settings_obj.SUPERTABLE_SNAPSHOT_RETENTION = 0
-
-        dw = _build_writer()
-        snap = _snapshot([_resource("a"), _resource("b")])
-        mock_simple = _mk_simple_mock(snap)
-        MockSimple.return_value = mock_simple
-
-        new_res = [{"file": "c.parquet", "file_size": 5000, "columns": []}]
-        sunset = {"a", "b"}
-        mock_compact_res.return_value = (2, 200, new_res, sunset)
-        dw._get_table_config = MagicMock(return_value={})
-
-        dw.compact("admin", "tbl")
-
-        # parquet enqueue called with the sunset paths
-        parquet_calls = [
-            c for c in mock_enqueue.call_args_list
-            if c.args[4] == "parquet"
-        ]
-        assert len(parquet_calls) == 1
-        assert set(parquet_calls[0].args[5]) == sunset
-
-    @patch(_P_AUDIT)
-    @patch(_P_MON_WRITER)
-    @patch(_P_MIRROR)
-    @patch(_P_ENQUEUE)
-    @patch(_P_COLLECT_OLD, return_value=[])
-    @patch(_P_COMPACT_RES)
-    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
-    @patch(_P_SETTINGS)
-    @patch(_P_SIMPLE_TABLE)
-    @patch(_P_CHECK_WRITE)
-    def test_no_gc_enqueue_when_flags_off(
-        self, mock_check_write, MockSimple, mock_settings_obj,
-        mock_compact_tomb, mock_compact_res, mock_collect_old,
-        mock_enqueue, MockMirror, MockMW, mock_audit,
-    ):
-        mock_settings_obj.SUPERTABLE_SUNSET_GC_ENABLED = False
-        mock_settings_obj.SUPERTABLE_SNAPSHOT_RETENTION = 0
-
-        dw = _build_writer()
-        snap = _snapshot([_resource("a")])
-        MockSimple.return_value = _mk_simple_mock(snap)
-        mock_compact_res.return_value = (1, 100, [{"file": "c", "file_size": 1, "columns": []}], {"a"})
-        dw._get_table_config = MagicMock(return_value={})
-
-        dw.compact("admin", "tbl")
-
-        mock_enqueue.assert_not_called()
 
 
 # ===========================================================================

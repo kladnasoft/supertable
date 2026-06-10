@@ -13,7 +13,6 @@ from polars import DataFrame
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
-from supertable.gc.queue import collect_old_snapshot_paths, enqueue_deletions
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
 from supertable.super_table import SuperTable
@@ -571,46 +570,6 @@ class DataWriter:
                     self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
                 mark("bump_root")
 
-                # --- Enqueue deferred deletions (post-CAS, post-bump) ----------
-                # Strict ordering matters: leaf-CAS + root-bump have committed
-                # the new snapshot as the authoritative state. Only NOW is it
-                # safe to schedule physical deletion of files that the old
-                # snapshot still references — any reader that loaded the
-                # previous leaf payload will finish before the cleaner's delay
-                # window expires.
-                #
-                # Both blocks are best-effort: enqueue_deletions and
-                # collect_old_snapshot_paths swallow Redis/storage errors and
-                # log a warning. A GC failure must never fail the write.
-                try:
-                    _org = self.super_table.organization
-                    _sup = self.super_table.super_name
-                    if settings.SUPERTABLE_SUNSET_GC_ENABLED and sunset_files:
-                        enqueue_deletions(
-                            self.catalog,
-                            _org, _sup, simple_name,
-                            "parquet",
-                            list(sunset_files),
-                            write_id=qid,
-                        )
-                    if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
-                        old_paths = collect_old_snapshot_paths(
-                            new_snapshot_dict,
-                            self.super_table.storage,
-                            settings.SUPERTABLE_SNAPSHOT_RETENTION,
-                        )
-                        if old_paths:
-                            enqueue_deletions(
-                                self.catalog,
-                                _org, _sup, simple_name,
-                                "snapshot",
-                                old_paths,
-                                write_id=qid,
-                            )
-                except Exception as e:
-                    logger.warning(lp(f"GC enqueue failed (write still succeeded): {e}"))
-                mark("gc_enqueue")
-
                 # --- Store schema + table name in Redis (permanent, not cache) ---
                 try:
                     schema_raw = new_snapshot_dict.get("schema", {})
@@ -994,12 +953,10 @@ class DataWriter:
             # Critical filter: a file produced by Phase A (tombstone
             # compaction) can be picked up as a small-file candidate
             # by Phase B (compact_resources) and then sunset there.
-            # If we leave it in ``all_new_resources`` it lands in the
-            # new snapshot **and** in ``all_sunset`` (slated for GC
-            # deletion). 30 min later GC deletes the file while the
-            # snapshot still references it — readers fail with
-            # FileNotFoundError. Filter the file out of new_resources
-            # when it also appears in any sunset set.
+            # If we leave it in ``all_new_resources`` it would land in the
+            # new snapshot **and** in ``all_sunset`` at the same time.
+            # Filter the file out of new_resources when it also appears
+            # in any sunset set so the snapshot stays consistent.
             all_sunset = set(tomb_sunset) | set(small_sunset)
             all_new_resources = [
                 r for r in (list(tomb_new_resources) + list(small_new_resources))
@@ -1011,7 +968,7 @@ class DataWriter:
             result["total_rows_written"] = small_total_rows
 
             # Short-circuit: nothing to do, skip the snapshot rewrite
-            # and the leaf-CAS / root-bump / GC / mirror path. BUT do
+            # and the leaf-CAS / root-bump / mirror path. BUT do
             # NOT return here — execution must fall through to the
             # ``finally`` (which releases the lock) AND the monitoring
             # + audit emission blocks after the try/finally so the
@@ -1114,36 +1071,6 @@ class DataWriter:
                     now_ms=now_ms,
                 )
                 mark("bump_root")
-
-                # --- GC enqueue (same flags as write) ----------------------------
-                try:
-                    _org = self.super_table.organization
-                    _sup = self.super_table.super_name
-                    if settings.SUPERTABLE_SUNSET_GC_ENABLED and all_sunset:
-                        enqueue_deletions(
-                            self.catalog,
-                            _org, _sup, simple_name,
-                            "parquet",
-                            list(all_sunset),
-                            write_id=qid,
-                        )
-                    if settings.SUPERTABLE_SNAPSHOT_RETENTION > 0:
-                        old_paths = collect_old_snapshot_paths(
-                            new_snapshot_dict,
-                            self.super_table.storage,
-                            settings.SUPERTABLE_SNAPSHOT_RETENTION,
-                        )
-                        if old_paths:
-                            enqueue_deletions(
-                                self.catalog,
-                                _org, _sup, simple_name,
-                                "snapshot",
-                                old_paths,
-                                write_id=qid,
-                            )
-                except Exception as e:
-                    logger.warning(lp(f"GC enqueue failed (compact still succeeded): {e}"))
-                mark("gc_enqueue")
 
                 # --- Mirroring ---------------------------------------------------
                 try:

@@ -55,4 +55,3 @@
 | # | Document | Description |
 |---|----------|-------------|
 | 16 | [Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy: every key starts with `supertable:`, single source of truth in `redis_keys.py` |
-| 17 | [Storage GC](17_gc.md) | Deferred deletion of sunset parquets + pruned snapshot JSONs via Redis streams + the `GCCleaner` orchestration primitive |

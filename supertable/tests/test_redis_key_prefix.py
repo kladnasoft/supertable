@@ -121,12 +121,6 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         # ---- Schema -----------------------------------------------------
         ("schema",                       RK.schema(ORG, SUP, SIMPLE),          f"{lake_pre}:schema:doc:{SIMPLE}"),
 
-        # ---- GC pending (deferred-deletion stream) ---------------------
-        ("gc_pending",                   RK.gc_pending(ORG, SUP, SIMPLE),      f"{lake_pre}:gc:pending:doc:{SIMPLE}"),
-        ("gc_pending_pattern",           RK.gc_pending_pattern(ORG, SUP),      f"{lake_pre}:gc:pending:doc:*"),
-        ("gc_pending_pattern_for_org",   RK.gc_pending_pattern_for_org(ORG),   f"supertable:{ORG}:lakes:*:gc:pending:doc:*"),
-        ("gc_pending_pattern_all_orgs",  RK.gc_pending_pattern_all_orgs(),     "supertable:*:lakes:*:gc:pending:doc:*"),
-
         # ---- Linked shares ---------------------------------------------
         ("linked_share_index",           RK.linked_share_index(ORG, SUP),      f"{lake_pre}:linked_shares:index"),
         ("linked_share_doc",             RK.linked_share_doc(ORG, SUP, LINK),  f"{lake_pre}:linked_shares:doc:{LINK}"),
@@ -421,20 +415,6 @@ def test_parse_registry_key_returns_none_for_other_keys():
     assert RK.parse_registry_key(RK.app_master_mcp("lighthouse")) is None
 
 
-def test_parse_gc_pending_key_extracts_fields():
-    key = RK.gc_pending("acme", "demo", "orders")
-    assert RK.parse_gc_pending_key(key) == ("acme", "demo", "orders")
-
-
-def test_parse_gc_pending_key_returns_none_for_other_keys():
-    assert RK.parse_gc_pending_key(RK.meta_root("acme", "demo")) is None
-    assert RK.parse_gc_pending_key(RK.meta_leaf("acme", "demo", "orders")) is None
-    assert RK.parse_gc_pending_key(RK.lock_leaf("acme", "demo", "orders")) is None
-    assert RK.parse_gc_pending_key("supertable:acme:lakes:demo:gc:pending:doc:") is None
-    assert RK.parse_gc_pending_key("") is None
-    assert RK.parse_gc_pending_key(None) is None  # type: ignore[arg-type]
-
-
 def test_parse_monitor_partition_key_extracts_fields():
     key = RK.monitor_partition("acme", "writes", "2026-06-09")
     assert RK.parse_monitor_partition_key(key) == ("acme", "writes", "2026-06-09")
@@ -442,7 +422,6 @@ def test_parse_monitor_partition_key_extracts_fields():
 
 def test_parse_monitor_partition_key_returns_none_for_other_keys():
     assert RK.parse_monitor_partition_key(RK.meta_root("acme", "demo")) is None
-    assert RK.parse_monitor_partition_key(RK.gc_pending("acme", "demo", "t")) is None
     # Drain handle is rejected (7 segments, not 6)
     assert RK.parse_monitor_partition_key(
         RK.monitor_partition_drain("acme", "writes", "2026-06-09")
