@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import hashlib
 import secrets
@@ -21,6 +22,38 @@ from supertable import redis_keys as RK
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Role-name safety check
+# ---------------------------------------------------------------------------
+#
+# Role names get interpolated into Redis keys, hash fields, and log lines, so
+# the safe set is intentionally small: ASCII letters / digits + underscore,
+# hyphen, dot, space. First character must be a letter or underscore so
+# names can't be confused with numeric IDs or hidden-file-style paths.
+#
+# Lives on the *catalog* layer (not just RoleManager) so direct callers —
+# admin scripts, migrations, tests using ``cat.rbac_create_role`` — can't
+# bypass it. Two write paths, one rule.
+SAFE_ROLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-. ]{0,126}$")
+
+
+def validate_role_name(role_name: str) -> None:
+    """Raise ``ValueError`` if ``role_name`` doesn't match :data:`SAFE_ROLE_NAME_RE`.
+
+    Empty / ``None`` is a no-op — role_name is optional in the data model
+    and absent names skip the lookup index. Only non-empty names get
+    validated.
+    """
+    if not role_name:
+        return
+    if not SAFE_ROLE_NAME_RE.fullmatch(role_name):
+        raise ValueError(
+            f"Invalid role_name: {role_name!r}. Must be 1-127 characters, "
+            "start with a letter or underscore, contain only ASCII letters, "
+            "digits, underscores, hyphens, dots, and spaces."
+        )
 
 
 # All Redis key strings are constructed via `supertable.redis_keys` (RK).
@@ -649,7 +682,13 @@ return 1
     # -- Role CRUD --
 
     def rbac_create_role(self, org: str, sup: str, role_id: str, role_data: Dict[str, Any]) -> None:
-        """Persist a new role document and update indexes."""
+        """Persist a new role document and update indexes.
+
+        Validates ``role_name`` against :data:`SAFE_ROLE_NAME_RE` before
+        writing — direct callers (tests, admin scripts, migrations) can't
+        bypass the rule by skipping ``RoleManager.create_role``.
+        """
+        validate_role_name(role_data.get("role_name", ""))
         key = RK.rbac_role_doc(org, sup, role_id)
         redis_data = {k: self._rbac_serialize(v) for k, v in role_data.items()}
         pipe = self.r.pipeline()
@@ -665,7 +704,13 @@ return 1
         self._rbac_bump(RK.rbac_role_meta(org, sup))
 
     def rbac_update_role(self, org: str, sup: str, role_id: str, fields: Dict[str, Any]) -> None:
-        """Update specific fields of an existing role in-place."""
+        """Update specific fields of an existing role in-place.
+
+        Validates ``role_name`` (when the update touches it) so direct
+        callers can't introduce unsafe names via a partial update either.
+        """
+        if "role_name" in fields:
+            validate_role_name(fields.get("role_name", ""))
         key = RK.rbac_role_doc(org, sup, role_id)
         if not self.r.exists(key):
             raise ValueError(f"Role {role_id} does not exist")

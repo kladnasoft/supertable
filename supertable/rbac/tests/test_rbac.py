@@ -998,6 +998,30 @@ class TestAccessControl(unittest.TestCase):
                     {"role": "writer", "role_name": name, "tables": {"t1": {}}},
                 )
 
+    def test_direct_catalog_write_cannot_bypass_role_name_validation(self):
+        """The catalog-layer ``rbac_create_role`` / ``rbac_update_role``
+        re-check the name rule, so admin scripts, migration jobs, and
+        tests that call the lower layer directly can't slip an unsafe
+        name past the validator. This is how ``Write.All`` originally
+        landed in production — defense in depth closes that gap."""
+        self.cat.rbac_init_role_meta(ORG, SUP)
+        # Dotted name is now legal (allowed by the relaxed rule).
+        self.cat.rbac_create_role(
+            ORG, SUP, "r-dot",
+            {"role": "writer", "role_id": "r-dot", "role_name": "Write.All"},
+        )
+        # Special-char name is rejected at the catalog layer.
+        with self.assertRaises(ValueError):
+            self.cat.rbac_create_role(
+                ORG, SUP, "r-bad",
+                {"role": "writer", "role_id": "r-bad", "role_name": "bad%name"},
+            )
+        # Update path also gates on the name.
+        with self.assertRaises(ValueError):
+            self.cat.rbac_update_role(
+                ORG, SUP, "r-dot", {"role_name": "É_admin"},
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  7. Integration / edge case tests                                          #

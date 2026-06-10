@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 from supertable.rbac.row_column_security import RowColumnSecurity
 from supertable.config.defaults import logger
-from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import RedisCatalog, SAFE_ROLE_NAME_RE, validate_role_name
 from supertable import redis_keys as RK
 
 try:
@@ -96,14 +96,12 @@ class RoleManager:
 
     # ── CRUD ────────────────────────────────────────────────────────── #
 
-    # First character: ASCII letter or underscore (avoids leading digits / dots
-    # that look like hidden files). Remaining characters: ASCII letters and
-    # digits plus the punctuation we accept in real-world role-name
-    # conventions — underscore, hyphen, dot, space. Excludes accented Latin
-    # letters (e.g. ``É``) and shell-meaningful symbols (``%``, ``$``, ``/``,
-    # ``\``, quotes, etc.) so role names stay safe to interpolate into
-    # Redis keys, URLs, and log lines.
-    _SAFE_ROLE_NAME_RE = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_\-. ]{0,126}$")
+    # Re-exported for backwards compat with callers that referenced the
+    # old class attribute. The single source of truth lives on the
+    # ``redis_catalog`` layer (see :data:`SAFE_ROLE_NAME_RE`) so direct
+    # catalog writers can't bypass the rule. See :func:`validate_role_name`
+    # for the canonical check.
+    _SAFE_ROLE_NAME_RE = SAFE_ROLE_NAME_RE
 
     def create_role(self, data: dict) -> str:
         """
@@ -128,13 +126,11 @@ class RoleManager:
         org, sup = self.organization, self.super_name
         role_name = data.get("role_name")
 
-        # Validate role_name format
-        if role_name and not self._SAFE_ROLE_NAME_RE.fullmatch(role_name):
-            raise ValueError(
-                f"Invalid role_name: {role_name!r}. Must be 1-127 characters, "
-                "start with a letter or underscore, contain only ASCII letters, digits, "
-                "underscores, hyphens, dots, and spaces."
-            )
+        # Validate role_name format up-front so callers get a clean error
+        # at the public API boundary instead of after RCS prep work. The
+        # catalog layer re-checks on write, but that's defense in depth —
+        # this is the user-facing contract.
+        validate_role_name(role_name)
 
         # If role_name given, check uniqueness (idempotent: return existing)
         if role_name:
@@ -174,13 +170,9 @@ class RoleManager:
         new_name = data.get("role_name")
         old_name = existing.get("role_name", "")
         if new_name is not None and new_name != old_name:
-            # Validate format
-            if new_name and not self._SAFE_ROLE_NAME_RE.fullmatch(new_name):
-                raise ValueError(
-                    f"Invalid role_name: {new_name!r}. Must be 1-127 characters, "
-                    "start with a letter or underscore, contain only ASCII letters, digits, "
-                    "underscores, hyphens, dots, and spaces."
-                )
+            # Validate format (same rule as create_role; catalog re-checks
+            # on write as defense in depth).
+            validate_role_name(new_name)
             # Check uniqueness
             if new_name:
                 conflicting_id = self._catalog.rbac_get_role_id_by_name(org, sup, new_name)
