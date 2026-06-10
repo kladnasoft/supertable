@@ -134,7 +134,7 @@ Properties:
 
 The SDK does **not** spawn any daemon for this. The drain side
 exposes pure orchestration primitives — your service owns the
-scheduling (see also chap. 17 for the same model on GC).
+scheduling.
 
 ```python
 from supertable.monitoring import (

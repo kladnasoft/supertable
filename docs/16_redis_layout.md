@@ -94,9 +94,6 @@ supertable:                                    ── SuperTable SDK state
         linked_shares:
           index                                SET     linked share IDs
           doc:{link_id}                        STRING  consumer-side linked share
-        gc:                                    ── deferred-deletion queue (chap. 17)
-          pending:
-            doc:{simple}                       STREAM  paths scheduled for delete
     monitor:                                   ── org-wide telemetry (position 2)
       {monitor_type}:                          ── plans|writes|mcp|odata|errors|locks
         doc:{YYYY-MM-DD}                       LIST    daily-partitioned metrics

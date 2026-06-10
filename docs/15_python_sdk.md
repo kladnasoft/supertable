@@ -32,9 +32,8 @@ from supertable import (
 )
 ```
 
-The monitoring drain primitives and the GC orchestration primitive
-live in their own subpackages so deployments that don't need them
-don't pay the import cost:
+The monitoring drain primitives live in their own subpackage so
+deployments that don't need them don't pay the import cost:
 
 ```python
 from supertable.monitoring import (

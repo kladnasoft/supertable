@@ -166,4 +166,3 @@ SuperTable SDK's own state under `supertable:`. See
 | [14 Monitoring](14_monitoring.md) | Daily-partitioned metrics + drain orchestration |
 | [15 Python SDK](15_python_sdk.md) | pip package usage |
 | [16 Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy |
-| [17 Storage GC](17_gc.md) | Deferred deletion of sunset parquets + old snapshots |
