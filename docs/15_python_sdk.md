@@ -42,9 +42,6 @@ from supertable.monitoring import (
     read_recent, MonitorPartition,
     MONITORING_SINK_TABLE_FOR, MONITORING_SINK_TABLES,
 )
-from supertable.gc.cleaner import GCCleaner
-# Optional daemon wrapper (most deployments call tick() directly):
-from supertable.gc.daemon import run_forever, run_all_orgs
 ```
 
 ## Installation
@@ -304,41 +301,6 @@ For huge partitions, swap `drain_partition` for `iter_partition_chunks`
 to stream in memory-bounded slices. See chap. 14 for atomicity and
 crash-recovery semantics.
 
-### GC orchestration
-
-Deferred-deletion of sunset parquets and pruned snapshot JSONs runs
-under the same caller-owned-scheduling model:
-
-```python
-from supertable.gc.cleaner import GCCleaner
-from supertable.redis_catalog import RedisCatalog
-from supertable.storage.storage_factory import get_storage
-
-cleaner = GCCleaner(
-    org="acme",
-    catalog=RedisCatalog(),
-    storage=get_storage(),
-    # optional overrides — settings.SUPERTABLE_GC_* are the defaults
-    delay_sec=1800, batch_size=500,
-)
-
-# Inside your service's own scheduler:
-while not service.shutdown_requested:
-    stats = cleaner.tick()
-    service.publish_metrics(stats)
-    service.sleep(60)
-```
-
-For single-node installs that don't have a scheduler, a convenience
-daemon wraps `tick()` with a tick/sleep/repeat loop and a CLI:
-
-```bash
-python -m supertable.gc.daemon --org acme
-python -m supertable.gc.daemon --all-orgs   # multi-tenant
-```
-
-See chap. 17 for the full lifecycle.
-
 ### Staging / SuperPipe
 
 ```python
@@ -430,8 +392,5 @@ every script (`organization`, `super_name`, `simple_name`, `role_name`,
 - `supertable/rbac/` — `RoleManager`, `UserManager`, filter / permission utilities.
 - `supertable/monitoring/partitions.py` — drain orchestration primitives (`list_drainable_partitions`, `drain_partition`, `iter_partition_chunks`, `read_recent`), `MonitorPartition` NamedTuple, `MONITORING_SINK_TABLES` / `MONITORING_SINK_TABLE_FOR` constants.
 - `supertable/monitoring_writer.py` — `MonitoringWriter` (daily-partitioned RPUSH), `get_monitoring_logger` singleton factory, `NullMonitoringLogger` fallback.
-- `supertable/gc/cleaner.py` — `GCCleaner` orchestration primitive (`tick()`).
-- `supertable/gc/daemon.py` — `run_forever`, `run_all_orgs`, `python -m supertable.gc.daemon` CLI.
-- `supertable/gc/queue.py` — `enqueue_deletions`, `collect_old_snapshot_paths`, `nuke_stream` helpers used by `DataWriter`.
 - `supertable/demo/quickstart/` — numbered API tutorial steps.
 - `supertable/demo/webshop/` — synthetic webshop dataset demo.
