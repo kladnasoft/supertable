@@ -754,8 +754,13 @@ class DataWriter:
              qualify — large files are left untouched. ``small_only=False``
              rewrites every resource regardless of size.
           5. Commit the new snapshot via ``simple_table.update``,
-             leaf-CAS, ``bump_root``, and the same GC enqueue +
+             leaf-CAS, ``bump_root``, optional mirroring, and the same
              monitoring + audit pipeline as ``write``.
+
+        Compaction does **not** garbage-collect: the small files it
+        merges away are left in storage (still referenced by older
+        snapshot versions for time-travel) for an external GC to
+        reclaim later.
 
         Concurrency: compaction is serialised against writes through
         the same per-simple lock. A concurrent ``write()`` either

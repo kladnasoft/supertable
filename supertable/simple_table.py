@@ -260,6 +260,56 @@ class SimpleTable:
         data = self.storage.read_json(path)
         return data, path
 
+    def export_to(self, target_dir: str, compression_level: int = 3, small_only: bool = False):
+        """Write a standalone copy of the current data into ``target_dir``.
+
+        Reads the current snapshot's parquet resources and re-writes them
+        as memory-bounded parquet chunks (each ~``max_memory_chunk_size``,
+        from the per-table config or the global default) under
+        ``target_dir``.  This is a pure copy: it does NOT create a new
+        snapshot, advance the Redis leaf, or touch ``data/``/``snapshots/``.
+
+        Args:
+            target_dir: destination directory for the exported parquet
+                files (created if missing).  Typically an
+                ``export/<timestamp>/`` folder next to ``data/``.
+            compression_level: zstd level for the exported parquet.
+            small_only: when False (default) every resource is read and
+                re-chunked; when True only files smaller than
+                ``max_memory_chunk_size`` are included.
+
+        Returns:
+            ``dict`` with ``files`` (list of written paths),
+            ``files_written``, ``total_rows`` and ``total_bytes``.
+        """
+        from supertable.processing import compact_resources
+
+        snapshot, _path = self.get_simple_table_snapshot()
+        table_config = self.catalog.get_table_config(
+            self.super_table.organization,
+            self.super_table.super_name,
+            self.simple_name,
+        ) or {}
+
+        _considered, total_rows, new_resources, _sunset = compact_resources(
+            snapshot=snapshot,
+            data_dir=target_dir,
+            compression_level=compression_level,
+            table_config=table_config,
+            small_only=small_only,
+        )
+
+        files = [r.get("file") for r in new_resources if isinstance(r, dict) and r.get("file")]
+        total_bytes = sum(
+            int(r.get("file_size") or 0) for r in new_resources if isinstance(r, dict)
+        )
+        return {
+            "files": files,
+            "files_written": len(files),
+            "total_rows": int(total_rows),
+            "total_bytes": int(total_bytes),
+        }
+
     def update(self, new_resources, sunset_files, model_df, last_snapshot=None, last_snapshot_path=None, lineage=None, profiler: Optional[Profiler] = None):
         """
         Build and write a new heavy snapshot on storage.

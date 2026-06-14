@@ -19,7 +19,7 @@ long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
     name="supertable",
-    version="2.2.2",
+    version="2.2.3",
     description="SuperTable — versioned data lake library for SQL analytics on Parquet + Redis.",
     long_description=long_description,
     long_description_content_type="text/markdown",
