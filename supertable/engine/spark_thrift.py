@@ -25,7 +25,7 @@ from supertable.engine.engine_common import (
     escape_parquet_path,
 )
 
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 # Suppress verbose INFO logging from PyHive and Thrift libraries.
 # PyHive logs every SQL statement (CREATE VIEW, DROP VIEW, SET, etc.)
@@ -77,8 +77,14 @@ def _to_s3a_path(file_path: str) -> str:
 
     if file_path.startswith("http://") or file_path.startswith("https://"):
         parsed = urlparse(file_path)
-        # path is /bucket/key — strip the leading slash, split into bucket + key
-        path = parsed.path.lstrip("/")
+        # path is /bucket/key — strip the leading slash, split into bucket + key.
+        # urlparse leaves percent-escapes intact, and boto3 presigning encodes
+        # the key (Hive partition dirs like ``year=2006`` become ``year%3D2006``).
+        # Spark's S3A client expects the *raw* object key and re-encodes itself,
+        # so we must decode here — otherwise Ceph RGW, which matches keys
+        # literally, 404s on the ``%3D`` form. The presign query string is
+        # dropped on purpose: Spark authenticates with its own fs.s3a.* creds.
+        path = unquote(parsed.path).lstrip("/")
         if "/" in path:
             return f"s3a://{path}"
         # Degenerate case: only bucket, no key — return as-is

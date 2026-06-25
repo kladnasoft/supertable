@@ -35,10 +35,10 @@ Hierarchy (v2)
           shares:
             doc:{share_id}                           STRING  share definition
             index                                    SET     share IDs
-          spark:
+          engine:
             thrifts                                  HASH    Spark Thrift clusters
             plugs                                    HASH    Spark Plug runtimes
-          config:engine                              STRING  engine runtime config
+            duckdb                                   STRING  DuckDB runtime config
         lakes:                                      ← user-data sentinel
           {sup}:                                    ← supertable scope
             meta:
@@ -121,7 +121,7 @@ SUPERTABLE_PREFIX: str = "supertable"
 DATAISLAND_PREFIX: str = "dataisland"
 
 # Position-2 sentinel under ``supertable:{org}:`` for org-level platform
-# state (auth tokens, audit, shares, spark).
+# state (auth tokens, audit, shares, engine).
 SYSTEM_SCOPE: str = "system"
 
 # Position-2 sentinel under ``supertable:{org}:`` for user-supplied
@@ -394,16 +394,21 @@ def share_index(org: str) -> str:
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:shares:index"
 
 
-# --- Org-level Spark ------------------------------------------------------- #
+# --- Org-level Engine ------------------------------------------------------ #
+#
+# All query-engine state lives under one ``system:engine:`` namespace: the
+# Spark Thrift cluster registry, the Spark Plug runtime registry, and the
+# DuckDB (Lite/Pro) runtime config document. Grouping them keeps every engine
+# knob the UI exposes under a single, discoverable path.
 
-def spark_thrifts(org: str) -> str:
+def engine_thrifts(org: str) -> str:
     """Spark Thrift cluster registry (HASH)."""
-    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:spark:thrifts"
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:engine:thrifts"
 
 
-def spark_plugs(org: str) -> str:
+def engine_plugs(org: str) -> str:
     """Spark Plug runtime registry (HASH)."""
-    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:spark:plugs"
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:engine:plugs"
 
 
 # =========================================================================== #
@@ -570,11 +575,15 @@ def pipe_pattern(org: str, sup: str, staging_name: str) -> str:
     )
 
 
-# --- Engine config --------------------------------------------------------- #
+# --- DuckDB engine config -------------------------------------------------- #
 
-def config_engine(org: str) -> str:
-    """Engine runtime config (STRING). Org-level system scope (global, not per-supertable)."""
-    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:config:engine"
+def engine_duckdb(org: str) -> str:
+    """DuckDB (Lite/Pro) runtime config (STRING). Org-level system scope (global, not per-supertable).
+
+    One document holds both engines' DuckDB pragmas plus the shared auto-pick
+    thresholds; see :mod:`supertable.engine.engine_config`.
+    """
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:engine:duckdb"
 
 
 # --- Locks ----------------------------------------------------------------- #
