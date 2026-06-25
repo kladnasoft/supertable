@@ -21,6 +21,7 @@ from supertable.engine.engine_common import (
     create_reflection_view_with_presign_retry,
     rewrite_query_with_hashed_tables,
     init_connection,
+    apply_runtime_pragmas,
     create_rbac_view,
     create_dedup_view,
     create_tombstone_view,
@@ -105,6 +106,7 @@ class DuckDBLite:
             query_manager: QueryPlanManager,
             timer_capture,
             log_prefix: str = "",
+            engine_config=None,
     ) -> pd.DataFrame:
         tried_presign = False
 
@@ -236,6 +238,10 @@ class DuckDBLite:
                 con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
             except Exception:
                 pass
+
+            # Re-apply live engine config (memory/threads/http/cache) so UI
+            # changes take effect on this persistent connection per query.
+            apply_runtime_pragmas(con, engine_config)
 
             logger.debug(f"{log_prefix}[duckdb.lite] executing: {executing_query}")
             result = con.execute(executing_query).fetchdf()

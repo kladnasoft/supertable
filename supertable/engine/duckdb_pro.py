@@ -25,6 +25,7 @@ from supertable.engine.engine_common import (
     make_presigned_list,
     rewrite_query_with_hashed_tables,
     init_connection,
+    apply_runtime_pragmas,
     create_rbac_view,
     create_dedup_view,
     create_tombstone_view,
@@ -268,6 +269,7 @@ class DuckDBPro:
             query_manager: QueryPlanManager,
             timer_capture,
             log_prefix: str = "",
+            engine_config=None,
     ) -> pd.DataFrame:
         tables_used: Set[str] = set()
 
@@ -367,6 +369,10 @@ class DuckDBPro:
             parser.executing_query = executing_query
 
             logger.debug(f"{log_prefix}[duckdb.pro] executing: {executing_query}")
+
+            # Re-apply live engine config (memory/threads/http/cache) so UI
+            # changes take effect on this persistent connection per query.
+            apply_runtime_pragmas(con, engine_config)
 
             # Profiling PRAGMAs are connection-level state.  Under concurrent
             # queries the last SET wins — one query's profile may land in the

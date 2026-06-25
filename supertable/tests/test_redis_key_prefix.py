@@ -70,6 +70,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("share_index",                  RK.share_index(ORG),                  f"{sys_pre}:shares:index"),
         ("spark_thrifts",                RK.spark_thrifts(ORG),                f"{sys_pre}:spark:thrifts"),
         ("spark_plugs",                  RK.spark_plugs(ORG),                  f"{sys_pre}:spark:plugs"),
+        ("config_engine",                RK.config_engine(ORG),                f"{sys_pre}:config:engine"),
 
         # ---- Lakes scope (per-org supertable enumeration) ---------------
         ("lakes_scope",                  RK.lakes_scope(ORG),                  f"supertable:{ORG}:lakes"),
@@ -94,9 +95,6 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("pipe_index",                   RK.pipe_index(ORG, SUP, STAGING),     f"{lake_pre}:meta:staging:doc:{STAGING}:pipes:index"),
         ("pipe_doc",                     RK.pipe_doc(ORG, SUP, STAGING, PIPE), f"{lake_pre}:meta:staging:doc:{STAGING}:pipes:doc:{PIPE}"),
         ("pipe_pattern",                 RK.pipe_pattern(ORG, SUP, STAGING),   f"{lake_pre}:meta:staging:doc:{STAGING}:pipes:doc:*"),
-
-        # ---- Config -----------------------------------------------------
-        ("config_engine",                RK.config_engine(ORG, SUP),           f"{lake_pre}:config:engine"),
 
         # ---- Locks ------------------------------------------------------
         ("lock_leaf",                    RK.lock_leaf(ORG, SUP, SIMPLE),       f"{lake_pre}:lock:leaf:doc:{SIMPLE}"),

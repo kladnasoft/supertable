@@ -1525,6 +1525,20 @@ return 1
             return []
 
 
+    def delete_spark_cluster(self, org: str, cluster_id: str) -> bool:
+        """Remove a registered Spark Thrift cluster. Returns True if it existed."""
+        if not (org and cluster_id):
+            return False
+        try:
+            removed = self.r.hdel(RK.spark_thrifts(org), cluster_id)
+            if removed:
+                logger.info(f"[redis-catalog] spark thrift deleted: {org}/{cluster_id}")
+            return bool(removed)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_spark_cluster error: {e}")
+            return False
+
+
     def select_spark_cluster(self, org: str, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
         """
         Select the best active Spark Thrift cluster for a job of the given size.
@@ -1669,10 +1683,12 @@ return 1
     def set_engine_config(
             self,
             org: str,
-            sup: str,
             config: Dict[str, Any],
     ) -> bool:
         """Store engine runtime configuration (DuckDB + auto-pick thresholds).
+
+        Org-level system scope: one engine config per organization, applied
+        globally across all supertables (not per-supertable).
 
         The config dict is stored as a JSON string.  Only recognised fields
         (see ENGINE_CONFIG_FIELDS) are persisted — unknown keys are silently
@@ -1680,7 +1696,7 @@ return 1
 
         Existing config is fully replaced (last-write-wins).
         """
-        if not (org and sup):
+        if not org:
             return False
         try:
             # Whitelist recognised fields only.
@@ -1691,7 +1707,7 @@ return 1
             }
             doc["modified_ms"] = _now_ms()
             self.r.set(
-                RK.config_engine(org, sup),
+                RK.config_engine(org),
                 json.dumps(doc, default=str),
             )
             return True
@@ -1702,16 +1718,15 @@ return 1
     def get_engine_config(
             self,
             org: str,
-            sup: str,
     ) -> Optional[Dict[str, Any]]:
-        """Retrieve engine runtime configuration.
+        """Retrieve engine runtime configuration (org-level system scope).
 
-        Returns None if no config has been stored for this tenant.
+        Returns None if no config has been stored for this organization.
         """
-        if not (org and sup):
+        if not org:
             return None
         try:
-            raw = self.r.get(RK.config_engine(org, sup))
+            raw = self.r.get(RK.config_engine(org))
             if raw:
                 return json.loads(raw)
         except (redis.RedisError, json.JSONDecodeError) as e:

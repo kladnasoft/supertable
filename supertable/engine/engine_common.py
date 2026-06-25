@@ -140,7 +140,11 @@ def _parse_memory_limit_mb(value: str) -> Optional[int]:
     return int(amount)
 
 
-def _derive_thread_count(memory_limit_str: str, fallback: int = 2) -> int:
+def _derive_thread_count(
+        memory_limit_str: str,
+        fallback: int = 2,
+        multiplier: Optional[float] = None,
+) -> int:
     """Derive a safe DuckDB thread count for remote parquet reads.
 
     DuckDB uses synchronous IO: each thread can make at most one HTTP/S3
@@ -170,9 +174,10 @@ def _derive_thread_count(memory_limit_str: str, fallback: int = 2) -> int:
         return fallback
 
     cpu_count = _os.cpu_count() or fallback
-    multiplier = settings.SUPERTABLE_DUCKDB_IO_MULTIPLIER
+    if multiplier is None:
+        multiplier = settings.SUPERTABLE_DUCKDB_IO_MULTIPLIER
 
-    io_threads = cpu_count * multiplier
+    io_threads = int(cpu_count * multiplier)
     # Safety ceiling: never allocate fewer than ~400 MB per thread.
     memory_floor = max(1, mb // 400)
     result = min(io_threads, memory_floor)
@@ -623,6 +628,56 @@ def init_connection(
         logger.debug(f"[duckdb.init] threads={thread_count}, memory={effective_memory_limit}")
     except Exception:
         pass
+
+
+def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
+    """Re-apply the session-settable DuckDB pragmas from a live engine config.
+
+    DuckDB Lite/Pro reuse a persistent connection, so settings applied once at
+    ``init_connection`` time would otherwise freeze for the connection's life.
+    Calling this immediately before each query makes the org's engine config
+    (memory limit, thread count, HTTP timeout, external file cache) take effect
+    live — the connection adopts the latest values without being torn down.
+
+    ``cfg`` is an ``EngineRuntimeConfig``.  When None the connection keeps
+    whatever ``init_connection`` applied (settings-based), so callers without a
+    resolved config are unaffected.  Every pragma is best-effort: httpfs-only
+    settings silently no-op on connections that have not loaded httpfs.
+    """
+    if cfg is None:
+        return
+
+    memory_limit = (cfg.duckdb_memory_limit or "").strip() or "1GB"
+    try:
+        con.execute(f"PRAGMA memory_limit='{memory_limit}';")
+    except Exception:
+        pass
+
+    # Explicit thread count wins; otherwise derive from the live memory limit
+    # and IO multiplier (same formula as init_connection).
+    if cfg.duckdb_threads is not None:
+        thread_count = cfg.duckdb_threads
+    else:
+        thread_count = _derive_thread_count(memory_limit, multiplier=cfg.duckdb_io_multiplier)
+    try:
+        con.execute(f"SET threads={thread_count};")
+    except Exception:
+        pass
+
+    # httpfs settings — only effective once httpfs is loaded (remote reads).
+    if cfg.duckdb_http_timeout is not None:
+        try:
+            con.execute(f"SET http_timeout={int(cfg.duckdb_http_timeout)};")
+        except Exception:
+            pass
+
+    cache_size = (cfg.duckdb_external_cache_size or "").strip()
+    if cache_size:
+        try:
+            con.execute("SET enable_external_file_cache=true;")
+            con.execute(f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';")
+        except Exception:
+            pass
 
 
 # =========================================================

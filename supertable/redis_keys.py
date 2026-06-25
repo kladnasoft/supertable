@@ -38,6 +38,7 @@ Hierarchy (v2)
           spark:
             thrifts                                  HASH    Spark Thrift clusters
             plugs                                    HASH    Spark Plug runtimes
+          config:engine                              STRING  engine runtime config
         lakes:                                      ← user-data sentinel
           {sup}:                                    ← supertable scope
             meta:
@@ -55,7 +56,6 @@ Hierarchy (v2)
                   pipes:
                     index                            SET     pipe names
                     doc:{pipe_name}                  STRING  pipe definition
-            config:engine                            STRING  engine runtime config
             lock:
               leaf:
                 doc:{simple}                         STRING  per-table lock token
@@ -572,12 +572,9 @@ def pipe_pattern(org: str, sup: str, staging_name: str) -> str:
 
 # --- Engine config --------------------------------------------------------- #
 
-def config_engine(org: str, sup: str) -> str:
-    """Engine runtime config (STRING)."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:config:engine"
-    )
+def config_engine(org: str) -> str:
+    """Engine runtime config (STRING). Org-level system scope (global, not per-supertable)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:config:engine"
 
 
 # --- Locks ----------------------------------------------------------------- #

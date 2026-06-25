@@ -16,9 +16,9 @@ from supertable.utils.sql_parser import SQLParser
 from supertable.engine.engine_enum import Engine
 from supertable.engine.duckdb_lite import DuckDBLite
 from supertable.engine.duckdb_pro import DuckDBPro
+from supertable.engine.engine_config import resolve_engine_config, EngineRuntimeConfig
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
-from supertable.config.settings import settings
 
 
 # Module-level singleton for the pro executor so the persistent
@@ -46,8 +46,23 @@ class Executor:
         self.organization = organization
         self.lite_exec = DuckDBLite(storage=storage)
         self.spark_exec = None
+        self._catalog = None  # lazily created RedisCatalog for live config reads
 
-    def _auto_pick(self, reflection: Reflection) -> Engine:
+    def _get_catalog(self):
+        """Lazily create a RedisCatalog for live engine-config reads.
+
+        Returns None when Redis is unreachable so config resolution degrades to
+        environment variables and built-in defaults instead of failing a query.
+        """
+        if self._catalog is None:
+            try:
+                from supertable.redis_catalog import RedisCatalog
+                self._catalog = RedisCatalog()
+            except Exception:
+                self._catalog = False  # sentinel: construction failed, do not retry
+        return self._catalog or None
+
+    def _auto_pick(self, reflection: Reflection, cfg: EngineRuntimeConfig) -> Engine:
         """Select the best engine based on data size and freshness.
 
         Decision matrix (all thresholds configurable via env vars):
@@ -74,21 +89,10 @@ class Executor:
         """
         bytes_total = reflection.reflection_bytes
 
-        # --- thresholds (env-configurable) ---
-        try:
-            lite_max = settings.SUPERTABLE_ENGINE_LITE_MAX_BYTES
-        except ValueError:
-            lite_max = 100 * 1024 * 1024  # 100 MB
-
-        try:
-            spark_min = settings.SUPERTABLE_ENGINE_SPARK_MIN_BYTES
-        except ValueError:
-            spark_min = 10 * 1024 * 1024 * 1024  # 10 GB
-
-        try:
-            freshness_threshold_s = settings.SUPERTABLE_ENGINE_FRESHNESS_SEC
-        except ValueError:
-            freshness_threshold_s = 300  # 5 min
+        # --- thresholds (resolved live from org system config) ---
+        lite_max = cfg.engine_lite_max_bytes
+        spark_min = cfg.engine_spark_min_bytes
+        freshness_threshold_s = cfg.engine_freshness_sec
 
         # --- freshness: how long ago was the most recent snapshot updated ---
         if reflection.freshness_ms > 0:
@@ -138,7 +142,11 @@ class Executor:
         plan_stats: PlanStats,
         log_prefix: str,
     ) -> Tuple[pd.DataFrame, str]:
-        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection)
+        # Resolve engine config live (Redis → env → default) for this query so
+        # UI changes take effect immediately without restart or cache.
+        cfg = resolve_engine_config(self.organization, self._get_catalog())
+
+        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection, cfg)
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
@@ -150,6 +158,7 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
+                engine_config=cfg,
             )
             used = "duckdb_lite"
 
@@ -161,6 +170,7 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
+                engine_config=cfg,
             )
             used = "duckdb_pro"
 
