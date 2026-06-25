@@ -16,7 +16,7 @@ from supertable.utils.sql_parser import SQLParser
 from supertable.engine.engine_enum import Engine
 from supertable.engine.duckdb_lite import DuckDBLite
 from supertable.engine.duckdb_pro import DuckDBPro
-from supertable.engine.engine_config import resolve_engine_config, EngineRuntimeConfig
+from supertable.engine.engine_config import resolve_engine_configs, EngineRuntimeConfig
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
 
@@ -143,10 +143,14 @@ class Executor:
         log_prefix: str,
     ) -> Tuple[pd.DataFrame, str]:
         # Resolve engine config live (Redis → env → default) for this query so
-        # UI changes take effect immediately without restart or cache.
-        cfg = resolve_engine_config(self.organization, self._get_catalog())
+        # UI changes take effect immediately without restart or cache.  Lite and
+        # Pro carry independent DuckDB pragmas; the shared auto-pick thresholds
+        # are identical in both, so either may drive the routing decision.
+        cfgs = resolve_engine_configs(self.organization, self._get_catalog())
+        lite_cfg = cfgs["lite"]
+        pro_cfg = cfgs["pro"]
 
-        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection, cfg)
+        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection, lite_cfg)
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
@@ -158,7 +162,7 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
-                engine_config=cfg,
+                engine_config=lite_cfg,
             )
             used = "duckdb_lite"
 
@@ -170,7 +174,7 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
-                engine_config=cfg,
+                engine_config=pro_cfg,
             )
             used = "duckdb_pro"
 

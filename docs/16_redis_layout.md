@@ -50,9 +50,10 @@ supertable:                                    ── SuperTable SDK state
       shares:
         doc:{share_id}                         STRING  share definition
         index                                  SET     share IDs
-      spark:
+      engine:
         thrifts                                HASH    Spark Thrift clusters
         plugs                                  HASH    Spark Plug runtimes
+        duckdb                                 STRING  DuckDB runtime config
     lakes:                                     ── user-data sentinel
       {sup}:                                   ── supertable scope (user-named)
         meta:
@@ -70,7 +71,6 @@ supertable:                                    ── SuperTable SDK state
               pipes:
                 index                          SET     pipe names
                 doc:{pipe_name}                STRING  pipe definition
-        config:engine                          STRING  engine runtime config
         lock:
           leaf:
             doc:{simple}                       STRING  per-table lock token

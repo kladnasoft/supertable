@@ -160,18 +160,15 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 | `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:index` | SET | Set of pipe names for a staging area |
 | `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:doc:{pipe_name}` | STRING (JSON) | Pipe metadata within a staging area |
 
-### Spark Cluster Keys
+### Engine Keys
+
+All query-engine state is unified under one org-level `system:engine:` namespace.
 
 | Pattern | Type | Purpose |
 |---------|------|---------|
-| `supertable:{org}:system:spark:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
-| `supertable:{org}:system:spark:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
-
-### Engine Configuration Keys
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:config:engine` | STRING (JSON) | DuckDB / engine runtime configuration (memory, threads, thresholds) |
+| `supertable:{org}:system:engine:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
+| `supertable:{org}:system:engine:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
+| `supertable:{org}:system:engine:duckdb` | STRING (JSON) | DuckDB Lite/Pro runtime config + shared auto-pick thresholds (memory, threads, thresholds) |
 
 ### Schema Keys
 

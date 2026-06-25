@@ -1468,7 +1468,7 @@ return 1
             return 0
 
     # ========================================================================= #
-    # Spark Thrift cluster management (org-scoped: supertable:{org}:system:spark:thrifts)
+    # Spark Thrift cluster management (org-scoped: supertable:{org}:system:engine:thrifts)
     # ========================================================================= #
 
     def register_spark_cluster(self, org: str, cluster_id: str, config: Dict[str, Any]) -> None:
@@ -1497,7 +1497,7 @@ return 1
             doc.setdefault("s3_enabled", True)
             doc["modified_ms"] = _now_ms()
             self.r.hset(
-                RK.spark_thrifts(org),
+                RK.engine_thrifts(org),
                 cluster_id,
                 json.dumps(doc, default=str),
             )
@@ -1512,7 +1512,7 @@ return 1
         if not org:
             return []
         try:
-            raw = self.r.hgetall(RK.spark_thrifts(org))
+            raw = self.r.hgetall(RK.engine_thrifts(org))
             clusters = []
             for _cid, data in raw.items():
                 try:
@@ -1530,7 +1530,7 @@ return 1
         if not (org and cluster_id):
             return False
         try:
-            removed = self.r.hdel(RK.spark_thrifts(org), cluster_id)
+            removed = self.r.hdel(RK.engine_thrifts(org), cluster_id)
             if removed:
                 logger.info(f"[redis-catalog] spark thrift deleted: {org}/{cluster_id}")
             return bool(removed)
@@ -1578,7 +1578,7 @@ return 1
         return candidates[0]
 
     # ========================================================================= #
-    # Spark Plug management (org-scoped: supertable:{org}:system:spark:plugs)
+    # Spark Plug management (org-scoped: supertable:{org}:system:engine:plugs)
     # ========================================================================= #
 
     def register_spark_plug(self, org: str, plug_id: str, config: Dict[str, Any]) -> None:
@@ -1604,7 +1604,7 @@ return 1
             doc.setdefault("webui_url", "")
             doc["modified_ms"] = _now_ms()
             self.r.hset(
-                RK.spark_plugs(org),
+                RK.engine_plugs(org),
                 plug_id,
                 json.dumps(doc, default=str),
             )
@@ -1669,45 +1669,53 @@ return 1
     # Canonical field names and their env-var counterparts.  Used by the
     # resolver in engine_common to fall back to os.getenv when a field
     # is absent from Redis.
-    ENGINE_CONFIG_FIELDS = {
-        "engine_lite_max_bytes":       "SUPERTABLE_ENGINE_LITE_MAX_BYTES",
-        "engine_spark_min_bytes":      "SUPERTABLE_ENGINE_SPARK_MIN_BYTES",
-        "engine_freshness_sec":        "SUPERTABLE_ENGINE_FRESHNESS_SEC",
-        "duckdb_memory_limit":         "SUPERTABLE_DUCKDB_MEMORY_LIMIT",
-        "duckdb_io_multiplier":        "SUPERTABLE_DUCKDB_IO_MULTIPLIER",
-        "duckdb_threads":              "SUPERTABLE_DUCKDB_THREADS",
-        "duckdb_http_timeout":         "SUPERTABLE_DUCKDB_HTTP_TIMEOUT",
-        "duckdb_external_cache_size":  "SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE",
-    }
+    # Per-engine DuckDB runtime pragmas (separate sections for "lite" / "pro").
+    DUCKDB_CONFIG_FIELDS = (
+        "duckdb_memory_limit",
+        "duckdb_io_multiplier",
+        "duckdb_threads",
+        "duckdb_http_timeout",
+        "duckdb_external_cache_size",
+    )
+    DUCKDB_ENGINES = ("lite", "pro")
 
     def set_engine_config(
             self,
             org: str,
+            engine: str,
             config: Dict[str, Any],
     ) -> bool:
-        """Store engine runtime configuration (DuckDB + auto-pick thresholds).
+        """Store DuckDB runtime configuration for one engine ("lite" / "pro").
 
-        Org-level system scope: one engine config per organization, applied
+        Org-level system scope: one engine document per organization, applied
         globally across all supertables (not per-supertable).
 
-        The config dict is stored as a JSON string.  Only recognised fields
-        (see ENGINE_CONFIG_FIELDS) are persisted — unknown keys are silently
-        dropped to prevent injection of arbitrary settings.
+        Only the requested engine's section is replaced; the other engine's
+        section and the shared auto-pick thresholds are preserved.  Within the
+        section it is a full replace (last-write-wins) — omitting a field clears
+        its Redis override so it falls back to env / default at read time.
 
-        Existing config is fully replaced (last-write-wins).
+        Only recognised DuckDB fields (see DUCKDB_CONFIG_FIELDS) are persisted —
+        unknown keys are silently dropped to prevent injection of arbitrary
+        settings.
         """
         if not org:
             return False
+        engine = (engine or "").strip().lower()
+        if engine not in self.DUCKDB_ENGINES:
+            return False
         try:
-            # Whitelist recognised fields only.
-            doc = {
+            doc = self.get_engine_config(org) or {}
+            # Whitelist recognised DuckDB fields only for this engine section.
+            section = {
                 k: config[k]
-                for k in self.ENGINE_CONFIG_FIELDS
+                for k in self.DUCKDB_CONFIG_FIELDS
                 if k in config and config[k] is not None and str(config[k]).strip() != ""
             }
+            doc[engine] = section
             doc["modified_ms"] = _now_ms()
             self.r.set(
-                RK.config_engine(org),
+                RK.engine_duckdb(org),
                 json.dumps(doc, default=str),
             )
             return True
@@ -1726,7 +1734,7 @@ return 1
         if not org:
             return None
         try:
-            raw = self.r.get(RK.config_engine(org))
+            raw = self.r.get(RK.engine_duckdb(org))
             if raw:
                 return json.loads(raw)
         except (redis.RedisError, json.JSONDecodeError) as e:
