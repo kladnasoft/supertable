@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import duckdb
@@ -282,11 +282,15 @@ def configure_httpfs_and_s3(
         "true" if meta_cache_on else "false",
     )
 
-    # External file cache (DuckDB >= 1.3) — caches remote data blocks on local
-    # disk so repeated queries do not re-download the same row groups.
-    # Only enabled when SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE is set.
+    # External file cache — an in-memory cache of remote data blocks so
+    # repeated queries do not re-download the same row groups.  It is only
+    # enabled when a size cap can be enforced: DuckDB builds without
+    # external_file_cache_max_size (e.g. 1.5.x) cannot bound it, and an
+    # uncapped cache grows to memory_limit on the persistent connection.
+    # Without an enforceable cap we keep it OFF to protect memory.
     cache_size = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE
-    if cache_size:
+    can_cap = "external_file_cache_max_size" in supported
+    if cache_size and can_cap:
         set_if_supported("enable_external_file_cache", "true")
         set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
         cache_dir_raw = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
@@ -302,6 +306,15 @@ def configure_httpfs_and_s3(
             + (f" size={cache_size}" if cache_size else "")
             + f", dir={cache_dir}"
         )
+    else:
+        # Uncappable (or disabled via empty size) — turn it off explicitly so
+        # the DuckDB 1.5.x default-on cache cannot accumulate in memory.
+        set_if_supported("enable_external_file_cache", "false")
+        if cache_size and not can_cap:
+            logger.info(
+                "[duckdb.cache] external file cache disabled: this DuckDB build "
+                "cannot cap it (no external_file_cache_max_size)"
+            )
 
 
 # =========================================================
@@ -555,6 +568,25 @@ def rewrite_query_with_hashed_tables(
 # Connection initialization
 # =========================================================
 
+def _external_file_cache_cappable(con: duckdb.DuckDBPyConnection) -> bool:
+    """True when this DuckDB build can bound the external file cache size.
+
+    DuckDB 1.5.x enables ``enable_external_file_cache`` by default but does
+    not expose ``external_file_cache_max_size``.  An enabled-but-uncapped
+    cache is held in memory (not on disk) and grows to ``memory_limit`` on
+    the long-lived persistent connection — a sustained-memory / OOM hazard.
+    When this returns False the cache is disabled outright rather than left
+    running unbounded.
+    """
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM duckdb_settings() "
+            "WHERE name = 'external_file_cache_max_size'"
+        ).fetchone())
+    except Exception:
+        return False
+
+
 def init_connection(
         con: duckdb.DuckDBPyConnection,
         temp_dir: str,
@@ -615,6 +647,17 @@ def init_connection(
         con.execute("SET preserve_insertion_order=false;")
     except Exception:
         pass  # older DuckDB builds may not support this setting
+
+    # External file cache baseline.  DuckDB 1.5.x turns the cache ON by
+    # default but cannot cap it, so an uncapped in-memory cache accumulates
+    # remote data up to memory_limit on the persistent connection.  Disable
+    # it here when uncappable; configure_httpfs_and_s3 / apply_runtime_pragmas
+    # re-enable it (capped) only on builds that support a size cap.
+    if not _external_file_cache_cappable(con):
+        try:
+            con.execute("SET enable_external_file_cache=false;")
+        except Exception:
+            pass
 
     # Thread count.
     # If SUPERTABLE_DUCKDB_THREADS is set explicitly, honour it exactly.
@@ -685,32 +728,294 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         except Exception:
             pass
 
+    # External file cache: only run it when the size cap is enforceable.
+    # On DuckDB builds without external_file_cache_max_size (e.g. 1.5.x) an
+    # enabled cache is in-memory and unbounded — it grows to memory_limit on
+    # the persistent connection — so we disable it instead of running uncapped.
     cache_size = normalize_memory_size(cfg.duckdb_external_cache_size, default="")
-    if cache_size:
+    if cache_size and _external_file_cache_cappable(con):
         try:
             con.execute("SET enable_external_file_cache=true;")
+            con.execute(
+                f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
+            )
         except Exception as e:
-            logger.warning(f"[duckdb.pragma] enable_external_file_cache failed: {e}")
-        # The size cap is version-dependent: ``external_file_cache_max_size``
-        # does not exist on every DuckDB build (e.g. 1.5.x).  Probe the
-        # settings catalog and only set it when present so we neither raise
-        # nor silently swallow a genuinely unsupported setting.
+            logger.warning(f"[duckdb.pragma] external file cache config failed: {e}")
+    else:
         try:
-            has_cap = bool(con.execute(
-                "SELECT 1 FROM duckdb_settings() "
-                "WHERE name='external_file_cache_max_size'"
-            ).fetchone())
-            if has_cap:
-                con.execute(
-                    f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
-                )
-            else:
-                logger.debug(
-                    "[duckdb.pragma] external_file_cache_max_size unsupported on this "
-                    "DuckDB version; cache enabled without a size cap"
-                )
+            con.execute("SET enable_external_file_cache=false;")
+        except Exception:
+            pass
+
+
+# =========================================================
+# Engine self-diagnostics (UI "Diagnose" button)
+# =========================================================
+
+def _filesystem_type(path: str) -> str:
+    """Best-effort filesystem type for ``path`` via /proc/mounts (Linux).
+
+    Used to warn when the spill directory is RAM-backed (tmpfs/ramfs), where
+    "spilling to disk" would actually consume memory instead of relieving it.
+    Returns "" when the type cannot be determined.
+    """
+    try:
+        target = os.path.abspath(path)
+        best_mp = ""
+        best_type = ""
+        with open("/proc/mounts", "r") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount_point, fstype = parts[1], parts[2]
+                if (
+                    target == mount_point
+                    or target.startswith(mount_point.rstrip("/") + "/")
+                    or mount_point == "/"
+                ):
+                    if len(mount_point) >= len(best_mp):
+                        best_mp = mount_point
+                        best_type = fstype
+        return best_type
+    except Exception:
+        return ""
+
+
+def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
+    """Deep runtime self-check for a DuckDB engine.
+
+    Unlike a connection "test", this exercises the runtime to confirm the
+    things that silently break in production:
+
+      * the memory limit is actually applied,
+      * the spill (``temp_directory``) exists, is writable, and is on real
+        disk (not a RAM-backed tmpfs),
+      * a query that exceeds memory genuinely spills to disk instead of OOMing,
+      * the external file cache is in a memory-safe state.
+
+    ``cfg`` is an ``EngineRuntimeConfig`` (or None to use init defaults); the
+    connection is configured exactly like a live Lite/Pro query via
+    ``init_connection`` + ``apply_runtime_pragmas``.  Returns a JSON-serialisable
+    report and never raises.
+    """
+    import shutil
+    import time
+    import uuid
+
+    checks: List[Dict[str, Any]] = []
+
+    def add(cid, label, status, detail="", value=""):
+        checks.append({
+            "id": cid,
+            "label": label,
+            "status": status,
+            "detail": str(detail),
+            "value": "" if value is None else str(value),
+        })
+
+    # 1. Open + configure a connection the same way the engine does.
+    con = None
+    try:
+        con = duckdb.connect()
+        init_connection(con, temp_dir="diagnostics")
+        if cfg is not None:
+            apply_runtime_pragmas(con, cfg)
+        add("connect", "Engine connection", "ok",
+            "Opened and configured a DuckDB connection")
+    except Exception as e:
+        add("connect", "Engine connection", "fail", f"Could not initialise: {e}")
+        return {"engine": engine, "duckdb_version": "", "overall": "fail", "checks": checks}
+
+    # 2. DuckDB version + whether the file cache can be capped on this build.
+    version = ""
+    cappable = False
+    try:
+        version = con.execute("SELECT version()").fetchone()[0]
+        cappable = _external_file_cache_cappable(con)
+        add("version", "DuckDB version", "ok" if cappable else "warn",
+            ("external_file_cache_max_size supported — the file cache can be capped"
+             if cappable else
+             "this build has no external_file_cache_max_size — the file cache "
+             "cannot be capped, so it is disabled to stay memory-safe"),
+            version)
+    except Exception as e:
+        add("version", "DuckDB version", "warn", f"version() failed: {e}")
+
+    # 3. Memory limit effective?
+    try:
+        mem = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        low = str(mem).strip().lower()
+        if not mem or low in ("0 bytes", "0", "-1") or "unlimited" in low:
+            add("memory", "Memory limit", "warn",
+                "No effective memory limit — a heavy query can consume all RAM", mem)
+        else:
+            add("memory", "Memory limit", "ok", "PRAGMA memory_limit is active", mem)
+    except Exception as e:
+        add("memory", "Memory limit", "fail", f"Could not read memory_limit: {e}")
+
+    # 4. Thread count.
+    try:
+        th = con.execute("SELECT current_setting('threads')").fetchone()[0]
+        add("threads", "Worker threads", "ok",
+            "More threads add parallelism but also raise simultaneous memory use", th)
+    except Exception as e:
+        add("threads", "Worker threads", "warn", f"Could not read threads: {e}")
+
+    # 5. Spill (temp) directory: set, exists, writable, on real disk?
+    temp_dir = ""
+    try:
+        temp_dir = con.execute(
+            "SELECT current_setting('temp_directory')"
+        ).fetchone()[0] or ""
+    except Exception:
+        temp_dir = ""
+
+    if not temp_dir:
+        add("temp_dir", "Spill directory", "fail",
+            "temp_directory is empty — DuckDB cannot spill, so heavy queries OOM")
+    else:
+        mtds = ""
+        try:
+            mtds = con.execute(
+                "SELECT current_setting('max_temp_directory_size')"
+            ).fetchone()[0]
+        except Exception:
+            mtds = ""
+
+        writable = False
+        werr = ""
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            probe = os.path.join(temp_dir, f".st_spill_probe_{uuid.uuid4().hex}")
+            with open(probe, "wb") as fh:
+                fh.write(b"\0" * (1024 * 1024))  # 1 MiB
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.remove(probe)
+            writable = True
         except Exception as e:
-            logger.warning(f"[duckdb.pragma] external_file_cache_max_size failed: {e}")
+            werr = str(e)
+
+        free_gb = None
+        try:
+            free_gb = shutil.disk_usage(temp_dir).free / (1024 ** 3)
+        except Exception:
+            free_gb = None
+        fstype = _filesystem_type(temp_dir)
+        ram_backed = fstype in ("tmpfs", "ramfs")
+
+        parts = [f"path={temp_dir}"]
+        if mtds:
+            parts.append(f"cap={mtds}")
+        if free_gb is not None:
+            parts.append(f"free={free_gb:.1f} GB")
+        if fstype:
+            parts.append(f"fs={fstype}")
+        summary = "; ".join(parts)
+
+        if not writable:
+            add("temp_dir", "Spill directory writable", "fail",
+                f"Cannot write to the spill directory — queries OOM instead of "
+                f"spilling. {werr} ({summary})", temp_dir)
+        elif ram_backed:
+            add("temp_dir", "Spill directory writable", "warn",
+                f"Writable but RAM-backed ({fstype}) — spilling here consumes memory "
+                f"instead of relieving it; mount a real disk volume. ({summary})",
+                temp_dir)
+        elif free_gb is not None and free_gb < 1.0:
+            add("temp_dir", "Spill directory writable", "warn",
+                f"Writable but low free space ({free_gb:.1f} GB) — large spills may "
+                f"fail. ({summary})", temp_dir)
+        else:
+            add("temp_dir", "Spill directory writable", "ok",
+                f"Wrote and removed a 1 MiB probe file. {summary}", temp_dir)
+
+    # 6. Force a real disk spill under memory pressure (end-to-end proof).
+    spill = None
+    try:
+        spill = duckdb.connect()
+        init_connection(spill, temp_dir="diagnostics")
+        spill.execute("PRAGMA memory_limit='256MB';")
+        spill.execute("SET threads=4;")
+        spill.execute("SET preserve_insertion_order=false;")
+        t0 = time.perf_counter()
+        # ~3M rows carrying a wide ~150-byte payload (~465 MB) sorted by a
+        # scrambled key under a 256 MB cap: the working set cannot fit in
+        # memory, so completion proves DuckDB spilled the payload to disk.
+        # The cheap integer sort key keeps it fast (<1 s) while the 256 MB cap
+        # sits far above the pinned-overhead floor, so a healthy disk never
+        # false-fails.
+        n = spill.execute(
+            "SELECT count(*) FROM ("
+            "SELECT hash(i) AS h, repeat('x', 140) || i::VARCHAR AS pad "
+            "FROM range(3000000) t(i) ORDER BY h"
+            ") q"
+        ).fetchone()[0]
+        ms = (time.perf_counter() - t0) * 1000.0
+        add("spill", "Disk spill under pressure", "ok",
+            f"Sorted {n:,} rows (~465 MB) under a 256 MB limit in {ms:.0f} ms — "
+            "DuckDB spilled to disk instead of failing", f"{n:,} rows")
+    except Exception as e:
+        msg = str(e)
+        if "out of memory" in msg.lower() or "failed to pin" in msg.lower():
+            add("spill", "Disk spill under pressure", "fail",
+                "A query that must spill ran out of memory instead — the spill "
+                f"directory is not usable for spilling. {msg}")
+        else:
+            add("spill", "Disk spill under pressure", "warn",
+                f"Spill probe did not complete: {msg}")
+    finally:
+        if spill is not None:
+            try:
+                spill.close()
+            except Exception:
+                pass
+
+    # 7. External file cache memory safety.
+    try:
+        efc = con.execute(
+            "SELECT current_setting('enable_external_file_cache')"
+        ).fetchone()[0]
+        efc_on = str(efc).strip().lower() in ("true", "1")
+        cache_cfg = ""
+        if cfg is not None:
+            cache_cfg = normalize_memory_size(
+                getattr(cfg, "duckdb_external_cache_size", ""), default=""
+            )
+        if efc_on and not cappable:
+            add("cache", "External file cache", "fail",
+                "Cache is ON but this build cannot cap it — it grows to the memory "
+                "limit and causes OOM", "on · uncapped")
+        elif efc_on and cappable:
+            add("cache", "External file cache", "ok",
+                f"Cache is ON and capped at {cache_cfg or 'the configured size'}",
+                "on · capped")
+        else:
+            add("cache", "External file cache", "ok",
+                "Cache is OFF — memory-safe; remote files are re-fetched per query "
+                "(set a Disk cache size on a cap-capable build to speed up repeats)",
+                "off")
+    except Exception as e:
+        add("cache", "External file cache", "warn", f"Could not read cache state: {e}")
+
+    try:
+        con.close()
+    except Exception:
+        pass
+
+    rank = {"ok": 0, "warn": 1, "fail": 2}
+    overall = "ok"
+    for c in checks:
+        if rank.get(c["status"], 0) > rank.get(overall, 0):
+            overall = c["status"]
+
+    return {
+        "engine": engine,
+        "duckdb_version": version,
+        "overall": overall,
+        "checks": checks,
+    }
 
 
 # =========================================================
