@@ -62,46 +62,50 @@ class Executor:
                 self._catalog = False  # sentinel: construction failed, do not retry
         return self._catalog or None
 
-    def _spark_min_bytes(self, cfg: EngineRuntimeConfig) -> int:
-        """Effective lower byte bound for routing a query to Spark under AUTO.
+    def _active_spark_clusters(self) -> list:
+        """Active Spark Thrift clusters registered for this org (best-effort).
 
-        Couples the configured policy floor (``engine_spark_min_bytes``) with the
-        registered Spark fleet so the boundary is::
-
-            max(engine_spark_min_bytes, min(active cluster min_bytes))
-
-        Rationale:
-          * The ``max`` keeps the admin's global floor effective — keep
-            ``engine_spark_min_bytes`` high to hold medium jobs on DuckDB even
-            when a cluster would accept them (set it to 0 to let the fleet alone
-            drive routing).
-          * Folding in the fleet minimum means AUTO never routes a job *below*
-            what any active cluster accepts — which would otherwise make
-            ``select_spark_cluster`` return nothing and hard-fail the query
-            (see spark_thrift.py ``_select_cluster``).
-
-        Degrades to the policy floor alone when no catalog is reachable or no
-        active clusters are registered.
+        Returns ``[]`` when no catalog is reachable or none are active, which
+        makes AUTO stay on DuckDB instead of routing to a fleet that cannot run
+        the job.
         """
-        policy = cfg.engine_spark_min_bytes
         catalog = self._get_catalog()
         if catalog is None:
-            return policy
+            return []
         try:
             clusters = catalog.list_spark_clusters(self.organization) or []
         except Exception:
-            return policy
+            return []
+        return [
+            c for c in clusters
+            if isinstance(c, dict) and c.get("status") == "active"
+        ]
+
+    def _spark_min_bytes(self, cfg: EngineRuntimeConfig, active_clusters: Optional[list] = None) -> int:
+        """Byte size at which AUTO hands a query to the Spark fleet.
+
+        Fleet-driven: the **smallest** ``min_bytes`` across active clusters —
+        the lowest job size any active cluster will accept.  A job at or above
+        this triggers Spark; :meth:`RedisCatalog.select_spark_cluster` then
+        picks (at random) one of the clusters whose ``[min_bytes, max_bytes]``
+        window contains the job.
+
+        Falls back to the ``engine_spark_min_bytes`` policy value only when no
+        active cluster is known (catalog down / empty fleet).  In that case
+        :meth:`_auto_pick` gates on an active cluster existing, so AUTO won't
+        route to Spark regardless of the returned bound.
+        """
+        if active_clusters is None:
+            active_clusters = self._active_spark_clusters()
         mins = []
-        for c in clusters:
-            if not isinstance(c, dict) or c.get("status") != "active":
-                continue
+        for c in active_clusters:
             try:
                 mins.append(int(c.get("min_bytes", 0)))
             except (TypeError, ValueError):
                 continue
-        if not mins:
-            return policy
-        return max(policy, min(mins))
+        if mins:
+            return min(mins)
+        return cfg.engine_spark_min_bytes
 
     def _auto_pick(self, reflection: Reflection, cfg: EngineRuntimeConfig) -> Engine:
         """Select the best engine based on data size and freshness.
@@ -118,27 +122,33 @@ class Executor:
           (lite–spk)│  cache would churn  │  cache pays off     │
                     ├─────────────────────┼─────────────────────┤
           Large     │       SPARK *       │       SPARK *       │
-          (>=spark) │  too big for DuckDB │  too big for DuckDB │
+          (>=spark) │  hand off to fleet  │  hand off to fleet  │
                     └─────────────────────┴─────────────────────┘
 
-        * Spark only if pyspark is available; falls back to PRO otherwise.
+        * Spark is chosen only when an **active Spark cluster is registered**
+          for the org and the job reaches the fleet's minimum accepted size
+          (the smallest ``min_bytes`` across active clusters — see
+          :meth:`_spark_min_bytes`).  With no active cluster, AUTO stays on
+          DuckDB regardless of size.  The concrete cluster is chosen later by
+          :meth:`RedisCatalog.select_spark_cluster`, at random among the active
+          clusters whose ``[min_bytes, max_bytes]`` window contains the job.
 
         Env var overrides:
           SUPERTABLE_ENGINE_LITE_MAX_BYTES   – upper bound for Lite (default 100 MB)
-          SUPERTABLE_ENGINE_SPARK_MIN_BYTES  – lower bound for Spark (default 10 GB)
+          SUPERTABLE_ENGINE_SPARK_MIN_BYTES  – Spark floor used only when no
+                                               active cluster is registered
           SUPERTABLE_ENGINE_FRESHNESS_SEC    – age threshold in seconds (default 300)
-
-        The Spark lower bound is additionally coupled to the registered fleet
-        (see :meth:`_spark_min_bytes`): the effective boundary is the larger of
-        the configured floor and the smallest ``min_bytes`` across active
-        clusters, so AUTO only routes to Spark when some cluster will take it.
         """
         bytes_total = reflection.reflection_bytes
 
         # --- thresholds (resolved live from org system config) ---
         lite_max = cfg.engine_lite_max_bytes
-        spark_min = self._spark_min_bytes(cfg)
         freshness_threshold_s = cfg.engine_freshness_sec
+
+        # --- Spark fleet: the registered clusters decide availability + floor ---
+        active_clusters = self._active_spark_clusters()
+        spark_available = bool(active_clusters)
+        spark_min = self._spark_min_bytes(cfg, active_clusters)
 
         # --- freshness: how long ago was the most recent snapshot updated ---
         if reflection.freshness_ms > 0:
@@ -149,19 +159,11 @@ class Executor:
             age_s = -1
             data_is_fresh = False
 
-        # --- Spark gate ---
-        spark_available = False
-        if bytes_total >= spark_min:
-            try:
-                from pyspark.sql import SparkSession  # noqa: F401
-                spark_available = True
-            except Exception:
-                pass
-
         # --- decision ---
         if spark_available and bytes_total >= spark_min:
             chosen = Engine.SPARK_SQL
-            reason = f"bytes={bytes_total} >= spark_min={spark_min}"
+            reason = (f"bytes={bytes_total} >= fleet_min={spark_min} "
+                      f"({len(active_clusters)} active cluster(s))")
         elif bytes_total <= lite_max:
             chosen = Engine.DUCKDB_LITE
             reason = f"bytes={bytes_total} <= lite_max={lite_max}"

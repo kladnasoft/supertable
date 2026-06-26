@@ -160,7 +160,7 @@ class Settings:
 
     # ── Engine Routing / Executor ────────────────────────────────────
     SUPERTABLE_ENGINE_LITE_MAX_BYTES: int = 100 * 1024 * 1024    # SUPERTABLE_ENGINE_LITE_MAX_BYTES (100 MB)
-    SUPERTABLE_ENGINE_SPARK_MIN_BYTES: int = 10 * 1024 * 1024 * 1024  # SUPERTABLE_ENGINE_SPARK_MIN_BYTES (10 GB)
+    SUPERTABLE_ENGINE_SPARK_MIN_BYTES: int = 0  # fallback only; 0 = active fleet's min_bytes drives Spark routing
     SUPERTABLE_ENGINE_FRESHNESS_SEC: int = 300     # SUPERTABLE_ENGINE_FRESHNESS_SEC
     SUPERTABLE_DEFAULT_ENGINE: str = "AUTO"        # SUPERTABLE_DEFAULT_ENGINE
 
@@ -410,7 +410,7 @@ def _build_settings() -> Settings:
 
         # ── Engine Routing ───────────────────────────────────────────
         SUPERTABLE_ENGINE_LITE_MAX_BYTES=_env_int("SUPERTABLE_ENGINE_LITE_MAX_BYTES", 100 * 1024 * 1024),
-        SUPERTABLE_ENGINE_SPARK_MIN_BYTES=_env_int("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", 10 * 1024 * 1024 * 1024),
+        SUPERTABLE_ENGINE_SPARK_MIN_BYTES=_env_int("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", 0),
         SUPERTABLE_ENGINE_FRESHNESS_SEC=_env_int("SUPERTABLE_ENGINE_FRESHNESS_SEC", 300),
         SUPERTABLE_DEFAULT_ENGINE=_env_str("SUPERTABLE_DEFAULT_ENGINE", "AUTO"),
 

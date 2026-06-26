@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 import hashlib
@@ -1541,14 +1542,16 @@ return 1
 
     def select_spark_cluster(self, org: str, job_bytes: int, force: bool = False) -> Optional[Dict[str, Any]]:
         """
-        Select the best active Spark Thrift cluster for a job of the given size.
+        Select an active Spark Thrift cluster for a job of the given size.
 
         Selection logic:
-        1. Filter clusters where status == "active"
-        2. If force=False: filter where min_bytes <= job_bytes AND (max_bytes >= job_bytes OR max_bytes == 0)
-        3. If force=True: skip size filtering (user explicitly requested Spark)
-        4. Among matches, prefer the cluster with the tightest max_bytes
-           (most specialized for this job size), breaking ties by name.
+        1. Filter clusters where status == "active".
+        2. If force=False: keep clusters whose size window contains the job,
+           i.e. ``min_bytes <= job_bytes`` AND (``max_bytes == 0`` (unbounded)
+           OR ``job_bytes <= max_bytes``).
+        3. If force=True: skip size filtering (user explicitly requested Spark).
+        4. Among the clusters that can take the job, pick one at **random** so
+           load spreads evenly across the eligible fleet.
         """
         clusters = self.list_spark_clusters(org)
         candidates = []
@@ -1557,8 +1560,11 @@ return 1
             if c.get("status") != "active":
                 continue
             if not force:
-                min_b = int(c.get("min_bytes", 0))
-                max_b = int(c.get("max_bytes", 0))
+                try:
+                    min_b = int(c.get("min_bytes", 0))
+                    max_b = int(c.get("max_bytes", 0))
+                except (TypeError, ValueError):
+                    continue
                 if job_bytes < min_b:
                     continue
                 if max_b > 0 and job_bytes > max_b:
@@ -1568,14 +1574,8 @@ return 1
         if not candidates:
             return None
 
-        # Prefer tightest fit: smallest max_bytes > 0, then by name
-        def sort_key(c):
-            max_b = int(c.get("max_bytes", 0))
-            # 0 means unlimited — sort last
-            return (0 if max_b > 0 else 1, max_b, c.get("name", ""))
-
-        candidates.sort(key=sort_key)
-        return candidates[0]
+        # Any candidate fits the job window; spread load by picking at random.
+        return random.choice(candidates)
 
     # ========================================================================= #
     # Spark Plug management (org-scoped: supertable:{org}:system:engine:plugs)

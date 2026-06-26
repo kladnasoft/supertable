@@ -108,7 +108,7 @@ def normalize_memory_size(value: Any, default: str = "1GB", *, bare_unit: str = 
 # Shared auto-pick thresholds: key → (env var, built-in default as string).
 _SHARED_SPEC: Dict[str, Tuple[str, str]] = {
     "engine_lite_max_bytes":  ("SUPERTABLE_ENGINE_LITE_MAX_BYTES",  str(100 * 1024 * 1024)),
-    "engine_spark_min_bytes": ("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", str(10 * 1024 * 1024 * 1024)),
+    "engine_spark_min_bytes": ("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", str(0)),
     "engine_freshness_sec":   ("SUPERTABLE_ENGINE_FRESHNESS_SEC",   "300"),
 }
 
@@ -209,7 +209,7 @@ def _build_runtime(redis_cfg: Dict[str, Any], engine: str) -> EngineRuntimeConfi
 
     return EngineRuntimeConfig(
         engine_lite_max_bytes=_to_int(sv["engine_lite_max_bytes"], 100 * 1024 * 1024),
-        engine_spark_min_bytes=_to_int(sv["engine_spark_min_bytes"], 10 * 1024 * 1024 * 1024),
+        engine_spark_min_bytes=_to_int(sv["engine_spark_min_bytes"], 0),
         engine_freshness_sec=_to_int(sv["engine_freshness_sec"], 300),
         duckdb_memory_limit=normalize_memory_size(dv["duckdb_memory_limit"], default="1GB"),
         duckdb_io_multiplier=_to_float(dv["duckdb_io_multiplier"], 3.0),
