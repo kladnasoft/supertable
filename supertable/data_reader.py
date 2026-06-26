@@ -44,10 +44,20 @@ class DataReader:
       - Execution to Executor (DuckDB/Spark)
     """
 
-    def __init__(self, super_name: str, organization: str, query: str):
+    def __init__(
+        self,
+        super_name: str,
+        organization: str,
+        query: str,
+        source: str = "sdk",
+    ):
         self.super_name = super_name
         self.organization = organization
         self.query = query
+        # Query origin surfaced in the reads monitoring tab. "sdk" is the
+        # default for direct SDK callers; the API/OData/MCP entry points
+        # pass "api"/"odata"/"mcp" so each query records where it came from.
+        self.source = source
 
         self.storage: StorageInterface = get_storage()
 
@@ -164,6 +174,9 @@ class DataReader:
                 current_meta_path="redis://meta/root",
                 query=parser.original_query,
             )
+            # Stamp the call origin so plan_extender records it on the read
+            # monitoring entry (defaults to "api" downstream if unset).
+            self.query_plan_manager.source_type = self.source
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
             self.query_plan_manager.original_table = ", ".join(t.simple_name for t in physical_tables) if physical_tables else ""
 
@@ -311,16 +324,25 @@ def query_sql(
         limit: int,
         engine: Any,
         role_name: str,
+        source: str = "sdk",
+        out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], List[List[Any]], List[Dict[str, Any]]]:
     """
     Execute SQL query and return results in the format expected by MCP server.
     Returns: (columns, rows, columns_meta)
+
+    ``source`` tags the query origin on the read monitoring entry
+    (defaults to "sdk"; the MCP server passes "mcp"). When an ``out``
+    dict is supplied it is populated with ``query_id``/``query_hash`` so
+    the caller can correlate its own audit log to this read record.
     """
     # Safety guard: ensure a LIMIT is present so unbounded queries don't
     # overwhelm the MCP response payload.
     sql = _ensure_sql_limit(sql, default_limit=limit)
 
-    reader = DataReader(organization=organization, super_name=super_name, query=sql)
+    reader = DataReader(
+        organization=organization, super_name=super_name, query=sql, source=source,
+    )
 
     # Execute the query
     result_df, status, message = reader.execute(
@@ -328,6 +350,15 @@ def query_sql(
         engine=engine,
         with_scan=False,
     )
+
+    # Expose the query identity so the caller (e.g. the MCP audit log) can
+    # link back to this read's monitoring entry. Populated even on error,
+    # since the QueryPlanManager is created before execution.
+    if out is not None:
+        qpm = reader.query_plan_manager
+        if qpm is not None:
+            out["query_id"] = qpm.query_id
+            out["query_hash"] = qpm.query_hash
 
     if status == Status.ERROR:
         raise RuntimeError(f"Query execution failed: {message}")

@@ -754,3 +754,85 @@ class TestReadRecent:
         cat.r.delete.assert_not_called()
         cat.r.xadd.assert_not_called()
         cat.r.xdel.assert_not_called()
+
+
+# ===========================================================================
+# 8. Retention backstop — 7-day TTL on every monitoring partition
+# ===========================================================================
+
+
+class TestPartitionTTL:
+    """The writer stamps an EXPIREAT on the partition so un-drained data
+    self-destructs after at most _MONITOR_TTL_DAYS. EXPIREAT is anchored to
+    the partition's own date (midnight UTC + N days), not the last write, so
+    retention is a hard ≤7-day cap rather than a renewable sliding window."""
+
+    def test_partition_expire_at_is_date_midnight_plus_ttl(self):
+        from supertable.monitoring_writer import (
+            _partition_expire_at, _MONITOR_TTL_DAYS,
+        )
+        # 2026-06-26 00:00:00Z + 7 days == 2026-07-03 00:00:00Z
+        got = _partition_expire_at("2026-06-26")
+        expected = int(
+            datetime(2026, 6, 26, tzinfo=timezone.utc).timestamp()
+        ) + _MONITOR_TTL_DAYS * 86400
+        assert got == expected
+
+    def test_default_ttl_is_seven_days(self):
+        from supertable.monitoring_writer import _MONITOR_TTL_DAYS
+        assert _MONITOR_TTL_DAYS == 7
+
+    def test_expire_at_is_idempotent_for_same_date(self):
+        from supertable.monitoring_writer import _partition_expire_at
+        assert _partition_expire_at("2026-06-26") == _partition_expire_at("2026-06-26")
+
+    def test_redis_partition_today_pairs_key_with_expiry(self):
+        from supertable.monitoring_writer import (
+            _MonitorKey, _today_utc_date, _partition_expire_at,
+        )
+        mk = _MonitorKey(organization="acme", monitor_type="writes")
+        key, expire_at = mk.redis_partition_today()
+        today = _today_utc_date()
+        assert key == RK.monitor_partition("acme", "writes", today)
+        assert expire_at == _partition_expire_at(today)
+
+    def _bare_logger(self, fake_redis):
+        """An _AsyncMonitoringLogger with no worker thread started."""
+        import threading
+        from supertable.monitoring_writer import _AsyncMonitoringLogger, _MonitorKey
+        log = _AsyncMonitoringLogger.__new__(_AsyncMonitoringLogger)
+        log._key = _MonitorKey(organization="acme", monitor_type="plans")
+        log._ship_to_redis = True
+        log._redis = fake_redis
+        log.queue_stats = {
+            "total_received": 0, "total_processed": 0,
+            "total_dropped": 0, "current_size": 0,
+        }
+        log.queue_stats_lock = threading.Lock()
+        return log
+
+    def test_ship_batch_sets_expireat_once_on_partition(self):
+        from supertable.monitoring_writer import _today_utc_date, _partition_expire_at
+        fake = MagicMock()
+        pipe = MagicMock()
+        fake.r.pipeline.return_value = pipe
+        log = self._bare_logger(fake)
+
+        log._ship_batch([{"a": 1}, {"a": 2}])
+
+        key = RK.monitor_partition("acme", "plans", _today_utc_date())
+        assert pipe.rpush.call_count == 2
+        pipe.expireat.assert_called_once_with(key, _partition_expire_at(_today_utc_date()))
+        pipe.execute.assert_called_once()
+
+    def test_ship_one_sets_expireat_on_partition(self):
+        from supertable.monitoring_writer import _today_utc_date, _partition_expire_at
+        fake = MagicMock()
+        log = self._bare_logger(fake)
+
+        log._ship_one({"a": 1})
+
+        key = RK.monitor_partition("acme", "plans", _today_utc_date())
+        fake.r.rpush.assert_called_once()
+        assert fake.r.rpush.call_args[0][0] == key
+        fake.r.expireat.assert_called_once_with(key, _partition_expire_at(_today_utc_date()))

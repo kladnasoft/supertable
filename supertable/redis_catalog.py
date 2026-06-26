@@ -1705,6 +1705,8 @@ return 1
         if engine not in self.DUCKDB_ENGINES:
             return False
         try:
+            from supertable.engine.engine_config import normalize_memory_size
+
             doc = self.get_engine_config(org) or {}
             # Whitelist recognised DuckDB fields only for this engine section.
             section = {
@@ -1712,6 +1714,21 @@ return 1
                 for k in self.DUCKDB_CONFIG_FIELDS
                 if k in config and config[k] is not None and str(config[k]).strip() != ""
             }
+            # Memory-size fields arrive from the UI as bare numbers (GB).  Persist
+            # them already unit-suffixed so the stored document is DuckDB-valid and
+            # never yields a `PRAGMA memory_limit='2'` ParserException downstream.
+            if "duckdb_memory_limit" in section:
+                section["duckdb_memory_limit"] = normalize_memory_size(
+                    section["duckdb_memory_limit"], default="1GB"
+                )
+            if "duckdb_external_cache_size" in section:
+                normalized_cache = normalize_memory_size(
+                    section["duckdb_external_cache_size"], default=""
+                )
+                if normalized_cache:
+                    section["duckdb_external_cache_size"] = normalized_cache
+                else:
+                    section.pop("duckdb_external_cache_size")
             doc[engine] = section
             doc["modified_ms"] = _now_ms()
             self.r.set(

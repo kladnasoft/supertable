@@ -58,8 +58,51 @@ defaults, so behaviour is identical whether a value flows through ``settings``
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
+
+# Optional decimal number followed by an optional byte unit (decimal KB/MB/GB/TB
+# or binary KiB/MiB/GiB/TiB), case-insensitive, whitespace-tolerant.
+_MEM_SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMGT]i?B)?$", re.IGNORECASE)
+
+
+def normalize_memory_size(value: Any, default: str = "1GB", *, bare_unit: str = "GB") -> str:
+    """Coerce a memory-size value into a DuckDB-valid, unit-suffixed string.
+
+    The engine UI collects a bare integer (interpreted as ``bare_unit`` — GB),
+    while env vars / older Redis docs may already carry a unit.  DuckDB's
+    ``PRAGMA memory_limit`` parser rejects a unit-less number
+    (``Unknown unit for memory: ''``), so this guarantees a value the parser
+    accepts before it is ever sent:
+
+      * bare number            -> ``"<n>GB"``       ("2"    -> "2GB")
+      * number + unit          -> canonical casing  ("2gib" -> "2GiB")
+      * empty / None           -> ``default``       (""/None -> default)
+      * non-positive / garbage -> ``default``       ("0", "x" -> default)
+
+    ``default`` is returned verbatim, so pass ``""`` when "unset" is the
+    desired fallback (e.g. the external file cache, where empty == disabled).
+    """
+    s = ("" if value is None else str(value)).strip()
+    if not s:
+        return default
+    m = _MEM_SIZE_RE.match(s)
+    if not m:
+        return default
+    num, unit = m.group(1), m.group(2)
+    try:
+        if float(num) <= 0:
+            return default
+    except ValueError:
+        return default
+    if unit:
+        u = unit.upper()
+        unit = (u[0] + "iB") if u.endswith("IB") else u
+    else:
+        unit = bare_unit
+    return f"{num}{unit}"
 
 
 # Shared auto-pick thresholds: key → (env var, built-in default as string).
@@ -168,11 +211,11 @@ def _build_runtime(redis_cfg: Dict[str, Any], engine: str) -> EngineRuntimeConfi
         engine_lite_max_bytes=_to_int(sv["engine_lite_max_bytes"], 100 * 1024 * 1024),
         engine_spark_min_bytes=_to_int(sv["engine_spark_min_bytes"], 10 * 1024 * 1024 * 1024),
         engine_freshness_sec=_to_int(sv["engine_freshness_sec"], 300),
-        duckdb_memory_limit=dv["duckdb_memory_limit"].strip() or "1GB",
+        duckdb_memory_limit=normalize_memory_size(dv["duckdb_memory_limit"], default="1GB"),
         duckdb_io_multiplier=_to_float(dv["duckdb_io_multiplier"], 3.0),
         duckdb_threads=(threads if threads > 0 else None),
         duckdb_http_timeout=(http if http > 0 else None),
-        duckdb_external_cache_size=dv["duckdb_external_cache_size"].strip(),
+        duckdb_external_cache_size=normalize_memory_size(dv["duckdb_external_cache_size"], default=""),
     )
 
 

@@ -62,6 +62,47 @@ class Executor:
                 self._catalog = False  # sentinel: construction failed, do not retry
         return self._catalog or None
 
+    def _spark_min_bytes(self, cfg: EngineRuntimeConfig) -> int:
+        """Effective lower byte bound for routing a query to Spark under AUTO.
+
+        Couples the configured policy floor (``engine_spark_min_bytes``) with the
+        registered Spark fleet so the boundary is::
+
+            max(engine_spark_min_bytes, min(active cluster min_bytes))
+
+        Rationale:
+          * The ``max`` keeps the admin's global floor effective — keep
+            ``engine_spark_min_bytes`` high to hold medium jobs on DuckDB even
+            when a cluster would accept them (set it to 0 to let the fleet alone
+            drive routing).
+          * Folding in the fleet minimum means AUTO never routes a job *below*
+            what any active cluster accepts — which would otherwise make
+            ``select_spark_cluster`` return nothing and hard-fail the query
+            (see spark_thrift.py ``_select_cluster``).
+
+        Degrades to the policy floor alone when no catalog is reachable or no
+        active clusters are registered.
+        """
+        policy = cfg.engine_spark_min_bytes
+        catalog = self._get_catalog()
+        if catalog is None:
+            return policy
+        try:
+            clusters = catalog.list_spark_clusters(self.organization) or []
+        except Exception:
+            return policy
+        mins = []
+        for c in clusters:
+            if not isinstance(c, dict) or c.get("status") != "active":
+                continue
+            try:
+                mins.append(int(c.get("min_bytes", 0)))
+            except (TypeError, ValueError):
+                continue
+        if not mins:
+            return policy
+        return max(policy, min(mins))
+
     def _auto_pick(self, reflection: Reflection, cfg: EngineRuntimeConfig) -> Engine:
         """Select the best engine based on data size and freshness.
 
@@ -86,12 +127,17 @@ class Executor:
           SUPERTABLE_ENGINE_LITE_MAX_BYTES   – upper bound for Lite (default 100 MB)
           SUPERTABLE_ENGINE_SPARK_MIN_BYTES  – lower bound for Spark (default 10 GB)
           SUPERTABLE_ENGINE_FRESHNESS_SEC    – age threshold in seconds (default 300)
+
+        The Spark lower bound is additionally coupled to the registered fleet
+        (see :meth:`_spark_min_bytes`): the effective boundary is the larger of
+        the configured floor and the smallest ``min_bytes`` across active
+        clusters, so AUTO only routes to Spark when some cluster will take it.
         """
         bytes_total = reflection.reflection_bytes
 
         # --- thresholds (resolved live from org system config) ---
         lite_max = cfg.engine_lite_max_bytes
-        spark_min = cfg.engine_spark_min_bytes
+        spark_min = self._spark_min_bytes(cfg)
         freshness_threshold_s = cfg.engine_freshness_sec
 
         # --- freshness: how long ago was the most recent snapshot updated ---

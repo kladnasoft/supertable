@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from supertable.config.settings import settings
 import queue
@@ -118,6 +118,30 @@ def _today_utc_date() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+# Hard retention cap for every monitoring partition. The external
+# orchestrator (``supertable.monitoring.partitions``) is the primary
+# cleanup — it drains older partitions into SDK sink tables and deletes
+# them. This TTL is the backstop: any partition that is never drained
+# self-destructs, so un-flushed monitoring data is lost after at most
+# this many days rather than accumulating in Redis forever.
+_MONITOR_TTL_DAYS: int = 7
+
+
+def _partition_expire_at(date: str) -> int:
+    """Absolute EXPIREAT epoch (seconds) for a monitoring partition.
+
+    Anchored to midnight UTC of the partition's *own* calendar date plus
+    ``_MONITOR_TTL_DAYS`` days — not to the time of the last write. So a
+    record written on date D is gone by the start of D+7 no matter when
+    within the day it landed, giving a strict ≤7-day retention rather
+    than a sliding window that a steadily-written partition could renew
+    indefinitely. Recomputing it for the same date yields the same value,
+    so re-applying EXPIREAT on every batch is idempotent.
+    """
+    midnight = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int((midnight + timedelta(days=_MONITOR_TTL_DAYS)).timestamp())
+
+
 @dataclass(frozen=True)
 class _MonitorKey:
     organization: str
@@ -144,6 +168,19 @@ class _MonitorKey:
         return RK.monitor_partition(
             self.organization, self.monitor_type, _today_utc_date(),
         )
+
+    def redis_partition_today(self) -> tuple[str, int]:
+        """Today's partition key paired with its absolute EXPIREAT epoch.
+
+        The UTC date is resolved exactly once here so the key and its
+        expiry can never disagree across a midnight boundary (computing
+        them separately could pin the TTL to a different day than the key
+        it guards). The expiry enforces the ≤7-day retention backstop —
+        see :func:`_partition_expire_at`.
+        """
+        date = _today_utc_date()
+        key = RK.monitor_partition(self.organization, self.monitor_type, date)
+        return key, _partition_expire_at(date)
 
 
 class _AsyncMonitoringLogger:
@@ -395,20 +432,26 @@ class _AsyncMonitoringLogger:
         dropped so stats remain accurate.
 
         Each batch resolves the target Redis key fresh via
-        ``_MonitorKey.redis_list_key_today()`` — that picks today's
+        ``_MonitorKey.redis_partition_today()`` — that picks today's
         partition under the daily-partitioned key layout
         (``supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD}``). A batch
         that crosses the UTC day boundary lands on whichever side of
         midnight the resolution runs; nothing is lost.
+
+        The same call returns the partition's absolute expiry, applied
+        with one ``EXPIREAT`` per batch so every partition self-destructs
+        at most ``_MONITOR_TTL_DAYS`` after its date (idempotent — the
+        timestamp is fixed per date, so re-shipping never extends it).
         """
         shipped = 0
         if self._ship_to_redis and self._redis is not None:
             try:
-                target_key = self._key.redis_list_key_today()
+                target_key, expire_at = self._key.redis_partition_today()
                 pipe = self._redis.r.pipeline()
                 for payload in batch:
                     s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                     pipe.rpush(target_key, s)
+                pipe.expireat(target_key, expire_at)
                 pipe.execute()
                 shipped = len(batch)
             except Exception:
@@ -440,7 +483,9 @@ class _AsyncMonitoringLogger:
 
         s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         # RedisConnector in your code exposes "r" as the redis client.
-        self._redis.r.rpush(self._key.redis_list_key_today(), s)
+        target_key, expire_at = self._key.redis_partition_today()
+        self._redis.r.rpush(target_key, s)
+        self._redis.r.expireat(target_key, expire_at)
 
 
 # ---- singleton cache (one worker per key) ----

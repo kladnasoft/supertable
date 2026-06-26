@@ -1320,6 +1320,7 @@ class TestQuerySqlDataReaderConstruction:
             organization="my_org",
             super_name="my_super",
             query="SELECT 1 LIMIT 10",
+            source="sdk",
         )
 
     @patch(f"{_MOD}.DataReader")
@@ -1341,6 +1342,35 @@ class TestQuerySqlDataReaderConstruction:
             engine=sentinel_engine,
             with_scan=False,
         )
+
+    @patch(f"{_MOD}.DataReader")
+    @patch(f"{_MOD}._ensure_sql_limit")
+    def test_source_is_forwarded_to_datareader(self, mock_ensure, MockDR):
+        mock_ensure.return_value = "Q"
+        from supertable.data_reader import Status, query_sql
+        mock_reader = MagicMock()
+        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        MockDR.return_value = mock_reader
+
+        query_sql("o", "s", "Q", 10, MagicMock(), "admin", source="mcp")
+
+        assert MockDR.call_args.kwargs["source"] == "mcp"
+
+    @patch(f"{_MOD}.DataReader")
+    @patch(f"{_MOD}._ensure_sql_limit")
+    def test_out_dict_receives_query_identity(self, mock_ensure, MockDR):
+        mock_ensure.return_value = "Q"
+        from supertable.data_reader import Status, query_sql
+        mock_reader = MagicMock()
+        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.query_plan_manager.query_id = "qid-123"
+        mock_reader.query_plan_manager.query_hash = "qh-abc"
+        MockDR.return_value = mock_reader
+
+        out = {}
+        query_sql("o", "s", "Q", 10, MagicMock(), "admin", source="mcp", out=out)
+
+        assert out == {"query_id": "qid-123", "query_hash": "qh-abc"}
 
 
 # ====================================================================

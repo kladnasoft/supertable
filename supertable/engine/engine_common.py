@@ -14,6 +14,7 @@ from sqlglot import exp
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
+from supertable.engine.engine_config import normalize_memory_size
 
 
 # =========================================================
@@ -578,8 +579,18 @@ def init_connection(
     # Resolve memory limit.
     # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
     # The `memory_limit` argument is the caller's fallback when the env var is absent.
-    effective_memory_limit = settings.SUPERTABLE_DUCKDB_MEMORY_LIMIT or memory_limit
-    con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
+    # normalize_memory_size guarantees a unit-suffixed value so DuckDB's parser
+    # never rejects a bare number (e.g. a UI-supplied "2" -> "2GB").
+    effective_memory_limit = normalize_memory_size(
+        settings.SUPERTABLE_DUCKDB_MEMORY_LIMIT or memory_limit, default="1GB"
+    )
+    try:
+        con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
+    except Exception as e:
+        logger.warning(
+            f"[duckdb.init] memory_limit='{effective_memory_limit}' rejected: {e}; "
+            f"keeping DuckDB default"
+        )
 
     # Absolute temp path is required for DuckDB to actually spill to disk.
     # Prefer a path rooted under the app home (~/supertable), which is
@@ -647,11 +658,14 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     if cfg is None:
         return
 
-    memory_limit = (cfg.duckdb_memory_limit or "").strip() or "1GB"
+    # normalize_memory_size guarantees a unit (UI sends a bare "2" -> "2GB");
+    # a rejected value is logged rather than silently swallowed so a bad
+    # config can never quietly leave the connection at the wrong limit.
+    memory_limit = normalize_memory_size(cfg.duckdb_memory_limit, default="1GB")
     try:
         con.execute(f"PRAGMA memory_limit='{memory_limit}';")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[duckdb.pragma] memory_limit='{memory_limit}' rejected: {e}")
 
     # Explicit thread count wins; otherwise derive from the live memory limit
     # and IO multiplier (same formula as init_connection).
@@ -671,13 +685,32 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         except Exception:
             pass
 
-    cache_size = (cfg.duckdb_external_cache_size or "").strip()
+    cache_size = normalize_memory_size(cfg.duckdb_external_cache_size, default="")
     if cache_size:
         try:
             con.execute("SET enable_external_file_cache=true;")
-            con.execute(f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[duckdb.pragma] enable_external_file_cache failed: {e}")
+        # The size cap is version-dependent: ``external_file_cache_max_size``
+        # does not exist on every DuckDB build (e.g. 1.5.x).  Probe the
+        # settings catalog and only set it when present so we neither raise
+        # nor silently swallow a genuinely unsupported setting.
+        try:
+            has_cap = bool(con.execute(
+                "SELECT 1 FROM duckdb_settings() "
+                "WHERE name='external_file_cache_max_size'"
+            ).fetchone())
+            if has_cap:
+                con.execute(
+                    f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
+                )
+            else:
+                logger.debug(
+                    "[duckdb.pragma] external_file_cache_max_size unsupported on this "
+                    "DuckDB version; cache enabled without a size cap"
+                )
+        except Exception as e:
+            logger.warning(f"[duckdb.pragma] external_file_cache_max_size failed: {e}")
 
 
 # =========================================================
