@@ -1,0 +1,54 @@
+{
+  "organization": "charorg",
+  "super_name": "super_query_join_two_tables",
+  "tables": {
+    "orders": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "cust": "Int64",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "orders__f1.parquet",
+          "rows": 2,
+          "columns": 3
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    },
+    "customers": {
+      "primary_keys": [
+        "cust"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "cust": "Int64",
+        "name": "String",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "customers__f1.parquet",
+          "rows": 2,
+          "columns": 3
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "cust"
+        ]
+      }
+    }
+  }
+}

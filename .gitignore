@@ -57,3 +57,7 @@ supertable/infrastructure/minio/minio-data2
 supertable/infrastructure/minio/minio-data3
 supertable/infrastructure/minio/minio-data4
 supertable/infrastructure/minio/scripts
+
+# Characterization performance benchmarks — timing-dependent, never sealed.
+# (The golden corpus under tests/golden IS committed; perf results are not.)
+tests/perf_results/

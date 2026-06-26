@@ -1,0 +1,25 @@
+{
+  "scenario": "schema_nullable_nulls",
+  "category": "schema",
+  "description": "Nullable columns preserve NULLs through the read (None stays None).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "s",
+    "f"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:12a65ac6b98405ad602561e0f5fb1249be151e6fec9cb3bdaf333bbc4e6b1f4b",
+  "expected_checksum": "sha256:92e40363ce9e2100902ddbe71e57e3d8524c4c9b48f8632aacd0cf0aa8ff71b2",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

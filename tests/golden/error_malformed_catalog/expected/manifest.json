@@ -1,0 +1,21 @@
+{
+  "scenario": "error_malformed_catalog",
+  "category": "error",
+  "description": "catalog.json is not valid JSON; the adapter fails to load it.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:0e4bd03b56f0446442408bbe0f1990896ead0bfdbf409e1f6066abeca34d3f00",
+  "expected_checksum": "sha256:33a16baca0462e567b87910863f33fa6188abce388d41416e3ea3db034bea6ae",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

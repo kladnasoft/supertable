@@ -1,0 +1,24 @@
+{
+  "scenario": "query_join_two_tables",
+  "category": "query",
+  "description": "Inner join of two deduped tables on a shared key.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "name"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:73a0349e2063721b4c31427bb2c1a4f89a9090b93b30dc0f57715245674e5c9a",
+  "expected_checksum": "sha256:3c1900739049d954403bb187eefbfe94be108f07364ef85d83275acf5bc01dc1",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

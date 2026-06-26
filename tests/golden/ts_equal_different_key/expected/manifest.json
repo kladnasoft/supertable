@@ -1,0 +1,24 @@
+{
+  "scenario": "ts_equal_different_key",
+  "category": "timestamp",
+  "description": "Equal timestamp on different keys — both survive independently.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:666d6bded5bb6f257074cc1cda9a1b87f7433a98b581235c256311233ea230f7",
+  "expected_checksum": "sha256:d321dfe5a07ca78e3bef6dd6c767e14f7d4fba18cdb62cacfb92abbe7a8a2248",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

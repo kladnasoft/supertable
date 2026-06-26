@@ -1,0 +1,24 @@
+{
+  "scenario": "key_string",
+  "category": "keys",
+  "description": "String primary key dedups newest-wins per distinct string.",
+  "business_key_columns": [
+    "code"
+  ],
+  "comparison_columns": [
+    "code",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "code"
+    ]
+  },
+  "input_checksum": "sha256:9c6d9717c892674588ff0dbb9d91c71e99da729d79b1515ac92701b448844cb0",
+  "expected_checksum": "sha256:ee5aa9916c61eb71cfaad974e76f1ce2a5cdc47ad7c3dd2408cbd2b74fd1f668",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

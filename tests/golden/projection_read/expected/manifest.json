@@ -1,0 +1,23 @@
+{
+  "scenario": "projection_read",
+  "category": "query",
+  "description": "Projection over id only; non-projected/internal cols absent.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:96b663c7becfc3ac273c9ab7454ffe21a55ea427e2b33d4d80ec6e2d075996a4",
+  "expected_checksum": "sha256:9ae116bc4ed09833c6f93370a7ec1f19e18c4a60f065ce7c53ede4e89467ee9b",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

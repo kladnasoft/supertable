@@ -1,0 +1,25 @@
+{
+  "scenario": "schema_reordered_columns",
+  "category": "schema",
+  "description": "Two files with the same columns in different physical order; union_by_name matches by name so values stay aligned.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "a",
+    "b"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:146e5951eb91f15fe0d7fcdea338e53cccd50b2cb7e7a53da29a15ca9674a5b1",
+  "expected_checksum": "sha256:38459e0d9bb7f5dddca14fa0a98fe3c763d69913deb4d80b180d61ceab159e5c",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

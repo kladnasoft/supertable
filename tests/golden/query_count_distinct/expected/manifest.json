@@ -1,0 +1,23 @@
+{
+  "scenario": "query_count_distinct",
+  "category": "query",
+  "description": "COUNT(DISTINCT region) over post-dedup rows.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "regions"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:61ea11d2075ae78ae83dd1e4bee762c0a0c87368e1fd2e131b5c37da5c8d6349",
+  "expected_checksum": "sha256:c457e1b0be0d6480c44695adeadcf836fe56351f19a58075f06ad95e59af4ef0",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

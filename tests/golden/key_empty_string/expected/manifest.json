@@ -1,0 +1,24 @@
+{
+  "scenario": "key_empty_string",
+  "category": "keys",
+  "description": "Empty-string key is distinct from any other and from NULL.",
+  "business_key_columns": [
+    "code"
+  ],
+  "comparison_columns": [
+    "code",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "code"
+    ]
+  },
+  "input_checksum": "sha256:e2031d6ff4a1e1394480ec5520f3b757ccae0559f7d9434a760d0a701add0495",
+  "expected_checksum": "sha256:57e17e1ea30963ded90d1e83d088e65235b71cf350c9b437053a635b6eb5c969",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

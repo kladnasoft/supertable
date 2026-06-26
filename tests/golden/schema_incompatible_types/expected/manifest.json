@@ -1,0 +1,24 @@
+{
+  "scenario": "schema_incompatible_types",
+  "category": "schema",
+  "description": "Same column typed int in one file and str in another; seals DuckDB union_by_name's resolution (cast vs error).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "x"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:f5820ced84c04d9a01cbb7ea5d382b4869e598fa59fe27ea8ce5c6e21f55b659",
+  "expected_checksum": "sha256:ef6785794ae0c81ae8a0ed8339ff60fadebb6256319ce2cf64e4952f0b398515",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

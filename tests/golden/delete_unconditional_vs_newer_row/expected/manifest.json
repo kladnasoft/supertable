@@ -1,0 +1,24 @@
+{
+  "scenario": "delete_unconditional_vs_newer_row",
+  "category": "delete",
+  "description": "Tombstones carry no version; a tombstoned key is excluded even when a far-future row exists for it.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:2c4c4981c63d2ea5bd2c575e1385a9be6d8ec8607963355c47e44401a9fa4f50",
+  "expected_checksum": "sha256:10271060793c6059b7b74bad32df3c2406eef7fc1326863d5db9d37e38677928",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

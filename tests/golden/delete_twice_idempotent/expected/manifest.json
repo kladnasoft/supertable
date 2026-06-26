@@ -1,0 +1,24 @@
+{
+  "scenario": "delete_twice_idempotent",
+  "category": "delete",
+  "description": "The same key tombstoned twice still simply excludes that key.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:13ff9a4515c35a3907acc1aed3cb05558365f2360c0537993f89412c8017d41e",
+  "expected_checksum": "sha256:0285bdd60d8528d8367f4d70f1619a4cb2cca9e06faa971084307c3472ed9448",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

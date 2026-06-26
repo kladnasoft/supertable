@@ -1,0 +1,25 @@
+{
+  "scenario": "query_select_star",
+  "category": "query",
+  "description": "SELECT * exposes only public columns (no __timestamp__ / __rn__).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "name",
+    "amount"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:ba218cd2da6fc30e21c345e6a4474fe5a006a32a5e63fcc9dfffefd4faf15903",
+  "expected_checksum": "sha256:bda034de75a07af8c9818efe1d723aea303a7a4638a1d2ea783e0d9beaf163b3",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

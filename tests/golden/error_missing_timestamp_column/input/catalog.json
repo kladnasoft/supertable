@@ -1,0 +1,29 @@
+{
+  "organization": "charorg",
+  "super_name": "super_error_missing_timestamp_column",
+  "tables": {
+    "t": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "val": "String"
+      },
+      "resources": [
+        {
+          "file": "t__f1.parquet",
+          "rows": 1,
+          "columns": 2
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "scenario": "query_count_star",
+  "category": "query",
+  "description": "COUNT(*) counts current (post-dedup, post-tombstone) rows only.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "n"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:6444ba4eeff17f8f0e72df1833885814aad35796e8ffa39cf5bb85e17aa4f928",
+  "expected_checksum": "sha256:97ddfe2aa410397def9c9661703ceb0e2091e33b42a4307f8d07e3407ad11d01",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

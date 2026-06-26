@@ -1,0 +1,21 @@
+{
+  "scenario": "error_missing_timestamp_column",
+  "category": "error",
+  "description": "dedup_on_read is set but the parquet has no __timestamp__ column; the dedup ORDER BY cannot bind.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:020287c585e83f377be856948953835e3b96be5d86b08feeb7bdfb9743258781",
+  "expected_checksum": "sha256:dae3c119a0ad91de9c52c5df8f2553bd45384e6c5acb7acba94ffb5cbd63ad22",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

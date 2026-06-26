@@ -1,0 +1,17 @@
+{
+  "columns": [
+    "code",
+    "val"
+  ],
+  "column_types": [
+    "str",
+    "str"
+  ],
+  "row_count": 1,
+  "rows": [
+    [
+      "A",
+      "upper"
+    ]
+  ]
+}

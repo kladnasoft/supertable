@@ -1,0 +1,17 @@
+{
+  "columns": [
+    "id",
+    "val"
+  ],
+  "column_types": [
+    "int",
+    "null"
+  ],
+  "row_count": 1,
+  "rows": [
+    [
+      2,
+      null
+    ]
+  ]
+}

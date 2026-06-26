@@ -1,0 +1,24 @@
+{
+  "scenario": "key_int_float_coercion",
+  "category": "keys",
+  "description": "Selecting an int key ALONGSIDE a float column triggers numpy homogeneous-array coercion in result_df.values.tolist(): the int key is returned as a float. Sealed as-is (a current quirk).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "amount"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:aec800ce804dd98457c9ac1c2c71b3f8002ca0d85c2c864d6685789cd689dfaa",
+  "expected_checksum": "sha256:a871a98fbf39d4d42d5964d041366932c3c98f9ec022eeb2772293a711c35756",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

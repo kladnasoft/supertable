@@ -1,0 +1,25 @@
+{
+  "columns": [
+    "id",
+    "name",
+    "amount"
+  ],
+  "column_types": [
+    "int",
+    "str",
+    "float"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      1,
+      "alice",
+      1.5
+    ],
+    [
+      2,
+      "bob",
+      2.5
+    ]
+  ]
+}

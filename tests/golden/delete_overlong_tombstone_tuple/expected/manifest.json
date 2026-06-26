@@ -1,0 +1,24 @@
+{
+  "scenario": "delete_overlong_tombstone_tuple",
+  "category": "delete",
+  "description": "A tombstone tuple with MORE components than primary_keys does not error: DuckDB tolerates the extra unaliased VALUES column and the anti-join matches on the leading (aliased) component only, so [1, 999] deletes key id=1 and ignores the trailing 999.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:7ef8e8af86f3aa26c2237a03a313525f3aed2327ec5e3ed7c74c118f75ed98f1",
+  "expected_checksum": "sha256:1002eef00fb58e41ae04d4582c726cc916a8b70d7f029289f2aa31b11f2801ec",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

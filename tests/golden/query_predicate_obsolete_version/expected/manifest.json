@@ -1,0 +1,24 @@
+{
+  "scenario": "query_predicate_obsolete_version",
+  "category": "query",
+  "description": "A predicate matching an OBSOLETE version's value returns nothing — only the current (deduped) version is visible to filters.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 0,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:319b1b480f7a803b5c75e61c8eb0734cafdb735cf1d8cc18b21a5945288229f9",
+  "expected_checksum": "sha256:df1d8995fbce85b6da39368de43968e20e8f7eb3ec6025d6060b4a239a2f61a5",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,24 @@
+{
+  "scenario": "multi_file_update_chain_3",
+  "category": "multi_file",
+  "description": "A key updated across three files; the newest timestamp wins.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:5744138abe4eacf03169133a8b0decd4e94088bdc4da18192abb86a4bd033eab",
+  "expected_checksum": "sha256:a60c9d5f7552cf19f3fbd3ff6e729022470b33a8117c77a1dbda207ec28fc9c5",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,25 @@
+{
+  "scenario": "schema_added_column",
+  "category": "schema",
+  "description": "A column present only in the later file; earlier-file rows read back NULL for it (union_by_name).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "a",
+    "b"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:2611f365b0328c241a276de0363bbf23092398718f9dcc2219419e42a7873fbf",
+  "expected_checksum": "sha256:8cb6fcdd29c2e570ab948f838f33c2858483cd003dc2b159de17d0f272e466da",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

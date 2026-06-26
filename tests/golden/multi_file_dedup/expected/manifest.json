@@ -1,0 +1,24 @@
+{
+  "scenario": "multi_file_dedup",
+  "category": "multi_file",
+  "description": "Latest version of a key spans two files; newest wins.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:3e86339e295526764d2e9cef2fff109245c432427dd7b7550a7abebfceb37f1c",
+  "expected_checksum": "sha256:c9c08ad33e3e117ae8d08a0db88b5759cdc5dcc1c8d604d125034ddeea19b22c",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

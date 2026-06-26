@@ -1,0 +1,21 @@
+{
+  "columns": [
+    "id",
+    "val"
+  ],
+  "column_types": [
+    "int",
+    "str"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      1,
+      "keep"
+    ],
+    [
+      3,
+      "keep"
+    ]
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "scenario": "ts_microsecond_precision",
+  "category": "timestamp",
+  "description": "Two versions 1 microsecond apart; the later microsecond wins.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:b8cd8ba3f6b3cc98fc0c0633f3da178af1e13c5d3a1e1ba4a5876f00e7242ae7",
+  "expected_checksum": "sha256:fc99a04a51cb2e3cf37b02cf5ae6b69f6b2b25829bb1985556820c250093c26c",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

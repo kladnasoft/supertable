@@ -1,0 +1,24 @@
+{
+  "scenario": "schema_widened_numeric",
+  "category": "schema",
+  "description": "Same column typed int32 in one file and int64 in another; union_by_name promotes to the wider type.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "x"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:c569da0d637f662d8a0292e84db1f510da4036cb960a7457fa90d7e3312ff57c",
+  "expected_checksum": "sha256:2ec6a0f990251155bd3b96a3668ead4fffd3eee1fdb2cefae784013a7729eb2b",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

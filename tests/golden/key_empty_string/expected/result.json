@@ -1,0 +1,21 @@
+{
+  "columns": [
+    "code",
+    "val"
+  ],
+  "column_types": [
+    "str",
+    "str"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      "",
+      "e1"
+    ],
+    [
+      "x",
+      "x0"
+    ]
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "scenario": "query_filter_by_nonkey",
+  "category": "query",
+  "description": "WHERE on a non-key column filters post-dedup rows.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:27a2602044a6ac4566f8be11c979a84c26629c99a0280c5ef7f75de077c16937",
+  "expected_checksum": "sha256:2bd281ea315a7b7e4c0df84762ae052f1e0db0a5dc292ba982477b1247786ba2",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

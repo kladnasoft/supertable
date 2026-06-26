@@ -1,0 +1,24 @@
+{
+  "scenario": "basic_update_delete",
+  "category": "basic",
+  "description": "One key updated to a newer version, one key soft-deleted.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:4391c7a7546adf531ba3488f136d944404a14f09c56fc47602ca9756e3a40ff4",
+  "expected_checksum": "sha256:26c401d05fe2df38e1c40fc27c775d2afee3fb3329089c4f40dfb6bd8a1f216c",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,17 @@
+{
+  "columns": [
+    "id",
+    "val"
+  ],
+  "column_types": [
+    "int",
+    "str"
+  ],
+  "row_count": 1,
+  "rows": [
+    [
+      1,
+      "same"
+    ]
+  ]
+}

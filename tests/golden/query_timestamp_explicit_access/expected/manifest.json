@@ -1,0 +1,24 @@
+{
+  "scenario": "query_timestamp_explicit_access",
+  "category": "query",
+  "description": "The internal __timestamp__ is EXCLUDEd from SELECT * (see query_select_star) but is currently still accessible when named EXPLICITLY — the dedup view only drops it from the '*' expansion. Sealed to document this quirk; the future impl may legitimately hide it.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "__timestamp__"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:7ca62ea8336c04205eb758c19247d9a15af0ea5ee166e775b92f79f0bb6c5fa4",
+  "expected_checksum": "sha256:b94b703926c5afb6c2e17ad028fdff89627fd78f4bd2626ecf46cab3b8daa480",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

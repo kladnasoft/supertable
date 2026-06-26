@@ -1,0 +1,38 @@
+{
+  "organization": "charorg",
+  "super_name": "super_schema_all_types",
+  "tables": {
+    "t": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "n32": "Int32",
+        "big": "Int64",
+        "s": "String",
+        "b": "Boolean",
+        "f": "Float64",
+        "d": "Float64",
+        "dt": "Date",
+        "tsv": "Datetime(time_unit='us', time_zone='UTC')",
+        "dec": "Decimal(precision=38, scale=9)",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "t__f1.parquet",
+          "rows": 2,
+          "columns": 11
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    }
+  }
+}

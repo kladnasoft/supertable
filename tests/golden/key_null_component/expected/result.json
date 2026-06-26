@@ -1,0 +1,25 @@
+{
+  "columns": [
+    "region",
+    "id",
+    "val"
+  ],
+  "column_types": [
+    "str",
+    "int",
+    "str"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      null,
+      1,
+      "n1"
+    ],
+    [
+      "US",
+      1,
+      "us"
+    ]
+  ]
+}

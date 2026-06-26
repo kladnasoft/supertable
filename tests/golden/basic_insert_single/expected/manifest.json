@@ -1,0 +1,24 @@
+{
+  "scenario": "basic_insert_single",
+  "category": "basic",
+  "description": "Single inserted row reads back verbatim.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:9d0f8a24dd54e0a71d94dd74a8503d2cf91d11f65bb9c0c39e39538d5b7aee08",
+  "expected_checksum": "sha256:0285bdd60d8528d8367f4d70f1619a4cb2cca9e06faa971084307c3472ed9448",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

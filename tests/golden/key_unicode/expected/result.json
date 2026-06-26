@@ -1,0 +1,25 @@
+{
+  "columns": [
+    "code",
+    "val"
+  ],
+  "column_types": [
+    "str",
+    "str"
+  ],
+  "row_count": 3,
+  "rows": [
+    [
+      "café",
+      "fr"
+    ],
+    [
+      "日本",
+      "jp"
+    ],
+    [
+      "🚀",
+      "rocket"
+    ]
+  ]
+}

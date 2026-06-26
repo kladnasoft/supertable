@@ -1,0 +1,21 @@
+{
+  "scenario": "error_corrupt_parquet",
+  "category": "error",
+  "description": "A resource file exists but is not a valid parquet.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:25c40edf1dc92baf842c22bf380c3a864aceca4f62c0bc393c0309cd67e794e5",
+  "expected_checksum": "sha256:a5fa44f916df5b39e94a065f97df7e43337fe3e55469b3950fc278f43c1e9fa8",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

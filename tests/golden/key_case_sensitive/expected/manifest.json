@@ -1,0 +1,24 @@
+{
+  "scenario": "key_case_sensitive",
+  "category": "keys",
+  "description": "Keys 'A' and 'a' are distinct (case-sensitive).",
+  "business_key_columns": [
+    "code"
+  ],
+  "comparison_columns": [
+    "code",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "code"
+    ]
+  },
+  "input_checksum": "sha256:fcd690885a207136f1a35d0143978e4ed2a74e42ad351e860daf5196adcfd6b7",
+  "expected_checksum": "sha256:699b0f25dfda9b0181adffdd02709ba26ce6ff76edfe38cd08c23f881c8bd3cd",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

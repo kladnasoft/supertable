@@ -1,0 +1,21 @@
+{
+  "scenario": "basic_zero_file_catalog",
+  "category": "basic",
+  "description": "A table whose snapshot lists no parquet resources at all.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:2dea95c721d8ba723c4ba4ca2836dddfaea4ee5ee2ce1ea6db0453a5e849c586",
+  "expected_checksum": "sha256:0b26296c07106ae374d1724847333ee2a9b706010bf46415c8c37d86f61dec93",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,23 @@
+{
+  "organization": "charorg",
+  "super_name": "super_basic_zero_file_catalog",
+  "tables": {
+    "t": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "val": "String"
+      },
+      "resources": [],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    }
+  }
+}

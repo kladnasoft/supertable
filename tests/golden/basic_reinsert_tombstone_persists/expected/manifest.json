@@ -1,0 +1,24 @@
+{
+  "scenario": "basic_reinsert_tombstone_persists",
+  "category": "basic",
+  "description": "Re-insert after delete while the tombstone PERSISTS (key still in deleted_keys) — tombstone is unconditional, key stays excluded even though a newer row exists.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 0,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:4c45cffb6f0195c2fc45fe771215126af2cbf701ba822fc36b8cebe48147327d",
+  "expected_checksum": "sha256:df1d8995fbce85b6da39368de43968e20e8f7eb3ec6025d6060b4a239a2f61a5",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

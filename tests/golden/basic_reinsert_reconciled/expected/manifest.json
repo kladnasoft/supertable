@@ -1,0 +1,24 @@
+{
+  "scenario": "basic_reinsert_reconciled",
+  "category": "basic",
+  "description": "Re-insert after delete with the tombstone reconciled away (key not in deleted_keys) — newest version is visible again.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:8377424b96ce682b2462c2e0fc84ecb092789c926958f12d33b2f99f3cc01a97",
+  "expected_checksum": "sha256:2e3cdba4980b8cb661fe4212e5dd80cb5a454900b1e899b9ca1976caeaaa4481",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

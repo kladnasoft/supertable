@@ -1,0 +1,35 @@
+{
+  "organization": "charorg",
+  "super_name": "super_schema_widened_numeric",
+  "tables": {
+    "m": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "x": "Int32",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "m__f1.parquet",
+          "rows": 1,
+          "columns": 3
+        },
+        {
+          "file": "m__f2.parquet",
+          "rows": 1,
+          "columns": 3
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    }
+  }
+}

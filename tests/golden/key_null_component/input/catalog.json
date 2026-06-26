@@ -1,0 +1,33 @@
+{
+  "organization": "charorg",
+  "super_name": "super_key_null_component",
+  "tables": {
+    "t": {
+      "primary_keys": [
+        "region",
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "region": "String",
+        "id": "Int64",
+        "val": "String",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "t__f1.parquet",
+          "rows": 3,
+          "columns": 4
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "region",
+          "id"
+        ]
+      }
+    }
+  }
+}

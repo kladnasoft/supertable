@@ -1,0 +1,21 @@
+{
+  "scenario": "error_missing_parquet",
+  "category": "error",
+  "description": "A resource file referenced by the catalog is missing on disk.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:8839365c86ab281911b14fdb792f8e81f22be2c72138cb1974c37cb6db0d5c12",
+  "expected_checksum": "sha256:45b8f11883fd0d4687d885694b0b8ceeff22b02dca8e78bbacedf2a7247c4aef",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

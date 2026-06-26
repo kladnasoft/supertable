@@ -1,0 +1,21 @@
+{
+  "scenario": "error_missing_key_column",
+  "category": "error",
+  "description": "primary_keys references a column absent from the parquet; the dedup PARTITION BY cannot bind.",
+  "business_key_columns": [
+    "nope"
+  ],
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
+  "ordering": {
+    "mode": "multiset",
+    "stable_sort_columns": [
+      "nope"
+    ]
+  },
+  "input_checksum": "sha256:3fcfb6cb37eac864929beaa126fd268d7fc70d12e9c5a6ca0fcbdde40d6a8314",
+  "expected_checksum": "sha256:8bfe5bb652f20c1c8aecd1278c5a6095f64483f012d0bb98bced5852007b22f7",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,24 @@
+{
+  "scenario": "ts_future_then_earlier",
+  "category": "timestamp",
+  "description": "A far-future version then an earlier one; the future timestamp is the 'latest' and wins.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:d5de9714e324d0455df47abfc1ab4ff898084d17ab0b61aab97ff149e474f6e6",
+  "expected_checksum": "sha256:46354a734f5948f69aa424f63f800f9e75c2ae2a989d7bd71dc49dd5ec701bd1",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,14 @@
+{
+  "columns": [
+    "id"
+  ],
+  "column_types": [
+    "int"
+  ],
+  "row_count": 1,
+  "rows": [
+    [
+      1
+    ]
+  ]
+}

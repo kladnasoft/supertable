@@ -1,0 +1,21 @@
+{
+  "columns": [
+    "region",
+    "total"
+  ],
+  "column_types": [
+    "str",
+    "float"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      "EU",
+      7.0
+    ],
+    [
+      "US",
+      15.0
+    ]
+  ]
+}

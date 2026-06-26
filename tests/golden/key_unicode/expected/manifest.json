@@ -1,0 +1,24 @@
+{
+  "scenario": "key_unicode",
+  "category": "keys",
+  "description": "Unicode keys (accented, CJK, emoji) are preserved and distinct.",
+  "business_key_columns": [
+    "code"
+  ],
+  "comparison_columns": [
+    "code",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 3,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "code"
+    ]
+  },
+  "input_checksum": "sha256:f210a01fa7c30d2b5c37f25c9222ae87535002d304aab373bff2b94542bff360",
+  "expected_checksum": "sha256:b72eb3ad0e2af8cdfdcb44dc793d2161911a29833d17e4d5bd98678ae52bb717",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

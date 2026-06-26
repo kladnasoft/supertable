@@ -1,0 +1,32 @@
+{
+  "scenario": "schema_all_types",
+  "category": "schema",
+  "description": "All supported logical types round-trip through the read in canonical form (int/bigint/str/bool/float/double/date/timestamp/decimal).",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "n32",
+    "big",
+    "s",
+    "b",
+    "f",
+    "d",
+    "dt",
+    "tsv",
+    "dec"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:37b1c22a1a119b9febfbfc67036f5cc6c47ea3e26557649d8d00db153513a352",
+  "expected_checksum": "sha256:c7326bf605862730b6883be9bcbaa31f0a33125ee0bc76f5bc3c4b382ac4dcb0",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

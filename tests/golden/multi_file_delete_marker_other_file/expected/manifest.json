@@ -1,0 +1,24 @@
+{
+  "scenario": "multi_file_delete_marker_other_file",
+  "category": "multi_file",
+  "description": "Tombstone is catalog-level; it excludes a key whose newest version lives in a different file.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:305769d7c6a752aaa6e91b725c79bd37c7586f1a725a2343f48d328a79b423c1",
+  "expected_checksum": "sha256:10271060793c6059b7b74bad32df3c2406eef7fc1326863d5db9d37e38677928",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

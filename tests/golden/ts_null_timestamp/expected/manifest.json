@@ -1,0 +1,24 @@
+{
+  "scenario": "ts_null_timestamp",
+  "category": "timestamp",
+  "description": "A row with a NULL __timestamp__ competes with a non-null version for the same key; seals DuckDB's NULL ordering under ORDER BY ... DESC.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:ec3fb8629e6d3f21e01b8f036ed1b7e24389342587145e8f549bed0b3e9e0b5b",
+  "expected_checksum": "sha256:48b9dfe40a98b8f1da8c9e51705f29edd0d05cc147124318f86809a878f332f7",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

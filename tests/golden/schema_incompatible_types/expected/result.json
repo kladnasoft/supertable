@@ -1,0 +1,21 @@
+{
+  "columns": [
+    "id",
+    "x"
+  ],
+  "column_types": [
+    "int",
+    "str"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      1,
+      "10"
+    ],
+    [
+      2,
+      "twenty"
+    ]
+  ]
+}

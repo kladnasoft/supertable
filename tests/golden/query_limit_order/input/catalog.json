@@ -1,0 +1,30 @@
+{
+  "organization": "charorg",
+  "super_name": "super_query_limit_order",
+  "tables": {
+    "t": {
+      "primary_keys": [
+        "id"
+      ],
+      "dedup_on_read": true,
+      "schema": {
+        "id": "Int64",
+        "val": "String",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+      },
+      "resources": [
+        {
+          "file": "t__f1.parquet",
+          "rows": 4,
+          "columns": 3
+        }
+      ],
+      "tombstones": {
+        "deleted_keys": [],
+        "primary_keys": [
+          "id"
+        ]
+      }
+    }
+  }
+}

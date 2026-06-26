@@ -1,0 +1,27 @@
+{
+  "scenario": "key_null_component",
+  "category": "keys",
+  "description": "Composite key where one component is NULL; rows with a NULL component still partition together for dedup.",
+  "business_key_columns": [
+    "region",
+    "id"
+  ],
+  "comparison_columns": [
+    "region",
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "region",
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:ba42c7c47807b3da45d07cccbae4059f3abc9ee8bc76f05b6d4746ab6db247da",
+  "expected_checksum": "sha256:2107f363e1a5babcb67caa31e7879902d1bb7509fee03234ef106dd631efb535",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

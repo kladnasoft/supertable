@@ -1,0 +1,23 @@
+{
+  "scenario": "key_large_int_alone",
+  "category": "keys",
+  "description": "Large integer key beyond 2^53 selected ALONE (all-int result frame) is preserved exactly.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:de86e2966081899ba9e32a20492c57fa24e07eee7a0e5ca11c7abd312e6afd2a",
+  "expected_checksum": "sha256:51290cc51caa407c7fd8666f2bc4115e3319c0088739d50a2f819b21f0393bfa",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

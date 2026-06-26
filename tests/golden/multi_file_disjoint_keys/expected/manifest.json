@@ -1,0 +1,24 @@
+{
+  "scenario": "multi_file_disjoint_keys",
+  "category": "multi_file",
+  "description": "Two files with disjoint key ranges union with no overlap.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 4,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:27690710105a13fcd401e7e5aef98c9efab1dbe8d890c3fdb8696c2e3a9bca17",
+  "expected_checksum": "sha256:66a4b62835efdda6c63c3ca2dcaee598b0452f07ea41d1710643ac0e3a8f99d9",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

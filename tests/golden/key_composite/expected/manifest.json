@@ -1,0 +1,27 @@
+{
+  "scenario": "key_composite",
+  "category": "keys",
+  "description": "Composite (region,id) key; same id under different region stays distinct.",
+  "business_key_columns": [
+    "region",
+    "id"
+  ],
+  "comparison_columns": [
+    "region",
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "region",
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:b11919c64bc3055d53692e206bd90a53337fea093ca1a8dcee09aca8ec407c75",
+  "expected_checksum": "sha256:2bdae110a0aeef0eef9af2dd183ee695b0513e1e469f0eb28bf70d6a13d8d310",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

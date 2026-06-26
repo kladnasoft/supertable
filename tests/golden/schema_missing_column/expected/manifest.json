@@ -1,0 +1,25 @@
+{
+  "scenario": "schema_missing_column",
+  "category": "schema",
+  "description": "A column present only in the earlier file; later-file rows read back NULL for it.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "a",
+    "b"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:9e4397e8000f6d160d74d4dfbf4d1464a24371d257331f8d73fdccd0545f0be2",
+  "expected_checksum": "sha256:3a38d45f5f521acaf92de87f887bb15b1c77d3863d94f4a3c1706ba879d3ff1a",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

@@ -1,0 +1,24 @@
+{
+  "scenario": "delete_cannot_target_null_key",
+  "category": "delete",
+  "description": "A tombstone with a NULL key component cannot delete a NULL-keyed row: the anti-join uses '=', and NULL = NULL is never true, so the row survives.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:1b13287f1cf1a4c49f2e87acf9f4034a2011ca9182344eb9b2a927b2907ead16",
+  "expected_checksum": "sha256:92b9438b4d1c24c62081d2c4ae2d46580d61d4f095b752bd8df42e516518594a",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

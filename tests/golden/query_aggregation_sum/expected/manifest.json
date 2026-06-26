@@ -1,0 +1,24 @@
+{
+  "scenario": "query_aggregation_sum",
+  "category": "query",
+  "description": "GROUP BY + SUM over post-dedup rows.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "region",
+    "total"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 2,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:77f581a1e85301a46c42a465d7e125b4ed773506ae410e353d83d9f94ff775ab",
+  "expected_checksum": "sha256:500c6ddd4f00a051dd1cc6f8f30ec3516946a05065b8fc25ce21d076cc68c614",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

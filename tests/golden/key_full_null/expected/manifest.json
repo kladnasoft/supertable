@@ -1,0 +1,24 @@
+{
+  "scenario": "key_full_null",
+  "category": "keys",
+  "description": "Single NULL key value: all-NULL keys form one dedup partition.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:6c5489700592a54f055aa261b5ba9d7a1916fad3de543a4579ce840d7d2d8a5d",
+  "expected_checksum": "sha256:e995ac15f8e18ec4afca8b45a03cb11ff11817425b23dc5b9468a773c37f3b2b",
+  "created_from": "pre-rowid-current-reader",
+  "contains_internal_rowid": false
+}

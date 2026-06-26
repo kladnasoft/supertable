@@ -1,0 +1,25 @@
+{
+  "columns": [
+    "id",
+    "s",
+    "f"
+  ],
+  "column_types": [
+    "int",
+    "str",
+    "float"
+  ],
+  "row_count": 2,
+  "rows": [
+    [
+      1,
+      null,
+      null
+    ],
+    [
+      2,
+      "x",
+      1.0
+    ]
+  ]
+}
