@@ -486,7 +486,7 @@ return 1
     def reserve_rowids(self, org: str, sup: str, simple: str, count: int) -> int:
         """Atomically reserve ``count`` contiguous ``__rowid__`` values.
 
-        Uses INCRBY on the per-leaf rowid counter so the reserved block is
+        Uses INCRBY on the per-table rowid counter so the reserved block is
         unique within the table even across concurrent writers. Returns the
         first id of the block; the reserved range is
         ``[start, start + count - 1]``. Ids start at 1. Returns 0 for a
@@ -494,7 +494,7 @@ return 1
         """
         if count <= 0:
             return 0
-        new_val = int(self.r.incrby(RK.meta_leaf_rowid_seq(org, sup, simple), count))
+        new_val = int(self.r.incrby(RK.meta_rowid_seq(org, sup, simple), count))
         return new_val - count + 1
 
     def delete_leaf(self, org: str, sup: str, simple: str) -> bool:

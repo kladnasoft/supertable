@@ -85,6 +85,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("meta_table_names",             RK.meta_table_names(ORG, SUP),        f"{lake_pre}:meta:table_names"),
         ("meta_leaf",                    RK.meta_leaf(ORG, SUP, SIMPLE),       f"{lake_pre}:meta:leaf:doc:{SIMPLE}"),
         ("meta_leaf_pattern",            RK.meta_leaf_pattern(ORG, SUP),       f"{lake_pre}:meta:leaf:doc:*"),
+        ("meta_rowid_seq",               RK.meta_rowid_seq(ORG, SUP, SIMPLE),  f"{lake_pre}:meta:rowid_seq:doc:{SIMPLE}"),
         ("meta_table_config",            RK.meta_table_config(ORG, SUP, SIMPLE), f"{lake_pre}:meta:table_config:doc:{SIMPLE}"),
 
         # ---- Staging + Pipes -------------------------------------------
@@ -349,6 +350,24 @@ def test_monitor_partition_lives_at_org_level():
     # No "lakes" or "system" segment, no super_name segment.
     assert ":lakes:" not in key
     assert ":system:" not in key
+
+
+def test_rowid_seq_not_matched_by_leaf_scan():
+    """The __rowid__ counter must not be enumerated as a table.
+
+    Regression: when the counter lived at ``meta:leaf:doc:{simple}:rowid_seq``
+    the ``meta:leaf:doc:*`` SCAN matched it, so table listings tried to parse
+    ``{simple}:rowid_seq`` as a table name and blew up in ``_safe``. Its own
+    ``meta:rowid_seq:doc:`` namespace keeps it out of that scan.
+    """
+    from fnmatch import fnmatchcase
+
+    seq_key = RK.meta_rowid_seq(ORG, SUP, SIMPLE)
+    leaf_glob = RK.meta_leaf_pattern(ORG, SUP)
+    assert not fnmatchcase(seq_key, leaf_glob)
+    assert ":meta:leaf:doc:" not in seq_key
+    # The genuine leaf key, by contrast, *is* matched by the same glob.
+    assert fnmatchcase(RK.meta_leaf(ORG, SUP, SIMPLE), leaf_glob)
 
 
 def test_registry_rejects_unknown_service_type():

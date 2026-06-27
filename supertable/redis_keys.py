@@ -47,6 +47,8 @@ Hierarchy (v2)
               table_names                            SET     all simple table names
               leaf:
                 doc:{simple}                         STRING  leaf snapshot pointer
+              rowid_seq:
+                doc:{simple}                         STRING  __rowid__ counter (INCRBY)
               table_config:
                 doc:{simple}                         STRING  per-table config
               staging:
@@ -496,17 +498,17 @@ def meta_leaf_pattern(org: str, sup: str) -> str:
     )
 
 
-def meta_leaf_rowid_seq(org: str, sup: str, simple: str) -> str:
+def meta_rowid_seq(org: str, sup: str, simple: str) -> str:
     """Monotonic ``__rowid__`` counter for one simple table (STRING, INCRBY).
 
-    Kept under the leaf doc namespace so the per-table sequence shares
-    the leaf's lifecycle. INCRBY makes id reservation atomic across
-    concurrent writers, guaranteeing ``__rowid__`` uniqueness within the
-    table.
+    Lives in its own ``meta:rowid_seq:doc:`` namespace so it never collides
+    with the ``meta:leaf:doc:*`` scan used to enumerate tables. INCRBY makes
+    id reservation atomic across concurrent writers, guaranteeing
+    ``__rowid__`` uniqueness within the table.
     """
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:meta:leaf:doc:{_safe('simple', simple)}:rowid_seq"
+        f":{_safe('sup', sup)}:meta:rowid_seq:doc:{_safe('simple', simple)}"
     )
 
 
