@@ -356,6 +356,7 @@ class DataEstimator:
         max_freshness_ms = 0
         files_before_prune = 0
         files_pruned = 0
+        files_kept = 0
 
         super_map = self._get_supertable_map()
 
@@ -409,12 +410,16 @@ class DataEstimator:
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
                 # satisfy the query's WHERE before resolving them to scan URLs.
-                survivors = self._prune_files(
-                    super_name, simple_name, raw_keys, stats_file,
-                    profiler=prune_profiler,
-                )
+                # The span accumulates the wall-clock of the whole pruning step
+                # (stats load + predicate eval) across every table in the query.
+                with prune_profiler.span("read.prune"):
+                    survivors = self._prune_files(
+                        super_name, simple_name, raw_keys, stats_file,
+                        profiler=prune_profiler,
+                    )
                 files_before_prune += len(raw_keys)
                 files_pruned += len(raw_keys) - len(survivors)
+                files_kept += len(survivors)
 
                 parquet_files: List[str] = []
                 for file_key in survivors:
@@ -469,6 +474,12 @@ class DataEstimator:
         if settings.SUPERTABLE_READ_PRUNING_ENABLED:
             self.plan_stats.add_stat({"FILES_BEFORE_PRUNE": files_before_prune})
             self.plan_stats.add_stat({"FILES_PRUNED": files_pruned})
+            self.plan_stats.add_stat({"FILES_KEPT": files_kept})
+            self.plan_stats.add_stat({
+                "PRUNE_DURATION_MS": round(
+                    prune_profiler.timings.get("read.prune", 0.0) * 1000, 3
+                )
+            })
             prune_counts = prune_profiler.emit_counts()
             if prune_counts:
                 self.plan_stats.add_stat({"PRUNE_COUNTS": prune_counts})

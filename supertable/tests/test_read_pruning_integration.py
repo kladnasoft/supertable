@@ -13,8 +13,9 @@ REAL stats artifact read back from disk, and asserts that:
     list and byte-identical result rows;
   * the read monitoring payload (``PlanStats.stats``, consumed by
     ``plan_extender.extend_execution_plan``) surfaces the pruning effect
-    (``FILES_BEFORE_PRUNE`` / ``FILES_PRUNED`` plus the profiler's
-    ``read_pruned_files`` / stats-cache counters), 0/absent for a no-prune query.
+    (``FILES_BEFORE_PRUNE`` / ``FILES_PRUNED`` / ``FILES_KEPT`` /
+    ``PRUNE_DURATION_MS`` plus the profiler's ``read_pruned_files`` /
+    stats-cache counters), 0/absent for a no-prune query.
 
 Scope note — why the estimator level, not a full ``DataReader.execute()`` round
 trip:  a real ``DataWriter -> DataReader.execute()`` round trip needs the hermetic
@@ -279,6 +280,33 @@ class TestReadPruningObservability:
             assert est.plan_stats is injected
             assert _stat(injected, "REFLECTIONS") == 1
             assert _stat(injected, "FILES_PRUNED") == 2
+
+    def test_kept_count_in_payload(self, orders_on_disk):
+        # 3 candidate files, 2 dropped -> 1 kept. The trio is self-consistent.
+        _, ps = _estimate(_PRUNE_Q, orders_on_disk, pruning=True)
+        assert _stat(ps, "FILES_KEPT") == 1
+        assert (
+            _stat(ps, "FILES_BEFORE_PRUNE")
+            == _stat(ps, "FILES_PRUNED") + _stat(ps, "FILES_KEPT")
+        )
+
+    def test_kept_count_when_nothing_pruned(self, orders_on_disk):
+        # OR predicate yields no usable constraint -> all 3 files kept.
+        _, ps = _estimate(_NOPRUNE_Q, orders_on_disk, pruning=True)
+        assert _stat(ps, "FILES_PRUNED") == 0
+        assert _stat(ps, "FILES_KEPT") == 3
+
+    def test_prune_duration_present(self, orders_on_disk):
+        _, ps = _estimate(_PRUNE_Q, orders_on_disk, pruning=True)
+        dur = _stat(ps, "PRUNE_DURATION_MS")
+        assert dur is not None
+        assert isinstance(dur, float)
+        assert dur >= 0.0
+
+    def test_disabled_pruning_omits_kept_and_duration(self, orders_on_disk):
+        _, ps = _estimate(_PRUNE_Q, orders_on_disk, pruning=False)
+        assert _stat(ps, "FILES_KEPT") is None
+        assert _stat(ps, "PRUNE_DURATION_MS") is None
 
 
 # ---------------------------------------------------------------------------
