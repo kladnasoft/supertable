@@ -314,8 +314,14 @@ class DataReader:
                         if isinstance(payload, dict):
                             tomb_path = payload.get("tombstone")
                             if tomb_path:
+                                # Resolve the deletion-vector key exactly like the
+                                # data files (estimator._to_duckdb_path, see
+                                # data_estimator.py:426): the catalog stores a bare
+                                # object key, which DuckDB/Spark cannot read against
+                                # an object store and must be presigned. LOCAL
+                                # storage returns the key unchanged.
                                 reflection.tombstone_views[td.alias] = TombstoneDef(
-                                    tombstone_path=tomb_path,
+                                    tombstone_path=estimator._to_duckdb_path(tomb_path),
                                 )
                     except Exception as te:
                         logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))

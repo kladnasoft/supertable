@@ -389,6 +389,127 @@ class TestExecuteHappyPath:
 
 
 # ====================================================================
+# 5b. DataReader.execute — Tombstone deletion-vector path resolution
+# ====================================================================
+
+class TestExecuteTombstoneResolution:
+    """Regression: the tombstone deletion-vector pointer must be resolved
+    through the SAME path as the data files (``estimator._to_duckdb_path``,
+    see data_estimator.py:426). Data files are presigned for object stores;
+    the tombstone key used to be embedded raw, so DuckDB/Spark could not read
+    it. These lock in 'if the data is presigned, the tombstone is too'.
+    """
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_tombstone_pointer_resolved_through_same_resolver_as_data(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+        _mock_data_reader_redis,
+    ):
+        from types import SimpleNamespace
+
+        td = SimpleNamespace(alias="t", super_name="s", simple_name="tbl")
+        mock_parser = MagicMock()
+        mock_parser.get_table_tuples.return_value = [td]
+        mock_parser.original_query = "SELECT * FROM tbl"
+        MockParser.return_value = mock_parser
+
+        mock_get_storage.return_value = MagicMock()
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
+
+        # Catalog leaf carries a deletion-vector pointer (a bare object key).
+        raw_tomb_key = "o/s/tables/tbl/tombstone/123_abc_deleted.parquet"
+        _mock_data_reader_redis.return_value.get_leaf.return_value = {
+            "payload": {"tombstone": raw_tomb_key},
+        }
+
+        # Estimator resolver presigns (object-store behaviour) — the SAME method
+        # the estimator applies to data files at data_estimator.py:426.
+        reflection = _make_reflection()
+        mock_est = MagicMock()
+        mock_est.estimate.return_value = reflection
+        mock_est._to_duckdb_path.side_effect = lambda k: f"https://signed/{k}"
+        MockEstimator.return_value = mock_est
+
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        MockExecutor.return_value = mock_exec
+
+        from supertable.data_reader import DataReader, engine
+        dr = DataReader("s", "o", "SELECT * FROM tbl")
+        dr.execute("admin", engine=engine.AUTO)
+
+        # The raw key was routed through the resolver (not embedded as-is) ...
+        mock_est._to_duckdb_path.assert_called_once_with(raw_tomb_key)
+        # ... and the RESOLVED (presigned) value is what lands in the reflection.
+        assert "t" in reflection.tombstone_views
+        assert (
+            reflection.tombstone_views["t"].tombstone_path
+            == f"https://signed/{raw_tomb_key}"
+        )
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_local_storage_tombstone_left_unchanged(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+        _mock_data_reader_redis,
+    ):
+        # LOCAL contract: no presign → _to_duckdb_path returns the key as-is,
+        # so the tombstone path stays readable from disk (golden-test path).
+        from types import SimpleNamespace
+
+        td = SimpleNamespace(alias="t", super_name="s", simple_name="tbl")
+        mock_parser = MagicMock()
+        mock_parser.get_table_tuples.return_value = [td]
+        mock_parser.original_query = "SELECT * FROM tbl"
+        MockParser.return_value = mock_parser
+
+        mock_get_storage.return_value = MagicMock()
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
+
+        raw_tomb_key = "local/dir/tombstone/x_deleted.parquet"
+        _mock_data_reader_redis.return_value.get_leaf.return_value = {
+            "payload": {"tombstone": raw_tomb_key},
+        }
+
+        reflection = _make_reflection()
+        mock_est = MagicMock()
+        mock_est.estimate.return_value = reflection
+        mock_est._to_duckdb_path.side_effect = lambda k: k  # LOCAL no-op
+        MockEstimator.return_value = mock_est
+
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        MockExecutor.return_value = mock_exec
+
+        from supertable.data_reader import DataReader, engine
+        dr = DataReader("s", "o", "SELECT * FROM tbl")
+        dr.execute("admin", engine=engine.AUTO)
+
+        assert reflection.tombstone_views["t"].tombstone_path == raw_tomb_key
+
+
+# ====================================================================
 # 6.  DataReader.execute — RBAC Failure
 # ====================================================================
 

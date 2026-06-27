@@ -239,7 +239,11 @@ def _spark_create_tombstone_view(
     has_rowid = "__rowid__" in src_cols
 
     if tomb_path and has_rowid:
-        escaped = tomb_path.replace("'", "''")
+        # The data files are converted to s3a:// for Spark (see the data-file
+        # loop in the executor); apply the same conversion to the already
+        # resolved deletion-vector pointer so Spark reads it via its own S3A
+        # client instead of choking on a presigned HTTP URL or bare key.
+        escaped = _to_s3a_path(tomb_path).replace("'", "''")
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
             f"SELECT {select_cols} FROM {source_table} AS src "
