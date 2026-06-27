@@ -63,15 +63,52 @@ def _ensure_stub(name, attrs=None):
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Snapshot the pre-bootstrap state of every module name / attribute the minio &
+# boto3 stubs below create or overwrite. ``tearDownModule`` uses this to undo the
+# process-global mutations so LATER test modules in the same interpreter import
+# the REAL minio/boto3 packages. (Without this, the fake ``minio.Minio`` leaks
+# into ``supertable.storage.minio_storage`` and breaks every later test that
+# builds a real storage backend via ``get_storage()``.)
+# ---------------------------------------------------------------------------
+_STUBBED_MODULE_NAMES = (
+    "minio", "minio.commonconfig", "minio.deleteobjects", "minio.error",
+    "boto3", "botocore", "botocore.config", "botocore.exceptions",
+)
+_ORIGINAL_SYS_MODULES = {n: sys.modules.get(n) for n in _STUBBED_MODULE_NAMES}
+# The one *existing* attribute we overwrite is ``minio.Minio`` (set below).
+_pre_minio_mod = sys.modules.get("minio")
+_ORIGINAL_MINIO_MINIO = (
+    (getattr(_pre_minio_mod, "Minio", None), hasattr(_pre_minio_mod, "Minio"))
+    if _pre_minio_mod is not None else (None, False)
+)
+# Production modules that bind the stubbed packages via ``from X import Y`` at
+# import time; they must be dropped so they re-import the real packages.
+_PRODUCTION_MODULES_TO_REFRESH = (
+    "supertable.storage.minio_storage",
+    "supertable.storage.s3_storage",
+)
+
+
 # --- pyarrow stubs ---
+# Prefer the REAL pyarrow.parquet whenever it's importable; only fall back to a
+# no-op stub on a stdlib-only run. This is essential: ~8 OTHER test modules do
+# ``import pyarrow.parquet as pq`` at module scope, and pytest imports every
+# module during collection — long before this module's ``tearDownModule`` runs.
+# A leaked no-op stub would strip ``pq.read_metadata`` / real ``write_table``
+# from all of them. The storage tests here never rely on the stub: they patch
+# ``...storage.X.pq`` locally where needed.
 _pa = _ensure_stub("pyarrow", {
     "Table": type("Table", (), {}),
     "table": lambda data, names=None: MagicMock(spec=[]),
 })
-_pq = _ensure_stub("pyarrow.parquet", {
-    "write_table": MagicMock(),
-    "read_table": MagicMock(return_value=MagicMock()),
-})
+try:
+    import pyarrow.parquet as _pq  # real package when pyarrow is installed
+except Exception:
+    _pq = _ensure_stub("pyarrow.parquet", {
+        "write_table": MagicMock(),
+        "read_table": MagicMock(return_value=MagicMock()),
+    })
 
 # --- minio stubs ---
 _minio_pkg = _ensure_stub("minio", {"__version__": "7.0.0"})
@@ -2280,6 +2317,42 @@ class TestStorageFactory(unittest.TestCase):
         finally:
             default.STORAGE_TYPE = original
         self.assertIsInstance(s, LocalStorage)
+
+
+def tearDownModule():
+    """Undo the import-time minio/boto3 stubbing performed by the bootstrap above.
+
+    The bootstrap installs method-less fakes into ``sys.modules`` (and overwrites
+    ``minio.Minio``) so this suite can run without the real cloud SDKs. Those
+    mutations are process-global and were never restored, leaking the fake
+    ``minio.Minio`` into ``supertable.storage.minio_storage`` — which breaks every
+    later test module that builds a real storage backend via ``get_storage()``
+    (e.g. compaction stats writes and read-pruning).
+
+    (pyarrow.parquet is not handled here: it is preferred-real at import time, so
+    nothing to restore.)
+    """
+    # 1) Restore each stubbed module name to its pre-bootstrap state.
+    for name, original in _ORIGINAL_SYS_MODULES.items():
+        if original is None:
+            sys.modules.pop(name, None)       # we created the stub -> drop it
+        else:
+            sys.modules[name] = original      # we shadowed a real one -> restore
+
+    # 2) Restore the clobbered ``minio.Minio`` on a surviving real module.
+    _m = sys.modules.get("minio")
+    if _m is not None:
+        _orig_minio, _had = _ORIGINAL_MINIO_MINIO
+        if _had:
+            _m.Minio = _orig_minio
+        elif hasattr(_m, "Minio"):
+            delattr(_m, "Minio")
+
+    # 3) Drop production storage modules that bound the fakes via ``from X import
+    #    Y`` so they re-import against the restored real packages on next use
+    #    (``get_storage`` imports them lazily via importlib).
+    for name in _PRODUCTION_MODULES_TO_REFRESH:
+        sys.modules.pop(name, None)
 
 
 if __name__ == "__main__":
