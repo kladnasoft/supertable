@@ -17,8 +17,8 @@
       "id"
     ]
   },
-  "input_checksum": "sha256:44d17065b71f6204f7671f3a06c547dee6ff7489f14fadbc21515429363d2f45",
+  "input_checksum": "sha256:aa795cf0d9235eb0d2fefef1fec771a6a500010d93ccf5f1f6446b12514f14d2",
   "expected_checksum": "sha256:860fce4a6e1912e2587bf6a6a9cf94855032b6c3aab947da5ec7618f7dc3e9ca",
-  "created_from": "pre-rowid-current-reader",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

@@ -25,6 +25,7 @@ from supertable.processing import (
     find_overlapping_files,
     filter_stale_incoming_rows,
     identify_deleted_rowids,
+    identify_all_rowids,
     build_tombstone_file,
     write_parquet_and_collect_resources,
     compact_resources,
@@ -440,6 +441,13 @@ class DataWriter:
                         dataframe,
                         overlapping_files,
                         overwrite_columns,
+                        file_cache=file_cache,
+                        profiler=profiler,
+                    )
+                elif delete_only:
+                    # delete-all: no overwrite_columns → tombstone every row.
+                    new_delete_pairs = identify_all_rowids(
+                        last_simple_table.get("resources", []),
                         file_cache=file_cache,
                         profiler=profiler,
                     )
@@ -1193,8 +1201,8 @@ class DataWriter:
             raise ValueError("overwrite columns must be list")
         if overwrite_columns and not all(col in dataframe.columns for col in overwrite_columns):
             raise ValueError("Some overwrite columns are not present in the dataset")
-        if delete_only and not overwrite_columns:
-            raise ValueError("delete_only requires overwrite_columns to identify rows to delete")
+        # delete_only with no overwrite_columns is the delete-all path (tombstone
+        # every existing row); with overwrite_columns it deletes the matches.
         if newer_than is not None:
             if not isinstance(newer_than, str):
                 raise ValueError("newer_than must be a column name string")

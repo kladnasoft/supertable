@@ -313,8 +313,9 @@ def _timestamp() -> List[Scenario]:
 
     out.append(_single(
         "ts_equal_same_key_same_value", "timestamp",
-        "Equal timestamp, same key, identical value — dedup collapses to one "
-        "row deterministically.",
+        "Equal timestamp, same key, identical value — two appends with no "
+        "overwrite. Neither row supersedes the other (equal __timestamp__ is not "
+        "an overwrite), so both physical rows survive.",
         columns=_C_IDVAL,
         rows=[
             {"id": 1, "val": "same", TS: ts(seconds=5)},
@@ -326,9 +327,9 @@ def _timestamp() -> List[Scenario]:
 
     out.append(_single(
         "ts_equal_same_key_diff_value_keyonly", "timestamp",
-        "Equal timestamp, same key, DIFFERENT value — which value survives is "
-        "NON-DETERMINISTIC; sealed read projects only the key so exactly one row "
-        "per key is the stable contract.",
+        "Equal timestamp, same key, DIFFERENT value — two appends, neither "
+        "supersedes the other (equal __timestamp__ is not an overwrite). Both "
+        "rows survive; projecting only the key yields the key twice.",
         columns=_C_IDVAL,
         rows=[
             {"id": 1, "val": "x", TS: ts(seconds=5)},
@@ -521,8 +522,9 @@ def _keys() -> List[Scenario]:
 
     out.append(_single(
         "key_duplicate_physical_rows", "keys",
-        "Identical physical rows (same key, ts, value) duplicated 3x collapse to "
-        "one row under dedup.",
+        "Identical physical rows (same key, ts, value) appended 3x. With no "
+        "overwrite/tombstone, all three physical rows are legitimate appends and "
+        "all survive (read removes only tombstoned __rowid__s, never duplicates).",
         columns=_C_IDVAL,
         rows=[
             {"id": 1, "val": "dup", TS: ts(seconds=0)},
@@ -682,14 +684,15 @@ def _query() -> List[Scenario]:
 
     out.append(_single(
         "query_timestamp_explicit_access", "query",
-        "The internal __timestamp__ is EXCLUDEd from SELECT * (see "
-        "query_select_star) but is currently still accessible when named "
-        "EXPLICITLY — the dedup view only drops it from the '*' expansion. "
-        "Sealed to document this quirk; the future impl may legitimately hide it.",
+        "The internal __timestamp__ is hidden from the read view (stripped along "
+        "with __rowid__), so it is NOT accessible even when named EXPLICITLY: the "
+        "reference fails to bind. Sealed as an error to lock in that system "
+        "columns never leak into a user query.",
         columns=_C_IDVAL,
         rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
         primary_keys=["id"],
         sql="SELECT id, __timestamp__ FROM t ORDER BY id", ordered=True,
+        expect_error=ErrorExpectation("RuntimeError", "__timestamp__", "execution"),
     ))
 
     out.append(_single(
@@ -777,8 +780,9 @@ def _query() -> List[Scenario]:
 
     out.append(_single(
         "query_predicate_obsolete_version", "query",
-        "A predicate matching an OBSOLETE version's value returns nothing — only "
-        "the current (deduped) version is visible to filters.",
+        "A predicate matching an OBSOLETE version's value returns nothing — the "
+        "older version is tombstoned at write, so only the current version is "
+        "visible to filters.",
         columns=_C_IDVAL,
         rows=[
             {"id": 1, "val": "old", TS: ts(seconds=0)},
@@ -786,6 +790,31 @@ def _query() -> List[Scenario]:
         ],
         primary_keys=["id"],
         sql="SELECT id, val FROM t WHERE val = 'old' ORDER BY id", ordered=True,
+    ))
+
+    # Formerly error scenarios whose failure mode (read-time dedup binding) no
+    # longer exists: reads never PARTITION BY primary_keys nor ORDER BY
+    # __timestamp__, so neither a bogus primary key nor an absent __timestamp__
+    # affects the read.  Characterized as the (now benign) results.
+    out.append(_single(
+        "config_unknown_primary_key_harmless", "query",
+        "primary_keys references a column absent from the parquet. Reads no "
+        "longer dedup (no PARTITION BY on the key), so the bogus config is inert "
+        "and the row reads back verbatim.",
+        columns=_C_IDVAL, rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
+        primary_keys=["nope"],
+        sql="SELECT id, val FROM t ORDER BY id", ordered=True,
+    ))
+
+    out.append(_single(
+        "table_without_timestamp_reads", "query",
+        "A table whose parquet has no __timestamp__ column reads back fine: the "
+        "read path never orders by __timestamp__ (no read-time dedup), so its "
+        "absence is harmless.",
+        columns={"id": "int", "val": "str"},
+        rows=[{"id": 1, "val": "a"}],
+        primary_keys=["id"],
+        sql="SELECT id, val FROM t ORDER BY id", ordered=True,
     ))
 
     return out
@@ -947,27 +976,6 @@ def _errors() -> List[Scenario]:
         sql="SELECT id, val FROM t",
         expect_error=ErrorExpectation("JSONDecodeError", "", "catalog"),
         corrupt_inputs=_malform_catalog,
-    ))
-
-    out.append(_single(
-        "error_missing_key_column", "error",
-        "primary_keys references a column absent from the parquet; the dedup "
-        "PARTITION BY cannot bind.",
-        columns=_C_IDVAL, rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
-        primary_keys=["nope"],
-        sql="SELECT id, val FROM t",
-        expect_error=ErrorExpectation("RuntimeError", "nope", "execution"),
-    ))
-
-    out.append(_single(
-        "error_missing_timestamp_column", "error",
-        "dedup_on_read is set but the parquet has no __timestamp__ column; the "
-        "dedup ORDER BY cannot bind.",
-        columns={"id": "int", "val": "str"},
-        rows=[{"id": 1, "val": "a"}],
-        primary_keys=["id"],
-        sql="SELECT id, val FROM t",
-        expect_error=ErrorExpectation("RuntimeError", "__timestamp__", "execution"),
     ))
 
     return out

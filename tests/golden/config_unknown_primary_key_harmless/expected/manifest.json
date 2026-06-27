@@ -1,0 +1,24 @@
+{
+  "scenario": "config_unknown_primary_key_harmless",
+  "category": "query",
+  "description": "primary_keys references a column absent from the parquet. Reads no longer dedup (no PARTITION BY on the key), so the bogus config is inert and the row reads back verbatim.",
+  "business_key_columns": [
+    "nope"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "nope"
+    ]
+  },
+  "input_checksum": "sha256:71f071d3b1d339b064468287ff61feb5c6c33d31bbc289e5f235d6c02e0e3a79",
+  "expected_checksum": "sha256:0285bdd60d8528d8367f4d70f1619a4cb2cca9e06faa971084307c3472ed9448",
+  "created_from": "deletion-vector-current-reader",
+  "contains_internal_rowid": false
+}

@@ -7,8 +7,16 @@
     "int",
     "str"
   ],
-  "row_count": 1,
+  "row_count": 3,
   "rows": [
+    [
+      1,
+      "dup"
+    ],
+    [
+      1,
+      "dup"
+    ],
     [
       1,
       "dup"

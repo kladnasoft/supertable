@@ -1,24 +1,21 @@
 {
   "scenario": "query_timestamp_explicit_access",
   "category": "query",
-  "description": "The internal __timestamp__ is EXCLUDEd from SELECT * (see query_select_star) but is currently still accessible when named EXPLICITLY — the dedup view only drops it from the '*' expansion. Sealed to document this quirk; the future impl may legitimately hide it.",
+  "description": "The internal __timestamp__ is hidden from the read view (stripped along with __rowid__), so it is NOT accessible even when named EXPLICITLY: the reference fails to bind. Sealed as an error to lock in that system columns never leak into a user query.",
   "business_key_columns": [
     "id"
   ],
-  "comparison_columns": [
-    "id",
-    "__timestamp__"
-  ],
-  "expected_kind": "result",
-  "expected_row_count": 1,
+  "comparison_columns": [],
+  "expected_kind": "error",
+  "expected_row_count": null,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
       "id"
     ]
   },
-  "input_checksum": "sha256:7ca62ea8336c04205eb758c19247d9a15af0ea5ee166e775b92f79f0bb6c5fa4",
-  "expected_checksum": "sha256:b94b703926c5afb6c2e17ad028fdff89627fd78f4bd2626ecf46cab3b8daa480",
-  "created_from": "pre-rowid-current-reader",
+  "input_checksum": "sha256:15a85d4c9dbe8395ae019224b98632e9eb0ae95d67257b373895248bef88c50e",
+  "expected_checksum": "sha256:dae3c119a0ad91de9c52c5df8f2553bd45384e6c5acb7acba94ffb5cbd63ad22",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

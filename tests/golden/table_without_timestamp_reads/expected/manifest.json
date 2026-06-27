@@ -1,0 +1,24 @@
+{
+  "scenario": "table_without_timestamp_reads",
+  "category": "query",
+  "description": "A table whose parquet has no __timestamp__ column reads back fine: the read path never orders by __timestamp__ (no read-time dedup), so its absence is harmless.",
+  "business_key_columns": [
+    "id"
+  ],
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 1,
+  "ordering": {
+    "mode": "ordered",
+    "stable_sort_columns": [
+      "id"
+    ]
+  },
+  "input_checksum": "sha256:f000f5b4ad49504724c8b4eed8933c791d59e0e6cf38bdaee99d36144a4f069b",
+  "expected_checksum": "sha256:0285bdd60d8528d8367f4d70f1619a4cb2cca9e06faa971084307c3472ed9448",
+  "created_from": "deletion-vector-current-reader",
+  "contains_internal_rowid": false
+}

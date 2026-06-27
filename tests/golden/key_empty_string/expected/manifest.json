@@ -17,8 +17,8 @@
       "code"
     ]
   },
-  "input_checksum": "sha256:e2031d6ff4a1e1394480ec5520f3b757ccae0559f7d9434a760d0a701add0495",
+  "input_checksum": "sha256:a853e58e41584191008d284d384a41bbd6ec51fe87ea860173fbdb08c898c715",
   "expected_checksum": "sha256:57e17e1ea30963ded90d1e83d088e65235b71cf350c9b437053a635b6eb5c969",
-  "created_from": "pre-rowid-current-reader",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

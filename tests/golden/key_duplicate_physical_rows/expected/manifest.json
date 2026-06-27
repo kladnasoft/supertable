@@ -1,7 +1,7 @@
 {
   "scenario": "key_duplicate_physical_rows",
   "category": "keys",
-  "description": "Identical physical rows (same key, ts, value) duplicated 3x collapse to one row under dedup.",
+  "description": "Identical physical rows (same key, ts, value) appended 3x. With no overwrite/tombstone, all three physical rows are legitimate appends and all survive (read removes only tombstoned __rowid__s, never duplicates).",
   "business_key_columns": [
     "id"
   ],
@@ -10,15 +10,15 @@
     "val"
   ],
   "expected_kind": "result",
-  "expected_row_count": 1,
+  "expected_row_count": 3,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
       "id"
     ]
   },
-  "input_checksum": "sha256:62b2e9f080fa87de9caa2b56b98ecde946d9a534af26ba97fe7e3a38b5ef2e5b",
-  "expected_checksum": "sha256:7ae72fd240e403147ca7a72c706a990309949266d43d6b2a8ae89da9f915a9f3",
-  "created_from": "pre-rowid-current-reader",
+  "input_checksum": "sha256:f0a66c77f8bfbccfd74b3b99d05173c9710233c45e8e2ac10e852b2444f3619a",
+  "expected_checksum": "sha256:546608c06e80274abf25e5e481a0cd0be99db63493e119abfe9e05cc3d1b33db",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

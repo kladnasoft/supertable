@@ -1,9 +1,26 @@
 # TESTING.md — running & maintaining the characterization suite
 
-This suite seals the **current** SuperTable read behavior as a backward-compat
-oracle for the upcoming internal-`__rowid` + deletion-vector + compaction
-migration. The golden bytes under `tests/golden/` are the contract; normal runs
-**compare** against them and never regenerate them.
+This suite seals the SuperTable **deletion-vector** read behavior as a
+regression oracle. The golden bytes under `tests/golden/` are the contract;
+normal runs **compare** against them and never regenerate them.
+
+**Read model the goldens encode.** Each fixture is authored as valid
+deletion-vector lakehouse state: every physical row carries a stable internal
+`__rowid__` (plus the internal `__timestamp__`), and a per-table tombstone
+deletion-vector parquet (`__file__` + `__rowid__`) lists the rows removed at
+**write** time. A read removes a row **solely** by anti-joining its `__rowid__`
+against that deletion vector — there is **no read-time key-collapse dedup**.
+Consequences the goldens lock in:
+
+* Multiple rows sharing a primary key are **all kept** unless explicitly
+  tombstoned — same-key rows are legitimate appends, not duplicates to collapse.
+* An overwrite (newer version of a key) or a delete is recorded by the writer as
+  tombstoned `__rowid__`s; the harness synthesizes these from each scenario's
+  declared intent (newest-`__timestamp__`-per-key supersedes older rows; declared
+  deleted keys tombstone all of a key's rows, with SQL `=` semantics).
+* The internal `__rowid__`/`__timestamp__` are stripped from every read view, so
+  they never appear in `SELECT *` **and** cannot be referenced explicitly (a
+  named `__timestamp__` fails to bind — see `query_timestamp_explicit_access`).
 
 All commands use the repo's canonical interpreter and are run from the repo root:
 
@@ -107,10 +124,11 @@ p=validate_manifest(all_scenario_ids()); \
 print('OK' if not p else '\n'.join(p))"
 ```
 
-Any edited/corrupt/missing sealed file (input parquet, `catalog.json`, or
-`expected/result.json`) fails as an **integrity error** — distinct from a logical
-diff — with the reseal instructions. Checksums are keyed by path *relative to*
-`tests/golden`, so they contain no environment-dependent absolute paths.
+Any edited/corrupt/missing sealed file (input parquet, the tombstone
+deletion-vector parquet, `catalog.json`, or `expected/result.json`) fails as an
+**integrity error** — distinct from a logical diff — with the reseal
+instructions. Checksums are keyed by path *relative to* `tests/golden`, so they
+contain no environment-dependent absolute paths.
 
 ## 6. Run the performance benchmarks (non-blocking)
 
@@ -128,33 +146,34 @@ harness ran — never a wall-clock threshold.
 
 ---
 
-## Plugging in the future deletion-vector implementation
+## Holding an alternative reader to the same goldens
 
-The whole suite is the conformance harness for the post-migration reader. When
-the internal-`__rowid` + deletion-vector + compaction read path lands:
+The deletion-vector read path (`CurrentViewReader`, wrapping the production
+`query_sql`) is the oracle that sealed these goldens. The `TableReader` Protocol
+in `tests/characterization/readers.py` lets a **second** implementation (e.g. a
+new engine, or a reimplemented executor) be held to the *same* sealed bytes
+without touching the goldens:
 
-1. **Implement** `DeletionVectorReader.read(...)` in
-   `tests/characterization/readers.py` to read the **existing sealed inputs**
-   (they already contain only public columns + the existing `__timestamp__`; do
-   **not** require `__rowid` in the fixtures) and return a canonical
-   `TableResult` — public projection only (`__rowid` must never appear in
-   `SELECT *`, sorting, or comparison).
-2. **Flip** `DeletionVectorReader.available()` to `return True`.
+1. **Implement** a new `TableReader` that reads the sealed inputs (public columns
+   + the internal `__rowid__`/`__timestamp__`, plus the per-table tombstone
+   deletion-vector parquet) and returns a canonical `TableResult` — public
+   projection only (`__rowid__`/`__timestamp__` must never appear in `SELECT *`,
+   sorting, or comparison).
+2. **Append** an instance to `READERS` and have `available()` return `True`.
 3. **Run the compatibility gate** — it must pass against the unchanged goldens:
 
    ```bash
    python -m pytest tests/characterization/test_compatibility.py -v
    ```
 
-   This parameterizes `(reader × non-error scenario)`; the new reader is now held
-   to every sealed byte the current engine produced. **Do not reseal** — if a
-   result differs, that is a real backward-incompatibility to fix in the new
-   reader, not a golden to update.
+   This parameterizes `(reader × non-error scenario)`; the new reader is held to
+   every sealed byte the oracle produced. **Do not reseal** — if a result
+   differs, that is a real divergence to fix in the new reader, not a golden to
+   update.
 
 4. (Optional) add the new reader to the **error** path and **cross-engine** path
    the same way if it must reproduce failure categories too.
 
-> Acceptance: the same sealed fixtures execute unchanged against the new
-> implementation, no test requires `__rowid`, and any externally observable
-> difference yields a clear, actionable failure. The current behavior remains the
-> sole oracle.
+> Acceptance: the same sealed fixtures execute unchanged against the alternative
+> implementation, the public projection never leaks `__rowid__`/`__timestamp__`,
+> and any externally observable difference yields a clear, actionable failure.

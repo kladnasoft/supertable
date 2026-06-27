@@ -16,6 +16,8 @@ DataFrames wherever possible and mocks for storage I/O.
 10. collect_column_statistics
 11. write_parquet_and_collect_resources
 12. filter_stale_incoming_rows
+13. identify_deleted_rowids
+14. identify_all_rowids
 """
 
 from __future__ import annotations
@@ -691,3 +693,159 @@ class TestFindAndLockOverlappingFiles:
         result = find_overlapping_files(snap, df, ["id"], MagicMock())
         matches = [f for f, overlap, _ in result if overlap]
         assert len(matches) == 1
+
+
+# ===========================================================================
+# 13. identify_deleted_rowids  (deletion-vector: which existing rows to tombstone)
+# ===========================================================================
+
+class TestIdentifyDeletedRowids:
+    """Maps a delete/overwrite predicate to the (file, __rowid__) pairs of the
+    existing rows it matches.  Real DataFrames are fed through ``file_cache`` so
+    no parquet I/O is mocked."""
+
+    def test_no_overwrite_columns_returns_empty(self):
+        from supertable.processing import identify_deleted_rowids
+        df = _df(id=[1])
+        result = identify_deleted_rowids(df, {("f.parquet", True, 100)}, [])
+        assert result == []
+
+    def test_append_multiple_same_key_then_delete_tombstones_all(self):
+        """The case the user named: three rows appended with the SAME key all
+        get tombstoned when a delete/overwrite hits that key."""
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1, 1, 1, 2], __rowid__=[10, 20, 30, 40])
+        df = _df(id=[1])  # delete/overwrite predicate: key == 1
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert sorted(result) == [("f.parquet", 10), ("f.parquet", 20), ("f.parquet", 30)]
+
+    def test_null_key_matches_null_null_safe(self):
+        """nulls_equal=True: an incoming NULL key tombstones an existing NULL
+        key (unlike SQL's NULL != NULL)."""
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1, None, 2], __rowid__=[10, 20, 30])
+        df = pl.DataFrame({"id": [None]}, schema={"id": pl.Int64})
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == [("f.parquet", 20)]
+
+    def test_multi_column_key_with_null_component(self):
+        """Composite key, one component NULL on both sides → matches null-safely."""
+        from supertable.processing import identify_deleted_rowids
+        existing = pl.DataFrame(
+            {"a": [1, 1, 2], "b": [None, "x", "y"], "__rowid__": [10, 20, 30]},
+            schema={"a": pl.Int64, "b": pl.Utf8, "__rowid__": pl.Int64},
+        )
+        df = pl.DataFrame({"a": [1], "b": [None]}, schema={"a": pl.Int64, "b": pl.Utf8})
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["a", "b"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == [("f.parquet", 10)]
+
+    def test_no_match_returns_empty(self):
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1, 2], __rowid__=[10, 20])
+        df = _df(id=[99])
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == []
+
+    def test_file_without_rowid_skipped(self):
+        """Legacy data lacking __rowid__ cannot be tombstoned by id → skipped."""
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1, 2])  # no __rowid__ column
+        df = _df(id=[1])
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == []
+
+    def test_non_overlapping_file_skipped(self):
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1], __rowid__=[10])
+        df = _df(id=[1])
+        result = identify_deleted_rowids(
+            df, {("f.parquet", False, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == []
+
+    def test_predicate_column_absent_from_incoming_returns_empty(self):
+        from supertable.processing import identify_deleted_rowids
+        existing = _df(id=[1], __rowid__=[10])
+        df = _df(other=[1])  # no 'id' column in incoming df
+        result = identify_deleted_rowids(
+            df, {("f.parquet", True, 100)}, ["id"],
+            file_cache={"f.parquet": existing},
+        )
+        assert result == []
+
+    def test_matches_across_multiple_files(self):
+        from supertable.processing import identify_deleted_rowids
+        f1 = _df(id=[1, 2], __rowid__=[10, 20])
+        f2 = _df(id=[1, 3], __rowid__=[30, 40])
+        df = _df(id=[1])
+        result = identify_deleted_rowids(
+            df,
+            {("f1.parquet", True, 100), ("f2.parquet", True, 100)},
+            ["id"],
+            file_cache={"f1.parquet": f1, "f2.parquet": f2},
+        )
+        assert sorted(result) == [("f1.parquet", 10), ("f2.parquet", 30)]
+
+
+# ===========================================================================
+# 14. identify_all_rowids  (delete-all: tombstone every live row)
+# ===========================================================================
+
+class TestIdentifyAllRowids:
+
+    def test_collects_every_rowid_across_resources(self):
+        from supertable.processing import identify_all_rowids
+        f1 = _df(id=[1, 2], __rowid__=[10, 20])
+        f2 = _df(id=[3], __rowid__=[30])
+        resources = [
+            {"file": "f1.parquet", "file_size": 100},
+            {"file": "f2.parquet", "file_size": 100},
+        ]
+        result = identify_all_rowids(
+            resources, file_cache={"f1.parquet": f1, "f2.parquet": f2}
+        )
+        assert sorted(result) == [
+            ("f1.parquet", 10), ("f1.parquet", 20), ("f2.parquet", 30),
+        ]
+
+    def test_empty_resources_returns_empty(self):
+        from supertable.processing import identify_all_rowids
+        assert identify_all_rowids([]) == []
+        assert identify_all_rowids(None) == []
+
+    def test_file_without_rowid_skipped(self):
+        from supertable.processing import identify_all_rowids
+        f1 = _df(id=[1])  # no __rowid__
+        resources = [{"file": "f1.parquet", "file_size": 100}]
+        result = identify_all_rowids(resources, file_cache={"f1.parquet": f1})
+        assert result == []
+
+    def test_resource_without_file_skipped(self):
+        from supertable.processing import identify_all_rowids
+        f1 = _df(id=[1], __rowid__=[10])
+        resources = [{"file_size": 100}, {"file": "f1.parquet", "file_size": 100}]
+        result = identify_all_rowids(resources, file_cache={"f1.parquet": f1})
+        assert result == [("f1.parquet", 10)]
+
+    def test_non_dict_resource_skipped(self):
+        from supertable.processing import identify_all_rowids
+        f1 = _df(id=[1], __rowid__=[10])
+        resources = ["not-a-dict", {"file": "f1.parquet", "file_size": 100}]
+        result = identify_all_rowids(resources, file_cache={"f1.parquet": f1})
+        assert result == [("f1.parquet", 10)]

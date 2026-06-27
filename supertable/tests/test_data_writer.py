@@ -289,11 +289,12 @@ class TestValidation:
 
     # ---- delete_only without overwrite_columns -------------------------
 
-    def test_delete_only_without_overwrite_columns_raises(self):
+    def test_delete_only_without_overwrite_columns_ok(self):
+        # delete-all path: delete_only with no overwrite_columns is allowed and
+        # tombstones the whole table.
         w = self._make_writer()
         df = _polars_df({"a": [1]})
-        with pytest.raises(ValueError, match="delete_only requires overwrite_columns"):
-            w.validation(df, "tbl", [], None, delete_only=True)
+        w.validation(df, "tbl", [], None, delete_only=True)
 
     def test_delete_only_with_overwrite_columns_ok(self):
         w = self._make_writer()

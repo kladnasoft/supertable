@@ -375,6 +375,27 @@ def make_presigned_list(storage, paths: List[str]) -> List[str]:
 # Reflection table creation
 # =========================================================
 
+def _reflection_select_cols(columns: Optional[List[str]]) -> str:
+    """Build the SELECT projection for a reflection table/view.
+
+    With no explicit ``columns`` this is a bare ``*``. With an explicit
+    projection the public columns are listed by name while the system
+    columns (``__rowid__`` / ``__timestamp__``) are pulled via a tolerant
+    ``COLUMNS(c -> c IN (...))`` tail rather than by name — so pre-migration
+    parquet that predates ``__rowid__`` does not raise "Referenced column
+    not found"; the absent system column is simply omitted from the scan.
+    """
+    if not columns:
+        return "*"
+    system = {ROWID_COL, TIMESTAMP_COL}
+    public = [c for c in columns if c and c.strip() and c not in system]
+    wants_system = any(c in system for c in columns)
+    parts = [quote_if_needed(c) for c in public]
+    if wants_system:
+        parts.append(f"COLUMNS(c -> c IN ('{ROWID_COL}', '{TIMESTAMP_COL}'))")
+    return ", ".join(parts) if parts else "*"
+
+
 def create_reflection_table(
         con: duckdb.DuckDBPyConnection,
         table_name: str,
@@ -386,9 +407,7 @@ def create_reflection_table(
         raise ValueError(f"No files provided for reflection table '{table_name}'")
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
-    select_cols = "*" if not columns else ", ".join(
-        quote_if_needed(c) for c in columns if c and c.strip()
-    )
+    select_cols = _reflection_select_cols(columns)
 
     sql = (
         f"CREATE TABLE {table_name} AS "
@@ -457,9 +476,7 @@ def create_reflection_view(
         raise ValueError(f"No files provided for reflection view '{view_name}'")
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
-    select_cols = "*" if not columns else ", ".join(
-        quote_if_needed(c) for c in columns if c and c.strip()
-    )
+    select_cols = _reflection_select_cols(columns)
 
     sql = (
         f"CREATE OR REPLACE VIEW {view_name} AS "
@@ -1087,9 +1104,12 @@ def create_tombstone_view(
 
       1. **Strip system columns** — ``__rowid__`` and ``__timestamp__`` are
          removed from the projection via a static DuckDB
-         ``* EXCLUDE (__rowid__, __timestamp__)`` so they never leak into
-         user query results.  Every written file carries both columns, so
-         the exclude list is fixed.
+         ``COLUMNS(c -> c NOT IN ('__rowid__', '__timestamp__'))`` so they
+         never leak into user query results.  The predicate is fixed (no
+         per-query schema introspection) yet tolerant: a column that is
+         absent — e.g. pre-migration parquet that predates ``__rowid__`` —
+         is simply not matched, instead of raising as a literal
+         ``EXCLUDE`` list would.
       2. **Apply the deletion-vector** — when *tombstone_def* carries a
          ``tombstone_path``, rows whose ``__rowid__`` appears in the
          deletion-vector parquet are removed with an ANTI JOIN *before*
@@ -1105,8 +1125,13 @@ def create_tombstone_view(
         view_name: the view name to create
         tombstone_def: TombstoneDef with ``tombstone_path`` (or None)
     """
-    exclude = (
-        f" EXCLUDE ({quote_if_needed(ROWID_COL)}, {quote_if_needed(TIMESTAMP_COL)})"
+    # Tolerant, static system-column strip: ``COLUMNS(c -> ...)`` silently
+    # skips a system column that is absent (pre-``__rowid__`` parquet), where
+    # a literal ``EXCLUDE`` list would raise. In an ANTI JOIN only the left
+    # table's columns reach the output, so the unqualified ``COLUMNS()`` never
+    # picks up the deletion-vector's ``__rowid__``.
+    live_cols = (
+        f"COLUMNS(c -> c NOT IN ('{ROWID_COL}', '{TIMESTAMP_COL}'))"
     )
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
@@ -1116,14 +1141,14 @@ def create_tombstone_view(
         escaped = escape_parquet_path(tomb_path)
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT {source_table}.*{exclude} FROM {source_table} "
+            f"SELECT {live_cols} FROM {source_table} "
             f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet('{escaped}')) AS __dv__ "
             f"ON {source_table}.{rid} = __dv__.{rid};"
         )
     else:
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT *{exclude} FROM {source_table};"
+            f"SELECT {live_cols} FROM {source_table};"
         )
     con.execute(sql)
 

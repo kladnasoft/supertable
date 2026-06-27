@@ -1,10 +1,10 @@
-"""Pluggable table readers for the forward-compatibility contract.
+"""Pluggable table readers for the reader-compatibility contract.
 
 A :class:`TableReader` turns a sealed scenario fixture into a canonical
-:class:`TableResult`.  The golden suite seals the CURRENT reader's output; this
-abstraction lets a FUTURE reader (the deletion-vector / ``__rowid``
-implementation) be held to the *same* sealed bytes without ever touching the
-goldens.
+:class:`TableResult`.  The golden suite seals the production deletion-vector
+reader's output; this abstraction lets an ALTERNATIVE reader (a new engine or a
+reimplemented executor) be held to the *same* sealed bytes without ever touching
+the goldens.
 
 To add an implementation, write a new ``TableReader`` and append an instance to
 :data:`READERS`.  ``test_compatibility`` then exercises it against every
@@ -36,11 +36,13 @@ class TableReader(Protocol):
 
 
 class CurrentViewReader:
-    """The CURRENT production read path (tombstone + dedup views over parquet).
+    """The production deletion-vector read path (tombstone anti-join over parquet).
 
-    This is the implementation that SEALED the goldens, exposed through the
-    reader Protocol so the compatibility test and the golden test share a single
-    oracle path (no second reimplementation to drift).
+    Removes rows solely by anti-joining ``__rowid__`` against the per-table
+    tombstone deletion-vector; there is no read-time key-collapse dedup.  This is
+    the implementation that SEALED the goldens, exposed through the reader
+    Protocol so the compatibility test and the golden test share a single oracle
+    path (no second reimplementation to drift).
     """
 
     name = "current_view"
@@ -54,31 +56,32 @@ class CurrentViewReader:
         return read_scenario(scenario, golden_root, engine="duckdb")
 
 
-class DeletionVectorReader:
-    """PLACEHOLDER for the future internal-``__rowid`` + deletion-vector reader.
+class AlternativeReader:
+    """PLACEHOLDER slot for an ALTERNATIVE read implementation.
 
-    When the deletion logic migrates to a stable row identifier + hybrid
-    deletion vectors + compaction, implement :meth:`read` to read the SAME
-    sealed inputs — which already contain only public columns plus the existing
-    internal ``__timestamp__`` — and return the SAME canonical
-    :class:`TableResult`.  Flip :meth:`available` to ``True`` and the
-    compatibility suite immediately holds the new reader to every sealed byte.
+    The production deletion-vector reader (:class:`CurrentViewReader`) already
+    seals the goldens.  Use this slot to hold a *second* implementation — a new
+    engine, or a reimplemented executor — to the SAME sealed inputs (public
+    columns + internal ``__rowid__``/``__timestamp__`` + the per-table tombstone
+    deletion-vector parquet) and the SAME canonical :class:`TableResult`.  Flip
+    :meth:`available` to ``True`` and the compatibility suite immediately holds
+    it to every sealed byte.
     """
 
-    name = "deletion_vector"
+    name = "alternative"
 
     def available(self) -> bool:
         return False
 
     def read(self, scenario, golden_root: str | Path) -> TableResult:  # pragma: no cover - placeholder
         raise NotImplementedError(
-            "DeletionVectorReader is a placeholder for the post-migration read "
-            "path.  Implement it to read the sealed inputs via __rowid + "
-            "deletion vectors and return the same canonical TableResult, then "
+            "AlternativeReader is a placeholder slot.  Implement it to read the "
+            "sealed inputs (public cols + __rowid__/__timestamp__ + tombstone "
+            "deletion-vector) and return the same canonical TableResult, then "
             "set available() -> True."
         )
 
 
 # Registry the compatibility suite parameterizes over.  Order is stable so test
 # ids stay deterministic.
-READERS = [CurrentViewReader(), DeletionVectorReader()]
+READERS = [CurrentViewReader(), AlternativeReader()]

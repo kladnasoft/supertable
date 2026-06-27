@@ -5,8 +5,11 @@
   "column_types": [
     "int"
   ],
-  "row_count": 1,
+  "row_count": 2,
   "rows": [
+    [
+      1
+    ],
     [
       1
     ]

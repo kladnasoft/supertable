@@ -1,7 +1,7 @@
 {
   "scenario": "ts_equal_same_key_diff_value_keyonly",
   "category": "timestamp",
-  "description": "Equal timestamp, same key, DIFFERENT value — which value survives is NON-DETERMINISTIC; sealed read projects only the key so exactly one row per key is the stable contract.",
+  "description": "Equal timestamp, same key, DIFFERENT value — two appends, neither supersedes the other (equal __timestamp__ is not an overwrite). Both rows survive; projecting only the key yields the key twice.",
   "business_key_columns": [
     "id"
   ],
@@ -9,15 +9,15 @@
     "id"
   ],
   "expected_kind": "result",
-  "expected_row_count": 1,
+  "expected_row_count": 2,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
       "id"
     ]
   },
-  "input_checksum": "sha256:fdc197b29de7de029cf6749fab4c87799574ee6c74fe2ad44e6f96a2dbbcc4a8",
-  "expected_checksum": "sha256:3221e93170e36a0c7ef83e258101daf9bd96d96a5f74a6f7c9d380e077921ca9",
-  "created_from": "pre-rowid-current-reader",
+  "input_checksum": "sha256:47a95b50c054a1870e731cc629fa6ebc776bbd38495d5ed21e48690b169f0caf",
+  "expected_checksum": "sha256:427c6030049a7db2f571c7dd72aaf7011e43fac48c2d59c818ce7baacec48ccb",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

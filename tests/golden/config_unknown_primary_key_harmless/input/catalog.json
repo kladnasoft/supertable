@@ -1,27 +1,30 @@
 {
   "organization": "charorg",
-  "super_name": "super_error_missing_timestamp_column",
+  "super_name": "super_config_unknown_primary_key_harmless",
   "tables": {
     "t": {
       "primary_keys": [
-        "id"
+        "nope"
       ],
       "dedup_on_read": true,
       "schema": {
         "id": "Int64",
-        "val": "String"
+        "val": "String",
+        "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
       },
       "resources": [
         {
           "file": "t__f1.parquet",
           "rows": 1,
-          "columns": 2
+          "columns": 3
         }
       ],
+      "tombstone_file": null,
+      "tombstone_rows": 0,
       "tombstones": {
         "deleted_keys": [],
         "primary_keys": [
-          "id"
+          "nope"
         ]
       }
     }

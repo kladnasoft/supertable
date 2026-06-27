@@ -986,11 +986,50 @@ def identify_deleted_rowids(
             continue
 
         with p.span("delete.semi_join"):
-            matched = existing_df.join(incoming_keys, on=overwrite_columns, how="semi")
+            # nulls_equal=True so a NULL in an overwrite key matches an existing
+            # NULL (null-safe overwrite/delete), unlike SQL's NULL != NULL.
+            matched = existing_df.join(
+                incoming_keys, on=overwrite_columns, how="semi", nulls_equal=True
+            )
         if matched.height == 0:
             continue
 
         rowids = matched.get_column(ROWID_COL).drop_nulls().to_list()
+        pairs.extend((file, int(rid)) for rid in rowids)
+        p.add("delete_rows_matched", len(rowids))
+
+    return pairs
+
+
+def identify_all_rowids(
+        resources: list,
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        profiler: Optional[Profiler] = None,
+) -> List[Tuple[str, int]]:
+    """Collect every ``(file, __rowid__)`` pair across all data files.
+
+    This is the delete-all tombstone set used by ``delete_only`` writes that
+    pass no *overwrite_columns*: the whole table is logically emptied by
+    tombstoning every live ``__rowid__``. Files lacking a ``__rowid__`` column
+    (legacy data written before rowids existed) cannot be tombstoned by id and
+    are skipped.
+    """
+    p = profiler or get_null_profiler()
+    pairs: List[Tuple[str, int]] = []
+    for resource in resources or []:
+        if not isinstance(resource, dict):
+            continue
+        file = resource.get("file")
+        if not file:
+            continue
+        file_size = int(resource.get("file_size") or 0)
+        if file_cache is not None and file in file_cache:
+            existing_df = file_cache.get(file)
+        else:
+            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
+        if existing_df is None or ROWID_COL not in existing_df.columns:
+            continue
+        rowids = existing_df.get_column(ROWID_COL).drop_nulls().to_list()
         pairs.extend((file, int(rid)) for rid in rowids)
         p.add("delete_rows_matched", len(rowids))
 

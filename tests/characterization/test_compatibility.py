@@ -4,12 +4,12 @@ Parameterized over (reader x non-error scenario).  Each implemented reader must
 turn the sealed input into a :class:`TableResult` that matches the sealed
 ``expected/result.json`` exactly (schema / row-count / multiset-or-ordered row
 contents).  A reader that is not implemented yet (``available() is False``) is
-skipped, so the future deletion-vector reader starts life as a visible pending
-gate and becomes a hard conformance check the instant it is wired up — with no
-edit to the sealed goldens.
+skipped, so an alternative reader starts life as a visible pending gate and
+becomes a hard conformance check the instant it is wired up — with no edit to
+the sealed goldens.
 
-This is the harness a future engineer runs to prove the post-migration read path
-is byte-for-byte backward compatible with the pre-migration behavior.
+This is the harness a future engineer runs to prove an alternative read path is
+byte-for-byte equivalent to the production deletion-vector reader.
 """
 
 from __future__ import annotations

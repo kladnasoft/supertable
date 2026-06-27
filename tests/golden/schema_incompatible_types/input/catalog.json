@@ -24,6 +24,8 @@
           "columns": 3
         }
       ],
+      "tombstone_file": null,
+      "tombstone_rows": 0,
       "tombstones": {
         "deleted_keys": [],
         "primary_keys": [

@@ -102,7 +102,7 @@ def _write_scenario_manifest(
         },
         "input_checksum": "sha256:" + _sha256_file(catalog_path),
         "expected_checksum": "sha256:" + _sha256_file(expected_path),
-        "created_from": "pre-rowid-current-reader",
+        "created_from": "deletion-vector-current-reader",
         "contains_internal_rowid": False,
     }
     expected_dir.mkdir(parents=True, exist_ok=True)

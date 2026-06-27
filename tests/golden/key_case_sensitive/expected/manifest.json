@@ -10,15 +10,15 @@
     "val"
   ],
   "expected_kind": "result",
-  "expected_row_count": 1,
+  "expected_row_count": 2,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
       "code"
     ]
   },
-  "input_checksum": "sha256:fcd690885a207136f1a35d0143978e4ed2a74e42ad351e860daf5196adcfd6b7",
-  "expected_checksum": "sha256:699b0f25dfda9b0181adffdd02709ba26ce6ff76edfe38cd08c23f881c8bd3cd",
-  "created_from": "pre-rowid-current-reader",
+  "input_checksum": "sha256:2fa74b1c588ed9deb90e0117ddc633e0144efaa240a8b774a2e9aa4d13f1a415",
+  "expected_checksum": "sha256:029a9212d73b006681d81a2fd5e163ab69aac5d6822f4eff7399e1d980bcf170",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

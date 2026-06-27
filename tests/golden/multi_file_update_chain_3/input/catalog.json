@@ -29,6 +29,8 @@
           "columns": 3
         }
       ],
+      "tombstone_file": "m__tombstone.parquet",
+      "tombstone_rows": 2,
       "tombstones": {
         "deleted_keys": [],
         "primary_keys": [

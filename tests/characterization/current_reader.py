@@ -85,6 +85,14 @@ def inject_catalog(catalog: dict, catalog_dir: Path) -> None:
             "schema": t.get("schema", {}),
             "snapshot_version": 1,
         }
+
+        # Deletion-vector pointer: when the scenario tombstones any row the read
+        # path resolves payload["tombstone"] to a DV parquet and anti-joins
+        # __rowid__ against it (the sole row-removal mechanism — no key dedup).
+        tomb_file = t.get("tombstone_file")
+        if tomb_file:
+            payload["tombstone"] = str((catalog_dir / tomb_file).resolve())
+            payload["tombstone_rows"] = int(t.get("tombstone_rows") or 0)
         cat.set_leaf_payload_cas(
             org, sup, simple_name, payload,
             path=f"{org}/{sup}/tables/{simple_name}/snapshots/sealed.json",

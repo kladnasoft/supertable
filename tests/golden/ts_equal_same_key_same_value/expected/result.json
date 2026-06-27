@@ -7,8 +7,12 @@
     "int",
     "str"
   ],
-  "row_count": 1,
+  "row_count": 2,
   "rows": [
+    [
+      1,
+      "same"
+    ],
     [
       1,
       "same"

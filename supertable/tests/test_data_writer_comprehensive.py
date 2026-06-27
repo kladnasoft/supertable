@@ -240,6 +240,7 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         patch("supertable.data_writer.find_overlapping_files", return_value=set()),
         patch("supertable.data_writer.write_parquet_and_collect_resources") as mock_process,
         patch("supertable.data_writer.identify_deleted_rowids") as mock_delete,
+        patch("supertable.data_writer.identify_all_rowids") as mock_delete_all,
         patch("supertable.data_writer.build_tombstone_file") as mock_build_tombstone,
         patch("supertable.data_writer.filter_stale_incoming_rows") as mock_filter_stale,
         # MonitoringWriter is used as `with MonitoringWriter(...) as mon:` —
@@ -281,6 +282,8 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         mock_process.side_effect = _append_resource
         # identify_deleted_rowids returns a list of (file, __rowid__) pairs.
         mock_delete.return_value = []
+        # identify_all_rowids (delete-all path) returns the same shape.
+        mock_delete_all.return_value = []
         # build_tombstone_file returns (tombstone_path, combined_df).
         mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
 
@@ -297,6 +300,7 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             "simple_inst": simple_inst,
             "process": mock_process,
             "delete": mock_delete,
+            "delete_all": mock_delete_all,
             "build_tombstone": mock_build_tombstone,
             "filter_stale": mock_filter_stale,
             "mirror": MockMirror,
@@ -400,9 +404,9 @@ class TestValidation:
     # -- delete_only rules --
 
     def test_delete_only_without_overwrite(self):
+        # delete-all path: valid, no overwrite_columns required.
         dw = self._make_writer_for_validation()
-        with pytest.raises(ValueError, match="delete_only requires overwrite_columns"):
-            dw.validation(self._df(), "t1", [], None, True)
+        dw.validation(self._df(), "t1", [], None, True)
 
     def test_delete_only_with_overwrite_valid(self):
         dw = self._make_writer_for_validation()
@@ -629,11 +633,22 @@ class TestWriteDeleteOnly:
         assert inserted == 0
         assert deleted == 1
 
-    def test_delete_only_requires_overwrite_columns(self, writer):
-        """validation should catch this before reaching process_delete_only."""
+    def test_delete_only_without_overwrite_columns_deletes_all(self, writer):
+        """delete_only with no overwrite_columns is the delete-all path: it
+        tombstones every existing row via identify_all_rowids and inserts
+        nothing."""
         data = _simple_arrow(3)
-        with pytest.raises(ValueError, match="delete_only requires overwrite_columns"):
-            writer.write("admin", "t1", data, overwrite_columns=[], delete_only=True)
+        mock_delete_all = writer._mocks["delete_all"]
+        mock_delete_all.return_value = [("old.parquet", 1), ("old.parquet", 2)]
+
+        result = writer.write("admin", "t1", data, overwrite_columns=[], delete_only=True)
+
+        assert mock_delete_all.called
+        # The match-based identifier must NOT run on the delete-all path.
+        assert not writer._mocks["delete"].called
+        total_cols, total_rows, inserted, deleted = result
+        assert inserted == 0
+        assert deleted == 2
 
 
 class TestWriteNewerThan:
@@ -845,8 +860,8 @@ class TestWriteErrorPropagation:
 
     def test_validation_error_propagates(self, writer):
         data = _simple_arrow(3)
-        with pytest.raises(ValueError, match="delete_only requires"):
-            writer.write("admin", "t1", data, overwrite_columns=[], delete_only=True)
+        with pytest.raises(ValueError, match="newer_than requires overwrite_columns"):
+            writer.write("admin", "t1", data, overwrite_columns=[], newer_than="value")
 
     def test_snapshot_read_error_propagates(self, writer):
         simple_inst = writer._mocks["simple_inst"]

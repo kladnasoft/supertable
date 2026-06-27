@@ -1,17 +1,17 @@
 {
   "columns": [
     "id",
-    "__timestamp__"
+    "val"
   ],
   "column_types": [
     "int",
-    "timestamp"
+    "str"
   ],
   "row_count": 1,
   "rows": [
     [
       1,
-      "TS:2026-01-01T10:00:00.000000Z"
+      "a"
     ]
   ]
 }

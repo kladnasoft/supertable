@@ -1,7 +1,7 @@
 {
   "scenario": "ts_equal_same_key_same_value",
   "category": "timestamp",
-  "description": "Equal timestamp, same key, identical value — dedup collapses to one row deterministically.",
+  "description": "Equal timestamp, same key, identical value — two appends with no overwrite. Neither row supersedes the other (equal __timestamp__ is not an overwrite), so both physical rows survive.",
   "business_key_columns": [
     "id"
   ],
@@ -10,15 +10,15 @@
     "val"
   ],
   "expected_kind": "result",
-  "expected_row_count": 1,
+  "expected_row_count": 2,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
       "id"
     ]
   },
-  "input_checksum": "sha256:54c25d4d92b1131522020449d5f6fe94d504e92b463910f8af57b71fbb8341c4",
-  "expected_checksum": "sha256:75a1e83c6a9b5bd229127db8b8332a8c0106e87275cb15065d43ddb9c709a23f",
-  "created_from": "pre-rowid-current-reader",
+  "input_checksum": "sha256:45fac3c069cb88dce0cbd6ff8d1a4104a496a868e8c635a1a8c4f4dee5a95ada",
+  "expected_checksum": "sha256:b182196af1e660232c60c573c6719576394e33cb3cd6d503ff1a7366421f2920",
+  "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }
