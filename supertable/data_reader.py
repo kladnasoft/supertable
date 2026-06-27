@@ -194,6 +194,7 @@ class DataReader:
                 storage=self.storage,
                 tables=physical_tables,
                 predicate_constraints=predicate_constraints,
+                plan_stats=self.plan_stats,
             )
             reflection = estimator.estimate()
 

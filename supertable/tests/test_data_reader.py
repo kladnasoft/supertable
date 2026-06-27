@@ -1486,6 +1486,7 @@ class TestExecuteExecutorArgs:
             storage=mock_storage,
             tables=physical_tables,
             predicate_constraints={},
+            plan_stats=MockPlanStats.return_value,
         )
 
 

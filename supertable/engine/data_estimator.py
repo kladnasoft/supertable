@@ -14,6 +14,7 @@ from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
+from supertable.utils.profiler import Profiler
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
 from supertable.utils.sql_parser import TableDefinition
@@ -116,6 +117,7 @@ class DataEstimator:
         storage,
         tables: List[TableDefinition],
         predicate_constraints: Optional[Dict] = None,
+        plan_stats: Optional[PlanStats] = None,
     ):
         self.organization = organization
         self.storage = storage
@@ -125,7 +127,11 @@ class DataEstimator:
         # None / empty ⇒ no read-path pruning.
         self.predicate_constraints = predicate_constraints or {}
         self.timer: Optional[Timer] = None
-        self.plan_stats: Optional[PlanStats] = None
+        # When the caller (DataReader) injects its PlanStats, estimator stats —
+        # REFLECTIONS, REFLECTION_SIZE and the read-pruning counters — land on
+        # the same object that flows to extend_execution_plan, so they reach the
+        # read monitoring payload. Standalone callers get a fresh PlanStats.
+        self.plan_stats: Optional[PlanStats] = plan_stats
         self.catalog = RedisCatalog()
 
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
@@ -301,12 +307,17 @@ class DataEstimator:
         simple_name: str,
         raw_keys: List[str],
         stats_file: Optional[str],
+        profiler: Optional[Profiler] = None,
     ) -> List[str]:
         """Narrow *raw_keys* to those that could satisfy the query predicates.
 
         Returns *raw_keys* unchanged whenever pruning is disabled, there's no
         stats artifact, or the query carries no usable constraint for this
         table — and never raises (a pruning failure must not break a read).
+
+        *profiler*, when supplied, accumulates the same IO/pruning counters the
+        write path emits (``stats_cache_hit``/``stats_cache_miss``,
+        ``read_pruned_files``) so the read monitoring payload can surface them.
         """
         if not settings.SUPERTABLE_READ_PRUNING_ENABLED:
             return raw_keys
@@ -318,8 +329,10 @@ class DataEstimator:
         if not occurrences:
             return raw_keys
         try:
-            stats_df = load_stats(stats_file, allow_cache=True)
-            return prune_files_by_predicates(raw_keys, stats_df, occurrences)
+            stats_df = load_stats(stats_file, allow_cache=True, profiler=profiler)
+            return prune_files_by_predicates(
+                raw_keys, stats_df, occurrences, profiler=profiler,
+            )
         except Exception as e:
             logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
             return raw_keys
@@ -331,11 +344,18 @@ class DataEstimator:
         Performs RBAC check and column validation.
         """
         self.timer = Timer()
-        self.plan_stats = PlanStats()
+        if self.plan_stats is None:
+            self.plan_stats = PlanStats()
+
+        # One profiler for the whole estimate; threaded into _prune_files so the
+        # stats-cache and pruned-file counters mirror the write-path convention.
+        prune_profiler = Profiler()
 
         supers: List[SuperSnapshot] = []
         reflection_file_size = 0
         max_freshness_ms = 0
+        files_before_prune = 0
+        files_pruned = 0
 
         super_map = self._get_supertable_map()
 
@@ -389,7 +409,12 @@ class DataEstimator:
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
                 # satisfy the query's WHERE before resolving them to scan URLs.
-                survivors = self._prune_files(super_name, simple_name, raw_keys, stats_file)
+                survivors = self._prune_files(
+                    super_name, simple_name, raw_keys, stats_file,
+                    profiler=prune_profiler,
+                )
+                files_before_prune += len(raw_keys)
+                files_pruned += len(raw_keys) - len(survivors)
 
                 parquet_files: List[str] = []
                 for file_key in survivors:
@@ -436,6 +461,17 @@ class DataEstimator:
 
         self.plan_stats.add_stat({"REFLECTIONS": total_reflections})
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
+
+        # Read-path pruning observability — only when pruning is engaged, so a
+        # disabled-pruning read doesn't litter the payload with noise. Mirrors
+        # the write path: surface the count effect plus the profiler's IO/cache
+        # counters (stats_cache_hit/miss, read_pruned_files).
+        if settings.SUPERTABLE_READ_PRUNING_ENABLED:
+            self.plan_stats.add_stat({"FILES_BEFORE_PRUNE": files_before_prune})
+            self.plan_stats.add_stat({"FILES_PRUNED": files_pruned})
+            prune_counts = prune_profiler.emit_counts()
+            if prune_counts:
+                self.plan_stats.add_stat({"PRUNE_COUNTS": prune_counts})
 
         return Reflection(
             storage_type=type(self.storage).__name__,
