@@ -1,10 +1,156 @@
 # route: supertable.utils.sql_parser
+from datetime import date, datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
-from supertable.data_classes import TableDefinition
+from sqlglot.optimizer.scope import traverse_scope
+from supertable.data_classes import PredInterval, TableDefinition
+
+
+# ---------------------------------------------------------------------------
+# Predicate → interval extraction helpers (read-path file pruning)
+# ---------------------------------------------------------------------------
+
+_COMPARISON_OPS: Dict[type, str] = {
+    exp.EQ: "eq",
+    exp.GT: "gt",
+    exp.GTE: "gte",
+    exp.LT: "lt",
+    exp.LTE: "lte",
+}
+
+# When the column sits on the RHS (``5 < t.x``) the operator flips.
+_FLIP_OP: Dict[str, str] = {
+    "eq": "eq", "gt": "lt", "gte": "lte", "lt": "gt", "lte": "gte",
+}
+
+
+def _unwrap_paren(node: exp.Expression) -> exp.Expression:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _split_and(node: exp.Expression) -> List[exp.Expression]:
+    """Flatten a top-level conjunction into its AND-connected leaves.
+
+    Only ``AND`` is split; an ``OR`` (or anything else) is returned whole so the
+    caller treats it as a single, un-extractable predicate (→ no constraint).
+    """
+    node = _unwrap_paren(node)
+    if isinstance(node, exp.And):
+        return _split_and(node.left) + _split_and(node.right)
+    return [node]
+
+
+def _parse_datetime_literal(s: str) -> Optional[datetime]:
+    """Parse an ISO-ish date/datetime string into a tz-naive microsecond
+    ``datetime``; ``None`` when it doesn't look like a date."""
+    txt = s.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _literal_to_lane_value(node: exp.Expression) -> Optional[Tuple[str, object]]:
+    """Reduce a literal-ish expression to ``(lane, value)`` or ``None``.
+
+    Lanes: ``numeric`` (ints/floats/bools), ``string`` (quoted strings) and
+    ``timestamp`` (DATE/TIMESTAMP casts of date-shaped strings).  Any expression
+    that isn't a pure literal (a column, a function, an arithmetic node, a
+    subquery) yields ``None`` → that predicate contributes no constraint.
+    """
+    node = _unwrap_paren(node)
+
+    if isinstance(node, exp.Neg):
+        inner = _literal_to_lane_value(node.this)
+        if inner is not None and inner[0] == "numeric":
+            return "numeric", -inner[1]
+        return None
+
+    if isinstance(node, exp.Boolean):
+        return "numeric", 1 if node.this else 0
+
+    if isinstance(node, (exp.Cast, exp.TryCast)):
+        to = node.args.get("to")
+        type_name = ""
+        if to is not None and getattr(to, "this", None) is not None:
+            type_name = str(to.this).upper()
+        inner = node.this
+        if any(t in type_name for t in ("DATE", "TIMESTAMP", "DATETIME")):
+            if isinstance(inner, exp.Literal) and inner.is_string:
+                dt = _parse_datetime_literal(inner.this)
+                return ("timestamp", dt) if dt is not None else None
+            return None
+        # Numeric / textual cast → fall through to the inner literal.
+        return _literal_to_lane_value(inner)
+
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return "string", node.this
+        text = node.this
+        try:
+            if any(c in text for c in (".", "e", "E")):
+                return "numeric", float(text)
+            return "numeric", int(text)
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
+
+def _interval_for_op(op: str, lane: str, value: object) -> PredInterval:
+    if op == "eq":
+        return PredInterval(lane, value, True, value, True)
+    if op == "gt":
+        return PredInterval(lane, value, False, None, True)
+    if op == "gte":
+        return PredInterval(lane, value, True, None, True)
+    if op == "lt":
+        return PredInterval(lane, None, True, value, False)
+    # lte
+    return PredInterval(lane, None, True, value, True)
+
+
+def _max_lower(alo, ai, blo, bi):
+    """Tighter (greater) of two lower bounds; ``None`` == -inf."""
+    if alo is None:
+        return blo, bi
+    if blo is None:
+        return alo, ai
+    if alo > blo:
+        return alo, ai
+    if alo < blo:
+        return blo, bi
+    return alo, (ai and bi)
+
+
+def _min_upper(ahi, ai, bhi, bi):
+    """Tighter (lesser) of two upper bounds; ``None`` == +inf."""
+    if ahi is None:
+        return bhi, bi
+    if bhi is None:
+        return ahi, ai
+    if ahi < bhi:
+        return ahi, ai
+    if ahi > bhi:
+        return bhi, bi
+    return ahi, (ai and bi)
+
+
+def _intersect_intervals(a: PredInterval, b: PredInterval) -> Optional[PredInterval]:
+    """Intersect two predicates on the same column; ``None`` if their lanes
+    conflict (the column then becomes un-prunable)."""
+    if a.lane != b.lane:
+        return None
+    lo, lo_incl = _max_lower(a.lo, a.lo_incl, b.lo, b.lo_incl)
+    hi, hi_incl = _min_upper(a.hi, a.hi_incl, b.hi, b.hi_incl)
+    return PredInterval(a.lane, lo, lo_incl, hi, hi_incl)
 
 
 class SQLParser:
@@ -535,5 +681,149 @@ class SQLParser:
                 alias=table_name,
                 columns=columns,
             ))
+
+        return result
+
+    # ---------------- Predicate extraction (read-path pruning) ----------------
+
+    def _conjunct_to_constraint(
+        self,
+        node: exp.Expression,
+        alias_to_phys: Dict[str, Tuple[str, str]],
+        single_alias: Optional[str],
+    ) -> Optional[Tuple[str, str, PredInterval]]:
+        """Turn one WHERE conjunct into ``(alias, column, PredInterval)``.
+
+        Only simple ``column OP literal`` comparisons, ``BETWEEN`` and ``IN``
+        (literal list) are recognised — and only when the column resolves to a
+        direct table source in the current scope.  Everything else (functions on
+        the column, ``!=``, ``IS NULL``, sub-selects, OR-branches) returns
+        ``None`` so the file is conservatively retained.
+        """
+        node = _unwrap_paren(node)
+
+        def _resolve(col: exp.Column) -> Optional[str]:
+            qualifier = col.table
+            if qualifier:
+                return qualifier if qualifier in alias_to_phys else None
+            return single_alias
+
+        # column OP literal  (or literal OP column)
+        op = _COMPARISON_OPS.get(type(node))
+        if op is not None:
+            left, right = node.left, node.right
+            if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
+                col, lit, flip = left, right, False
+            elif isinstance(right, exp.Column) and not isinstance(left, exp.Column):
+                col, lit, flip = right, left, True
+            else:
+                return None
+            alias = _resolve(col)
+            if alias is None:
+                return None
+            lane_value = _literal_to_lane_value(lit)
+            if lane_value is None:
+                return None
+            lane, value = lane_value
+            if flip:
+                op = _FLIP_OP[op]
+            return alias, col.name, _interval_for_op(op, lane, value)
+
+        # column BETWEEN low AND high
+        if isinstance(node, exp.Between):
+            col = node.this
+            if not isinstance(col, exp.Column):
+                return None
+            alias = _resolve(col)
+            if alias is None:
+                return None
+            lo_lv = _literal_to_lane_value(node.args.get("low"))
+            hi_lv = _literal_to_lane_value(node.args.get("high"))
+            if lo_lv is None or hi_lv is None or lo_lv[0] != hi_lv[0]:
+                return None
+            return alias, col.name, PredInterval(lo_lv[0], lo_lv[1], True, hi_lv[1], True)
+
+        # column IN (literal, literal, ...)
+        if isinstance(node, exp.In):
+            col = node.this
+            if not isinstance(col, exp.Column) or node.args.get("query"):
+                return None
+            alias = _resolve(col)
+            if alias is None:
+                return None
+            exprs = node.args.get("expressions") or []
+            if not exprs:
+                return None
+            lanes_values = [_literal_to_lane_value(e) for e in exprs]
+            if any(lv is None for lv in lanes_values):
+                return None
+            lanes = {lv[0] for lv in lanes_values}
+            if len(lanes) != 1:
+                return None
+            lane = lanes.pop()
+            values = [lv[1] for lv in lanes_values]
+            return alias, col.name, PredInterval(lane, min(values), True, max(values), True)
+
+        return None
+
+    def get_predicate_constraints(self) -> Dict[Tuple[str, str], List[Dict[str, PredInterval]]]:
+        """Per physical table, the list of per-scan constraint dicts.
+
+        Keyed by ``(super_name.lower(), simple_name.lower())``.  Each list entry
+        is one *occurrence* of that table (an alias in some query scope) mapping
+        ``column → PredInterval`` for the conjuncts that constrain it; an empty
+        dict means that occurrence is unconstrained (so the table must be read in
+        full).  Read-path pruning unions across occurrences: a file is dropped
+        only when **every** occurrence excludes it.
+
+        Always returns safely — any parse/scope error yields ``{}`` (no
+        pruning), so this never breaks a query.
+        """
+        result: Dict[Tuple[str, str], List[Dict[str, PredInterval]]] = {}
+        try:
+            scopes = traverse_scope(self._parsed)
+        except Exception:
+            return result
+
+        for scope in scopes:
+            select = scope.expression
+            if not isinstance(select, exp.Select):
+                continue
+
+            alias_to_phys: Dict[str, Tuple[str, str]] = {}
+            for name, src in scope.sources.items():
+                if isinstance(src, exp.Table):
+                    db = self._get_db_name(src) or self.default_super_name
+                    alias_to_phys[name] = (db, src.name)
+            if not alias_to_phys:
+                continue
+
+            single_alias = (
+                next(iter(alias_to_phys))
+                if len(alias_to_phys) == 1 and len(scope.sources) == 1
+                else None
+            )
+
+            per_alias: Dict[str, Dict[str, PredInterval]] = {a: {} for a in alias_to_phys}
+            where = select.args.get("where")
+            if where is not None:
+                for conj in _split_and(where.this):
+                    parsed = self._conjunct_to_constraint(conj, alias_to_phys, single_alias)
+                    if parsed is None:
+                        continue
+                    alias, col, interval = parsed
+                    d = per_alias[alias]
+                    if col in d:
+                        merged = _intersect_intervals(d[col], interval)
+                        if merged is None:
+                            del d[col]
+                        else:
+                            d[col] = merged
+                    else:
+                        d[col] = interval
+
+            for alias, (db, tbl) in alias_to_phys.items():
+                key = (db.lower(), tbl.lower())
+                result.setdefault(key, []).append(per_alias[alias])
 
         return result

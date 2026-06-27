@@ -17,6 +17,7 @@ from supertable.utils.timer import Timer
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
 from supertable.utils.sql_parser import TableDefinition
+from supertable.processing import load_stats, prune_files_by_predicates
 
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -109,10 +110,20 @@ class DataEstimator:
       }
     """
 
-    def __init__(self, organization: str, storage, tables: List[TableDefinition]):
+    def __init__(
+        self,
+        organization: str,
+        storage,
+        tables: List[TableDefinition],
+        predicate_constraints: Optional[Dict] = None,
+    ):
         self.organization = organization
         self.storage = storage
         self.tables = tables
+        # (super_lower, simple_lower) -> List[Dict[col, PredInterval]] from the
+        # query's WHERE clauses; used to prune files by the stats artifact.
+        # None / empty ⇒ no read-path pruning.
+        self.predicate_constraints = predicate_constraints or {}
         self.timer: Optional[Timer] = None
         self.plan_stats: Optional[PlanStats] = None
         self.catalog = RedisCatalog()
@@ -284,6 +295,35 @@ class DataEstimator:
             for super_name, simple_names in grouped.items()
         ]
 
+    def _prune_files(
+        self,
+        super_name: str,
+        simple_name: str,
+        raw_keys: List[str],
+        stats_file: Optional[str],
+    ) -> List[str]:
+        """Narrow *raw_keys* to those that could satisfy the query predicates.
+
+        Returns *raw_keys* unchanged whenever pruning is disabled, there's no
+        stats artifact, or the query carries no usable constraint for this
+        table — and never raises (a pruning failure must not break a read).
+        """
+        if not settings.SUPERTABLE_READ_PRUNING_ENABLED:
+            return raw_keys
+        if not stats_file or not raw_keys:
+            return raw_keys
+        occurrences = self.predicate_constraints.get(
+            (super_name.lower(), simple_name.lower())
+        )
+        if not occurrences:
+            return raw_keys
+        try:
+            stats_df = load_stats(stats_file, allow_cache=True)
+            return prune_files_by_predicates(raw_keys, stats_df, occurrences)
+        except Exception as e:
+            logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
+            return raw_keys
+
     # ----------------------- main API -----------------------
     def estimate(self) -> Reflection:
         """
@@ -316,8 +356,10 @@ class DataEstimator:
                     super_name, self.organization, create_if_missing=False,
                 )
 
-                parquet_files: List[str] = []
                 schema: Set[str] = set()
+                raw_keys: List[str] = []
+                key_size: Dict[str, int] = {}
+                stats_file: Optional[str] = None
 
                 current_version = 0
                 for snapshot in snapshots:
@@ -333,15 +375,26 @@ class DataEstimator:
                     current_version = current_snapshot_data.get("snapshot_version", 0)
                     current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
                     schema.update(dict_keys_to_lowercase(current_schema).keys())
+                    sf = current_snapshot_data.get("stats_file")
+                    if sf:
+                        stats_file = sf
 
                     resources = current_snapshot_data.get("resources", []) or []
                     for resource in resources:
                         file_key = resource.get("file")
                         if not file_key:
                             continue
-                        resolved = self._to_duckdb_path(file_key)
-                        parquet_files.append(resolved)
-                        reflection_file_size += int(resource.get("file_size", 0))
+                        raw_keys.append(file_key)
+                        key_size[file_key] = int(resource.get("file_size", 0))
+
+                # Read-path pruning: drop raw keys whose stats prove they cannot
+                # satisfy the query's WHERE before resolving them to scan URLs.
+                survivors = self._prune_files(super_name, simple_name, raw_keys, stats_file)
+
+                parquet_files: List[str] = []
+                for file_key in survivors:
+                    parquet_files.append(self._to_duckdb_path(file_key))
+                    reflection_file_size += key_size.get(file_key, 0)
 
                 # SuperSnapshot is created ONCE per (super_name, simple_name) after
                 # all snapshot iterations have accumulated their files and schema.

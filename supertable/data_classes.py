@@ -1,5 +1,23 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set
+
+
+class PredInterval(NamedTuple):
+    """A closed/open range of values a column is *allowed* to take, derived from
+    a SQL WHERE predicate, used for read-path file pruning.
+
+    ``lane`` is one of ``"numeric"`` / ``"string"`` / ``"timestamp"`` and selects
+    which stored stats lane the interval is compared against (numeric unifies the
+    stored ``bigint``/``double`` lanes).  ``lo``/``hi`` are the bounds with
+    ``None`` meaning unbounded (-inf / +inf); ``lo_incl``/``hi_incl`` mark
+    whether each bound is inclusive.  Examples: ``col = 5`` →
+    ``(lane, 5, True, 5, True)``; ``col > 5`` → ``(lane, 5, False, None, True)``.
+    """
+    lane: str
+    lo: object
+    lo_incl: bool
+    hi: object
+    hi_incl: bool
 
 
 @dataclass

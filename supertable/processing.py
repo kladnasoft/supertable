@@ -5,6 +5,8 @@ import logging
 import os
 import io
 import time
+import threading
+from collections import OrderedDict
 from datetime import datetime, date, timezone
 from typing import Dict, List, Set, Tuple, Optional
 
@@ -14,8 +16,10 @@ import pyarrow.parquet as pq
 
 from supertable.utils.helper import generate_filename
 from supertable.config.defaults import default
+from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
 from supertable.utils.profiler import Profiler, get_null_profiler
+from supertable.data_classes import PredInterval
 
 # Target row-group size for all Parquet writes.
 # 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
@@ -1476,6 +1480,253 @@ def prune_overlapping_files_by_stats(
             pruned += 1
     p.add("stats_pruned_files", pruned)
     return kept
+
+
+# ===========================================================================
+# Read-path pruning (consumer 5b) — prune files by SQL WHERE predicates
+# ---------------------------------------------------------------------------
+# The write path probes the *incoming dataframe's* range against the stored
+# stats.  The read path instead derives an *allowed range* per column from the
+# query's WHERE predicate (a :class:`PredInterval`) and drops any file whose
+# every row group provably cannot satisfy it.  Same conservative contract:
+# a file is dropped ONLY when no row group can match; every uncertainty (no
+# stats, missing/​unavailable stat, lane it can't compare) retains the file.
+# ===========================================================================
+
+
+def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]) -> bool:
+    """True if a value in the stored row-group range ``[s_min, s_max]`` could
+    satisfy the predicate interval *pred*.
+
+    Returns ``True`` (assume overlap → retain) whenever the predicate lane and
+    the stored lane can't be compared — never a false "no overlap", so pruning
+    stays sound.
+    """
+    p_lane = pred.lane
+    s_lane, s_min, s_max = stored
+    if p_lane == "numeric" and s_lane in ("bigint", "double"):
+        smin, smax = float(s_min), float(s_max)
+        plo = None if pred.lo is None else float(pred.lo)
+        phi = None if pred.hi is None else float(pred.hi)
+    elif p_lane == "timestamp" and s_lane == "timestamp":
+        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+    elif p_lane == "string" and s_lane == "string":
+        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+    else:
+        return True  # incomparable lanes → cannot exclude
+
+    # Effective lower bound = the greater of [smin (inclusive), plo].
+    if plo is None or smin > plo:
+        low, low_incl = smin, True
+    elif smin < plo:
+        low, low_incl = plo, pred.lo_incl
+    else:
+        low, low_incl = smin, pred.lo_incl
+    # Effective upper bound = the lesser of [smax (inclusive), phi].
+    if phi is None or smax < phi:
+        high, high_incl = smax, True
+    elif smax > phi:
+        high, high_incl = phi, pred.hi_incl
+    else:
+        high, high_incl = smax, pred.hi_incl
+
+    if low < high:
+        return True
+    if low == high:
+        return low_incl and high_incl
+    return False
+
+
+def _occurrence_excludes_file(
+        occ: Dict[str, PredInterval],
+        rgs: Dict[int, Dict[str, Optional[Tuple[str, object, object]]]],
+) -> bool:
+    """True if *every* row group of a file fails at least one of this
+    occurrence's column predicates (so the file cannot contribute any row).
+
+    AND-within-row-group (all constrained columns must be able to overlap),
+    OR-across-row-groups (one possibly-matching row group keeps the file).
+    """
+    for _rg_id, cols in rgs.items():
+        rg_matches = True
+        for col, pred in occ.items():
+            stored = cols.get(col)
+            if stored is None:
+                continue  # missing / unavailable stat → can't exclude
+            if not _pred_overlaps_stored(pred, stored):
+                rg_matches = False
+                break
+        if rg_matches:
+            return False
+    return True
+
+
+def prune_files_by_predicates(
+        file_keys: List[str],
+        stored_stats_df: Optional[polars.DataFrame],
+        occurrences: List[Dict[str, PredInterval]],
+        profiler: Optional[Profiler] = None,
+) -> List[str]:
+    """Return the subset of *file_keys* that could satisfy the query predicates.
+
+    *occurrences* is one constraint dict per place the physical table is scanned
+    (alias / subquery scope).  Because the executor scans a table once and reuses
+    it for every occurrence, the surviving set is the **union** of what each
+    occurrence needs: a file is dropped only when **every** occurrence excludes
+    it.  Conservative guards (all retain the full list):
+
+      - no occurrences, or any occurrence carries no usable constraint;
+      - no stored stats;
+      - pruning that would empty the list (keeps the estimator's "≥1 file"
+        invariant and lets the executor return the correct empty result).
+
+    Files absent from the stats are always retained.  ``file_keys`` are matched
+    against the stats ``file_path`` column, so callers must pass the raw storage
+    keys (not resolved/presigned URLs).
+    """
+    p = profiler or get_null_profiler()
+    if not occurrences or any(not occ for occ in occurrences):
+        return file_keys
+    if stored_stats_df is None or stored_stats_df.height == 0:
+        return file_keys
+
+    constrained_cols = sorted({c for occ in occurrences for c in occ})
+    needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
+    index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
+    for row in needed.iter_rows(named=True):
+        fp = row["file_path"]
+        rg = row["row_group_id"]
+        col = row["column_name"]
+        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+
+    kept: List[str] = []
+    pruned = 0
+    for fk in file_keys:
+        rgs = index.get(fk)
+        if not rgs:
+            kept.append(fk)  # no stats for this file → cannot prove absence
+            continue
+        if all(_occurrence_excludes_file(occ, rgs) for occ in occurrences):
+            pruned += 1
+        else:
+            kept.append(fk)
+
+    # Never empty a table's file list — pruning is an optimisation, and the
+    # estimator treats zero files as an error.  Retain all if we pruned all.
+    if not kept:
+        return file_keys
+    p.add("read_pruned_files", pruned)
+    return kept
+
+
+# ===========================================================================
+# Stats artifact accessor + in-process cache
+# ---------------------------------------------------------------------------
+# The stats parquet is read on every overwrite/delete (write-path pruning) and
+# on every filtered read (query estimation).  Re-reading it from object storage
+# each time would defeat the point of having one consolidated artifact, so we
+# keep the *latest* version of each table's stats in memory.
+#
+# Cache semantics (deliberately minimal):
+#   * Keyed by the table's stats directory; each entry holds exactly one
+#     ``(path, DataFrame)`` — the most recent version seen for that table.
+#   * A versioned stats filename is immutable, so a cache hit (cached path ==
+#     requested path) can never be stale: a new write produces a NEW path, which
+#     misses and reads fresh.
+#   * Historical (time-travel) reads pass ``allow_cache=False`` so they read the
+#     old version fresh WITHOUT evicting the table's cached latest.
+#   * Writers call :func:`cache_stats` with the just-built frame, so the next
+#     read is served from memory with no storage round-trip at all.
+# ===========================================================================
+
+class _StatsCache:
+    """Process-wide LRU of each table's latest stats frame (one per table)."""
+
+    __slots__ = ("_lock", "_entries")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # table_key -> (stats_path, DataFrame)
+        self._entries: "OrderedDict[str, Tuple[str, polars.DataFrame]]" = OrderedDict()
+
+    @staticmethod
+    def _key(stats_path: str) -> str:
+        # All versions of a table's stats live in the same stats/ directory.
+        return os.path.dirname(stats_path)
+
+    @staticmethod
+    def _cap() -> int:
+        try:
+            return int(settings.SUPERTABLE_STATS_CACHE_MAX_TABLES)
+        except Exception:
+            return 64
+
+    def get(self, stats_path: str) -> Optional[polars.DataFrame]:
+        """Return the cached frame iff the cached path matches *exactly*."""
+        if self._cap() <= 0:
+            return None
+        key = self._key(stats_path)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[0] == stats_path:
+                self._entries.move_to_end(key)
+                return entry[1]
+        return None
+
+    def put(self, stats_path: str, df: polars.DataFrame) -> None:
+        cap = self._cap()
+        if cap <= 0:
+            return
+        key = self._key(stats_path)
+        with self._lock:
+            self._entries[key] = (stats_path, df)
+            self._entries.move_to_end(key)
+            while len(self._entries) > cap:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_STATS_CACHE = _StatsCache()
+
+
+def load_stats(
+        stats_path: Optional[str],
+        *,
+        allow_cache: bool = True,
+        profiler: Optional[Profiler] = None,
+) -> Optional[polars.DataFrame]:
+    """Load a table's stats parquet, serving the latest version from memory.
+
+    *allow_cache* must be ``True`` only when *stats_path* is the table's CURRENT
+    (latest) stats version — that version is what gets memoised.  Time-travel
+    reads of an older version must pass ``allow_cache=False`` so they read fresh
+    without disturbing the cached latest.
+    """
+    if not stats_path:
+        return None
+    p = profiler or get_null_profiler()
+    cached = _STATS_CACHE.get(stats_path)
+    if cached is not None:
+        p.add("stats_cache_hit", 1)
+        return cached
+    p.add("stats_cache_miss", 1)
+    df = _read_parquet_safe(stats_path, profiler=p)
+    if df is not None and allow_cache:
+        _STATS_CACHE.put(stats_path, df)
+    return df
+
+
+def cache_stats(stats_path: Optional[str], df: Optional[polars.DataFrame]) -> None:
+    """Seed the cache with a freshly built latest-version stats frame.
+
+    Called by writers right after :func:`build_stats_file` so the very next
+    read (this process's next overwrite/delete or query) needs no storage read.
+    """
+    if stats_path and df is not None:
+        _STATS_CACHE.put(stats_path, df)
 
 
 def compact_tombstones(

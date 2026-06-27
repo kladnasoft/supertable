@@ -180,11 +180,20 @@ class DataReader:
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
             self.query_plan_manager.original_table = ", ".join(t.simple_name for t in physical_tables) if physical_tables else ""
 
+            # Derive per-table WHERE constraints so the estimator can prune
+            # files via the stats artifact.  Never let this break a read.
+            try:
+                predicate_constraints = parser.get_predicate_constraints()
+            except Exception as pc_err:
+                logger.debug(self._lp(f"[prune] predicate extraction failed: {pc_err}"))
+                predicate_constraints = {}
+
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
                 organization=self.organization,
                 storage=self.storage,
-                tables=physical_tables
+                tables=physical_tables,
+                predicate_constraints=predicate_constraints,
             )
             reflection = estimator.estimate()
 

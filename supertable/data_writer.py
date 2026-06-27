@@ -31,6 +31,8 @@ from supertable.processing import (
     extract_stats_rows,
     probe_ranges_from_df,
     prune_overlapping_files_by_stats,
+    load_stats,
+    cache_stats,
     write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
@@ -381,7 +383,7 @@ class DataWriter:
             if overwrite_columns:
                 stats_file = last_simple_table.get("stats_file")
                 if stats_file:
-                    stored_stats_df = _read_parquet_safe(stats_file, profiler=profiler)
+                    stored_stats_df = load_stats(stats_file, allow_cache=True, profiler=profiler)
                     if stored_stats_df is not None and stored_stats_df.height > 0:
                         probe = probe_ranges_from_df(dataframe, overwrite_columns)
                         before = len(overlapping_files)
@@ -577,6 +579,10 @@ class DataWriter:
                 )
                 last_simple_table["stats_file"] = stats_path
                 last_simple_table["stats_rows"] = stats_rows
+                # Seed the in-process cache so the next read (this process's next
+                # overwrite/delete or query) needs no storage round-trip.
+                if combined_stats_df is not None:
+                    cache_stats(stats_path, combined_stats_df)
                 mark("build_stats")
 
                 total_rows = inserted
@@ -1109,6 +1115,8 @@ class DataWriter:
                     if combined_stats_df is not None
                     else int(last_simple_table.get("stats_rows", 0) or 0)
                 )
+                if combined_stats_df is not None:
+                    cache_stats(stats_path, combined_stats_df)
                 mark("build_stats")
 
                 # Derive the post-compaction schema for ``simple_table.update``.

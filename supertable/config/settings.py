@@ -260,6 +260,16 @@ class Settings:
     # ── Meta Reader / Caching ────────────────────────────────────────
     SUPERTABLE_SUPER_META_CACHE_TTL_S: Optional[float] = None  # SUPERTABLE_SUPER_META_CACHE_TTL_S
 
+    # Max number of tables whose *latest* stats artifact is held in the
+    # in-process stats cache (one DataFrame per table; older versions are
+    # always read fresh and never cached).  0 disables caching.
+    SUPERTABLE_STATS_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_STATS_CACHE_MAX_TABLES
+
+    # Read-path file pruning: when True the estimator uses the stats artifact to
+    # drop parquet files that provably can't satisfy a query's WHERE predicates.
+    # Conservative (never drops a file that could match); set False to disable.
+    SUPERTABLE_READ_PRUNING_ENABLED: bool = True  # SUPERTABLE_READ_PRUNING_ENABLED
+
     # ── Audit ────────────────────────────────────────────────────────
     # Audit is OFF by default.  Enable per-organization in the WebUI
     # /ui/audit → Compliance tab (persisted at supertable:{org}:system:audit:config),
@@ -511,6 +521,8 @@ def _build_settings() -> Settings:
 
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
+        SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
 
         # ── Audit ────────────────────────────────────────────────────
         SUPERTABLE_AUDIT_ENABLED=_env_bool("SUPERTABLE_AUDIT_ENABLED", False),

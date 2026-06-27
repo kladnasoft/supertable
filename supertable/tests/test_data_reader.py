@@ -1459,6 +1459,7 @@ class TestExecuteExecutorArgs:
         mock_parser = MagicMock()
         mock_parser.get_table_tuples.return_value = tables
         mock_parser.get_physical_tables.return_value = physical_tables
+        mock_parser.get_predicate_constraints.return_value = {}
         mock_parser.original_query = "Q"
         MockParser.return_value = mock_parser
 
@@ -1484,6 +1485,7 @@ class TestExecuteExecutorArgs:
             organization="my_org",
             storage=mock_storage,
             tables=physical_tables,
+            predicate_constraints={},
         )
 
 
