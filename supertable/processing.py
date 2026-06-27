@@ -11,7 +11,7 @@ import polars
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from supertable.utils.helper import generate_filename, collect_schema
+from supertable.utils.helper import generate_filename
 from supertable.config.defaults import default
 from supertable.storage.storage_factory import get_storage
 from supertable.utils.profiler import Profiler, get_null_profiler
@@ -300,8 +300,9 @@ def find_overlapping_files(  # keep name/signature for compatibility
 ) -> Set[Tuple[str, bool, int]]:
     """
     Builds the candidate set:
-      - has_overlap=True for files whose stats indicate key overlap (or missing stats)
-      - has_overlap=False for small, non-overlapping files (< MAX_MEMORY_CHUNK_SIZE)
+      - has_overlap=True for every existing file when overwrite_columns are given
+        (snapshots carry no per-file key statistics, so non-overlap can't be proven)
+      - has_overlap=False for small files in the pure-compaction path (< MAX_MEMORY_CHUNK_SIZE)
     Then applies prune_not_overlapping_files_by_threshold to decide the final merge set.
 
     Limits are resolved per-table (table_config) with fallback to global default.
@@ -316,71 +317,14 @@ def find_overlapping_files(  # keep name/signature for compatibility
     p.add("resources_total", len(resources))
 
     if overwrite_columns:
-        # ORIGINAL APPROACH - much faster
-        with p.span("overlap.schema"):
-            new_schema = collect_schema(df)
-        new_data_columns: Dict[str, List] = {}
-        with p.span("overlap.unique_values"):
-            for col in overwrite_columns:
-                if col in df.columns:
-                    # Use original unique values approach - it's actually faster for most cases
-                    unique_values = df[col].unique().to_list()
-                    new_data_columns[col] = unique_values
-
+        # Snapshots carry no per-file key statistics, so a file cannot be proven
+        # free of the incoming keys.  Every existing file is therefore a
+        # delete/overwrite candidate and must be scanned for matching rowids.
         t0 = time.perf_counter()
         for resource in resources:
             file = resource["file"]
             file_size = int(resource.get("file_size") or 0)
-            stats = resource.get("stats")
-
-            if stats:
-                # Check overlap per overwrite column
-                overlapped = False
-                for col in overwrite_columns:
-                    if col not in stats:
-                        overlapped = True
-                        break
-
-                    col_stats = stats[col]
-                    min_val = col_stats.get("min")
-                    max_val = col_stats.get("max")
-                    new_vals = new_data_columns.get(col, [])
-
-                    if min_val is None or max_val is None:
-                        overlapped = True
-                        break
-
-                    # Normalize to types if needed
-                    if col in new_schema and new_schema[col] == "Date":
-                        if isinstance(min_val, str):
-                            min_val = datetime.fromisoformat(min_val).date()
-                        if isinstance(max_val, str):
-                            max_val = datetime.fromisoformat(max_val).date()
-                    elif col in new_schema and new_schema[col] == "DateTime":
-                        if isinstance(min_val, str):
-                            min_val = datetime.fromisoformat(min_val)
-                        if isinstance(max_val, str):
-                            max_val = datetime.fromisoformat(max_val)
-
-                    if any(val is None for val in new_vals):
-                        overlapped = True
-                        break
-
-                    if any(min_val <= val <= max_val for val in new_vals if val is not None):
-                        overlapped = True
-                        break
-
-                if overlapped:
-                    overlapping_files.add((file, True, file_size))
-                else:
-                    # non-overlapping small files can be considered for compaction
-                    _max_mem, _ = _resolve_limits(table_config)
-                    if (file_size < _max_mem) and not is_file_in_overlapping_files(file,
-                                                                                   overlapping_files):
-                        overlapping_files.add((file, False, file_size))
-            else:
-                # Missing stats → treat as overlapping (be conservative)
-                overlapping_files.add((file, True, file_size))
+            overlapping_files.add((file, True, file_size))
         p.mark("overlap.scan_resources", t0)
 
     else:
@@ -536,10 +480,8 @@ def compact_resources(
         # Flush when the buffered chunk exceeds the per-table memory cap.
         if chunk_size_bytes >= max_mem:
             total_rows += chunk_df.shape[0]
-            # No overwrite columns for plain compaction — the resource
-            # stats will be re-collected by
-            # ``collect_column_statistics`` inside the writer; we don't
-            # need to pin a specific key for the resulting file.
+            # No overwrite columns for plain compaction — we don't need to pin
+            # a specific key for the resulting file.
             write_parquet_and_collect_resources(
                 write_df=chunk_df,
                 overwrite_columns=[],
@@ -652,9 +594,6 @@ def _write_single_parquet_file(
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    with p.span("write.collect_stats"):
-        stats = collect_column_statistics(write_df, overwrite_columns)
-
     # Ensure target directory exists (no-op on object storage)
     with p.span("write.ensure_dir"):
         try:
@@ -741,46 +680,8 @@ def _write_single_parquet_file(
             "file_size": int(file_size),
             "rows": rows,
             "columns": columns,
-            "stats": stats,
         }
     )
-
-
-def collect_column_statistics(write_df, overwrite_columns: List[str]):
-    """
-    Collect min/max for EVERY column in a single vectorized pass (fast).
-    Function signature stays the same to preserve call sites and internal logic.
-    """
-    stats: Dict[str, dict] = {}
-
-    if write_df.is_empty():
-        return stats
-
-    cols = write_df.columns
-
-    # Build vectorized aggregations: for each column compute min/max.
-    agg_exprs: List[polars.Expr] = []
-    for c in cols:
-        agg_exprs.append(polars.col(c).min().alias(f"__min__{c}"))
-        agg_exprs.append(polars.col(c).max().alias(f"__max__{c}"))
-
-    agg = write_df.select(agg_exprs)
-    # Single-row result; convert once to Python dict for cheap lookups
-    row = agg.to_dicts()[0]
-
-    for c in cols:
-        min_val = row.get(f"__min__{c}")
-        max_val = row.get(f"__max__{c}")
-
-        # Normalize temporal types to ISO strings (matches original behavior)
-        if isinstance(min_val, (date, datetime)):
-            min_val = min_val.isoformat()
-        if isinstance(max_val, (date, datetime)):
-            max_val = max_val.isoformat()
-
-        stats[c] = {"min": min_val, "max": max_val}
-
-    return stats
 
 
 # =========================

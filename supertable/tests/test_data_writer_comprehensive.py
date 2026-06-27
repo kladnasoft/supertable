@@ -889,34 +889,6 @@ class TestWriteSnapshot:
         assert "last_snapshot" in call_kwargs.kwargs
         assert "last_snapshot_path" in call_kwargs.kwargs
 
-    def test_snapshot_strips_stats_from_payload(self, writer, fake_catalog):
-        """Resources in the leaf payload should have 'stats' stripped."""
-        # Make update return resources WITH stats
-        simple_inst = writer._mocks["simple_inst"]
-        snapshot_with_stats = {
-            "simple_name": "t1",
-            "snapshot_version": 1,
-            "schema": [],
-            "resources": [
-                {"file": "f1.parquet", "file_size": 100, "rows": 10, "columns": 3,
-                 "stats": {"id": {"min": 1, "max": 10}}},
-            ],
-        }
-        simple_inst.update.return_value = (
-            snapshot_with_stats,
-            "testorg/testsuper/tables/t1/snapshots/new.json",
-        )
-
-        data = _simple_arrow(3)
-        writer.write("admin", "t1", data, overwrite_columns=[])
-
-        # Verify the payload passed to set_leaf_payload_cas has stats stripped
-        assert len(fake_catalog.set_leaf_payload_cas_calls) == 1
-        _, _, _, payload, _ = fake_catalog.set_leaf_payload_cas_calls[0]
-        for res in payload.get("resources", []):
-            assert "stats" not in res
-
-
 # ===========================================================================
 # Tests: write() — timing metrics
 # ===========================================================================

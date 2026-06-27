@@ -13,7 +13,6 @@ DataFrames wherever possible and mocks for storage I/O.
  7. is_file_in_overlapping_files
  8. prune_not_overlapping_files_by_threshold
  9. find_and_lock_overlapping_files
-10. collect_column_statistics
 11. write_parquet_and_collect_resources
 12. filter_stale_incoming_rows
 13. identify_deleted_rowids
@@ -327,64 +326,6 @@ class TestPruneNotOverlappingFilesByThreshold:
 
 
 # ===========================================================================
-# 9. collect_column_statistics
-# ===========================================================================
-
-class TestCollectColumnStatistics:
-
-    def test_basic_int_stats(self):
-        from supertable.processing import collect_column_statistics
-        df = _df(id=[1, 5, 3])
-        stats = collect_column_statistics(df, ["id"])
-        assert stats["id"]["min"] == 1
-        assert stats["id"]["max"] == 5
-
-    def test_string_stats(self):
-        from supertable.processing import collect_column_statistics
-        df = _df(name=["alice", "bob", "charlie"])
-        stats = collect_column_statistics(df, [])
-        assert stats["name"]["min"] == "alice"
-        assert stats["name"]["max"] == "charlie"
-
-    def test_date_stats_iso_format(self):
-        from supertable.processing import collect_column_statistics
-        df = pl.DataFrame({
-            "d": [date(2024, 1, 1), date(2024, 12, 31)],
-        })
-        stats = collect_column_statistics(df, [])
-        assert stats["d"]["min"] == "2024-01-01"
-        assert stats["d"]["max"] == "2024-12-31"
-
-    def test_datetime_stats_iso_format(self):
-        from supertable.processing import collect_column_statistics
-        df = pl.DataFrame({
-            "ts": [datetime(2024, 1, 1, 10, 0), datetime(2024, 6, 15, 20, 30)],
-        })
-        stats = collect_column_statistics(df, [])
-        assert "2024-01-01" in stats["ts"]["min"]
-        assert "2024-06-15" in stats["ts"]["max"]
-
-    def test_empty_df_returns_empty(self):
-        from supertable.processing import collect_column_statistics
-        df = pl.DataFrame(schema={"id": pl.Int64})
-        stats = collect_column_statistics(df, [])
-        assert stats == {}
-
-    def test_all_columns_included(self):
-        from supertable.processing import collect_column_statistics
-        df = _df(a=[1], b=["x"], c=[1.5])
-        stats = collect_column_statistics(df, ["a"])
-        assert set(stats.keys()) == {"a", "b", "c"}
-
-    def test_single_row(self):
-        from supertable.processing import collect_column_statistics
-        df = _df(x=[42])
-        stats = collect_column_statistics(df, [])
-        assert stats["x"]["min"] == 42
-        assert stats["x"]["max"] == 42
-
-
-# ===========================================================================
 # 10. write_parquet_and_collect_resources
 # ===========================================================================
 
@@ -416,7 +357,7 @@ class TestWriteParquetAndCollectResources:
         assert res["columns"] == 2
         assert res["file_size"] == 1234
         assert "data.parquet" in res["file"]
-        assert "stats" in res
+        assert "stats" not in res
 
     @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
     @patch(f"{_MOD}._get_storage")
@@ -627,48 +568,35 @@ class TestFindAndLockOverlappingFiles:
         for f, has_overlap, _ in result:
             assert has_overlap is False
 
-    def test_missing_stats_treated_as_overlap(self):
+    def test_overwrite_column_marks_every_file_overlapping(self):
+        """Without per-file stats, every existing file is a delete/overwrite
+        candidate (has_overlap=True) so no matching rowid is missed."""
         from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
-                {"file": "f1.parquet", "file_size": 100},  # no stats
+                {"file": "f1.parquet", "file_size": 100},
+                {"file": "f2.parquet", "file_size": 200},
             ]
         }
         df = _df(id=[1])
 
         result = find_overlapping_files(snap, df, ["id"], MagicMock())
-        matches = [f for f, overlap, _ in result if overlap]
-        assert len(matches) == 1
+        matches = {f for f, overlap, _ in result if overlap}
+        assert matches == {"f1.parquet", "f2.parquet"}
 
-    def test_stats_no_overlap_marked_false(self):
+    def test_stale_stats_in_snapshot_are_ignored(self):
+        """Legacy snapshots may still carry a 'stats' block; it must no longer
+        prune files — the file is still treated as overlapping."""
         from supertable.processing import find_overlapping_files
 
         snap = {
             "resources": [
                 {"file": "f1.parquet", "file_size": 100,
-                 "stats": {"id": {"min": 10, "max": 20}}},
+                 "stats": {"id": {"min": 10, "max": 20}}},  # incoming id=1 is outside
             ]
         }
-        # Incoming id=1 is outside [10,20]
         df = _df(id=[1])
-
-        result = find_overlapping_files(snap, df, ["id"], MagicMock())
-        for f, has_overlap, _ in result:
-            if f == "f1.parquet":
-                assert has_overlap is False
-
-    def test_stats_overlap_marked_true(self):
-        from supertable.processing import find_overlapping_files
-
-        snap = {
-            "resources": [
-                {"file": "f1.parquet", "file_size": 100,
-                 "stats": {"id": {"min": 1, "max": 10}}},
-            ]
-        }
-        # Incoming id=5 is within [1,10]
-        df = _df(id=[5])
 
         result = find_overlapping_files(snap, df, ["id"], MagicMock())
         matches = [f for f, overlap, _ in result if overlap]
@@ -678,21 +606,6 @@ class TestFindAndLockOverlappingFiles:
         from supertable.processing import find_overlapping_files
         result = find_overlapping_files({"resources": []}, _df(id=[1]), ["id"], MagicMock())
         assert result == set()
-
-    def test_null_stats_min_max_treated_as_overlap(self):
-        from supertable.processing import find_overlapping_files
-
-        snap = {
-            "resources": [
-                {"file": "f1.parquet", "file_size": 100,
-                 "stats": {"id": {"min": None, "max": None}}},
-            ]
-        }
-        df = _df(id=[1])
-
-        result = find_overlapping_files(snap, df, ["id"], MagicMock())
-        matches = [f for f, overlap, _ in result if overlap]
-        assert len(matches) == 1
 
 
 # ===========================================================================
