@@ -27,6 +27,10 @@ from supertable.processing import (
     identify_deleted_rowids,
     identify_all_rowids,
     build_tombstone_file,
+    build_stats_file,
+    extract_stats_rows,
+    probe_ranges_from_df,
+    prune_overlapping_files_by_stats,
     write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
@@ -365,6 +369,33 @@ class DataWriter:
             )
             mark("overlap")
 
+            # --- Stats-driven file pruning (consumer 5a) ----------------------
+            # Narrow the overwrite/delete candidate set using the external stats
+            # artifact: drop files that provably hold none of the incoming keys.
+            # Conservative — only removes files with zero possible matches, so
+            # the tombstone result is identical to the unpruned path. The probe
+            # is the in-memory dataframe range (df-probe): the file we are about
+            # to write carries identical footer min/max, so comparing the df
+            # range to the stored stats is equivalent to comparing footers,
+            # without opening any file.
+            if overwrite_columns:
+                stats_file = last_simple_table.get("stats_file")
+                if stats_file:
+                    stored_stats_df = _read_parquet_safe(stats_file, profiler=profiler)
+                    if stored_stats_df is not None and stored_stats_df.height > 0:
+                        probe = probe_ranges_from_df(dataframe, overwrite_columns)
+                        before = len(overlapping_files)
+                        overlapping_files = prune_overlapping_files_by_stats(
+                            overlapping_files,
+                            stored_stats_df,
+                            probe,
+                            profiler=profiler,
+                        )
+                        pruned = before - len(overlapping_files)
+                        if pruned > 0:
+                            logger.info(lp(f"stats pruning: skipped {pruned}/{before} candidate files"))
+                mark("stats_prune")
+
             # File cache: populated by newer-than filtering, reused by process step
             # to avoid double-reading overlapping parquet files from storage.
             file_cache = {}
@@ -452,6 +483,7 @@ class DataWriter:
                         profiler=profiler,
                     )
                 deleted = len(new_delete_pairs)
+                mark("identify_deletes")
 
                 # 2. Write the incoming rows as a new file (insert/upsert side).
                 #    delete_only carries only predicate columns — nothing to insert.
@@ -467,6 +499,7 @@ class DataWriter:
                     inserted = dataframe.height
                 else:
                     inserted = 0
+                mark("write_parquet")
 
                 # 3. Carry forward + extend the deletion-vector tombstone file.
                 #    No new deletes → reuse the previous file (combined_df=None).
@@ -488,6 +521,7 @@ class DataWriter:
                     if combined_tombstone_df is not None
                     else int(last_simple_table.get("tombstone_rows", 0) or 0)
                 )
+                mark("build_tombstone")
 
                 # 4. Threshold compaction: physically drop dead rows once the
                 #    deletion-vector grows past max_tombstone_rows, then clear it.
@@ -516,13 +550,40 @@ class DataWriter:
                 #    and its row count.
                 last_simple_table["tombstone"] = tombstone_path
                 last_simple_table["tombstone_rows"] = tombstone_rows
+                mark("compact_tombstones")
+
+                # 6. Carry forward + extend the external column-statistics parquet.
+                #    Read the footers of the newly written data files, drop the
+                #    rows of any sunset file, and append the new ones. No new
+                #    files and nothing sunset → reuse the previous stats file.
+                stats_dir = os.path.join(simple_table.simple_dir, "stats")
+                new_data_files = [
+                    r.get("file") for r in new_resources
+                    if isinstance(r, dict) and r.get("file")
+                ]
+                new_stats_rows = extract_stats_rows(new_data_files, profiler=profiler)
+                stats_path, combined_stats_df = build_stats_file(
+                    stats_dir=stats_dir,
+                    prev_stats_path=last_simple_table.get("stats_file"),
+                    new_rows=new_stats_rows,
+                    removed_files=sunset_files,
+                    compression_level=compression_level,
+                    profiler=profiler,
+                )
+                stats_rows = (
+                    combined_stats_df.height
+                    if combined_stats_df is not None
+                    else int(last_simple_table.get("stats_rows", 0) or 0)
+                )
+                last_simple_table["stats_file"] = stats_path
+                last_simple_table["stats_rows"] = stats_rows
+                mark("build_stats")
 
                 total_rows = inserted
                 # Logical (user-facing) width: the injected __rowid__/__timestamp__
                 # system columns are hidden from query output, so they are not
                 # counted here.
                 total_columns = incoming_columns
-                mark("process")
 
                 # --- Update snapshot on storage -----------------------------------
                 # Build effective lineage — auto-generate if caller didn't provide
@@ -649,8 +710,9 @@ class DataWriter:
                         f"total={total_duration:.3f} | "
                         f"convert={timings.get('convert', 0):.3f} | dedup_ts={timings.get('dedup_ts', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
                         f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
-                        f"overlap={timings.get('overlap', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
-                        f"process={timings.get('process', 0):.3f} | "
+                        f"overlap={timings.get('overlap', 0):.3f} | stats_prune={timings.get('stats_prune', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
+                        f"identify_deletes={timings.get('identify_deletes', 0):.3f} | write_parquet={timings.get('write_parquet', 0):.3f} | "
+                        f"build_tombstone={timings.get('build_tombstone', 0):.3f} | compact_tombstones={timings.get('compact_tombstones', 0):.3f} | build_stats={timings.get('build_stats', 0):.3f} | "
                         f"update_simple={timings.get('update_simple', 0):.3f} | bump_root={timings.get('bump_root', 0):.3f} | "
                         f"mirror={timings.get('mirror', 0):.3f} | prepare_monitor={timings.get('prepare_monitor', 0):.3f}"
                     )
@@ -999,6 +1061,7 @@ class DataWriter:
             if not all_new_resources and not all_sunset:
                 result["files_after"] = files_before
                 result["duration"] = round(time.time() - t0, 6)
+                result["timings"] = {k: round(v, 6) for k, v in timings.items()}
                 stats_payload = dict(result)
                 logger.info(lp(
                     f"compact: nothing to do (files_before={files_before})"
@@ -1023,6 +1086,30 @@ class DataWriter:
                 if should_run_tombstones:
                     last_simple_table["tombstone"] = None
                     last_simple_table["tombstone_rows"] = 0
+
+                # Carry forward + extend the external column-statistics parquet
+                # for the compacted file set: drop rows of every sunset file and
+                # append footer stats for the newly written compacted files.
+                stats_dir = os.path.join(simple_table.simple_dir, "stats")
+                new_data_files = [
+                    r.get("file") for r in all_new_resources
+                    if isinstance(r, dict) and r.get("file")
+                ]
+                new_stats_rows = extract_stats_rows(new_data_files)
+                stats_path, combined_stats_df = build_stats_file(
+                    stats_dir=stats_dir,
+                    prev_stats_path=last_simple_table.get("stats_file"),
+                    new_rows=new_stats_rows,
+                    removed_files=all_sunset,
+                    compression_level=compression_level,
+                )
+                last_simple_table["stats_file"] = stats_path
+                last_simple_table["stats_rows"] = (
+                    combined_stats_df.height
+                    if combined_stats_df is not None
+                    else int(last_simple_table.get("stats_rows", 0) or 0)
+                )
+                mark("build_stats")
 
                 # Derive the post-compaction schema for ``simple_table.update``.
                 # update() builds the new snapshot's ``schema`` field from
@@ -1101,6 +1188,7 @@ class DataWriter:
                 new_resources_list = new_snapshot_dict.get("resources") or []
                 result["files_after"] = len(new_resources_list)
                 result["duration"] = round(time.time() - t0, 6)
+                result["timings"] = {k: round(v, 6) for k, v in timings.items()}
                 stats_payload = dict(result)
 
                 logger.info(lp(

@@ -186,6 +186,8 @@ class SimpleTable:
             "resources": [],
             "tombstone": None,
             "tombstone_rows": 0,
+            "stats_file": None,
+            "stats_rows": 0,
         }
         self.storage.write_json(new_simple_path, snapshot_data)
 

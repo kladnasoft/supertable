@@ -599,6 +599,21 @@ class TestWriteAppend:
         assert payload["table_name"] == "t1"
         assert "duration" in payload
 
+    def test_per_step_timings_in_payload(self, writer):
+        """Every major write step must ship its wall-clock duration to the
+        monitoring (redis) stats so bottlenecks are analysable later."""
+        data = _simple_arrow(3)
+        writer.write("admin", "t1", data, overwrite_columns=["id"])
+        payload = writer._mocks["monitor"].metrics[0]
+        timings = payload["timings"]
+        for stage in (
+            "overlap", "identify_deletes", "write_parquet",
+            "build_tombstone", "compact_tombstones", "build_stats",
+            "update_simple", "bump_root",
+        ):
+            assert stage in timings, f"missing per-step timing: {stage}"
+            assert isinstance(timings[stage], (int, float))
+
 
 class TestWriteOverwrite:
     """write() with overwrite_columns set."""

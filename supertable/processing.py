@@ -1,10 +1,11 @@
 # processing.py
 
+import decimal
 import logging
 import os
 import io
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Dict, List, Set, Tuple, Optional
 
 import polars
@@ -988,6 +989,493 @@ def build_tombstone_file(
     new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     return new_path, combined
+
+
+# =========================
+# Column-statistics artifact (external "stats parquet")
+# =========================
+#
+# A per-table, immutable, versioned parquet built by reading the FOOTERS of the
+# data parquet files (no data scan).  One row per (file × row_group × column).
+# It mirrors the tombstone deletion-vector exactly: never overwritten, carried
+# forward on each write (minus rows for sunset files, plus rows for new files),
+# and referenced by the snapshot via ``stats_file`` / ``stats_rows``.  The two
+# consumers (write-path overwrite/delete pruning and read-path SELECT pruning)
+# use it to skip data files whose row-group min/max ranges cannot overlap a
+# predicate.  ``stats_available=False`` rows are always retained by both
+# consumers (decimal / unsupported / no footer stats → never used to exclude).
+
+TIMESTAMP_COL = "__timestamp__"
+
+# Schema (column order is significant — keep it stable, the artifact is sealed).
+STATS_SCHEMA: Dict[str, polars.DataType] = {
+    "file_path": polars.Utf8,
+    "row_group_id": polars.Int64,
+    "column_name": polars.Utf8,
+    "physical_type": polars.Utf8,
+    "logical_type": polars.Utf8,
+    "min_bigint": polars.Int64,
+    "max_bigint": polars.Int64,
+    "min_double": polars.Float64,
+    "max_double": polars.Float64,
+    "min_timestamp": polars.Datetime("us"),
+    "max_timestamp": polars.Datetime("us"),
+    "min_string": polars.Utf8,
+    "max_string": polars.Utf8,
+    "null_count": polars.Int64,
+    "row_group_rows": polars.Int64,
+    "stats_available": polars.Boolean,
+    "min_is_exact": polars.Boolean,
+    "max_is_exact": polars.Boolean,
+}
+
+STATS_FILE_PATH_COL = "file_path"
+
+# Internal system columns never emitted into the stats artifact (they must not
+# leak, same as everywhere else).
+_STATS_SYSTEM_COLUMNS = {ROWID_COL, TIMESTAMP_COL}
+
+
+def _logical_type_name(stat) -> str:
+    """Return the parquet logical type name (e.g. ``TIMESTAMP``/``STRING``) or ``""``."""
+    try:
+        lt = stat.logical_type
+        if lt is None:
+            return ""
+        name = getattr(lt, "type", None)
+        if name is None or str(name).upper() == "NONE":
+            return ""
+        return str(name)
+    except Exception:
+        return ""
+
+
+def _to_us_datetime(v) -> Optional[datetime]:
+    """Normalise a footer min/max into a tz-naive microsecond ``datetime``.
+
+    ``datetime`` (tz-aware → converted to UTC wall time, tz dropped) and ``date``
+    (→ midnight) are supported; anything else returns ``None`` (→ unsupported,
+    stats_available stays False so the column never prunes).
+    """
+    if isinstance(v, datetime):
+        if v.tzinfo is not None:
+            v = v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v
+    # NOTE: ``datetime`` is a subclass of ``date`` — handled above first.
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    return None
+
+
+def _route_stats(stat) -> Tuple[Optional[str], object, object]:
+    """Route a footer ``Statistics`` to a typed column.
+
+    Returns ``(category, min_val, max_val)`` where ``category`` is one of
+    ``bigint`` / ``double`` / ``timestamp`` / ``string`` (with normalised
+    values), or ``(None, None, None)`` when the type is unsupported for pruning
+    (decimal — lossy as double, binary, time, etc.).  Conservative: an
+    unsupported type yields no usable range, so the column is never used to
+    exclude a file.
+    """
+    mn, mx = stat.min, stat.max
+    # Decimal is intentionally unsupported: routing through double is lossy and
+    # could cause false negatives. Detected via logical type or decoded value.
+    if _logical_type_name(stat).upper() == "DECIMAL":
+        return None, None, None
+    if isinstance(mn, decimal.Decimal) or isinstance(mx, decimal.Decimal):
+        return None, None, None
+    # date / timestamp → micros (datetime is a date subclass; both routed here)
+    if isinstance(mn, date):
+        a = _to_us_datetime(mn)
+        b = _to_us_datetime(mx)
+        if a is None or b is None:
+            return None, None, None
+        return "timestamp", a, b
+    # bool(0/1) and all integer widths → bigint (bool is an int subclass)
+    if isinstance(mn, bool):
+        return "bigint", int(mn), int(mx)
+    if isinstance(mn, int):
+        return "bigint", int(mn), int(mx)
+    if isinstance(mn, float):
+        return "double", float(mn), float(mx)
+    if isinstance(mn, str):
+        return "string", str(mn), str(mx)
+    # bytes / binary / anything else → unsupported
+    return None, None, None
+
+
+def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None):
+    """Read just the parquet footer (FileMetaData) for *path*, or ``None``.
+
+    Reads the file's bytes from the active storage backend and parses only the
+    footer via ``pq.read_metadata`` — no data pages are decoded.  Returns
+    ``None`` on a race (file already sunset) or any read/parse error.
+    """
+    p = profiler or get_null_profiler()
+    if not _safe_exists(path, profiler=p):
+        logging.info(f"[stats] file already sunset before footer read: {path}")
+        return None
+    try:
+        with p.span("stats.read_footer"):
+            data = _get_storage().read_bytes(path)
+            return pq.read_metadata(io.BytesIO(data))
+    except FileNotFoundError:
+        logging.info(f"[stats] file vanished before footer read: {path}")
+        return None
+    except Exception as e:
+        logging.warning(f"[stats] failed to read footer at {path}: {e}")
+        return None
+
+
+def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
+    """Build the per-(row_group × column) stats rows for one file's footer."""
+    rows: List[dict] = []
+    for rg in range(md.num_row_groups):
+        g = md.row_group(rg)
+        rg_rows = int(g.num_rows)
+        for c in range(g.num_columns):
+            col = g.column(c)
+            name = col.path_in_schema
+            if name in _STATS_SYSTEM_COLUMNS:
+                continue
+            stat = col.statistics if col.is_stats_set else None
+            row = {k: None for k in STATS_SCHEMA}
+            row["file_path"] = file_path
+            row["row_group_id"] = int(rg)
+            row["column_name"] = name
+            row["physical_type"] = str(col.physical_type or "")
+            row["logical_type"] = _logical_type_name(stat) if stat is not None else ""
+            row["null_count"] = (
+                int(stat.null_count)
+                if stat is not None and stat.null_count is not None
+                else 0
+            )
+            row["row_group_rows"] = rg_rows
+            # We never truncate footer stats, so min/max are always exact.
+            row["min_is_exact"] = True
+            row["max_is_exact"] = True
+            row["stats_available"] = False
+
+            if stat is not None and stat.has_min_max:
+                category, mn, mx = _route_stats(stat)
+                if category == "bigint":
+                    row["min_bigint"], row["max_bigint"] = mn, mx
+                    row["stats_available"] = True
+                elif category == "double":
+                    row["min_double"], row["max_double"] = mn, mx
+                    row["stats_available"] = True
+                elif category == "timestamp":
+                    row["min_timestamp"], row["max_timestamp"] = mn, mx
+                    row["stats_available"] = True
+                elif category == "string":
+                    row["min_string"], row["max_string"] = mn, mx
+                    row["stats_available"] = True
+                # else: unsupported type → stats_available stays False
+            rows.append(row)
+    return rows
+
+
+def _empty_stats_df() -> polars.DataFrame:
+    return polars.DataFrame(schema=STATS_SCHEMA)
+
+
+def extract_stats_rows(
+        file_paths: List[str],
+        profiler: Optional[Profiler] = None,
+) -> polars.DataFrame:
+    """Read the footers of *file_paths* and return their stats rows.
+
+    One row per (file × row_group × column), excluding the internal
+    ``__rowid__`` / ``__timestamp__`` columns.  Files whose footer cannot be
+    read (race / corruption) are skipped.  Returns a frame with ``STATS_SCHEMA``
+    (possibly empty).
+    """
+    p = profiler or get_null_profiler()
+    all_rows: List[dict] = []
+    for path in file_paths:
+        if not path:
+            continue
+        md = _read_footer_metadata(path, profiler=p)
+        if md is None:
+            continue
+        all_rows.extend(_stats_rows_for_metadata(path, md))
+    if not all_rows:
+        return _empty_stats_df()
+    p.add("stats_rows_extracted", len(all_rows))
+    return polars.DataFrame(all_rows, schema=STATS_SCHEMA)
+
+
+def build_stats_file(
+        stats_dir: str,
+        prev_stats_path: Optional[str],
+        new_rows: Optional[polars.DataFrame],
+        removed_files: Optional[Set[str]],
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
+    """Carry forward the previous stats parquet and apply this write's delta.
+
+    The new stats parquet = (previous rows, MINUS any row whose ``file_path`` is
+    in *removed_files*) + *new_rows*.  Mirrors :func:`build_tombstone_file`: each
+    change writes a NEW immutable, versioned file — an existing artifact is never
+    mutated.
+
+    Returns ``(stats_path, combined_df)``:
+      - no new rows AND nothing removed → ``(prev_stats_path, None)`` — pure
+        carry-forward; the new snapshot reuses the previous file, no rewrite.
+      - otherwise → ``(new_path, combined_df)`` where ``combined_df`` is the
+        full stats artifact (so the caller can record ``stats_rows`` without
+        re-reading the file).
+    """
+    p = profiler or get_null_profiler()
+    removed = set(removed_files or set())
+    new_df = new_rows if new_rows is not None else _empty_stats_df()
+    has_new = new_df.height > 0
+
+    if not has_new and not removed:
+        return prev_stats_path, None
+
+    prev_df = _read_parquet_safe(prev_stats_path, profiler=p) if prev_stats_path else None
+    if prev_df is not None and prev_df.height > 0 and STATS_FILE_PATH_COL in prev_df.columns:
+        kept_prev = prev_df.select(list(STATS_SCHEMA.keys()))
+        if removed:
+            kept_prev = kept_prev.filter(
+                ~polars.col(STATS_FILE_PATH_COL).is_in(list(removed))
+            )
+        if has_new:
+            combined = polars.concat([kept_prev, new_df], how="vertical_relaxed")
+        else:
+            combined = kept_prev
+    else:
+        combined = new_df
+
+    try:
+        if not _get_storage().exists(stats_dir):
+            _get_storage().makedirs(stats_dir)
+    except Exception:
+        pass
+
+    new_path = os.path.join(stats_dir, generate_filename("stats", "parquet"))
+    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    p.add("stats_rows_total", int(combined.height))
+    return new_path, combined
+
+
+# ===========================================================================
+# Consumer 5a: stats-driven file pruning for overwrite / delete
+# ---------------------------------------------------------------------------
+# Given the incoming dataframe's per-key-column range ("probe") and the stored
+# external stats artifact, drop candidate files that *provably* contain none of
+# the incoming keys.  The contract is one-directional: pruning may only remove
+# files with zero matching keys.  Every uncertainty (missing file/row-group/
+# column stat, unsupported type, lane mismatch, NULL keys) resolves to RETAIN,
+# never to drop — so the tombstone output is bit-identical with or without
+# pruning.  Pruning is a pure performance optimisation, never a correctness one.
+# ===========================================================================
+
+# polars dtypes that route into the bigint lane (signed ints + the unsigned
+# widths that fit losslessly in Int64).  UInt64 is deliberately excluded: its
+# range can exceed Int64, so we never prune on it (→ retain).
+_PROBE_BIGINT_DTYPES = {
+    polars.Int8, polars.Int16, polars.Int32, polars.Int64,
+    polars.UInt8, polars.UInt16, polars.UInt32,
+}
+_PROBE_FLOAT_DTYPES = {polars.Float32, polars.Float64}
+
+
+def _intervals_overlap(a_lo, a_hi, b_lo, b_hi) -> bool:
+    """Closed-interval overlap test: ``[a_lo,a_hi]`` ∩ ``[b_lo,b_hi]`` ≠ ∅.
+
+    The robust, type-agnostic primitive behind all pruning: two ranges overlap
+    iff ``a_lo <= b_hi and b_lo <= a_hi``.  Both endpoints are inclusive
+    (footer min/max are inclusive bounds).  Only ever called with non-None,
+    same-lane values.
+    """
+    return a_lo <= b_hi and b_lo <= a_hi
+
+
+def _probe_lane_for_dtype(dtype) -> Optional[str]:
+    """Map an incoming polars key-column dtype to a stored stats lane.
+
+    Returns ``bigint`` / ``double`` / ``timestamp`` / ``string`` to match
+    :func:`_route_stats`, or ``None`` for any type we never prune on (decimal,
+    UInt64, binary, …).  ``None`` ⇒ that column contributes no constraint, so
+    no file can be excluded by it.
+    """
+    if dtype == polars.Boolean:
+        return "bigint"
+    if dtype in _PROBE_BIGINT_DTYPES:
+        return "bigint"
+    if dtype in _PROBE_FLOAT_DTYPES:
+        return "double"
+    if dtype == polars.Date or isinstance(dtype, polars.Datetime):
+        return "timestamp"
+    if dtype == polars.Utf8:
+        return "string"
+    return None
+
+
+def _normalise_probe_bounds(lane: str, lo, hi):
+    """Coerce a column's min/max into the same normalised form the stored lane
+    uses, so probe and stored values are directly comparable.  Returns
+    ``(lo, hi)`` or ``None`` if the values can't be normalised."""
+    if lane == "bigint":
+        return int(lo), int(hi)
+    if lane == "double":
+        return float(lo), float(hi)
+    if lane == "string":
+        return str(lo), str(hi)
+    if lane == "timestamp":
+        a, b = _to_us_datetime(lo), _to_us_datetime(hi)
+        if a is None or b is None:
+            return None
+        return a, b
+    return None
+
+
+def probe_ranges_from_df(
+        df: polars.DataFrame,
+        key_cols: List[str],
+) -> Dict[str, Optional[Tuple[str, object, object]]]:
+    """Derive the incoming dataframe's per-key-column range ("probe").
+
+    For each column in *key_cols* returns ``(lane, lo, hi)`` — the closed range
+    of that column's values, normalised to the stored lane — or ``None`` when
+    the column must not be used to prune:
+
+      - any NULL present (footer min/max exclude NULLs, but overwrite equality
+        uses ``nulls_equal=True``: a NULL key could match a file whose range
+        doesn't cover it → must retain);
+      - unsupported dtype (decimal / UInt64 / binary → :func:`_probe_lane_for_dtype`
+        returns None);
+      - empty column (min/max are None).
+
+    A column mapped to ``None`` simply drops out of the constraint set, so it
+    can never exclude a file.  This is the df-probe: because the file we just
+    wrote carries identical footer min/max, comparing the in-memory df range
+    against the stored stats is mathematically equivalent to comparing footers,
+    without opening a single file.
+    """
+    out: Dict[str, Optional[Tuple[str, object, object]]] = {}
+    for name in key_cols:
+        if name not in df.columns:
+            out[name] = None
+            continue
+        col = df[name]
+        lane = _probe_lane_for_dtype(col.dtype)
+        if lane is None:
+            out[name] = None
+            continue
+        if col.null_count() > 0:
+            out[name] = None
+            continue
+        lo, hi = col.min(), col.max()
+        if lo is None or hi is None:
+            out[name] = None
+            continue
+        bounds = _normalise_probe_bounds(lane, lo, hi)
+        if bounds is None:
+            out[name] = None
+            continue
+        out[name] = (lane, bounds[0], bounds[1])
+    return out
+
+
+def _stored_lane(row: dict) -> Optional[Tuple[str, object, object]]:
+    """Read a stored stats row's typed range as ``(lane, min, max)``.
+
+    Returns ``None`` when the row carries no usable range (``stats_available``
+    False, or no lane populated) — meaning the file/row-group can't be excluded
+    on that column.
+    """
+    if not row.get("stats_available"):
+        return None
+    if row.get("min_bigint") is not None and row.get("max_bigint") is not None:
+        return "bigint", row["min_bigint"], row["max_bigint"]
+    if row.get("min_double") is not None and row.get("max_double") is not None:
+        return "double", row["min_double"], row["max_double"]
+    if row.get("min_timestamp") is not None and row.get("max_timestamp") is not None:
+        return "timestamp", row["min_timestamp"], row["max_timestamp"]
+    if row.get("min_string") is not None and row.get("max_string") is not None:
+        return "string", row["min_string"], row["max_string"]
+    return None
+
+
+def prune_overlapping_files_by_stats(
+        overlapping_files: Set[Tuple[str, bool, int]],
+        stored_stats_df: Optional[polars.DataFrame],
+        probe_ranges: Dict[str, Optional[Tuple[str, object, object]]],
+        profiler: Optional[Profiler] = None,
+) -> Set[Tuple[str, bool, int]]:
+    """Narrow the overwrite/delete candidate set using the stored stats.
+
+    A file is dropped **only** when, for every row group, at least one probed
+    key column's range provably does NOT overlap the stored range (so that row
+    group cannot hold any incoming key) — i.e. no row group can match.  The
+    decision is AND-within-row-group (every constrained column must overlap),
+    OR-across-row-groups (one matching row group keeps the file).
+
+    Every uncertainty retains the file:
+      - no usable probe constraints → return the input unchanged;
+      - no stored stats → return the input unchanged;
+      - file absent from the stats → retained;
+      - a (row-group, column) stat missing / ``stats_available`` False / lane
+        mismatch → that column can't exclude that row group → treated as a
+        potential match.
+
+    ``has_overlap=False`` entries (pure-compaction candidates) are passed
+    through untouched — pruning only applies to overwrite/delete candidates.
+    """
+    p = profiler or get_null_profiler()
+    constraints = {c: v for c, v in (probe_ranges or {}).items() if v is not None}
+    if not constraints:
+        return overlapping_files
+    if stored_stats_df is None or stored_stats_df.height == 0:
+        return overlapping_files
+
+    constrained_cols = list(constraints.keys())
+    needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
+    # index: file_path -> row_group_id -> column_name -> (lane,min,max)|None
+    index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
+    for row in needed.iter_rows(named=True):
+        fp = row["file_path"]
+        rg = row["row_group_id"]
+        col = row["column_name"]
+        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+
+    kept: Set[Tuple[str, bool, int]] = set()
+    pruned = 0
+    for entry in overlapping_files:
+        file_path, has_overlap, _file_size = entry
+        if not has_overlap:
+            kept.add(entry)
+            continue
+        rgs = index.get(file_path)
+        if not rgs:
+            kept.add(entry)  # no stats for this file → cannot prove absence
+            continue
+        file_can_match = False
+        for _rg_id, cols in rgs.items():
+            rg_matches = True
+            for col, (lane, lo, hi) in constraints.items():
+                stored = cols.get(col)
+                if stored is None:
+                    continue  # missing / unavailable stat → can't exclude
+                s_lane, s_min, s_max = stored
+                if s_lane != lane:
+                    continue  # lane mismatch → can't compare → assume overlap
+                if not _intervals_overlap(lo, hi, s_min, s_max):
+                    rg_matches = False
+                    break
+            if rg_matches:
+                file_can_match = True
+                break
+        if file_can_match:
+            kept.add(entry)
+        else:
+            pruned += 1
+    p.add("stats_pruned_files", pruned)
+    return kept
 
 
 def compact_tombstones(
