@@ -1587,3 +1587,342 @@ class TestExecuteEngineDefault:
             assert kwargs["engine"] == _Engine.AUTO
         else:
             assert args[0] == _Engine.AUTO
+
+
+# ====================================================================
+# 24. DataReader.execute — EXPLAIN routing (system_query classifier)
+# ====================================================================
+
+class TestExecuteExplainRouting:
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_explain_passes_flags_and_forces_lite(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        mock_parser = MagicMock()
+        mock_parser.get_table_tuples.return_value = []
+        mock_parser.original_query = "SELECT * FROM t"
+        MockParser.return_value = mock_parser
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
+
+        mock_est = MagicMock()
+        mock_est.estimate.return_value = _make_reflection()
+        MockEstimator.return_value = mock_est
+
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = (pd.DataFrame({"plan": ["x"]}), "duckdb_lite")
+        MockExecutor.return_value = mock_exec
+
+        from supertable.data_reader import DataReader, Status, engine
+        from supertable.engine.executor import Engine as _Engine
+        # Request PRO — EXPLAIN must override it to LITE.
+        dr = DataReader("s", "o", "EXPLAIN SELECT * FROM t")
+        df, status, msg = dr.execute("admin", engine=engine.DUCKDB_PRO)
+
+        assert status == Status.OK
+        # Parser is built on the INNER select only (EXPLAIN prefix stripped).
+        assert MockParser.call_args.kwargs["query"] == "SELECT * FROM t"
+        # Executor receives explain flags and is pinned to DuckDB-lite.
+        ekw = mock_exec.execute.call_args.kwargs
+        assert ekw["explain"] is True
+        assert ekw["explain_options"] == ""
+        assert ekw["engine"] == _Engine.DUCKDB_LITE
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_explain_analyze_sets_options(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        mock_parser = MagicMock()
+        mock_parser.get_table_tuples.return_value = []
+        mock_parser.original_query = "SELECT 1"
+        MockParser.return_value = mock_parser
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
+
+        mock_est = MagicMock()
+        mock_est.estimate.return_value = _make_reflection()
+        MockEstimator.return_value = mock_est
+
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
+        MockExecutor.return_value = mock_exec
+
+        from supertable.data_reader import DataReader, engine
+        dr = DataReader("s", "o", "EXPLAIN ANALYZE SELECT 1")
+        dr.execute("admin", engine=engine.AUTO)
+
+        ekw = mock_exec.execute.call_args.kwargs
+        assert ekw["explain"] is True
+        assert ekw["explain_options"] == "ANALYZE"
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_plain_select_passes_explain_false(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+    ):
+        """Regression guard: ordinary SELECT routes with explain=False and the
+        engine the caller requested (no LITE override)."""
+        mock_get_storage.return_value = MagicMock()
+        mock_parser = MagicMock()
+        mock_parser.get_table_tuples.return_value = []
+        mock_parser.original_query = "SELECT * FROM t"
+        MockParser.return_value = mock_parser
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
+
+        mock_est = MagicMock()
+        mock_est.estimate.return_value = _make_reflection()
+        MockEstimator.return_value = mock_est
+
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
+        MockExecutor.return_value = mock_exec
+
+        from supertable.data_reader import DataReader, engine
+        from supertable.engine.executor import Engine as _Engine
+        dr = DataReader("s", "o", "SELECT * FROM t")
+        dr.execute("admin", engine=engine.DUCKDB_PRO)
+
+        ekw = mock_exec.execute.call_args.kwargs
+        assert ekw["explain"] is False
+        assert ekw["explain_options"] == ""
+        assert ekw["engine"] == _Engine.DUCKDB_PRO  # not overridden
+
+
+# ====================================================================
+# 25. DataReader.execute — rejected / malformed commands
+# ====================================================================
+
+class TestExecuteRejectedCommands:
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_no_table_returns_error(
+        self, mock_get_storage, MockParser, MockEstimator, MockExecutor,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        from supertable.data_reader import DataReader, Status
+        dr = DataReader("s", "o", "SHOW STATS")
+        df, status, msg = dr.execute("admin")
+
+        assert status == Status.ERROR
+        assert "table reference" in msg
+        assert df.empty
+        # Rejected before any pipeline work.
+        MockParser.assert_not_called()
+        MockEstimator.assert_not_called()
+        MockExecutor.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_GET_STORAGE)
+    def test_explain_non_select_returns_error(
+        self, mock_get_storage, MockParser, MockEstimator, MockExecutor,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        from supertable.data_reader import DataReader, Status
+        dr = DataReader("s", "o", "EXPLAIN DELETE FROM t")
+        df, status, msg = dr.execute("admin")
+
+        assert status == Status.ERROR
+        assert "only supported for SELECT" in msg
+        MockExecutor.assert_not_called()
+        MockEstimator.assert_not_called()
+
+
+# ====================================================================
+# 26. DataReader.execute — SHOW STATS short-circuit
+# ====================================================================
+
+class TestExecuteShowStats:
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_returns_stats_frame(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        import polars as pl
+        from supertable.processing import STATS_SCHEMA
+
+        # In-memory stats frame with the canonical schema. load_stats reads
+        # through the storage backend, so we stub it here and exercise the
+        # handler's resolve -> load -> to_pandas path directly.
+        rows = [{
+            "file_path": "data/f1.parquet", "row_group_id": 0,
+            "column_name": "id", "physical_type": "INT64", "logical_type": "",
+            "min_bigint": 1, "max_bigint": 99,
+            "min_double": None, "max_double": None,
+            "min_timestamp": None, "max_timestamp": None,
+            "min_string": None, "max_string": None,
+            "null_count": 0, "row_group_rows": 99,
+            "stats_available": True, "min_is_exact": True, "max_is_exact": True,
+        }]
+        stats_df = pl.DataFrame(rows, schema=STATS_SCHEMA)
+
+        mock_get_storage.return_value = MagicMock()
+        from supertable.data_reader import DataReader, Status
+
+        with patch.object(
+            DataReader, "_resolve_latest_stats_file",
+            return_value="redis://stats/v1",
+        ), patch("supertable.processing.load_stats", return_value=stats_df):
+            dr = DataReader("mysuper", "o", "SHOW STATS mysuper.mytable")
+            df, status, msg = dr.execute("admin")
+
+        assert status == Status.OK
+        assert msg is None
+        assert list(df.columns) == list(STATS_SCHEMA.keys())
+        assert len(df) == 1
+        assert df.iloc[0]["column_name"] == "id"
+        assert df.iloc[0]["max_bigint"] == 99
+        # RBAC table-gate enforced; engine pipeline skipped entirely.
+        mock_restrict.assert_called_once()
+        MockEstimator.assert_not_called()
+        MockExecutor.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_no_artifact_returns_empty_schema_frame(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        from supertable.processing import STATS_SCHEMA
+        mock_get_storage.return_value = MagicMock()
+        from supertable.data_reader import DataReader, Status
+
+        # No stats pointer -> empty frame carrying the schema columns, OK status.
+        with patch.object(
+            DataReader, "_resolve_latest_stats_file", return_value=None,
+        ):
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            df, status, msg = dr.execute("admin")
+
+        assert status == Status.OK
+        assert msg is None
+        assert df.empty
+        assert list(df.columns) == list(STATS_SCHEMA.keys())
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_rbac_denial_propagates(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        mock_restrict.side_effect = PermissionError("no access to mytable")
+        from supertable.data_reader import DataReader
+
+        dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+        with pytest.raises(PermissionError, match="no access to mytable"):
+            dr.execute("reader_role")
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_missing_table_returns_error(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor, _mock_data_reader_redis,
+    ):
+        mock_get_storage.return_value = MagicMock()
+        # Make the existence pre-flight fail.
+        _mock_data_reader_redis.return_value.root_exists.return_value = False
+        from supertable.data_reader import DataReader, Status
+
+        dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+        df, status, msg = dr.execute("admin")
+
+        assert status == Status.ERROR
+        assert df.empty
+        # Access check never reached (existence fails first).
+        mock_restrict.assert_not_called()
+
+
+# ====================================================================
+# 27. query_sql — LIMIT guard skips non-SELECT commands
+# ====================================================================
+
+class TestQuerySqlLimitGuard:
+
+    @patch(f"{_MOD}.DataReader")
+    @patch(f"{_MOD}._ensure_sql_limit")
+    def test_limit_appended_for_select(self, mock_ensure, MockDR):
+        mock_ensure.return_value = "SELECT 1 LIMIT 10"
+        from supertable.data_reader import Status, query_sql
+        mock_reader = MagicMock()
+        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        MockDR.return_value = mock_reader
+
+        query_sql("org", "sup", "SELECT 1", 10, MagicMock(), "admin")
+        mock_ensure.assert_called_once_with("SELECT 1", default_limit=10)
+
+    @patch(f"{_MOD}.DataReader")
+    @patch(f"{_MOD}._ensure_sql_limit")
+    def test_limit_skipped_for_show_stats(self, mock_ensure, MockDR):
+        from supertable.data_reader import Status, query_sql
+        mock_reader = MagicMock()
+        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        MockDR.return_value = mock_reader
+
+        query_sql("org", "sup", "SHOW STATS s.t", 10, MagicMock(), "admin")
+        mock_ensure.assert_not_called()
+        # Raw SQL forwarded unchanged to the reader.
+        assert MockDR.call_args.kwargs["query"] == "SHOW STATS s.t"
+
+    @patch(f"{_MOD}.DataReader")
+    @patch(f"{_MOD}._ensure_sql_limit")
+    def test_limit_skipped_for_explain(self, mock_ensure, MockDR):
+        from supertable.data_reader import Status, query_sql
+        mock_reader = MagicMock()
+        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        MockDR.return_value = mock_reader
+
+        query_sql("org", "sup", "EXPLAIN SELECT 1", 10, MagicMock(), "admin")
+        mock_ensure.assert_not_called()
+        assert MockDR.call_args.kwargs["query"] == "EXPLAIN SELECT 1"

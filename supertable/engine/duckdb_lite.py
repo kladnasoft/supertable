@@ -106,6 +106,8 @@ class DuckDBLite:
             timer_capture,
             log_prefix: str = "",
             engine_config=None,
+            explain: bool = False,
+            explain_options: str = "",
     ) -> pd.DataFrame:
         tried_presign = False
 
@@ -210,6 +212,15 @@ class DuckDBLite:
             executing_query = rewrite_query_with_hashed_tables(
                 parser.original_query, query_alias_to_name,
             )
+            # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
+            # query (over the reflection/tombstone/RBAC view chain) instead of
+            # the rows. The prefix is applied to the final SQL so the plan
+            # reflects exactly what a real read would execute.
+            if explain:
+                _opts = (explain_options or "").strip()
+                executing_query = (
+                    f"EXPLAIN {(_opts + ' ') if _opts else ''}{executing_query}"
+                )
             parser.executing_query = executing_query
 
             # Profiling PRAGMAs are connection-level state.  Under concurrent

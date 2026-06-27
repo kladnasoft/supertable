@@ -279,3 +279,46 @@ class TestReadPruningObservability:
             assert est.plan_stats is injected
             assert _stat(injected, "REFLECTIONS") == 1
             assert _stat(injected, "FILES_PRUNED") == 2
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN SQL contract — the prefix duckdb_lite builds is valid DuckDB and
+# returns a plan (not rows) over the real reflection-style view.
+# ---------------------------------------------------------------------------
+
+def _explain_prefixed(query: str, explain_options: str = "") -> str:
+    # Mirrors supertable/engine/duckdb_lite.py: the exact prefix construction
+    # applied to the final rewritten query when explain=True.
+    _opts = (explain_options or "").strip()
+    return f"EXPLAIN {(_opts + ' ') if _opts else ''}{query}"
+
+
+def _duckdb_explain(query: str, files: list[str]) -> pd.DataFrame:
+    con = duckdb.connect()
+    try:
+        flist = "[" + ", ".join("'" + f + "'" for f in files) + "]"
+        con.execute(f'CREATE VIEW "{_SIMPLE}" AS SELECT * FROM read_parquet({flist})')
+        return con.execute(query).fetchdf()
+    finally:
+        con.close()
+
+
+class TestExplainSqlContract:
+
+    def test_explain_returns_plan_not_rows(self, orders_on_disk):
+        files = orders_on_disk["files"]
+        plan = _duckdb_explain(_explain_prefixed(_PRUNE_Q), files)
+        # DuckDB EXPLAIN yields a small plan table, not the matching data rows.
+        assert not plan.empty
+        text = "\n".join(plan.astype(str).agg(" ".join, axis=1))
+        assert "PHYSICAL_PLAN" in text.upper() or "SCAN" in text.upper()
+
+    def test_explain_analyze_returns_plan(self, orders_on_disk):
+        files = orders_on_disk["files"]
+        plan = _duckdb_explain(_explain_prefixed(_PRUNE_Q, "ANALYZE"), files)
+        assert not plan.empty
+
+    def test_explain_prefix_forms(self):
+        assert _explain_prefixed("SELECT 1") == "EXPLAIN SELECT 1"
+        assert _explain_prefixed("SELECT 1", "ANALYZE") == "EXPLAIN ANALYZE SELECT 1"
+        assert _explain_prefixed("SELECT 1", "  ") == "EXPLAIN SELECT 1"

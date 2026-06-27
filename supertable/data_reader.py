@@ -25,6 +25,7 @@ from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
 from supertable.data_classes import TombstoneDef, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
+from supertable.system_query import classify_query, CommandKind
 
 
 class Status(Enum):
@@ -109,6 +110,82 @@ class DataReader:
                     self.organization, super_name, simple_name
                 )
 
+    def _resolve_latest_stats_file(
+        self, super_name: str, simple_name: str,
+    ) -> Optional[str]:
+        """Return the ``stats_file`` pointer of the table's latest snapshot.
+
+        Prefers the leaf payload (already in Redis); falls back to reading the
+        snapshot JSON from storage. ``None`` when the table has no stats artifact
+        yet (never written, or written before stats existed).
+        """
+        catalog = RedisCatalog()
+        leaf = catalog.get_leaf(self.organization, super_name, simple_name)
+        if not isinstance(leaf, dict):
+            return None
+        payload = leaf.get("payload")
+        if isinstance(payload, dict) and payload.get("stats_file"):
+            return payload["stats_file"]
+        path = leaf.get("path")
+        if not path:
+            return None
+        from supertable.super_table import SuperTable
+        snapshot = SuperTable(
+            super_name, self.organization, create_if_missing=False,
+        ).read_simple_table_snapshot(path)
+        return snapshot.get("stats_file") if isinstance(snapshot, dict) else None
+
+    def _execute_show_stats(
+        self, command, role_name: str,
+    ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+        """Return the raw contents of a table's latest statistics parquet.
+
+        Reads-never-create and table-level RBAC are enforced (the same gates a
+        SELECT hits); the statistics rows/columns themselves are returned
+        unfiltered. When the table exists but has no stats artifact yet, an empty
+        frame with the stats schema columns is returned (success, not error).
+        """
+        from supertable.data_classes import TableDefinition
+        from supertable.processing import load_stats, STATS_SCHEMA
+
+        super_name = command.super_name
+        simple_name = command.simple_name
+        td = TableDefinition(
+            super_name=super_name,
+            simple_name=simple_name,
+            alias=simple_name,
+            columns=[],
+        )
+
+        # Reads never create catalog entries.
+        try:
+            self._assert_targets_exist([td])
+        except (SuperTableNotFoundError, TableNotFoundError) as e:
+            logger.warning(self._lp(f"[show-stats] target missing: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
+
+        # Table-level RBAC: raises PermissionError if the role cannot read the
+        # table at all. columns=[] means "all columns", which skips column-level
+        # denial — we don't filter the stats output, only gate table access.
+        restrict_read_access(
+            super_name=super_name,
+            organization=self.organization,
+            role_name=role_name,
+            tables=[td],
+            physical_tables=[td],
+        )
+
+        try:
+            stats_file = self._resolve_latest_stats_file(super_name, simple_name)
+            stats_df = load_stats(stats_file, allow_cache=True) if stats_file else None
+        except Exception as e:
+            logger.error(self._lp(f"[show-stats] failed to load stats: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
+
+        if stats_df is None:
+            return pd.DataFrame(columns=list(STATS_SCHEMA.keys())), Status.OK, None
+        return stats_df.to_pandas(), Status.OK, None
+
     def execute(
         self,
         role_name: str,
@@ -120,10 +197,27 @@ class DataReader:
         self.timer = Timer()
         self.plan_stats = PlanStats()
 
-        # Build parser with the correct dialect for the chosen engine.
+        # Classify into an allowed read-path command. Ordinary SELECTs fall
+        # through unchanged; EXPLAIN/SHOW STATS are the two diagnostic
+        # extensions. A recognised-but-malformed command (e.g. SHOW STATS with
+        # no table) returns a clean error rather than raising.
+        try:
+            command = classify_query(self.query, self.super_name)
+        except ValueError as e:
+            logger.warning(self._lp(f"rejected query: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
+
+        # SHOW STATS short-circuits the engine entirely — it returns the raw
+        # statistics artifact, no reflection/estimation/execution.
+        if command.kind is CommandKind.SHOW_STATS:
+            return self._execute_show_stats(command, role_name)
+
+        # Build parser with the correct dialect for the chosen engine. For
+        # EXPLAIN, parse only the inner SELECT so estimation/RBAC/reflection
+        # behave exactly as for the equivalent plain SELECT.
         parser = SQLParser(
             super_name=self.super_name,
-            query=self.query,
+            query=command.sql,
             dialect=engine.dialect,
         )
         tables = parser.get_table_tuples()
@@ -255,15 +349,23 @@ class DataReader:
                 message = "No parquet files found"
                 return pd.DataFrame(), status, message
 
-            # 2) EXECUTE
+            # 2) EXECUTE.  EXPLAIN is pinned to DuckDB-lite so the plan is
+            # produced cheaply and uniformly (no Pro materialisation / Spark
+            # round trip) and prefixed onto the final rewritten query.
+            exec_engine = engine
+            if command.explain:
+                from supertable.engine.engine_enum import Engine as _EngineEnum
+                exec_engine = _EngineEnum.DUCKDB_LITE
             result_df, engine_used = executor.execute(
-                engine=engine,
+                engine=exec_engine,
                 reflection=reflection,
                 parser=parser,
                 query_manager=self.query_plan_manager,
                 timer=self.timer,
                 plan_stats=self.plan_stats,
                 log_prefix=self._lp(""),
+                explain=command.explain,
+                explain_options=command.explain_options,
             )
             status = Status.OK
         except Exception as e:
@@ -330,8 +432,14 @@ def query_sql(
     the caller can correlate its own audit log to this read record.
     """
     # Safety guard: ensure a LIMIT is present so unbounded queries don't
-    # overwhelm the MCP response payload.
-    sql = _ensure_sql_limit(sql, default_limit=limit)
+    # overwhelm the MCP response payload. Only plain SELECTs take an appended
+    # LIMIT — EXPLAIN output is tiny and SHOW STATS does not accept a LIMIT.
+    try:
+        is_select = classify_query(sql, super_name).kind is CommandKind.SELECT
+    except ValueError:
+        is_select = True
+    if is_select:
+        sql = _ensure_sql_limit(sql, default_limit=limit)
 
     reader = DataReader(
         organization=organization, super_name=super_name, query=sql, source=source,

@@ -189,6 +189,8 @@ class Executor:
         timer: Timer,
         plan_stats: PlanStats,
         log_prefix: str,
+        explain: bool = False,
+        explain_options: str = "",
     ) -> Tuple[pd.DataFrame, str]:
         # Resolve engine config live (Redis → env → default) for this query so
         # UI changes take effect immediately without restart or cache.  Lite and
@@ -211,6 +213,8 @@ class Executor:
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
                 engine_config=lite_cfg,
+                explain=explain,
+                explain_options=explain_options,
             )
             used = "duckdb_lite"
 
