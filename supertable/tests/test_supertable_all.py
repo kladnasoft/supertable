@@ -475,187 +475,6 @@ class TestWriteParquetAndCollectResources:
         assert stats["a"]["max"] == 20
 
 
-class TestProcessOverlappingFiles:
-    """Tests for process_overlapping_files (full pipeline)."""
-
-    @patch("supertable.processing._storage")
-    def test_insert_only_no_overlapping(self, mock_storage):
-        from supertable.processing import process_overlapping_files
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 1024
-
-        df = _polars_df({"x": [1, 2, 3], "y": ["a", "b", "c"]})
-        overlapping: Set[Tuple[str, bool, int]] = set()
-
-        inserted, deleted, total_rows, total_columns, new_resources, sunset_files = (
-            process_overlapping_files(df, overlapping, ["x"], "/tmp/data", 1)
-        )
-        assert inserted == 3
-        assert deleted == 0
-        assert total_columns == 2
-        assert total_rows == 3
-        assert len(new_resources) == 1
-        assert len(sunset_files) == 0
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_overlap_deletes_matching_rows(self, mock_storage, mock_read):
-        from supertable.processing import process_overlapping_files
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 1024
-
-        existing_df = _polars_df({"x": [1, 2, 3], "y": ["old_a", "old_b", "old_c"]})
-        mock_read.return_value = existing_df
-
-        new_df = _polars_df({"x": [2, 3, 4], "y": ["new_b", "new_c", "new_d"]})
-        overlapping: Set[Tuple[str, bool, int]] = {("data/old_file.parquet", True, 1024)}
-
-        inserted, deleted, total_rows, total_columns, new_resources, sunset_files = (
-            process_overlapping_files(new_df, overlapping, ["x"], "/tmp/data", 1)
-        )
-        assert inserted == 3
-        assert deleted == 2  # rows x=2 and x=3 deleted from existing
-        assert "data/old_file.parquet" in sunset_files
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_no_overwrite_columns_compaction(self, mock_storage, mock_read):
-        from supertable.processing import process_overlapping_files
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 512
-
-        existing_df = _polars_df({"x": [10, 20]})
-        mock_read.return_value = existing_df
-
-        new_df = _polars_df({"x": [30]})
-        overlapping: Set[Tuple[str, bool, int]] = {("data/compact.parquet", False, 512)}
-
-        inserted, deleted, total_rows, total_columns, new_resources, sunset_files = (
-            process_overlapping_files(new_df, overlapping, [], "/tmp/data", 1)
-        )
-        assert inserted == 1
-        assert "data/compact.parquet" in sunset_files
-
-
-class TestProcessFilesWithOverlap:
-    """Tests for process_files_with_overlap."""
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_skips_file_when_read_returns_none(self, mock_storage, mock_read):
-        from supertable.processing import process_files_with_overlap
-        mock_read.return_value = None
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 1024
-
-        df = _polars_df({"x": [1]})
-        empty_df = pl.DataFrame(schema={"x": pl.Int64})
-        merged_df = df.clone()
-        new_resources: list = []
-        sunset_files: set = set()
-
-        deleted, result_merged, total_rows, _skipped = process_files_with_overlap(
-            data_dir="/tmp",
-            deleted=0,
-            df=df,
-            empty_df=empty_df,
-            merged_df=merged_df,
-            new_resources=new_resources,
-            overlapping_files={("missing.parquet", True, 1024)},
-            overwrite_columns=["x"],
-            sunset_files=sunset_files,
-            total_rows=0,
-            compression_level=1,
-        )
-        assert deleted == 0
-        assert "missing.parquet" not in sunset_files
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_no_rows_deleted_skips_sunset(self, mock_storage, mock_read):
-        from supertable.processing import process_files_with_overlap
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 1024
-
-        existing = _polars_df({"x": [10, 20], "y": ["a", "b"]})
-        mock_read.return_value = existing
-
-        # New df has x=99 → no overlap with existing x=[10,20]
-        df = _polars_df({"x": [99], "y": ["z"]})
-        empty_df = pl.DataFrame(schema={"x": pl.Int64, "y": pl.Utf8})
-        merged_df = df.clone()
-        new_resources: list = []
-        sunset_files: set = set()
-
-        deleted, result_merged, total_rows, _skipped = process_files_with_overlap(
-            data_dir="/tmp",
-            deleted=0,
-            df=df,
-            empty_df=empty_df,
-            merged_df=merged_df,
-            new_resources=new_resources,
-            overlapping_files={("nochange.parquet", True, 1024)},
-            overwrite_columns=["x"],
-            sunset_files=sunset_files,
-            total_rows=0,
-            compression_level=1,
-        )
-        assert deleted == 0
-        assert "nochange.parquet" not in sunset_files
-
-
-class TestProcessFilesWithoutOverlap:
-    """Tests for process_files_without_overlap."""
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_compacts_false_files(self, mock_storage, mock_read):
-        from supertable.processing import process_files_without_overlap
-        mock_storage.exists.return_value = True
-        mock_storage.size.return_value = 512
-
-        existing = _polars_df({"x": [10, 20]})
-        mock_read.return_value = existing
-
-        empty_df = pl.DataFrame(schema={"x": pl.Int64})
-        new_resources: list = []
-        sunset_files: set = set()
-
-        result = process_files_without_overlap(
-            empty_df=empty_df,
-            data_dir="/tmp",
-            new_resources=new_resources,
-            overlapping_files={("compact1.parquet", False, 512)},
-            overwrite_columns=["x"],
-            sunset_files=sunset_files,
-            compression_level=1,
-        )
-        assert "compact1.parquet" in sunset_files
-        assert result.shape[0] == 2
-
-    @patch("supertable.processing._read_parquet_safe")
-    @patch("supertable.processing._storage")
-    def test_ignores_true_files(self, mock_storage, mock_read):
-        from supertable.processing import process_files_without_overlap
-
-        empty_df = pl.DataFrame(schema={"x": pl.Int64})
-        new_resources: list = []
-        sunset_files: set = set()
-
-        result = process_files_without_overlap(
-            empty_df=empty_df,
-            data_dir="/tmp",
-            new_resources=new_resources,
-            overlapping_files={("overlap.parquet", True, 512)},
-            overwrite_columns=["x"],
-            sunset_files=sunset_files,
-            compression_level=1,
-        )
-        # True files are skipped by this function
-        assert "overlap.parquet" not in sunset_files
-        assert result.shape[0] == 0
-
-
 class TestSafeExists:
     """Tests for _safe_exists."""
 
@@ -1317,7 +1136,9 @@ class TestDataWriterWrite:
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
-    @patch("supertable.data_writer.process_overlapping_files")
+    @patch("supertable.data_writer.build_tombstone_file")
+    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1330,7 +1151,9 @@ class TestDataWriterWrite:
         mock_catalog_cls,
         mock_access,
         mock_find_overlap,
-        mock_process_overlap,
+        mock_write_parquet,
+        mock_identify_deleted,
+        mock_build_tombstone,
         mock_mirror,
         mock_monitor,
     ):
@@ -1346,6 +1169,7 @@ class TestDataWriterWrite:
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = "lock_token_123"
         mock_catalog.release_simple_lock.return_value = True
+        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         # Setup SimpleTable mock
@@ -1356,9 +1180,16 @@ class TestDataWriterWrite:
         mock_simple.update.return_value = (snapshot, "new_snap.json")
         mock_simple_cls.return_value = mock_simple
 
-        # Setup processing mocks
+        # Setup processing mocks (deletion-vector model)
         mock_find_overlap.return_value = set()
-        mock_process_overlap.return_value = (3, 0, 3, 2, [_resource_entry("new.parquet")], set())
+        mock_identify_deleted.return_value = []  # no rows deleted
+
+        def _append_resource(**kwargs):
+            kwargs["new_resources"].append(_resource_entry("new.parquet"))
+        mock_write_parquet.side_effect = _append_resource
+
+        # No delete pairs + no prev tombstone → (None, None), no I/O.
+        mock_build_tombstone.return_value = (None, None)
 
         # Setup monitoring mock
         mock_monitor_inst = MagicMock()
@@ -1368,6 +1199,7 @@ class TestDataWriterWrite:
         arrow = _arrow_table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
         result = dw.write("user_hash", "my_table", arrow, ["x"])
 
+        # (total_columns=2 logical, total_rows=3, inserted=3, deleted=0)
         assert result == (2, 3, 3, 0)
         mock_access.assert_called_once()
         mock_catalog.acquire_simple_lock.assert_called_once()
@@ -1387,6 +1219,7 @@ class TestDataWriterWrite:
 
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = None  # lock failed
+        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         dw = DataWriter("test_super", "test_org")
@@ -1419,7 +1252,9 @@ class TestDataWriterWrite:
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
-    @patch("supertable.data_writer.process_overlapping_files")
+    @patch("supertable.data_writer.build_tombstone_file")
+    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1432,7 +1267,9 @@ class TestDataWriterWrite:
         mock_catalog_cls,
         mock_access,
         mock_find_overlap,
-        mock_process_overlap,
+        mock_write_parquet,
+        mock_identify_deleted,
+        mock_build_tombstone,
         mock_mirror,
         mock_monitor,
     ):
@@ -1445,6 +1282,7 @@ class TestDataWriterWrite:
 
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = "token_abc"
+        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         # Fail during processing
@@ -1466,7 +1304,9 @@ class TestDataWriterWrite:
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
-    @patch("supertable.data_writer.process_overlapping_files")
+    @patch("supertable.data_writer.build_tombstone_file")
+    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1479,7 +1319,9 @@ class TestDataWriterWrite:
         mock_catalog_cls,
         mock_access,
         mock_find_overlap,
-        mock_process_overlap,
+        mock_write_parquet,
+        mock_identify_deleted,
+        mock_build_tombstone,
         mock_mirror,
         mock_monitor,
     ):
@@ -1493,6 +1335,7 @@ class TestDataWriterWrite:
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
+        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         mock_simple = MagicMock()
@@ -1503,7 +1346,11 @@ class TestDataWriterWrite:
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
-        mock_process_overlap.return_value = (1, 0, 1, 1, [], set())
+        mock_identify_deleted.return_value = []
+        mock_write_parquet.side_effect = (
+            lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
+        )
+        mock_build_tombstone.return_value = (None, None)
 
         # Mirror fails
         mock_mirror.mirror_if_enabled.side_effect = RuntimeError("mirror fail")
@@ -1520,7 +1367,9 @@ class TestDataWriterWrite:
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
-    @patch("supertable.data_writer.process_overlapping_files")
+    @patch("supertable.data_writer.build_tombstone_file")
+    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1533,7 +1382,9 @@ class TestDataWriterWrite:
         mock_catalog_cls,
         mock_access,
         mock_find_overlap,
-        mock_process_overlap,
+        mock_write_parquet,
+        mock_identify_deleted,
+        mock_build_tombstone,
         mock_mirror,
         mock_monitor,
     ):
@@ -1547,6 +1398,7 @@ class TestDataWriterWrite:
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
+        mock_catalog.reserve_rowids.return_value = 0
         # set_leaf_payload_cas fails → fallback to set_leaf_path_cas
         mock_catalog.set_leaf_payload_cas.side_effect = Exception("not supported")
         mock_catalog_cls.return_value = mock_catalog
@@ -1559,7 +1411,11 @@ class TestDataWriterWrite:
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
-        mock_process_overlap.return_value = (1, 0, 1, 1, [], set())
+        mock_identify_deleted.return_value = []
+        mock_write_parquet.side_effect = (
+            lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
+        )
+        mock_build_tombstone.return_value = (None, None)
         mock_monitor.return_value = MagicMock()
 
         dw = DataWriter("test_super", "test_org")
@@ -1571,7 +1427,9 @@ class TestDataWriterWrite:
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
-    @patch("supertable.data_writer.process_overlapping_files")
+    @patch("supertable.data_writer.build_tombstone_file")
+    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1584,7 +1442,9 @@ class TestDataWriterWrite:
         mock_catalog_cls,
         mock_access,
         mock_find_overlap,
-        mock_process_overlap,
+        mock_write_parquet,
+        mock_identify_deleted,
+        mock_build_tombstone,
         mock_mirror,
         mock_monitor,
     ):
@@ -1598,6 +1458,7 @@ class TestDataWriterWrite:
         mock_catalog = MagicMock()
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
+        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         mock_simple = MagicMock()
@@ -1608,7 +1469,16 @@ class TestDataWriterWrite:
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
-        mock_process_overlap.return_value = (1, 0, 1, 1, [], set())
+        # Two existing rows tombstoned → deleted == 2.  Non-empty delete pairs
+        # mean build_tombstone_file would do real parquet I/O, so it is patched.
+        mock_identify_deleted.return_value = [
+            ("/tmp/data/old.parquet", 10),
+            ("/tmp/data/old.parquet", 11),
+        ]
+        mock_write_parquet.side_effect = (
+            lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
+        )
+        mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
 
         # Monitoring fails
         mock_monitor.side_effect = RuntimeError("monitoring down")
@@ -1617,8 +1487,9 @@ class TestDataWriterWrite:
         arrow = _arrow_table({"x": [1]})
         result = dw.write("user_hash", "my_table", arrow, ["x"])
 
-        # Should still return result
+        # Should still return result; deleted count comes from identify_deleted_rowids.
         assert result is not None
+        assert result == (1, 1, 1, 2)
 
 
 # ===========================================================================

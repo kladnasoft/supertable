@@ -35,7 +35,7 @@ _P_SIMPLE_TABLE  = f"{_MOD}.SimpleTable"
 _P_REDIS_CAT     = f"{_MOD}.RedisCatalog"
 _P_COMPACT_RES   = f"{_MOD}.compact_resources"
 _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
-_P_TOMB_THRESH   = f"{_MOD}._tombstone_threshold"
+_P_READ_PARQUET  = f"{_MOD}._read_parquet_safe"
 _P_MIRROR        = f"{_MOD}.MirrorFormats"
 _P_MON_WRITER    = f"{_MOD}.MonitoringWriter"
 _P_AUDIT         = f"{_MOD}._audit_emit"
@@ -57,15 +57,24 @@ def _resource(file: str, file_size: int = 1_000, rows: int = 100) -> dict:
     }
 
 
-def _snapshot(resources: list, *, tombstones: dict | None = None) -> dict:
+def _snapshot(resources: list, *, tombstone: str | None = None) -> dict:
     snap = {
         "simple_name": "orders",
         "snapshot_version": 1,
         "resources": resources,
     }
-    if tombstones is not None:
-        snap["tombstones"] = tombstones
+    if tombstone is not None:
+        # In the merge-on-read model the snapshot stores a POINTER (path)
+        # to the deletion-vector parquet, not an inline dict. compact()
+        # reads it via ``_read_parquet_safe`` and gates draining purely
+        # on whether that frame has rows (tombstone_rows > 0).
+        snap["tombstone"] = tombstone
     return snap
+
+
+def _dv_frame(n_rows: int):
+    """A stand-in deletion-vector frame whose ``.height`` is ``n_rows``."""
+    return pl.DataFrame({"__rowid__": list(range(n_rows))})
 
 
 def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
@@ -285,34 +294,38 @@ class TestRefusesBootstrap:
 
 
 class TestTombstoneGating:
+    """compact() drains the deletion-vector whenever it has rows.
+
+    Post-refactor, draining is gated purely on ``tombstone_rows > 0``
+    (the frame read from the snapshot's ``tombstone`` pointer). The
+    ``force_tombstones`` flag is retained for API/lineage compatibility
+    but no longer gates the DV-drain, and the per-table
+    ``max_tombstone_rows`` threshold gates only the WRITE path.
+    """
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_TOMB_THRESH, return_value=1000)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_force_tombstones_true_runs_unconditionally(
-        self, mock_check_write, MockSimple, mock_settings, mock_thresh,
+    def test_force_tombstones_true_drains_dv(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """force_tombstones=True ignores the natural threshold."""
+        """force_tombstones=True + a non-empty DV → compact_tombstones runs."""
         dw = _build_writer()
-        # Snapshot has 1 tombstone — far below the 1000-row threshold.
         snap = _snapshot(
             [_resource("a"), _resource("b")],
-            tombstones={
-                "primary_keys": ["id"],
-                "deleted_keys": [[42]],
-                "total_tombstones": 1,
-            },
+            tombstone="/d/tombstone.parquet",
         )
         MockSimple.return_value = _mk_simple_mock(snap)
+        mock_read_pq.return_value = _dv_frame(1)  # 1 tombstoned row
         mock_compact_tomb.return_value = (1, [{"file": "rebuilt.parquet", "file_size": 100, "columns": []}], {"a"})
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
+        dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
 
@@ -323,57 +336,25 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_TOMB_THRESH, return_value=1000)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_force_tombstones_false_below_threshold_skips(
-        self, mock_check_write, MockSimple, mock_settings, mock_thresh,
+    def test_force_tombstones_false_still_drains_dv(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """force_tombstones=False + tombstones below threshold = skip."""
+        """force_tombstones=False no longer suppresses the drain: a
+        non-empty DV is still consumed unconditionally."""
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a")],
-            tombstones={
-                "primary_keys": ["id"],
-                "deleted_keys": [[1], [2]],   # 2 tombstones, threshold=1000
-                "total_tombstones": 2,
-            },
+            tombstone="/d/tombstone.parquet",
         )
         MockSimple.return_value = _mk_simple_mock(snap)
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
-
-        dw.compact("admin", "tbl", force_tombstones=False)
-
-        mock_compact_tomb.assert_not_called()
-
-    @patch(_P_AUDIT)
-    @patch(_P_MON_WRITER)
-    @patch(_P_MIRROR)
-    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
-    @patch(_P_COMPACT_TOMB)
-    @patch(_P_TOMB_THRESH, return_value=2)
-    @patch(_P_SETTINGS, new_callable=_stub_settings)
-    @patch(_P_SIMPLE_TABLE)
-    @patch(_P_CHECK_WRITE)
-    def test_force_tombstones_false_above_threshold_runs(
-        self, mock_check_write, MockSimple, mock_settings, mock_thresh,
-        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
-    ):
-        """force_tombstones=False + tombstones ≥ threshold = run."""
-        dw = _build_writer()
-        snap = _snapshot(
-            [_resource("a")],
-            tombstones={
-                "primary_keys": ["id"],
-                "deleted_keys": [[1], [2], [3]],  # 3 tombstones, threshold=2
-                "total_tombstones": 3,
-            },
-        )
-        MockSimple.return_value = _mk_simple_mock(snap)
-        mock_compact_tomb.return_value = (3, [{"file": "rebuilt", "file_size": 1, "columns": []}], {"a"})
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
+        mock_read_pq.return_value = _dv_frame(2)  # 2 tombstoned rows
+        mock_compact_tomb.return_value = (2, [{"file": "rebuilt", "file_size": 1, "columns": []}], {"a"})
+        dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=False)
 
@@ -384,30 +365,85 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_TOMB_THRESH, return_value=1)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_no_primary_keys_skips_tombstone_step(
-        self, mock_check_write, MockSimple, mock_settings, mock_thresh,
+    def test_threshold_does_not_gate_compact_drain(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """Without primary keys the tombstone step is a no-op."""
+        """A tiny DV (well below any max_tombstone_rows threshold) is
+        still drained — the threshold gates only the write path."""
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a")],
-            tombstones={
-                "primary_keys": [],
-                "deleted_keys": [[1]],
-                "total_tombstones": 1,
-            },
+            tombstone="/d/tombstone.parquet",
         )
+        MockSimple.return_value = _mk_simple_mock(snap)
+        mock_read_pq.return_value = _dv_frame(3)
+        mock_compact_tomb.return_value = (3, [{"file": "rebuilt", "file_size": 1, "columns": []}], {"a"})
+        # A huge per-table threshold must NOT suppress compact()'s drain.
+        dw._get_table_config = MagicMock(return_value={"max_tombstone_rows": 1_000_000})
+
+        dw.compact("admin", "tbl", force_tombstones=False)
+
+        mock_compact_tomb.assert_called_once()
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_empty_dv_skips_tombstone_step(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        """No tombstone rows → tombstone step is skipped.
+
+        Two ways to have no rows: an empty DV frame, or no ``tombstone``
+        pointer at all. Both must skip compact_tombstones."""
+        dw = _build_writer()
+        snap = _snapshot(
+            [_resource("a")],
+            tombstone="/d/tombstone.parquet",
+        )
+        MockSimple.return_value = _mk_simple_mock(snap)
+        mock_read_pq.return_value = _dv_frame(0)  # empty deletion-vector
+        dw._get_table_config = MagicMock(return_value={})
+
+        dw.compact("admin", "tbl", force_tombstones=True)
+
+        mock_compact_tomb.assert_not_called()
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_no_tombstone_pointer_skips_tombstone_step(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        """A snapshot without a ``tombstone`` pointer never reads the DV
+        and never runs the tombstone step."""
+        dw = _build_writer()
+        snap = _snapshot([_resource("a")])  # no tombstone pointer
         MockSimple.return_value = _mk_simple_mock(snap)
         dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
 
         mock_compact_tomb.assert_not_called()
+        mock_read_pq.assert_not_called()
 
 
 # ===========================================================================
@@ -919,11 +955,12 @@ class TestTwoPhaseAggregation:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
     def test_tombstone_output_resunset_by_phase_b_not_in_new_resources(
-        self, mock_check_write, MockSimple, mock_settings,
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
         dw = _build_writer()
@@ -934,19 +971,16 @@ class TestTwoPhaseAggregation:
             {"id": pa.array([1], type=pa.int64())}
         )
 
-        # Snapshot has A (with tombstones), B, C
+        # Snapshot has A, B, C plus a non-empty deletion-vector.
         snap = _snapshot(
             [_resource("A", file_size=2_000_000),
              _resource("B", file_size=1_000_000),
              _resource("C", file_size=1_000_000)],
-            tombstones={
-                "primary_keys": ["id"],
-                "deleted_keys": [[42]],
-                "total_tombstones": 1,
-            },
+            tombstone="/d/tombstone.parquet",
         )
         mock_simple = _mk_simple_mock(snap)
         MockSimple.return_value = mock_simple
+        mock_read_pq.return_value = _dv_frame(1)  # DV has rows → drains
 
         # Phase A: tombstone compaction rewrites A → F
         F_resource = {
@@ -963,7 +997,7 @@ class TestTwoPhaseAggregation:
         }
         mock_compact_res.return_value = (3, 150, [G_resource], {"B", "C", "F"})
 
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
+        dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
 
@@ -987,11 +1021,12 @@ class TestTwoPhaseAggregation:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
     def test_tombstone_output_survives_when_phase_b_does_not_sunset_it(
-        self, mock_check_write, MockSimple, mock_settings,
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
         """The benign case: tombstone-output F is large (or otherwise
@@ -1006,14 +1041,11 @@ class TestTwoPhaseAggregation:
         snap = _snapshot(
             [_resource("A", file_size=2_000_000),
              _resource("B", file_size=500_000)],
-            tombstones={
-                "primary_keys": ["id"],
-                "deleted_keys": [[42]],
-                "total_tombstones": 1,
-            },
+            tombstone="/d/tombstone.parquet",
         )
         mock_simple = _mk_simple_mock(snap)
         MockSimple.return_value = mock_simple
+        mock_read_pq.return_value = _dv_frame(1)  # DV has rows → drains
 
         F_resource = {
             "file": "F", "file_size": 20_000_000,  # large
@@ -1029,7 +1061,7 @@ class TestTwoPhaseAggregation:
         }
         mock_compact_res.return_value = (1, 50, [G_resource], {"B"})
 
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
+        dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
 
@@ -1052,17 +1084,18 @@ class TestResultShape:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
     def test_returns_stats_dict_with_expected_keys(
-        self, mock_check_write, MockSimple, mock_settings,
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a"), _resource("b"), _resource("c")],
-            tombstones={"primary_keys": ["id"], "deleted_keys": [[1]], "total_tombstones": 1},
+            tombstone="/d/tombstone.parquet",
         )
         mock_simple = _mk_simple_mock(snap)
         mock_simple.update.return_value = (
@@ -1070,11 +1103,12 @@ class TestResultShape:
             "/snap/v2.json",
         )
         MockSimple.return_value = mock_simple
+        mock_read_pq.return_value = _dv_frame(1)  # 1 tombstoned row
 
         new_res = [{"file": "c.parquet", "file_size": 5000, "columns": [{"name": "id"}]}]
         mock_compact_res.return_value = (3, 300, new_res, {"a", "b", "c"})
         mock_compact_tomb.return_value = (1, [], {"a"})  # 1 tombstoned row, no new files
-        dw._get_table_config = MagicMock(return_value={"primary_keys": ["id"]})
+        dw._get_table_config = MagicMock(return_value={})
 
         result = dw.compact("admin", "tbl", force_tombstones=True)
 

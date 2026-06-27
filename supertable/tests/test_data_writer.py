@@ -37,8 +37,16 @@ _PATCH_TIMER = f"{_MOD}.Timer"
 _PATCH_POLARS_FROM_ARROW = f"{_MOD}.polars.from_arrow"
 _PATCH_FIND_OVERLAP = f"{_MOD}.find_overlapping_files"
 _PATCH_FILTER_STALE = f"{_MOD}.filter_stale_incoming_rows"
-_PATCH_PROCESS_OVERLAP = f"{_MOD}.process_overlapping_files"
-_PATCH_PROCESS_DELETE = f"{_MOD}.process_delete_only"
+# The merge-on-read write path no longer funnels through a single
+# process_*() call.  Inserts go through write_parquet_and_collect_resources
+# (called once per non-delete write, skipped on delete_only — same
+# structural role the old process_overlapping_files mock filled, but its
+# return value is now ignored).  Deletes are identified by
+# identify_deleted_rowids (returns a list of (file, __rowid__) pairs) and
+# recorded by build_tombstone_file.
+_PATCH_PROCESS_OVERLAP = f"{_MOD}.write_parquet_and_collect_resources"
+_PATCH_PROCESS_DELETE = f"{_MOD}.identify_deleted_rowids"
+_PATCH_BUILD_TOMBSTONE = f"{_MOD}.build_tombstone_file"
 _PATCH_MIRROR = f"{_MOD}.MirrorFormats"
 _PATCH_GET_MON_LOGGER = f"{_MOD}.MonitoringWriter"
 _PATCH_UUID4 = f"{_MOD}.uuid.uuid4"
@@ -145,6 +153,7 @@ class TestDataWriterInit:
         mock_st = MagicMock()
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
@@ -356,6 +365,7 @@ class TestWriteHappyPath:
         mock_st = MagicMock(super_name="s1", organization="o1")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.release_simple_lock.return_value = True
@@ -426,6 +436,7 @@ class TestWriteHappyPath:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -457,6 +468,7 @@ class TestWriteHappyPath:
 
 class TestWriteDeleteOnly:
 
+    @patch(_PATCH_BUILD_TOMBSTONE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_DELETE)
@@ -470,10 +482,12 @@ class TestWriteDeleteOnly:
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_proc_del, MockMirror, mock_get_mon,
+        mock_build_tomb,
     ):
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -488,7 +502,13 @@ class TestWriteDeleteOnly:
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
 
-        mock_proc_del.return_value = (0, 1, 0, 2, [], {"f1"})
+        # identify_deleted_rowids returns a list of (file, __rowid__) pairs;
+        # one pair → deleted == 1.
+        mock_proc_del.return_value = [("f1", 1)]
+        # build_tombstone_file does real parquet I/O against simple_dir (a
+        # MagicMock here), so it must be stubbed.  (path, combined_df) shape;
+        # combined_df=None keeps us below the compaction threshold.
+        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -515,6 +535,7 @@ class TestWriteDeleteOnly:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -528,11 +549,16 @@ class TestWriteDeleteOnly:
         mock_simple.update.return_value = ({}, "/np")
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
-        mock_proc_del.return_value = (0, 0, 0, 1, [], set())
+        # No deletes → empty pair list; build_tombstone_file with no new pairs
+        # and no prior tombstone returns (None, None) doing no I/O, so it need
+        # not be stubbed.
+        mock_proc_del.return_value = []
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
 
+        # write_parquet_and_collect_resources is the insert path; delete_only
+        # carries no insert rows so it must never be called.
         with patch(_PATCH_PROCESS_OVERLAP) as mock_proc_overlap:
             dw = DataWriter("s", "o")
             dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"], delete_only=True)
@@ -565,6 +591,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.release_simple_lock.return_value = True
@@ -612,6 +639,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -659,6 +687,7 @@ class TestWriteNewerThan:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -703,6 +732,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = None  # Lock not acquired
         MockCat.return_value = mock_cat
@@ -733,6 +763,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -773,6 +804,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
@@ -812,6 +844,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = None
         MockCat.return_value = mock_cat
@@ -845,6 +878,7 @@ class TestWriteLockLifecycle:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.release_simple_lock.side_effect = RuntimeError("release boom")
@@ -893,6 +927,7 @@ class TestWriteCASFallback:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.side_effect = Exception("no payload support")
@@ -944,6 +979,7 @@ class TestWriteMirroring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -994,6 +1030,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1048,6 +1085,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1087,6 +1125,7 @@ class TestWriteMonitoring:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
@@ -1166,6 +1205,7 @@ class TestWriteAccessControl:
         mock_st = MagicMock(super_name="my_s", organization="my_o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1218,6 +1258,7 @@ class TestWriteConversion:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
@@ -1256,6 +1297,7 @@ class TestWriteSnapshotRead:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         MockCat.return_value = mock_cat
@@ -1282,6 +1324,8 @@ class TestWriteSnapshotRead:
 
 class TestWriteMonitoringPayload:
 
+    @patch(_PATCH_BUILD_TOMBSTONE)
+    @patch(_PATCH_PROCESS_DELETE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
@@ -1295,10 +1339,12 @@ class TestWriteMonitoringPayload:
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
+        mock_proc_del, mock_build_tomb,
     ):
         mock_st = MagicMock(super_name="sup", organization="org")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1310,11 +1356,17 @@ class TestWriteMonitoringPayload:
         mock_simple = MagicMock(data_dir="/d")
         mock_simple.get_simple_table_snapshot.return_value = ({"resources": []}, "/p")
         new_res = [{"file": "f1"}, {"file": "f2"}]
-        sunset = {"old1"}
         mock_simple.update.return_value = ({"resources": new_res}, "/np")
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
-        mock_process.return_value = (2, 1, 5, 2, new_res, sunset)
+
+        # write_parquet appends two resources to the new_resources list it's given.
+        def _append_res(*a, **k):
+            k["new_resources"].extend(new_res)
+        mock_process.side_effect = _append_res
+        # One delete pair → deleted == 1.
+        mock_proc_del.return_value = [("f1", 7)]
+        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
 
         # MonitoringWriter is a context manager; in-block instance is
         # accessed via __enter__.return_value
@@ -1342,10 +1394,11 @@ class TestWriteMonitoringPayload:
         assert payload["delete_only"] is False
         assert payload["inserted"] == 2
         assert payload["deleted"] == 1
-        assert payload["total_rows"] == 5
-        assert payload["total_columns"] == 2
+        assert payload["total_rows"] == 2
+        assert payload["total_columns"] == 2  # logical width, system cols excluded
         assert payload["new_resources"] == 2  # len(new_res)
-        assert payload["sunset_files"] == 1  # len(sunset)
+        # sunset_files is empty without a tombstone-compaction this write
+        assert payload["sunset_files"] == 0
         assert isinstance(payload["duration"], float)
         assert payload["duration"] >= 0
 
@@ -1372,6 +1425,7 @@ class TestWriteMonitoringPayload:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         MockCat.return_value = mock_cat
@@ -1418,6 +1472,7 @@ class TestWriteValidationErrors:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         MockCat.return_value = mock_cat
 
@@ -1476,6 +1531,7 @@ class TestWriteUpdateIntegration:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "tok"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1493,9 +1549,11 @@ class TestWriteUpdateIntegration:
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
 
-        new_res = [{"file": "new.parquet"}]
-        sunset = {"old.parquet"}
-        mock_process.return_value = (1, 0, 1, 1, new_res, sunset)
+        # write_parquet_and_collect_resources mutates the new_resources list it
+        # is handed (its return value is ignored), so emulate that append.
+        def _append_res(*a, **k):
+            k["new_resources"].append({"file": "new.parquet"})
+        mock_process.side_effect = _append_res
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -1504,10 +1562,14 @@ class TestWriteUpdateIntegration:
 
         mock_simple.update.assert_called_once()
         args, kwargs = mock_simple.update.call_args
-        assert args[0] is new_res
-        assert args[1] is sunset
-        # The DataFrame passed to update is the (possibly filtered) polars DF
-        assert args[2] is df
+        # new_resources collected by the write path
+        assert args[0] == [{"file": "new.parquet"}]
+        # sunset_files is empty without a tombstone-compaction this write
+        assert args[1] == set()
+        # schema model df is the system-column-augmented frame (not delete_only)
+        assert args[2] is not None
+        assert "__rowid__" in args[2].columns
+        assert "__timestamp__" in args[2].columns
         assert kwargs.get("last_snapshot") is snap
         assert kwargs.get("last_snapshot_path") == snap_path
 
@@ -1535,6 +1597,7 @@ class TestWriteBumpRoot:
         mock_st = MagicMock(super_name="mysup", organization="myorg")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1585,6 +1648,7 @@ class TestWriteEmptyDataFrame:
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1635,6 +1699,7 @@ class TestTimerAttribute:
 
 class TestWriteReturnValue:
 
+    @patch(_PATCH_BUILD_TOMBSTONE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_DELETE)
@@ -1648,16 +1713,20 @@ class TestWriteReturnValue:
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_proc_del, MockMirror, mock_get_mon,
+        mock_build_tomb,
     ):
         """Verify the 4-tuple format: (total_columns, total_rows, inserted, deleted)."""
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
         MockCat.return_value = mock_cat
 
+        # delete_only: total_columns == dataframe.width (2 here), inserted == 0,
+        # total_rows == inserted == 0, deleted == len(identify_deleted_rowids()).
         df = _polars_df({"id": [1], "val": ["x"]})
         mock_from_arrow.return_value = df
 
@@ -1666,7 +1735,9 @@ class TestWriteReturnValue:
         mock_simple.update.return_value = ({}, "/np")
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
-        mock_proc_del.return_value = (0, 5, 10, 3, [], set())  # inserted=0, deleted=5, rows=10, cols=3
+        # Three delete pairs → deleted == 3.
+        mock_proc_del.return_value = [("f1", 1), ("f1", 2), ("f2", 3)]
+        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -1675,10 +1746,10 @@ class TestWriteReturnValue:
 
         assert len(result) == 4
         total_columns, total_rows, inserted, deleted = result
-        assert total_columns == 3
-        assert total_rows == 10
+        assert total_columns == 2
+        assert total_rows == 0
         assert inserted == 0
-        assert deleted == 5
+        assert deleted == 3
 
 
 # ====================================================================
@@ -1687,6 +1758,8 @@ class TestWriteReturnValue:
 
 class TestWriteFileCache:
 
+    @patch(_PATCH_BUILD_TOMBSTONE)
+    @patch(_PATCH_PROCESS_DELETE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
@@ -1697,16 +1770,21 @@ class TestWriteFileCache:
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_file_cache_passed_to_filter_stale_and_process(
+    def test_file_cache_passed_to_filter_stale_and_identify_deletes(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_filter_stale,
-        mock_process, MockMirror, mock_get_mon,
+        mock_process, MockMirror, mock_get_mon, mock_proc_del, mock_build_tomb,
     ):
-        """file_cache dict is created and passed to both filter_stale and process."""
+        """The single file_cache dict is shared by the two write-path readers:
+        filter_stale_incoming_rows (newer-than) and identify_deleted_rowids
+        (deletion-vector).  write_parquet_and_collect_resources writes the
+        incoming rows only and never reads overlapping files, so it gets no
+        file_cache."""
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
         mock_cat.get_table_config.return_value = None
         mock_cat.acquire_simple_lock.return_value = "t"
         mock_cat.set_leaf_payload_cas.return_value = 1
@@ -1723,7 +1801,9 @@ class TestWriteFileCache:
 
         # filter_stale returns non-empty (so we continue to process)
         mock_filter_stale.return_value = df
-        mock_process.return_value = (1, 0, 1, 2, [], set())
+        # No deletes → empty pairs → build_tombstone returns (None, None).
+        mock_proc_del.return_value = []
+        mock_build_tomb.return_value = (None, None)
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -1735,8 +1815,8 @@ class TestWriteFileCache:
         assert "file_cache" in filter_kwargs
         assert isinstance(filter_kwargs["file_cache"], dict)
 
-        # Check process received the same file_cache
-        process_kwargs = mock_process.call_args[1]
-        assert "file_cache" in process_kwargs
-        # Both should share the same dict instance
-        assert filter_kwargs["file_cache"] is process_kwargs["file_cache"]
+        # Check identify_deleted_rowids received the same file_cache
+        del_kwargs = mock_proc_del.call_args[1]
+        assert "file_cache" in del_kwargs
+        # Both readers should share the same dict instance
+        assert filter_kwargs["file_cache"] is del_kwargs["file_cache"]

@@ -3,7 +3,7 @@
 Comprehensive tests for supertable.data_writer.DataWriter.
 
 Every public method and code path is exercised:
-  - write() with append, overwrite, delete_only, newer_than, dedup_on_read
+  - write() with append, overwrite, delete_only, newer_than
   - validation() edge cases
   - configure_table() and _get_table_config()
   - Lock acquire/release lifecycle
@@ -112,6 +112,7 @@ class FakeCatalog:
         self._roots: Dict[str, Dict] = {}
         self._table_configs: Dict[str, Dict] = {}
         self._simple_tables: set = set()
+        self._rowid_counter: int = 0
 
         # Tracking
         self.bump_root_calls: list = []
@@ -119,6 +120,11 @@ class FakeCatalog:
         self.set_leaf_path_cas_calls: list = []
         self.release_calls: list = []
         self.leaf_payload_cas_should_fail: bool = False
+
+    def reserve_rowids(self, org, sup, simple, count) -> int:
+        start = self._rowid_counter
+        self._rowid_counter += count
+        return start
 
     def acquire_simple_lock(self, org, sup, simple, ttl_s=30, timeout_s=60) -> Optional[str]:
         key = f"{org}:{sup}:{simple}"
@@ -232,8 +238,9 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         patch("supertable.data_writer.check_write_access"),
         patch("supertable.data_writer.SimpleTable") as MockSimpleTable,
         patch("supertable.data_writer.find_overlapping_files", return_value=set()),
-        patch("supertable.data_writer.process_overlapping_files") as mock_process,
-        patch("supertable.data_writer.process_delete_only") as mock_delete,
+        patch("supertable.data_writer.write_parquet_and_collect_resources") as mock_process,
+        patch("supertable.data_writer.identify_deleted_rowids") as mock_delete,
+        patch("supertable.data_writer.build_tombstone_file") as mock_build_tombstone,
         patch("supertable.data_writer.filter_stale_incoming_rows") as mock_filter_stale,
         # MonitoringWriter is used as `with MonitoringWriter(...) as mon:` —
         # so the in-block monitor is the __enter__ return value.
@@ -265,9 +272,17 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             "testorg/testsuper/tables/t1/snapshots/new.json",
         )
 
-        # Default process returns
-        mock_process.return_value = (3, 0, 3, 3, [], set())
-        mock_delete.return_value = (0, 2, 1, 3, [], {"old.parquet"})
+        # Default write-path mock behaviour.
+        # write_parquet_and_collect_resources appends a resource dict to the
+        # caller-supplied new_resources list; its return value is ignored.
+        def _append_resource(*args, **kwargs):
+            kwargs["new_resources"].append({"file": "new.parquet"})
+            return None
+        mock_process.side_effect = _append_resource
+        # identify_deleted_rowids returns a list of (file, __rowid__) pairs.
+        mock_delete.return_value = []
+        # build_tombstone_file returns (tombstone_path, combined_df).
+        mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
 
         from supertable.data_writer import DataWriter
         dw = DataWriter.__new__(DataWriter)
@@ -282,6 +297,7 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             "simple_inst": simple_inst,
             "process": mock_process,
             "delete": mock_delete,
+            "build_tombstone": mock_build_tombstone,
             "filter_stale": mock_filter_stale,
             "mirror": MockMirror,
             "monitor": fake_monitor,
@@ -437,33 +453,10 @@ class TestConfigureTable:
             dw._table_config_cache = {}
             return dw
 
-    def test_basic_configure(self, fake_catalog):
-        dw = self._make_writer(fake_catalog)
-        with patch("supertable.data_writer.check_write_access"):
-            dw.configure_table("admin", "t1", primary_keys=["id"], dedup_on_read=True)
-
-        cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
-        assert cfg["primary_keys"] == ["id"]
-        assert cfg["dedup_on_read"] is True
-        # Also cached locally
-        assert dw._table_config_cache["t1"]["primary_keys"] == ["id"]
-
-    def test_empty_primary_keys_rejected(self, fake_catalog):
-        dw = self._make_writer(fake_catalog)
-        with patch("supertable.data_writer.check_write_access"):
-            with pytest.raises(ValueError, match="non-empty list"):
-                dw.configure_table("admin", "t1", primary_keys=[], dedup_on_read=True)
-
-    def test_primary_keys_not_list_rejected(self, fake_catalog):
-        dw = self._make_writer(fake_catalog)
-        with patch("supertable.data_writer.check_write_access"):
-            with pytest.raises(ValueError, match="non-empty list"):
-                dw.configure_table("admin", "t1", primary_keys="id", dedup_on_read=True)
-
     def test_max_memory_chunk_size_positive(self, fake_catalog):
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
-            dw.configure_table("admin", "t1", primary_keys=["id"], max_memory_chunk_size=1024)
+            dw.configure_table("admin", "t1", max_memory_chunk_size=1024)
 
         cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
         assert cfg["max_memory_chunk_size"] == 1024
@@ -472,18 +465,18 @@ class TestConfigureTable:
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
             with pytest.raises(ValueError, match="max_memory_chunk_size must be a positive"):
-                dw.configure_table("admin", "t1", primary_keys=["id"], max_memory_chunk_size=0)
+                dw.configure_table("admin", "t1", max_memory_chunk_size=0)
 
     def test_max_memory_chunk_size_negative_rejected(self, fake_catalog):
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
             with pytest.raises(ValueError, match="max_memory_chunk_size must be a positive"):
-                dw.configure_table("admin", "t1", primary_keys=["id"], max_memory_chunk_size=-5)
+                dw.configure_table("admin", "t1", max_memory_chunk_size=-5)
 
     def test_max_overlapping_files_positive(self, fake_catalog):
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
-            dw.configure_table("admin", "t1", primary_keys=["id"], max_overlapping_files=50)
+            dw.configure_table("admin", "t1", max_overlapping_files=50)
 
         cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
         assert cfg["max_overlapping_files"] == 50
@@ -492,42 +485,18 @@ class TestConfigureTable:
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
             with pytest.raises(ValueError, match="max_overlapping_files must be a positive"):
-                dw.configure_table("admin", "t1", primary_keys=["id"], max_overlapping_files=0)
-
-    def test_configure_preserves_existing_limits_when_not_set(self, fake_catalog):
-        """When max_memory_chunk_size/max_overlapping_files are None, existing values stay."""
-        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
-            "primary_keys": ["old_key"],
-            "dedup_on_read": False,
-            "max_memory_chunk_size": 2048,
-            "max_overlapping_files": 75,
-        })
-
-        dw = self._make_writer(fake_catalog)
-        with patch("supertable.data_writer.check_write_access"):
-            dw.configure_table("admin", "t1", primary_keys=["id"], dedup_on_read=True)
-
-        cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
-        assert cfg["primary_keys"] == ["id"]
-        assert cfg["dedup_on_read"] is True
-        # Existing limits should NOT be removed (they weren't overridden)
-        # The behavior depends on whether existing config was already cached;
-        # since no prior _get_table_config call happened, the fallback reads
-        # from the local cache which was empty → config starts from {}.
-        # This is expected behavior per the code.
+                dw.configure_table("admin", "t1", max_overlapping_files=0)
 
     def test_configure_updates_limits(self, fake_catalog):
         """When both limits are provided, they read existing config from Redis first."""
         fake_catalog.set_table_config("testorg", "testsuper", "t1", {
-            "primary_keys": ["old_key"],
-            "dedup_on_read": False,
             "max_memory_chunk_size": 2048,
         })
 
         dw = self._make_writer(fake_catalog)
         with patch("supertable.data_writer.check_write_access"):
             dw.configure_table(
-                "admin", "t1", primary_keys=["id"],
+                "admin", "t1",
                 max_memory_chunk_size=4096, max_overlapping_files=200,
             )
 
@@ -594,7 +563,8 @@ class TestWriteAppend:
         assert result is not None
         assert len(result) == 4
         total_columns, total_rows, inserted, deleted = result
-        # Values come from mock process_overlapping_files returns
+        # total_rows/inserted derive from the incoming row count; deleted from
+        # identify_deleted_rowids (empty by default).
         assert isinstance(total_columns, int)
         assert isinstance(total_rows, int)
 
@@ -645,14 +615,19 @@ class TestWriteOverwrite:
 class TestWriteDeleteOnly:
     """write() with delete_only=True."""
 
-    def test_delete_only_calls_process_delete_only(self, writer):
+    def test_delete_only_calls_identify_deleted_rowids(self, writer):
         data = _simple_arrow(3)
         mock_delete = writer._mocks["delete"]
+        # One delete pair → a non-empty tombstone, so build_tombstone_file
+        # (already patched in the fixture) handles the parquet I/O.
+        mock_delete.return_value = [("old.parquet", 1)]
 
-        with patch("supertable.data_writer.process_delete_only", mock_delete):
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
 
         assert mock_delete.called
+        total_cols, total_rows, inserted, deleted = result
+        assert inserted == 0
+        assert deleted == 1
 
     def test_delete_only_requires_overwrite_columns(self, writer):
         """validation should catch this before reaching process_delete_only."""
@@ -695,72 +670,13 @@ class TestWriteNewerThan:
         assert total_rows == 0
         assert inserted == 0
         assert deleted == 0
-        # process_overlapping_files should NOT have been called
+        # the insert path (write_parquet_and_collect_resources) should NOT run
         assert not writer._mocks["process"].called
 
     def test_newer_than_validation_missing_column(self, writer):
         data = _simple_arrow(3)
         with pytest.raises(ValueError, match="not present in the dataset"):
             writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="nonexistent")
-
-
-class TestWriteDedupOnRead:
-    """write() with dedup_on_read config (auto __timestamp__ injection)."""
-
-    def test_timestamp_injected_when_dedup_enabled(self, writer, fake_catalog):
-        """When dedup_on_read is enabled, __timestamp__ should be added to the dataframe."""
-        # Configure dedup
-        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
-            "primary_keys": ["id"],
-            "dedup_on_read": True,
-        })
-        writer._table_config_cache.clear()
-
-        data = _simple_arrow(3)
-        mock_process = writer._mocks["process"]
-
-        # Capture the dataframe passed to process_overlapping_files
-        captured_dfs = []
-        original_write = writer.write
-
-        with patch("supertable.data_writer.process_overlapping_files", mock_process):
-            # We need to verify that the internal dataframe has __timestamp__
-            # The simplest way is to check that validation passes (it would fail
-            # if __timestamp__ interfered with anything)
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"])
-            assert result is not None
-
-    def test_timestamp_not_injected_when_dedup_disabled(self, writer, fake_catalog):
-        """When dedup_on_read is disabled, __timestamp__ should NOT be added."""
-        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
-            "primary_keys": ["id"],
-            "dedup_on_read": False,
-        })
-        writer._table_config_cache.clear()
-
-        data = _simple_arrow(3)
-        result = writer.write("admin", "t1", data, overwrite_columns=["id"])
-        assert result is not None
-
-    def test_timestamp_not_duplicated_when_already_present(self, writer, fake_catalog):
-        """If __timestamp__ already exists in data, don't add a duplicate."""
-        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
-            "primary_keys": ["id"],
-            "dedup_on_read": True,
-        })
-        writer._table_config_cache.clear()
-
-        data = _arrow_table({
-            "id": [1, 2, 3],
-            "name": ["a", "b", "c"],
-            "__timestamp__": [
-                datetime(2025, 1, 1, tzinfo=timezone.utc),
-                datetime(2025, 1, 2, tzinfo=timezone.utc),
-                datetime(2025, 1, 3, tzinfo=timezone.utc),
-            ],
-        })
-        result = writer.write("admin", "t1", data, overwrite_columns=["id"])
-        assert result is not None
 
 
 # ===========================================================================
@@ -779,10 +695,8 @@ class TestWriteLocking:
         data = _simple_arrow(3)
         writer._mocks["process"].side_effect = RuntimeError("boom")
 
-        with patch("supertable.data_writer.process_overlapping_files",
-                   writer._mocks["process"]):
-            with pytest.raises(RuntimeError, match="boom"):
-                writer.write("admin", "t1", data, overwrite_columns=[])
+        with pytest.raises(RuntimeError, match="boom"):
+            writer.write("admin", "t1", data, overwrite_columns=[])
 
         # Lock should still have been released
         assert len(fake_catalog.release_calls) == 1
@@ -893,10 +807,8 @@ class TestWriteMonitoring:
         data = _simple_arrow(3)
         writer._mocks["process"].side_effect = RuntimeError("processing failed")
 
-        with patch("supertable.data_writer.process_overlapping_files",
-                   writer._mocks["process"]):
-            with pytest.raises(RuntimeError):
-                writer.write("admin", "t1", data, overwrite_columns=[])
+        with pytest.raises(RuntimeError):
+            writer.write("admin", "t1", data, overwrite_columns=[])
 
         monitor = writer._mocks["monitor"]
         assert len(monitor.metrics) == 0
@@ -1068,26 +980,28 @@ class TestWriteSequential:
 class TestWriteOverwriteWithDelete:
 
     def test_overwrite_reports_deleted_rows(self, writer):
-        """process_overlapping_files returns delete count → propagated to result."""
-        mock_process = writer._mocks["process"]
-        mock_process.return_value = (5, 2, 5, 3, [{"file": "new.parquet"}], {"old.parquet"})
+        """identify_deleted_rowids drives the deleted count; inserted = incoming rows."""
+        mock_delete = writer._mocks["delete"]
+        # Two delete pairs → deleted == 2.
+        mock_delete.return_value = [("old.parquet", 1), ("old.parquet", 2)]
 
-        with patch("supertable.data_writer.process_overlapping_files", mock_process):
-            data = _simple_arrow(5)
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"])
+        data = _simple_arrow(5)
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"])
 
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 5
         assert deleted == 2
 
     def test_delete_only_reports_no_inserts(self, writer):
-        """delete_only path: inserted should always be 0."""
+        """delete_only path: inserted should always be 0; deleted from pair count."""
         mock_delete = writer._mocks["delete"]
-        mock_delete.return_value = (0, 3, 2, 3, [{"file": "kept.parquet"}], {"old.parquet"})
+        # Three delete pairs → deleted == 3.
+        mock_delete.return_value = [
+            ("old.parquet", 1), ("old.parquet", 2), ("old.parquet", 3),
+        ]
 
-        with patch("supertable.data_writer.process_delete_only", mock_delete):
-            data = _simple_arrow(3)
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
+        data = _simple_arrow(3)
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
 
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 0

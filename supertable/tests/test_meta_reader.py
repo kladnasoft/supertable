@@ -1038,6 +1038,50 @@ class TestGetSuperMeta:
         assert result["super"]["rows"] == 300
         assert result["super"]["size"] == 3000
 
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_tombstone_rows_deducted_from_total(self, mock_check, MockST, mock_ttl):
+        """Live deletion-vector size is subtracted from physical row sums."""
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        leaf = json.dumps({
+            "resources": [{"file": "f1", "rows": 100, "file_size": 5000}],
+            "tombstone_rows": 30,
+        })
+        reader.catalog.r.mget.return_value = [leaf.encode()]
+
+        result = reader.get_super_meta("admin")
+        # 100 physical rows - 30 tombstoned = 70 live rows
+        assert result["super"]["rows"] == 70
+        # Physical file count/size are unaffected by logical deletes.
+        assert result["super"]["files"] == 1
+        assert result["super"]["size"] == 5000
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_tombstone_rows_clamped_to_zero(self, mock_check, MockST, mock_ttl):
+        """tombstone_rows exceeding physical rows clamps the total to 0."""
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        leaf = json.dumps({
+            "resources": [{"file": "f1", "rows": 20, "file_size": 5000}],
+            "tombstone_rows": 50,
+        })
+        reader.catalog.r.mget.return_value = [leaf.encode()]
+
+        result = reader.get_super_meta("admin")
+        assert result["super"]["rows"] == 0
+
     @patch(_P_CHECK_META)
     def test_cache_hit_returns_cached_result(self, mock_check):
         """Second call with same root version → cache hit."""

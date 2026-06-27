@@ -116,6 +116,7 @@ class Settings:
     # ── Defaults (legacy config/defaults.py) ─────────────────────────
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024  # MAX_MEMORY_CHUNK_SIZE
     MAX_OVERLAPPING_FILES: int = 100               # MAX_OVERLAPPING_FILES
+    MAX_TOMBSTONE_ROWS: int = 1_000_000            # MAX_TOMBSTONE_ROWS
     DEFAULT_TIMEOUT_SEC: int = 60                  # DEFAULT_TIMEOUT_SEC
     DEFAULT_LOCK_DURATION_SEC: int = 30            # DEFAULT_LOCK_DURATION_SEC
     IS_SHOW_TIMING: bool = False                   # IS_SHOW_TIMING
@@ -366,6 +367,7 @@ def _build_settings() -> Settings:
         # ── Defaults ─────────────────────────────────────────────────
         MAX_MEMORY_CHUNK_SIZE=_env_int("MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024),
         MAX_OVERLAPPING_FILES=_env_int("MAX_OVERLAPPING_FILES", 100),
+        MAX_TOMBSTONE_ROWS=_env_int("MAX_TOMBSTONE_ROWS", 1_000_000),
         DEFAULT_TIMEOUT_SEC=_env_int("DEFAULT_TIMEOUT_SEC", 60),
         DEFAULT_LOCK_DURATION_SEC=_env_int("DEFAULT_LOCK_DURATION_SEC", 30),
         IS_SHOW_TIMING=_env_bool("IS_SHOW_TIMING", True),

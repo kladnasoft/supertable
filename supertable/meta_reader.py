@@ -435,6 +435,12 @@ class MetaReader:
                 resources = st_data.get("resources", []) if isinstance(st_data, dict) else []
                 table_files = len(resources) if isinstance(resources, list) else 0
                 table_rows = sum(res.get("rows", 0) for res in resources if isinstance(res, dict))
+                # Deduct logically-deleted (tombstoned) rows: the deletion-vector
+                # model keeps dead rows physically present in the parquet files
+                # until threshold compaction, so the resource row sums over-count
+                # live rows by the persisted deletion-vector size.
+                tombstone_rows = st_data.get("tombstone_rows", 0) if isinstance(st_data, dict) else 0
+                table_rows = max(0, table_rows - int(tombstone_rows or 0))
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 
                 # Column count: count distinct column names across all resources

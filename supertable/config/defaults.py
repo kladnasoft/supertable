@@ -23,6 +23,7 @@ _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 class Default:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024
     MAX_OVERLAPPING_FILES: int = 100
+    MAX_TOMBSTONE_ROWS: int = 1_000_000
     DEFAULT_TIMEOUT_SEC: int = 60
     DEFAULT_LOCK_DURATION_SEC: int = 30
     LOG_LEVEL: str = "INFO"
@@ -51,6 +52,7 @@ def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = Tr
     return Default(
         MAX_MEMORY_CHUNK_SIZE=settings.MAX_MEMORY_CHUNK_SIZE,
         MAX_OVERLAPPING_FILES=settings.MAX_OVERLAPPING_FILES,
+        MAX_TOMBSTONE_ROWS=settings.MAX_TOMBSTONE_ROWS,
         DEFAULT_TIMEOUT_SEC=settings.DEFAULT_TIMEOUT_SEC,
         DEFAULT_LOCK_DURATION_SEC=settings.DEFAULT_LOCK_DURATION_SEC,
         LOG_LEVEL=log_level,

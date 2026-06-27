@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -21,15 +22,15 @@ from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.processing import (
-    process_overlapping_files,
-    process_delete_only,
     find_overlapping_files,
     filter_stale_incoming_rows,
-    extract_key_tuples,
-    reconcile_tombstones,
+    identify_deleted_rowids,
+    build_tombstone_file,
+    write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
-    _tombstone_threshold,
+    _max_tombstone_rows,
+    _read_parquet_safe,
 )
 from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
@@ -56,37 +57,33 @@ class DataWriter:
 
     timer = Timer()
 
-    # ---- Table configuration (dedup-on-read) --------------------------------
+    # ---- Table configuration (per-table limits) -----------------------------
 
     def configure_table(
             self,
             role_name: str,
             simple_name: str,
-            primary_keys: list,
-            dedup_on_read: bool = False,
             max_memory_chunk_size: int | None = None,
             max_overlapping_files: int | None = None,
-            tombstone_compact_total: int | None = None,
+            max_tombstone_rows: int | None = None,
     ) -> None:
-        """Set table-level configuration for dedup-on-read behaviour and per-table limits.
+        """Set per-table limit overrides.
 
         This is a one-time (or infrequent) operation.  The configuration is
-        persisted in Redis so the read side can build the dedup view, and
-        cached locally so subsequent ``write()`` calls can inject
-        ``__timestamp__`` without an extra Redis round-trip.
+        persisted in Redis and cached locally so subsequent ``write()`` /
+        ``compact()`` calls pick up the overrides without an extra Redis
+        round-trip.
 
         Args:
             role_name: RBAC role performing the configuration.
             simple_name: Name of the SimpleTable to configure.
-            primary_keys: Column names that form the logical primary key.
-            dedup_on_read: When True, the read side wraps queries with a
-                ROW_NUMBER window to return only the latest row per key.
             max_memory_chunk_size: Override MAX_MEMORY_CHUNK_SIZE (bytes) for
                 this table.  None leaves the existing value unchanged.
             max_overlapping_files: Override MAX_OVERLAPPING_FILES for this
                 table.  None leaves the existing value unchanged.
-            tombstone_compact_total: Maximum number of soft-deleted key
-                tombstones before compaction is triggered.  Default 1000.
+            max_tombstone_rows: Maximum number of rows in the deletion-vector
+                before physical compaction is triggered.  Overrides
+                MAX_TOMBSTONE_ROWS (default 1,000,000) for this table.
                 None leaves the existing value unchanged.
         """
         check_write_access(
@@ -96,12 +93,9 @@ class DataWriter:
             table_name=simple_name,
         )
 
-        if not isinstance(primary_keys, list) or not primary_keys:
-            raise ValueError("primary_keys must be a non-empty list of column names")
-
         # Only fetch existing Redis config when a limit override is being set,
         # preserving the cache-population guarantee for callers that omit them.
-        if max_memory_chunk_size is not None or max_overlapping_files is not None or tombstone_compact_total is not None:
+        if max_memory_chunk_size is not None or max_overlapping_files is not None or max_tombstone_rows is not None:
             existing = self.catalog.get_table_config(
                 self.super_table.organization,
                 self.super_table.super_name,
@@ -110,8 +104,6 @@ class DataWriter:
         else:
             existing = self._table_config_cache.get(simple_name) or {}
         config = dict(existing)
-        config["primary_keys"] = primary_keys
-        config["dedup_on_read"] = bool(dedup_on_read)
         if max_memory_chunk_size is not None:
             if max_memory_chunk_size <= 0:
                 raise ValueError("max_memory_chunk_size must be a positive integer")
@@ -120,10 +112,10 @@ class DataWriter:
             if max_overlapping_files <= 0:
                 raise ValueError("max_overlapping_files must be a positive integer")
             config["max_overlapping_files"] = int(max_overlapping_files)
-        if tombstone_compact_total is not None:
-            if tombstone_compact_total <= 0:
-                raise ValueError("tombstone_compact_total must be a positive integer")
-            config["tombstone_compact_total"] = int(tombstone_compact_total)
+        if max_tombstone_rows is not None:
+            if max_tombstone_rows <= 0:
+                raise ValueError("max_tombstone_rows must be a positive integer")
+            config["max_tombstone_rows"] = int(max_tombstone_rows)
 
         self.catalog.set_table_config(
             self.super_table.organization,
@@ -311,18 +303,44 @@ class DataWriter:
             incoming_columns = dataframe.width
             mark("convert")
 
-            # --- Dedup-on-read: inject __timestamp__ if needed -----------------
-            table_config = self._get_table_config(simple_name)
-            if table_config.get("dedup_on_read"):
-                if "__timestamp__" not in dataframe.columns:
-                    dataframe = dataframe.with_columns(
-                        polars.lit(datetime.now(timezone.utc)).alias("__timestamp__")
-                    )
-            mark("dedup_ts")
-
             # --- Validate ------------------------------------------------------
+            # Runs before __rowid__ reservation so invalid input never burns a
+            # range of the per-table Redis id counter.
             self.validation(dataframe, simple_name, overwrite_columns, newer_than, delete_only)
             mark("validate")
+
+            # --- Assign table-unique __rowid__ --------------------------------
+            # Reserve a contiguous block of ids from the per-table Redis
+            # counter (INCRBY) so every inserted row gets a value unique
+            # within the table, even across concurrent writers. Skipped for
+            # delete_only writes, whose dataframe carries only delete-predicate
+            # columns (no rows are inserted). with_columns overwrites any
+            # caller-supplied __rowid__ so uniqueness is always enforced.
+            if not delete_only and incoming_rows > 0:
+                start_rowid = self.catalog.reserve_rowids(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    incoming_rows,
+                )
+                dataframe = dataframe.with_columns(
+                    polars.int_range(
+                        start_rowid, start_rowid + incoming_rows, dtype=polars.Int64
+                    ).alias("__rowid__")
+                )
+            mark("rowid")
+
+            # --- Inject __timestamp__ system column ---------------------------
+            # Added to every non-delete write (drives the date-partitioned
+            # layout and tight row-group zonemaps). Together with __rowid__ it
+            # is hidden from query output by the read view's
+            # ``EXCLUDE (__rowid__, __timestamp__)`` projection.
+            table_config = self._get_table_config(simple_name)
+            if not delete_only and "__timestamp__" not in dataframe.columns:
+                dataframe = dataframe.with_columns(
+                    polars.lit(datetime.now(timezone.utc)).alias("__timestamp__")
+                )
+            mark("dedup_ts")
 
             # --- Per-simple Redis lock ----------------------------------------
             token = self.catalog.acquire_simple_lock(
@@ -367,7 +385,7 @@ class DataWriter:
                 if dataframe.height == 0:
                     logger.info(lp("newer_than: all incoming rows are stale — skipping write"))
                     mark("newer_than")
-                    total_columns = dataframe.width
+                    total_columns = incoming_columns
                     result_tuple = (total_columns, 0, 0, 0)
                     stats_payload = {
                         "query_id": qid,
@@ -401,102 +419,102 @@ class DataWriter:
                 else:
                     mark("newer_than")
 
-            # --- Tombstone / soft-delete logic --------------------------------
+            # --- Deletion-vector (tombstone) logic ----------------------------
+            # Merge-on-read model: every write tombstones the __rowid__s of the
+            # old matching rows (delete + upsert) and appends the incoming rows
+            # as a brand-new immutable file — no in-place merge of old files.
+            # The deletion-vector is carried forward and extended each write;
+            # dead rows are physically dropped only at the compaction threshold.
             # Skip if early exit already set result_tuple (all rows were stale).
             if result_tuple is None:
-                primary_keys = table_config.get("primary_keys") or []
-                use_tombstones = bool(primary_keys) and table_config.get("dedup_on_read")
-                existing_tombstones = (last_simple_table.get("tombstones") or {}).get("deleted_keys") or []
-                tombstone_pk = (last_simple_table.get("tombstones") or {}).get("primary_keys") or primary_keys
+                prev_tombstone_path = last_simple_table.get("tombstone")
+                new_resources = []
+                sunset_files = set()
 
-                if delete_only and use_tombstones:
-                    # --- Soft-delete path: append keys to tombstone list, no file I/O ---
-                    new_delete_keys = extract_key_tuples(dataframe, primary_keys)
-                    deleted = len(new_delete_keys)
-                    merged_tombstones = list(existing_tombstones) + [list(k) for k in new_delete_keys]
-                    # Deduplicate tombstone list (a key may be deleted more than once)
-                    seen = set()
-                    deduped = []
-                    for k in merged_tombstones:
-                        kt = tuple(k)
-                        if kt not in seen:
-                            seen.add(kt)
-                            deduped.append(list(k))
-                    merged_tombstones = deduped
-                    inserted = 0
-                    total_rows = 0
-                    total_columns = dataframe.width
-                    new_resources = []
-                    sunset_files = set()
+                # 1. Identify which existing rows this write deletes/replaces.
+                #    overwrite_columns drives the anti-join key (delete + upsert);
+                #    pure appends (no overwrite_columns) tombstone nothing.
+                new_delete_pairs = []
+                if overwrite_columns:
+                    new_delete_pairs = identify_deleted_rowids(
+                        dataframe,
+                        overlapping_files,
+                        overwrite_columns,
+                        file_cache=file_cache,
+                        profiler=profiler,
+                    )
+                deleted = len(new_delete_pairs)
 
-                    # Check if compaction threshold is breached
-                    threshold = _tombstone_threshold(table_config)
-                    if len(merged_tombstones) >= threshold:
-                        logger.info(lp(f"tombstone threshold breached ({len(merged_tombstones)}>={threshold}), compacting"))
-                        compacted, compact_resources, compact_sunset = compact_tombstones(
-                            snapshot=last_simple_table,
-                            primary_keys=primary_keys,
-                            data_dir=simple_table.data_dir,
-                            compression_level=compression_level,
-                            table_config=table_config,
-                            profiler=profiler,
-                        )
-                        new_resources = compact_resources
-                        sunset_files = compact_sunset
-                        merged_tombstones = []  # clear after compaction
-                        logger.info(lp(f"compaction removed {compacted} rows from {len(compact_sunset)} files"))
-
-                    # Store tombstones on snapshot for update()
-                    last_simple_table["tombstones"] = {
-                        "primary_keys": primary_keys,
-                        "deleted_keys": merged_tombstones,
-                        "total_tombstones": len(merged_tombstones),
-                    }
-                    mark("process")
-
+                # 2. Write the incoming rows as a new file (insert/upsert side).
+                #    delete_only carries only predicate columns — nothing to insert.
+                if not delete_only and dataframe.height > 0:
+                    write_parquet_and_collect_resources(
+                        write_df=dataframe,
+                        overwrite_columns=[],
+                        data_dir=simple_table.data_dir,
+                        new_resources=new_resources,
+                        compression_level=compression_level,
+                        profiler=profiler,
+                    )
+                    inserted = dataframe.height
                 else:
-                    # --- Non-tombstone path (original) --------------------------------
+                    inserted = 0
 
-                    # Reconcile: if incoming data (insert/overwrite/append) has keys
-                    # matching existing tombstones, remove those from the tombstone list
-                    # so the newly-written rows become visible.
-                    if existing_tombstones and primary_keys:
-                        incoming_keys = extract_key_tuples(dataframe, primary_keys)
-                        reconciled = reconcile_tombstones(existing_tombstones, incoming_keys)
-                        last_simple_table["tombstones"] = {
-                            "primary_keys": tombstone_pk,
-                            "deleted_keys": reconciled,
-                            "total_tombstones": len(reconciled),
-                        }
-                        if len(reconciled) < len(existing_tombstones):
-                            logger.debug(lp(
-                                f"reconciled {len(existing_tombstones) - len(reconciled)} "
-                                f"tombstones against incoming keys"
-                            ))
+                # 3. Carry forward + extend the deletion-vector tombstone file.
+                #    No new deletes → reuse the previous file (combined_df=None).
+                tombstone_dir = os.path.join(simple_table.simple_dir, "tombstone")
+                tombstone_path, combined_tombstone_df = build_tombstone_file(
+                    tombstone_dir=tombstone_dir,
+                    prev_tombstone_path=prev_tombstone_path,
+                    new_pairs=new_delete_pairs,
+                    compression_level=compression_level,
+                    profiler=profiler,
+                )
 
-                    if delete_only:
-                        # delete_only without dedup — fall back to physical delete
-                        inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_delete_only(
-                            dataframe,
-                            overlapping_files,
-                            overwrite_columns,
-                            simple_table.data_dir,
-                            compression_level,
-                            file_cache=file_cache,
-                            profiler=profiler,
-                        )
-                    else:
-                        inserted, deleted, total_rows, total_columns, new_resources, sunset_files = process_overlapping_files(
-                            dataframe,
-                            overlapping_files,
-                            overwrite_columns,
-                            simple_table.data_dir,
-                            compression_level,
-                            file_cache=file_cache,
-                            table_config=table_config,
-                            profiler=profiler,
-                        )
-                    mark("process")
+                # Track the live deletion-vector row count so meta reads can
+                # deduct dead rows from the physical resource row totals.
+                # New deletes → combined_tombstone_df is the full deduped DV
+                # (exact count); pure carry-forward → reuse the previous count.
+                tombstone_rows = (
+                    combined_tombstone_df.height
+                    if combined_tombstone_df is not None
+                    else int(last_simple_table.get("tombstone_rows", 0) or 0)
+                )
+
+                # 4. Threshold compaction: physically drop dead rows once the
+                #    deletion-vector grows past max_tombstone_rows, then clear it.
+                if (
+                    combined_tombstone_df is not None
+                    and combined_tombstone_df.height >= _max_tombstone_rows(table_config)
+                ):
+                    removed, compact_new, compact_sunset = compact_tombstones(
+                        snapshot=last_simple_table,
+                        tombstone_df=combined_tombstone_df,
+                        data_dir=simple_table.data_dir,
+                        compression_level=compression_level,
+                        table_config=table_config,
+                        profiler=profiler,
+                    )
+                    new_resources.extend(compact_new)
+                    sunset_files |= compact_sunset
+                    tombstone_path = None  # deletion-vector fully consumed
+                    tombstone_rows = 0
+                    logger.info(lp(
+                        f"tombstone compaction removed {removed} rows "
+                        f"from {len(compact_sunset)} files"
+                    ))
+
+                # 5. Pin the (carried-forward / new / cleared) tombstone pointer
+                #    and its row count.
+                last_simple_table["tombstone"] = tombstone_path
+                last_simple_table["tombstone_rows"] = tombstone_rows
+
+                total_rows = inserted
+                # Logical (user-facing) width: the injected __rowid__/__timestamp__
+                # system columns are hidden from query output, so they are not
+                # counted here.
+                total_columns = incoming_columns
+                mark("process")
 
                 # --- Update snapshot on storage -----------------------------------
                 # Build effective lineage — auto-generate if caller didn't provide
@@ -737,17 +755,14 @@ class DataWriter:
           2. Read the current snapshot via the leaf pointer. The simple
              table must already exist — compaction is **not** a
              bootstrap.
-          3. If primary keys + tombstones are present:
-
-             * When ``force_tombstones=True`` (default), run
-               ``compact_tombstones`` unconditionally — this is the
-               whole point of calling ``compact()`` manually.
-             * When ``force_tombstones=False``, only run if the
-               natural ``tombstone_compact_total`` threshold is
-               breached (same gate as ``write``).
-
-             The compaction physically removes tombstoned rows from
-             the affected parquet files and clears the tombstone list.
+          3. If a deletion-vector exists, run ``compact_tombstones``
+             unconditionally — physically removing tombstoned rows from
+             the affected parquet files and clearing the vector. This
+             must happen before step 4 so the small-file step never
+             rewrites a file the vector still references (which would
+             resurrect dead rows onto disk and orphan the vector). The
+             lazy ``max_tombstone_rows`` threshold gates only ``write``;
+             ``compact()`` is explicit maintenance and always drains.
           4. Run ``compact_resources`` to merge small parquet files in
              memory-bounded chunks. When ``small_only=True`` (default),
              only files strictly smaller than ``max_memory_chunk_size``
@@ -771,9 +786,10 @@ class DataWriter:
                 write access on the target table (checked via
                 ``check_write_access`` — same as ``write``).
             simple_name: target table.
-            force_tombstones: bypass the ``tombstone_compact_total``
-                threshold and compact whatever tombstones exist now.
-                Set to False to honor the natural threshold.
+            force_tombstones: retained for API/lineage compatibility.
+                ``compact()`` always drains an existing deletion-vector
+                regardless of this flag (the vector must be consumed
+                before small-file compaction to stay consistent).
             small_only: only consider files smaller than
                 ``max_memory_chunk_size`` for compaction. Set to False
                 to rewrite every file (e.g. for a full-table re-encode).
@@ -895,29 +911,35 @@ class DataWriter:
             mark("snapshot")
 
             # --- Phase A: tombstone compaction -------------------------------
-            # Physically remove soft-deleted rows from parquet files. Runs
-            # unconditionally when force_tombstones=True; otherwise only
-            # when the natural threshold is reached (same gate as the
-            # delete-only path in ``write``).
-            tomb_block = last_simple_table.get("tombstones") or {}
-            tomb_keys = tomb_block.get("deleted_keys") or []
-            primary_keys = (
-                tomb_block.get("primary_keys")
-                or table_config.get("primary_keys")
-                or []
+            # Physically remove tombstoned rows from the data files named in
+            # the deletion-vector, then clear the pointer. This MUST run
+            # whenever a deletion-vector exists — Phase B (compact_resources)
+            # rewrites data files without consulting the vector, so a file
+            # named in ``__file__`` that Phase B sunsets would carry its dead
+            # rows into the new compacted file while the vector keeps pointing
+            # at the (now gone) original. The rows would stay hidden on read
+            # (anti-join is rowid-only) but become permanently unreclaimable.
+            # Draining the vector first guarantees Phase B only ever sees clean
+            # survivor files. The lazy ``max_tombstone_rows`` threshold gates
+            # the *write* path; compact() is explicit maintenance and always
+            # consumes the vector.
+            tombstone_path = last_simple_table.get("tombstone")
+            tombstone_df = (
+                _read_parquet_safe(tombstone_path) if tombstone_path else None
+            )
+            tombstone_rows = (
+                tombstone_df.height if tombstone_df is not None else 0
             )
 
             tomb_new_resources: list = []
             tomb_sunset: set = set()
             tomb_compacted_rows = 0
 
-            should_run_tombstones = bool(tomb_keys) and bool(primary_keys) and (
-                force_tombstones or len(tomb_keys) >= _tombstone_threshold(table_config)
-            )
+            should_run_tombstones = tombstone_rows > 0
             if should_run_tombstones:
                 tomb_compacted_rows, tomb_new_resources, tomb_sunset = compact_tombstones(
                     snapshot=last_simple_table,
-                    primary_keys=primary_keys,
+                    tombstone_df=tombstone_df,
                     data_dir=simple_table.data_dir,
                     compression_level=compression_level,
                     table_config=table_config,
@@ -999,15 +1021,12 @@ class DataWriter:
                         "write_id": qid,
                     }
 
-                # Clear the tombstone list now that they've been physically
-                # applied (if applicable). ``simple_table.update`` is going
-                # to write the updated snapshot.
+                # Clear the deletion-vector pointer now that the dead rows
+                # have been physically dropped. ``simple_table.update`` writes
+                # the updated snapshot (with tombstone=None) below.
                 if should_run_tombstones:
-                    last_simple_table["tombstones"] = {
-                        "primary_keys": primary_keys,
-                        "deleted_keys": [],
-                        "total_tombstones": 0,
-                    }
+                    last_simple_table["tombstone"] = None
+                    last_simple_table["tombstone_rows"] = 0
 
                 # Derive the post-compaction schema for ``simple_table.update``.
                 # update() builds the new snapshot's ``schema`` field from

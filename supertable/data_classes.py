@@ -33,38 +33,19 @@ class RbacViewDef:
 
 
 @dataclass
-class DedupViewDef:
-    """Dedup-on-read view definition for a single table alias.
-
-    Produced by DataReader from table config in Redis, consumed by executors
-    to create a ROW_NUMBER window view that keeps only the latest row per
-    primary key combination.
-
-    - primary_keys: columns that form the composite key for dedup.
-    - order_column: column to ORDER BY DESC (default ``__timestamp__``).
-    - visible_columns: columns to expose in the dedup view.  When empty or
-      ["*"], all columns except ``__rn__`` are exposed.  When set, only
-      these columns are projected (hiding PK / order cols that the user
-      did not request).
-    """
-    primary_keys: List[str] = field(default_factory=list)
-    order_column: str = "__timestamp__"
-    visible_columns: List[str] = field(default_factory=list)
-
-
-@dataclass
 class TombstoneDef:
-    """Tombstone definition for a single table alias.
+    """Tombstone (deletion-vector) definition for a single table alias.
 
-    Produced by DataReader from the snapshot's ``tombstones`` block,
-    consumed by executors to create a filtering view that excludes
-    soft-deleted keys.
+    Produced by DataReader from the snapshot's ``tombstone`` pointer,
+    consumed by executors to create a view that anti-joins the data on
+    ``__rowid__`` against the deletion-vector parquet, hiding rows that
+    have been logically deleted but not yet physically compacted.
 
-    - primary_keys: columns that form the composite key.
-    - deleted_keys: list of key tuples (each a list of scalars).
+    - tombstone_path: storage path of the deletion-vector parquet
+      (columns ``__file__`` + ``__rowid__``).  ``None`` means no
+      tombstone exists, so no anti-join is applied.
     """
-    primary_keys: List[str] = field(default_factory=list)
-    deleted_keys: List = field(default_factory=list)
+    tombstone_path: Optional[str] = None
 
 
 @dataclass
@@ -79,7 +60,5 @@ class Reflection:
     freshness_ms: int = 0
     # alias -> RbacViewDef.  Empty dict means no RBAC filtering.
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
-    # alias -> DedupViewDef.  Empty dict means no dedup-on-read.
-    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
     # alias -> TombstoneDef.  Empty dict means no tombstone filtering.
     tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)

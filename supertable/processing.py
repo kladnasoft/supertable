@@ -242,79 +242,6 @@ def _read_parquet_safe(
 
 
 # =========================
-# Idempotency: filter stale incoming rows
-# =========================
-
-
-def filter_stale_incoming_rows(
-        incoming_df: polars.DataFrame,
-        overlapping_files: Set[Tuple[str, bool, int]],
-        overwrite_columns: List[str],
-        idempotent_check_col: str,
-) -> polars.DataFrame:
-    """
-    Remove incoming rows whose key already exists in storage with an equal or
-    newer value in the ``idempotent_check_col`` column.
-
-    Only files marked ``has_overlap=True`` are inspected (they are the only ones
-    that can contain matching keys).
-
-    Rules:
-      - existing >= incoming  →  drop the incoming row  (stale / replay)
-      - existing < incoming   →  keep the incoming row   (genuine update)
-      - key not found         →  keep the incoming row   (new data)
-      - idempotent_check_col missing in existing file →  keep the incoming row
-    """
-    # Collect existing rows from overlapping files, only the columns we need
-    needed_cols = overwrite_columns + [idempotent_check_col]
-    existing_parts: List[polars.DataFrame] = []
-
-    for file, has_overlap, _ in overlapping_files:
-        if not has_overlap:
-            continue
-        df_existing = _read_parquet_safe(file)
-        if df_existing is None:
-            continue
-        # If the idempotent check column is missing from this file, skip it
-        # (rule: missing column → allow incoming rows through)
-        if idempotent_check_col not in df_existing.columns:
-            continue
-        # Select only columns we need that exist in the file
-        select_cols = [c for c in needed_cols if c in df_existing.columns]
-        existing_parts.append(df_existing.select(select_cols))
-
-    if not existing_parts:
-        # No existing data with the idempotent column → everything is new
-        return incoming_df
-
-    existing_keys_df = polars.concat(existing_parts, how="vertical_relaxed")
-
-    # For each key combination, find the max idempotent_check value in existing data
-    existing_max = (
-        existing_keys_df
-        .group_by(overwrite_columns)
-        .agg(polars.col(idempotent_check_col).max().alias("__existing_max__"))
-    )
-
-    # Left join incoming against existing max values
-    incoming_with_max = incoming_df.join(
-        existing_max,
-        on=overwrite_columns,
-        how="left",
-    )
-
-    # Keep rows where:
-    #   - no existing max found (new key) → __existing_max__ is null
-    #   - incoming value > existing max   (genuine update)
-    filtered = incoming_with_max.filter(
-        polars.col("__existing_max__").is_null()
-        | (polars.col(idempotent_check_col) > polars.col("__existing_max__"))
-    ).drop("__existing_max__")
-
-    return filtered
-
-
-# =========================
 # Original-style merge threshold logic
 # =========================
 
@@ -335,9 +262,9 @@ def prune_not_overlapping_files_by_threshold(
       - For has_overlap=False small files, include them only if either:
           total_size_of_all_candidates > MAX_MEMORY_CHUNK_SIZE
           OR count_of_false_items >= MAX_OVERLAPPING_FILES
-        When the gate opens, ALL false items are included (the downstream
-        process_files_without_overlap handles chunked flushing at memory
-        boundaries, so we must not drop files here).
+        When the gate opens, ALL false items are included (downstream
+        compaction handles chunked flushing at memory boundaries, so we
+        must not drop files here).
 
     Limits are resolved per-table (table_config) with fallback to global default.
     """
@@ -478,231 +405,6 @@ def find_overlapping_files(  # keep name/signature for compatibility
 
 
 # =========================
-# Public API: Processing (merge & rewrite)
-# =========================
-
-def process_overlapping_files(
-        df: polars.DataFrame,
-        overlapping_files: Set[Tuple[str, bool, int]],
-        overwrite_columns: List[str],
-        data_dir: str,
-        compression_level: int,
-        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
-        table_config: Optional[dict] = None,
-        profiler: Optional[Profiler] = None,
-):
-    """
-    Merge implementation:
-      - For has_overlap=False entries, batch-read & append (compaction)
-      - For has_overlap=True entries, read existing file, drop rows being overwritten, append the remainder
-      - Periodically flush chunks if they get too big
-      - Write any remainder at the end
-
-    Limits are resolved per-table (table_config) with fallback to global default.
-    """
-    p = profiler or get_null_profiler()
-    inserted = df.shape[0]
-    deleted = 0
-    total_columns = df.shape[1]
-    total_rows = 0
-
-    new_resources: List[Dict] = []
-    sunset_files: Set[str] = set()
-
-    # Base schema/empty chunk
-    schema = df.schema
-    empty_df = polars.DataFrame(schema=schema)
-
-    # Phase 1: pull in non-overlapping (False) as compaction chunks
-    with p.span("process.phase1_compact"):
-        chunk_df = process_files_without_overlap(
-            empty_df=empty_df,
-            data_dir=data_dir,
-            new_resources=new_resources,
-            overlapping_files=overlapping_files,
-            overwrite_columns=overwrite_columns,
-            sunset_files=sunset_files,
-            compression_level=compression_level,
-            table_config=table_config,
-            profiler=p,
-        )
-
-    # Start merged with compaction chunk + incoming df
-    with p.span("process.initial_concat"):
-        merged_df = concat_with_union(chunk_df, df)
-
-    # Phase 2: process overlapping=True files (pull-forward non-overwritten rows)
-    with p.span("process.phase2"):
-        deleted, merged_df, total_rows, skipped_files = process_files_with_overlap(
-            data_dir=data_dir,
-            deleted=deleted,
-            df=df,
-            empty_df=empty_df,
-            merged_df=merged_df,
-            new_resources=new_resources,
-            overlapping_files=overlapping_files,
-            overwrite_columns=overwrite_columns,
-            sunset_files=sunset_files,
-            total_rows=total_rows,
-            compression_level=compression_level,
-            file_cache=file_cache,
-            table_config=table_config,
-            profiler=p,
-        )
-    p.add("phase2_skipped_files", len(skipped_files))
-
-    # Phase 3: compact skipped small files when file count exceeds threshold.
-    #
-    # After the OR→AND fix, has_overlap=True files with zero actual composite
-    # key matches are correctly left untouched in Phase 2.  Without compaction
-    # these accumulate as many small files over successive writes.
-    #
-    # Policy: when the number of skipped (untouched) small files reaches
-    # MAX_OVERLAPPING_FILES, merge ALL of them into the output buffer.
-    # process_files_without_overlap already handles this pattern for
-    # has_overlap=False files; this does the same for the skipped True files.
-    max_mem, max_files = _resolve_limits(table_config)
-
-    if len(skipped_files) >= max_files:
-        p.add("phase3_compaction_triggered", 1)
-        with p.span("process.phase3_skipped_compact"):
-            compact_size = 0
-            for file, file_size in skipped_files:
-                existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
-                if existing_df is None:
-                    continue
-
-                with p.span("process.phase3.concat"):
-                    merged_df = concat_with_union(merged_df, existing_df)
-                sunset_files.add(file)
-                compact_size += int(file_size or 0)
-
-                # Flush if chunk exceeds memory limit
-                if compact_size >= max_mem:
-                    total_rows += merged_df.shape[0]
-                    with p.span("process.phase3.flush"):
-                        write_parquet_and_collect_resources(
-                            write_df=merged_df,
-                            overwrite_columns=overwrite_columns,
-                            data_dir=data_dir,
-                            new_resources=new_resources,
-                            compression_level=compression_level,
-                            profiler=p,
-                        )
-                    merged_df = empty_df.clone()
-                    compact_size = 0
-
-    # Final flush if anything remains
-    if merged_df.shape[0] > 0:
-        total_rows += merged_df.shape[0]
-        with p.span("process.final_flush"):
-            write_parquet_and_collect_resources(
-                write_df=merged_df,
-                overwrite_columns=overwrite_columns,
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-                profiler=p,
-            )
-
-    return inserted, deleted, total_rows, total_columns, new_resources, sunset_files
-
-
-def process_files_with_overlap(
-        data_dir,
-        deleted,
-        df,
-        empty_df,
-        merged_df,
-        new_resources,
-        overlapping_files,
-        overwrite_columns,
-        sunset_files,
-        total_rows,
-        compression_level,
-        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
-        table_config: Optional[dict] = None,
-        profiler: Optional[Profiler] = None,
-):
-    p = profiler or get_null_profiler()
-    # Pre-compute unique values for overwrite columns (ORIGINAL FAST APPROACH)
-    unique_values_map = {}
-    if overwrite_columns:
-        with p.span("process.phase2.unique_values"):
-            for col in overwrite_columns:
-                if col in df.columns:
-                    unique_values_map[col] = df[col].unique(maintain_order=False)
-
-    # Track has_overlap=True files that had zero actual row matches (skipped).
-    # These are candidates for small-file compaction when the total file count
-    # exceeds MAX_OVERLAPPING_FILES.
-    skipped_files: List[Tuple[str, int]] = []
-
-    # Iterate only files where has_overlap is True
-    for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if has_overlap):
-        p.add("phase2_files_seen", 1)
-        # Use cached read if available (populated by filter_stale_incoming_rows)
-        if file_cache is not None and file in file_cache:
-            existing_df = file_cache.pop(file)
-            p.add("phase2_cache_hits", 1)
-        else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
-        if existing_df is None:
-            continue
-
-        filtered_df = empty_df.clone()
-
-        if overwrite_columns:
-            # Use anti-join on composite key to correctly match all columns (AND),
-            # not OR'd is_in per column which over-deletes on partial key matches.
-            key_cols_in_existing = [c for c in overwrite_columns if c in existing_df.columns]
-            key_cols_in_incoming = [c for c in overwrite_columns if c in unique_values_map]
-
-            if key_cols_in_existing == list(overwrite_columns) and key_cols_in_incoming == list(overwrite_columns):
-                # Build a DataFrame of unique incoming key tuples for the join
-                with p.span("process.phase2.incoming_keys"):
-                    incoming_keys = df.select(overwrite_columns).unique()
-                with p.span("process.phase2.anti_join"):
-                    kept = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
-                difference = existing_df.shape[0] - kept.shape[0]
-                deleted += difference
-                filtered_df = kept
-            else:
-                filtered_df = existing_df
-        else:
-            filtered_df = existing_df
-
-        # If nothing changed, skip re-writing that file
-        if filtered_df.shape[0] == existing_df.shape[0] and overwrite_columns:
-            # No rows deleted → keep original; record for potential compaction
-            skipped_files.append((file, file_size))
-            p.add("phase2_files_skipped", 1)
-            continue
-
-        with p.span("process.phase2.concat"):
-            merged_df = concat_with_union(merged_df, filtered_df)
-        sunset_files.add(file)
-        p.add("phase2_files_touched", 1)
-
-        # Spill chunk if too large (ORIGINAL APPROACH - 2x memory chunk)
-        _max_mem, _ = _resolve_limits(table_config)
-        if merged_df.estimated_size() > _max_mem * 2:
-            total_rows += merged_df.shape[0]
-            with p.span("process.phase2.flush"):
-                write_parquet_and_collect_resources(
-                    write_df=merged_df,
-                    overwrite_columns=overwrite_columns,
-                    data_dir=data_dir,
-                    new_resources=new_resources,
-                    compression_level=compression_level,
-                    profiler=p,
-                )
-            merged_df = empty_df.clone()
-
-    return deleted, merged_df, total_rows, skipped_files
-
-
-# =========================
 # Public API: standalone compaction (no incoming data)
 # =========================
 
@@ -712,12 +414,13 @@ def compact_resources(
         compression_level: int,
         table_config: Optional[dict] = None,
         small_only: bool = True,
+        dead_rowids: Optional[Set[int]] = None,
 ) -> Tuple[int, int, List[Dict], Set[str]]:
     """Compact small parquet files in a snapshot's resources list.
 
-    This is the standalone counterpart to ``process_overlapping_files``:
-    it reads files and rewrites them in memory-bounded chunks, **without
-    needing any incoming data**. Used by ``DataWriter.compact()``.
+    Reads files and rewrites them in memory-bounded chunks, **without
+    needing any incoming data**. Used by ``DataWriter.compact()`` and
+    ``SimpleTable.export_to()``.
 
     Args:
         snapshot: the current snapshot dict (read by the caller — must
@@ -732,6 +435,12 @@ def compact_resources(
             than ``max_memory_chunk_size`` are considered for
             compaction — large files are left untouched. When False,
             every file is rewritten regardless of size.
+        dead_rowids: optional set of ``__rowid__`` values to physically
+            drop from the output. When provided, each source file is
+            anti-joined against this set before buffering, so the written
+            files contain no logically-deleted rows. Used by ``export_to``
+            to bake the deletion-vector into a standalone copy. ``None``
+            (default) preserves every row.
 
     Returns:
         A 4-tuple ``(considered, total_rows, new_resources, sunset_files)``:
@@ -802,6 +511,13 @@ def compact_resources(
             # references it; the next compaction will retry.
             continue
 
+        # Physically drop logically-deleted rows when a deletion-vector
+        # is supplied (export bakes the vector into the copy).
+        if dead_rowids and ROWID_COL in existing_df.columns:
+            existing_df = existing_df.filter(
+                ~polars.col(ROWID_COL).is_in(list(dead_rowids))
+            )
+
         if chunk_df is None or chunk_df.height == 0:
             # Seed the buffer with the first survivor. Using
             # ``concat_with_union`` even for the seed keeps the schema
@@ -818,7 +534,6 @@ def compact_resources(
         chunk_size_bytes += int(file_size or 0)
 
         # Flush when the buffered chunk exceeds the per-table memory cap.
-        # The same threshold ``process_files_without_overlap`` uses.
         if chunk_size_bytes >= max_mem:
             total_rows += chunk_df.shape[0]
             # No overwrite columns for plain compaction — the resource
@@ -847,160 +562,6 @@ def compact_resources(
         )
 
     return len(sunset_files), total_rows, new_resources, sunset_files
-
-
-def process_files_without_overlap(
-        empty_df,
-        data_dir,
-        new_resources,
-        overlapping_files,
-        overwrite_columns,
-        sunset_files,
-        compression_level,
-        table_config: Optional[dict] = None,
-        profiler: Optional[Profiler] = None,
-):
-    p = profiler or get_null_profiler()
-    # ORIGINAL COMPACTION APPROACH - simple and fast
-    chunk_size = 0
-    chunk_df = empty_df.clone()
-    max_mem, _ = _resolve_limits(table_config)
-
-    # Pull in has_overlap=False files (selected by threshold pruning) for compaction
-    for file, file_size in ((file, file_size) for file, has_overlap, file_size in overlapping_files if not has_overlap):
-        existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
-        if existing_df is None:
-            continue
-
-        with p.span("process.phase1.concat"):
-            chunk_df = concat_with_union(chunk_df, existing_df)
-        sunset_files.add(file)
-        chunk_size += int(file_size or 0)
-        p.add("phase1_files", 1)
-
-        # If the chunk size exceeds the max memory chunk size, write it out
-        if chunk_size >= max_mem:
-            with p.span("process.phase1.flush"):
-                write_parquet_and_collect_resources(
-                    write_df=chunk_df,
-                    overwrite_columns=overwrite_columns,
-                    data_dir=data_dir,
-                    new_resources=new_resources,
-                    compression_level=compression_level,
-                    profiler=p,
-                )
-            chunk_size = 0
-            chunk_df = empty_df.clone()
-
-    return chunk_df
-
-
-# =========================
-# Delete-only processing (per-file in-place rewrite)
-# =========================
-
-def process_delete_only(
-        df: polars.DataFrame,
-        overlapping_files: Set[Tuple[str, bool, int]],
-        overwrite_columns: List[str],
-        data_dir: str,
-        compression_level: int,
-        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
-        profiler: Optional[Profiler] = None,
-):
-    """
-    Delete-only path: for each overlapping file, remove rows matching the
-    overwrite_columns keys present in *df*, then rewrite the remainder as a
-    standalone file.
-
-    Semantics:
-      - Only has_overlap=True files are touched.
-      - has_overlap=False files are ignored (no compaction during delete).
-      - Each file is rewritten independently — no union/merge across files.
-      - If all rows are deleted from a file, only sunset occurs (no new file).
-      - If no rows match, the file is left untouched.
-
-    Returns the same 6-tuple as process_overlapping_files:
-        (inserted, deleted, total_rows, total_columns, new_resources, sunset_files)
-    where inserted is always 0.
-    """
-    p = profiler or get_null_profiler()
-    deleted = 0
-    total_rows = 0
-    total_columns = 0
-
-    new_resources: List[Dict] = []
-    sunset_files: Set[str] = set()
-
-    # Pre-compute unique key values for efficient is_in() filtering
-    unique_values_map: Dict[str, polars.Series] = {}
-    with p.span("delete.unique_values"):
-        for col in overwrite_columns:
-            if col in df.columns:
-                unique_values_map[col] = df[col].unique(maintain_order=False)
-
-    for file, has_overlap, file_size in overlapping_files:
-        if not has_overlap:
-            continue
-        p.add("delete_files_seen", 1)
-
-        # Use cached read if available (populated by filter_stale_incoming_rows)
-        if file_cache is not None and file in file_cache:
-            existing_df = file_cache.pop(file)
-            p.add("delete_cache_hits", 1)
-        else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
-        if existing_df is None:
-            continue
-
-        # Build the match condition: anti-join on composite key (AND semantics)
-        key_cols_in_existing = [c for c in overwrite_columns if c in existing_df.columns]
-        key_cols_in_incoming = [c for c in overwrite_columns if c in unique_values_map]
-
-        if key_cols_in_existing != list(overwrite_columns) or key_cols_in_incoming != list(overwrite_columns):
-            # No key columns overlap with this file — skip
-            continue
-
-        # Build a DataFrame of unique incoming key tuples for the join
-        with p.span("delete.incoming_keys"):
-            incoming_keys = df.select(overwrite_columns).unique()
-        with p.span("delete.anti_join"):
-            kept_df = existing_df.join(incoming_keys, on=overwrite_columns, how="anti")
-        difference = existing_df.shape[0] - kept_df.shape[0]
-
-        if difference == 0:
-            # Nothing deleted from this file — leave it untouched
-            p.add("delete_files_skipped", 1)
-            continue
-
-        deleted += difference
-
-        # Sunset the original file
-        sunset_files.add(file)
-        p.add("delete_files_touched", 1)
-
-        # Track total_columns from existing files (they have the full schema)
-        if total_columns == 0:
-            total_columns = existing_df.shape[1]
-
-        # If there are remaining rows, write them as a standalone file
-        if kept_df.shape[0] > 0:
-            total_rows += kept_df.shape[0]
-            with p.span("delete.write_kept"):
-                write_parquet_and_collect_resources(
-                    write_df=kept_df,
-                    overwrite_columns=overwrite_columns,
-                    data_dir=data_dir,
-                    new_resources=new_resources,
-                    compression_level=compression_level,
-                    profiler=p,
-                )
-
-    # Fallback: if no files were touched, derive total_columns from the delete df
-    if total_columns == 0:
-        total_columns = df.shape[1]
-
-    return 0, deleted, total_rows, total_columns, new_resources, sunset_files
 
 
 # =========================
@@ -1311,170 +872,255 @@ def filter_stale_incoming_rows(
 
 
 # =========================
-# Tombstone (soft-delete) helpers
+# Tombstone (rowid deletion-vector) helpers
 # =========================
+#
+# Deletes and upserts no longer rewrite data files in the common case.
+# Instead, the ``__rowid__`` of every logically-removed row is recorded in a
+# per-table deletion-vector parquet (columns ``__file__`` + ``__rowid__``).
+# The read path anti-joins live data against that vector on ``__rowid__``.
+# Physical removal happens lazily, only when the vector grows past
+# ``max_tombstone_rows`` (see ``compact_tombstones``).
 
-# Default threshold: number of tombstoned keys before compaction is triggered.
-_DEFAULT_TOMBSTONE_COMPACT_TOTAL = 1000
+ROWID_COL = "__rowid__"
+TOMBSTONE_FILE_COL = "__file__"
 
 
-def _tombstone_threshold(table_config: Optional[dict]) -> int:
-    """Return the tombstone compaction threshold for the given table config."""
+def _max_tombstone_rows(table_config: Optional[dict]) -> int:
+    """Return the deletion-vector row count that triggers physical compaction.
+
+    Per-table ``max_tombstone_rows`` override falls back to the global
+    ``MAX_TOMBSTONE_ROWS`` default (env-configurable, like
+    ``MAX_MEMORY_CHUNK_SIZE`` / ``MAX_OVERLAPPING_FILES``).
+    """
     cfg = table_config or {}
-    return int(cfg.get("tombstone_compact_total") or _DEFAULT_TOMBSTONE_COMPACT_TOTAL)
+    return int(cfg.get("max_tombstone_rows") or getattr(default, "MAX_TOMBSTONE_ROWS", 1_000_000))
 
 
-def extract_key_tuples(
+def _write_df_parquet(
+        write_df: polars.DataFrame,
+        path: str,
+        compression_level: int = 1,
+        profiler: Optional[Profiler] = None,
+) -> int:
+    """Write a Polars DataFrame to a single parquet file on the active storage.
+
+    Minimal writer for system files (the tombstone deletion-vector) that need
+    no column statistics or Hive partitioning. Returns the file size in bytes.
+    """
+    p = profiler or get_null_profiler()
+    data = None
+    try:
+        with p.span("tombstone.encode"):
+            arrow_tbl = write_df.to_arrow()
+            buf = io.BytesIO()
+            pq.write_table(
+                arrow_tbl, buf,
+                compression="zstd",
+                compression_level=int(compression_level),
+                use_dictionary=True,
+                write_statistics=True,
+                row_group_size=_PARQUET_ROW_GROUP_SIZE,
+            )
+            data = buf.getvalue()
+        if hasattr(_get_storage(), "write_bytes"):
+            _get_storage().write_bytes(path, data)
+        elif hasattr(_get_storage(), "write_parquet"):
+            _get_storage().write_parquet(arrow_tbl, path)
+        else:
+            write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
+    except Exception:
+        write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
+    try:
+        return int(_get_storage().size(path))
+    except Exception:
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            return len(data) if data is not None else 0
+
+
+def identify_deleted_rowids(
         df: polars.DataFrame,
-        primary_keys: List[str],
-) -> List[Tuple]:
-    """Extract unique composite-key tuples from a DataFrame.
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        file_cache: Optional[Dict[str, polars.DataFrame]] = None,
+        profiler: Optional[Profiler] = None,
+) -> List[Tuple[str, int]]:
+    """Find the ``(file, __rowid__)`` pairs of existing rows matching a delete predicate.
 
-    Each element is a tuple of Python scalars ordered by *primary_keys*.
-    Suitable for JSON-serialisable tombstone storage.
+    For every overlapping data file, semi-joins the file against the unique
+    *overwrite_columns* key tuples present in *df* and collects the
+    ``__rowid__`` of each matched row plus the file it lives in. These pairs
+    are appended to the tombstone deletion-vector by the caller.
+
+    Files lacking a ``__rowid__`` column (legacy data written before rowids
+    existed) cannot be tombstoned by id and are skipped.
     """
-    available = [c for c in primary_keys if c in df.columns]
-    if available != list(primary_keys):
-        return []
-    key_df = df.select(primary_keys).unique()
-    return key_df.rows()  # list of tuples
+    p = profiler or get_null_profiler()
+    pairs: List[Tuple[str, int]] = []
+    if not overwrite_columns:
+        return pairs
+
+    key_cols = [c for c in overwrite_columns if c in df.columns]
+    if key_cols != list(overwrite_columns):
+        # Not all predicate columns present in the incoming df — nothing to match.
+        return pairs
+    with p.span("delete.incoming_keys"):
+        incoming_keys = df.select(overwrite_columns).unique()
+
+    for file, has_overlap, file_size in overlapping_files:
+        if not has_overlap:
+            continue
+        p.add("delete_files_seen", 1)
+
+        if file_cache is not None and file in file_cache:
+            existing_df = file_cache.get(file)
+        else:
+            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
+        if existing_df is None:
+            continue
+        if ROWID_COL not in existing_df.columns:
+            continue
+        if not all(c in existing_df.columns for c in overwrite_columns):
+            continue
+
+        with p.span("delete.semi_join"):
+            matched = existing_df.join(incoming_keys, on=overwrite_columns, how="semi")
+        if matched.height == 0:
+            continue
+
+        rowids = matched.get_column(ROWID_COL).drop_nulls().to_list()
+        pairs.extend((file, int(rid)) for rid in rowids)
+        p.add("delete_rows_matched", len(rowids))
+
+    return pairs
 
 
-def reconcile_tombstones(
-        tombstone_keys: List,
-        incoming_keys: List,
-) -> List:
-    """Remove from *tombstone_keys* any key tuple also present in *incoming_keys*.
+def build_tombstone_file(
+        tombstone_dir: str,
+        prev_tombstone_path: Optional[str],
+        new_pairs: List[Tuple[str, int]],
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
+    """Carry forward the previous deletion-vector and append newly deleted rows.
 
-    Both inputs are lists of tuples/lists (one entry per composite key).
-    Returns the pruned tombstone list.
+    The tombstone parquet has two columns: ``__file__`` (the data file that
+    holds the row) and ``__rowid__``. Each delete writes a NEW immutable
+    tombstone file = previous rows ∪ new rows (deduplicated on ``__rowid__``).
+
+    Returns ``(tombstone_path, combined_df)``:
+      - no new pairs → ``(prev_tombstone_path, None)`` — pure carry-forward,
+        the new snapshot reuses the previous file, no rewrite.
+      - new pairs → ``(new_path, combined_df)`` where ``combined_df`` is the
+        full deletion-vector (so the caller can run threshold compaction
+        without re-reading the file).
     """
-    if not tombstone_keys or not incoming_keys:
-        return list(tombstone_keys or [])
-    incoming_set = {tuple(k) for k in incoming_keys}
-    return [k for k in tombstone_keys if tuple(k) not in incoming_set]
+    p = profiler or get_null_profiler()
+    if not new_pairs:
+        return prev_tombstone_path, None
+
+    new_df = polars.DataFrame(
+        {
+            TOMBSTONE_FILE_COL: [f for f, _ in new_pairs],
+            ROWID_COL: [int(r) for _, r in new_pairs],
+        }
+    )
+
+    prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p) if prev_tombstone_path else None
+    if prev_df is not None and prev_df.height > 0 and ROWID_COL in prev_df.columns:
+        combined = polars.concat(
+            [prev_df.select([TOMBSTONE_FILE_COL, ROWID_COL]), new_df],
+            how="vertical",
+        )
+    else:
+        combined = new_df
+
+    combined = combined.unique(subset=[ROWID_COL], keep="first")
+
+    try:
+        if not _get_storage().exists(tombstone_dir):
+            _get_storage().makedirs(tombstone_dir)
+    except Exception:
+        pass
+
+    new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
+    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    return new_path, combined
 
 
 def compact_tombstones(
         snapshot: dict,
-        primary_keys: List[str],
+        tombstone_df: polars.DataFrame,
         data_dir: str,
         compression_level: int,
         table_config: Optional[dict] = None,
         profiler: Optional[Profiler] = None,
 ) -> Tuple[int, List[Dict], Set[str]]:
-    """Physically remove tombstoned rows from parquet files.
+    """Physically drop tombstoned rows from the data files that hold them.
 
-    Reads the ``tombstones`` block from *snapshot*, iterates all resources
-    whose stats *might* overlap with the tombstoned keys, anti-joins the
-    rows out, and rewrites the file.
+    *tombstone_df* is the deletion-vector (columns ``__file__`` + ``__rowid__``).
+    Only the data files named in ``__file__`` are read and rewritten — a
+    targeted compaction. For each, rows whose ``__rowid__`` is in the vector
+    are anti-joined out and the survivors written to a new file; the original
+    is sunset. Survivors keep their original ``__rowid__`` (no remapping).
 
-    Returns:
-        (compacted_rows, new_resources, sunset_files)
-    where compacted_rows is the total number of rows physically removed.
-    After this call the caller should clear the tombstone list.
+    After this call the caller clears the tombstone pointer: the dead rows no
+    longer exist on disk, so the deletion-vector is fully consumed.
+
+    Returns ``(removed_rows, new_resources, sunset_files)``.
     """
     p = profiler or get_null_profiler()
-    tombstone_block = snapshot.get("tombstones") or {}
-    deleted_keys = tombstone_block.get("deleted_keys") or []
-    if not deleted_keys or not primary_keys:
+    if tombstone_df is None or tombstone_df.height == 0:
         return 0, [], set()
 
-    # Build a Polars DataFrame of the tombstone keys for anti-join
-    with p.span("tombstone.build_df"):
-        try:
-            tombstone_df = polars.DataFrame(
-                {pk: [row[i] for row in deleted_keys] for i, pk in enumerate(primary_keys)}
-            )
-        except Exception:
-            return 0, [], set()
-
     resources = snapshot.get("resources") or []
-    p.add("tombstone_keys", len(deleted_keys))
-    p.add("tombstone_resources_total", len(resources))
-    compacted = 0
+    by_path = {r.get("file"): r for r in resources if r.get("file")}
+
+    removed = 0
     new_resources: List[Dict] = []
     sunset_files: Set[str] = set()
 
-    for resource in resources:
-        file_path = resource.get("file")
-        if not file_path:
+    files_with_deletes = (
+        tombstone_df.select(TOMBSTONE_FILE_COL).unique().get_column(TOMBSTONE_FILE_COL).to_list()
+    )
+    p.add("tombstone_files_total", len(files_with_deletes))
+
+    for file_path in files_with_deletes:
+        resource = by_path.get(file_path)
+        if not resource:
+            # File already sunset by an earlier compaction — skip.
             continue
         file_size = int(resource.get("file_size") or 0)
-
-        # Use stats to skip files that cannot contain any tombstoned key
-        stats = resource.get("stats")
-        if stats:
-            with p.span("tombstone.stats_check"):
-                overlaps = _tombstone_overlaps_stats(tombstone_df, primary_keys, stats)
-            if not overlaps:
-                p.add("tombstone_files_pruned", 1)
-                continue
-
         existing_df = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
-        if existing_df is None:
+        if existing_df is None or ROWID_COL not in existing_df.columns:
             continue
 
-        # Check that all primary key columns exist in the file
-        if not all(c in existing_df.columns for c in primary_keys):
-            continue
-
+        dead_ids = (
+            tombstone_df.filter(polars.col(TOMBSTONE_FILE_COL) == file_path)
+            .select(ROWID_COL)
+            .unique()
+        )
         with p.span("tombstone.anti_join"):
-            kept_df = existing_df.join(tombstone_df, on=primary_keys, how="anti")
-        difference = existing_df.shape[0] - kept_df.shape[0]
-
+            kept_df = existing_df.join(dead_ids, on=ROWID_COL, how="anti")
+        difference = existing_df.height - kept_df.height
         if difference == 0:
-            p.add("tombstone_files_skipped", 1)
             continue
 
-        compacted += difference
+        removed += difference
         sunset_files.add(file_path)
         p.add("tombstone_files_touched", 1)
 
-        if kept_df.shape[0] > 0:
+        if kept_df.height > 0:
             with p.span("tombstone.write_kept"):
                 write_parquet_and_collect_resources(
                     write_df=kept_df,
-                    overwrite_columns=primary_keys,
+                    overwrite_columns=[],
                     data_dir=data_dir,
                     new_resources=new_resources,
                     compression_level=compression_level,
                     profiler=p,
                 )
 
-    return compacted, new_resources, sunset_files
-
-
-def _tombstone_overlaps_stats(
-        tombstone_df: polars.DataFrame,
-        primary_keys: List[str],
-        stats: Dict,
-) -> bool:
-    """Check if any tombstone key *might* overlap with a file's column stats.
-
-    Conservative: returns True (might overlap) when stats are missing or
-    inconclusive.  Only returns False when we can **prove** no overlap —
-    i.e. when at least one primary-key column has *all* tombstone values
-    falling outside the file's [min, max] range for that column.
-    """
-    for col in primary_keys:
-        if col not in stats:
-            return True  # missing stats → assume overlap
-        col_stats = stats[col]
-        min_val = col_stats.get("min")
-        max_val = col_stats.get("max")
-        if min_val is None or max_val is None:
-            return True
-
-        try:
-            tomb_vals = tombstone_df[col].unique().to_list()
-        except Exception:
-            return True
-
-        # If NO tombstone value falls in [min, max] for this column,
-        # the file cannot contain any of the tombstoned keys → skip.
-        if not any(v is not None and min_val <= v <= max_val for v in tomb_vals):
-            return False
-
-    # Every column has at least one tombstone value in range → must check file
-    return True
+    return removed, new_resources, sunset_files

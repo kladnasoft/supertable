@@ -23,7 +23,7 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
-from supertable.data_classes import DedupViewDef, TombstoneDef, RbacViewDef
+from supertable.data_classes import TombstoneDef, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 
 
@@ -194,26 +194,13 @@ class DataReader:
             # executors create filtered views for restricted roles.
             reflection.rbac_views = rbac_views
 
-            # --- Dedup-on-read & tombstones: look up table configs and snapshot metadata ---
+            # --- Tombstone (deletion-vector): look up snapshot metadata ------
             try:
                 catalog = RedisCatalog()
                 for td in tables:
-                    tbl_cfg = catalog.get_table_config(
-                        self.organization, td.super_name, td.simple_name,
-                    )
-                    if tbl_cfg and tbl_cfg.get("dedup_on_read"):
-                        pk = tbl_cfg.get("primary_keys", [])
-                        if pk:
-                            # visible_columns: what the user actually asked for.
-                            # Empty list (SELECT *) means "all user columns" — the
-                            # executor will expose everything except __rn__.
-                            reflection.dedup_views[td.alias] = DedupViewDef(
-                                primary_keys=pk,
-                                order_column="__timestamp__",
-                                visible_columns=list(td.columns or []),
-                            )
-
-                    # Tombstone filtering: read from snapshot payload in Redis leaf
+                    # Tombstone filtering: read the deletion-vector pointer from
+                    # the snapshot payload in the Redis leaf.  When present, the
+                    # executor anti-joins the data on __rowid__ against it.
                     payload = None
                     try:
                         leaf = catalog.get_leaf(
@@ -221,15 +208,11 @@ class DataReader:
                         )
                         payload = (leaf or {}).get("payload") if isinstance(leaf, dict) else None
                         if isinstance(payload, dict):
-                            tomb_block = payload.get("tombstones")
-                            if isinstance(tomb_block, dict):
-                                tomb_keys = tomb_block.get("deleted_keys") or []
-                                tomb_pk = tomb_block.get("primary_keys") or []
-                                if tomb_keys and tomb_pk:
-                                    reflection.tombstone_views[td.alias] = TombstoneDef(
-                                        primary_keys=tomb_pk,
-                                        deleted_keys=tomb_keys,
-                                    )
+                            tomb_path = payload.get("tombstone")
+                            if tomb_path:
+                                reflection.tombstone_views[td.alias] = TombstoneDef(
+                                    tombstone_path=tomb_path,
+                                )
                     except Exception as te:
                         logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))
 

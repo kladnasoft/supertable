@@ -1067,59 +1067,12 @@ def rbac_view_name(base_table_name: str) -> str:
 
 
 # =========================================================
-# Dedup-on-read view creation
+# Tombstone (deletion-vector) view creation
 # =========================================================
 
-def create_dedup_view(
-        con: duckdb.DuckDBPyConnection,
-        source_table: str,
-        view_name: str,
-        dedup_def,
-) -> None:
-    """
-    Create a dedup view on top of a reflection table (or RBAC view).
+ROWID_COL = "__rowid__"
+TIMESTAMP_COL = "__timestamp__"
 
-    The view uses ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY <ts> DESC)
-    to keep only the latest row per primary key combination.
-
-    Only ``visible_columns`` are projected in the outer SELECT so that
-    internal columns (__timestamp__, extra PKs, __rn__) are hidden from
-    the user query.  If visible_columns is empty or ["*"], all columns
-    from the source are exposed except __rn__.
-
-    Args:
-        con: DuckDB connection
-        source_table: the underlying table or view to dedup
-        view_name: the view name to create
-        dedup_def: DedupViewDef with primary_keys, order_column, visible_columns
-    """
-    pk_cols = ", ".join(quote_if_needed(c) for c in dedup_def.primary_keys)
-    order_col = quote_if_needed(dedup_def.order_column)
-
-    # Determine which columns to expose
-    visible = dedup_def.visible_columns
-    if not visible or visible == ["*"]:
-        # Expose all source columns except internal dedup columns.
-        # DuckDB EXCLUDE removes them from SELECT *.
-        exclude_cols = "__rn__, " + quote_if_needed(dedup_def.order_column)
-        outer_select = f"* EXCLUDE ({exclude_cols})"
-    else:
-        outer_select = ", ".join(quote_if_needed(c) for c in visible)
-
-    sql = (
-        f"CREATE OR REPLACE VIEW {view_name} AS "
-        f"SELECT {outer_select} FROM ("
-        f"SELECT *, ROW_NUMBER() OVER ("
-        f"PARTITION BY {pk_cols} ORDER BY {order_col} DESC"
-        f") AS __rn__ FROM {source_table}"
-        f") sub WHERE __rn__ = 1;"
-    )
-    con.execute(sql)
-
-
-# =========================================================
-# Tombstone (soft-delete) view creation
-# =========================================================
 
 def create_tombstone_view(
         con: duckdb.DuckDBPyConnection,
@@ -1128,65 +1081,50 @@ def create_tombstone_view(
         tombstone_def,
 ) -> None:
     """
-    Create a filtering view that excludes soft-deleted (tombstoned) rows.
+    Create a view that hides the system columns and drops tombstoned rows.
 
-    The view anti-joins the source table against a VALUES list of
-    tombstoned composite keys.  Because the tombstone list is bounded
-    by the compaction threshold (typically ≤1000 keys), the VALUES
-    list is small and DuckDB handles it efficiently in memory.
+    Two responsibilities, applied to every reflected table:
 
-    This view should be inserted in the chain AFTER RBAC filtering
-    and BEFORE the dedup view so that tombstoned rows are excluded
-    before dedup's ROW_NUMBER window runs.
+      1. **Strip system columns** — ``__rowid__`` and ``__timestamp__`` are
+         removed from the projection via a static DuckDB
+         ``* EXCLUDE (__rowid__, __timestamp__)`` so they never leak into
+         user query results.  Every written file carries both columns, so
+         the exclude list is fixed.
+      2. **Apply the deletion-vector** — when *tombstone_def* carries a
+         ``tombstone_path``, rows whose ``__rowid__`` appears in the
+         deletion-vector parquet are removed with an ANTI JOIN *before*
+         the columns are stripped.
+
+    This view sits directly on top of the reflection table (before RBAC),
+    so the anti-join still has ``__rowid__`` available and RBAC never sees
+    the system columns.
 
     Args:
         con: DuckDB connection
-        source_table: the underlying table or view
+        source_table: the underlying reflection table or view
         view_name: the view name to create
-        tombstone_def: TombstoneDef with primary_keys and deleted_keys
+        tombstone_def: TombstoneDef with ``tombstone_path`` (or None)
     """
-    pk = tombstone_def.primary_keys
-    deleted = tombstone_def.deleted_keys
-    if not pk or not deleted:
-        # No tombstones — create a passthrough view
-        con.execute(
+    exclude = (
+        f" EXCLUDE ({quote_if_needed(ROWID_COL)}, {quote_if_needed(TIMESTAMP_COL)})"
+    )
+
+    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+
+    if tomb_path:
+        rid = quote_if_needed(ROWID_COL)
+        escaped = escape_parquet_path(tomb_path)
+        sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT * FROM {source_table};"
+            f"SELECT {source_table}.*{exclude} FROM {source_table} "
+            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet('{escaped}')) AS __dv__ "
+            f"ON {source_table}.{rid} = __dv__.{rid};"
         )
-        return
-
-    # Build VALUES rows: each key tuple becomes a row
-    # Example: VALUES (1, 'US'), (2, 'EU')
-    def _sql_literal(val) -> str:
-        if val is None:
-            return "NULL"
-        if isinstance(val, str):
-            return "'" + val.replace("'", "''") + "'"
-        return str(val)
-
-    value_rows = []
-    for key_tuple in deleted:
-        vals = ", ".join(_sql_literal(v) for v in key_tuple)
-        value_rows.append(f"({vals})")
-    values_sql = ", ".join(value_rows)
-
-    # Column aliases for the VALUES table
-    pk_aliases = ", ".join(quote_if_needed(c) for c in pk)
-
-    # Anti-join via NOT EXISTS (handles NULLs correctly, no column name collisions)
-    conditions = " AND ".join(
-        f"{source_table}.{quote_if_needed(c)} = __tombstones__.{quote_if_needed(c)}"
-        for c in pk
-    )
-
-    sql = (
-        f"CREATE OR REPLACE VIEW {view_name} AS "
-        f"SELECT * FROM {source_table} "
-        f"WHERE NOT EXISTS ("
-        f"SELECT 1 FROM (VALUES {values_sql}) AS __tombstones__({pk_aliases}) "
-        f"WHERE {conditions}"
-        f");"
-    )
+    else:
+        sql = (
+            f"CREATE OR REPLACE VIEW {view_name} AS "
+            f"SELECT *{exclude} FROM {source_table};"
+        )
     con.execute(sql)
 
 # (ParquetMetadataCache removed: was write-only dead weight.

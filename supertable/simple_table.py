@@ -184,6 +184,8 @@ class SimpleTable:
             "previous_snapshot": None,
             "schema": [],
             "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
         }
         self.storage.write_json(new_simple_path, snapshot_data)
 
@@ -269,6 +271,11 @@ class SimpleTable:
         ``target_dir``.  This is a pure copy: it does NOT create a new
         snapshot, advance the Redis leaf, or touch ``data/``/``snapshots/``.
 
+        Logically-deleted rows are physically dropped: the snapshot's
+        deletion-vector (``tombstone`` pointer) is read and its
+        ``__rowid__`` values are anti-joined out of the exported files, so
+        a standalone export never contains tombstoned rows.
+
         Args:
             target_dir: destination directory for the exported parquet
                 files (created if missing).  Typically an
@@ -282,7 +289,7 @@ class SimpleTable:
             ``dict`` with ``files`` (list of written paths),
             ``files_written``, ``total_rows`` and ``total_bytes``.
         """
-        from supertable.processing import compact_resources
+        from supertable.processing import compact_resources, ROWID_COL, _read_parquet_safe
 
         snapshot, _path = self.get_simple_table_snapshot()
         table_config = self.catalog.get_table_config(
@@ -291,12 +298,22 @@ class SimpleTable:
             self.simple_name,
         ) or {}
 
+        # Read the deletion-vector (if any) so its rows are dropped from
+        # the export rather than copied verbatim.
+        dead_rowids = None
+        tombstone_path = snapshot.get("tombstone")
+        if tombstone_path:
+            tomb_df = _read_parquet_safe(tombstone_path)
+            if tomb_df is not None and ROWID_COL in tomb_df.columns:
+                dead_rowids = set(tomb_df.get_column(ROWID_COL).drop_nulls().to_list())
+
         _considered, total_rows, new_resources, _sunset = compact_resources(
             snapshot=snapshot,
             data_dir=target_dir,
             compression_level=compression_level,
             table_config=table_config,
             small_only=small_only,
+            dead_rowids=dead_rowids,
         )
 
         files = [r.get("file") for r in new_resources if isinstance(r, dict) and r.get("file")]

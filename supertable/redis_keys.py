@@ -496,6 +496,20 @@ def meta_leaf_pattern(org: str, sup: str) -> str:
     )
 
 
+def meta_leaf_rowid_seq(org: str, sup: str, simple: str) -> str:
+    """Monotonic ``__rowid__`` counter for one simple table (STRING, INCRBY).
+
+    Kept under the leaf doc namespace so the per-table sequence shares
+    the leaf's lifecycle. INCRBY makes id reservation atomic across
+    concurrent writers, guaranteeing ``__rowid__`` uniqueness within the
+    table.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:leaf:doc:{_safe('simple', simple)}:rowid_seq"
+    )
+
+
 def meta_table_config(org: str, sup: str, simple: str) -> str:
     """Per-table runtime config (STRING)."""
     return (

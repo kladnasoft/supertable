@@ -483,6 +483,20 @@ return 1
             logger.error(f"[redis-catalog] get_leaf error: {e}")
             return None
 
+    def reserve_rowids(self, org: str, sup: str, simple: str, count: int) -> int:
+        """Atomically reserve ``count`` contiguous ``__rowid__`` values.
+
+        Uses INCRBY on the per-leaf rowid counter so the reserved block is
+        unique within the table even across concurrent writers. Returns the
+        first id of the block; the reserved range is
+        ``[start, start + count - 1]``. Ids start at 1. Returns 0 for a
+        non-positive ``count`` (nothing reserved).
+        """
+        if count <= 0:
+            return 0
+        new_val = int(self.r.incrby(RK.meta_leaf_rowid_seq(org, sup, simple), count))
+        return new_val - count + 1
+
     def delete_leaf(self, org: str, sup: str, simple: str) -> bool:
         """Delete a leaf pointer (used when unlinking shared tables)."""
         try:

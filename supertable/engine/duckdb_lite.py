@@ -23,7 +23,6 @@ from supertable.engine.engine_common import (
     init_connection,
     apply_runtime_pragmas,
     create_rbac_view,
-    create_dedup_view,
     create_tombstone_view,
 )
 
@@ -129,8 +128,6 @@ class DuckDBLite:
         alias_to_files = {}
         alias_to_columns = {}
 
-        dedup_views = getattr(reflection, "dedup_views", None) or {}
-
         for td in table_defs:
             key = (td.super_name, td.simple_name)
             sup = snapshots_by_key.get(key)
@@ -139,16 +136,17 @@ class DuckDBLite:
 
             cols = list(td.columns or [])
 
-            # Dedup views require PK + order columns even when not SELECTed.
-            dedup_def = dedup_views.get(td.alias)
-            if dedup_def and cols:
-                extra = []
-                for c in dedup_def.primary_keys:
-                    if c.lower() not in {x.lower() for x in cols}:
-                        extra.append(c)
-                if dedup_def.order_column.lower() not in {x.lower() for x in cols}:
-                    extra.append(dedup_def.order_column)
-                cols = cols + extra
+            # When specific columns are requested, also pull the system
+            # columns (__rowid__/__timestamp__) so the tombstone view can
+            # anti-join on __rowid__ and then statically EXCLUDE both from
+            # the output. Every written file carries both columns, so they
+            # are always threaded in. A bare SELECT * (cols == []) already
+            # carries them.
+            if cols:
+                lower = {x.lower() for x in cols}
+                for c in ("__rowid__", "__timestamp__"):
+                    if c not in lower:
+                        cols.append(c)
 
             name = hashed_table_name(
                 sup.super_name, sup.simple_name, sup.simple_version, cols,
@@ -178,46 +176,34 @@ class DuckDBLite:
 
             timer_capture("CREATING_REFLECTION")
 
-            # RBAC views
-            rbac_views = getattr(reflection, "rbac_views", None) or {}
+            # Per-query suffix so concurrent requests on the same table do not
+            # collide on a shared view name (CREATE OR REPLACE would silently
+            # corrupt a sibling query's view mid-execution).
+            query_suffix = _uuid.uuid4().hex[:8]
             query_alias_to_name = dict(alias_to_table_name)
+
+            # Tombstone / system-column view — created for EVERY alias so the
+            # system columns (__rowid__, __timestamp__) are always stripped and
+            # the deletion-vector (when present) is anti-joined out.  Sits on
+            # the reflection table directly, before RBAC.
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            for alias in list(query_alias_to_name.keys()):
+                source = query_alias_to_name[alias]
+                tomb_def = tombstone_views.get(alias)
+                view = f"tomb_{source}_{query_suffix}"
+                create_tombstone_view(con, source, view, tomb_def)
+                created_views.append(view)
+                query_alias_to_name[alias] = view
+
+            # RBAC views (column + row filtering) on top of stripped data.
+            rbac_views = getattr(reflection, "rbac_views", None) or {}
             if rbac_views:
-                # Use a per-query suffix so concurrent requests on the same table
-                # do not collide on the same view name (CREATE OR REPLACE would
-                # silently corrupt the sibling query's view mid-execution).
-                query_suffix = _uuid.uuid4().hex[:8]
-                for alias, table_name in alias_to_table_name.items():
+                for alias in list(query_alias_to_name.keys()):
                     view_def = rbac_views.get(alias)
                     if view_def:
-                        view = f"rbac_{table_name}_{query_suffix}"
-                        create_rbac_view(con, table_name, view, view_def)
-                        created_views.append(view)
-                        query_alias_to_name[alias] = view
-
-            # Tombstone views (soft-delete filtering)
-            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
-            if tombstone_views:
-                if not rbac_views:
-                    query_suffix = _uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    tomb_def = tombstone_views.get(alias)
-                    if tomb_def and tomb_def.deleted_keys:
                         source = query_alias_to_name[alias]
-                        view = f"tomb_{source}_{query_suffix}"
-                        create_tombstone_view(con, source, view, tomb_def)
-                        created_views.append(view)
-                        query_alias_to_name[alias] = view
-
-            # Dedup views
-            if dedup_views:
-                if not rbac_views and not tombstone_views:
-                    query_suffix = _uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    dedup_def = dedup_views.get(alias)
-                    if dedup_def:
-                        source = query_alias_to_name[alias]
-                        view = f"dedup_{source}_{query_suffix}"
-                        create_dedup_view(con, source, view, dedup_def)
+                        view = f"rbac_{source}_{query_suffix}"
+                        create_rbac_view(con, source, view, view_def)
                         created_views.append(view)
                         query_alias_to_name[alias] = view
 

@@ -27,7 +27,6 @@ from supertable.engine.engine_common import (
     init_connection,
     apply_runtime_pragmas,
     create_rbac_view,
-    create_dedup_view,
     create_tombstone_view,
     rbac_view_name,
 )
@@ -313,54 +312,38 @@ class DuckDBPro:
         # always reference them, even if an exception fires before the inner
         # assignments are reached (which would cause a NameError otherwise).
         rbac_view_names: List[str] = []
-        dedup_view_names: List[str] = []
         tombstone_view_names: List[str] = []
         try:
-            # Create per-query RBAC views if filtering is required
-            rbac_views = getattr(reflection, "rbac_views", None) or {}
             query_alias_to_name = dict(alias_to_table_name)
+            # Per-query suffix so concurrent queries never collide on a shared
+            # view name (CREATE OR REPLACE would corrupt a sibling's view).
+            query_suffix = _uuid.uuid4().hex[:8]
 
+            # Tombstone / system-column view — created for EVERY alias so the
+            # system columns (__rowid__, __timestamp__) are always stripped and
+            # the deletion-vector (when present) is anti-joined out.  Built on
+            # the reflection view directly, before RBAC.
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            for alias in list(query_alias_to_name.keys()):
+                source = query_alias_to_name[alias]
+                tomb_def = tombstone_views.get(alias)
+                view = f"tomb_{source}_{query_suffix}"
+                with self._lock:
+                    create_tombstone_view(con, source, view, tomb_def)
+                tombstone_view_names.append(view)
+                query_alias_to_name[alias] = view
+
+            # RBAC views (column + row filtering) on top of the stripped data.
+            rbac_views = getattr(reflection, "rbac_views", None) or {}
             if rbac_views:
-                # RBAC views are per-query (role-specific), not cached.
-                # Use a unique suffix to avoid collisions between concurrent queries.
-                query_suffix = _uuid.uuid4().hex[:8]
-                for alias, table_name in alias_to_table_name.items():
+                for alias in list(query_alias_to_name.keys()):
                     view_def = rbac_views.get(alias)
                     if view_def:
-                        view = f"rbac_{table_name}_{query_suffix}"
+                        source = query_alias_to_name[alias]
+                        view = f"rbac_{source}_{query_suffix}"
                         with self._lock:
-                            create_rbac_view(con, table_name, view, view_def)
+                            create_rbac_view(con, source, view, view_def)
                         rbac_view_names.append(view)
-                        query_alias_to_name[alias] = view
-
-            # Create per-query tombstone views if soft-deleted keys exist
-            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
-            if tombstone_views:
-                if not rbac_views:
-                    query_suffix = _uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    tomb_def = tombstone_views.get(alias)
-                    if tomb_def and tomb_def.deleted_keys:
-                        source = query_alias_to_name[alias]
-                        view = f"tomb_{source}_{query_suffix}"
-                        with self._lock:
-                            create_tombstone_view(con, source, view, tomb_def)
-                        tombstone_view_names.append(view)
-                        query_alias_to_name[alias] = view
-
-            # Create per-query dedup views if dedup-on-read is configured
-            dedup_views = getattr(reflection, "dedup_views", None) or {}
-            if dedup_views:
-                if not rbac_views and not tombstone_views:
-                    query_suffix = _uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    dedup_def = dedup_views.get(alias)
-                    if dedup_def:
-                        source = query_alias_to_name[alias]
-                        view = f"dedup_{source}_{query_suffix}"
-                        with self._lock:
-                            create_dedup_view(con, source, view, dedup_def)
-                        dedup_view_names.append(view)
                         query_alias_to_name[alias] = view
 
             executing_query = rewrite_query_with_hashed_tables(
@@ -407,15 +390,6 @@ class DuckDBPro:
             if tombstone_view_names:
                 with self._lock:
                     for view in tombstone_view_names:
-                        try:
-                            con.execute(f"DROP VIEW IF EXISTS {view};")
-                        except Exception:
-                            pass
-
-            # Drop per-query dedup views
-            if dedup_view_names:
-                with self._lock:
-                    for view in dedup_view_names:
                         try:
                             con.execute(f"DROP VIEW IF EXISTS {view};")
                         except Exception:

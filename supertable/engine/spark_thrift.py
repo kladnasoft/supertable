@@ -16,7 +16,7 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
-from supertable.data_classes import Reflection, RbacViewDef, DedupViewDef
+from supertable.data_classes import Reflection, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 
 from supertable.engine.engine_common import (
@@ -201,52 +201,7 @@ def _spark_create_rbac_view(
     cursor.execute(sql)
 
 
-def _spark_create_dedup_view(
-        cursor,
-        source_table: str,
-        view_name: str,
-        dedup_def: DedupViewDef,
-) -> None:
-    """Create a dedup-on-read view on top of a Spark table or RBAC view.
-
-    Uses ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY <ts> DESC) to keep
-    only the latest row per primary key.  Only visible_columns are projected
-    so that internal columns (__timestamp__, extra PKs, __rn__) are hidden.
-    """
-    pk_cols = ", ".join(f"`{c}`" for c in dedup_def.primary_keys)
-    order_col = f"`{dedup_def.order_column}`"
-
-    visible = dedup_def.visible_columns
-    if not visible or visible == ["*"]:
-        # Spark has no EXCLUDE syntax.  Query the source schema to build
-        # an explicit column list that omits __rn__ and __timestamp__.
-        hidden = {"__rn__", dedup_def.order_column}
-        try:
-            cursor.execute(f"DESCRIBE {source_table}")
-            src_cols = [row[0] for row in cursor.fetchall()]
-            keep = [c for c in src_cols if c not in hidden]
-        except Exception:
-            # Fallback: can't introspect — expose everything including __timestamp__.
-            # __rn__ is still filtered via the WHERE clause so it won't appear,
-            # but __timestamp__ will be visible.  Acceptable degraded behaviour.
-            keep = []
-
-        if keep:
-            outer_select = ", ".join(f"sub.`{c}`" for c in keep)
-        else:
-            outer_select = "sub.*"
-    else:
-        outer_select = ", ".join(f"sub.`{c}`" for c in visible)
-
-    sql = (
-        f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
-        f"SELECT {outer_select} FROM ("
-        f"SELECT *, ROW_NUMBER() OVER ("
-        f"PARTITION BY {pk_cols} ORDER BY {order_col} DESC"
-        f") AS __rn__ FROM {source_table}"
-        f") sub WHERE sub.__rn__ = 1"
-    )
-    cursor.execute(sql)
+_SPARK_SYSTEM_COLS = ("__rowid__", "__timestamp__")
 
 
 def _spark_create_tombstone_view(
@@ -255,49 +210,48 @@ def _spark_create_tombstone_view(
         view_name: str,
         tombstone_def,
 ) -> None:
-    """Create a tombstone-filtering view on top of a Spark table or RBAC view.
+    """Create a view that hides system columns and drops tombstoned rows.
 
-    Uses NOT EXISTS with a VALUES subquery to exclude soft-deleted keys.
-    The tombstone list is small (bounded by compaction threshold) so the
-    VALUES list fits comfortably in Spark's query plan.
+    Spark has no ``EXCLUDE`` syntax, so the source schema is introspected via
+    ``DESCRIBE`` and an explicit column list is built that omits the system
+    columns (``__rowid__`` / ``__timestamp__``).  When the table has a
+    deletion-vector (``tombstone_def.tombstone_path``), rows whose
+    ``__rowid__`` appears in the vector parquet are removed with a
+    LEFT ANTI JOIN before the columns are projected away.
+
+    Created on top of the reflection table (before RBAC), so the anti-join
+    still has ``__rowid__`` and RBAC never sees the system columns.
     """
-    pk = tombstone_def.primary_keys
-    deleted = tombstone_def.deleted_keys
-    if not pk or not deleted:
-        # No tombstones — passthrough
-        cursor.execute(
+    try:
+        cursor.execute(f"DESCRIBE {source_table}")
+        src_cols = [row[0] for row in cursor.fetchall()]
+    except Exception:
+        src_cols = []
+
+    user_cols = [c for c in src_cols if c not in _SPARK_SYSTEM_COLS]
+    if user_cols:
+        select_cols = ", ".join(f"src.`{c}`" for c in user_cols)
+    else:
+        # Can't introspect — fall back to SELECT * (system columns may leak).
+        select_cols = "src.*"
+
+    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    has_rowid = "__rowid__" in src_cols
+
+    if tomb_path and has_rowid:
+        escaped = tomb_path.replace("'", "''")
+        sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
-            f"SELECT * FROM {source_table}"
+            f"SELECT {select_cols} FROM {source_table} AS src "
+            f"LEFT ANTI JOIN (SELECT DISTINCT `__rowid__` "
+            f"FROM parquet.`{escaped}`) AS __dv__ "
+            f"ON src.`__rowid__` = __dv__.`__rowid__`"
         )
-        return
-
-    def _sql_literal(val) -> str:
-        if val is None:
-            return "NULL"
-        if isinstance(val, str):
-            return "'" + val.replace("'", "''") + "'"
-        return str(val)
-
-    value_rows = []
-    for key_tuple in deleted:
-        vals = ", ".join(_sql_literal(v) for v in key_tuple)
-        value_rows.append(f"({vals})")
-    values_sql = ", ".join(value_rows)
-
-    # Spark supports VALUES ... AS alias(col1, col2)
-    pk_aliases = ", ".join(f"`{c}`" for c in pk)
-    conditions = " AND ".join(
-        f"{source_table}.`{c}` = __tombstones__.`{c}`" for c in pk
-    )
-
-    sql = (
-        f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
-        f"SELECT * FROM {source_table} "
-        f"WHERE NOT EXISTS ("
-        f"SELECT 1 FROM VALUES {values_sql} AS __tombstones__({pk_aliases}) "
-        f"WHERE {conditions}"
-        f")"
-    )
+    else:
+        sql = (
+            f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
+            f"SELECT {select_cols} FROM {source_table} AS src"
+        )
     cursor.execute(sql)
 
 
@@ -778,51 +732,38 @@ class SparkThriftExecutor:
             )
 
             # 5. Create RBAC views
-            rbac_views = getattr(reflection, "rbac_views", None) or {}
             query_alias_to_name = dict(alias_to_table_name)
+            query_suffix = uuid.uuid4().hex[:8]
 
+            # 5a. Tombstone / system-column views — created for EVERY alias so
+            # the system columns (__rowid__/__timestamp__) are always stripped
+            # and the deletion-vector (when present) is anti-joined out.  Built
+            # on the reflection table directly, before RBAC.
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            for alias in list(query_alias_to_name.keys()):
+                source = query_alias_to_name[alias]
+                tomb_def = tombstone_views.get(alias)
+                tomb_view = f"tomb_{source}_{query_suffix}"
+                _spark_create_tombstone_view(cursor, source, tomb_view, tomb_def)
+                created_views.append(tomb_view)
+                query_alias_to_name[alias] = tomb_view
+
+            # 5b. RBAC views (column + row filtering) on top of stripped data.
+            rbac_views = getattr(reflection, "rbac_views", None) or {}
             if rbac_views:
-                query_suffix = uuid.uuid4().hex[:8]
-                for alias, table_name in alias_to_table_name.items():
+                for alias in list(query_alias_to_name.keys()):
                     view_def = rbac_views.get(alias)
                     if view_def:
-                        view_name = f"rbac_{table_name}_{query_suffix}"
-                        _spark_create_rbac_view(cursor, table_name, view_name, view_def)
+                        source = query_alias_to_name[alias]
+                        view_name = f"rbac_{source}_{query_suffix}"
+                        _spark_create_rbac_view(cursor, source, view_name, view_def)
                         created_views.append(view_name)
                         query_alias_to_name[alias] = view_name
-
-            # 5b. Create tombstone views if soft-deleted keys exist
-            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
-            if tombstone_views:
-                if not rbac_views:
-                    query_suffix = uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    tomb_def = tombstone_views.get(alias)
-                    if tomb_def and tomb_def.deleted_keys:
-                        source = query_alias_to_name[alias]
-                        tomb_view = f"tomb_{source}_{query_suffix}"
-                        _spark_create_tombstone_view(cursor, source, tomb_view, tomb_def)
-                        created_views.append(tomb_view)
-                        query_alias_to_name[alias] = tomb_view
-
-            # 5c. Create dedup views if dedup-on-read is configured
-            dedup_views = getattr(reflection, "dedup_views", None) or {}
-            if dedup_views:
-                if not rbac_views and not tombstone_views:
-                    query_suffix = uuid.uuid4().hex[:8]
-                for alias in list(query_alias_to_name.keys()):
-                    dedup_def = dedup_views.get(alias)
-                    if dedup_def:
-                        source = query_alias_to_name[alias]
-                        dedup_view = f"dedup_{source}_{query_suffix}"
-                        _spark_create_dedup_view(cursor, source, dedup_view, dedup_def)
-                        created_views.append(dedup_view)
-                        query_alias_to_name[alias] = dedup_view
 
             if _timed_out.is_set():
                 raise RuntimeError(
                     f"Spark query timed out after {query_timeout}s "
-                    f"during RBAC/tombstone/dedup view creation"
+                    f"during tombstone/RBAC view creation"
                 )
 
             # 6. Rewrite and execute
