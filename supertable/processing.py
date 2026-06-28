@@ -6,6 +6,7 @@ import os
 import io
 import time
 import threading
+import uuid
 from collections import OrderedDict
 from datetime import datetime, date, timezone
 from typing import Dict, List, Set, Tuple, Optional
@@ -940,6 +941,278 @@ def identify_all_rowids(
         p.add("delete_rows_matched", len(rowids))
 
     return pairs
+
+
+# =========================
+# Pushdown overwrite resolution (DuckDB probe, polars fallback)
+# =========================
+#
+# The legacy path (``filter_stale_incoming_rows`` + ``identify_deleted_rowids``)
+# reads EVERY overlapping data file FULLY (all columns, all rows) into polars,
+# then group/join over the whole table — cost O(table size), independent of how
+# few rows are actually written.  ``resolve_overwrite_writes`` replaces both with
+# ONE column-projected DuckDB ``parquet_scan`` that reads only the key /
+# ``__rowid__`` / newer-than columns and only the rows whose key matches an
+# incoming key (null-safe SEMI JOIN), then derives both results in-memory from
+# that small matched set.  The two legacy functions are retained as the exact
+# semantic oracle and the fallback for any environment/schema the probe can't
+# handle.
+
+
+def _storage_duckdb_path(storage, key: str) -> str:
+    """Resolve a storage key to a path string DuckDB can read directly.
+
+    Object stores expose ``to_duckdb_path`` (→ ``s3://`` or ``http(s)://``);
+    local storage has none, so the on-disk path is already DuckDB-readable and
+    returned unchanged.  Anything already a URL passes through untouched.
+    """
+    if not key or "://" in key:
+        return key
+    fn = getattr(storage, "to_duckdb_path", None)
+    if callable(fn):
+        try:
+            url = fn(key)
+            if isinstance(url, str) and url:
+                return url
+        except NotImplementedError:
+            pass
+        except Exception as e:
+            logging.debug(f"[write-probe] to_duckdb_path failed for {key}: {e}")
+    return key
+
+
+def _duckdb_probe_overlap_matches(
+        overlap_true_files: List[Tuple[str, int]],
+        overwrite_columns: List[str],
+        newer_than_col: Optional[str],
+        incoming_keys: polars.DataFrame,
+        profiler: Optional[Profiler] = None,
+) -> Optional[polars.DataFrame]:
+    """Column-projected pushdown probe over the overlapping data files.
+
+    Runs one ``parquet_scan`` (union_by_name, ranged GETs, row-group skipping)
+    null-safe ``SEMI JOIN``-ed against the unique *incoming_keys*, projecting only
+    ``__rowid__`` + the overwrite columns (+ *newer_than_col* when given) plus the
+    source ``filename``.  Returns a polars frame with columns ``__file__`` (the
+    original storage key), ``__rowid__``, the overwrite columns and the
+    newer-than column — i.e. every existing row whose key matches an incoming
+    key.  Returns ``None`` on any failure or unsupported schema (e.g. a referenced
+    column absent from EVERY candidate file → DuckDB binder error), signalling the
+    caller to fall back to the polars full-read path.
+    """
+    p = profiler or get_null_profiler()
+    if not overlap_true_files or not overwrite_columns:
+        return None
+
+    try:
+        import duckdb
+        from supertable.engine.engine_common import (
+            configure_httpfs_and_s3,
+            escape_parquet_path,
+            quote_if_needed,
+        )
+    except Exception as e:
+        logging.info(f"[write-probe] duckdb unavailable, using polars path: {e}")
+        return None
+
+    storage = _get_storage()
+    duck_to_key: Dict[str, str] = {}
+    duck_paths: List[str] = []
+    for file_key, _sz in overlap_true_files:
+        dp = _storage_duckdb_path(storage, file_key)
+        duck_to_key[dp] = file_key
+        duck_paths.append(dp)
+
+    select_cols = ["filename", quote_if_needed(ROWID_COL)]
+    select_cols += [quote_if_needed(c) for c in overwrite_columns]
+    if newer_than_col:
+        select_cols.append(quote_if_needed(newer_than_col))
+    join_cond = " AND ".join(
+        f"src.{quote_if_needed(c)} IS NOT DISTINCT FROM k.{quote_if_needed(c)}"
+        for c in overwrite_columns
+    )
+    files_sql = ", ".join(f"'{escape_parquet_path(dp)}'" for dp in duck_paths)
+    ik_name = f"__st_ik_{uuid.uuid4().hex}"
+
+    con = None
+    try:
+        con = duckdb.connect()
+        if any("://" in dp for dp in duck_paths):
+            configure_httpfs_and_s3(con, duck_paths)
+        con.register(ik_name, incoming_keys.to_arrow())
+        sql = (
+            f"SELECT {', '.join(select_cols)} "
+            f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
+            f"filename=TRUE, hive_partitioning=FALSE) AS src "
+            f"SEMI JOIN {ik_name} AS k ON {join_cond}"
+        )
+        with p.span("io.duckdb_probe"):
+            matched = con.execute(sql).pl()
+    except Exception as e:
+        logging.info(f"[write-probe] probe failed, using polars path: {e}")
+        return None
+    finally:
+        if con is not None:
+            try:
+                con.unregister(ik_name)
+            except Exception:
+                pass
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    if matched is None or "filename" not in matched.columns:
+        return None
+    # Restore the original storage key (DuckDB's ``filename`` is the path we
+    # passed in) as __file__ via a join so the tombstone stores keys, not URLs.
+    map_df = polars.DataFrame(
+        {"filename": list(duck_to_key.keys()),
+         TOMBSTONE_FILE_COL: list(duck_to_key.values())}
+    )
+    matched = matched.join(map_df, on="filename", how="left").drop("filename")
+    if matched.get_column(TOMBSTONE_FILE_COL).null_count() > 0:
+        # A returned filename did not map back — refuse to emit ambiguous
+        # tombstones; let the caller fall back to the polars path.
+        logging.info("[write-probe] unmapped filename in probe result; using polars path")
+        return None
+    p.add("probe_files", len(duck_paths))
+    p.add("probe_rows_matched", int(matched.height))
+    return matched
+
+
+def _align_keys_to_incoming(
+        matched: polars.DataFrame,
+        incoming_df: polars.DataFrame,
+        overwrite_columns: List[str],
+        newer_than_col: Optional[str],
+) -> polars.DataFrame:
+    """Cast probe-result key / newer-than columns to the incoming df's dtypes.
+
+    DuckDB → Arrow → polars round-trips can yield a different (if compatible)
+    dtype than the in-memory incoming frame; polars joins/comparisons want
+    matching dtypes.  Casts are best-effort; an unrepresentable cast raises and
+    the caller falls back to the polars path.
+    """
+    casts = []
+    for c in overwrite_columns:
+        if c in matched.columns and c in incoming_df.columns:
+            if matched.schema[c] != incoming_df.schema[c]:
+                casts.append(polars.col(c).cast(incoming_df.schema[c]))
+    if newer_than_col and newer_than_col in matched.columns and newer_than_col in incoming_df.columns:
+        if matched.schema[newer_than_col] != incoming_df.schema[newer_than_col]:
+            casts.append(polars.col(newer_than_col).cast(incoming_df.schema[newer_than_col]))
+    return matched.with_columns(casts) if casts else matched
+
+
+def _derive_stale_and_deletes(
+        incoming_df: polars.DataFrame,
+        matched: polars.DataFrame,
+        overwrite_columns: List[str],
+        newer_than_col: Optional[str],
+        profiler: Optional[Profiler] = None,
+) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
+    """Derive (filtered incoming df, delete pairs) from the probe's matched rows.
+
+    Mirrors the legacy two-function semantics exactly:
+      * stale filter — drop incoming rows whose newer-than value is <= the max
+        existing value for that key (null existing max ⇒ new/legacy key ⇒ keep);
+        skipped entirely when *newer_than_col* is falsy;
+      * delete pairs — ``(file, __rowid__)`` of existing rows matched by the
+        SURVIVING incoming keys (null-safe), so stale rows tombstone nothing and
+        rows without a ``__rowid__`` (legacy files) are dropped.
+    """
+    p = profiler or get_null_profiler()
+    matched = _align_keys_to_incoming(matched, incoming_df, overwrite_columns, newer_than_col)
+
+    if newer_than_col and newer_than_col in matched.columns:
+        with p.span("newer_than.group_agg"):
+            existing_max = matched.group_by(overwrite_columns).agg(
+                polars.col(newer_than_col).max().alias("__existing_max__")
+            )
+        with p.span("newer_than.join_filter"):
+            joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
+            filtered = joined.filter(
+                polars.col("__existing_max__").is_null()
+                | (polars.col(newer_than_col) > polars.col("__existing_max__"))
+            ).drop("__existing_max__")
+    else:
+        filtered = incoming_df
+
+    pairs: List[Tuple[str, int]] = []
+    if ROWID_COL in matched.columns:
+        surviving_keys = filtered.select(overwrite_columns).unique()
+        with p.span("delete.semi_join"):
+            matched_surviving = matched.join(
+                surviving_keys, on=overwrite_columns, how="semi", nulls_equal=True
+            )
+        dv = matched_surviving.select([TOMBSTONE_FILE_COL, ROWID_COL]).drop_nulls()
+        pairs = [(file, int(rid)) for file, rid in dv.iter_rows()]
+        p.add("delete_rows_matched", len(pairs))
+    return filtered, pairs
+
+
+def resolve_overwrite_writes(
+        incoming_df: polars.DataFrame,
+        overlapping_files: Set[Tuple[str, bool, int]],
+        overwrite_columns: List[str],
+        newer_than_col: Optional[str] = None,
+        profiler: Optional[Profiler] = None,
+) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
+    """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
+
+    Returns ``(filtered_incoming_df, delete_pairs)`` computed from ONE DuckDB
+    pushdown probe over the overlapping files.  Falls back to the original polars
+    full-read path (``filter_stale_incoming_rows`` + ``identify_deleted_rowids``)
+    when DuckDB is unavailable, the probe fails, or the file schema can't be
+    probed — semantics are identical on both paths.
+
+    *newer_than_col* falsy ⇒ no stale filtering (delete/upsert without conflict
+    resolution); the incoming df is returned unchanged and every overlapping row
+    matched by an incoming key is tombstoned.
+    """
+    p = profiler or get_null_profiler()
+    overlap_true = [(f, sz) for f, has_overlap, sz in overlapping_files if has_overlap]
+    if not overlap_true or not overwrite_columns:
+        return incoming_df, []
+
+    key_cols = [c for c in overwrite_columns if c in incoming_df.columns]
+    if key_cols != list(overwrite_columns):
+        # Incoming df lacks a key column → no existing row can match (mirrors the
+        # polars path, which returns no pairs and filters nothing).
+        return incoming_df, []
+
+    incoming_keys = incoming_df.select(overwrite_columns).unique()
+    matched = _duckdb_probe_overlap_matches(
+        overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
+    )
+    if matched is not None:
+        try:
+            return _derive_stale_and_deletes(
+                incoming_df, matched, overwrite_columns, newer_than_col, profiler=p,
+            )
+        except Exception as e:
+            logging.warning(f"[write-probe] derive failed, using polars path: {e}")
+
+    # ---- Fallback: original polars full-read path (semantics oracle) ----
+    p.add("overwrite_resolve_fallback", 1)
+    file_cache: Dict[str, polars.DataFrame] = {}
+    if newer_than_col:
+        filtered = filter_stale_incoming_rows(
+            incoming_df=incoming_df,
+            overlapping_files=overlapping_files,
+            overwrite_columns=overwrite_columns,
+            newer_than_col=newer_than_col,
+            file_cache=file_cache,
+            profiler=p,
+        )
+    else:
+        filtered = incoming_df
+    pairs = identify_deleted_rowids(
+        filtered, overlapping_files, overwrite_columns,
+        file_cache=file_cache, profiler=p,
+    )
+    return filtered, pairs
 
 
 def build_tombstone_file(

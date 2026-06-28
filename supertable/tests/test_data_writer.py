@@ -36,16 +36,14 @@ _PATCH_REDIS_CATALOG = f"{_MOD}.RedisCatalog"
 _PATCH_TIMER = f"{_MOD}.Timer"
 _PATCH_POLARS_FROM_ARROW = f"{_MOD}.polars.from_arrow"
 _PATCH_FIND_OVERLAP = f"{_MOD}.find_overlapping_files"
-_PATCH_FILTER_STALE = f"{_MOD}.filter_stale_incoming_rows"
-# The merge-on-read write path no longer funnels through a single
-# process_*() call.  Inserts go through write_parquet_and_collect_resources
-# (called once per non-delete write, skipped on delete_only — same
-# structural role the old process_overlapping_files mock filled, but its
-# return value is now ignored).  Deletes are identified by
-# identify_deleted_rowids (returns a list of (file, __rowid__) pairs) and
-# recorded by build_tombstone_file.
+_PATCH_RESOLVE = f"{_MOD}.resolve_overwrite_writes"
+# The merge-on-read write path resolves overwrite/newer_than conflicts in a
+# single resolve_overwrite_writes() probe that returns (filtered_df, [(file,
+# __rowid__), ...]).  Inserts go through write_parquet_and_collect_resources
+# (called once per non-delete write, skipped on delete_only — its return value
+# is ignored); deletes are recorded by build_tombstone_file.  The delete-all
+# path (delete_only with no overwrite_columns) uses identify_all_rowids.
 _PATCH_PROCESS_OVERLAP = f"{_MOD}.write_parquet_and_collect_resources"
-_PATCH_PROCESS_DELETE = f"{_MOD}.identify_deleted_rowids"
 _PATCH_BUILD_TOMBSTONE = f"{_MOD}.build_tombstone_file"
 _PATCH_MIRROR = f"{_MOD}.MirrorFormats"
 _PATCH_GET_MON_LOGGER = f"{_MOD}.MonitoringWriter"
@@ -472,17 +470,17 @@ class TestWriteDeleteOnly:
     @patch(_PATCH_BUILD_TOMBSTONE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
-    @patch(_PATCH_PROCESS_DELETE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_delete_only_calls_process_delete_only(
+    def test_delete_only_resolves_deletes(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_proc_del, MockMirror, mock_get_mon,
+        MockSimple, mock_find_overlap, mock_resolve, MockMirror, mock_get_mon,
         mock_build_tomb,
     ):
         mock_st = MagicMock(super_name="s", organization="o")
@@ -503,9 +501,9 @@ class TestWriteDeleteOnly:
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
 
-        # identify_deleted_rowids returns a list of (file, __rowid__) pairs;
+        # resolve_overwrite_writes returns (filtered_df, [(file, __rowid__)]);
         # one pair → deleted == 1.
-        mock_proc_del.return_value = [("f1", 1)]
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 1)])
         # build_tombstone_file does real parquet I/O against simple_dir (a
         # MagicMock here), so it must be stubbed.  (path, combined_df) shape;
         # combined_df=None keeps us below the compaction threshold.
@@ -516,12 +514,12 @@ class TestWriteDeleteOnly:
         dw = DataWriter("s", "o")
         result = dw.write("admin", "tbl", _arrow_table({"id": [1], "val": ["x"]}), ["id"], delete_only=True)
 
-        mock_proc_del.assert_called_once()
+        mock_resolve.assert_called_once()
         assert result == (2, 0, 0, 1)  # (cols, total_rows, inserted, deleted)
 
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
-    @patch(_PATCH_PROCESS_DELETE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -531,7 +529,7 @@ class TestWriteDeleteOnly:
     def test_delete_only_does_not_call_process_overlapping_files(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_proc_del, MockMirror, mock_get_mon,
+        MockSimple, mock_find_overlap, mock_resolve, MockMirror, mock_get_mon,
     ):
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
@@ -553,7 +551,7 @@ class TestWriteDeleteOnly:
         # No deletes → empty pair list; build_tombstone_file with no new pairs
         # and no prior tombstone returns (None, None) doing no I/O, so it need
         # not be stubbed.
-        mock_proc_del.return_value = []
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -575,7 +573,7 @@ class TestWriteNewerThan:
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
-    @patch(_PATCH_FILTER_STALE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -585,7 +583,7 @@ class TestWriteNewerThan:
     def test_newer_than_all_stale_returns_early(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_filter_stale,
+        MockSimple, mock_find_overlap, mock_resolve,
         mock_process, MockMirror, mock_get_mon,
     ):
         """When all rows are stale, write returns (cols, 0, 0, 0) without processing."""
@@ -608,7 +606,7 @@ class TestWriteNewerThan:
 
         # Return empty DataFrame (all stale)
         empty_df = _polars_df({"id": [], "ts": []}).cast({"id": pl.Int64, "ts": pl.Int64})
-        mock_filter_stale.return_value = empty_df
+        mock_resolve.side_effect = lambda **kw: (empty_df, [])
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -623,7 +621,7 @@ class TestWriteNewerThan:
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
-    @patch(_PATCH_FILTER_STALE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -633,7 +631,7 @@ class TestWriteNewerThan:
     def test_newer_than_some_rows_survive_continues_write(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_filter_stale,
+        MockSimple, mock_find_overlap, mock_resolve,
         mock_process, MockMirror, mock_get_mon,
     ):
         """When some rows survive stale filtering, write continues to process."""
@@ -657,7 +655,7 @@ class TestWriteNewerThan:
 
         # 1 of 2 rows survives
         surviving = _polars_df({"id": [2], "ts": [200]})
-        mock_filter_stale.return_value = surviving
+        mock_resolve.side_effect = lambda **kw: (surviving, [])
         mock_process.return_value = (1, 0, 1, 2, [], set())
         mock_get_mon.return_value = MagicMock()
 
@@ -671,7 +669,7 @@ class TestWriteNewerThan:
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
-    @patch(_PATCH_FILTER_STALE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -681,7 +679,7 @@ class TestWriteNewerThan:
     def test_newer_than_skipped_when_no_overwrite_columns(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_filter_stale,
+        MockSimple, mock_find_overlap, mock_resolve,
         mock_process, MockMirror, mock_get_mon,
     ):
         """newer_than filtering is only triggered if BOTH newer_than and overwrite_columns are set."""
@@ -706,7 +704,7 @@ class TestWriteNewerThan:
         with pytest.raises(ValueError, match="newer_than requires overwrite_columns"):
             dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [1]}), [], newer_than="ts")
 
-        mock_filter_stale.assert_not_called()
+        mock_resolve.assert_not_called()
 
 
 # ====================================================================
@@ -1326,7 +1324,7 @@ class TestWriteSnapshotRead:
 class TestWriteMonitoringPayload:
 
     @patch(_PATCH_BUILD_TOMBSTONE)
-    @patch(_PATCH_PROCESS_DELETE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
@@ -1340,7 +1338,7 @@ class TestWriteMonitoringPayload:
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
-        mock_proc_del, mock_build_tomb,
+        mock_resolve, mock_build_tomb,
     ):
         mock_st = MagicMock(super_name="sup", organization="org")
         MockST.return_value = mock_st
@@ -1365,8 +1363,8 @@ class TestWriteMonitoringPayload:
         def _append_res(*a, **k):
             k["new_resources"].extend(new_res)
         mock_process.side_effect = _append_res
-        # One delete pair → deleted == 1.
-        mock_proc_del.return_value = [("f1", 7)]
+        # One delete pair → deleted == 1; pass incoming through for inserts.
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 7)])
         mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
 
         # MonitoringWriter is a context manager; in-block instance is
@@ -1406,7 +1404,7 @@ class TestWriteMonitoringPayload:
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
-    @patch(_PATCH_FILTER_STALE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -1416,7 +1414,7 @@ class TestWriteMonitoringPayload:
     def test_stale_early_return_skips_monitoring_enqueue(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_filter_stale,
+        MockSimple, mock_find_overlap, mock_resolve,
         mock_process, MockMirror, mock_get_mon,
     ):
         """When all rows are stale, write() returns early via 'return' inside the
@@ -1440,7 +1438,7 @@ class TestWriteMonitoringPayload:
         mock_find_overlap.return_value = set()
 
         empty_df = _polars_df({"id": [], "ts": []}).cast({"id": pl.Int64, "ts": pl.Int64})
-        mock_filter_stale.return_value = empty_df
+        mock_resolve.side_effect = lambda **kw: (empty_df, [])
 
         mock_mon = MagicMock()
         mock_get_mon.return_value = mock_mon
@@ -1703,7 +1701,7 @@ class TestWriteReturnValue:
     @patch(_PATCH_BUILD_TOMBSTONE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
-    @patch(_PATCH_PROCESS_DELETE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
@@ -1713,7 +1711,7 @@ class TestWriteReturnValue:
     def test_return_tuple_format_delete_only(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_proc_del, MockMirror, mock_get_mon,
+        MockSimple, mock_find_overlap, mock_resolve, MockMirror, mock_get_mon,
         mock_build_tomb,
     ):
         """Verify the 4-tuple format: (total_columns, total_rows, inserted, deleted)."""
@@ -1727,7 +1725,7 @@ class TestWriteReturnValue:
         MockCat.return_value = mock_cat
 
         # delete_only: total_columns == dataframe.width (2 here), inserted == 0,
-        # total_rows == inserted == 0, deleted == len(identify_deleted_rowids()).
+        # total_rows == inserted == 0, deleted == len(resolve pairs).
         df = _polars_df({"id": [1], "val": ["x"]})
         mock_from_arrow.return_value = df
 
@@ -1737,7 +1735,7 @@ class TestWriteReturnValue:
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
         # Three delete pairs → deleted == 3.
-        mock_proc_del.return_value = [("f1", 1), ("f1", 2), ("f2", 3)]
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 1), ("f1", 2), ("f2", 3)])
         mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
         mock_get_mon.return_value = MagicMock()
 
@@ -1754,34 +1752,33 @@ class TestWriteReturnValue:
 
 
 # ====================================================================
-# 20. DataWriter.write — file_cache passed through
+# 20. DataWriter.write — overwrite resolution delegation
 # ====================================================================
 
-class TestWriteFileCache:
+class TestWriteOverwriteResolution:
 
     @patch(_PATCH_BUILD_TOMBSTONE)
-    @patch(_PATCH_PROCESS_DELETE)
     @patch(_PATCH_GET_MON_LOGGER)
     @patch(_PATCH_MIRROR)
     @patch(_PATCH_PROCESS_OVERLAP)
-    @patch(_PATCH_FILTER_STALE)
+    @patch(_PATCH_RESOLVE)
     @patch(_PATCH_FIND_OVERLAP)
     @patch(_PATCH_SIMPLE_TABLE)
     @patch(_PATCH_CHECK_WRITE)
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_file_cache_passed_to_filter_stale_and_identify_deletes(
+    def test_resolve_overwrite_writes_called_with_expected_args(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
-        MockSimple, mock_find_overlap, mock_filter_stale,
-        mock_process, MockMirror, mock_get_mon, mock_proc_del, mock_build_tomb,
+        MockSimple, mock_find_overlap, mock_resolve,
+        mock_process, MockMirror, mock_get_mon, mock_build_tomb,
     ):
-        """The single file_cache dict is shared by the two write-path readers:
-        filter_stale_incoming_rows (newer-than) and identify_deleted_rowids
-        (deletion-vector).  write_parquet_and_collect_resources writes the
-        incoming rows only and never reads overlapping files, so it gets no
-        file_cache."""
+        """The newer-than + deletion-vector resolution is delegated to a single
+        resolve_overwrite_writes call that owns its own reads internally (no
+        externally threaded file_cache).  It must receive the incoming frame,
+        the overwrite keys, and the newer_than column, and its returned delete
+        pairs must drive the deleted-row count."""
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
@@ -1800,24 +1797,20 @@ class TestWriteFileCache:
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
 
-        # filter_stale returns non-empty (so we continue to process)
-        mock_filter_stale.return_value = df
-        # No deletes → empty pairs → build_tombstone returns (None, None).
-        mock_proc_del.return_value = []
-        mock_build_tomb.return_value = (None, None)
+        # Survives stale filtering and reports one tombstoned existing rowid.
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("existing.parquet", 1)])
+        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
+        mock_process.return_value = (1, 0, 1, 1, [], set())
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s", "o")
-        dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [100]}), ["id"], newer_than="ts")
+        result = dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [100]}), ["id"], newer_than="ts")
 
-        # Check filter_stale received file_cache kwarg
-        filter_kwargs = mock_filter_stale.call_args[1]
-        assert "file_cache" in filter_kwargs
-        assert isinstance(filter_kwargs["file_cache"], dict)
-
-        # Check identify_deleted_rowids received the same file_cache
-        del_kwargs = mock_proc_del.call_args[1]
-        assert "file_cache" in del_kwargs
-        # Both readers should share the same dict instance
-        assert filter_kwargs["file_cache"] is del_kwargs["file_cache"]
+        mock_resolve.assert_called_once()
+        kwargs = mock_resolve.call_args[1]
+        assert "incoming_df" in kwargs
+        assert kwargs["overwrite_columns"] == ["id"]
+        assert kwargs["newer_than_col"] == "ts"
+        # The single returned delete pair drives the deleted count.
+        assert result[3] == 1

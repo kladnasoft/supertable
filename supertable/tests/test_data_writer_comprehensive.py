@@ -239,10 +239,9 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         patch("supertable.data_writer.SimpleTable") as MockSimpleTable,
         patch("supertable.data_writer.find_overlapping_files", return_value=set()),
         patch("supertable.data_writer.write_parquet_and_collect_resources") as mock_process,
-        patch("supertable.data_writer.identify_deleted_rowids") as mock_delete,
+        patch("supertable.data_writer.resolve_overwrite_writes") as mock_resolve,
         patch("supertable.data_writer.identify_all_rowids") as mock_delete_all,
         patch("supertable.data_writer.build_tombstone_file") as mock_build_tombstone,
-        patch("supertable.data_writer.filter_stale_incoming_rows") as mock_filter_stale,
         # MonitoringWriter is used as `with MonitoringWriter(...) as mon:` —
         # so the in-block monitor is the __enter__ return value.
         patch("supertable.data_writer.MonitoringWriter") as MockMonitorCls,
@@ -280,9 +279,12 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             kwargs["new_resources"].append({"file": "new.parquet"})
             return None
         mock_process.side_effect = _append_resource
-        # identify_deleted_rowids returns a list of (file, __rowid__) pairs.
-        mock_delete.return_value = []
-        # identify_all_rowids (delete-all path) returns the same shape.
+        # resolve_overwrite_writes returns (filtered_df, [(file, __rowid__), ...]).
+        # Default: pass the incoming frame through unchanged with no deletes.
+        def _resolve_passthrough(**kwargs):
+            return kwargs["incoming_df"], []
+        mock_resolve.side_effect = _resolve_passthrough
+        # identify_all_rowids (delete-all path) returns (file, __rowid__) pairs.
         mock_delete_all.return_value = []
         # build_tombstone_file returns (tombstone_path, combined_df).
         mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
@@ -299,10 +301,9 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             "SimpleTable": MockSimpleTable,
             "simple_inst": simple_inst,
             "process": mock_process,
-            "delete": mock_delete,
+            "resolve": mock_resolve,
             "delete_all": mock_delete_all,
             "build_tombstone": mock_build_tombstone,
-            "filter_stale": mock_filter_stale,
             "mirror": MockMirror,
             "monitor": fake_monitor,
             "find_overlap": patch("supertable.data_writer.find_overlapping_files",
@@ -568,7 +569,7 @@ class TestWriteAppend:
         assert len(result) == 4
         total_columns, total_rows, inserted, deleted = result
         # total_rows/inserted derive from the incoming row count; deleted from
-        # identify_deleted_rowids (empty by default).
+        # resolve_overwrite_writes' delete pairs (empty by default).
         assert isinstance(total_columns, int)
         assert isinstance(total_rows, int)
 
@@ -634,16 +635,16 @@ class TestWriteOverwrite:
 class TestWriteDeleteOnly:
     """write() with delete_only=True."""
 
-    def test_delete_only_calls_identify_deleted_rowids(self, writer):
+    def test_delete_only_with_overwrite_columns_reports_deletes(self, writer):
         data = _simple_arrow(3)
-        mock_delete = writer._mocks["delete"]
+        mock_resolve = writer._mocks["resolve"]
         # One delete pair → a non-empty tombstone, so build_tombstone_file
         # (already patched in the fixture) handles the parquet I/O.
-        mock_delete.return_value = [("old.parquet", 1)]
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("old.parquet", 1)])
 
         result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)
 
-        assert mock_delete.called
+        assert mock_resolve.called
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 0
         assert deleted == 1
@@ -659,8 +660,8 @@ class TestWriteDeleteOnly:
         result = writer.write("admin", "t1", data, overwrite_columns=[], delete_only=True)
 
         assert mock_delete_all.called
-        # The match-based identifier must NOT run on the delete-all path.
-        assert not writer._mocks["delete"].called
+        # The overwrite-resolve probe must NOT run on the delete-all path.
+        assert not writer._mocks["resolve"].called
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 0
         assert deleted == 2
@@ -671,28 +672,26 @@ class TestWriteNewerThan:
 
     def test_newer_than_filters_stale_rows(self, writer):
         data = _arrow_table({"id": [1, 2, 3], "name": ["a", "b", "c"], "ts": [10, 20, 30]})
-        mock_filter = writer._mocks["filter_stale"]
-        # filter returns a subset
+        mock_resolve = writer._mocks["resolve"]
+        # resolve returns the stale-filtered subset + no deletes.
         filtered_df = pl.DataFrame({"id": [3], "name": ["c"], "ts": [30]})
-        mock_filter.return_value = filtered_df
+        mock_resolve.side_effect = lambda **kw: (filtered_df, [])
 
-        with patch("supertable.data_writer.filter_stale_incoming_rows", mock_filter):
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
 
-        assert mock_filter.called
+        assert mock_resolve.called
 
     def test_newer_than_all_stale_returns_early(self, writer, fake_catalog):
         """When all rows are stale, write should return early without processing."""
         data = _arrow_table({"id": [1, 2], "name": ["a", "b"], "ts": [10, 20]})
-        mock_filter = writer._mocks["filter_stale"]
+        mock_resolve = writer._mocks["resolve"]
         # Return empty DataFrame with same schema
         empty_filtered = pl.DataFrame({"id": [], "name": [], "ts": []}).cast(
             {"id": pl.Int64, "name": pl.Utf8, "ts": pl.Int64}
         )
-        mock_filter.return_value = empty_filtered
+        mock_resolve.side_effect = lambda **kw: (empty_filtered, [])
 
-        with patch("supertable.data_writer.filter_stale_incoming_rows", mock_filter):
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
 
         # Should return early with zeros
         assert result is not None
@@ -925,14 +924,13 @@ class TestWriteTimings:
         the lock longer than needed and skips non-essential side-effects.
         """
         data = _arrow_table({"id": [1], "name": ["a"], "ts": [10]})
-        mock_filter = writer._mocks["filter_stale"]
+        mock_resolve = writer._mocks["resolve"]
         empty_filtered = pl.DataFrame({"id": [], "name": [], "ts": []}).cast(
             {"id": pl.Int64, "name": pl.Utf8, "ts": pl.Int64}
         )
-        mock_filter.return_value = empty_filtered
+        mock_resolve.side_effect = lambda **kw: (empty_filtered, [])
 
-        with patch("supertable.data_writer.filter_stale_incoming_rows", mock_filter):
-            result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
+        result = writer.write("admin", "t1", data, overwrite_columns=["id"], newer_than="ts")
 
         # The current implementation still enqueues a monitoring metric on
         # the newer_than early-exit path (so durations are observable). The
@@ -982,10 +980,11 @@ class TestWriteSequential:
 class TestWriteOverwriteWithDelete:
 
     def test_overwrite_reports_deleted_rows(self, writer):
-        """identify_deleted_rowids drives the deleted count; inserted = incoming rows."""
-        mock_delete = writer._mocks["delete"]
-        # Two delete pairs → deleted == 2.
-        mock_delete.return_value = [("old.parquet", 1), ("old.parquet", 2)]
+        """resolve_overwrite_writes drives the deleted count; inserted = incoming rows."""
+        mock_resolve = writer._mocks["resolve"]
+        # Two delete pairs → deleted == 2; pass incoming through for inserts.
+        mock_resolve.side_effect = lambda **kw: (
+            kw["incoming_df"], [("old.parquet", 1), ("old.parquet", 2)])
 
         data = _simple_arrow(5)
         result = writer.write("admin", "t1", data, overwrite_columns=["id"])
@@ -996,11 +995,11 @@ class TestWriteOverwriteWithDelete:
 
     def test_delete_only_reports_no_inserts(self, writer):
         """delete_only path: inserted should always be 0; deleted from pair count."""
-        mock_delete = writer._mocks["delete"]
+        mock_resolve = writer._mocks["resolve"]
         # Three delete pairs → deleted == 3.
-        mock_delete.return_value = [
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [
             ("old.parquet", 1), ("old.parquet", 2), ("old.parquet", 3),
-        ]
+        ])
 
         data = _simple_arrow(3)
         result = writer.write("admin", "t1", data, overwrite_columns=["id"], delete_only=True)

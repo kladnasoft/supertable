@@ -23,8 +23,7 @@ from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.processing import (
     find_overlapping_files,
-    filter_stale_incoming_rows,
-    identify_deleted_rowids,
+    resolve_overwrite_writes,
     identify_all_rowids,
     build_tombstone_file,
     build_stats_file,
@@ -398,60 +397,67 @@ class DataWriter:
                             logger.info(lp(f"stats pruning: skipped {pruned}/{before} candidate files"))
                 mark("stats_prune")
 
-            # File cache: populated by newer-than filtering, reused by process step
-            # to avoid double-reading overlapping parquet files from storage.
+            # File cache: used only by delete_only's identify_all_rowids below.
             file_cache = {}
 
-            # --- Newer-than filtering (skip stale/replayed rows) ---------------
-            if newer_than and overwrite_columns:
+            # --- Overwrite resolution: stale-row filtering + delete-pair -------
+            # identification in one DuckDB-pushdown probe over the overlapping
+            # files (column projection, row-group skipping, ranged GETs, native
+            # null-safe SEMI JOIN) instead of full-file polars reads.  Returns
+            # the stale-filtered incoming df plus the (file, __rowid__) delete
+            # pairs derived from the surviving keys; falls back to the polars
+            # oracle on any probe/derive failure.  delete_only (no
+            # overwrite_columns) is handled separately in the deletion block.
+            resolved_delete_pairs = None
+            if overwrite_columns:
                 pre_filter_count = dataframe.height
-                dataframe = filter_stale_incoming_rows(
+                dataframe, resolved_delete_pairs = resolve_overwrite_writes(
                     incoming_df=dataframe,
                     overlapping_files=overlapping_files,
                     overwrite_columns=overwrite_columns,
                     newer_than_col=newer_than,
-                    file_cache=file_cache,
                     profiler=profiler,
                 )
-                skipped = pre_filter_count - dataframe.height
-                if skipped > 0:
-                    logger.info(lp(f"newer_than={newer_than}: skipped {skipped}/{pre_filter_count} stale rows"))
-                if dataframe.height == 0:
-                    logger.info(lp("newer_than: all incoming rows are stale — skipping write"))
-                    mark("newer_than")
-                    total_columns = incoming_columns
-                    result_tuple = (total_columns, 0, 0, 0)
-                    stats_payload = {
-                        "query_id": qid,
-                        "recorded_at": datetime.now(timezone.utc).isoformat(),
-                        "organization": self.super_table.organization,
-                        "super_name": self.super_table.super_name,
-                        "role_name": role_name,
-                        "table_name": simple_name,
-                        "overwrite_columns": overwrite_columns,
-                        "compression_level": compression_level,
-                        "newer_than": newer_than,
-                        "delete_only": delete_only,
-                        "incoming_rows": incoming_rows,
-                        "incoming_columns": incoming_columns,
-                        "inserted": 0,
-                        "deleted": 0,
-                        "total_rows": 0,
-                        "total_columns": total_columns,
-                        "new_resources": 0,
-                        "sunset_files": 0,
-                        "skipped_stale": skipped,
-                        "lineage": _safe_json(lineage or {}),
-                        "duration": round(time.time() - t0, 6),
-                        "timings": profiler.emit_timings(),
-                        "counts": profiler.emit_counts(),
-                    }
-                    # Don't return here — fall through to finally (lock release)
-                    # and the post-finally monitoring block.  Returning inside the
-                    # try block would either skip monitoring or run it while the
-                    # Redis data lock is still held.
-                else:
-                    mark("newer_than")
+                if newer_than:
+                    skipped = pre_filter_count - dataframe.height
+                    if skipped > 0:
+                        logger.info(lp(f"newer_than={newer_than}: skipped {skipped}/{pre_filter_count} stale rows"))
+                    if dataframe.height == 0:
+                        logger.info(lp("newer_than: all incoming rows are stale — skipping write"))
+                        mark("newer_than")
+                        total_columns = incoming_columns
+                        result_tuple = (total_columns, 0, 0, 0)
+                        stats_payload = {
+                            "query_id": qid,
+                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "organization": self.super_table.organization,
+                            "super_name": self.super_table.super_name,
+                            "role_name": role_name,
+                            "table_name": simple_name,
+                            "overwrite_columns": overwrite_columns,
+                            "compression_level": compression_level,
+                            "newer_than": newer_than,
+                            "delete_only": delete_only,
+                            "incoming_rows": incoming_rows,
+                            "incoming_columns": incoming_columns,
+                            "inserted": 0,
+                            "deleted": 0,
+                            "total_rows": 0,
+                            "total_columns": total_columns,
+                            "new_resources": 0,
+                            "sunset_files": 0,
+                            "skipped_stale": skipped,
+                            "lineage": _safe_json(lineage or {}),
+                            "duration": round(time.time() - t0, 6),
+                            "timings": profiler.emit_timings(),
+                            "counts": profiler.emit_counts(),
+                        }
+                        # Don't return here — fall through to finally (lock release)
+                        # and the post-finally monitoring block.  Returning inside the
+                        # try block would either skip monitoring or run it while the
+                        # Redis data lock is still held.
+                    else:
+                        mark("newer_than")
 
             # --- Deletion-vector (tombstone) logic ----------------------------
             # Merge-on-read model: every write tombstones the __rowid__s of the
@@ -467,16 +473,12 @@ class DataWriter:
 
                 # 1. Identify which existing rows this write deletes/replaces.
                 #    overwrite_columns drives the anti-join key (delete + upsert);
-                #    pure appends (no overwrite_columns) tombstone nothing.
+                #    pure appends (no overwrite_columns) tombstone nothing.  The
+                #    pairs were already derived (from the surviving keys) by the
+                #    resolve_overwrite_writes probe above.
                 new_delete_pairs = []
                 if overwrite_columns:
-                    new_delete_pairs = identify_deleted_rowids(
-                        dataframe,
-                        overlapping_files,
-                        overwrite_columns,
-                        file_cache=file_cache,
-                        profiler=profiler,
-                    )
+                    new_delete_pairs = resolved_delete_pairs or []
                 elif delete_only:
                     # delete-all: no overwrite_columns → tombstone every row.
                     new_delete_pairs = identify_all_rowids(

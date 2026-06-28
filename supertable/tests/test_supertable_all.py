@@ -1041,7 +1041,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.build_tombstone_file")
-    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.resolve_overwrite_writes")
     @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
@@ -1056,7 +1056,7 @@ class TestDataWriterWrite:
         mock_access,
         mock_find_overlap,
         mock_write_parquet,
-        mock_identify_deleted,
+        mock_resolve,
         mock_build_tombstone,
         mock_mirror,
         mock_monitor,
@@ -1086,7 +1086,7 @@ class TestDataWriterWrite:
 
         # Setup processing mocks (deletion-vector model)
         mock_find_overlap.return_value = set()
-        mock_identify_deleted.return_value = []  # no rows deleted
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])  # no rows deleted
 
         def _append_resource(**kwargs):
             kwargs["new_resources"].append(_resource_entry("new.parquet"))
@@ -1157,7 +1157,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.build_tombstone_file")
-    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.resolve_overwrite_writes")
     @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
@@ -1172,7 +1172,7 @@ class TestDataWriterWrite:
         mock_access,
         mock_find_overlap,
         mock_write_parquet,
-        mock_identify_deleted,
+        mock_resolve,
         mock_build_tombstone,
         mock_mirror,
         mock_monitor,
@@ -1209,7 +1209,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.build_tombstone_file")
-    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.resolve_overwrite_writes")
     @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
@@ -1224,7 +1224,7 @@ class TestDataWriterWrite:
         mock_access,
         mock_find_overlap,
         mock_write_parquet,
-        mock_identify_deleted,
+        mock_resolve,
         mock_build_tombstone,
         mock_mirror,
         mock_monitor,
@@ -1250,7 +1250,7 @@ class TestDataWriterWrite:
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
-        mock_identify_deleted.return_value = []
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
         mock_write_parquet.side_effect = (
             lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
         )
@@ -1272,7 +1272,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.build_tombstone_file")
-    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.resolve_overwrite_writes")
     @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
@@ -1287,7 +1287,7 @@ class TestDataWriterWrite:
         mock_access,
         mock_find_overlap,
         mock_write_parquet,
-        mock_identify_deleted,
+        mock_resolve,
         mock_build_tombstone,
         mock_mirror,
         mock_monitor,
@@ -1315,7 +1315,7 @@ class TestDataWriterWrite:
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
-        mock_identify_deleted.return_value = []
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
         mock_write_parquet.side_effect = (
             lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
         )
@@ -1332,7 +1332,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
     @patch("supertable.data_writer.build_tombstone_file")
-    @patch("supertable.data_writer.identify_deleted_rowids")
+    @patch("supertable.data_writer.resolve_overwrite_writes")
     @patch("supertable.data_writer.write_parquet_and_collect_resources")
     @patch("supertable.data_writer.find_overlapping_files")
     @patch("supertable.data_writer.check_write_access")
@@ -1347,7 +1347,7 @@ class TestDataWriterWrite:
         mock_access,
         mock_find_overlap,
         mock_write_parquet,
-        mock_identify_deleted,
+        mock_resolve,
         mock_build_tombstone,
         mock_mirror,
         mock_monitor,
@@ -1375,10 +1375,10 @@ class TestDataWriterWrite:
         mock_find_overlap.return_value = set()
         # Two existing rows tombstoned → deleted == 2.  Non-empty delete pairs
         # mean build_tombstone_file would do real parquet I/O, so it is patched.
-        mock_identify_deleted.return_value = [
-            ("/tmp/data/old.parquet", 10),
-            ("/tmp/data/old.parquet", 11),
-        ]
+        mock_resolve.side_effect = lambda **kw: (
+            kw["incoming_df"],
+            [("/tmp/data/old.parquet", 10), ("/tmp/data/old.parquet", 11)],
+        )
         mock_write_parquet.side_effect = (
             lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
         )
@@ -1391,7 +1391,7 @@ class TestDataWriterWrite:
         arrow = _arrow_table({"x": [1]})
         result = dw.write("user_hash", "my_table", arrow, ["x"])
 
-        # Should still return result; deleted count comes from identify_deleted_rowids.
+        # Should still return result; deleted count comes from resolve_overwrite_writes.
         assert result is not None
         assert result == (1, 1, 1, 2)
 
