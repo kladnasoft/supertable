@@ -29,6 +29,7 @@ from supertable.engine.engine_common import (
     create_rbac_view,
     create_tombstone_view,
     rbac_view_name,
+    TombstoneCache,
 )
 
 
@@ -80,6 +81,14 @@ class DuckDBPro:
         # Multiple entries per key when old version still has in-flight queries.
         self._registry: Dict[Tuple[str, str], List[_ProCacheEntry]] = {}
 
+        # Shared deletion-vector table cache: per-table eviction (idle TTL +
+        # per-table version cap), bounded by config. Tables live on the
+        # persistent connection and are forgotten when it resets.
+        self._tombstone_cache = TombstoneCache(
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
+        )
+
         # Temp dir for spill — set on first query
         self._temp_dir: Optional[str] = None
 
@@ -123,6 +132,8 @@ class DuckDBPro:
             self._con = None
             self._httpfs_configured = False
             self._registry.clear()
+            # DV tables died with the connection — just forget the registry.
+            self._tombstone_cache.clear_registry()
             logger.warning("[duckdb.pro] connection reset — all cached views lost")
 
     # ---------------------------------------------------------
@@ -313,6 +324,8 @@ class DuckDBPro:
         # assignments are reached (which would cause a NameError otherwise).
         rbac_view_names: List[str] = []
         tombstone_view_names: List[str] = []
+        # Deletion-vector cache keys acquired this query — released in finally.
+        acquired_dv_keys: List[str] = []
         try:
             query_alias_to_name = dict(alias_to_table_name)
             # Per-query suffix so concurrent queries never collide on a shared
@@ -328,8 +341,18 @@ class DuckDBPro:
                 source = query_alias_to_name[alias]
                 tomb_def = tombstone_views.get(alias)
                 view = f"tomb_{source}_{query_suffix}"
+                # Reuse a materialised deletion-vector table when the cache is
+                # enabled and the alias has a stable key; otherwise fall back to
+                # the inline read_parquet path (dv_table=None). All DDL — the DV
+                # CREATE TABLE inside acquire() and the view creation — runs
+                # under the connection lock, matching Pro's serialised model.
+                cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
+                tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
                 with self._lock:
-                    create_tombstone_view(con, source, view, tomb_def)
+                    dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+                    if dv_table:
+                        acquired_dv_keys.append(cache_key)
+                    create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
                 tombstone_view_names.append(view)
                 query_alias_to_name[alias] = view
 
@@ -392,6 +415,16 @@ class DuckDBPro:
                     for view in tombstone_view_names:
                         try:
                             con.execute(f"DROP VIEW IF EXISTS {view};")
+                        except Exception:
+                            pass
+
+            # Release deletion-vector refs now their views are gone; this may
+            # evict + DROP unreferenced DV tables over capacity.
+            if acquired_dv_keys:
+                with self._lock:
+                    for cache_key in acquired_dv_keys:
+                        try:
+                            self._tombstone_cache.release(con, cache_key)
                         except Exception:
                             pass
 

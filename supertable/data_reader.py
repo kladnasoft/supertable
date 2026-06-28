@@ -322,6 +322,9 @@ class DataReader:
                                 # storage returns the key unchanged.
                                 reflection.tombstone_views[td.alias] = TombstoneDef(
                                     tombstone_path=estimator._to_duckdb_path(tomb_path),
+                                    # Bare key (pre-presign) is stable across
+                                    # appends → safe deletion-vector cache key.
+                                    cache_key=tomb_path,
                                 )
                     except Exception as te:
                         logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))

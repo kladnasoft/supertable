@@ -157,6 +157,25 @@ class Settings:
     SUPERTABLE_DUCKDB_MATERIALIZE: str = "view"    # SUPERTABLE_DUCKDB_MATERIALIZE
     SUPERTABLE_DUCKDB_PRESIGNED: bool = False      # SUPERTABLE_DUCKDB_PRESIGNED
     SUPERTABLE_DUCKDB_USE_HTTPFS: bool = False     # SUPERTABLE_DUCKDB_USE_HTTPFS
+    # Deletion-vector (tombstone) table cache.  Each entry is a small
+    # `DISTINCT __rowid__` table keyed by the stable tombstone path; the
+    # tombstone view ANTI JOINs it instead of re-reading the parquet every
+    # query.  Eviction is purely per-table — a churny table can never evict a
+    # slow table's cached deletion-vector:
+    #   * Idle TTL (below): every entry, including a table's latest, is dropped
+    #     once it goes unqueried for the TTL window.
+    #   * Per-table cap (this knob): at most N most-recently-used versions are
+    #     kept per table, so a burst of rewrites (e.g. 1000 updates in 5 min)
+    #     retains only the last N rather than all of them.
+    # <= 0 disables the cache entirely (inline read_parquet fallback).
+    SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE: int = 8  # SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
+    # Idle TTL (seconds): a cached deletion-vector is dropped once it has gone
+    # unqueried for this long; every query that uses it refreshes the timer.
+    # Applies to every entry (a table's latest included), so an abandoned table
+    # reclaims its cache instead of lingering until the connection resets.
+    # <= 0 keeps an entry only while a query references it (no persistence).
+    # Defaults to SUPERTABLE_ENGINE_FRESHNESS_SEC (300 s / 5 min).
+    SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC: int = 300  # SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
     SUPERTABLE_DEBUG_TIMINGS: bool = False          # SUPERTABLE_DEBUG_TIMINGS
 
     # ── Engine Routing / Executor ────────────────────────────────────
@@ -418,6 +437,8 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
+        SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
+        SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),
 
         # ── Engine Routing ───────────────────────────────────────────

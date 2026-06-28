@@ -61,9 +61,17 @@ class TombstoneDef:
 
     - tombstone_path: storage path of the deletion-vector parquet
       (columns ``__file__`` + ``__rowid__``).  ``None`` means no
-      tombstone exists, so no anti-join is applied.
+      tombstone exists, so no anti-join is applied.  This may be a
+      presigned/object-store URL that rotates per request, so it is
+      *not* stable enough to use as a cache key.
+    - cache_key: the bare, stable storage key of the same deletion-vector
+      parquet (no presign).  Stable across pure appends (carry-forward
+      returns the previous tombstone), so DuckDB engines use it to key the
+      materialised deletion-vector table cache.  ``None`` disables caching
+      for this alias (falls back to inline ``read_parquet``).
     """
     tombstone_path: Optional[str] = None
+    cache_key: Optional[str] = None
 
 
 @dataclass

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Any, Dict, List, Optional
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import duckdb
@@ -625,6 +628,17 @@ def init_connection(
     - Thread count defaults to 4 to limit concurrent buffer-pool competition
       inside a constrained container.  Override with ``SUPERTABLE_DUCKDB_THREADS``.
     """
+    # Pin DuckDB's home directory to the (guaranteed-writable) app home before
+    # anything else.  DuckDB otherwise derives it from the OS ``$HOME`` and uses
+    # it for extension/secret lookups; under a restricted service user that path
+    # may not exist, surfacing as "Can't find the home directory at '/home/app'".
+    # The app home is created and made writable at import time, so this keeps all
+    # home-dependent operations (LOAD/INSTALL httpfs, secrets) inside it.
+    try:
+        con.execute(f"SET home_directory='{get_app_home()}';")
+    except Exception as e:
+        logger.warning(f"[duckdb.init] home_directory pin failed: {e}")
+
     # Resolve memory limit.
     # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
     # The `memory_limit` argument is the caller's fallback when the env var is absent.
@@ -699,6 +713,30 @@ def init_connection(
         logger.debug(f"[duckdb.init] threads={thread_count}, memory={effective_memory_limit}")
     except Exception:
         pass
+
+
+def new_duckdb_connection(
+        temp_dir: str,
+        for_paths: Optional[List[str]] = None,
+        memory_limit: str = "1GB",
+) -> duckdb.DuckDBPyConnection:
+    """Create a DuckDB connection configured exactly like the read path.
+
+    Single constructor for transient (write-side) connections so they apply the
+    same ``init_connection`` pragmas as the persistent read executors — memory
+    limit, thread count, ``temp_directory`` and, crucially, the pinned
+    ``home_directory``.  This keeps the write-side probe from falling back to the
+    OS home directory, which may be absent under a restricted service user.
+
+    httpfs/S3 is configured only when *for_paths* contains a remote URL, matching
+    the read path's lazy behaviour and avoiding a needless extension load for
+    purely local scans.
+    """
+    con = duckdb.connect()
+    init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
+    if for_paths and any("://" in str(p) for p in for_paths):
+        configure_httpfs_and_s3(con, for_paths)
+    return con
 
 
 def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
@@ -1096,6 +1134,7 @@ def create_tombstone_view(
         source_table: str,
         view_name: str,
         tombstone_def,
+        dv_table: Optional[str] = None,
 ) -> None:
     """
     Create a view that hides the system columns and drops tombstoned rows.
@@ -1110,10 +1149,19 @@ def create_tombstone_view(
          absent — e.g. pre-migration parquet that predates ``__rowid__`` —
          is simply not matched, instead of raising as a literal
          ``EXCLUDE`` list would.
-      2. **Apply the deletion-vector** — when *tombstone_def* carries a
-         ``tombstone_path``, rows whose ``__rowid__`` appears in the
-         deletion-vector parquet are removed with an ANTI JOIN *before*
-         the columns are stripped.
+      2. **Apply the deletion-vector** — rows whose ``__rowid__`` appears in
+         the deletion-vector are removed with an ANTI JOIN *before* the
+         columns are stripped.  The deletion-vector comes from one of two
+         sources, in priority order:
+
+         * *dv_table* — a pre-materialised ``DISTINCT __rowid__`` table
+           (see :class:`TombstoneCache`).  Built once and reused across
+           queries, avoiding a parquet re-read per query.
+         * *tombstone_def.tombstone_path* — inline ``read_parquet`` of the
+           deletion-vector parquet.  Used when the cache is disabled or has
+           no stable key.  This is the legacy path and is semantically
+           identical to the cached one (same ``DISTINCT __rowid__`` set,
+           same anti-join, same ``__dv__`` alias).
 
     This view sits directly on top of the reflection table (before RBAC),
     so the anti-join still has ``__rowid__`` available and RBAC never sees
@@ -1124,6 +1172,8 @@ def create_tombstone_view(
         source_table: the underlying reflection table or view
         view_name: the view name to create
         tombstone_def: TombstoneDef with ``tombstone_path`` (or None)
+        dv_table: name of a pre-materialised deletion-vector table, or None
+            to fall back to the inline ``read_parquet`` path
     """
     # Tolerant, static system-column strip: ``COLUMNS(c -> ...)`` silently
     # skips a system column that is absent (pre-``__rowid__`` parquet), where
@@ -1135,9 +1185,19 @@ def create_tombstone_view(
     )
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    rid = quote_if_needed(ROWID_COL)
 
-    if tomb_path:
-        rid = quote_if_needed(ROWID_COL)
+    if dv_table:
+        # Cached deletion-vector: anti-join the already-materialised table.
+        # Semantically identical to the inline subquery below — the table is
+        # exactly `SELECT DISTINCT __rowid__ FROM read_parquet(...)`.
+        sql = (
+            f"CREATE OR REPLACE VIEW {view_name} AS "
+            f"SELECT {live_cols} FROM {source_table} "
+            f"ANTI JOIN {dv_table} AS __dv__ "
+            f"ON {source_table}.{rid} = __dv__.{rid};"
+        )
+    elif tomb_path:
         escaped = escape_parquet_path(tomb_path)
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
@@ -1151,6 +1211,228 @@ def create_tombstone_view(
             f"SELECT {live_cols} FROM {source_table};"
         )
     con.execute(sql)
+
+
+# =========================================================
+# Deletion-vector (tombstone) table cache
+# =========================================================
+
+@dataclass
+class _DVCacheEntry:
+    """One materialised deletion-vector table tracked by TombstoneCache."""
+    table_name: str          # DuckDB table name (e.g. dv_a3f8c1...)
+    cache_key: str           # stable tombstone path this DV was built from
+    table_id: str            # logical table this version belongs to
+    ref_count: int = 0       # in-flight queries currently anti-joining it
+    last_used: int = 0       # monotonic tick — per-table LRU ordering
+    expires_at: float = 0.0  # idle deadline; refreshed on every acquire
+
+
+def dv_table_name(cache_key: str) -> str:
+    """Deterministic DuckDB table name for a deletion-vector cache key."""
+    h = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:16]
+    return f"dv_{h}"
+
+
+def dv_table_id(cache_key: str) -> str:
+    """Group key identifying the logical table a deletion-vector belongs to.
+
+    Every version of a table's deletion-vector is written to the same
+    directory (``<simple_dir>/tombstone/<ts>_<rand>_deleted.parquet``); only
+    the filename rotates when a write adds new deletes.  The parent directory
+    is therefore a stable per-table identity derivable from the cache key
+    alone — no extra plumbing from the engines.  Falls back to the whole key
+    when there is no separator (each version then groups alone, which merely
+    relaxes the per-table cap for that key — never a correctness issue, since
+    the materialised DV table is keyed by the path hash regardless).
+    """
+    idx = max(cache_key.rfind("/"), cache_key.rfind("\\"))
+    return cache_key[:idx] if idx > 0 else cache_key
+
+
+class TombstoneCache:
+    """Materialises deletion-vectors as cached DuckDB tables, keyed by the
+    *stable* tombstone path, with **per-table** eviction.
+
+    Why a table and not the inline subquery?  The tombstone parquet is
+    re-read on every query in the inline form.  Because the tombstone path is
+    stable across pure appends (the writer carries forward the previous
+    deletion-vector when a write adds no new deletes), the same
+    ``DISTINCT __rowid__`` set is recomputed needlessly.  Materialising it
+    once — ``CREATE TABLE dv_<hash> AS SELECT DISTINCT __rowid__ FROM
+    read_parquet(path)`` — lets every subsequent tombstone view ANTI JOIN the
+    table directly.  The anti-join result is bit-identical to the inline form.
+
+    Eviction is entirely per logical table — a frequently-changing table can
+    never evict a slowly-changing table's cached deletion-vector — and rests on
+    two independent, table-local rules:
+
+      * **Idle TTL.**  Every entry carries ``expires_at = now + ttl``, refreshed
+        on every acquire.  The lazy sweep drops any unreferenced entry past its
+        deadline, including a table's most-recent version: a table that stops
+        being queried for ``ttl`` seconds reclaims its whole cache instead of
+        lingering until the connection resets.  ``ttl <= 0`` keeps an entry only
+        while a query references it (no persistence).
+      * **Per-table cap.**  At most ``capacity`` most-recently-used versions are
+        retained per table; the sweep evicts the least-recently-used
+        unreferenced ones beyond that.  A burst of rewrites (e.g. 1000 updates
+        in 5 minutes) keeps only the last ``capacity`` versions of *that* table
+        and touches no other table.  ``capacity <= 0`` disables the cache
+        entirely (callers fall back to the inline ``read_parquet`` path).
+
+    There is no global ceiling: total residency is bounded by the number of
+    tables queried within the TTL window times ``capacity`` versions each,
+    reclaimed by the idle TTL or by a connection reset.
+
+    Thread-safe: every registry mutation and the DDL it triggers is guarded
+    by an internal lock.  The lock is only ever acquired *after* an engine's
+    own connection lock, never before, so the two compose without deadlock.
+    """
+
+    def __init__(
+            self,
+            capacity: int,
+            ttl_seconds: int = 0,
+            *,
+            time_fn: Callable[[], float] = time.monotonic,
+    ):
+        self.capacity = capacity
+        self.ttl_seconds = ttl_seconds
+        self._time = time_fn
+        self._lock = threading.Lock()
+        self._registry: Dict[str, _DVCacheEntry] = {}   # cache_key -> entry
+        self._tick = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.capacity > 0
+
+    def acquire(
+            self,
+            con: duckdb.DuckDBPyConnection,
+            cache_key: Optional[str],
+            duckdb_path: Optional[str],
+    ) -> Optional[str]:
+        """Return the DV table name for *cache_key*, materialising it on miss,
+        refreshing its idle TTL, and incrementing its ref count.  Returns
+        ``None`` when caching is disabled or the inputs are incomplete — the
+        caller then falls back to the inline ``read_parquet`` path, preserving
+        exact legacy behaviour.
+        """
+        if not self.enabled or not cache_key or not duckdb_path:
+            return None
+        with self._lock:
+            entry = self._registry.get(cache_key)
+            if entry is None:
+                table_name = dv_table_name(cache_key)
+                rid = quote_if_needed(ROWID_COL)
+                escaped = escape_parquet_path(duckdb_path)
+                con.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table_name} AS "
+                    f"SELECT DISTINCT {rid} FROM read_parquet('{escaped}');"
+                )
+                entry = _DVCacheEntry(
+                    table_name=table_name,
+                    cache_key=cache_key,
+                    table_id=dv_table_id(cache_key),
+                )
+                self._registry[cache_key] = entry
+
+            entry.ref_count += 1
+            self._tick += 1
+            entry.last_used = self._tick
+            entry.expires_at = self._deadline()   # refresh idle TTL on access
+            self._sweep_locked(con)
+            return entry.table_name
+
+    def release(
+            self,
+            con: duckdb.DuckDBPyConnection,
+            cache_key: Optional[str],
+    ) -> None:
+        """Decrement the ref count for *cache_key* and run the lazy sweep."""
+        if not self.enabled or not cache_key:
+            return
+        with self._lock:
+            entry = self._registry.get(cache_key)
+            if entry is not None:
+                entry.ref_count = max(0, entry.ref_count - 1)
+            self._sweep_locked(con)
+
+    def _deadline(self) -> float:
+        """Idle deadline for a just-accessed entry.
+
+        ``ttl <= 0`` returns "now" so the entry is dropped as soon as it is
+        unreferenced (no persistence beyond in-flight queries); otherwise it
+        gets ``now + ttl``.
+        """
+        now = self._time()
+        return now if self.ttl_seconds <= 0 else now + self.ttl_seconds
+
+    def _drop_entry_locked(
+            self, con: duckdb.DuckDBPyConnection, entry: _DVCacheEntry,
+    ) -> None:
+        try:
+            con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
+        except Exception:
+            pass
+        self._registry.pop(entry.cache_key, None)
+
+    def _sweep_locked(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Apply the two table-local eviction rules; never drop an in-flight
+        (``ref_count > 0``) entry.
+
+          1. Idle TTL — drop every unreferenced entry past its deadline.
+          2. Per-table cap — within each table keep at most ``capacity``
+             most-recently-used versions, evicting the LRU unreferenced ones.
+             Pinned entries are exempt, so a table may briefly exceed the cap
+             while many of its versions are in flight; it shrinks back as they
+             release.
+        """
+        now = self._time()
+        for e in list(self._registry.values()):
+            if e.ref_count == 0 and now >= e.expires_at:
+                self._drop_entry_locked(con, e)
+
+        by_table: Dict[str, List[_DVCacheEntry]] = {}
+        for e in self._registry.values():
+            by_table.setdefault(e.table_id, []).append(e)
+        for entries in by_table.values():
+            if len(entries) <= self.capacity:
+                continue
+            entries.sort(key=lambda e: e.last_used)   # oldest first
+            excess = len(entries) - self.capacity
+            for e in entries:
+                if excess <= 0:
+                    break
+                if e.ref_count == 0:
+                    self._drop_entry_locked(con, e)
+                    excess -= 1
+
+    def clear_registry(self) -> None:
+        """Forget every entry *without* issuing DROPs.
+
+        Called when the underlying connection has already been closed/reset —
+        the tables vanished with it, so there is nothing to drop, only state
+        to forget.
+        """
+        with self._lock:
+            self._registry.clear()
+
+    def snapshot(self) -> List[Dict]:
+        """Diagnostics: a copy of the current registry state."""
+        with self._lock:
+            return [
+                {
+                    "table_name": e.table_name,
+                    "cache_key": e.cache_key,
+                    "table_id": e.table_id,
+                    "ref_count": e.ref_count,
+                    "last_used": e.last_used,
+                    "expires_at": e.expires_at,
+                }
+                for e in self._registry.values()
+            ]
 
 # (ParquetMetadataCache removed: was write-only dead weight.
 #  DuckDB's built-in enable_http_metadata_cache on the persistent connection

@@ -986,14 +986,33 @@ def identify_all_rowids(
 # handle.
 
 
-def _storage_duckdb_path(storage, key: str) -> str:
+def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
     """Resolve a storage key to a path string DuckDB can read directly.
 
-    Object stores expose ``to_duckdb_path`` (→ ``s3://`` or ``http(s)://``);
-    local storage has none, so the on-disk path is already DuckDB-readable and
-    returned unchanged.  Anything already a URL passes through untouched.
+    Mirrors the read path's ``DataEstimator._to_duckdb_path``: DuckDB cannot read
+    a private object-store file unless the URL is **presigned**, so when
+    ``SUPERTABLE_DUCKDB_PRESIGNED`` is set (or *force_presign* is True — used by
+    the probe's reactive retry after an HTTP/auth error) the bare object key is
+    signed via ``storage.presign(key)``.  Otherwise object stores expose
+    ``to_duckdb_path`` (→ ``s3://``/``http(s)://``); local storage has none, so
+    the on-disk path is already DuckDB-readable and returned unchanged.  Anything
+    already a URL passes through untouched (presign takes a key, never a URL).
     """
-    if not key or "://" in key:
+    if not key:
+        return key
+
+    # Proactive (or forced) presign — sign the bare object key, never a URL.
+    if (force_presign or settings.SUPERTABLE_DUCKDB_PRESIGNED) and "://" not in key:
+        presign_fn = getattr(storage, "presign", None)
+        if callable(presign_fn):
+            try:
+                url = presign_fn(key)
+                if isinstance(url, str) and url:
+                    return url
+            except Exception as e:
+                logging.debug(f"[write-probe] presign failed for {key}: {e}")
+
+    if "://" in key:
         return key
     fn = getattr(storage, "to_duckdb_path", None)
     if callable(fn):
@@ -1006,6 +1025,15 @@ def _storage_duckdb_path(storage, key: str) -> str:
         except Exception as e:
             logging.debug(f"[write-probe] to_duckdb_path failed for {key}: {e}")
     return key
+
+
+# Error substrings that signal an unsigned/expired object-store read which a
+# presigned URL can fix.  Mirrors create_reflection_view_with_presign_retry so
+# the write-side probe retries the same way the read path does.
+_PRESIGN_RETRY_TOKENS = (
+    "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
+    "AccessDenied", "SignatureDoesNotMatch", "403", "400",
+)
 
 
 def _duckdb_probe_overlap_matches(
@@ -1032,8 +1060,9 @@ def _duckdb_probe_overlap_matches(
         return None
 
     try:
-        import duckdb
+        import duckdb  # noqa: F401  (imported for availability check / errors)
         from supertable.engine.engine_common import (
+            new_duckdb_connection,
             configure_httpfs_and_s3,
             escape_parquet_path,
             quote_if_needed,
@@ -1043,12 +1072,25 @@ def _duckdb_probe_overlap_matches(
         return None
 
     storage = _get_storage()
-    duck_to_key: Dict[str, str] = {}
-    duck_paths: List[str] = []
-    for file_key, _sz in overlap_true_files:
-        dp = _storage_duckdb_path(storage, file_key)
-        duck_to_key[dp] = file_key
-        duck_paths.append(dp)
+    file_keys = [fk for fk, _sz in overlap_true_files]
+
+    def _resolve(force_presign: bool):
+        """Resolve keys → (duck_paths, {duck_path: original_key}).
+
+        When *force_presign* (or SUPERTABLE_DUCKDB_PRESIGNED) is set, the paths
+        are presigned URLs; the map still keys on the exact string handed to
+        DuckDB so its returned ``filename`` resolves back to the storage key.
+        """
+        d2k: Dict[str, str] = {}
+        paths: List[str] = []
+        for k in file_keys:
+            dp = _storage_duckdb_path(storage, k, force_presign=force_presign)
+            d2k[dp] = k
+            paths.append(dp)
+        return paths, d2k
+
+    # Proactive: honours SUPERTABLE_DUCKDB_PRESIGNED exactly like the read path.
+    duck_paths, duck_to_key = _resolve(force_presign=False)
 
     select_cols = ["filename", quote_if_needed(ROWID_COL)]
     select_cols += [quote_if_needed(c) for c in overwrite_columns]
@@ -1058,15 +1100,10 @@ def _duckdb_probe_overlap_matches(
         f"src.{quote_if_needed(c)} IS NOT DISTINCT FROM k.{quote_if_needed(c)}"
         for c in overwrite_columns
     )
-    files_sql = ", ".join(f"'{escape_parquet_path(dp)}'" for dp in duck_paths)
     ik_name = f"__st_ik_{uuid.uuid4().hex}"
 
-    con = None
-    try:
-        con = duckdb.connect()
-        if any("://" in dp for dp in duck_paths):
-            configure_httpfs_and_s3(con, duck_paths)
-        con.register(ik_name, incoming_keys.to_arrow())
+    def _run(paths):
+        files_sql = ", ".join(f"'{escape_parquet_path(dp)}'" for dp in paths)
         sql = (
             f"SELECT {', '.join(select_cols)} "
             f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
@@ -1074,7 +1111,33 @@ def _duckdb_probe_overlap_matches(
             f"SEMI JOIN {ik_name} AS k ON {join_cond}"
         )
         with p.span("io.duckdb_probe"):
-            matched = con.execute(sql).pl()
+            return con.execute(sql).pl()
+
+    con = None
+    try:
+        # Build the connection exactly like the read path (same pragmas, and a
+        # pinned home_directory) so the probe never falls back to the OS home —
+        # which is absent under a restricted service user.  httpfs/S3 is loaded
+        # by the helper only when duck_paths contain a remote URL.
+        con = new_duckdb_connection(temp_dir="write_probe", for_paths=duck_paths)
+        con.register(ik_name, incoming_keys.to_arrow())
+        try:
+            matched = _run(duck_paths)
+        except Exception as e:
+            # Reactive presign fallback — mirrors the read path's
+            # create_reflection_view_with_presign_retry: a private object store
+            # rejects an unsigned/expired read (403 / AccessDenied /
+            # SignatureDoesNotMatch / HTTP …); presign the keys and retry once.
+            msg = str(e)
+            if getattr(storage, "presign", None) and any(
+                tok in msg for tok in _PRESIGN_RETRY_TOKENS
+            ):
+                logging.warning(f"[write-probe] presign fallback after: {msg}")
+                duck_paths, duck_to_key = _resolve(force_presign=True)
+                configure_httpfs_and_s3(con, duck_paths)
+                matched = _run(duck_paths)
+            else:
+                raise
     except Exception as e:
         logging.info(f"[write-probe] probe failed, using polars path: {e}")
         return None
@@ -1248,12 +1311,17 @@ def build_tombstone_file(
         new_pairs: List[Tuple[str, int]],
         compression_level: int,
         profiler: Optional[Profiler] = None,
+        prev_df: Optional[polars.DataFrame] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous deletion-vector and append newly deleted rows.
 
     The tombstone parquet has two columns: ``__file__`` (the data file that
     holds the row) and ``__rowid__``. Each delete writes a NEW immutable
     tombstone file = previous rows ∪ new rows (deduplicated on ``__rowid__``).
+
+    *prev_df* lets the caller hand in the already-loaded previous deletion-vector
+    (the writer reads it to exclude already-tombstoned rows) so it is not read
+    from storage twice.  When ``None`` it is read from *prev_tombstone_path*.
 
     Returns ``(tombstone_path, combined_df)``:
       - no new pairs → ``(prev_tombstone_path, None)`` — pure carry-forward,
@@ -1273,7 +1341,8 @@ def build_tombstone_file(
         }
     )
 
-    prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p) if prev_tombstone_path else None
+    if prev_df is None and prev_tombstone_path:
+        prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p)
     if prev_df is not None and prev_df.height > 0 and ROWID_COL in prev_df.columns:
         combined = polars.concat(
             [prev_df.select([TOMBSTONE_FILE_COL, ROWID_COL]), new_df],
@@ -1293,6 +1362,71 @@ def build_tombstone_file(
     new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     return new_path, combined
+
+
+def reclaim_fully_dead_files(
+        resources: List[Dict],
+        combined_dv: polars.DataFrame,
+        tombstone_dir: str,
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+) -> Tuple[Set[str], Optional[str], Optional[polars.DataFrame]]:
+    """Drop data files whose every physical row is in the deletion-vector.
+
+    Merge-on-read defers physical deletes to the compaction threshold, so a
+    file whose rows are *all* tombstoned otherwise lingers in the snapshot —
+    re-scanned by every later overwrite probe and inflating the resource list.
+    Such a file is 100% dead and can be removed for free: no rewrite, just drop
+    it from ``resources`` and drop its ``__rowid__``s from the vector.
+
+    A file is fully dead when the count of its rowids in *combined_dv* equals
+    its physical ``rows`` count.  (rowids are table-unique and each lives in one
+    file, so the vector never holds more rowids for a file than the file has.)
+
+    Returns ``(sunset_files, new_tombstone_path, new_dv)``:
+      - nothing fully dead → ``(set(), None, None)`` — caller keeps its current
+        tombstone pointer / frame unchanged;
+      - some fully dead → the reclaimed file keys, plus a freshly written
+        tombstone holding only the surviving rowids, or
+        ``(sunset_files, None, None)`` when the vector is emptied entirely.
+    """
+    p = profiler or get_null_profiler()
+    if combined_dv is None or combined_dv.height == 0 or not resources:
+        return set(), None, None
+
+    dead_counts = (
+        combined_dv.group_by(TOMBSTONE_FILE_COL).agg(polars.len().alias("__dead__"))
+    )
+    dead_map = {f: int(n) for f, n in dead_counts.iter_rows()}
+
+    fully_dead: Set[str] = set()
+    for r in resources:
+        if not isinstance(r, dict):
+            continue
+        f = r.get("file")
+        rows = int(r.get("rows") or 0)
+        if f and rows > 0 and dead_map.get(f, 0) >= rows:
+            fully_dead.add(f)
+
+    if not fully_dead:
+        return set(), None, None
+
+    survivors = combined_dv.filter(
+        ~polars.col(TOMBSTONE_FILE_COL).is_in(list(fully_dead))
+    )
+    if survivors.height == 0:
+        return fully_dead, None, None
+
+    try:
+        if not _get_storage().exists(tombstone_dir):
+            _get_storage().makedirs(tombstone_dir)
+    except Exception:
+        pass
+
+    new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
+    _write_df_parquet(survivors, new_path, compression_level, profiler=p)
+    p.add("reclaimed_dead_files", len(fully_dead))
+    return fully_dead, new_path, survivors
 
 
 # =========================

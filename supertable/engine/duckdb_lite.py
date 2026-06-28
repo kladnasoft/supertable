@@ -10,6 +10,7 @@ import duckdb
 import pandas as pd
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.data_classes import Reflection
@@ -24,6 +25,7 @@ from supertable.engine.engine_common import (
     apply_runtime_pragmas,
     create_rbac_view,
     create_tombstone_view,
+    TombstoneCache,
 )
 
 
@@ -56,6 +58,13 @@ class DuckDBLite:
         self._lock = threading.Lock()
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
+        # Shared deletion-vector table cache: per-table eviction (idle TTL +
+        # per-table version cap), bounded by config. Tables live on the
+        # persistent connection and are forgotten when it resets.
+        self._tombstone_cache = TombstoneCache(
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -92,6 +101,8 @@ class DuckDBLite:
                 pass
             self._con = None
             self._httpfs_configured = False
+            # Tables died with the connection — just forget the registry.
+            self._tombstone_cache.clear_registry()
             logger.warning("[duckdb.lite] connection reset")
 
     # ------------------------------------------------------------------
@@ -163,6 +174,8 @@ class DuckDBLite:
 
         # Create per-query VIEWs. Dropped in finally regardless of outcome.
         created_views: List[str] = []
+        # Deletion-vector cache keys acquired this query — released in finally.
+        acquired_dv_keys: List[str] = []
         try:
             for alias, table_name in alias_to_table_name.items():
                 files = alias_to_files[alias]
@@ -193,7 +206,15 @@ class DuckDBLite:
                 source = query_alias_to_name[alias]
                 tomb_def = tombstone_views.get(alias)
                 view = f"tomb_{source}_{query_suffix}"
-                create_tombstone_view(con, source, view, tomb_def)
+                # Reuse a materialised deletion-vector table when the cache is
+                # enabled and the alias has a stable key; otherwise the call
+                # falls back to the inline read_parquet path (dv_table=None).
+                cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
+                tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
+                dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+                if dv_table:
+                    acquired_dv_keys.append(cache_key)
+                create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
                 created_views.append(view)
                 query_alias_to_name[alias] = view
 
@@ -258,6 +279,13 @@ class DuckDBLite:
             for view in reversed(created_views):
                 try:
                     con.execute(f"DROP VIEW IF EXISTS {view};")
+                except Exception:
+                    pass
+            # Release deletion-vector refs now the views referencing them are
+            # gone; this may evict + DROP unreferenced DV tables over capacity.
+            for cache_key in acquired_dv_keys:
+                try:
+                    self._tombstone_cache.release(con, cache_key)
                 except Exception:
                     pass
 
