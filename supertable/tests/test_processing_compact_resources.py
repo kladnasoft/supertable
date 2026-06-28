@@ -573,3 +573,96 @@ class TestRaceTolerance:
         # Output has only the present file's rows
         after = _read_all(patched_storage, [r["file"] for r in new_res])
         assert _multiset(after) == _multiset(df)
+
+
+# ---------------------------------------------------------------------------
+# should_compact_small_files — the auto-compaction gate predicate
+# ---------------------------------------------------------------------------
+#
+# Pure function (no I/O): decides whether write() should trigger an inline
+# small-file merge.  This is the gate the user's bug report was about —
+# 170×80KB files never compacted because nothing was *checking* it on write.
+# Two independent triggers, both measured over files SMALLER than the chunk
+# size (large files are already "done" and must never force a merge):
+#   (a) the small-file COUNT reaches max_overlapping_files, or
+#   (b) the small-file total BYTES exceed max_memory_chunk_size.
+
+
+def _res(file: str | None, size: int) -> dict:
+    return {"file": file, "file_size": size, "rows": 1}
+
+
+class TestShouldCompactSmallFiles:
+
+    def _limits(self):
+        from supertable.processing import _resolve_limits
+        return _resolve_limits(None)  # global defaults
+
+    def test_empty_resources_never_compacts(self):
+        from supertable.processing import should_compact_small_files
+        assert should_compact_small_files([]) is False
+        assert should_compact_small_files(None) is False
+
+    def test_count_trigger_at_threshold(self):
+        from supertable.processing import should_compact_small_files
+        max_mem, max_files = self._limits()
+        # Each file small enough that the BYTE trigger stays dormant, so this
+        # isolates the COUNT trigger: sum = max_files*s = max_mem/2 <= max_mem.
+        s = max_mem // (max_files * 2)
+        at = [_res(f"f{i}.parquet", s) for i in range(max_files)]
+        below = at[:-1]
+        assert should_compact_small_files(below) is False  # max_files-1
+        assert should_compact_small_files(at) is True       # == max_files
+
+    def test_size_trigger_below_count(self):
+        from supertable.processing import should_compact_small_files
+        max_mem, max_files = self._limits()
+        # 5 files, each a quarter-chunk (< chunk, so "small") → 1.25 chunks
+        # total: the BYTE trigger fires even though count is far below max_files.
+        s = max_mem // 4
+        res = [_res(f"f{i}.parquet", s) for i in range(5)]
+        assert len(res) < max_files
+        assert should_compact_small_files(res) is True
+
+    def test_size_trigger_is_strict_greater_than(self):
+        from supertable.processing import should_compact_small_files
+        max_mem, _ = self._limits()
+        # Exactly == max_mem must NOT trip (boundary): two half-chunk files.
+        res = [_res("a.parquet", max_mem // 2), _res("b.parquet", max_mem // 2)]
+        assert sum(r["file_size"] for r in res) == max_mem
+        assert should_compact_small_files(res) is False
+
+    def test_large_files_are_ignored(self):
+        from supertable.processing import should_compact_small_files
+        max_mem, max_files = self._limits()
+        # Files >= chunk size are "already compacted": even max_files+50 of
+        # them must NOT trigger a merge (they are not small).
+        big = [_res(f"b{i}.parquet", max_mem) for i in range(max_files + 50)]
+        assert should_compact_small_files(big) is False
+        # A handful of small files mixed in stays below both triggers.
+        mixed = big + [_res(f"s{i}.parquet", 80 * 1024) for i in range(5)]
+        assert should_compact_small_files(mixed) is False
+
+    def test_per_table_config_overrides_global_count(self):
+        from supertable.processing import should_compact_small_files
+        cfg = {"max_overlapping_files": 10}
+        small = [_res(f"f{i}.parquet", 80 * 1024) for i in range(10)]
+        assert should_compact_small_files(small, cfg) is True
+        assert should_compact_small_files(small[:-1], cfg) is False
+
+    def test_resource_without_file_key_is_skipped(self):
+        from supertable.processing import should_compact_small_files
+        _, max_files = self._limits()
+        # Entries lacking a ``file`` path are not real files → ignored, even
+        # at max_files of them (guards against directory/placeholder rows).
+        phantom = [_res(None, 80 * 1024) for _ in range(max_files)]
+        assert should_compact_small_files(phantom) is False
+
+    def test_missing_file_size_does_not_crash(self):
+        from supertable.processing import should_compact_small_files
+        # ``file_size`` absent/None coerces to 0 (counts toward the COUNT
+        # trigger but contributes no bytes) — must never raise.
+        _, max_files = self._limits()
+        no_size = [{"file": f"f{i}.parquet"} for i in range(max_files)]
+        assert should_compact_small_files(no_size) is True  # count trigger
+        assert should_compact_small_files(no_size[:1]) is False

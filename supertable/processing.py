@@ -292,6 +292,33 @@ def prune_not_overlapping_files_by_threshold(
     return result
 
 
+def should_compact_small_files(
+        resources: List[Dict],
+        table_config: Optional[dict] = None,
+) -> bool:
+    """Return True when accumulated small files trip the auto-compaction gate.
+
+    Mirrors the threshold in ``prune_not_overlapping_files_by_threshold``: a
+    file is "small" when its ``file_size`` is strictly smaller than
+    ``max_memory_chunk_size``.  The gate opens when EITHER the small-file count
+    reaches ``max_overlapping_files`` OR the combined small-file size exceeds
+    ``max_memory_chunk_size``.  Files already at/above the chunk size are big
+    enough on their own and are never counted.
+
+    ``resources`` is a snapshot's resource list (dicts with ``file`` /
+    ``file_size``).  Limits resolve per-table via ``_resolve_limits``.
+    """
+    max_mem, max_files = _resolve_limits(table_config)
+    small_sizes = [
+        int(r.get("file_size") or 0)
+        for r in (resources or [])
+        if r.get("file") and int(r.get("file_size") or 0) < max_mem
+    ]
+    if not small_sizes:
+        return False
+    return len(small_sizes) >= max_files or sum(small_sizes) > max_mem
+
+
 # =========================
 # Public API: Overlap selection (with compaction triggers)
 # =========================

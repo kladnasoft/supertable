@@ -48,6 +48,16 @@ _PATCH_BUILD_TOMBSTONE = f"{_MOD}.build_tombstone_file"
 _PATCH_MIRROR = f"{_MOD}.MirrorFormats"
 _PATCH_GET_MON_LOGGER = f"{_MOD}.MonitoringWriter"
 _PATCH_UUID4 = f"{_MOD}.uuid.uuid4"
+# Auto-compaction step (Phase A drain + Phase B small-file merge) wired into
+# write().  The gate (should_compact_small_files) is left UNMOCKED so tests
+# drive the REAL threshold off the snapshot's resource list; the heavy merge
+# helpers and the stats writers (which would otherwise touch storage once files
+# are sunset) are mocked so the tests pin orchestration, not Parquet I/O.
+_PATCH_COMPACT_RES = f"{_MOD}.compact_resources"
+_PATCH_COMPACT_TOMB = f"{_MOD}.compact_tombstones"
+_PATCH_READ_PARQUET = f"{_MOD}._read_parquet_safe"
+_PATCH_EXTRACT_STATS = f"{_MOD}.extract_stats_rows"
+_PATCH_BUILD_STATS = f"{_MOD}.build_stats_file"
 
 
 # ---------------------------------------------------------------------------
@@ -1814,3 +1824,277 @@ class TestWriteOverwriteResolution:
         assert kwargs["newer_than_col"] == "ts"
         # The single returned delete pair drives the deleted count.
         assert result[3] == 1
+
+
+# ====================================================================
+# 12.  DataWriter.write — Inline Auto-Compaction (small-file gate)
+# ====================================================================
+
+def _small_resources(n: int, *, size: int = 80 * 1024) -> List[Dict]:
+    """N small-file resource dicts that trip should_compact_small_files'
+    REAL count gate (default MAX_OVERLAPPING_FILES=100) once n >= 100.
+
+    Only ``file`` / ``file_size`` matter — the gate ignores everything else,
+    and the merge helper is mocked so the files are never opened."""
+    return [
+        {"file": f"small_{i}.parquet", "file_size": size, "rows": 100}
+        for i in range(n)
+    ]
+
+
+def _mk_compaction_catalog():
+    cat = MagicMock()
+    cat.reserve_rowids.return_value = 0
+    cat.get_table_config.return_value = None   # → default limits (100 / 16MB)
+    cat.acquire_simple_lock.return_value = "t"
+    cat.release_simple_lock.return_value = True
+    cat.set_leaf_payload_cas.return_value = 1
+    cat.bump_root.return_value = 1
+    return cat
+
+
+class TestWriteAutoCompaction:
+    """The user's bug: small files accumulated forever because automatic
+    compaction was never wired into write() — only the manual compact()
+    entry point merged them.  These tests pin the inline step: the gate is
+    checked on every write, draining the deletion-vector FIRST (Phase A)
+    so the small-file merge (Phase B) can never sunset a vector-referenced
+    file, and the merged output folds into the SAME snapshot commit."""
+
+    @patch(_PATCH_COMPACT_RES)
+    @patch(_PATCH_COMPACT_TOMB)
+    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_BUILD_STATS)
+    @patch(_PATCH_EXTRACT_STATS)
+    @patch(_PATCH_BUILD_TOMBSTONE)
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_RESOLVE)
+    @patch(_PATCH_FIND_OVERLAP)
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_gate_trips_append_merges_and_folds_into_snapshot(
+        self,
+        MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_resolve, mock_process,
+        MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
+        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_compact_res,
+    ):
+        """100 accumulated small files → REAL gate trips → compact_resources
+        runs once and its merged output / sunset set fold into the single
+        simple_table.update() commit.  No deletes ⇒ tombstone drain is a
+        no-op (nothing to orphan)."""
+        mock_st = MagicMock(super_name="s", organization="o")
+        MockST.return_value = mock_st
+        MockCat.return_value = _mk_compaction_catalog()
+
+        df = _polars_df({"id": [1], "ts": [100]})
+        mock_from_arrow.return_value = df
+
+        snap = {"resources": _small_resources(100)}
+        mock_simple = MagicMock(data_dir="/d")
+        mock_simple.get_simple_table_snapshot.return_value = (snap, "/p")
+        mock_simple.update.return_value = ({}, "/np")
+        MockSimple.return_value = mock_simple
+        mock_find_overlap.return_value = set()
+
+        # Pure append: rows survive, no delete pairs, no carried-forward vector.
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
+        mock_build_tomb.return_value = (None, None)
+        # The just-written file lands in new_resources (the established pattern).
+        mock_process.side_effect = lambda **kw: kw["new_resources"].append(
+            {"file": "new.parquet", "file_size": 80 * 1024, "rows": 1}
+        )
+        mock_extract_stats.return_value = MagicMock()
+        mock_build_stats.return_value = (None, None)
+        mock_get_mon.return_value = MagicMock()
+
+        # compact_resources merges EVERY live file into one and reports them
+        # all as sunset (computed from the snapshot it actually received).
+        def _merge(**kw):
+            live = kw["snapshot"]["resources"]
+            sunset = {r["file"] for r in live}
+            return (len(live), 10_100, [{"file": "merged.parquet",
+                                          "file_size": 8_000_000,
+                                          "rows": 10_100}], sunset)
+        mock_compact_res.side_effect = _merge
+
+        from supertable.data_writer import DataWriter
+        dw = DataWriter("s", "o")
+        result = dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [100]}), ["id"])
+
+        assert result is not None
+        # Gate tripped → merge ran exactly once; append had no vector to drain.
+        mock_compact_res.assert_called_once()
+        mock_compact_tomb.assert_not_called()
+        # The merge saw the 100 existing files plus the one just written.
+        merged_snapshot = mock_compact_res.call_args.kwargs["snapshot"]
+        assert len(merged_snapshot["resources"]) == 101
+
+        # Folded into the SAME commit: update() lists the merged file as the
+        # sole survivor and every consumed file as sunset.
+        new_resources_arg = mock_simple.update.call_args[0][0]
+        sunset_arg = mock_simple.update.call_args[0][1]
+        assert [r["file"] for r in new_resources_arg] == ["merged.parquet"]
+        assert "new.parquet" in sunset_arg
+        assert "small_0.parquet" in sunset_arg
+        assert "merged.parquet" not in sunset_arg
+
+    @patch(_PATCH_COMPACT_RES)
+    @patch(_PATCH_COMPACT_TOMB)
+    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_BUILD_STATS)
+    @patch(_PATCH_EXTRACT_STATS)
+    @patch(_PATCH_BUILD_TOMBSTONE)
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_RESOLVE)
+    @patch(_PATCH_FIND_OVERLAP)
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_below_threshold_does_not_compact(
+        self,
+        MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_resolve, mock_process,
+        MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
+        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_compact_res,
+    ):
+        """A handful of small files stays under both the count and size
+        triggers, so the write commits without invoking either compaction
+        helper — auto-compaction must not run on every write, only when the
+        gate is open."""
+        mock_st = MagicMock(super_name="s", organization="o")
+        MockST.return_value = mock_st
+        MockCat.return_value = _mk_compaction_catalog()
+
+        df = _polars_df({"id": [1], "ts": [100]})
+        mock_from_arrow.return_value = df
+
+        snap = {"resources": _small_resources(5)}
+        mock_simple = MagicMock(data_dir="/d")
+        mock_simple.get_simple_table_snapshot.return_value = (snap, "/p")
+        mock_simple.update.return_value = ({}, "/np")
+        MockSimple.return_value = mock_simple
+        mock_find_overlap.return_value = set()
+
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
+        mock_build_tomb.return_value = (None, None)
+        mock_process.side_effect = lambda **kw: kw["new_resources"].append(
+            {"file": "new.parquet", "file_size": 80 * 1024, "rows": 1}
+        )
+        mock_extract_stats.return_value = MagicMock()
+        mock_build_stats.return_value = (None, None)
+        mock_get_mon.return_value = MagicMock()
+
+        from supertable.data_writer import DataWriter
+        dw = DataWriter("s", "o")
+        result = dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [100]}), ["id"])
+
+        assert result is not None
+        mock_compact_res.assert_not_called()
+        mock_compact_tomb.assert_not_called()
+        # Write still committed the freshly written file untouched.
+        new_resources_arg = mock_simple.update.call_args[0][0]
+        assert [r["file"] for r in new_resources_arg] == ["new.parquet"]
+        assert mock_simple.update.call_args[0][1] == set()
+
+    @patch(_PATCH_COMPACT_RES)
+    @patch(_PATCH_COMPACT_TOMB)
+    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_BUILD_STATS)
+    @patch(_PATCH_EXTRACT_STATS)
+    @patch(_PATCH_BUILD_TOMBSTONE)
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_RESOLVE)
+    @patch(_PATCH_FIND_OVERLAP)
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_carried_forward_vector_drains_before_merge(
+        self,
+        MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_resolve, mock_process,
+        MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
+        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_compact_res,
+    ):
+        """The ordering invariant: when a live deletion-vector is carried
+        forward (build_tombstone_file returns a path but no fresh frame) and
+        the gate trips, Phase A must LOAD and drain that vector (compact_
+        tombstones) BEFORE Phase B merges small files (compact_resources).
+        Merging first could sunset a file the vector still references and
+        permanently orphan its dead rows."""
+        mock_st = MagicMock(super_name="s", organization="o")
+        MockST.return_value = mock_st
+        MockCat.return_value = _mk_compaction_catalog()
+
+        df = _polars_df({"id": [1], "ts": [100]})
+        mock_from_arrow.return_value = df
+
+        snap = {
+            "resources": _small_resources(100),
+            "tombstone": "/d/tombstone/dv.parquet",
+            "tombstone_rows": 50,
+        }
+        mock_simple = MagicMock(data_dir="/d")
+        mock_simple.get_simple_table_snapshot.return_value = (snap, "/p")
+        mock_simple.update.return_value = ({}, "/np")
+        MockSimple.return_value = mock_simple
+        mock_find_overlap.return_value = set()
+
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [])
+        # Carry-forward: pointer reused, no fresh combined frame this write.
+        mock_build_tomb.return_value = ("/d/tombstone/dv.parquet", None)
+        mock_process.side_effect = lambda **kw: kw["new_resources"].append(
+            {"file": "new.parquet", "file_size": 80 * 1024, "rows": 1}
+        )
+        # Phase A loads the live vector off its pointer to drain it.
+        mock_read_parquet.return_value = _polars_df(
+            {"__rowid__": list(range(50))}
+        )
+        mock_extract_stats.return_value = MagicMock()
+        mock_build_stats.return_value = (None, None)
+        mock_get_mon.return_value = MagicMock()
+
+        order: List[str] = []
+
+        def _drain(**kw):
+            order.append("tomb")
+            return (50, [{"file": "survivor.parquet",
+                          "file_size": 70 * 1024, "rows": 50}],
+                    {"small_0.parquet"})
+        mock_compact_tomb.side_effect = _drain
+
+        def _merge(**kw):
+            order.append("res")
+            return (10, 5_000, [{"file": "merged.parquet",
+                                 "file_size": 4_000_000, "rows": 5_000}],
+                    set())
+        mock_compact_res.side_effect = _merge
+
+        from supertable.data_writer import DataWriter
+        dw = DataWriter("s", "o")
+        result = dw.write("admin", "tbl", _arrow_table({"id": [1], "ts": [100]}), ["id"])
+
+        assert result is not None
+        # The carried-forward vector was read off its pointer to drain it.
+        mock_read_parquet.assert_called_once()
+        assert mock_read_parquet.call_args[0][0] == "/d/tombstone/dv.parquet"
+        # Both phases ran, drain strictly before merge.
+        mock_compact_tomb.assert_called_once()
+        mock_compact_res.assert_called_once()
+        assert order == ["tomb", "res"]

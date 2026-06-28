@@ -35,6 +35,7 @@ from supertable.processing import (
     write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
+    should_compact_small_files,
     _max_tombstone_rows,
     _read_parquet_safe,
 )
@@ -527,34 +528,97 @@ class DataWriter:
                 )
                 mark("build_tombstone")
 
-                # 4. Threshold compaction: physically drop dead rows once the
-                #    deletion-vector grows past max_tombstone_rows, then clear it.
-                if (
+                # 4. Threshold compaction (two triggers, same physical step):
+                #      (a) the deletion-vector grew past max_tombstone_rows, or
+                #      (b) the small files tripped the auto-compaction gate.
+                #    Both must FIRST physically drop tombstoned rows (Phase A)
+                #    and only THEN merge small files (Phase B): compact_resources
+                #    rewrites data files WITHOUT consulting the deletion-vector,
+                #    so sunsetting a vector-referenced file would orphan its dead
+                #    rows (hidden on read, never reclaimable).  Draining first
+                #    guarantees Phase B only ever sees vector-free survivors.
+                post_write_resources = (
+                    (last_simple_table.get("resources") or []) + new_resources
+                )
+                compaction_gate = should_compact_small_files(
+                    post_write_resources, table_config
+                )
+                tombstone_threshold_hit = (
                     combined_tombstone_df is not None
                     and combined_tombstone_df.height >= _max_tombstone_rows(table_config)
-                ):
-                    removed, compact_new, compact_sunset = compact_tombstones(
-                        snapshot=last_simple_table,
-                        tombstone_df=combined_tombstone_df,
-                        data_dir=simple_table.data_dir,
-                        compression_level=compression_level,
-                        table_config=table_config,
-                        profiler=profiler,
-                    )
-                    new_resources.extend(compact_new)
-                    sunset_files |= compact_sunset
-                    tombstone_path = None  # deletion-vector fully consumed
-                    tombstone_rows = 0
-                    logger.info(lp(
-                        f"tombstone compaction removed {removed} rows "
-                        f"from {len(compact_sunset)} files"
-                    ))
+                )
+
+                # Phase A — drain the deletion-vector when either trigger fires
+                # and a vector is actually live (freshly built this write OR
+                # carried forward from a prior one).
+                if tombstone_threshold_hit or compaction_gate:
+                    dv_to_drain = combined_tombstone_df
+                    if dv_to_drain is None and tombstone_path:
+                        # Pure carry-forward: load the live vector so the merge
+                        # below never sunsets a file it still references.
+                        dv_to_drain = _read_parquet_safe(tombstone_path, profiler=profiler)
+                    if dv_to_drain is not None and dv_to_drain.height > 0:
+                        removed, tomb_new, tomb_sunset = compact_tombstones(
+                            snapshot=last_simple_table,
+                            tombstone_df=dv_to_drain,
+                            data_dir=simple_table.data_dir,
+                            compression_level=compression_level,
+                            table_config=table_config,
+                            profiler=profiler,
+                        )
+                        new_resources.extend(tomb_new)
+                        sunset_files |= tomb_sunset
+                        tombstone_path = None  # deletion-vector fully consumed
+                        tombstone_rows = 0
+                        logger.info(lp(
+                            f"tombstone compaction removed {removed} rows "
+                            f"from {len(tomb_sunset)} files"
+                        ))
 
                 # 5. Pin the (carried-forward / new / cleared) tombstone pointer
                 #    and its row count.
                 last_simple_table["tombstone"] = tombstone_path
                 last_simple_table["tombstone_rows"] = tombstone_rows
                 mark("compact_tombstones")
+
+                # Phase B — auto small-file compaction.  Merge the accumulated
+                # small files (existing survivors + the file just written) once
+                # the gate is open so the file count stays bounded.  The vector
+                # was drained above, so every surviving file is safe to sunset.
+                # Result folds into the SAME snapshot commit below (new_resources
+                # / sunset_files feed build_stats and simple_table.update).
+                compaction_ran = False
+                if compaction_gate:
+                    live_resources = [
+                        r for r in (last_simple_table.get("resources") or [])
+                        if r.get("file") not in sunset_files
+                    ]
+                    live_resources += [
+                        r for r in new_resources if r.get("file") not in sunset_files
+                    ]
+                    considered, comp_rows, comp_new, comp_sunset = compact_resources(
+                        snapshot={"resources": live_resources},
+                        data_dir=simple_table.data_dir,
+                        compression_level=compression_level,
+                        table_config=table_config,
+                        small_only=True,
+                    )
+                    if comp_new or comp_sunset:
+                        sunset_files |= comp_sunset
+                        # A file written above (incoming or tombstone survivor)
+                        # may have been re-merged here; drop any new_resources
+                        # entry that is now sunset so the snapshot never lists a
+                        # file as both live and gone.
+                        new_resources = [
+                            r for r in (new_resources + comp_new)
+                            if r.get("file") not in sunset_files
+                        ]
+                        compaction_ran = True
+                        logger.info(lp(
+                            f"auto-compaction merged {considered} small files "
+                            f"into {len(comp_new)} file(s) ({comp_rows} rows)"
+                        ))
+                mark("compact_small")
 
                 # 6. Carry forward + extend the external column-statistics parquet.
                 #    Read the footers of the newly written data files, drop the
@@ -614,7 +678,18 @@ class DataWriter:
                 # model_df would shrink schema / schemaString to that partial
                 # shape even though all parquet files still have full schema.
                 # See docs/03_data_model.md "Schema Field Semantics".
-                schema_model_df = None if delete_only else dataframe
+                #
+                # When auto-compaction merged files this write, derive the
+                # schema from the compacted output instead: a merged file may
+                # union in columns from older files that the incoming frame
+                # lacks (schema-evolving tables), so `dataframe` would narrow
+                # the metadata even though the Parquet is wider.
+                if compaction_ran:
+                    schema_model_df = self._build_compact_model_df(
+                        new_resources, last_simple_table
+                    )
+                else:
+                    schema_model_df = None if delete_only else dataframe
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
                     new_resources, sunset_files, schema_model_df,
                     last_snapshot=last_simple_table,
@@ -720,7 +795,7 @@ class DataWriter:
                         f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
                         f"overlap={timings.get('overlap', 0):.3f} | stats_prune={timings.get('stats_prune', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
                         f"identify_deletes={timings.get('identify_deletes', 0):.3f} | write_parquet={timings.get('write_parquet', 0):.3f} | "
-                        f"build_tombstone={timings.get('build_tombstone', 0):.3f} | compact_tombstones={timings.get('compact_tombstones', 0):.3f} | build_stats={timings.get('build_stats', 0):.3f} | "
+                        f"build_tombstone={timings.get('build_tombstone', 0):.3f} | compact_tombstones={timings.get('compact_tombstones', 0):.3f} | compact_small={timings.get('compact_small', 0):.3f} | build_stats={timings.get('build_stats', 0):.3f} | "
                         f"update_simple={timings.get('update_simple', 0):.3f} | bump_root={timings.get('bump_root', 0):.3f} | "
                         f"mirror={timings.get('mirror', 0):.3f} | prepare_monitor={timings.get('prepare_monitor', 0):.3f}"
                     )
