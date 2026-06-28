@@ -65,7 +65,9 @@ class _FakeStorage:
     def read_bytes(self, path: str) -> bytes:
         return self.store[path]
 
-    def read_parquet(self, path: str):
+    def read_parquet(self, path: str, columns=None):
+        # columns is a projection hint; reading full here is correct (callers
+        # select the subset they need) and avoids errors on heterogeneous files.
         return pq.read_table(io.BytesIO(self.store[path]))
 
     def size(self, path: str) -> int:

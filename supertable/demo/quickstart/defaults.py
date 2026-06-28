@@ -14,7 +14,9 @@ from enum import Enum
 
 from supertable.config import defaults
 
-logging.getLogger("supertable").setLevel(logging.INFO)
+# Follow the configured SUPERTABLE_LOG_LEVEL (resolved in supertable.config.defaults)
+# instead of hard-pinning INFO, so DEBUG surfaces the detailed write step[...] logs.
+logging.getLogger("supertable").setLevel(defaults.default.LOG_LEVEL)
 
 defaults.default.IS_SHOW_TIMING = True
 

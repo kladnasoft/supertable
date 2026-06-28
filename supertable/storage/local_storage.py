@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import time
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from supertable.config.homedir import app_home
 from supertable.storage.storage_interface import StorageInterface
@@ -187,13 +187,13 @@ class LocalStorage(StorageInterface):
 
         pq.write_table(table, path)
 
-    def read_parquet(self, path: str) -> pa.Table:
+    def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Parquet file not found at: {path}")
 
         try:
-            table = pq.read_table(path)
-            return table
+            proj = self._project_columns(pq.read_schema(path).names, columns) if columns else None
+            return pq.read_table(path, columns=proj) if proj else pq.read_table(path)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
 

@@ -311,7 +311,7 @@ class GCSStorage(StorageInterface):
         blob = self.bucket.blob(path)
         blob.upload_from_string(data, content_type="application/octet-stream")
 
-    def read_parquet(self, path: str) -> pa.Table:
+    def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         """
         Reads and returns a PyArrow Table.
         """
@@ -322,7 +322,12 @@ class GCSStorage(StorageInterface):
         data = blob.download_as_bytes()
         if not data:
             raise ValueError(f"File is empty: {path}")
-        return pq.read_table(io.BytesIO(data))
+        buf = io.BytesIO(data)
+        proj = None
+        if columns:
+            proj = self._project_columns(pq.read_schema(buf).names, columns)
+            buf.seek(0)
+        return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
 
     # -------------------------
     # Raw bytes / text

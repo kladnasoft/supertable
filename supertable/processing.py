@@ -225,6 +225,7 @@ def _read_parquet_safe(
         path: str,
         profiler: Optional[Profiler] = None,
         file_size: int = 0,
+        columns: Optional[List[str]] = None,
 ) -> Optional[polars.DataFrame]:
     p = profiler or get_null_profiler()
     if not _safe_exists(path, profiler=p):
@@ -232,7 +233,13 @@ def _read_parquet_safe(
         return None
     try:
         with p.span("io.read_parquet"):
-            tbl = _get_storage().read_parquet(path)  # -> pyarrow.Table
+            # Project to *columns* when given so only those column chunks are
+            # read (memory-bound fallback); gated so storages/test doubles that
+            # only accept ``path`` keep working on the unprojected paths.
+            tbl = (
+                _get_storage().read_parquet(path, columns=columns)
+                if columns else _get_storage().read_parquet(path)
+            )  # -> pyarrow.Table
         with p.span("io.arrow_to_polars"):
             df = polars.from_arrow(tbl)
         p.add("files_read", 1)
@@ -627,11 +634,12 @@ def _write_single_parquet_file(
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
-    # Ensure target directory exists (no-op on object storage)
+    # Ensure the target directory exists.  makedirs is idempotent on local
+    # storage and a no-op on object storage; calling it directly avoids a
+    # pointless prefix HEAD (which always 404s) on object stores.
     with p.span("write.ensure_dir"):
         try:
-            if not _get_storage().exists(target_dir):
-                _get_storage().makedirs(target_dir)
+            _get_storage().makedirs(target_dir)
         except Exception:
             pass
 
@@ -728,6 +736,7 @@ def filter_stale_incoming_rows(
         newer_than_col: str,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
+        read_columns: Optional[List[str]] = None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -762,7 +771,7 @@ def filter_stale_incoming_rows(
     # Read and collect relevant rows from overlapping files
     existing_parts: List[polars.DataFrame] = []
     for file_path, file_size in overlap_true_files:
-        part = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
+        part = _read_parquet_safe(file_path, profiler=p, file_size=file_size, columns=read_columns)
         if part is None:
             continue
         # Cache the full DataFrame for downstream reuse (avoids double-read)
@@ -880,6 +889,7 @@ def identify_deleted_rowids(
         overwrite_columns: List[str],
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
+        read_columns: Optional[List[str]] = None,
 ) -> List[Tuple[str, int]]:
     """Find the ``(file, __rowid__)`` pairs of existing rows matching a delete predicate.
 
@@ -911,7 +921,7 @@ def identify_deleted_rowids(
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.get(file)
         else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
+            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size, columns=read_columns)
         if existing_df is None:
             continue
         if ROWID_COL not in existing_df.columns:
@@ -1110,6 +1120,10 @@ def _duckdb_probe_overlap_matches(
             f"filename=TRUE, hive_partitioning=FALSE) AS src "
             f"SEMI JOIN {ik_name} AS k ON {join_cond}"
         )
+        logging.debug(
+            f"[write-probe] duckdb scan: {len(paths)} file(s), "
+            f"project={select_cols}, semi-join on {incoming_keys.height} key(s)"
+        )
         with p.span("io.duckdb_probe"):
             return con.execute(sql).pl()
 
@@ -1168,6 +1182,11 @@ def _duckdb_probe_overlap_matches(
         return None
     p.add("probe_files", len(duck_paths))
     p.add("probe_rows_matched", int(matched.height))
+    logging.debug(
+        f"[write-probe] duckdb scan matched {matched.height} existing row(s) "
+        f"across {len(duck_paths)} file(s) (only key/__rowid__ columns read, "
+        f"row groups skipped by footer min/max)"
+    )
     return matched
 
 
@@ -1273,6 +1292,11 @@ def resolve_overwrite_writes(
         return incoming_df, []
 
     incoming_keys = incoming_df.select(overwrite_columns).unique()
+    logging.debug(
+        f"[write-probe] resolve: {len(overlap_true)} overlapping file(s), "
+        f"{incoming_keys.height} unique incoming key(s) on {overwrite_columns}, "
+        f"newer_than={newer_than_col}"
+    )
     matched = _duckdb_probe_overlap_matches(
         overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
     )
@@ -1286,6 +1310,19 @@ def resolve_overwrite_writes(
 
     # ---- Fallback: original polars full-read path (semantics oracle) ----
     p.add("overwrite_resolve_fallback", 1)
+    # Project reads to only the columns the fallback consumes — overwrite keys
+    # (+ newer-than for stale filtering) + __rowid__ (for the delete vector) —
+    # so wide tables are not fully materialised into memory.  The shared
+    # file_cache holds this projected union; each consumer selects its subset.
+    read_columns = list(dict.fromkeys(
+        list(overwrite_columns)
+        + ([newer_than_col] if newer_than_col else [])
+        + [ROWID_COL]
+    ))
+    logging.debug(
+        f"[write-probe] polars full-read fallback over {len(overlap_true)} file(s), "
+        f"reading only {read_columns}"
+    )
     file_cache: Dict[str, polars.DataFrame] = {}
     if newer_than_col:
         filtered = filter_stale_incoming_rows(
@@ -1295,12 +1332,13 @@ def resolve_overwrite_writes(
             newer_than_col=newer_than_col,
             file_cache=file_cache,
             profiler=p,
+            read_columns=read_columns,
         )
     else:
         filtered = incoming_df
     pairs = identify_deleted_rowids(
         filtered, overlapping_files, overwrite_columns,
-        file_cache=file_cache, profiler=p,
+        file_cache=file_cache, profiler=p, read_columns=read_columns,
     )
     return filtered, pairs
 
@@ -1354,8 +1392,8 @@ def build_tombstone_file(
     combined = combined.unique(subset=[ROWID_COL], keep="first")
 
     try:
-        if not _get_storage().exists(tombstone_dir):
-            _get_storage().makedirs(tombstone_dir)
+        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
+        _get_storage().makedirs(tombstone_dir)
     except Exception:
         pass
 
@@ -1418,8 +1456,8 @@ def reclaim_fully_dead_files(
         return fully_dead, None, None
 
     try:
-        if not _get_storage().exists(tombstone_dir):
-            _get_storage().makedirs(tombstone_dir)
+        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
+        _get_storage().makedirs(tombstone_dir)
     except Exception:
         pass
 
@@ -1688,8 +1726,8 @@ def build_stats_file(
         combined = new_df
 
     try:
-        if not _get_storage().exists(stats_dir):
-            _get_storage().makedirs(stats_dir)
+        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
+        _get_storage().makedirs(stats_dir)
     except Exception:
         pass
 

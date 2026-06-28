@@ -327,7 +327,7 @@ class MinioStorage(StorageInterface):
             content_type="application/octet-stream",
         )
 
-    def read_parquet(self, path: str) -> pa.Table:
+    def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         path = self._with_base(path)
         try:
             data = self._get_object_safe(path)
@@ -336,7 +336,12 @@ class MinioStorage(StorageInterface):
                 raise FileNotFoundError(f"Parquet file not found: {path}") from e
             raise
         try:
-            return pq.read_table(io.BytesIO(data))
+            buf = io.BytesIO(data)
+            proj = None
+            if columns:
+                proj = self._project_columns(pq.read_schema(buf).names, columns)
+                buf.seek(0)
+            return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
 

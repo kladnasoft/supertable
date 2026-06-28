@@ -107,12 +107,31 @@ class StorageInterface(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def read_parquet(self, path: str) -> pa.Table:
+    def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         """
         Reads and returns a PyArrow Table from the given Parquet path.
-        Raises FileNotFoundError, ValueError, etc. on error.
+
+        When *columns* is given, only those columns are read (projection is
+        pushed down to the parquet reader so other column chunks are skipped);
+        ``None`` reads every column.  Raises FileNotFoundError, ValueError, etc.
+        on error.
         """
         pass
+
+    @staticmethod
+    def _project_columns(available, columns: Optional[List[str]]) -> Optional[List[str]]:
+        """Intersect requested *columns* with those *available* in the file.
+
+        Parquet files within one table can carry heterogeneous schemas, so a
+        requested column a given file lacks is silently dropped rather than
+        raising a binder error.  Returns the projection list to hand the parquet
+        reader, or ``None`` to read every column (nothing requested, or none of
+        the requested columns exist in this file).
+        """
+        if not columns:
+            return None
+        present = [c for c in columns if c in set(available)]
+        return present or None
 
     # -------------------------
     # Byte / text / copy operations

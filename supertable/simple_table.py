@@ -128,19 +128,10 @@ class SimpleTable:
         self.data_dir = os.path.join(self.simple_dir, "data")
         self.snapshot_dir = os.path.join(self.simple_dir, "snapshots")
 
-        logger.debug(f"simple_dir: {self.simple_dir}")
-        logger.debug(f"data_dir: {self.data_dir}")
-        logger.debug(f"snapshot_dir: {self.snapshot_dir}")
-
         # Fast path: if meta:leaf exists, don't touch storage
         if self.catalog.leaf_exists(
                 self.super_table.organization, self.super_table.super_name, self.simple_name
         ):
-            logger.debug(
-                f"[SimpleTable] Leaf exists in Redis for "
-                f"{self.super_table.organization}/{self.super_table.super_name}/{self.simple_name}; "
-                f"skipping storage mkdirs and bootstrap."
-            )
             return
 
         # Read-only opt-out: refuse to bootstrap as a side effect. The

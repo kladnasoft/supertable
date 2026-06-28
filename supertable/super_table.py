@@ -7,7 +7,6 @@ from typing import Dict, Any
 
 # never remove the homedir, it is mandatory be there
 from supertable.config.homedir import app_home
-from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import SuperTableNotFoundError
@@ -69,14 +68,9 @@ class SuperTable:
 
         # Directories for data layout (still used for heavy JSON & data files)
         self.super_dir = os.path.join(self.organization, self.super_name, self.identity)
-        logger.debug(f"super_dir: {self.super_dir}")
 
         # Fast path: if meta:root exists, don't touch storage
         if self.catalog.root_exists(self.organization, self.super_name):
-            logger.debug(
-                f"[SuperTable] Root exists in Redis for {self.organization}/{self.super_name}; "
-                f"skipping storage mkdirs."
-            )
             return
 
         # Read-only opt-out: refuse to bootstrap as a side effect. This

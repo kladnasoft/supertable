@@ -94,12 +94,13 @@ class FakeStorage:
     def write_bytes(self, path: str, data: bytes):
         self._files[path] = data
 
-    def read_parquet(self, path: str) -> pa.Table:
+    def read_parquet(self, path: str, columns=None) -> pa.Table:
         import io
         import pyarrow.parquet as pq
         raw = self._files.get(path)
         if raw is None:
             raise FileNotFoundError(path)
+        # columns is a projection hint; reading full is correct here.
         return pq.read_table(io.BytesIO(raw))
 
 
