@@ -457,6 +457,9 @@ class TestExecuteTombstoneResolution:
             reflection.tombstone_views["t"].tombstone_path
             == f"https://signed/{raw_tomb_key}"
         )
+        # cache_key is the BARE (pre-presign) key — stable across appends,
+        # so the DuckDB DV-table cache keys on it, not the rotating URL.
+        assert reflection.tombstone_views["t"].cache_key == raw_tomb_key
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -507,6 +510,8 @@ class TestExecuteTombstoneResolution:
         dr.execute("admin", engine=engine.AUTO)
 
         assert reflection.tombstone_views["t"].tombstone_path == raw_tomb_key
+        # LOCAL: no presign, so cache_key equals the (also unchanged) path.
+        assert reflection.tombstone_views["t"].cache_key == raw_tomb_key
 
 
 # ====================================================================

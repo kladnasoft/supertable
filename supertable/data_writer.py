@@ -26,6 +26,7 @@ from supertable.processing import (
     resolve_overwrite_writes,
     identify_all_rowids,
     build_tombstone_file,
+    reclaim_fully_dead_files,
     build_stats_file,
     extract_stats_rows,
     probe_ranges_from_df,
@@ -472,6 +473,17 @@ class DataWriter:
                 new_resources = []
                 sunset_files = set()
 
+                # Load the current deletion-vector once: used both to exclude
+                # already-tombstoned rows from this write's deletes (below) and,
+                # via prev_df, to extend the vector without a second read.
+                prev_dv_df = (
+                    _read_parquet_safe(prev_tombstone_path, profiler=profiler)
+                    if prev_tombstone_path else None
+                )
+                prev_dv_rowids = set()
+                if prev_dv_df is not None and "__rowid__" in prev_dv_df.columns:
+                    prev_dv_rowids = set(prev_dv_df.get_column("__rowid__").to_list())
+
                 # 1. Identify which existing rows this write deletes/replaces.
                 #    overwrite_columns drives the anti-join key (delete + upsert);
                 #    pure appends (no overwrite_columns) tombstone nothing.  The
@@ -487,6 +499,20 @@ class DataWriter:
                         file_cache=file_cache,
                         profiler=profiler,
                     )
+
+                # Never re-tombstone rows already in the deletion-vector.  The
+                # overlap probe (and identify_all_rowids) scan the *physical*
+                # files, which still hold logically-deleted rows until
+                # compaction; without this filter every write re-counts those
+                # already-dead rows — inflating ``deleted`` and forcing a
+                # needless tombstone rewrite even when nothing live was removed.
+                # Excluding them makes ``deleted`` the true count of live rows
+                # removed and lets unchanged writes carry the vector forward.
+                if new_delete_pairs and prev_dv_rowids:
+                    new_delete_pairs = [
+                        (f, rid) for (f, rid) in new_delete_pairs
+                        if rid not in prev_dv_rowids
+                    ]
                 deleted = len(new_delete_pairs)
                 mark("identify_deletes")
 
@@ -515,6 +541,7 @@ class DataWriter:
                     new_pairs=new_delete_pairs,
                     compression_level=compression_level,
                     profiler=profiler,
+                    prev_df=prev_dv_df,
                 )
 
                 # Track the live deletion-vector row count so meta reads can
@@ -528,6 +555,38 @@ class DataWriter:
                 )
                 mark("build_tombstone")
 
+                # 3b. Eager reclamation of fully-dead files.  Any existing data
+                #     file whose every physical row is now tombstoned is 100%
+                #     dead: drop it from the snapshot for free (no rewrite) and
+                #     remove its rowids from the vector.  Without this, fully
+                #     deleted files linger until the compaction threshold,
+                #     bloating the snapshot and getting re-scanned by every later
+                #     overwrite probe.  Only runs when the vector changed this
+                #     write (combined_tombstone_df is not None) — a carry-forward
+                #     can create no newly-dead file.
+                if combined_tombstone_df is not None:
+                    reclaimed_files, reclaimed_tomb_path, reclaimed_dv = (
+                        reclaim_fully_dead_files(
+                            resources=last_simple_table.get("resources") or [],
+                            combined_dv=combined_tombstone_df,
+                            tombstone_dir=tombstone_dir,
+                            compression_level=compression_level,
+                            profiler=profiler,
+                        )
+                    )
+                    if reclaimed_files:
+                        sunset_files |= reclaimed_files
+                        tombstone_path = reclaimed_tomb_path
+                        combined_tombstone_df = reclaimed_dv
+                        tombstone_rows = (
+                            reclaimed_dv.height if reclaimed_dv is not None else 0
+                        )
+                        logger.info(lp(
+                            f"reclaimed {len(reclaimed_files)} fully-deleted "
+                            f"file(s); deletion-vector now {tombstone_rows} rows"
+                        ))
+                mark("reclaim_dead_files")
+
                 # 4. Threshold compaction (two triggers, same physical step):
                 #      (a) the deletion-vector grew past max_tombstone_rows, or
                 #      (b) the small files tripped the auto-compaction gate.
@@ -538,7 +597,9 @@ class DataWriter:
                 #    rows (hidden on read, never reclaimable).  Draining first
                 #    guarantees Phase B only ever sees vector-free survivors.
                 post_write_resources = (
-                    (last_simple_table.get("resources") or []) + new_resources
+                    [r for r in (last_simple_table.get("resources") or [])
+                     if r.get("file") not in sunset_files]
+                    + new_resources
                 )
                 compaction_gate = should_compact_small_files(
                     post_write_resources, table_config
@@ -554,9 +615,17 @@ class DataWriter:
                 if tombstone_threshold_hit or compaction_gate:
                     dv_to_drain = combined_tombstone_df
                     if dv_to_drain is None and tombstone_path:
-                        # Pure carry-forward: load the live vector so the merge
-                        # below never sunsets a file it still references.
-                        dv_to_drain = _read_parquet_safe(tombstone_path, profiler=profiler)
+                        # Pure carry-forward: the pointer is unchanged, so the
+                        # live vector is exactly the one already loaded at the
+                        # top of this block — reuse it instead of a second
+                        # storage read (fall back to a read only if it wasn't
+                        # loaded, which shouldn't happen when tombstone_path is
+                        # set, but stays correct if it ever does).
+                        dv_to_drain = (
+                            prev_dv_df
+                            if prev_dv_df is not None
+                            else _read_parquet_safe(tombstone_path, profiler=profiler)
+                        )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
                         removed, tomb_new, tomb_sunset = compact_tombstones(
                             snapshot=last_simple_table,

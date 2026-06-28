@@ -33,6 +33,7 @@ from supertable.data_classes import (
     RbacViewDef,
     SuperSnapshot,
     TableDefinition,
+    TombstoneDef,
 )
 
 
@@ -63,11 +64,16 @@ from supertable.engine.engine_common import (
     make_presigned_list,
     rewrite_query_with_hashed_tables,
     init_connection,
+    new_duckdb_connection,
     create_rbac_view,
     rbac_view_name,
     create_reflection_table,
     create_reflection_table_with_presign_retry,
     configure_httpfs_and_s3,
+    create_tombstone_view,
+    TombstoneCache,
+    dv_table_name,
+    dv_table_id,
 )
 from supertable.engine.data_estimator import DataEstimator, get_missing_columns
 from supertable.engine.engine_enum import Engine
@@ -471,6 +477,220 @@ class TestInitConnection:
         result = duckdb_con.execute("SELECT 1 AS val").fetchdf()
         assert result["val"][0] == 1
 
+    def test_pins_home_directory_to_app_home(self, duckdb_con, tmp_path):
+        # The write-side probe failed in production with "Can't find the home
+        # directory at '/home/app'" under a restricted user.  init_connection
+        # must pin DuckDB's home_directory to the app home, which is created and
+        # writable at import time, so home-dependent ops never touch the OS home.
+        from supertable.config.homedir import get_app_home
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        home = duckdb_con.execute(
+            "SELECT current_setting('home_directory')"
+        ).fetchone()[0]
+        assert home == get_app_home()
+        assert os.path.isdir(home)
+
+
+# ═══════════════════════════════════════════════════════════
+#  engine_common — read/write DuckDB parity
+# ═══════════════════════════════════════════════════════════
+
+# Settings that must be identical between the read executors and the write-side
+# probe so both paths configure DuckDB the same way (and never fall back to the
+# OS home directory).
+_PARITY_SETTINGS = (
+    "home_directory",
+    "temp_directory",
+    "memory_limit",
+    "threads",
+    "default_collation",
+    "preserve_insertion_order",
+)
+
+
+def _duckdb_settings_snapshot(con):
+    snap = {}
+    for name in _PARITY_SETTINGS:
+        snap[name] = con.execute(
+            f"SELECT current_setting('{name}')"
+        ).fetchone()[0]
+    return snap
+
+
+class TestReadWriteDuckDBParity:
+    """Read (DuckDBLite) and write (probe via new_duckdb_connection) must
+    configure DuckDB identically — same pragmas, same pinned home directory."""
+
+    def test_helper_matches_read_executor_settings(self, tmp_path):
+        lite = DuckDBLite(storage=None)
+        con_read = lite._get_connection(temp_dir=str(tmp_path))
+        con_write = new_duckdb_connection(temp_dir=str(tmp_path))
+        try:
+            read_snap = _duckdb_settings_snapshot(con_read)
+            write_snap = _duckdb_settings_snapshot(con_write)
+            assert read_snap == write_snap
+            # Never the OS home (which may be missing under a restricted user).
+            assert os.path.isdir(read_snap["home_directory"])
+        finally:
+            try:
+                con_write.close()
+            except Exception:
+                pass
+            try:
+                con_read.close()
+            except Exception:
+                pass
+
+    def test_helper_loads_httpfs_only_for_remote_paths(self, tmp_path, monkeypatch):
+        calls = []
+        real = _engine_common.configure_httpfs_and_s3
+        monkeypatch.setattr(
+            _engine_common,
+            "configure_httpfs_and_s3",
+            lambda con, paths: calls.append(list(paths)) or real(con, paths),
+        )
+        # Local-only paths: helper must NOT load httpfs.
+        con_local = new_duckdb_connection(
+            temp_dir=str(tmp_path), for_paths=[str(tmp_path / "f.parquet")]
+        )
+        con_local.close()
+        assert calls == []
+
+    def test_probe_uses_shared_connection_constructor(self, tmp_path, monkeypatch):
+        # The probe must build its connection via new_duckdb_connection so it
+        # inherits the read path's init_connection setup (home_directory pin).
+        import polars
+        from supertable import processing as _processing
+
+        monkeypatch.setattr(_processing, "_get_storage", lambda: object())
+
+        f1 = str(tmp_path / "f1.parquet")
+        polars.DataFrame({"__rowid__": [10, 20], "id": [1, 2]}).write_parquet(f1)
+
+        calls = []
+        real = _engine_common.new_duckdb_connection
+
+        def spy(*a, **k):
+            calls.append((a, k))
+            return real(*a, **k)
+
+        monkeypatch.setattr(_engine_common, "new_duckdb_connection", spy)
+
+        out = _processing._duckdb_probe_overlap_matches(
+            overlap_true_files=[(f1, 0)],
+            overwrite_columns=["id"],
+            newer_than_col=None,
+            incoming_keys=polars.DataFrame({"id": [2]}),
+        )
+        assert out is not None
+        assert len(calls) == 1
+        # for_paths forwarded so httpfs is loaded for remote scans.
+        assert "for_paths" in calls[0][1]
+
+    def test_probe_matches_rows_on_local_parquet(self, tmp_path, monkeypatch):
+        import polars
+        from supertable import processing as _processing
+
+        monkeypatch.setattr(_processing, "_get_storage", lambda: object())
+
+        f1 = str(tmp_path / "f1.parquet")
+        f2 = str(tmp_path / "f2.parquet")
+        polars.DataFrame({"__rowid__": [10, 20], "id": [1, 2]}).write_parquet(f1)
+        polars.DataFrame({"__rowid__": [30, 40], "id": [3, 4]}).write_parquet(f2)
+
+        out = _processing._duckdb_probe_overlap_matches(
+            overlap_true_files=[(f1, 0), (f2, 0)],
+            overwrite_columns=["id"],
+            newer_than_col=None,
+            incoming_keys=polars.DataFrame({"id": [2, 3, 99]}),
+        )
+        assert out is not None
+        assert set(out.get_column("id").to_list()) == {2, 3}
+        assert set(out.get_column("__rowid__").to_list()) == {20, 30}
+        assert "__file__" in out.columns
+        assert set(out.get_column("__file__").to_list()) == {f1, f2}
+
+    # ── S3 presigning parity (DuckDB cannot read private S3 unsigned) ──
+
+    def test_resolver_presigns_only_when_flag_set(self, monkeypatch):
+        # _storage_duckdb_path mirrors DataEstimator._to_duckdb_path: presign the
+        # bare key only when SUPERTABLE_DUCKDB_PRESIGNED is on (or forced).
+        from supertable import processing as _processing
+
+        class _S3Stub:
+            def presign(self, key, expiry_seconds=3600):
+                return f"https://signed/{key}?sig=abc"
+
+            def to_duckdb_path(self, key):
+                return f"s3://bucket/{key}"
+
+        # Force the flag OFF (the repo .env turns it on) so this branch is
+        # deterministic regardless of ambient config.
+        monkeypatch.setattr(
+            _processing, "settings",
+            _dc_replace(_processing.settings, SUPERTABLE_DUCKDB_PRESIGNED=False),
+        )
+        stub = _S3Stub()
+        # Flag off → object-store URL via to_duckdb_path, NOT presigned.
+        assert _processing._storage_duckdb_path(stub, "data/f.parquet") == (
+            "s3://bucket/data/f.parquet"
+        )
+        # force_presign=True → signed URL (the reactive-retry path).
+        assert _processing._storage_duckdb_path(
+            stub, "data/f.parquet", force_presign=True
+        ) == "https://signed/data/f.parquet?sig=abc"
+        # A value already a URL is never presigned (presign takes a key).
+        assert _processing._storage_duckdb_path(
+            stub, "s3://bucket/x.parquet", force_presign=True
+        ) == "s3://bucket/x.parquet"
+
+    def test_resolver_presigns_when_global_flag_enabled(self, monkeypatch):
+        from supertable import processing as _processing
+
+        class _S3Stub:
+            def presign(self, key, expiry_seconds=3600):
+                return f"https://signed/{key}"
+
+        monkeypatch.setattr(
+            _processing, "settings",
+            _dc_replace(_processing.settings, SUPERTABLE_DUCKDB_PRESIGNED=True),
+        )
+        assert _processing._storage_duckdb_path(_S3Stub(), "data/f.parquet") == (
+            "https://signed/data/f.parquet"
+        )
+
+    def test_probe_presigns_keys_and_maps_back_to_storage_key(self, tmp_path, monkeypatch):
+        # End-to-end: with presigning enabled the probe scans the SIGNED path but
+        # __file__ must still resolve back to the original (bare) storage key, so
+        # tombstones store keys, not transient signed URLs.
+        import polars
+        from supertable import processing as _processing
+
+        real_file = str(tmp_path / "real.parquet")
+        polars.DataFrame({"__rowid__": [10, 20], "id": [1, 2]}).write_parquet(real_file)
+
+        class _S3Stub:
+            def presign(self, key, expiry_seconds=3600):
+                # Pretend the bare key signs to a readable URL (here a local file).
+                return real_file
+
+        monkeypatch.setattr(_processing, "_get_storage", lambda: _S3Stub())
+        monkeypatch.setattr(
+            _processing, "settings",
+            _dc_replace(_processing.settings, SUPERTABLE_DUCKDB_PRESIGNED=True),
+        )
+
+        bare_key = "bucket/data/f1.parquet"
+        out = _processing._duckdb_probe_overlap_matches(
+            overlap_true_files=[(bare_key, 0)],
+            overwrite_columns=["id"],
+            newer_than_col=None,
+            incoming_keys=polars.DataFrame({"id": [2]}),
+        )
+        assert out is not None
+        assert out.get_column("__file__").to_list() == [bare_key]
+        assert out.get_column("__rowid__").to_list() == [20]
+
 
 # ═══════════════════════════════════════════════════════════
 #  engine_common — RBAC views
@@ -503,6 +723,309 @@ class TestCreateRbacView:
         df = duckdb_con.execute("SELECT * FROM rbac_v2").fetchdf()
         assert len(df) == 1
         assert list(df.columns) == ["id", "name"]
+
+
+# ═══════════════════════════════════════════════════════════
+#  engine_common — create_tombstone_view (inline vs cached DV)
+# ═══════════════════════════════════════════════════════════
+
+
+def _make_tomb_source(con, table: str) -> None:
+    """Source reflection table with system columns + 4 user rows."""
+    con.execute(
+        f'CREATE TABLE {table} '
+        f'(id INTEGER, name VARCHAR, "__rowid__" BIGINT, "__timestamp__" BIGINT)'
+    )
+    con.execute(
+        f"INSERT INTO {table} VALUES "
+        f"(1,'a',10,100),(2,'b',20,100),(3,'c',30,100),(4,'d',40,100)"
+    )
+
+
+def _write_dv_parquet(con, path: str, rowids) -> None:
+    """Write a deletion-vector parquet of the given __rowid__ values."""
+    values = ",".join(f"({r})" for r in rowids)
+    con.execute(
+        f'COPY (SELECT * FROM (VALUES {values}) AS t("__rowid__")) '
+        f"TO '{path}' (FORMAT PARQUET)"
+    )
+
+
+class TestCreateTombstoneView:
+
+    def test_strips_system_columns_no_tombstone(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        _make_tomb_source(duckdb_con, "src_a")
+        create_tombstone_view(duckdb_con, "src_a", "tv_a", None)
+        df = duckdb_con.execute("SELECT * FROM tv_a ORDER BY id").fetchdf()
+        assert "__rowid__" not in df.columns
+        assert "__timestamp__" not in df.columns
+        assert df["id"].tolist() == [1, 2, 3, 4]
+
+    def test_inline_path_applies_deletion_vector(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        _make_tomb_source(duckdb_con, "src_b")
+        dv = str(tmp_path / "dv_b.parquet")
+        _write_dv_parquet(duckdb_con, dv, [20, 40])
+        tomb = TombstoneDef(tombstone_path=dv, cache_key="bare/b")
+        # dv_table=None → inline read_parquet anti-join
+        create_tombstone_view(duckdb_con, "src_b", "tv_b", tomb, dv_table=None)
+        df = duckdb_con.execute("SELECT * FROM tv_b ORDER BY id").fetchdf()
+        assert df["id"].tolist() == [1, 3]
+        assert "__rowid__" not in df.columns
+
+    def test_cached_path_matches_inline_bit_for_bit(self, duckdb_con, tmp_path):
+        # The core correctness guarantee: anti-joining a materialised DV table
+        # is identical to the inline read_parquet subquery.
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        _make_tomb_source(duckdb_con, "src_c")
+        dv = str(tmp_path / "dv_c.parquet")
+        _write_dv_parquet(duckdb_con, dv, [20, 40])
+        tomb = TombstoneDef(tombstone_path=dv, cache_key="bare/c")
+
+        create_tombstone_view(duckdb_con, "src_c", "tv_inline", tomb, dv_table=None)
+        inline = duckdb_con.execute("SELECT * FROM tv_inline ORDER BY id").fetchdf()
+
+        cache = TombstoneCache(capacity=8)
+        dvt = cache.acquire(duckdb_con, tomb.cache_key, tomb.tombstone_path)
+        assert dvt == dv_table_name(tomb.cache_key)
+        create_tombstone_view(duckdb_con, "src_c", "tv_cached", tomb, dv_table=dvt)
+        cached = duckdb_con.execute("SELECT * FROM tv_cached ORDER BY id").fetchdf()
+
+        pd.testing.assert_frame_equal(
+            inline.reset_index(drop=True), cached.reset_index(drop=True)
+        )
+        assert cached["id"].tolist() == [1, 3]
+        assert "__rowid__" not in cached.columns
+        assert "__timestamp__" not in cached.columns
+
+
+# ═══════════════════════════════════════════════════════════
+#  engine_common — TombstoneCache (deletion-vector table cache)
+# ═══════════════════════════════════════════════════════════
+
+
+def _dv_table_exists(con, name: str) -> bool:
+    row = con.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [name]
+    ).fetchone()
+    return row[0] > 0
+
+
+class TestTombstoneCacheUnit:
+
+    # Two versions of the same logical table share a tombstone directory; only
+    # the filename rotates.  These helpers keep that convention explicit.
+    T = "org/super/simple/tombstone"
+    V1 = f"{T}/1000_aa_deleted.parquet"
+    V2 = f"{T}/2000_bb_deleted.parquet"
+    V3 = f"{T}/3000_cc_deleted.parquet"
+
+    @pytest.mark.parametrize("capacity", [0, -1])
+    def test_disabled_returns_none(self, duckdb_con, tmp_path, capacity):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=capacity)
+        assert cache.enabled is False
+        assert cache.acquire(duckdb_con, "k", dv) is None
+        # No table materialised when disabled.
+        assert not _dv_table_exists(duckdb_con, dv_table_name("k"))
+
+    def test_missing_key_or_path_returns_none(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        cache = TombstoneCache(capacity=4)
+        assert cache.acquire(duckdb_con, None, "/p") is None
+        assert cache.acquire(duckdb_con, "k", None) is None
+
+    def test_acquire_materializes_distinct_rowids(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2, 2, 3])  # dup 2
+        cache = TombstoneCache(capacity=4)
+        name = cache.acquire(duckdb_con, self.V1, dv)
+        assert name == dv_table_name(self.V1)
+        assert _dv_table_exists(duckdb_con, name)
+        count = duckdb_con.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+        assert count == 3  # DISTINCT
+        snap = cache.snapshot()
+        assert len(snap) == 1 and snap[0]["ref_count"] == 1
+
+    def test_hit_reuses_single_entry_and_refcounts(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=4)
+        n1 = cache.acquire(duckdb_con, self.V1, dv)
+        n2 = cache.acquire(duckdb_con, self.V1, dv)
+        assert n1 == n2
+        snap = cache.snapshot()
+        assert len(snap) == 1 and snap[0]["ref_count"] == 2
+
+    def test_release_decrements(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1])
+        # Non-zero TTL with a fixed clock so the entry survives at ref_count 0
+        # (ttl<=0 would drop it the instant it becomes unreferenced).
+        cache = TombstoneCache(capacity=4, ttl_seconds=300, time_fn=lambda: 1000.0)
+        cache.acquire(duckdb_con, self.V1, dv)
+        cache.acquire(duckdb_con, self.V1, dv)
+        cache.release(duckdb_con, self.V1)
+        assert cache.snapshot()[0]["ref_count"] == 1
+        cache.release(duckdb_con, self.V1)
+        assert cache.snapshot()[0]["ref_count"] == 0
+
+    # ── table identity ────────────────────────────────────────────
+
+    def test_dv_table_id_groups_versions_by_directory(self):
+        assert dv_table_id(self.V1) == self.T
+        assert dv_table_id(self.V2) == self.T
+        assert dv_table_id(self.V1) == dv_table_id(self.V2)
+        # Different tables → different ids.
+        assert dv_table_id("other/tombstone/x.parquet") != self.T
+        # No separator → key groups alone (cap relaxed for it, never wrong).
+        assert dv_table_id("bare") == "bare"
+
+    # ── idle TTL (refreshed on access) ────────────────────────────
+
+    def test_acquire_sets_idle_ttl(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=4, ttl_seconds=300, time_fn=lambda: 1000.0)
+        cache.acquire(duckdb_con, self.V1, dv)
+        assert cache.snapshot()[0]["expires_at"] == 1000.0 + 300
+
+    def test_idle_entry_survives_within_ttl(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        clock = [1000.0]
+        cache = TombstoneCache(capacity=8, ttl_seconds=300, time_fn=lambda: clock[0])
+        cache.acquire(duckdb_con, self.V1, dv)
+        cache.release(duckdb_con, self.V1)       # expires at 1300
+        clock[0] = 1299.0
+        # Another table's activity triggers a sweep without touching V1.
+        other = "other/tombstone/1_x.parquet"
+        cache.acquire(duckdb_con, other, dv); cache.release(duckdb_con, other)
+        assert _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+
+    def test_idle_entry_evicted_after_ttl_even_if_only_version(self, duckdb_con, tmp_path):
+        # The user's rule: every table gets a TTL; the latest/only version is
+        # dropped too once the table goes unqueried for the window.
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        clock = [1000.0]
+        cache = TombstoneCache(capacity=8, ttl_seconds=300, time_fn=lambda: clock[0])
+        cache.acquire(duckdb_con, self.V1, dv)
+        cache.release(duckdb_con, self.V1)       # expires at 1300
+        clock[0] = 1301.0                        # past the window
+        other = "other/tombstone/1_x.parquet"
+        cache.acquire(duckdb_con, other, dv); cache.release(duckdb_con, other)
+        assert not _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert {e["cache_key"] for e in cache.snapshot()} == {other}
+
+    def test_reacquire_refreshes_idle_ttl(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        clock = [1000.0]
+        cache = TombstoneCache(capacity=8, ttl_seconds=300, time_fn=lambda: clock[0])
+        cache.acquire(duckdb_con, self.V1, dv)
+        cache.release(duckdb_con, self.V1)       # expires at 1300
+        clock[0] = 1250.0
+        cache.acquire(duckdb_con, self.V1, dv)   # refresh → expires at 1550
+        cache.release(duckdb_con, self.V1)
+        clock[0] = 1400.0                        # past old deadline, before new
+        other = "other/tombstone/1_x.parquet"
+        cache.acquire(duckdb_con, other, dv); cache.release(duckdb_con, other)
+        assert _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert cache.snapshot()
+        assert {e["cache_key"] for e in cache.snapshot()} >= {self.V1}
+
+    def test_ttl_zero_drops_when_unreferenced(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=8, ttl_seconds=0)
+        cache.acquire(duckdb_con, self.V1, dv)   # pinned → survives
+        assert _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        cache.release(duckdb_con, self.V1)       # unref + ttl 0 → dropped
+        assert not _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert cache.snapshot() == []
+
+    # ── per-table version cap ─────────────────────────────────────
+
+    def test_per_table_cap_keeps_last_n_versions(self, duckdb_con, tmp_path):
+        # 10 rapid rewrites of ONE table under cap=3 → only the last 3
+        # (most-recently-used) versions survive; the rest are dropped.
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=3, ttl_seconds=10_000, time_fn=lambda: 0.0)
+        keys = [f"{self.T}/{i}_x_deleted.parquet" for i in range(10)]
+        for k in keys:
+            cache.acquire(duckdb_con, k, dv)
+            cache.release(duckdb_con, k)
+        kept = {e["cache_key"] for e in cache.snapshot()}
+        assert kept == set(keys[-3:])
+        for k in keys[:-3]:
+            assert not _dv_table_exists(duckdb_con, dv_table_name(k))
+        for k in keys[-3:]:
+            assert _dv_table_exists(duckdb_con, dv_table_name(k))
+
+    def test_per_table_cap_is_isolated_across_tables(self, duckdb_con, tmp_path):
+        # A churny table at its cap must never shrink a slow table's residency:
+        # the cap is counted per table_id, not globally.
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=2, ttl_seconds=10_000, time_fn=lambda: 0.0)
+        slow = "slow/tombstone/1000_x_deleted.parquet"
+        cache.acquire(duckdb_con, slow, dv); cache.release(duckdb_con, slow)
+        fast = [f"fast/tombstone/{i}_y.parquet" for i in range(5)]
+        for k in fast:
+            cache.acquire(duckdb_con, k, dv); cache.release(duckdb_con, k)
+        kept = {e["cache_key"] for e in cache.snapshot()}
+        assert slow in kept                                  # slow untouched
+        assert _dv_table_exists(duckdb_con, dv_table_name(slow))
+        assert len({k for k in kept if k.startswith("fast")}) == 2  # fast capped
+
+    def test_pinned_over_cap_not_dropped_until_released(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=1, ttl_seconds=10_000, time_fn=lambda: 0.0)
+        cache.acquire(duckdb_con, self.V1, dv)   # pinned (ref 1)
+        cache.acquire(duckdb_con, self.V2, dv)   # over cap but V1 pinned
+        assert _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert _dv_table_exists(duckdb_con, dv_table_name(self.V2))
+        cache.release(duckdb_con, self.V1)       # now evictable (LRU) → dropped
+        assert not _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert {e["cache_key"] for e in cache.snapshot()} == {self.V2}
+
+    # ── lifecycle / determinism ───────────────────────────────────
+
+    def test_clear_registry_forgets_without_dropping(self, duckdb_con, tmp_path):
+        init_connection(duckdb_con, temp_dir=str(tmp_path))
+        dv = str(tmp_path / "dv.parquet")
+        _write_dv_parquet(duckdb_con, dv, [1, 2])
+        cache = TombstoneCache(capacity=4)
+        name = cache.acquire(duckdb_con, self.V1, dv)
+        cache.clear_registry()
+        assert cache.snapshot() == []
+        # Table is NOT dropped — connection still owns it.
+        assert _dv_table_exists(duckdb_con, name)
+        # State forgotten: re-acquiring starts fresh.
+        cache.acquire(duckdb_con, self.V1, dv)
+        assert len(cache.snapshot()) == 1
+
+    def test_dv_table_name_deterministic_and_prefixed(self):
+        assert dv_table_name("x") == dv_table_name("x")
+        assert dv_table_name("x").startswith("dv_")
+        assert dv_table_name("x") != dv_table_name("y")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1026,6 +1549,19 @@ class TestDuckDBLite:
         dt = DuckDBLite(storage=MagicMock())
         assert dt.storage is not None
 
+    def test_init_builds_tombstone_cache_from_settings(self):
+        dt = DuckDBLite()
+        assert dt._tombstone_cache.capacity == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
+        assert dt._tombstone_cache.ttl_seconds == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
+
+    def test_reset_clears_tombstone_cache(self):
+        dt = DuckDBLite()
+        dt._con = MagicMock()
+        dt._tombstone_cache._registry["k"] = MagicMock()
+        dt._reset_connection()
+        assert dt._con is None
+        assert dt._tombstone_cache.snapshot() == []
+
     @patch("supertable.engine.duckdb_lite.duckdb")
     @patch("supertable.engine.duckdb_lite.init_connection")
     @patch("supertable.engine.duckdb_lite.hashed_table_name", return_value="st_abc")
@@ -1089,6 +1625,18 @@ class TestDuckDBPro:
         assert p._con is None
         assert p._httpfs_configured is False
         assert p._registry == {}
+
+    def test_init_builds_tombstone_cache_from_settings(self):
+        p = self._make()
+        assert p._tombstone_cache.capacity == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
+        assert p._tombstone_cache.ttl_seconds == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
+
+    def test_reset_clears_tombstone_cache(self):
+        p = self._make()
+        p._con = MagicMock()
+        p._tombstone_cache._registry["k"] = MagicMock()
+        p._reset_connection()
+        assert p._tombstone_cache.snapshot() == []
 
     @patch("supertable.engine.duckdb_pro.duckdb")
     @patch("supertable.engine.duckdb_pro.init_connection")
