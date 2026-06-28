@@ -285,39 +285,35 @@ def configure_httpfs_and_s3(
         "true" if meta_cache_on else "false",
     )
 
-    # External file cache — an in-memory cache of remote data blocks so
-    # repeated queries do not re-download the same row groups.  It is only
-    # enabled when a size cap can be enforced: DuckDB builds without
-    # external_file_cache_max_size (e.g. 1.5.x) cannot bound it, and an
-    # uncapped cache grows to memory_limit on the persistent connection.
-    # Without an enforceable cap we keep it OFF to protect memory.
+    # External file cache — an in-memory cache of external (e.g. remote
+    # Parquet) data blocks so repeated queries do not re-download the same row
+    # groups.  Enabled whenever a cache size is configured.  The cache is
+    # bounded by the global memory_limit (DuckDB enforces that bound), which is
+    # the effective cap; a dedicated per-cache cap is applied only on builds
+    # that expose external_file_cache_max_size (no released DuckDB through
+    # 1.5.x does), so in practice memory_limit is the bound.
     cache_size = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE
     can_cap = "external_file_cache_max_size" in supported
-    if cache_size and can_cap:
+    if cache_size:
         set_if_supported("enable_external_file_cache", "true")
-        set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
-        cache_dir_raw = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
-        if not cache_dir_raw:
-            # Derive from SUPERTABLE_HOME — single env var controls all paths.
-            cache_dir_raw = os.path.join(get_app_home(), "duckdb_cache")
-        # Expand ~ so DuckDB receives an absolute path.
-        cache_dir = os.path.expanduser(cache_dir_raw)
-        os.makedirs(cache_dir, exist_ok=True)
-        set_if_supported("external_file_cache_directory", f"'{cache_dir}'")
-        logger.info(
+        if can_cap:
+            set_if_supported("external_file_cache_max_size", f"'{cache_size}'")
+            cache_dir_raw = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+            if not cache_dir_raw:
+                # Derive from SUPERTABLE_HOME — single env var controls all paths.
+                cache_dir_raw = os.path.join(get_app_home(), "duckdb_cache")
+            # Expand ~ so DuckDB receives an absolute path.
+            cache_dir = os.path.expanduser(cache_dir_raw)
+            os.makedirs(cache_dir, exist_ok=True)
+            set_if_supported("external_file_cache_directory", f"'{cache_dir}'")
+        logger.debug(
             "[duckdb.cache] external file cache enabled"
-            + (f" size={cache_size}" if cache_size else "")
-            + f", dir={cache_dir}"
+            + (f", capped at {cache_size}" if can_cap
+               else f", bounded by memory_limit (size={cache_size}; "
+                    "this DuckDB build has no dedicated cap)")
         )
     else:
-        # Uncappable (or disabled via empty size) — turn it off explicitly so
-        # the DuckDB 1.5.x default-on cache cannot accumulate in memory.
         set_if_supported("enable_external_file_cache", "false")
-        if cache_size and not can_cap:
-            logger.info(
-                "[duckdb.cache] external file cache disabled: this DuckDB build "
-                "cannot cap it (no external_file_cache_max_size)"
-            )
 
 
 # =========================================================
@@ -589,14 +585,13 @@ def rewrite_query_with_hashed_tables(
 # =========================================================
 
 def _external_file_cache_cappable(con: duckdb.DuckDBPyConnection) -> bool:
-    """True when this DuckDB build can bound the external file cache size.
+    """True when this DuckDB build exposes a dedicated external-file-cache cap.
 
-    DuckDB 1.5.x enables ``enable_external_file_cache`` by default but does
-    not expose ``external_file_cache_max_size``.  An enabled-but-uncapped
-    cache is held in memory (not on disk) and grows to ``memory_limit`` on
-    the long-lived persistent connection — a sustained-memory / OOM hazard.
-    When this returns False the cache is disabled outright rather than left
-    running unbounded.
+    No released DuckDB (through 1.5.x) exposes ``external_file_cache_max_size``;
+    the cache is in-memory and bounded by ``memory_limit``, which DuckDB
+    enforces.  This predicate gates only the *dedicated* per-cache size cap:
+    when it returns False the cache still runs, bounded by ``memory_limit``
+    rather than a separate cap.
     """
     try:
         return bool(con.execute(
@@ -679,16 +674,19 @@ def init_connection(
     except Exception:
         pass  # older DuckDB builds may not support this setting
 
-    # External file cache baseline.  DuckDB 1.5.x turns the cache ON by
-    # default but cannot cap it, so an uncapped in-memory cache accumulates
-    # remote data up to memory_limit on the persistent connection.  Disable
-    # it here when uncappable; configure_httpfs_and_s3 / apply_runtime_pragmas
-    # re-enable it (capped) only on builds that support a size cap.
-    if not _external_file_cache_cappable(con):
-        try:
-            con.execute("SET enable_external_file_cache=false;")
-        except Exception:
-            pass
+    # External file cache baseline.  DuckDB (>=1.3.0) ships an in-memory cache
+    # of external files, bounded by memory_limit (DuckDB enforces that bound).
+    # Honour the configured default here: enable when a cache size is set,
+    # otherwise off.  configure_httpfs_and_s3 / apply_runtime_pragmas refine
+    # this (and apply a dedicated cap on builds that expose one).
+    try:
+        con.execute(
+            "SET enable_external_file_cache="
+            + ("true" if settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE else "false")
+            + ";"
+        )
+    except Exception:
+        pass
 
     # Thread count.
     # If SUPERTABLE_DUCKDB_THREADS is set explicitly, honour it exactly.
@@ -783,17 +781,19 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         except Exception:
             pass
 
-    # External file cache: only run it when the size cap is enforceable.
-    # On DuckDB builds without external_file_cache_max_size (e.g. 1.5.x) an
-    # enabled cache is in-memory and unbounded — it grows to memory_limit on
-    # the persistent connection — so we disable it instead of running uncapped.
+    # External file cache: enable whenever the org configures a cache size.
+    # The cache is in-memory and bounded by memory_limit (DuckDB enforces that
+    # bound), which is the effective cap.  A dedicated per-cache cap is applied
+    # only on builds that expose external_file_cache_max_size (no released
+    # DuckDB through 1.5.x does); otherwise memory_limit is the bound.
     cache_size = normalize_memory_size(cfg.duckdb_external_cache_size, default="")
-    if cache_size and _external_file_cache_cappable(con):
+    if cache_size:
         try:
             con.execute("SET enable_external_file_cache=true;")
-            con.execute(
-                f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
-            )
+            if _external_file_cache_cappable(con):
+                con.execute(
+                    f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
+                )
         except Exception as e:
             logger.warning(f"[duckdb.pragma] external file cache config failed: {e}")
     else:
@@ -892,7 +892,7 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
             ("external_file_cache_max_size supported — the file cache can be capped"
              if cappable else
              "this build has no external_file_cache_max_size — the file cache "
-             "cannot be capped, so it is disabled to stay memory-safe"),
+             "runs bounded by memory_limit rather than a dedicated cap"),
             version)
     except Exception as e:
         add("version", "DuckDB version", "warn", f"version() failed: {e}")
@@ -1039,18 +1039,19 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
                 getattr(cfg, "duckdb_external_cache_size", ""), default=""
             )
         if efc_on and not cappable:
-            add("cache", "External file cache", "fail",
-                "Cache is ON but this build cannot cap it — it grows to the memory "
-                "limit and causes OOM", "on · uncapped")
+            add("cache", "External file cache", "ok",
+                "Cache is ON, bounded by memory_limit — this build has no "
+                "dedicated cap (external_file_cache_max_size), so memory_limit "
+                "is the bound", "on · memory_limit")
         elif efc_on and cappable:
             add("cache", "External file cache", "ok",
                 f"Cache is ON and capped at {cache_cfg or 'the configured size'}",
                 "on · capped")
         else:
             add("cache", "External file cache", "ok",
-                "Cache is OFF — memory-safe; remote files are re-fetched per query "
-                "(set a Disk cache size on a cap-capable build to speed up repeats)",
-                "off")
+                "Cache is OFF — remote files are re-fetched per query (set "
+                "SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE to enable, bounded by "
+                "memory_limit)", "off")
     except Exception as e:
         add("cache", "External file cache", "warn", f"Could not read cache state: {e}")
 

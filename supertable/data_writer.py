@@ -371,6 +371,14 @@ class DataWriter:
                 profiler=profiler,
             )
             mark("overlap")
+            if overwrite_columns:
+                _snap_files = len(last_simple_table.get("resources") or [])
+                _cand = sum(1 for _, ov, _ in overlapping_files if ov)
+                logger.debug(lp(
+                    f"step[overlap]: {_cand}/{_snap_files} existing file(s) are overwrite "
+                    f"candidates on {overwrite_columns} "
+                    f"(snapshot has no per-file key stats → every file is suspect)"
+                ))
 
             # --- Stats-driven file pruning (consumer 5a) ----------------------
             # Narrow the overwrite/delete candidate set using the external stats
@@ -387,6 +395,10 @@ class DataWriter:
                     stored_stats_df = load_stats(stats_file, allow_cache=True, profiler=profiler)
                     if stored_stats_df is not None and stored_stats_df.height > 0:
                         probe = probe_ranges_from_df(dataframe, overwrite_columns)
+                        _probe_desc = {
+                            c: (f"{v[0]}[{v[1]}..{v[2]}]" if v else "unconstrained(null/unsupported)")
+                            for c, v in probe.items()
+                        }
                         before = len(overlapping_files)
                         overlapping_files = prune_overlapping_files_by_stats(
                             overlapping_files,
@@ -395,8 +407,21 @@ class DataWriter:
                             profiler=profiler,
                         )
                         pruned = before - len(overlapping_files)
+                        logger.debug(lp(
+                            f"step[stats-prune]: df-probe {_probe_desc} vs {stored_stats_df.height} "
+                            f"stored stat row(s) → kept {len(overlapping_files)}/{before}, "
+                            f"pruned {pruned} (no data file opened)"
+                        ))
                         if pruned > 0:
                             logger.info(lp(f"stats pruning: skipped {pruned}/{before} candidate files"))
+                    else:
+                        logger.debug(lp(
+                            "step[stats-prune]: stats artifact empty → no pruning, all candidates retained"
+                        ))
+                else:
+                    logger.debug(lp(
+                        "step[stats-prune]: snapshot has no stats_file → no pruning, all candidates retained"
+                    ))
                 mark("stats_prune")
 
             # File cache: used only by delete_only's identify_all_rowids below.
@@ -420,6 +445,16 @@ class DataWriter:
                     newer_than_col=newer_than,
                     profiler=profiler,
                 )
+                mark("resolve_overwrite")
+                _counts = profiler.counts
+                _fallback = bool(_counts.get("overwrite_resolve_fallback"))
+                logger.debug(lp(
+                    f"step[probe-resolve] via {'polars-fallback' if _fallback else 'duckdb-pushdown'}: "
+                    f"matched {_counts.get('probe_rows_matched', _counts.get('delete_rows_matched', 0))} "
+                    f"existing row(s) on {overwrite_columns} → "
+                    f"{len(resolved_delete_pairs or [])} (file,__rowid__) delete pair(s); "
+                    f"{dataframe.height}/{pre_filter_count} incoming row(s) survive"
+                ))
                 if newer_than:
                     skipped = pre_filter_count - dataframe.height
                     if skipped > 0:
@@ -515,6 +550,10 @@ class DataWriter:
                     ]
                 deleted = len(new_delete_pairs)
                 mark("identify_deletes")
+                logger.debug(lp(
+                    f"step[deletes]: tombstoning {deleted} live row(s) this write "
+                    f"(excluded {len(prev_dv_rowids)} row(s) already in the deletion-vector)"
+                ))
 
                 # 2. Write the incoming rows as a new file (insert/upsert side).
                 #    delete_only carries only predicate columns — nothing to insert.
@@ -531,6 +570,10 @@ class DataWriter:
                 else:
                     inserted = 0
                 mark("write_parquet")
+                logger.debug(lp(
+                    f"step[write]: appended {inserted} incoming row(s) as {len(new_resources)} "
+                    f"new immutable file(s) (no existing data file rewritten)"
+                ))
 
                 # 3. Carry forward + extend the deletion-vector tombstone file.
                 #    No new deletes → reuse the previous file (combined_df=None).
@@ -554,6 +597,10 @@ class DataWriter:
                     else int(last_simple_table.get("tombstone_rows", 0) or 0)
                 )
                 mark("build_tombstone")
+                logger.debug(lp(
+                    f"step[tombstone]: deletion-vector now {tombstone_rows} row(s) "
+                    f"({'rewritten' if combined_tombstone_df is not None else 'carried forward unchanged'})"
+                ))
 
                 # 3b. Eager reclamation of fully-dead files.  Any existing data
                 #     file whose every physical row is now tombstoned is 100%
@@ -812,7 +859,7 @@ class DataWriter:
                         schema_json = "{}"
                     _org, _sup = self.super_table.organization, self.super_table.super_name
                     self.catalog.r.set(RK.schema(_org, _sup, simple_name), schema_json)
-                    self.catalog.r.sadd(RK.table_names(_org, _sup), simple_name)
+                    self.catalog.r.sadd(RK.meta_table_names(_org, _sup), simple_name)
                 except Exception as e:
                     logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
 
@@ -862,7 +909,7 @@ class DataWriter:
                         f"total={total_duration:.3f} | "
                         f"convert={timings.get('convert', 0):.3f} | dedup_ts={timings.get('dedup_ts', 0):.3f} | validate={timings.get('validate', 0):.3f} | "
                         f"lock={timings.get('lock', 0):.3f} | snapshot={timings.get('snapshot', 0):.3f} | "
-                        f"overlap={timings.get('overlap', 0):.3f} | stats_prune={timings.get('stats_prune', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
+                        f"overlap={timings.get('overlap', 0):.3f} | stats_prune={timings.get('stats_prune', 0):.3f} | resolve_overwrite={timings.get('resolve_overwrite', 0):.3f} | newer_than={timings.get('newer_than', 0):.3f} | "
                         f"identify_deletes={timings.get('identify_deletes', 0):.3f} | write_parquet={timings.get('write_parquet', 0):.3f} | "
                         f"build_tombstone={timings.get('build_tombstone', 0):.3f} | compact_tombstones={timings.get('compact_tombstones', 0):.3f} | compact_small={timings.get('compact_small', 0):.3f} | build_stats={timings.get('build_stats', 0):.3f} | "
                         f"update_simple={timings.get('update_simple', 0):.3f} | bump_root={timings.get('bump_root', 0):.3f} | "
