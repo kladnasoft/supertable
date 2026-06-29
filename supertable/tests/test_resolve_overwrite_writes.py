@@ -20,19 +20,35 @@ local files regardless of the ambient STORAGE_TYPE.
 """
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import patch
 
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
+import supertable.processing as st_processing
 from supertable.processing import (
     resolve_overwrite_writes,
     filter_stale_incoming_rows,
     identify_deleted_rowids,
 )
+from supertable.config.settings import settings
 from supertable.storage.local_storage import LocalStorage
 from supertable.utils.profiler import Profiler
+
+
+@pytest.fixture(autouse=True)
+def _enable_write_probe(monkeypatch):
+    """These tests validate the DuckDB pushdown probe path, which is opt-in
+    (``SUPERTABLE_DUCKDB_WRITE_PROBE``, default off).  Force it on so the probe
+    is actually exercised; without this the gate in ``resolve_overwrite_writes``
+    would route every call to the polars fallback and the probe assertions
+    (``probe_files`` present, no ``overwrite_resolve_fallback``) would be vacuous."""
+    monkeypatch.setattr(
+        st_processing, "settings",
+        dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=True),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1316,11 +1316,13 @@ def resolve_overwrite_writes(
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
-    Returns ``(filtered_incoming_df, delete_pairs)`` computed from ONE DuckDB
-    pushdown probe over the overlapping files.  Falls back to the original polars
+    Returns ``(filtered_incoming_df, delete_pairs)``.  When the DuckDB pushdown
+    probe is enabled (``SUPERTABLE_DUCKDB_WRITE_PROBE``) it is computed from ONE
+    probe over the overlapping files.  Falls back to the original polars
     full-read path (``filter_stale_incoming_rows`` + ``identify_deleted_rowids``)
-    when DuckDB is unavailable, the probe fails, or the file schema can't be
-    probed — semantics are identical on both paths.
+    when the probe is disabled (the default), DuckDB is unavailable, the probe
+    fails, or the file schema can't be probed — semantics are identical on both
+    paths.
 
     *newer_than_col* falsy ⇒ no stale filtering (delete/upsert without conflict
     resolution); the incoming df is returned unchanged and every overlapping row
@@ -1343,9 +1345,15 @@ def resolve_overwrite_writes(
         f"{incoming_keys.height} unique incoming key(s) on {overwrite_columns}, "
         f"newer_than={newer_than_col}"
     )
-    matched = _duckdb_probe_overlap_matches(
-        overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
-    )
+    # The DuckDB pushdown probe is opt-in (SUPERTABLE_DUCKDB_WRITE_PROBE).  When
+    # disabled (the default), skip it entirely and use the polars fallback below,
+    # which reads only the projected key columns via the storage SDK and needs no
+    # httpfs extension — the safe path for environments without one.
+    matched = None
+    if settings.SUPERTABLE_DUCKDB_WRITE_PROBE:
+        matched = _duckdb_probe_overlap_matches(
+            overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
+        )
     if matched is not None:
         try:
             return _derive_stale_and_deletes(

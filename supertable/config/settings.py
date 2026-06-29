@@ -157,6 +157,13 @@ class Settings:
     SUPERTABLE_DUCKDB_MATERIALIZE: str = "view"    # SUPERTABLE_DUCKDB_MATERIALIZE
     SUPERTABLE_DUCKDB_PRESIGNED: bool = False      # SUPERTABLE_DUCKDB_PRESIGNED
     SUPERTABLE_DUCKDB_USE_HTTPFS: bool = False     # SUPERTABLE_DUCKDB_USE_HTTPFS
+    # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
+    # Disabled by default: the polars fallback reads only the projected key
+    # columns through the storage SDK and needs no httpfs extension, so it works
+    # in environments without one (or without internet to install it).  Enable
+    # only where httpfs is available and the probe's row-group skipping is worth
+    # it (e.g. very wide tables / many overlapping files).
+    SUPERTABLE_DUCKDB_WRITE_PROBE: bool = False    # SUPERTABLE_DUCKDB_WRITE_PROBE
     # Deletion-vector (tombstone) table cache.  Each entry is a small
     # `DISTINCT __rowid__` table keyed by the stable tombstone path; the
     # tombstone view ANTI JOINs it instead of re-reading the parquet every
@@ -437,6 +444,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
+        SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),

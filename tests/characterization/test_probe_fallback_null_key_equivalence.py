@@ -40,14 +40,29 @@ the probe-vs-fallback equivalence assertions are unchanged.
 from __future__ import annotations
 
 import collections
+import dataclasses
 
 import polars as pl
 import pyarrow as pa
+import pytest
 
 import supertable.processing as st_processing
+from supertable.config.settings import settings
 from supertable.data_writer import DataWriter
 from supertable.simple_table import SimpleTable
 from supertable.super_table import SuperTable
+
+
+@pytest.fixture(autouse=True)
+def _enable_write_probe(monkeypatch):
+    """The DuckDB pushdown probe is opt-in (``SUPERTABLE_DUCKDB_WRITE_PROBE``,
+    default off).  Force it on so ``_resolve`` (which goes through
+    ``resolve_overwrite_writes``) genuinely exercises the probe — otherwise the
+    probe-vs-fallback comparison would degrade to fallback-vs-fallback."""
+    monkeypatch.setattr(
+        st_processing, "settings",
+        dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=True),
+    )
 
 ORG = "kladna-soft"
 SUPER = "demo_pf"
