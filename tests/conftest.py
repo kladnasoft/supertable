@@ -99,3 +99,18 @@ def hermetic_fakeredis():
         except Exception:
             pass
         reset_engine_singletons()
+
+
+@pytest.fixture(autouse=True)
+def _reset_probe_pool():
+    """Keep the thread-local write-probe connection pool from leaking across tests.
+
+    Probes reuse a pooled DuckDB connection, so a test that injects a fake/spy
+    connection via the factory would otherwise leave it in the pool and poison
+    every later probe in the session.  Imported lazily so conftest load stays
+    light and never pulls supertable before the hermetic env is pinned.
+    """
+    from supertable.engine.engine_common import reset_pooled_duckdb_connections
+    reset_pooled_duckdb_connections()
+    yield
+    reset_pooled_duckdb_connections()

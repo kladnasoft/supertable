@@ -18,20 +18,23 @@ monkeypatched to ``None`` (forced polars fallback).  It diffs the surviving rows
 ``(file, __rowid__)`` delete-pairs.  A guard first confirms the probe genuinely engages,
 so the comparison is probe-vs-fallback, never a vacuous fallback-vs-fallback.
 
-Empirical result: they AGREE -> Finding #4 is NOT real.  The audit mis-read the probe
-path: its stale filter (``_derive_stale_and_deletes``, processing.py:1262) uses the SAME
-null-unsafe ``how="left"`` join as the fallback (823).  Both KEEP the NULL-keyed incoming
-row; both tombstone the same pairs.  No divergence on either half.
+Empirical result: they AGREE -> Finding #4 (probe/fallback divergence) is NOT real.
+Both the probe stale filter (``_derive_stale_and_deletes``) and the fallback
+(``filter_stale_incoming_rows``) share the SAME join, so they never diverge from each
+other -- that equivalence is this test's primary, permanent guarantee.
 
-What IS real (a different, narrower issue this test pins down)
--------------------------------------------------------------
-On BOTH paths a NULL overwrite-key bypasses the ``newer_than`` stale filter (null-unsafe
-left join) yet is still matched null-safely on the DELETE side (``nulls_equal=True``,
-processing.py:955 / 1275).  Net effect of an overwrite+newer_than whose key is NULL: the
-OLDER incoming row survives and tombstones the *newer* existing NULL-keyed row -- a
-newer_than violation.  But it is identical on both paths, so it is an intra-path NULL
-inconsistency, NOT the probe/fallback divergence Finding #4 described.  (NULLs in a merge
-key are semantically dubious to begin with; surfaced to the user as a refined finding.)
+The real (path-independent) issue this test pinned down -- NOW FIXED (audit R7)
+------------------------------------------------------------------------------
+Originally BOTH paths used a null-UNSAFE ``how="left"`` stale-filter join, so a NULL
+overwrite-key bypassed the ``newer_than`` filter yet was still matched null-SAFELY on
+the DELETE side (``nulls_equal=True``).  Net effect of an overwrite+newer_than whose key
+is NULL: the OLDER incoming row survived and tombstoned the *newer* existing NULL-keyed
+row -- a newer_than violation (identical on both paths, so never a probe/fallback
+divergence).  R7 made BOTH stale-filter joins ``nulls_equal=True`` (processing.py:823 /
+1267), consistent with the delete semi-join (955 / 1280): a NULL key now compares against
+the existing NULL group's max, so a stale NULL-keyed row is dropped and the newer existing
+NULL row is preserved.  The ground-truth assertions below now verify that fixed behavior;
+the probe-vs-fallback equivalence assertions are unchanged.
 """
 
 from __future__ import annotations
@@ -139,19 +142,20 @@ def test_probe_and_fallback_agree_on_null_key_under_newer_than():
         f"probe={sorted(pairs_probe)} fallback={sorted(pairs_fb)}"
     )
 
-    # GROUND TRUTH both paths agree on: "x" (non-null) is dropped as stale; the NULL key
-    # is KEPT (null-unsafe stale filter).  This documents the real, path-independent quirk.
+    # GROUND TRUTH both paths agree on (post-R7, null-safe stale filter): BOTH incoming
+    # rows are stale -- non-null "x" (5 <= existing 10) AND the NULL key (5 <= the
+    # existing NULL-group max 10) -- so NOTHING survives the stale filter.
     survivors = _rowset(filt_probe)
-    assert survivors == collections.Counter({(None, 5): 1}), (
-        f"expected only the NULL-keyed incoming row to survive the stale filter on BOTH "
-        f"paths (non-null 'x' is stale); got {dict(survivors)}"
+    assert survivors == collections.Counter(), (
+        f"expected NO incoming row to survive the stale filter on BOTH paths (both 'x' "
+        f"and the NULL key are older than the existing ver=10); got {dict(survivors)}"
     )
-    # ...and that surviving NULL key DOES tombstone the existing NULL-keyed row (delete
-    # side is null-safe), so the older row replaces the newer one -- a newer_than
-    # violation, but identical on both paths (NOT a probe/fallback divergence).
-    assert len(pairs_probe) == 1, (
-        f"expected the surviving NULL-keyed row to tombstone exactly the existing NULL "
-        f"row; pairs={pairs_probe}"
+    # ...and with no surviving key, nothing is tombstoned: the newer existing NULL-keyed
+    # row is preserved -- newer_than is now honored for NULL keys (R7 fix), no longer
+    # clobbered by an older incoming NULL-keyed row.
+    assert len(pairs_probe) == 0, (
+        f"expected no tombstones: the stale NULL-keyed incoming row must not replace the "
+        f"newer existing NULL row; pairs={pairs_probe}"
     )
 
 

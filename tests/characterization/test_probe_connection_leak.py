@@ -1,41 +1,41 @@
-"""§8 leak check: the transient write-probe DuckDB connection is closed on EVERY path.
+"""§8 leak check: the pooled write-probe DuckDB connection is bounded, not leaked.
 
 The §8 question
 ---------------
-``_duckdb_probe_overlap_matches`` (processing.py:1068) spins up a *transient*
-DuckDB connection per overwrite to do the key-overlap semi-join.  §8 asks: is
-that connection closed on ALL paths, including exceptions?  A leaked connection
-per failed probe is a real (slow-burn) resource leak.
+``_duckdb_probe_overlap_matches`` runs the key-overlap semi-join on a DuckDB
+connection per overwrite.  §8 asks: can that connection leak — one abandoned per
+probe, especially on the failure path?
 
-The code's claim
-----------------
-The connection is created as ``con = None`` then built inside a ``try`` whose
-``finally`` unconditionally unregisters the incoming-keys relation and calls
-``con.close()`` (processing.py:1149-1186).  So whether the scan succeeds, raises
-a presign-retryable error, or raises anything else, the ``finally`` should run
-and close the connection.
+The code's claim (post-pooling)
+-------------------------------
+The probe no longer builds a *transient* connection it must close.  It calls
+``get_pooled_duckdb_connection``, which keeps ONE connection per thread in a
+``threading.local`` pool and reuses it across writes (amortising the ~150 ms
+warmup).  So the probe's ``finally`` only unregisters the per-probe incoming-keys
+relation — it deliberately does NOT close the connection, which is returned to
+the pool.  The no-leak guarantee is therefore: N probes (success or failure)
+share ONE connection, never N; the per-probe relation is unregistered so it
+can't accumulate; and ``reset_pooled_duckdb_connections()`` closes the pooled
+connection, bounding the resource.
 
 What this test does -- drives the real function, not a re-implementation
 -----------------------------------------------------------------------
-``new_duckdb_connection`` is imported *inside* the probe from
-``engine.engine_common``; patching it on that module is picked up at call time.
-Two cases, both calling the real ``_duckdb_probe_overlap_matches`` over a real
-seeded data file:
+``new_duckdb_connection`` is the cold-build factory ``get_pooled_duckdb_connection``
+calls; patching it on ``engine_common`` is picked up at call time.  Two cases,
+both calling the real ``_duckdb_probe_overlap_matches`` twice over a real seeded
+data file (the autouse ``_reset_probe_pool`` fixture gives each a cold pool):
 
-  * FAILURE path -- patch the factory to hand back a fake connection whose
-    ``execute`` raises a NON-presign error.  The probe must swallow it and
-    return ``None`` (fall back to polars), and -- the point of the test -- the
-    fake's ``close()`` must have been called by the ``finally``.  If the
-    ``finally`` were missing, the connection would leak on every failed probe.
+  * FAILURE path -- factory hands back a fake whose ``execute`` raises a
+    NON-presign error.  Both probes must return ``None`` (fall back to polars),
+    the factory must run ONCE (the failed probe reuses the pooled connection,
+    not one-per-failure), the probe must NOT close it, and the reset hook must.
 
-  * SUCCESS path -- wrap the REAL connection in a spy that delegates everything
-    but records ``close()``.  A genuine overlapping key makes the probe match
-    and return a non-empty frame; the spy must still have been closed.  Proves
-    the happy path doesn't leak either.
+  * SUCCESS path -- wrap the REAL connection in a spy.  A genuine overlapping
+    key makes both probes match; the connection is built once, reused on the
+    warm probe, never closed by the probe, and closed by the reset hook.
 
-Expected: PASS on both -- the try/finally closes the connection on success and on
-failure alike, so §8 (probe connection leak) is NOT a real bug.  Remove the
-``finally``'s ``con.close()`` and the failure case's ``closed`` assertion flips red.
+Expected: PASS on both -- pooling bounds the connection to one-per-thread and the
+reset hook closes it, so §8 (probe connection leak) is NOT a real bug.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ class _SpyConn:
         return object.__getattribute__(self, "_real").close()
 
 
-def test_probe_failure_closes_connection_no_leak():
+def test_probe_failure_pools_connection_no_leak():
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
     _seed_one_file(dw)
@@ -109,26 +109,31 @@ def test_probe_failure_closes_connection_no_leak():
     assert overlap, "seed produced no resource file for the probe to scan"
     incoming_keys = pl.DataFrame({KEY: ["x"]}).select([KEY]).unique()
 
+    engine_common.reset_pooled_duckdb_connections()  # start cold
     fake = _FakeConn()
+    builds = []
     saved = engine_common.new_duckdb_connection
-    engine_common.new_duckdb_connection = lambda *a, **k: fake
+    engine_common.new_duckdb_connection = lambda *a, **k: (builds.append(1), fake)[1]
     try:
-        result = st_processing._duckdb_probe_overlap_matches(
-            overlap, [KEY], None, incoming_keys,
-        )
+        r1 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
+        r2 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
     finally:
         engine_common.new_duckdb_connection = saved
 
-    # The probe swallowed the scan error and signalled "fall back to polars".
-    assert result is None, "a failed scan must return None so the caller falls back"
-    # ...and -- the actual leak check -- the finally closed the connection.
-    assert fake.closed is True, (
-        "the transient DuckDB connection was NOT closed after the probe scan raised "
-        "-- every failed probe would leak a connection (missing try/finally close)"
-    )
+    # Both failed scans signalled "fall back to polars".
+    assert r1 is None and r2 is None, "a failed scan must return None so the caller falls back"
+    # The connection is built ONCE and reused -- not one abandoned per failed probe.
+    assert len(builds) == 1, "failed probe rebuilt the connection instead of reusing the pool"
+    # The probe must NOT close the pooled connection (it is returned for reuse)...
+    assert fake.closed is False, "probe closed the pooled connection -- breaks reuse"
+    assert engine_common._probe_pool.con is fake, "failed probe did not retain the pooled connection"
+    # ...and the reset hook closes it, bounding the resource (this is the no-leak guarantee).
+    engine_common.reset_pooled_duckdb_connections()
+    assert fake.closed is True, "reset hook did not close the pooled connection -- would leak"
+    assert getattr(engine_common._probe_pool, "con", None) is None
 
 
-def test_probe_success_closes_connection_no_leak():
+def test_probe_success_pools_and_reuses_connection_no_leak():
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
     _seed_one_file(dw)
@@ -137,6 +142,7 @@ def test_probe_success_closes_connection_no_leak():
     assert overlap, "seed produced no resource file for the probe to scan"
     incoming_keys = pl.DataFrame({KEY: ["x"]}).select([KEY]).unique()  # overlaps 'x'
 
+    engine_common.reset_pooled_duckdb_connections()  # start cold
     spies = []
     saved = engine_common.new_duckdb_connection
 
@@ -147,18 +153,20 @@ def test_probe_success_closes_connection_no_leak():
 
     engine_common.new_duckdb_connection = _spying_factory
     try:
-        result = st_processing._duckdb_probe_overlap_matches(
-            overlap, [KEY], None, incoming_keys,
-        )
+        r1 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
+        r2 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
     finally:
         engine_common.new_duckdb_connection = saved
 
-    # Guard: the probe genuinely engaged (matched the seeded 'x'), so this is a
-    # real success path and not a vacuous early-return before the connection.
-    assert result is not None and result.height > 0, (
-        "probe did not engage in-harness; the success-path close assertion would be vacuous"
-    )
-    assert spies, "the patched connection factory was never called"
-    assert all(s.closed for s in spies), (
-        "the transient DuckDB connection was not closed on the successful probe path"
-    )
+    # Guard: the probe genuinely engaged (matched the seeded 'x') on both calls,
+    # so these are real success paths and not a vacuous early-return.
+    assert r1 is not None and r1.height > 0, "first probe did not engage in-harness"
+    assert r2 is not None and r2.height > 0, "second probe did not engage in-harness"
+    # Built ONCE and reused on the warm probe -- one pooled connection per thread.
+    assert len(spies) == 1, "warm probe rebuilt the connection instead of reusing the pool"
+    # The happy path does NOT close it (returned to the pool for reuse)...
+    assert spies[0].closed is False, "happy path closed the pooled connection -- breaks reuse"
+    assert engine_common._probe_pool.con is spies[0], "probe did not retain the pooled connection"
+    # ...and the reset hook closes the pooled connection, so it is bounded, not leaked.
+    engine_common.reset_pooled_duckdb_connections()
+    assert spies[0].closed is True, "reset hook did not close the pooled connection -- would leak"

@@ -731,10 +731,64 @@ def new_duckdb_connection(
     purely local scans.
     """
     con = duckdb.connect()
-    init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
-    if for_paths and any("://" in str(p) for p in for_paths):
+    try:
+        init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
+        if for_paths and any("://" in str(p) for p in for_paths):
+            configure_httpfs_and_s3(con, for_paths)
+    except Exception:
+        # Don't leak the half-initialised connection if a pragma / httpfs load
+        # raises; re-raise so callers still fall back exactly as before.
+        con.close()
+        raise
+    return con
+
+
+# Thread-local pool for the write-side probe connection.  DuckDB connections are
+# NOT thread-safe, so each thread keeps its own; reusing it amortises the
+# ~150 ms init/warmup across writes on the same thread — the same reason the
+# read executors hold a persistent connection.
+_probe_pool = threading.local()
+
+
+def get_pooled_duckdb_connection(
+        temp_dir: str,
+        for_paths: Optional[List[str]] = None,
+        memory_limit: str = "1GB",
+) -> duckdb.DuckDBPyConnection:
+    """Return this thread's pooled probe connection, building it on first use.
+
+    The cold build goes through ``new_duckdb_connection`` so the pinned
+    ``home_directory`` / pragma contract is byte-for-byte identical to a
+    transient connection.  On a *warm* connection httpfs/S3 is re-applied for
+    remote paths so a connection first built for local paths can still serve a
+    later remote probe and credentials always reflect the current environment
+    (``configure_httpfs_and_s3`` re-reads env each call and is idempotent).
+    """
+    con = getattr(_probe_pool, "con", None)
+    if con is None:
+        con = new_duckdb_connection(
+            temp_dir=temp_dir, for_paths=for_paths, memory_limit=memory_limit
+        )
+        _probe_pool.con = con
+    elif for_paths and any("://" in str(p) for p in for_paths):
         configure_httpfs_and_s3(con, for_paths)
     return con
+
+
+def reset_pooled_duckdb_connections() -> None:
+    """Close and drop the calling thread's pooled probe connection.
+
+    A no-op when the thread has none.  Used for test determinism and as an
+    eviction hook; the pool slot is cleared before the close so a failing close
+    still leaves the thread ready to rebuild.
+    """
+    con = getattr(_probe_pool, "con", None)
+    if con is not None:
+        _probe_pool.con = None
+        try:
+            con.close()
+        except Exception:
+            pass
 
 
 def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:

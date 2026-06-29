@@ -229,11 +229,12 @@ class TestNullKeys:
             "user_id": pl.Series([None], dtype=pl.Int64), "v": [1], "updated_at": [9]})
         _compare(incoming, {f}, ["user_id"], "updated_at")
 
-    def test_null_key_stale_kept_as_new(self, tmp_path):
+    def test_null_key_stale_dropped(self, tmp_path):
         f = self._null_file(tmp_path)
-        # Stale filter uses a non-null-safe join (oracle semantics) so the null
-        # key never matches existing_max → row is KEPT; delete derivation uses a
-        # null-safe semi join so the existing null-keyed rowid IS tombstoned.
+        # Null-safe stale filter (R7): the incoming NULL key (updated_at=6) compares
+        # against the existing NULL-group max (7) and is dropped as stale, so it
+        # tombstones nothing — the newer existing NULL-keyed row is preserved.
         incoming = pl.DataFrame({
             "user_id": pl.Series([None], dtype=pl.Int64), "v": [1], "updated_at": [6]})
-        _compare(incoming, {f}, ["user_id"], "updated_at")
+        filt, pairs, _ = _compare(incoming, {f}, ["user_id"], "updated_at")
+        assert filt.height == 0 and pairs == []

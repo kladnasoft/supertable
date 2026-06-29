@@ -587,6 +587,38 @@ class TestReadWriteDuckDBParity:
         # for_paths forwarded so httpfs is loaded for remote scans.
         assert "for_paths" in calls[0][1]
 
+    def test_probe_reuses_pooled_connection(self, tmp_path, monkeypatch):
+        # A second probe on the same thread must REUSE the pooled connection,
+        # so new_duckdb_connection is built exactly once — the ~150ms warmup is
+        # paid on the cold probe and amortised on every subsequent write.
+        import polars
+        from supertable import processing as _processing
+
+        monkeypatch.setattr(_processing, "_get_storage", lambda: object())
+
+        f1 = str(tmp_path / "f1.parquet")
+        polars.DataFrame({"__rowid__": [10, 20], "id": [1, 2]}).write_parquet(f1)
+
+        calls = []
+        real = _engine_common.new_duckdb_connection
+        monkeypatch.setattr(
+            _engine_common,
+            "new_duckdb_connection",
+            lambda *a, **k: (calls.append((a, k)), real(*a, **k))[1],
+        )
+
+        def _probe():
+            return _processing._duckdb_probe_overlap_matches(
+                overlap_true_files=[(f1, 0)],
+                overwrite_columns=["id"],
+                newer_than_col=None,
+                incoming_keys=polars.DataFrame({"id": [2]}),
+            )
+
+        assert _probe() is not None
+        assert _probe() is not None
+        assert len(calls) == 1  # built on the cold probe, reused on the warm one
+
     def test_probe_matches_rows_on_local_parquet(self, tmp_path, monkeypatch):
         import polars
         from supertable import processing as _processing

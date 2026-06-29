@@ -5,6 +5,7 @@ import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import re
 
@@ -528,8 +529,14 @@ class DataWriter:
                     _read_parquet_safe(prev_tombstone_path, profiler=profiler, required=True)
                     if prev_tombstone_path else None
                 )
+                # The rowid set is consumed only by the idempotency filter below,
+                # which runs only when this write actually tombstones rows
+                # (overwrite or delete_only).  Pure appends tombstone nothing, so
+                # skip materialising the whole deletion-vector as a Python set —
+                # prev_dv_df is still carried forward into build_tombstone_file.
                 prev_dv_rowids = set()
-                if prev_dv_df is not None and "__rowid__" in prev_dv_df.columns:
+                if (overwrite_columns or delete_only) and prev_dv_df is not None \
+                        and "__rowid__" in prev_dv_df.columns:
                     prev_dv_rowids = set(prev_dv_df.get_column("__rowid__").to_list())
 
                 # 1. Identify which existing rows this write deletes/replaces.
@@ -568,37 +575,86 @@ class DataWriter:
                     f"(excluded {len(prev_dv_rowids)} row(s) already in the deletion-vector)"
                 ))
 
-                # 2. Write the incoming rows as a new file (insert/upsert side).
-                #    delete_only carries only predicate columns — nothing to insert.
-                if not delete_only and dataframe.height > 0:
+                # 2. + 3.  Write the incoming rows as a new data file (insert/
+                #    upsert side) AND carry-forward/extend the deletion-vector
+                #    tombstone file.  These two object-store PUTs are independent:
+                #    neither reads the other's output and they write to disjoint
+                #    dirs (data/ vs tombstone/), so they run concurrently to
+                #    overlap the two round-trips.  delete_only carries only
+                #    predicate columns → nothing to insert.  No new deletes →
+                #    build_tombstone reuses the previous file (combined_df=None).
+                #
+                #    Profiler is NOT thread-safe, so each branch records into its
+                #    own sub-profiler which the parent merges after the join;
+                #    each branch also measures its own wall time so the per-phase
+                #    monitoring timings stay meaningful despite the overlap.
+                #    Footers of files written via the write_bytes path are captured
+                #    in footer_md_cache so stats extraction (step 6) reuses them
+                #    instead of re-downloading each freshly-written file.
+                footer_md_cache = {}
+                tombstone_dir = os.path.join(simple_table.simple_dir, "tombstone")
+                do_insert = (not delete_only and dataframe.height > 0)
+
+                def _write_data_branch():
+                    sub = Profiler()
+                    t = time.perf_counter()
                     write_parquet_and_collect_resources(
                         write_df=dataframe,
                         overwrite_columns=[],
                         data_dir=simple_table.data_dir,
                         new_resources=new_resources,
                         compression_level=compression_level,
-                        profiler=profiler,
+                        profiler=sub,
+                        footer_md_out=footer_md_cache,
                     )
+                    return sub, time.perf_counter() - t
+
+                def _write_tombstone_branch():
+                    sub = Profiler()
+                    t = time.perf_counter()
+                    tp, cdf = build_tombstone_file(
+                        tombstone_dir=tombstone_dir,
+                        prev_tombstone_path=prev_tombstone_path,
+                        new_pairs=new_delete_pairs,
+                        compression_level=compression_level,
+                        profiler=sub,
+                        prev_df=prev_dv_df,
+                    )
+                    return tp, cdf, sub, time.perf_counter() - t
+
+                if do_insert:
+                    with ThreadPoolExecutor(max_workers=2) as _ex:
+                        _f_data = _ex.submit(_write_data_branch)
+                        _f_tomb = _ex.submit(_write_tombstone_branch)
+                        # .result() re-raises in the parent: a failure in either
+                        # PUT aborts the write before any snapshot commit, exactly
+                        # as the former sequential path did (an orphaned immutable
+                        # file no snapshot references is harmless garbage).
+                        data_sub, data_secs = _f_data.result()
+                        tombstone_path, combined_tombstone_df, tomb_sub, tomb_secs = (
+                            _f_tomb.result()
+                        )
+                    profiler.merge(data_sub)
+                    profiler.merge(tomb_sub)
                     inserted = dataframe.height
                 else:
+                    tombstone_path, combined_tombstone_df, tomb_sub, tomb_secs = (
+                        _write_tombstone_branch()
+                    )
+                    profiler.merge(tomb_sub)
+                    data_secs = 0.0
                     inserted = 0
-                mark("write_parquet")
+
+                # Assign the two per-phase timings from each branch's own measured
+                # wall time (they overlapped, so the serial mark() deltas would
+                # misattribute the time), then advance the mark() baseline.
+                timings["write_parquet"] = data_secs
+                timings["build_tombstone"] = tomb_secs
+                t_last = time.time()
                 logger.debug(lp(
                     f"step[write]: appended {inserted} incoming row(s) as {len(new_resources)} "
                     f"new immutable file(s) (no existing data file rewritten)"
                 ))
-
-                # 3. Carry forward + extend the deletion-vector tombstone file.
-                #    No new deletes → reuse the previous file (combined_df=None).
-                tombstone_dir = os.path.join(simple_table.simple_dir, "tombstone")
-                tombstone_path, combined_tombstone_df = build_tombstone_file(
-                    tombstone_dir=tombstone_dir,
-                    prev_tombstone_path=prev_tombstone_path,
-                    new_pairs=new_delete_pairs,
-                    compression_level=compression_level,
-                    profiler=profiler,
-                    prev_df=prev_dv_df,
-                )
 
                 # Track the live deletion-vector row count so meta reads can
                 # deduct dead rows from the physical resource row totals.
@@ -609,7 +665,6 @@ class DataWriter:
                     if combined_tombstone_df is not None
                     else int(last_simple_table.get("tombstone_rows", 0) or 0)
                 )
-                mark("build_tombstone")
                 logger.debug(lp(
                     f"step[tombstone]: deletion-vector now {tombstone_rows} row(s) "
                     f"({'rewritten' if combined_tombstone_df is not None else 'carried forward unchanged'})"
@@ -758,7 +813,9 @@ class DataWriter:
                     r.get("file") for r in new_resources
                     if isinstance(r, dict) and r.get("file")
                 ]
-                new_stats_rows = extract_stats_rows(new_data_files, profiler=profiler)
+                new_stats_rows = extract_stats_rows(
+                    new_data_files, profiler=profiler, footer_md_cache=footer_md_cache
+                )
                 stats_path, combined_stats_df = build_stats_file(
                     stats_dir=stats_dir,
                     prev_stats_path=last_simple_table.get("stats_file"),

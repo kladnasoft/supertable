@@ -572,6 +572,7 @@ def compact_resources(
 def write_parquet_and_collect_resources(
         write_df, overwrite_columns, data_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
+        footer_md_out: Optional[Dict] = None,
 ):
     """Write a DataFrame as one or more Parquet files and append resource dicts.
 
@@ -612,7 +613,7 @@ def write_parquet_and_collect_resources(
 
         if has_nulls:
             null_df = partitioned.filter(null_mask).drop(["__p_year__", "__p_month__", "__p_day__"])
-            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler)
+            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
             partitioned = partitioned.filter(~null_mask)
 
         if partitioned.height > 0:
@@ -632,16 +633,17 @@ def write_parquet_and_collect_resources(
                 )
                 _write_single_parquet_file(
                     group_df, overwrite_columns, partition_dir, new_resources, compression_level,
-                    profiler=profiler,
+                    profiler=profiler, footer_md_out=footer_md_out,
                 )
     else:
         # --- Flat write path (no __timestamp__) — backward compatible ---
-        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler)
+        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
 
 
 def _write_single_parquet_file(
         write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
+        footer_md_out: Optional[Dict] = None,
 ):
     """Write a single Parquet file into *target_dir* and append a resource entry.
 
@@ -695,6 +697,17 @@ def _write_single_parquet_file(
         if hasattr(_get_storage(), "write_bytes"):
             with p.span("write.upload_bytes"):
                 _get_storage().write_bytes(new_parquet_path, data)
+            # The uploaded bytes ARE ``data`` here, so parse the footer in memory
+            # (footer-only, no decode, no network round-trip) for stats reuse.
+            # ONLY on this path: the write_parquet / polars fallbacks below
+            # re-encode via a different writer, so their on-disk row-group layout
+            # and statistics need not match ``data`` — reusing it there could
+            # mis-prune row groups on read.
+            if footer_md_out is not None:
+                try:
+                    footer_md_out[new_parquet_path] = pq.read_metadata(io.BytesIO(data))
+                except Exception:
+                    pass
         elif hasattr(_get_storage(), "write_parquet"):
             with p.span("write.upload_parquet"):
                 _get_storage().write_parquet(arrow_tbl, new_parquet_path)
@@ -818,9 +831,14 @@ def filter_stale_incoming_rows(
             polars.col(newer_than_col).max().alias("__existing_max__")
         )
 
-    # Left join incoming against existing max
+    # Left join incoming against existing max.  nulls_equal=True so a NULL key
+    # compares against the existing NULL group's max, consistent with the
+    # null-safe delete semi-join — otherwise an older NULL-keyed row would skip
+    # the stale filter yet still tombstone the newer existing NULL-keyed row.
     with p.span("newer_than.join_filter"):
-        joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
+        joined = incoming_df.join(
+            existing_max, on=overwrite_columns, how="left", nulls_equal=True
+        )
 
         # Keep rows where:
         #   - no existing data for this key (null max → new key)
@@ -1096,7 +1114,7 @@ def _duckdb_probe_overlap_matches(
     try:
         import duckdb  # noqa: F401  (imported for availability check / errors)
         from supertable.engine.engine_common import (
-            new_duckdb_connection,
+            get_pooled_duckdb_connection,
             configure_httpfs_and_s3,
             escape_parquet_path,
             quote_if_needed,
@@ -1153,11 +1171,12 @@ def _duckdb_probe_overlap_matches(
 
     con = None
     try:
-        # Build the connection exactly like the read path (same pragmas, and a
-        # pinned home_directory) so the probe never falls back to the OS home —
-        # which is absent under a restricted service user.  httpfs/S3 is loaded
-        # by the helper only when duck_paths contain a remote URL.
-        con = new_duckdb_connection(temp_dir="write_probe", for_paths=duck_paths)
+        # Reuse this thread's pooled connection (cold-built exactly like the
+        # read path: same pragmas, pinned home_directory so the probe never
+        # falls back to the OS home, which is absent under a restricted service
+        # user).  The pool re-applies httpfs/S3 for remote paths, so a warm
+        # connection is configured for the current probe's object store.
+        con = get_pooled_duckdb_connection(temp_dir="write_probe", for_paths=duck_paths)
         con.register(ik_name, incoming_keys.to_arrow())
         try:
             matched = _run(duck_paths)
@@ -1181,12 +1200,11 @@ def _duckdb_probe_overlap_matches(
         return None
     finally:
         if con is not None:
+            # Return the connection to the thread-local pool (do NOT close it);
+            # only drop the per-probe registered relation so the uuid-named
+            # keys table can't accumulate across reuses.
             try:
                 con.unregister(ik_name)
-            except Exception:
-                pass
-            try:
-                con.close()
             except Exception:
                 pass
 
@@ -1264,7 +1282,11 @@ def _derive_stale_and_deletes(
                 polars.col(newer_than_col).max().alias("__existing_max__")
             )
         with p.span("newer_than.join_filter"):
-            joined = incoming_df.join(existing_max, on=overwrite_columns, how="left")
+            # nulls_equal=True keeps this consistent with the null-safe delete
+            # semi-join below and the polars fallback oracle.
+            joined = incoming_df.join(
+                existing_max, on=overwrite_columns, how="left", nulls_equal=True
+            )
             filtered = joined.filter(
                 polars.col("__existing_max__").is_null()
                 | (polars.col(newer_than_col) > polars.col("__existing_max__"))
@@ -1684,6 +1706,7 @@ def _empty_stats_df() -> polars.DataFrame:
 def extract_stats_rows(
         file_paths: List[str],
         profiler: Optional[Profiler] = None,
+        footer_md_cache: Optional[Dict] = None,
 ) -> polars.DataFrame:
     """Read the footers of *file_paths* and return their stats rows.
 
@@ -1691,13 +1714,23 @@ def extract_stats_rows(
     ``__rowid__`` / ``__timestamp__`` columns.  Files whose footer cannot be
     read (race / corruption) are skipped.  Returns a frame with ``STATS_SCHEMA``
     (possibly empty).
+
+    *footer_md_cache* (optional) maps a file path to a parquet ``FileMetaData``
+    already parsed in memory at write time (from the exact bytes that were
+    uploaded).  When a path is present its footer is reused directly, skipping a
+    full-file re-download; otherwise the footer is read back from storage.
     """
     p = profiler or get_null_profiler()
+    cache = footer_md_cache or {}
     all_rows: List[dict] = []
     for path in file_paths:
         if not path:
             continue
-        md = _read_footer_metadata(path, profiler=p)
+        md = cache.get(path)
+        if md is None:
+            md = _read_footer_metadata(path, profiler=p)
+        else:
+            p.add("stats_footer_cache_hit", 1)
         if md is None:
             continue
         all_rows.extend(_stats_rows_for_metadata(path, md))

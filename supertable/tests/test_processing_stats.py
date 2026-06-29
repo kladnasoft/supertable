@@ -222,6 +222,66 @@ class TestExtractStatsRows:
         assert out.height == 0
         assert list(out.columns) == list(STATS_SCHEMA.keys())
 
+    @patch(f"{_MOD}._get_storage")
+    @patch(f"{_MOD}._safe_exists", return_value=True)
+    def test_footer_md_cache_skips_readback(self, _mock_exists, mock_gs):
+        """R1: a cached footer is consumed in place — no storage round-trip."""
+        df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        buf = io.BytesIO()
+        pq.write_table(df.to_arrow(), buf, write_statistics=True)
+        md = pq.read_metadata(io.BytesIO(buf.getvalue()))
+
+        stor = MagicMock()
+        mock_gs.return_value = stor
+
+        out = extract_stats_rows(["one.parquet"], footer_md_cache={"one.parquet": md})
+        assert out.height == 2
+        assert set(out["column_name"].to_list()) == {"a", "b"}
+        stor.read_bytes.assert_not_called()  # the whole point: no re-download
+
+    @patch(f"{_MOD}._get_storage")
+    @patch(f"{_MOD}._safe_exists", return_value=True)
+    def test_cached_footer_matches_readback(self, _mock_exists, mock_gs):
+        """R1 correctness invariant: for the SAME bytes, the cached-footer path
+        and the readback path yield IDENTICAL stats rows.  In production the
+        cached footer is parsed from the exact bytes uploaded via write_bytes, so
+        this equivalence guarantees R1 changes no stats value."""
+        df = pl.DataFrame({"a": [3, 1, 2], "b": ["c", "a", "b"]})
+        buf = io.BytesIO()
+        pq.write_table(df.to_arrow(), buf, write_statistics=True)
+        raw = buf.getvalue()
+
+        stor = MagicMock()
+        stor.read_bytes.return_value = raw
+        mock_gs.return_value = stor
+
+        readback = extract_stats_rows(["one.parquet"])
+        cached = extract_stats_rows(
+            ["one.parquet"], footer_md_cache={"one.parquet": pq.read_metadata(io.BytesIO(raw))}
+        )
+        assert readback.equals(cached)
+
+    @patch(f"{_MOD}._get_storage")
+    @patch(f"{_MOD}._safe_exists", return_value=True)
+    def test_partial_cache_falls_back_for_uncached_path(self, _mock_exists, mock_gs):
+        """A path absent from the cache must still be read back (mixed write_bytes
+        / re-encode batches), while the cached one skips the read."""
+        df = pl.DataFrame({"a": [1, 2]})
+        buf = io.BytesIO()
+        pq.write_table(df.to_arrow(), buf, write_statistics=True)
+        raw = buf.getvalue()
+        md = pq.read_metadata(io.BytesIO(raw))
+
+        stor = MagicMock()
+        stor.read_bytes.return_value = raw
+        mock_gs.return_value = stor
+
+        out = extract_stats_rows(
+            ["cached.parquet", "uncached.parquet"], footer_md_cache={"cached.parquet": md}
+        )
+        assert set(out["file_path"].to_list()) == {"cached.parquet", "uncached.parquet"}
+        stor.read_bytes.assert_called_once()  # only the uncached path hit storage
+
 
 # ---------------------------------------------------------------------------
 # build_stats_file: copy-forward + versioning

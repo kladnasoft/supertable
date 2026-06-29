@@ -86,6 +86,21 @@ def _mock_redis_catalog():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_probe_pool():
+    """Clear the thread-local write-probe connection pool around every test.
+
+    The probe now reuses a pooled connection across writes, so tests that
+    assert how many times ``new_duckdb_connection`` is built must start from a
+    cold pool; resetting afterwards keeps the connection from leaking into the
+    next test.
+    """
+    from supertable.engine.engine_common import reset_pooled_duckdb_connections
+    reset_pooled_duckdb_connections()
+    yield
+    reset_pooled_duckdb_connections()
+
+
 @pytest.fixture()
 def duckdb_con():
     """Provide a real in-memory DuckDB connection, closed after each test."""
