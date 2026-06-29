@@ -343,8 +343,18 @@ class DataWriter:
             # layout and tight row-group zonemaps). Together with __rowid__ it
             # is hidden from query output by the read view's
             # ``EXCLUDE (__rowid__, __timestamp__)`` projection.
+            #
+            # System-owned, exactly like __rowid__ above: ALWAYS overwrite any
+            # caller-supplied __timestamp__ instead of preserving it.  It is a
+            # reserved internal column that is both the dedup ORDER BY key (newest
+            # per key wins) and the source of the __p_year__/month/day partition
+            # derivation (processing.py); letting a caller inject an arbitrary value
+            # (wrong dtype, non-UTC, or chosen to game which row wins) would
+            # silently corrupt partitioning and dedup.  ``newer_than`` is the
+            # supported, explicit mechanism for caller-controlled conflict
+            # resolution.
             table_config = self._get_table_config(simple_name)
-            if not delete_only and "__timestamp__" not in dataframe.columns:
+            if not delete_only:
                 dataframe = dataframe.with_columns(
                     polars.lit(datetime.now(timezone.utc)).alias("__timestamp__")
                 )

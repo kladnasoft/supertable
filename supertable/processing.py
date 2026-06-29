@@ -989,7 +989,12 @@ def identify_all_rowids(
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.get(file)
         else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size)
+            # Only __rowid__ is consumed below, so read just that column chunk.
+            # A delete-all can touch every file; a full-width read would pull all
+            # columns of every file into memory for nothing.
+            existing_df = _read_parquet_safe(
+                file, profiler=p, file_size=file_size, columns=[ROWID_COL]
+            )
         if existing_df is None or ROWID_COL not in existing_df.columns:
             continue
         rowids = existing_df.get_column(ROWID_COL).drop_nulls().to_list()
@@ -2265,7 +2270,18 @@ def compact_tombstones(
             # File already sunset by an earlier compaction — skip.
             continue
         file_size = int(resource.get("file_size") or 0)
-        existing_df = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
+        # required=True: this is the ONLY physical drain (Phase B is row-preserving
+        # and never re-drops these rows), and the callers clear the deletion-vector
+        # pointer unconditionally once the vector was non-empty.  If a transient
+        # backend error here were swallowed to None, this file's tombstoned rows
+        # would be silently skipped yet the pointer cleared -> the rows RESURRECT on
+        # read.  Failing loud aborts the write/compact with the prior snapshot +
+        # vector intact for retry (matches the carry-forward DV-pointer reads).  A
+        # genuine absence still returns None (file already sunset/raced -> its rows
+        # are gone, so skipping it is correct).
+        existing_df = _read_parquet_safe(
+            file_path, profiler=p, file_size=file_size, required=True
+        )
         if existing_df is None or ROWID_COL not in existing_df.columns:
             continue
 
