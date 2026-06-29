@@ -193,7 +193,18 @@ class LocalStorage(StorageInterface):
 
         try:
             proj = self._project_columns(pq.read_schema(path).names, columns) if columns else None
-            return pq.read_table(path, columns=proj) if proj else pq.read_table(path)
+            # partitioning=None: read only the file's own footer columns; never let
+            # pyarrow infer Hive year/month/day from a ``year=YYYY/...`` path.  The
+            # object-store backends read from a BytesIO buffer (no path) and so never
+            # infer -- this keeps LocalStorage consistent with them and upholds the
+            # "partition columns are path-only, never in the body" contract.  Without
+            # it a full read injects int32 year/month/day that compaction bakes into
+            # the rewritten body, leaking them into query output and breaking later
+            # reads with an int32-vs-dictionary merge error.
+            return (
+                pq.read_table(path, columns=proj, partitioning=None) if proj
+                else pq.read_table(path, partitioning=None)
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
 
