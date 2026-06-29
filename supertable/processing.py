@@ -212,12 +212,17 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
 # Safe storage I/O helpers
 # =========================
 
-def _safe_exists(path: str, profiler: Optional[Profiler] = None) -> bool:
+def _safe_exists(path: str, profiler: Optional[Profiler] = None, strict: bool = False) -> bool:
     p = profiler or get_null_profiler()
     try:
         with p.span("io.exists"):
             return _get_storage().exists(path)
     except Exception:
+        # A failed existence probe is normally treated as "absent" (lenient).
+        # *strict* callers (carry-forward reads) must not mistake a backend
+        # error for a genuine absence, so re-raise instead.
+        if strict:
+            raise
         return False
 
 
@@ -226,9 +231,21 @@ def _read_parquet_safe(
         profiler: Optional[Profiler] = None,
         file_size: int = 0,
         columns: Optional[List[str]] = None,
+        required: bool = False,
 ) -> Optional[polars.DataFrame]:
+    """Read a parquet object into polars, or ``None`` when it is absent.
+
+    When *required* is True a genuine read failure — the object exists but cannot
+    be read (corrupt body, transient/persistent backend error) — is re-raised
+    instead of being swallowed to ``None``.  Absence still returns ``None`` even
+    when required (a missing object, or one sunset by a concurrent writer, is a
+    legitimate "no previous artifact" signal).  Carry-forward callers that would
+    otherwise silently drop a still-referenced artifact — the deletion-vector —
+    must pass ``required=True`` so a failed read aborts the write rather than
+    persisting a truncated successor (which would resurrect deleted rows).
+    """
     p = profiler or get_null_profiler()
-    if not _safe_exists(path, profiler=p):
+    if not _safe_exists(path, profiler=p, strict=required):
         logging.info(f"[race] file already sunset by another writer: {path}")
         return None
     try:
@@ -251,6 +268,8 @@ def _read_parquet_safe(
         return None
     except Exception as e:
         logging.warning(f"[read] failed to read parquet at {path}: {e}")
+        if required:
+            raise
         return None
 
 
@@ -1380,7 +1399,9 @@ def build_tombstone_file(
     )
 
     if prev_df is None and prev_tombstone_path:
-        prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p)
+        # required=True: refuse to build a truncated deletion-vector if the
+        # previous one exists but cannot be read (would resurrect dead rows).
+        prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p, required=True)
     if prev_df is not None and prev_df.height > 0 and ROWID_COL in prev_df.columns:
         combined = polars.concat(
             [prev_df.select([TOMBSTONE_FILE_COL, ROWID_COL]), new_df],

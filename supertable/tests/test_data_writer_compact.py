@@ -1029,8 +1029,16 @@ class TestTwoPhaseAggregation:
         self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """The benign case: tombstone-output F is large (or otherwise
-        not picked up by Phase B). F must remain in new_resources."""
+        """The benign case: tombstone-output F is large (or otherwise not picked
+        up by Phase B). F must survive in the final snapshot exactly once.
+
+        F is spliced into the in-memory baseline right after Phase A, so ``update``
+        carries it forward via ``(baseline - sunset)``.  It must therefore NOT be
+        re-passed as ``new_resources`` — doing so listed the same file twice in the
+        new snapshot (a real defect; see
+        tests/characterization/test_compaction_duplicate_resource_entry.py).  So
+        ``update`` receives only Phase B's brand-new file G, while F survives
+        through the baseline."""
         dw = _build_writer()
 
         import pyarrow as pa
@@ -1067,9 +1075,32 @@ class TestTwoPhaseAggregation:
 
         args, kwargs = mock_simple.update.call_args
         new_resources_passed = args[0]
-        new_files = {r["file"] for r in new_resources_passed}
-        # Both F and G survive — neither was sunset
-        assert new_files == {"F", "G"}, f"unexpected new={new_files}"
+        sunset_passed = args[1]
+        new_files_list = [r["file"] for r in new_resources_passed]
+
+        # F (Phase-A output) is already in the baseline ``update`` merges
+        # against, so it must NOT be re-passed as new_resources — only Phase
+        # B's brand-new G is. Re-passing F is the duplicate-entry defect.
+        assert set(new_files_list) == {"G"}, (
+            f"update must receive only Phase B's net-new file; got new={new_files_list}"
+        )
+        assert sunset_passed == {"A", "B"}, f"unexpected sunset={sunset_passed}"
+
+        # F survives via the baseline: Phase A spliced it into the in-memory
+        # snapshot ([B, F]) before Phase B ran, so ``update`` carries it forward
+        # through ``(baseline - sunset)``.
+        baseline_files = [r["file"] for r in kwargs["last_snapshot"]["resources"]]
+        assert "F" in baseline_files, (
+            f"Phase-A output F must be carried by the update baseline; "
+            f"baseline={baseline_files}"
+        )
+
+        # Effective snapshot = (baseline - sunset) + new_resources — F and G
+        # each listed exactly once (a re-passed F would surface here as a dup).
+        effective = [f for f in baseline_files if f not in sunset_passed] + new_files_list
+        assert sorted(effective) == ["F", "G"], (
+            f"new snapshot must list F and G exactly once each; got {effective}"
+        )
 
 
 # ===========================================================================

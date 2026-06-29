@@ -511,8 +511,11 @@ class DataWriter:
                 # Load the current deletion-vector once: used both to exclude
                 # already-tombstoned rows from this write's deletes (below) and,
                 # via prev_df, to extend the vector without a second read.
+                # required=True: a DV that exists but cannot be read must abort
+                # the write, never be treated as empty — silently dropping the
+                # carried-forward vector would resurrect previously deleted rows.
                 prev_dv_df = (
-                    _read_parquet_safe(prev_tombstone_path, profiler=profiler)
+                    _read_parquet_safe(prev_tombstone_path, profiler=profiler, required=True)
                     if prev_tombstone_path else None
                 )
                 prev_dv_rowids = set()
@@ -1181,8 +1184,17 @@ class DataWriter:
             # the *write* path; compact() is explicit maintenance and always
             # consumes the vector.
             tombstone_path = last_simple_table.get("tombstone")
+            # required=True: a DV that exists but cannot be read must abort the
+            # compaction, never be treated as empty. A swallowed read here would
+            # set should_run_tombstones=False, skipping both Phase A and the
+            # pointer-clear below, so Phase B would carry the dead rows into the
+            # new file while the vector kept pointing at the sunset __file__ —
+            # leaving them permanently unreclaimable. Failing loud leaves the
+            # prior snapshot + vector intact for a retry, and matches the
+            # write-path carry-forward read (required=True) above.
             tombstone_df = (
-                _read_parquet_safe(tombstone_path) if tombstone_path else None
+                _read_parquet_safe(tombstone_path, required=True)
+                if tombstone_path else None
             )
             tombstone_rows = (
                 tombstone_df.height if tombstone_df is not None else 0
@@ -1245,6 +1257,24 @@ class DataWriter:
             all_new_resources = [
                 r for r in (list(tomb_new_resources) + list(small_new_resources))
                 if r.get("file") not in all_sunset
+            ]
+            # ``all_new_resources`` is the full set of files written by THIS
+            # compaction; it feeds stats extraction, the schema model_df and the
+            # result metrics below, all of which need every new file.
+            #
+            # For ``simple_table.update`` it must NOT be reused verbatim, though:
+            # Phase A's outputs were already spliced into
+            # ``last_simple_table["resources"]`` (the in-memory baseline that
+            # ``update`` starts from) right after Phase A ran.  ``update`` does
+            # ``(baseline - sunset) + new_resources`` with no dedup, so any
+            # Phase-A output that Phase B did NOT consume (left un-sunset because
+            # it exceeded the ``small_only`` threshold, or its read failed) would
+            # be counted once from the baseline AND once from new_resources —
+            # i.e. the same file listed twice in the new snapshot.  Hand ``update``
+            # only Phase B's brand-new files, which are the only resources genuinely
+            # absent from that baseline.
+            update_new_resources = [
+                r for r in small_new_resources if r.get("file") not in all_sunset
             ]
             result["files_compacted"] = considered
             result["new_resources"] = len(all_new_resources)
@@ -1338,7 +1368,7 @@ class DataWriter:
                 )
 
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
-                    all_new_resources,
+                    update_new_resources,
                     all_sunset,
                     model_df,
                     last_snapshot=last_simple_table,
