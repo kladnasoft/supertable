@@ -724,6 +724,24 @@ class DataWriter:
                     and combined_tombstone_df.height >= _max_tombstone_rows(table_config)
                 )
 
+                # Snapshot the shared I/O counters BEFORE the compaction phases so
+                # the reads/writes they perform can be attributed precisely (the
+                # incoming-data write already ran above, so any delta below is
+                # purely compaction).  Trackers default to "phase did not run".
+                _cio_files0 = profiler.counts.get("files_written", 0)
+                _cio_bw0 = profiler.counts.get("bytes_written", 0)
+                _cio_fr0 = profiler.counts.get("files_read", 0)
+                _cio_br0 = profiler.counts.get("bytes_read", 0)
+                _live_before = len(post_write_resources)
+                _tomb_phase_ran = False
+                _tomb_removed = 0
+                _tomb_files_touched = 0
+                _tomb_files_written = 0
+                _tomb_files_total = 0
+                _comp_considered = 0
+                _comp_files_written = 0
+                _comp_rows = 0
+
                 # Phase A — drain the deletion-vector when either trigger fires
                 # and a vector is actually live (freshly built this write OR
                 # carried forward from a prior one).
@@ -754,6 +772,15 @@ class DataWriter:
                         sunset_files |= tomb_sunset
                         tombstone_path = None  # deletion-vector fully consumed
                         tombstone_rows = 0
+                        _tomb_phase_ran = True
+                        _tomb_removed = removed
+                        _tomb_files_touched = len(tomb_sunset)
+                        _tomb_files_written = len(tomb_new)
+                        # Distinct files named in the deletion-vector — set by
+                        # compact_tombstones this call (one call per write).
+                        _tomb_files_total = int(
+                            profiler.counts.get("tombstone_files_total", 0)
+                        )
                         logger.info(lp(
                             f"tombstone compaction removed {removed} rows "
                             f"from {len(tomb_sunset)} files"
@@ -786,8 +813,12 @@ class DataWriter:
                         compression_level=compression_level,
                         table_config=table_config,
                         small_only=True,
+                        profiler=profiler,
                     )
                     if comp_new or comp_sunset:
+                        _comp_considered = considered
+                        _comp_files_written = len(comp_new)
+                        _comp_rows = comp_rows
                         sunset_files |= comp_sunset
                         # A file written above (incoming or tombstone survivor)
                         # may have been re-merged here; drop any new_resources
@@ -803,6 +834,40 @@ class DataWriter:
                             f"into {len(comp_new)} file(s) ({comp_rows} rows)"
                         ))
                 mark("compact_small")
+
+                # Precise, single-line attribution of the compaction work done
+                # INSIDE this write: which gate fired, what each phase touched,
+                # and the I/O it cost.  Only emitted when a phase actually ran so
+                # ordinary writes stay quiet.  This is the line that makes a
+                # "compaction happened during the write" visible at a glance.
+                if _tomb_phase_ran or compaction_ran:
+                    _final_live = len(
+                        [r for r in (last_simple_table.get("resources") or [])
+                         if r.get("file") not in sunset_files]
+                        + [r for r in new_resources
+                           if r.get("file") not in sunset_files]
+                    )
+                    _triggers = []
+                    if tombstone_threshold_hit:
+                        _triggers.append("tombstone_threshold")
+                    if compaction_gate:
+                        _triggers.append("small_file_gate")
+                    _cio_files = profiler.counts.get("files_written", 0) - _cio_files0
+                    _cio_bw = profiler.counts.get("bytes_written", 0) - _cio_bw0
+                    _cio_fr = profiler.counts.get("files_read", 0) - _cio_fr0
+                    _cio_br = profiler.counts.get("bytes_read", 0) - _cio_br0
+                    logger.info(lp(
+                        "compaction during write "
+                        f"[trigger={'+'.join(_triggers) or 'none'}]: "
+                        f"tombstone phase removed {_tomb_removed} row(s) from "
+                        f"{_tomb_files_touched}/{_tomb_files_total} deletion-vector file(s), "
+                        f"wrote {_tomb_files_written} file(s); "
+                        f"small-file phase merged {_comp_considered} small file(s) -> "
+                        f"{_comp_files_written} file(s) ({_comp_rows} row(s)); "
+                        f"large files left untouched; live files {_live_before} -> {_final_live}; "
+                        f"compaction io: read {_cio_fr} file(s)/{_cio_br / 1048576:.1f} MiB, "
+                        f"wrote {_cio_files} file(s)/{_cio_bw / 1048576:.1f} MiB"
+                    ))
 
                 # 6. Carry forward + extend the external column-statistics parquet.
                 #    Read the footers of the newly written data files, drop the

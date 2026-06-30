@@ -86,6 +86,10 @@ from supertable.engine.spark_thrift import (
     _spark_create_rbac_view,
     _spark_rewrite_query,
     _configure_spark_s3,
+    _read_parquet_schema,
+    _parquet_timestamp_units,
+    _ts_to_timestamp_expr,
+    _build_tscast_select,
     SparkThriftExecutor,
 )
 
@@ -1988,6 +1992,246 @@ class TestSparkThriftExecutor:
         ste.catalog.select_spark_cluster.return_value = None
         with pytest.raises(RuntimeError, match="No active Spark cluster"):
             ste._select_cluster(1000)
+
+
+# ═══════════════════════════════════════════════════════════
+#  spark_sql — timestamp cast wrapper (type-based detection)
+# ═══════════════════════════════════════════════════════════
+
+
+def _write_ts_parquet(path, *, ts_unit="us", with_created_at=True):
+    """Write a parquet file mimicking the SuperTable write path.
+
+    A ``__timestamp__`` timestamp column at *ts_unit* resolution plus plain
+    int64 / string user columns — including an epoch-integer ``created_at``
+    (int64, NOT a parquet timestamp) that must never be detected as a timestamp.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    epoch = {"s": 1_700_000_000, "ms": 1_700_000_000_000,
+             "us": 1_700_000_000_000_000, "ns": 1_700_000_000_000_000_000}[ts_unit]
+    cols = {
+        "__timestamp__": pa.array([epoch], type=pa.timestamp(ts_unit, tz="UTC")),
+        "user_id": pa.array([5], type=pa.int64()),
+        "name": pa.array(["Alice"], type=pa.string()),
+    }
+    if with_created_at:
+        cols["created_at"] = pa.array([1_700_000_000_000], type=pa.int64())  # epoch-ms
+    pq.write_table(pa.table(cols), path)
+
+
+class TestSparkTimestampCast:
+    """The Spark nanos→TIMESTAMP wrapper must convert a column back to TIMESTAMP
+    only when Spark surfaces it as BIGINT AND its PARQUET logical type is a
+    timestamp — never by name, so epoch-integer columns like ``created_at``
+    (int64 epoch-ms) stay BIGINT.  This pins the fix for the engine divergence
+    where DuckDB returned correct results but Spark force-cast epoch ints."""
+
+    # ── pure projection builder ────────────────────────────────────
+
+    def test_only_parquet_timestamp_bigint_is_cast(self):
+        desc = [("__timestamp__", "bigint"), ("created_at", "bigint"),
+                ("user_id", "bigint"), ("name", "string")]
+        parts, cast = _build_tscast_select(desc, {"__timestamp__": "ns"})
+        assert cast == ["__timestamp__"]
+        assert "`created_at`" in parts                        # passthrough, untouched
+        assert "timestamp_micros(`created_at`" not in " ".join(parts)
+        assert "timestamp_micros(`__timestamp__` DIV 1000) AS `__timestamp__`" in parts
+
+    def test_epoch_int_named_like_timestamp_not_cast(self):
+        # The exact bug: BIGINTs named like timestamps but absent from the footer
+        # timestamp set must be left alone.
+        desc = [("source_ts_ms", "bigint"), ("transaction_created_at", "bigint")]
+        parts, cast = _build_tscast_select(desc, {})          # footer read, zero ts cols
+        assert cast == []
+        assert parts == ["`source_ts_ms`", "`transaction_created_at`"]
+
+    def test_footer_unreadable_casts_only_system_col(self):
+        # ts_units None → only __timestamp__ (assumed nanos), never the heuristic.
+        desc = [("__timestamp__", "bigint"), ("created_at", "bigint"),
+                ("stat_date", "bigint")]
+        parts, cast = _build_tscast_select(desc, None)
+        assert cast == ["__timestamp__"]
+        assert "`created_at`" in parts and "`stat_date`" in parts
+        assert not any("timestamp_micros(`created_at`" in p for p in parts)
+
+    def test_non_bigint_timestamp_not_cast(self):
+        # A micros __timestamp__ already reads as TIMESTAMP in Spark → not BIGINT
+        # → no conversion even though the footer flags it as a timestamp.
+        desc = [("__timestamp__", "timestamp"), ("user_id", "bigint")]
+        parts, cast = _build_tscast_select(desc, {"__timestamp__": "us"})
+        assert cast == []
+        assert parts == ["`__timestamp__`", "`user_id`"]
+
+    def test_unit_aware_conversion_expressions(self):
+        desc = [("a", "bigint"), ("b", "bigint"), ("c", "bigint"), ("d", "bigint")]
+        parts, cast = _build_tscast_select(
+            desc, {"a": "s", "b": "ms", "c": "us", "d": "ns"})
+        assert set(cast) == {"a", "b", "c", "d"}
+        joined = " ".join(parts)
+        assert "timestamp_seconds(`a`) AS `a`" in joined
+        assert "timestamp_millis(`b`) AS `b`" in joined
+        assert "timestamp_micros(`c`) AS `c`" in joined
+        assert "timestamp_micros(`d` DIV 1000) AS `d`" in joined
+
+    def test_describe_metadata_rows_skipped(self):
+        desc = [("__timestamp__", "bigint"), ("# Partitioning", ""), ("", "")]
+        parts, cast = _build_tscast_select(desc, {"__timestamp__": "ns"})
+        assert cast == ["__timestamp__"]
+        assert parts == ["timestamp_micros(`__timestamp__` DIV 1000) AS `__timestamp__`"]
+
+    def test_ts_expr_helper_units(self):
+        assert _ts_to_timestamp_expr("x", "s") == "timestamp_seconds(`x`) AS `x`"
+        assert _ts_to_timestamp_expr("x", "ms") == "timestamp_millis(`x`) AS `x`"
+        assert _ts_to_timestamp_expr("x", "us") == "timestamp_micros(`x`) AS `x`"
+        assert _ts_to_timestamp_expr("x", "ns") == "timestamp_micros(`x` DIV 1000) AS `x`"
+
+    # ── real-parquet footer reading ────────────────────────────────
+
+    def test_parquet_units_local_micros(self, tmp_path):
+        p = str(tmp_path / "m.parquet")
+        _write_ts_parquet(p, ts_unit="us")
+        units = _parquet_timestamp_units(None, p)              # local path, no storage
+        assert units == {"__timestamp__": "us"}
+        assert "created_at" not in units                       # epoch int64 is NOT a timestamp
+
+    def test_parquet_units_local_nanos(self, tmp_path):
+        p = str(tmp_path / "n.parquet")
+        _write_ts_parquet(p, ts_unit="ns")
+        assert _parquet_timestamp_units(None, p) == {"__timestamp__": "ns"}
+
+    def test_read_schema_missing_local_returns_none(self, tmp_path):
+        assert _read_parquet_schema(None, str(tmp_path / "nope.parquet")) is None
+
+    def test_read_schema_via_storage_strips_base_prefix(self, tmp_path):
+        # Object-store path: bytes come through storage; base_prefix must be
+        # stripped from the recovered key (storage re-applies it), bucket dropped.
+        p = tmp_path / "data.parquet"
+        _write_ts_parquet(str(p), ts_unit="ns")
+        raw = p.read_bytes()
+        seen = {}
+
+        class _FakeStorage:
+            base_prefix = "org/warehouse"
+            def read_bytes(self, key):
+                seen["key"] = key
+                return raw
+
+        units = _parquet_timestamp_units(
+            _FakeStorage(), "s3://bucket/org/warehouse/t/data.parquet")
+        assert seen["key"] == "t/data.parquet"
+        assert units == {"__timestamp__": "ns"}
+
+    def test_read_schema_presigned_url_via_storage(self, tmp_path):
+        # Presigned HTTP URL with query string (path-style): key recovered, query
+        # dropped, read through storage.
+        p = tmp_path / "data.parquet"
+        _write_ts_parquet(str(p), ts_unit="ns")
+        raw = p.read_bytes()
+        seen = {}
+
+        class _FakeStorage:
+            base_prefix = ""
+            def read_bytes(self, key):
+                seen["key"] = key
+                return raw
+
+        url = ("https://minio:9000/bucket/t/data.parquet"
+               "?X-Amz-Signature=abc&X-Amz-Expires=3600")
+        assert _parquet_timestamp_units(_FakeStorage(), url) == {"__timestamp__": "ns"}
+        assert seen["key"] == "t/data.parquet"
+
+    def test_storage_failure_returns_none(self):
+        class _BoomStorage:
+            base_prefix = ""
+            def read_bytes(self, key):
+                raise RuntimeError("network down")
+
+        assert _parquet_timestamp_units(_BoomStorage(), "s3://b/k.parquet") is None
+
+    # ── end-to-end execute flow ────────────────────────────────────
+
+    @patch.object(SparkThriftExecutor, "_select_cluster")
+    @patch.object(SparkThriftExecutor, "_get_connection")
+    @patch("supertable.engine.spark_thrift._configure_spark_s3")
+    @patch("supertable.engine.spark_thrift._spark_create_parquet_view")
+    @patch("supertable.engine.spark_thrift._spark_rewrite_query", return_value="SELECT 1")
+    def test_execute_wraps_nanos_not_epoch_int(
+        self, mock_rewrite, mock_view, mock_s3, mock_conn, mock_cluster, tmp_path,
+    ):
+        # Real parquet: nanos __timestamp__ + epoch-int created_at (the repro).
+        f = str(tmp_path / "data.parquet")
+        _write_ts_parquet(f, ts_unit="ns")
+
+        mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h", "thrift_port": 10000}
+        fake_cursor = MagicMock()
+        fake_cursor.description = [("col_name",), ("data_type",)]
+        fake_cursor.fetchall.return_value = [
+            ("__timestamp__", "bigint"), ("__rowid__", "bigint"),
+            ("created_at", "bigint"), ("user_id", "bigint"), ("name", "string"),
+        ]
+        fake_conn = MagicMock()
+        fake_conn.cursor.return_value = fake_cursor
+        mock_conn.return_value = fake_conn
+
+        parser = MagicMock()
+        parser.original_query = "SELECT * FROM t"
+        parser.get_table_tuples.return_value = [TableDefinition("s", "t", "t_alias")]
+        reflection = Reflection(
+            storage_type="local", reflection_bytes=100, total_reflections=1,
+            supers=[SuperSnapshot("s", "t", 1, [f], {"user_id", "created_at"})],
+        )
+        SparkThriftExecutor(storage=MagicMock()).execute(
+            reflection, parser, MagicMock(), lambda e: None,
+        )
+
+        all_sql = [c[0][0] for c in fake_cursor.execute.call_args_list]
+        tscast = [s for s in all_sql if "_tscast__" in s and "CREATE OR REPLACE" in s]
+        assert tscast, f"no tscast wrapper view created; SQL issued: {all_sql}"
+        sql = tscast[0]
+        # __timestamp__ (nanos) converted; created_at (epoch int64) left as BIGINT.
+        assert "timestamp_micros(`__timestamp__` DIV 1000) AS `__timestamp__`" in sql
+        assert "`created_at`" in sql
+        assert "timestamp_micros(`created_at`" not in sql
+
+    @patch.object(SparkThriftExecutor, "_select_cluster")
+    @patch.object(SparkThriftExecutor, "_get_connection")
+    @patch("supertable.engine.spark_thrift._configure_spark_s3")
+    @patch("supertable.engine.spark_thrift._spark_create_parquet_view")
+    @patch("supertable.engine.spark_thrift._spark_rewrite_query", return_value="SELECT 1")
+    def test_execute_no_wrapper_for_micros_timestamp(
+        self, mock_rewrite, mock_view, mock_s3, mock_conn, mock_cluster, tmp_path,
+    ):
+        # Micros __timestamp__ reads natively as TIMESTAMP (Spark DESCRIBE shows
+        # 'timestamp'); with no BIGINT parquet-timestamp column, NO wrapper view.
+        f = str(tmp_path / "data.parquet")
+        _write_ts_parquet(f, ts_unit="us")
+
+        mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h"}
+        fake_cursor = MagicMock()
+        fake_cursor.description = [("col_name",), ("data_type",)]
+        fake_cursor.fetchall.return_value = [
+            ("__timestamp__", "timestamp"), ("created_at", "bigint"),
+            ("user_id", "bigint"), ("name", "string"),
+        ]
+        fake_conn = MagicMock()
+        fake_conn.cursor.return_value = fake_cursor
+        mock_conn.return_value = fake_conn
+
+        parser = MagicMock()
+        parser.original_query = "SELECT * FROM t"
+        parser.get_table_tuples.return_value = [TableDefinition("s", "t", "t_alias")]
+        reflection = Reflection(
+            storage_type="local", reflection_bytes=100, total_reflections=1,
+            supers=[SuperSnapshot("s", "t", 1, [f], {"user_id", "created_at"})],
+        )
+        SparkThriftExecutor(storage=MagicMock()).execute(
+            reflection, parser, MagicMock(), lambda e: None,
+        )
+        all_sql = [c[0][0] for c in fake_cursor.execute.call_args_list]
+        assert not any("_tscast__" in s for s in all_sql), \
+            f"unexpected tscast wrapper for a native micros timestamp: {all_sql}"
 
 
 # ═══════════════════════════════════════════════════════════

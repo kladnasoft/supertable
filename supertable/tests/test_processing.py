@@ -22,7 +22,7 @@ DataFrames wherever possible and mocks for storage I/O.
 from __future__ import annotations
 
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Dict, List, Set, Tuple
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -376,6 +376,95 @@ class TestWriteParquetAndCollectResources:
         )
 
         mock_stor.makedirs.assert_called_once_with("/data")
+
+    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_timestamp_rows_spanning_days_write_one_current_time_bucket(
+        self, mock_gs, mock_gen
+    ):
+        """A frame whose ``__timestamp__`` rows span many days must become ONE
+        file under a single Hive bucket derived from the CURRENT write time —
+        not one tiny file per distinct row-day.
+
+        This is the anti-fragmentation contract: per-row bucketing shredded a
+        memory-bounded compaction chunk into one file per day, so merging small
+        files never actually consolidated and the small-file gate stayed tripped.
+        """
+        from supertable.processing import write_parquet_and_collect_resources
+
+        mock_stor = MagicMock()
+        mock_stor.size.return_value = 4096
+        mock_gs.return_value = mock_stor
+
+        # Rows deliberately span three different calendar years.
+        df = _df(
+            __timestamp__=[
+                datetime(2020, 1, 1, tzinfo=timezone.utc),
+                datetime(2021, 6, 15, tzinfo=timezone.utc),
+                datetime(2022, 12, 31, tzinfo=timezone.utc),
+            ],
+            id=[1, 2, 3],
+        )
+        resources: list = []
+
+        fixed = datetime(2026, 6, 30, 12, 0, 0, tzinfo=timezone.utc)
+        with patch(f"{_MOD}.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            write_parquet_and_collect_resources(
+                write_df=df,
+                overwrite_columns=["id"],
+                data_dir="/data",
+                new_resources=resources,
+            )
+
+        # ONE file, not three (one per row-day) -> consolidation is possible.
+        assert len(resources) == 1
+        path = resources[0]["file"]
+        # Bucket reflects the current write time, NOT any row's __timestamp__.
+        assert "year=2026" in path
+        assert "month=06" in path
+        assert "day=30" in path
+        for foreign in ("year=2020", "year=2021", "year=2022"):
+            assert foreign not in path, f"row-day {foreign} leaked into shard path {path}"
+
+    @patch(f"{_MOD}._get_storage")
+    def test_timestamp_preserved_in_body_no_partition_column_leak(
+        self, mock_gs, tmp_path
+    ):
+        """Real round-trip: the shard folder is path-only.  ``__timestamp__``
+        stays in the file body (it is the dedup ORDER BY key) and the Hive
+        ``year/month/day`` keys are NEVER materialized as body columns."""
+        from supertable.processing import write_parquet_and_collect_resources
+        from supertable.storage.local_storage import LocalStorage
+
+        mock_gs.return_value = LocalStorage()
+
+        df = _df(
+            __timestamp__=[
+                datetime(2020, 1, 1, tzinfo=timezone.utc),
+                datetime(2022, 12, 31, tzinfo=timezone.utc),
+            ],
+            id=[1, 2],
+            val=["a", "b"],
+        )
+        resources: list = []
+        write_parquet_and_collect_resources(
+            write_df=df,
+            overwrite_columns=["id"],
+            data_dir=str(tmp_path),
+            new_resources=resources,
+        )
+
+        assert len(resources) == 1
+        written = pl.read_parquet(resources[0]["file"])
+        # Body keeps __timestamp__ and the user columns ...
+        assert "__timestamp__" in written.columns
+        assert set(written.columns) == {"__timestamp__", "id", "val"}
+        # ... but never the Hive partition keys.
+        for leaked in ("year", "month", "day"):
+            assert leaked not in written.columns
+        # All rows survived as a single file.
+        assert written.height == 2
 
 
 # ===========================================================================

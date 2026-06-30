@@ -259,6 +259,157 @@ def _spark_create_tombstone_view(
     cursor.execute(sql)
 
 
+# ---------------------------------------------------------------------------
+# Timestamp-cast wrapper: detect timestamp columns by PARQUET logical type
+# ---------------------------------------------------------------------------
+#
+# When ``spark.sql.legacy.parquet.nanosAsLong=true`` Spark reads a
+# TIMESTAMP(NANOS) parquet column as BIGINT (epoch nanoseconds) instead of
+# failing, so we wrap the view to convert those back to TIMESTAMP.  The columns
+# to convert are found by their ACTUAL parquet logical type (read from the file
+# footer), NEVER by name: an epoch-integer column merely *named* like a
+# timestamp (``created_at`` holding epoch-ms, ``source_ts_ms``) is a plain INT64
+# with no timestamp logical type, so it must stay BIGINT.  Casting it — as the
+# old name heuristic did — both corrupts its value and breaks expressions like
+# ``FROM_UNIXTIME(created_at / 1000.0)`` that need a number, not a TIMESTAMP.
+
+
+def _read_parquet_schema(storage, original_path: str):
+    """Read one parquet file's schema (footer only); return a ``pyarrow.Schema``.
+
+    Returns ``None`` if the schema can't be read.  *original_path* is a snapshot
+    file path (``sup.files`` — a local path, an ``s3://``/``s3a://`` URL, or a
+    presigned ``http(s)://`` URL), NOT the s3a form handed to Spark.
+
+      * Local file   → footer-only read straight from disk.
+      * Object store → the bucket/key is recovered from the path (reusing
+        :func:`_to_s3a_path`, which drops any presign query string and decodes
+        percent-escapes) and the object is pulled through *storage*, which holds
+        the endpoint/credentials.  The whole object is fetched (the storage
+        abstraction exposes no range read), but only once per table.
+    """
+    if not original_path:
+        return None
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception:
+        return None
+
+    s3a = _to_s3a_path(original_path)
+    if not s3a.startswith("s3a://"):
+        # Local filesystem path: pyarrow reads only the footer from the path.
+        try:
+            if os.path.isfile(original_path):
+                return pq.read_schema(original_path)
+        except Exception:
+            return None
+        return None
+
+    if storage is None:
+        return None
+    # s3a://bucket/full_key  →  bucket + object key (key already includes any
+    # base_prefix).  ``storage.read_bytes`` re-applies base_prefix and uses its
+    # own bucket, so strip base_prefix from the key here to avoid doubling it.
+    rest = s3a[len("s3a://"):]
+    _bucket, _, full_key = rest.partition("/")
+    if not full_key:
+        return None
+    base = (getattr(storage, "base_prefix", "") or "").strip("/")
+    rel_key = full_key
+    if base and full_key.startswith(base + "/"):
+        rel_key = full_key[len(base) + 1:]
+    try:
+        data = storage.read_bytes(rel_key)
+        return pq.read_schema(pa.BufferReader(data))
+    except Exception:
+        return None
+
+
+def _parquet_timestamp_units(storage, original_path: str) -> Optional[Dict[str, str]]:
+    """Map ``column -> parquet timestamp unit`` ('s'/'ms'/'us'/'ns') for every
+    column whose PARQUET logical type is a timestamp.
+
+    Returns ``None`` when the footer can't be read — the caller then casts only
+    ``__timestamp__`` (never the name heuristic).
+    """
+    schema = _read_parquet_schema(storage, original_path)
+    if schema is None:
+        return None
+    try:
+        import pyarrow.types as patypes
+        units: Dict[str, str] = {}
+        for i in range(len(schema)):
+            field = schema.field(i)
+            if patypes.is_timestamp(field.type):
+                units[field.name] = getattr(field.type, "unit", "us") or "us"
+        return units
+    except Exception:
+        return None
+
+
+def _ts_to_timestamp_expr(col_name: str, unit: str) -> str:
+    """Spark expression reinterpreting a BIGINT epoch column as TIMESTAMP.
+
+    Uses the explicit ``timestamp_seconds/millis/micros`` builtins rather than
+    ``CAST(x AS TIMESTAMP)``: the cast's numeric→timestamp behaviour is both
+    seconds-based AND gated behind ``spark.sql.legacy.allowCastNumericToTimestamp``
+    in Spark 3.x, whereas the builtins are always enabled and unambiguous about
+    the source unit.  Nanoseconds have no Spark timestamp type, so they are
+    reduced to microseconds with integer division (``DIV 1000``) first.
+    """
+    q = f"`{col_name}`"
+    if unit == "s":
+        expr = f"timestamp_seconds({q})"
+    elif unit == "ms":
+        expr = f"timestamp_millis({q})"
+    elif unit == "us":
+        expr = f"timestamp_micros({q})"
+    else:  # 'ns' or unknown: nanoseconds is the only unit Spark surfaces as BIGINT
+        expr = f"timestamp_micros({q} DIV 1000)"
+    return f"{expr} AS {q}"
+
+
+def _build_tscast_select(desc_rows, ts_units: Optional[Dict[str, str]]):
+    """Build the projection for the timestamp-cast wrapper view.
+
+    *desc_rows* is Spark ``DESCRIBE`` output (rows whose first two items are the
+    column name and Spark type).  *ts_units* maps each genuine parquet-timestamp
+    column to its unit, or is ``None`` when the footer couldn't be read.
+
+    A column is converted back to TIMESTAMP iff Spark surfaces it as BIGINT AND
+    it is a genuine parquet timestamp (under ``nanosAsLong`` only NANOS columns
+    appear as BIGINT); every other column passes through untouched.  When
+    *ts_units* is ``None`` the only column treated as a timestamp is the system
+    column ``__timestamp__`` (assumed nanoseconds — a non-nanos timestamp would
+    already read as TIMESTAMP, not BIGINT), never the name heuristic, so
+    epoch-integer columns are always left as BIGINT.
+
+    Returns ``(select_parts, cast_cols)``.
+    """
+    if ts_units is None:
+        ts_units = {"__timestamp__": "ns"}
+    select_parts: List[str] = []
+    cast_cols: List[str] = []
+    for row in desc_rows or []:
+        if not row:
+            continue
+        col_name = str(row[0])
+        if not col_name or col_name.startswith("#"):
+            # Skip blank / partition-metadata rows Spark DESCRIBE may append.
+            continue
+        col_type = (
+            str(row[1]).strip().upper()
+            if len(row) > 1 and row[1] is not None else ""
+        )
+        if col_type == "BIGINT" and col_name in ts_units:
+            select_parts.append(_ts_to_timestamp_expr(col_name, ts_units[col_name]))
+            cast_cols.append(col_name)
+        else:
+            select_parts.append(f"`{col_name}`")
+    return select_parts, cast_cols
+
+
 def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
@@ -635,6 +786,10 @@ class SparkThriftExecutor:
             }
             table_defs = parser.get_table_tuples()
             alias_to_table_name: Dict[str, str] = {}
+            # table_name -> a representative ORIGINAL (pre-s3a) snapshot file,
+            # used to read the parquet footer once per table for type-based
+            # timestamp detection in step 4a below.
+            table_repr_file: Dict[str, str] = {}
 
             for td in table_defs:
                 key = (td.super_name, td.simple_name)
@@ -645,6 +800,11 @@ class SparkThriftExecutor:
                 table_name = _spark_table_name(
                     sup.super_name, sup.simple_name, sup.simple_version,
                 )
+
+                # Keep one ORIGINAL (pre-s3a) file per table for the footer read
+                # that drives type-based timestamp detection (step 4a).
+                if sup.files and table_name not in table_repr_file:
+                    table_repr_file[table_name] = sup.files[0]
 
                 # Convert to s3a:// paths for Spark (handles s3://, presigned HTTP URLs, etc.)
                 files = [_to_s3a_path(f) for f in sup.files]
@@ -667,47 +827,36 @@ class SparkThriftExecutor:
 
             timer_capture("CREATING_REFLECTION")
 
-            # 4a. Wrap parquet views to CAST nanosecond-epoch BIGINT columns
+            # 4a. Wrap parquet views to convert nanosecond-epoch BIGINT columns
             #     back to TIMESTAMP.  When nanosAsLong=true, Spark reads
-            #     TIMESTAMP(NANOS, false) parquet columns as BIGINT (epoch
-            #     nanoseconds).  Downstream queries expect DATE/TIMESTAMP
-            #     semantics (e.g. WHERE stat_date >= CURRENT_DATE - INTERVAL
-            #     '7' DAYS), so we create a wrapper view that converts them.
-            #     The wrapper replaces the original view name in alias_to_table_name
-            #     so all downstream logic (RBAC, dedup, tombstone, user query)
-            #     sees proper TIMESTAMP columns.
+            #     TIMESTAMP(NANOS) parquet columns as BIGINT (epoch nanoseconds);
+            #     genuine micros/millis timestamps already read as TIMESTAMP and
+            #     need no wrapper.  Downstream queries expect DATE/TIMESTAMP
+            #     semantics (e.g. WHERE stat_date >= CURRENT_DATE - INTERVAL '7'
+            #     DAYS), so we wrap the view to convert the BIGINT-surfaced ones.
+            #     Conversion targets are detected by ACTUAL parquet logical type
+            #     (read once per table from the file footer), never by name — so
+            #     epoch-integer columns named like timestamps (created_at,
+            #     source_ts_ms) stay BIGINT.  If the footer can't be read we
+            #     convert only the system column __timestamp__ (never the name
+            #     heuristic).  The wrapper replaces the view name in
+            #     alias_to_table_name so all downstream logic (RBAC, dedup,
+            #     tombstone, user query) sees proper TIMESTAMP columns.
+            _ts_units_cache: Dict[str, Optional[Dict[str, str]]] = {}
             for alias, table_name in list(alias_to_table_name.items()):
                 try:
                     cursor.execute(f"DESCRIBE {table_name}")
                     desc_rows = cursor.fetchall()
 
-                    # Identify BIGINT columns that look like nanosecond timestamps.
-                    # Heuristic: column name contains 'date', 'time', 'timestamp',
-                    # '_at', '_ts', or is exactly '__timestamp__'.
-                    _ts_patterns = ('date', 'time', 'timestamp', '_at', '_ts')
-                    cast_cols = []
-                    for row in desc_rows:
-                        col_name = str(row[0])
-                        col_type = str(row[1]).strip().upper()
-                        if col_type != 'BIGINT':
-                            continue
-                        col_lower = col_name.lower()
-                        if col_lower == '__timestamp__' or any(p in col_lower for p in _ts_patterns):
-                            cast_cols.append(col_name)
+                    if table_name not in _ts_units_cache:
+                        _ts_units_cache[table_name] = _parquet_timestamp_units(
+                            self.storage, table_repr_file.get(table_name),
+                        )
+                    ts_units = _ts_units_cache[table_name]
+
+                    select_parts, cast_cols = _build_tscast_select(desc_rows, ts_units)
 
                     if cast_cols:
-                        # Build SELECT with CASTs for timestamp columns, pass-through for others
-                        select_parts = []
-                        for row in desc_rows:
-                            col_name = str(row[0])
-                            if col_name in cast_cols:
-                                # nanos → micros → TIMESTAMP
-                                select_parts.append(
-                                    f"CAST(`{col_name}` / 1000000 AS TIMESTAMP) AS `{col_name}`"
-                                )
-                            else:
-                                select_parts.append(f"`{col_name}`")
-
                         wrapper_name = f"__{table_name}_tscast__"
                         wrapper_sql = (
                             f"CREATE OR REPLACE TEMPORARY VIEW {wrapper_name} AS "
@@ -718,15 +867,16 @@ class SparkThriftExecutor:
                         alias_to_table_name[alias] = wrapper_name
 
                         logger.debug(
-                            f"{log_prefix}[spark.thrift] CAST wrapper for {table_name}: "
-                            f"converted {len(cast_cols)} column(s): {cast_cols}"
+                            f"{log_prefix}[spark.thrift] timestamp wrapper for {table_name}: "
+                            f"converted {len(cast_cols)} parquet-timestamp column(s) "
+                            f"{cast_cols} back to TIMESTAMP"
                         )
                 except Exception as cast_err:
-                    # Non-fatal: if DESCRIBE or CAST fails, the original view
-                    # stays in place.  The query may still fail with a type
+                    # Non-fatal: if DESCRIBE or the wrapper fails, the original
+                    # view stays in place.  The query may still fail with a type
                     # mismatch, but at least we don't break the happy path.
                     logger.debug(
-                        f"{log_prefix}[spark.thrift] timestamp CAST wrapper "
+                        f"{log_prefix}[spark.thrift] timestamp wrapper "
                         f"failed for {table_name} (non-fatal): {cast_err}"
                     )
 

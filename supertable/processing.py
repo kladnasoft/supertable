@@ -418,6 +418,7 @@ def compact_resources(
         table_config: Optional[dict] = None,
         small_only: bool = True,
         dead_rowids: Optional[Set[int]] = None,
+        profiler: Optional[Profiler] = None,
 ) -> Tuple[int, int, List[Dict], Set[str]]:
     """Compact small parquet files in a snapshot's resources list.
 
@@ -444,6 +445,12 @@ def compact_resources(
             files contain no logically-deleted rows. Used by ``export_to``
             to bake the deletion-vector into a standalone copy. ``None``
             (default) preserves every row.
+        profiler: optional :class:`Profiler`.  When supplied, the reads of
+            the small candidate files and the writes of the merged chunks are
+            counted into the shared ``files_read``/``bytes_read``/
+            ``files_written``/``bytes_written`` counters and ``io.*`` spans, so
+            the auto-compaction I/O is attributable per write (the write path
+            passes the live profiler; ``None`` -> no instrumentation).
 
     Returns:
         A 4-tuple ``(considered, total_rows, new_resources, sunset_files)``:
@@ -477,6 +484,7 @@ def compact_resources(
         read fails (``_read_parquet_safe`` returns ``None``), the file
         is left in the snapshot — the next compaction retries it.
     """
+    p = profiler or get_null_profiler()
     resources = snapshot.get("resources") or []
     if not resources:
         return 0, 0, [], set()
@@ -506,8 +514,9 @@ def compact_resources(
     chunk_size_bytes = 0
     chunk_df: Optional[polars.DataFrame] = None
 
+    p.add("compact_small_candidates", len(candidates))
     for file_path, file_size in candidates:
-        existing_df = _read_parquet_safe(file_path)
+        existing_df = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
         if existing_df is None:
             # Race: another writer already sunset this file. Skip and
             # leave it out of sunset_files — the snapshot still
@@ -547,6 +556,7 @@ def compact_resources(
                 data_dir=data_dir,
                 new_resources=new_resources,
                 compression_level=compression_level,
+                profiler=p,
             )
             chunk_df = None
             chunk_size_bytes = 0
@@ -560,6 +570,7 @@ def compact_resources(
             data_dir=data_dir,
             new_resources=new_resources,
             compression_level=compression_level,
+            profiler=p,
         )
 
     return len(sunset_files), total_rows, new_resources, sunset_files
@@ -574,67 +585,59 @@ def write_parquet_and_collect_resources(
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
 ):
-    """Write a DataFrame as one or more Parquet files and append resource dicts.
+    """Write a DataFrame as a single Parquet file and append a resource dict.
 
-    Partitioning strategy:
-      - If ``__timestamp__`` is present and non-null, rows are split by
-        year/month/day and each partition is written into a Hive-style
-        subdirectory: ``data_dir/year=YYYY/month=MM/day=DD/``.
-      - Rows where ``__timestamp__`` is null (if any) are written to the
-        flat ``data_dir/`` for safety.
-      - If ``__timestamp__`` is absent (table has no dedup-on-read), the
-        entire DataFrame is written to the flat ``data_dir/`` as before.
+    Sharding strategy:
+      - If ``__timestamp__`` is present, the file is written into a Hive-style
+        subdirectory ``data_dir/year=YYYY/month=MM/day=DD/`` whose date is the
+        CURRENT write time — a single bucket for the whole frame, NOT a per-row
+        split.  The folder only bounds how many files accumulate per directory;
+        it is never read back as data.
+      - If ``__timestamp__`` is absent (table has no dedup-on-read), the frame
+        is written to the flat ``data_dir/`` as before.
 
-    The partition columns are derived from the path only — they are NOT
-    stored as extra columns inside the Parquet file.  This keeps full
-    backward compatibility: the resource ``file`` path is still the only
-    thing the read side needs.
+    The folder is sharding metadata only: its date is derived from the path, the
+    partition keys are NOT stored as columns inside the Parquet file, and the
+    read side passes ``partitioning=None`` so they are never inferred either —
+    the resource ``file`` path is the only thing the read side needs.  Crucially
+    the bucket is NOT derived from each row's ``__timestamp__``: a compaction
+    chunk whose rows span many days is still written as one file (it would
+    otherwise be shredded into one tiny file per day, defeating compaction).
+    ``__timestamp__`` itself stays in the body untouched.
     """
     if write_df.height == 0:
         return
 
-    # --- Partitioned write path: split by __timestamp__ day ------------
+    # --- Sharded write path: one current-time bucket, one file ----------
+    # When ``__timestamp__`` is present the file is placed under a Hive-style
+    # ``year=YYYY/month=MM/day=DD/`` folder.  That folder is PURELY a sharding
+    # device to bound how many files pile up in a single directory — it is NOT
+    # semantic: the read side passes ``partitioning=None`` (local_storage.py) and
+    # locates every file by its resource path, never by the folder.  The bucket
+    # is therefore derived from the CURRENT write time, NOT from each row's
+    # ``__timestamp__``.
+    #
+    # Deriving it per-row (the old behaviour) shredded a memory-bounded compaction
+    # chunk back into one tiny file per distinct row-day: merging small files whose
+    # rows span N days emitted N small files instead of one ~16 MB file, so
+    # compaction could never actually consolidate and the small-file gate stayed
+    # permanently tripped.  Writing the whole chunk into a single current-time
+    # bucket keeps it one ~chunk-sized file regardless of how many days its rows
+    # span.  ``__timestamp__`` is untouched in the body — it stays the dedup
+    # ORDER BY key and is hidden from query output by the read view's EXCLUDE
+    # projection; only the *external folder* stops tracking it.
     if "__timestamp__" in write_df.columns:
-        # Add temporary partition-key columns derived from __timestamp__
-        partitioned = write_df.with_columns([
-            polars.col("__timestamp__").dt.year().alias("__p_year__"),
-            polars.col("__timestamp__").dt.month().alias("__p_month__"),
-            polars.col("__timestamp__").dt.day().alias("__p_day__"),
-        ])
-
-        # Separate rows with null timestamps (defensive — shouldn't happen
-        # in normal flow because data_writer always injects a non-null value)
-        null_mask = (
-            polars.col("__p_year__").is_null()
-            | polars.col("__p_month__").is_null()
-            | polars.col("__p_day__").is_null()
+        now = datetime.now(timezone.utc)
+        partition_dir = os.path.join(
+            data_dir,
+            f"year={now.year}",
+            f"month={now.month:02d}",
+            f"day={now.day:02d}",
         )
-        has_nulls = partitioned.filter(null_mask).height > 0
-
-        if has_nulls:
-            null_df = partitioned.filter(null_mask).drop(["__p_year__", "__p_month__", "__p_day__"])
-            _write_single_parquet_file(null_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
-            partitioned = partitioned.filter(~null_mask)
-
-        if partitioned.height > 0:
-            # partition_by returns a list of DataFrames, one per unique (year, month, day)
-            groups = partitioned.partition_by(["__p_year__", "__p_month__", "__p_day__"], maintain_order=False)
-            for group_df in groups:
-                year = int(group_df["__p_year__"][0])
-                month = int(group_df["__p_month__"][0])
-                day = int(group_df["__p_day__"][0])
-                group_df = group_df.drop(["__p_year__", "__p_month__", "__p_day__"])
-
-                partition_dir = os.path.join(
-                    data_dir,
-                    f"year={year}",
-                    f"month={month:02d}",
-                    f"day={day:02d}",
-                )
-                _write_single_parquet_file(
-                    group_df, overwrite_columns, partition_dir, new_resources, compression_level,
-                    profiler=profiler, footer_md_out=footer_md_out,
-                )
+        _write_single_parquet_file(
+            write_df, overwrite_columns, partition_dir, new_resources, compression_level,
+            profiler=profiler, footer_md_out=footer_md_out,
+        )
     else:
         # --- Flat write path (no __timestamp__) — backward compatible ---
         _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
