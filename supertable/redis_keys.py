@@ -756,7 +756,7 @@ def linked_share_doc(org: str, sup: str, link_id: str) -> str:
 def quality_prefix(org: str, sup: str) -> str:
     """Per-supertable data-quality namespace prefix (with trailing colon).
 
-    The dataisland-core quality module appends its own sub-keys to
+    The ``supertable.quality`` module appends its own sub-keys to
     this prefix (e.g. ``config:__global__``, ``rules:index``,
     ``rules:doc:{rule_id}``, ``schedule:{table}``, ``latest:{table}``,
     ``history``, ``pending:{table}``, ``running:{table}``,

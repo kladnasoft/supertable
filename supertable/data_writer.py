@@ -1095,19 +1095,24 @@ class DataWriter:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
         # ---------- DATA QUALITY: notify scheduler of new data ----------
-        # Sets a debounced "pending" flag in Redis.  The DQ scheduler will
-        # pick it up on the next tick, respecting lock + cooldown rules.
-        # Safe to call at any frequency — never blocks or fails the write.
+        # Producer side of the DQ pipeline: set a debounced "pending" flag in
+        # Redis so the background scheduler (started via
+        # ``supertable.quality.start_scheduler``) picks this table up on its
+        # next tick, respecting debounce + lock + cooldown.  ``notify_ingest``
+        # has its own internal guard and never raises; the outer guard here
+        # only covers an unexpected import-time failure so a write can never
+        # fail due to quality scheduling.  We log (not silently ``pass``) so a
+        # future packaging regression is visible instead of a dead no-op.
         try:
-            from supertable.services.quality.scheduler import notify_ingest
+            from supertable.quality.scheduler import notify_ingest
             notify_ingest(
                 self.catalog.r,
                 self.super_table.organization,
                 self.super_table.super_name,
                 simple_name,
             )
-        except Exception:
-            pass  # Never fail a write due to quality scheduling
+        except Exception as qe:
+            logger.warning(lp(f"data-quality notify_ingest skipped: {qe}"))
 
         # ---------- AUDIT LOG ----------
         try:
