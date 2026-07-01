@@ -23,7 +23,13 @@ import polars as pl
 import pytest
 
 from supertable import processing
-from supertable.processing import load_stats, cache_stats, STATS_SCHEMA, _STATS_CACHE
+from supertable.processing import (
+    load_stats,
+    cache_stats,
+    build_stats_file,
+    STATS_SCHEMA,
+    _STATS_CACHE,
+)
 
 _MOD = "supertable.processing"
 
@@ -37,6 +43,43 @@ def _df(n: int = 1) -> pl.DataFrame:
     base["max_bigint"] = [n]
     base["stats_available"] = [True]
     return pl.DataFrame(base, schema=STATS_SCHEMA)
+
+
+def _full_stats_df(file_path: str, value: int) -> pl.DataFrame:
+    """A stats frame with every STATS_SCHEMA column populated (build-ready)."""
+    base = {k: [None] for k in STATS_SCHEMA}
+    base["file_path"] = [file_path]
+    base["row_group_id"] = [0]
+    base["column_name"] = ["a"]
+    base["physical_type"] = ["INT64"]
+    base["logical_type"] = [""]
+    base["min_bigint"] = [value]
+    base["max_bigint"] = [value]
+    base["null_count"] = [0]
+    base["row_group_rows"] = [1]
+    base["stats_available"] = [True]
+    base["min_is_exact"] = [True]
+    base["max_is_exact"] = [True]
+    return pl.DataFrame(base, schema=STATS_SCHEMA)
+
+
+class _FakeStorage:
+    """Minimal in-memory backend for build_stats_file's write of the new file."""
+
+    def __init__(self):
+        self.store: dict = {}
+
+    def exists(self, path: str) -> bool:
+        return path in self.store
+
+    def makedirs(self, path: str) -> None:
+        pass
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.store[path] = data
+
+    def size(self, path: str) -> int:
+        return len(self.store[path])
 
 
 @pytest.fixture(autouse=True)
@@ -150,3 +193,50 @@ class TestCacheBounds:
                 load_stats("t/stats/v1.parquet")
                 load_stats("t/stats/v1.parquet")
                 assert mock_read.call_count == 2  # never cached
+
+
+class TestBuildStatsFileUsesCache:
+    """Change 1: build_stats_file reads the previous stats through the cache
+    (load_stats), so a process writing in a loop needs no storage GET for the
+    carry-forward once the cache is warm — seeded by the prune phase of the same
+    write or by the prior write's cache_stats."""
+
+    @patch(f"{_MOD}._get_storage")
+    def test_warm_cache_prev_read_is_a_hit_no_storage_read(self, mock_gs):
+        mock_gs.return_value = _FakeStorage()
+        prev_path = "t/stats/prev.parquet"
+        # Warm the cache exactly as the write path does (prune phase / prior write).
+        cache_stats(prev_path, _full_stats_df("fileA.parquet", 1))
+
+        with patch(f"{_MOD}._read_parquet_safe") as mock_read:
+            path, combined = build_stats_file(
+                stats_dir="t/stats",
+                prev_stats_path=prev_path,
+                new_rows=_full_stats_df("fileB.parquet", 2),
+                removed_files=set(),
+                compression_level=1,
+            )
+            # The previous stats came from memory → zero storage reads.
+            mock_read.assert_not_called()
+
+        assert path != prev_path  # a NEW versioned artifact was written
+        assert set(combined["file_path"].to_list()) == {"fileA.parquet", "fileB.parquet"}
+
+    @patch(f"{_MOD}._get_storage")
+    def test_cold_cache_reads_prev_once(self, mock_gs):
+        # Negative control: with an EMPTY cache the same build DOES read prev
+        # exactly once — proving the warm-cache assertion above is not vacuous.
+        mock_gs.return_value = _FakeStorage()
+        prev_path = "t/stats/prev.parquet"
+        with patch(
+            f"{_MOD}._read_parquet_safe",
+            return_value=_full_stats_df("fileA.parquet", 1),
+        ) as mock_read:
+            build_stats_file(
+                stats_dir="t/stats",
+                prev_stats_path=prev_path,
+                new_rows=_full_stats_df("fileB.parquet", 2),
+                removed_files=set(),
+                compression_level=1,
+            )
+            assert mock_read.call_count == 1  # cold cache → exactly one GET

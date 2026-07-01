@@ -299,6 +299,12 @@ class Settings:
     # always read fresh and never cached).  0 disables caching.
     SUPERTABLE_STATS_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_STATS_CACHE_MAX_TABLES
 
+    # Max number of tables whose *latest* tombstone (deletion-vector) artifact is
+    # held in the in-process tombstone cache (one DataFrame per table; older
+    # versions are always read fresh and never cached).  Mirrors the stats cache
+    # so a process writing in a loop skips the carry-forward read.  0 disables.
+    SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES
+
     # Read-path file pruning: when True the estimator uses the stats artifact to
     # drop parquet files that provably can't satisfy a query's WHERE predicates.
     # Conservative (never drops a file that could match); set False to disable.
@@ -560,6 +566,7 @@ def _build_settings() -> Settings:
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
 
         # ── Audit ────────────────────────────────────────────────────

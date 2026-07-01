@@ -34,6 +34,8 @@ from supertable.processing import (
     prune_overlapping_files_by_stats,
     load_stats,
     cache_stats,
+    load_tombstone,
+    cache_tombstone,
     write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
@@ -525,8 +527,13 @@ class DataWriter:
                 # required=True: a DV that exists but cannot be read must abort
                 # the write, never be treated as empty — silently dropping the
                 # carried-forward vector would resurrect previously deleted rows.
+                # Cache-first: if this process wrote the table on a prior loop
+                # iteration, the current deletion-vector is already in memory
+                # (seeded below after the pointer is pinned), so this is a hit
+                # with no storage round-trip.  required=True preserves the
+                # carry-forward safety on a genuine miss (abort, never truncate).
                 prev_dv_df = (
-                    _read_parquet_safe(prev_tombstone_path, profiler=profiler, required=True)
+                    load_tombstone(prev_tombstone_path, allow_cache=True, required=True, profiler=profiler)
                     if prev_tombstone_path else None
                 )
                 # The rowid set is consumed only by the idempotency filter below,
@@ -790,6 +797,15 @@ class DataWriter:
                 #    and its row count.
                 last_simple_table["tombstone"] = tombstone_path
                 last_simple_table["tombstone_rows"] = tombstone_rows
+                # Seed the in-process cache so the NEXT write's carry-forward read
+                # (prev_dv_df above) is a pure memory hit.  The frame is the fresh
+                # build/reclaim result when this write changed the vector, else the
+                # already-loaded prev frame for a pure carry-forward.  No-op when
+                # the vector was fully consumed this write (tombstone_path is None).
+                cache_tombstone(
+                    tombstone_path,
+                    combined_tombstone_df if combined_tombstone_df is not None else prev_dv_df,
+                )
                 mark("compact_tombstones")
 
                 # Phase B — auto small-file compaction.  Merge the accumulated
@@ -1328,7 +1344,10 @@ class DataWriter:
             # new file while the vector kept pointing at the sunset __file__ —
             # leaving them permanently unreclaimable. Failing loud leaves the
             # prior snapshot + vector intact for a retry, and matches the
-            # write-path carry-forward read (required=True) above.
+            # write-path carry-forward read (required=True) above.  Read directly
+            # (not via the in-process cache): compact() always drains the vector,
+            # so there is no carry-forward hit to gain and it never re-seeds the
+            # cache after draining — the loop-caching win lives on the write path.
             tombstone_df = (
                 _read_parquet_safe(tombstone_path, required=True)
                 if tombstone_path else None

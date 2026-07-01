@@ -24,9 +24,21 @@ from supertable.processing import (
     extract_stats_rows,
     _route_stats,
     _stats_rows_for_metadata,
+    _write_df_parquet,
+    _STATS_CACHE,
 )
 
 _MOD = "supertable.processing"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stats_cache():
+    # build_stats_file now reads the previous stats through the in-process cache
+    # (load_stats).  Clear it around every test so each build reads from its own
+    # seeded fake storage and tests never leak cached frames into one another.
+    _STATS_CACHE.clear()
+    yield
+    _STATS_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -388,3 +400,66 @@ def _serialize(df: pl.DataFrame) -> bytes:
     buf = io.BytesIO()
     pq.write_table(tbl, buf, write_statistics=True)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Change 3: _write_df_parquet returns len(data) on the write_bytes path,
+# skipping the post-PUT size() HEAD round-trip.
+# ---------------------------------------------------------------------------
+
+class _SizeSpyStorage:
+    """write_bytes backend (MinIO/S3/local) that records size() calls."""
+
+    def __init__(self):
+        self.store: dict = {}
+        self.size_calls = 0
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.store[path] = data
+
+    def size(self, path: str) -> int:
+        self.size_calls += 1
+        return len(self.store[path])
+
+
+class _WriteParquetOnlyStorage:
+    """Backend WITHOUT write_bytes → the re-encoding write_parquet branch, which
+    must still consult size() (len(data) would not match the on-disk object)."""
+
+    def __init__(self):
+        self.store: dict = {}
+        self.size_calls = 0
+
+    def write_parquet(self, arrow_tbl, path: str) -> None:
+        buf = io.BytesIO()
+        pq.write_table(arrow_tbl, buf)
+        self.store[path] = buf.getvalue()
+
+    def size(self, path: str) -> int:
+        self.size_calls += 1
+        return len(self.store[path])
+
+
+class TestWriteDfParquetSize:
+
+    @patch(f"{_MOD}._get_storage")
+    def test_write_bytes_returns_len_data_without_size_head(self, mock_gs):
+        stor = _SizeSpyStorage()
+        mock_gs.return_value = stor
+        df = pl.DataFrame({"__file__": ["a.parquet"], "__rowid__": [1]})
+        n = _write_df_parquet(df, "t/tombstone/x.parquet", compression_level=1)
+        assert "t/tombstone/x.parquet" in stor.store
+        # Returned size is exactly the bytes we PUT …
+        assert n == len(stor.store["t/tombstone/x.parquet"])
+        # … and it came from len(data), NOT a follow-up size() HEAD.
+        assert stor.size_calls == 0
+
+    @patch(f"{_MOD}._get_storage")
+    def test_write_parquet_branch_still_uses_size(self, mock_gs):
+        stor = _WriteParquetOnlyStorage()
+        mock_gs.return_value = stor
+        df = pl.DataFrame({"__file__": ["a.parquet"], "__rowid__": [1]})
+        n = _write_df_parquet(df, "t/tombstone/y.parquet", compression_level=1)
+        # No write_bytes → we can't assume len(data) == object size → size() used.
+        assert stor.size_calls == 1
+        assert n == len(stor.store["t/tombstone/y.parquet"])

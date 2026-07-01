@@ -9,13 +9,13 @@ import threading
 import uuid
 from collections import OrderedDict
 from datetime import datetime, date, timezone
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Callable, Dict, List, Set, Tuple, Optional
 
 import polars
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from supertable.utils.helper import generate_filename
+from supertable.utils.helper import generate_filename, hourly_partition_subpath
 from supertable.config.defaults import default
 from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
@@ -893,6 +893,7 @@ def _write_df_parquet(
     """
     p = profiler or get_null_profiler()
     data = None
+    wrote_exact_bytes = False
     try:
         with p.span("tombstone.encode"):
             arrow_tbl = write_df.to_arrow()
@@ -908,12 +909,20 @@ def _write_df_parquet(
             data = buf.getvalue()
         if hasattr(_get_storage(), "write_bytes"):
             _get_storage().write_bytes(path, data)
+            # We PUT exactly these bytes, so len(data) IS the object size —
+            # no need for a follow-up size() HEAD round-trip below.
+            wrote_exact_bytes = True
         elif hasattr(_get_storage(), "write_parquet"):
             _get_storage().write_parquet(arrow_tbl, path)
         else:
             write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
     except Exception:
         write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
+    # Fast path: the write_bytes backend (MinIO/S3/local) stored precisely
+    # `data`, so return its length and skip the extra HEAD.  Only the
+    # write_parquet / fallback branches (which may re-encode) consult size().
+    if wrote_exact_bytes and data is not None:
+        return len(data)
     try:
         return int(_get_storage().size(path))
     except Exception:
@@ -1400,6 +1409,27 @@ def resolve_overwrite_writes(
     return filtered, pairs
 
 
+def _partitioned_new_path(base_dir: str, alias: str) -> str:
+    """Return a fresh versioned artifact path under an hour-partitioned subdir.
+
+    Spreads immutable tombstone/stats artifacts across
+    ``<base_dir>/year=YYYY/month=MM/day=DD/hour=HH/`` (UTC) so no single folder
+    accumulates hundreds of thousands of files under heavy writes — which slows
+    directory listing and per-file creation on object stores and real
+    filesystems alike.  The partition subdir is created idempotently (a no-op
+    prefix on object stores); the returned path is stored verbatim in the
+    snapshot metadata, so reads are unaffected and pre-existing flat-layout
+    files need no migration.
+    """
+    part_dir = os.path.join(base_dir, hourly_partition_subpath())
+    try:
+        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
+        _get_storage().makedirs(part_dir)
+    except Exception:
+        pass
+    return os.path.join(part_dir, generate_filename(alias, "parquet"))
+
+
 def build_tombstone_file(
         tombstone_dir: str,
         prev_tombstone_path: Optional[str],
@@ -1450,13 +1480,7 @@ def build_tombstone_file(
 
     combined = combined.unique(subset=[ROWID_COL], keep="first")
 
-    try:
-        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
-        _get_storage().makedirs(tombstone_dir)
-    except Exception:
-        pass
-
-    new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
+    new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     return new_path, combined
 
@@ -1514,13 +1538,7 @@ def reclaim_fully_dead_files(
     if survivors.height == 0:
         return fully_dead, None, None
 
-    try:
-        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
-        _get_storage().makedirs(tombstone_dir)
-    except Exception:
-        pass
-
-    new_path = os.path.join(tombstone_dir, generate_filename("deleted", "parquet"))
+    new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(survivors, new_path, compression_level, profiler=p)
     p.add("reclaimed_dead_files", len(fully_dead))
     return fully_dead, new_path, survivors
@@ -1781,7 +1799,13 @@ def build_stats_file(
     if not has_new and not removed:
         return prev_stats_path, None
 
-    prev_df = _read_parquet_safe(prev_stats_path, profiler=p) if prev_stats_path else None
+    # Serve the previous stats from the in-process cache: the prune phase of
+    # THIS same write already loaded this exact (latest) version via
+    # load_stats(allow_cache=True), so on the warm path this is a memory hit
+    # with no storage round-trip.  prev_stats_path is the table's CURRENT latest
+    # version here, so allow_cache=True is correct; a genuine miss falls through
+    # to a fresh read (identical to the former _read_parquet_safe behaviour).
+    prev_df = load_stats(prev_stats_path, allow_cache=True, profiler=p) if prev_stats_path else None
     if prev_df is not None and prev_df.height > 0 and STATS_FILE_PATH_COL in prev_df.columns:
         kept_prev = prev_df.select(list(STATS_SCHEMA.keys()))
         if removed:
@@ -1795,13 +1819,7 @@ def build_stats_file(
     else:
         combined = new_df
 
-    try:
-        # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
-        _get_storage().makedirs(stats_dir)
-    except Exception:
-        pass
-
-    new_path = os.path.join(stats_dir, generate_filename("stats", "parquet"))
+    new_path = _partitioned_new_path(stats_dir, "stats")
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     p.add("stats_rows_total", int(combined.height))
     return new_path, combined
@@ -2162,12 +2180,14 @@ def prune_files_by_predicates(
 
 
 # ===========================================================================
-# Stats artifact accessor + in-process cache
+# Stats + tombstone artifact accessors + in-process caches
 # ---------------------------------------------------------------------------
 # The stats parquet is read on every overwrite/delete (write-path pruning) and
-# on every filtered read (query estimation).  Re-reading it from object storage
-# each time would defeat the point of having one consolidated artifact, so we
-# keep the *latest* version of each table's stats in memory.
+# on every filtered read (query estimation); the tombstone (deletion-vector)
+# parquet is read on every overwrite/delete to carry the vector forward.
+# Re-reading either from object storage each time would defeat the point of
+# having one consolidated artifact, so we keep the *latest* version of each
+# table's stats — and, symmetrically, its deletion-vector — in memory.
 #
 # Cache semantics (deliberately minimal):
 #   * Keyed by the table's stats directory; each entry holds exactly one
@@ -2181,47 +2201,56 @@ def prune_files_by_predicates(
 #     read is served from memory with no storage round-trip at all.
 # ===========================================================================
 
-class _StatsCache:
-    """Process-wide LRU of each table's latest stats frame (one per table)."""
+class _PathKeyedFrameCache:
+    """Process-wide LRU of each table's latest artifact frame (one per table).
 
-    __slots__ = ("_lock", "_entries")
+    Keyed by the artifact's *directory*; each entry holds exactly one
+    ``(path, DataFrame)`` — the most recent version seen for that table.  A
+    versioned artifact filename is immutable, so a cache hit (cached path ==
+    requested path) can never be stale: a new write produces a NEW path, which
+    misses and reads fresh.  The cap is resolved dynamically per call via
+    *cap_getter* (so a settings change / test patch takes effect immediately);
+    ``<= 0`` disables the cache.  Backs both the stats and tombstone caches.
+    """
 
-    def __init__(self) -> None:
+    __slots__ = ("_lock", "_entries", "_cap_getter")
+
+    def __init__(self, cap_getter: Callable[[], int]) -> None:
         self._lock = threading.Lock()
-        # table_key -> (stats_path, DataFrame)
+        # table_key -> (path, DataFrame)
         self._entries: "OrderedDict[str, Tuple[str, polars.DataFrame]]" = OrderedDict()
+        self._cap_getter = cap_getter
 
     @staticmethod
-    def _key(stats_path: str) -> str:
-        # All versions of a table's stats live in the same stats/ directory.
-        return os.path.dirname(stats_path)
+    def _key(path: str) -> str:
+        # All versions of a table's artifact live in the same directory.
+        return os.path.dirname(path)
 
-    @staticmethod
-    def _cap() -> int:
+    def _cap(self) -> int:
         try:
-            return int(settings.SUPERTABLE_STATS_CACHE_MAX_TABLES)
+            return int(self._cap_getter())
         except Exception:
             return 64
 
-    def get(self, stats_path: str) -> Optional[polars.DataFrame]:
+    def get(self, path: str) -> Optional[polars.DataFrame]:
         """Return the cached frame iff the cached path matches *exactly*."""
         if self._cap() <= 0:
             return None
-        key = self._key(stats_path)
+        key = self._key(path)
         with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and entry[0] == stats_path:
+            if entry is not None and entry[0] == path:
                 self._entries.move_to_end(key)
                 return entry[1]
         return None
 
-    def put(self, stats_path: str, df: polars.DataFrame) -> None:
+    def put(self, path: str, df: polars.DataFrame) -> None:
         cap = self._cap()
         if cap <= 0:
             return
-        key = self._key(stats_path)
+        key = self._key(path)
         with self._lock:
-            self._entries[key] = (stats_path, df)
+            self._entries[key] = (path, df)
             self._entries.move_to_end(key)
             while len(self._entries) > cap:
                 self._entries.popitem(last=False)
@@ -2231,7 +2260,16 @@ class _StatsCache:
             self._entries.clear()
 
 
-_STATS_CACHE = _StatsCache()
+def _stats_cache_cap() -> int:
+    return int(settings.SUPERTABLE_STATS_CACHE_MAX_TABLES)
+
+
+def _tombstone_cache_cap() -> int:
+    return int(settings.SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES)
+
+
+_STATS_CACHE = _PathKeyedFrameCache(_stats_cache_cap)
+_TOMBSTONE_CACHE = _PathKeyedFrameCache(_tombstone_cache_cap)
 
 
 def load_stats(
@@ -2269,6 +2307,53 @@ def cache_stats(stats_path: Optional[str], df: Optional[polars.DataFrame]) -> No
     """
     if stats_path and df is not None:
         _STATS_CACHE.put(stats_path, df)
+
+
+def load_tombstone(
+        tombstone_path: Optional[str],
+        *,
+        allow_cache: bool = True,
+        required: bool = False,
+        profiler: Optional[Profiler] = None,
+) -> Optional[polars.DataFrame]:
+    """Load a table's deletion-vector parquet, serving the latest from memory.
+
+    Symmetric to :func:`load_stats`.  *allow_cache* must be ``True`` only when
+    *tombstone_path* is the table's CURRENT (latest) deletion-vector version —
+    that version is what gets memoised; time-travel/older reads must pass
+    ``allow_cache=False``.
+
+    *required* is forwarded to the reader: when ``True`` a genuine read failure
+    of an object that EXISTS re-raises rather than being swallowed to ``None``
+    (a truncated carried-forward deletion-vector would resurrect deleted rows).
+    Absence still returns ``None``.  A cache hit returns the exact in-memory
+    frame that was previously read/built for this immutable path — never stale,
+    and never an empty truncation — so it satisfies the ``required`` contract.
+    """
+    if not tombstone_path:
+        return None
+    p = profiler or get_null_profiler()
+    cached = _TOMBSTONE_CACHE.get(tombstone_path)
+    if cached is not None:
+        p.add("tombstone_cache_hit", 1)
+        return cached
+    p.add("tombstone_cache_miss", 1)
+    df = _read_parquet_safe(tombstone_path, profiler=p, required=required)
+    if df is not None and allow_cache:
+        _TOMBSTONE_CACHE.put(tombstone_path, df)
+    return df
+
+
+def cache_tombstone(tombstone_path: Optional[str], df: Optional[polars.DataFrame]) -> None:
+    """Seed the cache with a freshly built latest-version deletion-vector frame.
+
+    Called by writers right after the tombstone pointer is finalised so the next
+    write's carry-forward read (this process's next overwrite/delete) needs no
+    storage round-trip.  No-op when the vector was fully consumed this write
+    (``tombstone_path`` is ``None``) or unchanged with no frame in hand.
+    """
+    if tombstone_path and df is not None:
+        _TOMBSTONE_CACHE.put(tombstone_path, df)
 
 
 def compact_tombstones(
