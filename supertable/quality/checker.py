@@ -50,6 +50,31 @@ def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# System columns the merge-on-read write path injects into every data file
+# (``__rowid__`` for the deletion-vector anti-join, ``__timestamp__`` for the
+# dedup / partition key).  They live in the STORED table schema, but the read
+# view strips them (engine_common:
+# ``COLUMNS(c -> c NOT IN ('__rowid__', '__timestamp__'))``), so a profiler that
+# queries THROUGH that view can never select them: referencing one raises a
+# DuckDB binder error and — because the quick profile is a single all-columns
+# SQL — fails the whole check.  Mirrors the read-view EXCLUDE by contract
+# (literals, not imported, to keep this SQL-builder module dependency-light);
+# ``test_quality_checker`` seals them against engine_common.ROWID_COL /
+# TIMESTAMP_COL so the two never drift.
+SYSTEM_COLUMNS = frozenset({"__rowid__", "__timestamp__"})
+
+
+def is_profilable_column(name: str) -> bool:
+    """Return True for a column the DQ profiler may legitimately select.
+
+    Excludes ``_sys_``-prefixed internal columns and the read-view-hidden
+    system columns (``__rowid__`` / ``__timestamp__``): both are present in the
+    stored schema but not exposed by the read path the profiler queries, so
+    profiling them produces SQL that cannot bind.
+    """
+    return not name.startswith("_sys_") and name not in SYSTEM_COLUMNS
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Quick profile SQL builder
 # ──────────────────────────────────────────────────────────────────────
@@ -69,7 +94,7 @@ def build_quick_sql(
     parts = ["COUNT(*) AS __total"]
 
     for col_name, col_type in columns:
-        if col_name.startswith("_sys_"):
+        if not is_profilable_column(col_name):
             continue
         q = _quote(col_name)
         s = _safe_alias(col_name)
@@ -116,7 +141,7 @@ def parse_quick_result(
     col_results = {}
 
     for col_name, col_type in columns:
-        if col_name.startswith("_sys_"):
+        if not is_profilable_column(col_name):
             continue
         s = _safe_alias(col_name)
         cat = _col_category(col_type)

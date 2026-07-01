@@ -325,7 +325,7 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
     from supertable.quality.checker import (
         build_quick_sql, parse_quick_result, build_custom_rule_sql,
-        evaluate_custom_rule, compute_quality_score,
+        evaluate_custom_rule, compute_quality_score, is_profilable_column,
     )
     from supertable.quality.anomaly import detect_anomalies, detect_schema_drift
 
@@ -346,8 +346,11 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             logger.warning(f"[dq-scheduler] No schema for {table_name}")
             return
         schema_dict = schema_raw[0]
+        # Exclude system columns the read view hides (__rowid__/__timestamp__)
+        # plus _sys_ internals: profiling them builds SQL that cannot bind
+        # against the read path and fails the whole quick check.
         columns = [(name, ctype) for name, ctype in schema_dict.items()
-                    if not name.startswith("_sys_")]
+                    if is_profilable_column(name)]
     except Exception as e:
         logger.error(f"[dq-scheduler] Schema read failed for {table_name}: {e}")
         return
@@ -449,6 +452,7 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
     from supertable.quality.checker import (
         build_deep_string_sql, build_deep_numeric_sql, _col_category,
+        is_profilable_column,
     )
 
     try:
@@ -477,7 +481,7 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     table_fqn = f"{sup}.{table_name}"
 
     for col_name, col_type in schema_dict.items():
-        if col_name.startswith("_sys_"):
+        if not is_profilable_column(col_name):
             continue
 
         cat = _col_category(col_type)
