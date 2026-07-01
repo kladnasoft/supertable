@@ -25,7 +25,7 @@ See the ``supertable.demo`` package for runnable end-to-end demos and the
 project documentation for the full API surface.
 """
 
-__version__ = "2.3.8"
+__version__ = "2.3.9"
 
 # Re-export the core public surface so users can do ``from supertable import …``
 # instead of remembering submodule paths.

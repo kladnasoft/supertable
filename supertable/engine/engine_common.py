@@ -215,12 +215,43 @@ def configure_httpfs_and_s3(
     if not for_paths:
         return
 
-    # Load httpfs; install only when not already available.
+    # Load httpfs.  It is baked into the image and seeded into the DuckDB
+    # extension dir (see the container entrypoint), so LOAD normally succeeds
+    # with no network access.
+    #
+    # Why this is NOT a blind ``INSTALL`` fallback: ``INSTALL httpfs`` performs
+    # an HTTP GET to extensions.duckdb.org.  On an offline / firewalled node
+    # that socket can stall for minutes — or hang indefinitely on a blackholed
+    # route — turning a should-be-instant failure into an unbounded query hang.
+    # So we fail fast instead:
+    #   * SET autoinstall_known_extensions=false makes LOAD raise immediately
+    #     when the extension is absent, rather than silently downloading it;
+    #   * a network INSTALL is attempted ONLY when explicitly opted in via
+    #     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD;
+    #   * otherwise we raise a clear, actionable error the caller returns.
+    try:
+        con.execute("SET autoinstall_known_extensions=false;")
+    except Exception:
+        pass
+
     try:
         con.execute("LOAD httpfs;")
-    except Exception:
-        con.execute("INSTALL httpfs;")
-        con.execute("LOAD httpfs;")
+    except Exception as load_err:
+        if settings.SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD:
+            # Operator explicitly allowed reaching the network for a one-off
+            # install (e.g. an online dev box without a baked extension).
+            con.execute("INSTALL httpfs;")
+            con.execute("LOAD httpfs;")
+        else:
+            raise RuntimeError(
+                "DuckDB 'httpfs' extension is not available locally and network "
+                "auto-download is disabled, so this query cannot run. Bake/seed "
+                "httpfs into "
+                f"'{get_app_home()}/.duckdb/extensions/v<duckdb_version>/<platform>/' "
+                "(the container entrypoint restores it from /opt/duckdb-extensions), "
+                "or set SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=true to permit a "
+                f"one-time online install. Underlying DuckDB error: {load_err}"
+            ) from load_err
 
     any_s3 = any(str(p).lower().startswith("s3://") for p in for_paths)
     any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
@@ -633,6 +664,17 @@ def init_connection(
         con.execute(f"SET home_directory='{get_app_home()}';")
     except Exception as e:
         logger.warning(f"[duckdb.init] home_directory pin failed: {e}")
+
+    # Never let DuckDB auto-DOWNLOAD an extension.  Everything we need (httpfs)
+    # is baked/seeded into the local extension dir; an implicit network install
+    # would reach out to extensions.duckdb.org and can hang for minutes on an
+    # offline/firewalled node — turning a should-be-instant error into an
+    # unbounded query hang.  configure_httpfs_and_s3() owns the explicit,
+    # opt-in install path (SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD).
+    try:
+        con.execute("SET autoinstall_known_extensions=false;")
+    except Exception as e:
+        logger.debug(f"[duckdb.init] disabling extension auto-install failed: {e}")
 
     # Resolve memory limit.
     # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
