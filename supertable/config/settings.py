@@ -157,6 +157,14 @@ class Settings:
     SUPERTABLE_DUCKDB_MATERIALIZE: str = "view"    # SUPERTABLE_DUCKDB_MATERIALIZE
     SUPERTABLE_DUCKDB_PRESIGNED: bool = False      # SUPERTABLE_DUCKDB_PRESIGNED
     SUPERTABLE_DUCKDB_USE_HTTPFS: bool = False     # SUPERTABLE_DUCKDB_USE_HTTPFS
+    # Allow DuckDB to DOWNLOAD a missing extension (httpfs) from
+    # extensions.duckdb.org at query time.  Default OFF: httpfs is baked into
+    # the image and seeded into the extension dir, and an implicit network
+    # install on an offline/firewalled node can hang for minutes instead of
+    # failing.  When OFF, a genuinely missing extension raises immediately with
+    # an actionable message; set ON only on a networked box that must
+    # self-install.
+    SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
     # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
     # Disabled by default: the polars fallback reads only the projected key
     # columns through the storage SDK and needs no httpfs extension, so it works
@@ -444,6 +452,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
+        SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
