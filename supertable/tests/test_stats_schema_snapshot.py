@@ -40,6 +40,7 @@ _EXPECTED_SCHEMA: list[tuple[str, pl.DataType]] = [
     ("max_string", pl.Utf8),
     ("null_count", pl.Int64),
     ("row_group_rows", pl.Int64),
+    ("compressed_bytes", pl.Int64),
     ("stats_available", pl.Boolean),
     ("min_is_exact", pl.Boolean),
     ("max_is_exact", pl.Boolean),
@@ -101,6 +102,12 @@ def test_built_artifact_matches_schema_and_routes_lanes(tmp_path):
     tsr = by_col["ts"]
     assert tsr["min_timestamp"] is not None and tsr["max_timestamp"] is not None
     assert tsr["stats_available"] is True
+
+    # Per-column on-disk size is captured for every column-chunk (drives
+    # projection-aware read sizing). Real column chunks are non-empty.
+    for r in by_col.values():
+        assert r["compressed_bytes"] is not None
+        assert r["compressed_bytes"] > 0
 
 
 def test_system_columns_never_emitted(tmp_path):

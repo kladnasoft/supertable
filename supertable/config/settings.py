@@ -204,6 +204,12 @@ class Settings:
     SUPERTABLE_SPARK_STATEMENT_TIMEOUT: int = 120  # SUPERTABLE_SPARK_STATEMENT_TIMEOUT
     SUPERTABLE_SPARK_CONNECT_TIMEOUT: int = 30     # SUPERTABLE_SPARK_CONNECT_TIMEOUT
     SUPERTABLE_SPARK_BATCH_SIZE: int = 50          # SUPERTABLE_SPARK_BATCH_SIZE
+    # Spark file access.  Default False → Spark scans direct s3a://bucket/key
+    # paths using its own fs.s3a.* credentials, independent of the DuckDB
+    # presign setting that shapes the shared reflection file list.  True →
+    # Spark scans presigned http(s):// URLs minted per request (use when the
+    # cluster cannot reach the object store with its own credentials).
+    SUPERTABLE_SPARK_PRESIGNED: bool = False       # SUPERTABLE_SPARK_PRESIGNED
 
     # ── Redis ────────────────────────────────────────────────────────
     SUPERTABLE_REDIS_URL: str = ""               # SUPERTABLE_REDIS_URL
@@ -309,6 +315,13 @@ class Settings:
     # drop parquet files that provably can't satisfy a query's WHERE predicates.
     # Conservative (never drops a file that could match); set False to disable.
     SUPERTABLE_READ_PRUNING_ENABLED: bool = True  # SUPERTABLE_READ_PRUNING_ENABLED
+
+    # Projection-aware read sizing: when True the estimator charges a query only
+    # the on-disk (compressed) bytes of the columns it selects — via per-column
+    # ``compressed_bytes`` in the stats artifact, falling back to a type-width
+    # ratio of the whole file. Drives AUTO engine routing (lite/pro/spark). Set
+    # False to fall back to whole-file sizing (every query charged all columns).
+    SUPERTABLE_READ_PROJECTION_SIZING_ENABLED: bool = True
 
     # ── Audit ────────────────────────────────────────────────────────
     # Audit is OFF by default.  Enable per-organization in the WebUI
@@ -475,6 +488,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_SPARK_STATEMENT_TIMEOUT=_env_int("SUPERTABLE_SPARK_STATEMENT_TIMEOUT", 120),
         SUPERTABLE_SPARK_CONNECT_TIMEOUT=_env_int("SUPERTABLE_SPARK_CONNECT_TIMEOUT", 30),
         SUPERTABLE_SPARK_BATCH_SIZE=_env_int("SUPERTABLE_SPARK_BATCH_SIZE", 50),
+        SUPERTABLE_SPARK_PRESIGNED=_env_bool("SUPERTABLE_SPARK_PRESIGNED", False),
 
         # ── Redis ────────────────────────────────────────────────────
         SUPERTABLE_REDIS_URL=_env_str("SUPERTABLE_REDIS_URL"),
@@ -568,6 +582,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
+        SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=_env_bool("SUPERTABLE_READ_PROJECTION_SIZING_ENABLED", True),
 
         # ── Audit ────────────────────────────────────────────────────
         SUPERTABLE_AUDIT_ENABLED=_env_bool("SUPERTABLE_AUDIT_ENABLED", False),

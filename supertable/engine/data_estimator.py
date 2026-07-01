@@ -7,6 +7,8 @@ from collections import defaultdict
 from typing import Iterable, Set, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
+import polars
+
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.data_classes import Reflection, SuperSnapshot
@@ -18,7 +20,12 @@ from supertable.utils.profiler import Profiler
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
 from supertable.utils.sql_parser import TableDefinition
-from supertable.processing import load_stats, prune_files_by_predicates
+from supertable.processing import (
+    load_stats,
+    prune_files_by_predicates,
+    ROWID_COL,
+    TIMESTAMP_COL,
+)
 
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -306,22 +313,25 @@ class DataEstimator:
         super_name: str,
         simple_name: str,
         raw_keys: List[str],
-        stats_file: Optional[str],
+        stats_df: Optional["polars.DataFrame"],
         profiler: Optional[Profiler] = None,
     ) -> List[str]:
         """Narrow *raw_keys* to those that could satisfy the query predicates.
 
-        Returns *raw_keys* unchanged whenever pruning is disabled, there's no
-        stats artifact, or the query carries no usable constraint for this
-        table — and never raises (a pruning failure must not break a read).
+        Takes the already-loaded *stats_df* (loaded once per table by
+        :meth:`estimate` and shared with projection sizing) rather than a path,
+        so the artifact is read at most once.  Returns *raw_keys* unchanged
+        whenever pruning is disabled, there's no stats artifact, or the query
+        carries no usable constraint for this table — and never raises (a
+        pruning failure must not break a read).
 
         *profiler*, when supplied, accumulates the same IO/pruning counters the
-        write path emits (``stats_cache_hit``/``stats_cache_miss``,
-        ``read_pruned_files``) so the read monitoring payload can surface them.
+        write path emits (``read_pruned_files``) so the read monitoring payload
+        can surface them.
         """
         if not settings.SUPERTABLE_READ_PRUNING_ENABLED:
             return raw_keys
-        if not stats_file or not raw_keys:
+        if stats_df is None or not raw_keys:
             return raw_keys
         occurrences = self.predicate_constraints.get(
             (super_name.lower(), simple_name.lower())
@@ -329,13 +339,144 @@ class DataEstimator:
         if not occurrences:
             return raw_keys
         try:
-            stats_df = load_stats(stats_file, allow_cache=True, profiler=profiler)
             return prune_files_by_predicates(
                 raw_keys, stats_df, occurrences, profiler=profiler,
             )
         except Exception as e:
             logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
             return raw_keys
+
+    # ----------------------- projection-aware sizing -----------------------
+
+    # Rough per-value byte widths for the type-width *fallback* (used only when
+    # per-column ``compressed_bytes`` are unavailable — e.g. a stats file that
+    # predates the column, or no stats artifact at all).  Substring-matched
+    # against the stored (DuckDB/polars) type name, most-specific first.
+    _STRING_AVG_WIDTH = 16
+
+    def _type_width(self, type_name: Optional[str]) -> int:
+        """Estimated on-disk bytes-per-value for a column type (fallback only)."""
+        t = (type_name or "").strip().lower()
+        if not t:
+            return 8
+        if "bool" in t:
+            return 1
+        if "timestamp" in t or "datetime" in t:
+            return 8
+        if "date" in t:
+            return 4
+        if any(s in t for s in ("varchar", "char", "utf8", "string", "text",
+                                "json", "blob", "binary", "bytea")):
+            return self._STRING_AVG_WIDTH
+        if "double" in t or "float64" in t:
+            return 8
+        if "float" in t or "real" in t:
+            return 4
+        if "decimal" in t or "numeric" in t:
+            return 8
+        if "bigint" in t or "int64" in t or "long" in t:
+            return 8
+        if "smallint" in t or "int16" in t:
+            return 2
+        if "tinyint" in t or "int8" in t:
+            return 1
+        if "int" in t:
+            return 4
+        return 8
+
+    def _selected_columns(self, super_name: str, simple_name: str) -> Optional[Set[str]]:
+        """Lowercased set of user columns this query projects from the table.
+
+        Returns ``None`` to mean "every column" — i.e. ``SELECT *`` / ``t.*``
+        (an empty ``TableDefinition.columns``), an unrecognised table, or a
+        projection that resolves to only system columns.  In every ``None`` case
+        the caller uses the whole-file size (no projection savings), which is
+        the safe over-estimate.  System columns (``__rowid__`` / ``__timestamp__``)
+        are stripped: the read view hides them, so they're never scanned.
+        """
+        key = (super_name.lower(), simple_name.lower())
+        selected: Set[str] = set()
+        matched = False
+        for t in self.tables:
+            if (t.super_name.lower(), t.simple_name.lower()) != key:
+                continue
+            matched = True
+            if not t.columns:          # [] => SELECT * / t.* => whole table
+                return None
+            for c in t.columns:
+                cl = c.lower()
+                if cl not in (ROWID_COL, TIMESTAMP_COL):
+                    selected.add(cl)
+        if not matched or not selected:
+            return None
+        return selected
+
+    def _projected_bytes_index(
+        self,
+        stats_df: Optional["polars.DataFrame"],
+        selected_cols: Set[str],
+    ) -> Tuple[Set[str], Dict[str, int]]:
+        """Sum per-column ``compressed_bytes`` for the selected columns per file.
+
+        Returns ``(tier3_files, proj)`` where *proj* maps a file path to the
+        summed on-disk bytes of its selected columns, and *tier3_files* is the
+        subset of files for which that sum is *trustworthy* — every matched row
+        carried a non-NULL ``compressed_bytes``.  A file with any NULL (an older
+        carried-forward row) is omitted so the caller falls back to a whole-file
+        ratio rather than under-counting it as zero.
+        """
+        if (
+            stats_df is None
+            or stats_df.height == 0
+            or "compressed_bytes" not in stats_df.columns
+        ):
+            return set(), {}
+        sel = (
+            stats_df.select(["file_path", "column_name", "compressed_bytes"])
+            .with_columns(polars.col("column_name").str.to_lowercase().alias("__cn"))
+            .filter(polars.col("__cn").is_in(list(selected_cols)))
+        )
+        if sel.height == 0:
+            return set(), {}
+        agg = sel.group_by("file_path").agg(
+            [
+                polars.col("compressed_bytes").sum().alias("__b"),
+                polars.col("compressed_bytes").is_null().sum().alias("__nulls"),
+            ]
+        )
+        tier3_files: Set[str] = set()
+        proj: Dict[str, int] = {}
+        for r in agg.iter_rows(named=True):
+            if int(r["__nulls"] or 0) == 0:
+                fp = r["file_path"]
+                tier3_files.add(fp)
+                proj[fp] = int(r["__b"] or 0)
+        return tier3_files, proj
+
+    def _ratio_bytes(
+        self,
+        file_key: str,
+        key_size: Dict[str, int],
+        selected_cols: Set[str],
+        schema_types: Dict[str, str],
+    ) -> int:
+        """Fallback size: scale the whole-file bytes by the selected columns'
+        type-width share of the table schema.  Used only when precise
+        per-column ``compressed_bytes`` are unavailable for *file_key*."""
+        full = int(key_size.get(file_key, 0))
+        if full <= 0 or not schema_types:
+            return full
+        all_cols = {
+            c: ty for c, ty in schema_types.items()
+            if c not in (ROWID_COL, TIMESTAMP_COL)
+        }
+        total_w = sum(self._type_width(ty) for ty in all_cols.values())
+        if total_w <= 0:
+            return full
+        sel_w = sum(self._type_width(all_cols[c]) for c in selected_cols if c in all_cols)
+        if sel_w <= 0:
+            return full
+        return int(full * sel_w / total_w)
 
     # ----------------------- main API -----------------------
     def estimate(self) -> Reflection:
@@ -352,7 +493,8 @@ class DataEstimator:
         prune_profiler = Profiler()
 
         supers: List[SuperSnapshot] = []
-        reflection_file_size = 0
+        reflection_file_size = 0        # projected (selected-column) bytes — routing
+        reflection_file_size_raw = 0    # whole-file bytes — physical footprint
         max_freshness_ms = 0
         files_before_prune = 0
         files_pruned = 0
@@ -378,6 +520,7 @@ class DataEstimator:
                 )
 
                 schema: Set[str] = set()
+                schema_types: Dict[str, str] = {}
                 raw_keys: List[str] = []
                 key_size: Dict[str, int] = {}
                 stats_file: Optional[str] = None
@@ -395,7 +538,12 @@ class DataEstimator:
 
                     current_version = current_snapshot_data.get("snapshot_version", 0)
                     current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
-                    schema.update(dict_keys_to_lowercase(current_schema).keys())
+                    lowered_schema = dict_keys_to_lowercase(current_schema)
+                    schema.update(lowered_schema.keys())
+                    # Retain name->type for the projection ratio fallback. First
+                    # writer wins for a given column (schemas are stable per table).
+                    for _cname, _ctype in lowered_schema.items():
+                        schema_types.setdefault(_cname, _ctype)
                     sf = current_snapshot_data.get("stats_file")
                     if sf:
                         stats_file = sf
@@ -408,23 +556,62 @@ class DataEstimator:
                         raw_keys.append(file_key)
                         key_size[file_key] = int(resource.get("file_size", 0))
 
+                # Which columns does the query actually read? None => SELECT *
+                # (whole table, no projection savings).
+                selected_cols = self._selected_columns(super_name, simple_name)
+                need_projection = (
+                    selected_cols is not None
+                    and settings.SUPERTABLE_READ_PROJECTION_SIZING_ENABLED
+                )
+                has_predicate = bool(
+                    self.predicate_constraints.get((super_name.lower(), simple_name.lower()))
+                )
+
+                # Load the stats artifact ONCE per table and reuse it for BOTH
+                # predicate pruning and projection sizing (cache-backed: a repeated
+                # read of the same table is a memory hit). Only load when at least
+                # one consumer needs it, so a SELECT * with no WHERE stays free.
+                stats_df: Optional["polars.DataFrame"] = None
+                if stats_file and (need_projection or has_predicate):
+                    stats_df = load_stats(stats_file, allow_cache=True, profiler=prune_profiler)
+
                 # Read-path pruning: drop raw keys whose stats prove they cannot
                 # satisfy the query's WHERE before resolving them to scan URLs.
                 # The span accumulates the wall-clock of the whole pruning step
-                # (stats load + predicate eval) across every table in the query.
+                # (predicate eval) across every table in the query.
                 with prune_profiler.span("read.prune"):
                     survivors = self._prune_files(
-                        super_name, simple_name, raw_keys, stats_file,
+                        super_name, simple_name, raw_keys, stats_df,
                         profiler=prune_profiler,
                     )
                 files_before_prune += len(raw_keys)
                 files_pruned += len(raw_keys) - len(survivors)
                 files_kept += len(survivors)
 
+                # Projection-aware size: a query selecting specific columns scans
+                # only those columns' on-disk (compressed) chunks, not the whole
+                # multi-column file. Precise path sums per-column compressed_bytes
+                # from the stats artifact; files predating that column (or with no
+                # stats) fall back to a type-width ratio of the whole-file size.
+                # SELECT * keeps every column (full file).
+                tier3_files: Set[str] = set()
+                proj: Dict[str, int] = {}
+                if need_projection:
+                    tier3_files, proj = self._projected_bytes_index(stats_df, selected_cols)
+
                 parquet_files: List[str] = []
                 for file_key in survivors:
                     parquet_files.append(self._to_duckdb_path(file_key))
-                    reflection_file_size += key_size.get(file_key, 0)
+                    full = int(key_size.get(file_key, 0))
+                    reflection_file_size_raw += full
+                    if not need_projection:
+                        reflection_file_size += full
+                    elif file_key in tier3_files:
+                        reflection_file_size += proj.get(file_key, 0)
+                    else:
+                        reflection_file_size += self._ratio_bytes(
+                            file_key, key_size, selected_cols, schema_types
+                        )
 
                 # SuperSnapshot is created ONCE per (super_name, simple_name) after
                 # all snapshot iterations have accumulated their files and schema.
@@ -465,7 +652,11 @@ class DataEstimator:
         self.timer.capture_and_reset_timing(event="ESTIMATE")
 
         self.plan_stats.add_stat({"REFLECTIONS": total_reflections})
+        # REFLECTION_SIZE is the projected (selected-column) size that drives
+        # engine routing; REFLECTION_SIZE_RAW is the whole-file footprint, kept
+        # for observability so the two are comparable in the plans payload.
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
+        self.plan_stats.add_stat({"REFLECTION_SIZE_RAW": reflection_file_size_raw})
 
         # Read-path pruning observability — only when pruning is engaged, so a
         # disabled-pruning read doesn't litter the payload with noise. Mirrors

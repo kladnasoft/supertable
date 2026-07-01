@@ -93,6 +93,53 @@ def _to_s3a_path(file_path: str) -> str:
     return file_path
 
 
+def _resolve_spark_file(storage, file_path: str) -> str:
+    """Resolve one snapshot file path to the form Spark should scan.
+
+    ``sup.files`` are resolved once by the estimator using the *DuckDB* presign
+    setting (``SUPERTABLE_DUCKDB_PRESIGNED``) and shared by every engine, so
+    Spark re-resolves here to make its access method depend solely on
+    ``SUPERTABLE_SPARK_PRESIGNED``:
+
+      * default (False) → a direct ``s3a://bucket/key`` path that Spark reads
+        with its own ``fs.s3a.*`` credentials (``_to_s3a_path`` already
+        normalises ``s3://``, presigned ``http(s)://`` and ``s3a://`` inputs);
+      * opt-in (True)   → a freshly minted presigned ``http(s)://`` URL, so
+        Spark works even when the cluster has no object-store credentials — and
+        regardless of whether ``sup.files`` were presigned for DuckDB.
+
+    Presigning is best-effort: a missing ``presign``, a local path, or an
+    unparseable key falls back to the s3a form.
+    """
+    s3a = _to_s3a_path(file_path)
+    if not settings.SUPERTABLE_SPARK_PRESIGNED or not s3a.startswith("s3a://"):
+        return s3a
+
+    presign_fn = getattr(storage, "presign", None)
+    if not callable(presign_fn):
+        return s3a
+
+    # s3a://bucket/full_key → object key.  storage.presign() re-applies
+    # base_prefix (like read_bytes), so strip it here — mirroring
+    # _read_parquet_schema — to avoid doubling it.
+    full_key = s3a[len("s3a://"):].partition("/")[2]
+    if not full_key:
+        return s3a
+    base = (getattr(storage, "base_prefix", "") or "").strip("/")
+    rel_key = (
+        full_key[len(base) + 1:]
+        if base and full_key.startswith(base + "/")
+        else full_key
+    )
+    try:
+        url = presign_fn(rel_key)
+        if isinstance(url, str) and url:
+            return url
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"[spark.thrift] presign failed for {rel_key!r}; using s3a: {e}")
+    return s3a
+
+
 # =========================================================
 # Spark SQL helpers
 # =========================================================
@@ -209,6 +256,7 @@ def _spark_create_tombstone_view(
         source_table: str,
         view_name: str,
         tombstone_def,
+        storage=None,
 ) -> None:
     """Create a view that hides system columns and drops tombstoned rows.
 
@@ -239,11 +287,12 @@ def _spark_create_tombstone_view(
     has_rowid = "__rowid__" in src_cols
 
     if tomb_path and has_rowid:
-        # The data files are converted to s3a:// for Spark (see the data-file
-        # loop in the executor); apply the same conversion to the already
-        # resolved deletion-vector pointer so Spark reads it via its own S3A
-        # client instead of choking on a presigned HTTP URL or bare key.
-        escaped = _to_s3a_path(tomb_path).replace("'", "''")
+        # Resolve the deletion-vector pointer the same way as the data files
+        # (see the data-file loop in the executor) so Spark reads it through the
+        # same access method — direct s3a:// by default, presigned when
+        # SUPERTABLE_SPARK_PRESIGNED is on — instead of a bare key or a
+        # DuckDB-shaped presigned URL.
+        escaped = _resolve_spark_file(storage, tomb_path).replace("'", "''")
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
             f"SELECT {select_cols} FROM {source_table} AS src "
@@ -806,8 +855,10 @@ class SparkThriftExecutor:
                 if sup.files and table_name not in table_repr_file:
                     table_repr_file[table_name] = sup.files[0]
 
-                # Convert to s3a:// paths for Spark (handles s3://, presigned HTTP URLs, etc.)
-                files = [_to_s3a_path(f) for f in sup.files]
+                # Resolve to Spark's access form: direct s3a:// by default, or
+                # presigned URLs when SUPERTABLE_SPARK_PRESIGNED is on (handles
+                # s3://, presigned HTTP URLs and bare keys either way).
+                files = [_resolve_spark_file(self.storage, f) for f in sup.files]
 
                 logger.debug(
                     f"{log_prefix}[spark.thrift] creating view {table_name} "
@@ -898,7 +949,7 @@ class SparkThriftExecutor:
                 source = query_alias_to_name[alias]
                 tomb_def = tombstone_views.get(alias)
                 tomb_view = f"tomb_{source}_{query_suffix}"
-                _spark_create_tombstone_view(cursor, source, tomb_view, tomb_def)
+                _spark_create_tombstone_view(cursor, source, tomb_view, tomb_def, self.storage)
                 created_views.append(tomb_view)
                 query_alias_to_name[alias] = tomb_view
 

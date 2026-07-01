@@ -1577,6 +1577,11 @@ STATS_SCHEMA: Dict[str, polars.DataType] = {
     "max_string": polars.Utf8,
     "null_count": polars.Int64,
     "row_group_rows": polars.Int64,
+    # On-disk (compressed) size of this column-chunk, from the parquet footer.
+    # Drives projection-aware read estimation: a query that selects N of M
+    # columns scans only the selected columns' chunks, not the whole file.
+    # Nullable so a stats file written before this column carries forward.
+    "compressed_bytes": polars.Int64,
     "stats_available": polars.Boolean,
     "min_is_exact": polars.Boolean,
     "max_is_exact": polars.Boolean,
@@ -1704,6 +1709,13 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
                 else 0
             )
             row["row_group_rows"] = rg_rows
+            # On-disk (compressed) bytes of this column-chunk — the bytes a
+            # projection-pushdown scan actually fetches for this column.
+            try:
+                tcs = col.total_compressed_size
+                row["compressed_bytes"] = int(tcs) if tcs is not None else None
+            except Exception:
+                row["compressed_bytes"] = None
             # We never truncate footer stats, so min/max are always exact.
             row["min_is_exact"] = True
             row["max_is_exact"] = True
@@ -1730,6 +1742,24 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
 
 def _empty_stats_df() -> polars.DataFrame:
     return polars.DataFrame(schema=STATS_SCHEMA)
+
+
+def _conform_stats_schema(df: polars.DataFrame) -> polars.DataFrame:
+    """Project *df* onto ``STATS_SCHEMA``, adding any absent column as a typed
+    all-null column.
+
+    Lets a stats artifact written before a schema *addition* (e.g.
+    ``compressed_bytes``) carry forward without a ``ColumnNotFoundError`` — the
+    older rows simply get NULLs for the new column, and consumers treat NULL as
+    "unknown" (falling back to whole-file sizing).  Only ever adds columns the
+    schema gained; it never drops or reorders the sealed set.
+    """
+    missing = [name for name in STATS_SCHEMA if name not in df.columns]
+    if missing:
+        df = df.with_columns(
+            [polars.lit(None).cast(STATS_SCHEMA[name]).alias(name) for name in missing]
+        )
+    return df.select(list(STATS_SCHEMA.keys()))
 
 
 def extract_stats_rows(
@@ -1807,7 +1837,9 @@ def build_stats_file(
     # to a fresh read (identical to the former _read_parquet_safe behaviour).
     prev_df = load_stats(prev_stats_path, allow_cache=True, profiler=p) if prev_stats_path else None
     if prev_df is not None and prev_df.height > 0 and STATS_FILE_PATH_COL in prev_df.columns:
-        kept_prev = prev_df.select(list(STATS_SCHEMA.keys()))
+        # Conform (not a bare select): a stats file written before a schema
+        # addition lacks the new column, so add it as NULL rather than raise.
+        kept_prev = _conform_stats_schema(prev_df)
         if removed:
             kept_prev = kept_prev.filter(
                 ~polars.col(STATS_FILE_PATH_COL).is_in(list(removed))
