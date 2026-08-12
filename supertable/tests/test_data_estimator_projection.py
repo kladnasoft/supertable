@@ -22,12 +22,16 @@ Redis / storage) and exercise the sizing math directly.
 """
 from __future__ import annotations
 
+import dataclasses
 import types
+from unittest.mock import MagicMock
 
 import polars as pl
 import pytest
 
 from supertable.engine.data_estimator import DataEstimator
+from supertable.engine import data_estimator as estimator_mod
+from supertable.config.settings import settings
 from supertable.processing import ROWID_COL, TIMESTAMP_COL
 
 
@@ -151,6 +155,16 @@ class TestProjectedBytesIndex:
         assert tier3 == {"f2"}
         assert proj == {"f2": 10}
 
+    def test_negative_corrupt_bytes_excludes_file_from_tier3(self):
+        est = _est()
+        stats = self._stats([
+            {"file_path": "f1", "column_name": "a", "compressed_bytes": -1},
+            {"file_path": "f2", "column_name": "a", "compressed_bytes": 10},
+        ])
+        tier3, proj = est._projected_bytes_index(stats, {"a"})
+        assert tier3 == {"f2"}
+        assert proj == {"f2": 10}
+
     def test_missing_compressed_bytes_column(self):
         # An old stats artifact without the column -> no precise data at all.
         est = _est()
@@ -169,6 +183,29 @@ class TestProjectedBytesIndex:
         assert est._projected_bytes_index(None, {"a"}) == (set(), {})
         empty = self._stats([])
         assert est._projected_bytes_index(empty, {"a"}) == (set(), {})
+
+    def test_filters_pruned_files_before_projection_aggregation(self):
+        est = _est()
+        stats = self._stats([
+            {"file_path": "kept", "column_name": "a", "compressed_bytes": 10},
+            {"file_path": "pruned", "column_name": "a", "compressed_bytes": 999},
+        ])
+
+        tier3, proj = est._projected_bytes_index(
+            stats, {"a"}, file_keys=["kept"],
+        )
+
+        assert tier3 == {"kept"}
+        assert proj == {"kept": 10}
+
+    def test_empty_survivor_filter_short_circuits(self):
+        est = _est()
+        stats = self._stats([
+            {"file_path": "pruned", "column_name": "a", "compressed_bytes": 999},
+        ])
+        assert est._projected_bytes_index(
+            stats, {"a"}, file_keys=[],
+        ) == (set(), {})
 
 
 class TestRatioBytes:
@@ -199,3 +236,76 @@ class TestRatioBytes:
         est = _est()
         # Defensive: selected col absent from schema -> can't scale, keep full.
         assert est._ratio_bytes("f1", {"f1": 700}, {"ghost"}, {"a": "BIGINT"}) == 700
+
+    def test_precomputed_widths_match_public_fallback(self):
+        est = _est()
+        schema_types = {
+            "a": "BIGINT",
+            "b": "VARCHAR",
+            ROWID_COL: "BIGINT",
+        }
+        widths = est._projection_widths({"a"}, schema_types)
+
+        assert widths == (8, 24)
+        assert est._ratio_bytes_with_widths(1200, widths) == 400
+        assert est._ratio_bytes(
+            "f1", {"f1": 1200}, {"a"}, schema_types,
+        ) == 400
+
+    @pytest.mark.parametrize("full", [0, -1, 700])
+    def test_precomputed_unknown_widths_keep_full_size(self, full):
+        est = _est()
+        assert est._ratio_bytes_with_widths(full, None) == full
+
+
+class TestDuckDbPathResolution:
+
+    def _resolver(self, storage=None):
+        est = _est()
+        est.storage = storage or types.SimpleNamespace()
+        est._fallback_url_config = None
+        return est
+
+    def test_settings_endpoint_fallback_is_defined_and_cached(self, monkeypatch):
+        monkeypatch.setattr(
+            estimator_mod,
+            "settings",
+            dataclasses.replace(
+                settings,
+                SUPERTABLE_DUCKDB_PRESIGNED=False,
+                SUPERTABLE_DUCKDB_USE_HTTPFS=True,
+                STORAGE_ENDPOINT_URL="http://lake.example:9000",
+                STORAGE_BUCKET="bucket",
+                STORAGE_USE_SSL=False,
+            ),
+        )
+        est = self._resolver()
+        detect_endpoint = MagicMock(
+            wraps=est._detect_endpoint,
+        )
+        est._detect_endpoint = detect_endpoint
+
+        assert est._to_duckdb_path("a.parquet") == (
+            "http://lake.example:9000/bucket/a.parquet"
+        )
+        assert est._to_duckdb_path("b.parquet") == (
+            "http://lake.example:9000/bucket/b.parquet"
+        )
+        detect_endpoint.assert_called_once_with()
+
+    def test_storage_helper_resolution_is_not_logged_at_info(self, monkeypatch):
+        helper = MagicMock(return_value="s3://bucket/f.parquet")
+        est = self._resolver(types.SimpleNamespace(to_duckdb_path=helper))
+        debug = MagicMock()
+        info = MagicMock()
+        monkeypatch.setattr(estimator_mod.logger, "debug", debug)
+        monkeypatch.setattr(estimator_mod.logger, "info", info)
+        monkeypatch.setattr(
+            estimator_mod.logger,
+            "isEnabledFor",
+            lambda _level: False,
+        )
+
+        assert est._to_duckdb_path("f.parquet") == "s3://bucket/f.parquet"
+        info.assert_not_called()
+        debug.assert_not_called()

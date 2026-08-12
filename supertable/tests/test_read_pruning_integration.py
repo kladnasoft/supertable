@@ -99,7 +99,8 @@ def orders_on_disk(tmp_path):
                    {"name": "val", "type": "VARCHAR"}],
         "stats_file": stats_path,
         "resources": [
-            {"file": p, "file_size": os.path.getsize(p)} for p in files
+            {"file": p, "file_size": os.path.getsize(p), "rows": 100}
+            for p in files
         ],
     }
     leaf_item = {

@@ -320,7 +320,10 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
                 "snapshot_version": 3,
                 "schema": {"k": "BIGINT"},
                 "stats_file": "a/_stats.parquet",
-                "resources": [{"file": f, "file_size": 1000} for f in a_files],
+                "resources": [
+                    {"file": f, "file_size": 1000, "rows": 100}
+                    for f in a_files
+                ],
             },
         },
         {
@@ -331,7 +334,9 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
                 "snapshot_version": 3,
                 "schema": {"k": "BIGINT"},
                 "stats_file": "b/_stats.parquet",
-                "resources": [{"file": "b/f00.parquet", "file_size": 1000}],
+                "resources": [
+                    {"file": "b/f00.parquet", "file_size": 1000, "rows": 100}
+                ],
             },
         },
     ]
@@ -428,14 +433,14 @@ def test_wrapper_where_pruning_is_case_insensitive():
 
 def test_cast_numeric_of_numeric_string_prunes_numerically():
     """Positive counterpart of the CAST red test: the constraint lands in the
-    numeric lane and prunes against bigint stats."""
+    cast-numeric lane and prunes against bigint stats for explicit DuckDB."""
     from supertable.utils.sql_parser import SQLParser as _P
 
     constraints = _P(SUPER, "SELECT * FROM s.t WHERE c = CAST('750' AS BIGINT)",
                      "duckdb").get_predicate_constraints()
     (occ,) = constraints[(SUPER, "t")]
     pred = occ["c"]
-    assert pred.lane == "numeric" and pred.lo == 750 and pred.hi == 750
+    assert pred.lane == "numeric_cast" and pred.lo == 750 and pred.hi == 750
 
 
 # ---------------------------------------------------------------------------

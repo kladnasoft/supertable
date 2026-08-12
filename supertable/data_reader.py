@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Any, List, Dict
 import pandas as pd
 
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
@@ -31,6 +32,78 @@ from supertable.system_query import classify_query, CommandKind
 class Status(Enum):
     OK = "ok"
     ERROR = "error"
+
+
+_SPARK_UNSAFE_PREDICATE_LANES = frozenset({
+    "numeric_cast", "date", "timestamp", "timestamptz",
+})
+
+# These are predicate-lane names exported by the join kernel.  Explicit
+# DuckDB preserves the DATE / timestamp-with(out)-timezone distinctions in the
+# stats artifact.  Spark deliberately reads Parquet NTZ timestamps as LTZ and
+# also supports legacy date/timestamp rebasing; AUTO may choose Spark only
+# after estimation.  Raw temporal footer ordering is therefore not proof for
+# AUTO/Spark, while integral equality/order is common to both executors.
+_DUCKDB_JOIN_PRUNING_LANES = frozenset({
+    "numeric", "date", "timestamp", "timestamptz",
+})
+_COMMON_JOIN_PRUNING_LANES = frozenset({"numeric"})
+
+
+def _engine_safe_join_pruning_lanes(requested_engine: engine):
+    if requested_engine in (engine.AUTO, engine.SPARK_SQL):
+        return _COMMON_JOIN_PRUNING_LANES
+    return _DUCKDB_JOIN_PRUNING_LANES
+
+
+def _engine_safe_predicate_constraints(
+    predicate_constraints: Dict,
+    requested_engine: engine,
+) -> Dict:
+    """Remove footer comparisons whose semantics depend on the executor.
+
+    SparkThriftExecutor sets ``spark.sql.parquet.inferTimestampNTZ.enabled``
+    to false so PyArrow/Polars ``TIMESTAMP(..., isAdjustedToUTC=false)`` files
+    are read as Spark TIMESTAMP_LTZ.  A timezone-less Spark TIMESTAMP literal
+    is interpreted in ``spark.sql.session.timeZone``; its UTC instant can
+    therefore match a footer wall time with a *different* clock value.  Raw
+    footer-vs-literal comparison could drop that contributing file.  Spark's
+    ANSI-off narrowing integer casts can also wrap on overflow; a cast-derived
+    bound must not be treated as its pre-cast Python integer.
+
+    AUTO may choose Spark only after estimation, so it needs the same guard.
+    Explicit DuckDB reads retain these constraints: DuckDB preserves the
+    DATE/TIMESTAMP/TIMESTAMPTZ distinctions used by the stats lanes.  DATE is
+    also gated for AUTO/Spark because legacy Parquet calendar rebasing can make
+    a pre-1582 footer day number differ from the executor's logical date.
+
+    Empty occurrences are omitted at the table level.  They mean at least one
+    physical occurrence is unconstrained, so the shared file list cannot be
+    pruned by its own WHERE anyway; omitting the key also avoids loading stats
+    solely for a guaranteed no-op.
+    """
+    if requested_engine not in (engine.AUTO, engine.SPARK_SQL):
+        return predicate_constraints
+
+    filtered: Dict = {}
+    try:
+        for table_key, occurrences in predicate_constraints.items():
+            safe_occurrences = [
+                {
+                    column: predicate
+                    for column, predicate in occurrence.items()
+                    if getattr(predicate, "lane", None)
+                    not in _SPARK_UNSAFE_PREDICATE_LANES
+                }
+                for occurrence in occurrences
+            ]
+            if safe_occurrences and all(safe_occurrences):
+                filtered[table_key] = safe_occurrences
+    except Exception:
+        # Analysis is an optional optimisation.  A malformed/custom result is
+        # not allowed to make an AUTO/Spark read narrower or fail.
+        return {}
+    return filtered
 
 
 from collections import defaultdict
@@ -274,22 +347,26 @@ class DataReader:
             self._log_ctx = f"[qid={self.query_plan_manager.query_id} qh={self.query_plan_manager.query_hash}] "
             self.query_plan_manager.original_table = ", ".join(t.simple_name for t in physical_tables) if physical_tables else ""
 
-            # Derive per-table WHERE constraints so the estimator can prune
-            # files via the stats artifact.  Never let this break a read.
-            try:
-                predicate_constraints = parser.get_predicate_constraints()
-            except Exception as pc_err:
-                logger.debug(self._lp(f"[prune] predicate extraction failed: {pc_err}"))
-                predicate_constraints = {}
-
-            # Derive equi-join links so the estimator can propagate a filtered
-            # table's join-key ranges to its partners (cross-table file pruning).
-            # Never let this break a read.
-            try:
-                join_edges = parser.get_join_edges()
-            except Exception as je_err:
-                logger.debug(self._lp(f"[prune] join-edge extraction failed: {je_err}"))
-                join_edges = []
+            predicate_constraints = {}
+            join_edges = []
+            if settings.SUPERTABLE_READ_PRUNING_ENABLED:
+                # Derive per-table WHERE constraints and equi-join links only
+                # when the estimator can consume them.  Both analyses walk the
+                # sqlglot scope tree, so skipping them under the master switch
+                # avoids pure overhead on every pruning-disabled read.
+                try:
+                    predicate_constraints = parser.get_predicate_constraints()
+                except Exception as pc_err:
+                    logger.debug(self._lp(
+                        f"[prune] predicate extraction failed: {pc_err}"))
+                predicate_constraints = _engine_safe_predicate_constraints(
+                    predicate_constraints, engine,
+                )
+                try:
+                    join_edges = parser.get_join_edges()
+                except Exception as je_err:
+                    logger.debug(self._lp(
+                        f"[prune] join-edge extraction failed: {je_err}"))
 
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
@@ -298,6 +375,7 @@ class DataReader:
                 tables=physical_tables,
                 predicate_constraints=predicate_constraints,
                 join_edges=join_edges,
+                join_pruning_lanes=_engine_safe_join_pruning_lanes(engine),
                 plan_stats=self.plan_stats,
             )
             reflection = estimator.estimate()

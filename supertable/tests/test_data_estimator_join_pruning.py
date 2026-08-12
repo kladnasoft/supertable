@@ -71,6 +71,7 @@ def _rows_for_file(file_path: str, colspecs: Dict[str, Tuple]) -> List[dict]:
             row["min_bigint"], row["max_bigint"] = int(spec[1]), int(spec[2])
         elif lane == "timestamp":
             row["min_timestamp"], row["max_timestamp"] = spec[1], spec[2]
+            row["logical_type"] = "TIMESTAMP_NTZ_MICROS"
         else:  # pragma: no cover
             raise ValueError(f"unknown lane {lane!r}")
         rows.append(row)
@@ -117,7 +118,7 @@ def _build_world(n: int = 20):
         cols: Dict[str, str] = {}
         for k in range(n):
             fp = f"{table}/f{k:02d}.parquet"
-            resources.append({"file": fp, "file_size": 1000})
+            resources.append({"file": fp, "file_size": 1000, "rows": 100})
             spec = _colspecs(table, k)
             rows += _rows_for_file(fp, spec)
             for c in spec:

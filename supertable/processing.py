@@ -1,6 +1,7 @@
 # processing.py
 
 import decimal
+import json
 import logging
 import os
 import io
@@ -1589,13 +1590,30 @@ STATS_SCHEMA: Dict[str, polars.DataType] = {
 
 STATS_FILE_PATH_COL = "file_path"
 
+# Narrow SELECT-pruning projections do not materialize the rejected
+# double/string bounds into Python.  They carry this boolean instead so a
+# malformed row with both a trusted lane and any second populated lane cannot
+# evade _stored_lane's exactly-one-lane invariant.
+_SELECT_OTHER_LANE_COL = "__select_other_lane_populated"
+
 # Internal system columns never emitted into the stats artifact (they must not
 # leak, same as everywhere else).
 _STATS_SYSTEM_COLUMNS = {ROWID_COL, TIMESTAMP_COL}
 
 
 def _logical_type_name(stat) -> str:
-    """Return the parquet logical type name (e.g. ``TIMESTAMP``/``STRING``) or ``""``."""
+    """Return a lossless-enough parquet logical type marker for pruning.
+
+    PyArrow exposes both TIMESTAMP and TIMESTAMPTZ as ``type ==
+    "TIMESTAMP"``.  The distinction lives in ``isAdjustedToUTC`` in the
+    logical type JSON.  Losing it is unsafe for range propagation: DuckDB
+    compares a naïve timestamp/date to a zoned timestamp in the session
+    timezone, not by comparing their raw footer integers.  New stats artifacts
+    therefore persist both semantics and resolution, for example
+    ``TIMESTAMP_NTZ_MICROS`` or ``TIMESTAMP_TZ_MILLIS``.  Historical rows
+    containing the old ambiguous ``TIMESTAMP`` marker (or a marker without a
+    resolution) are deliberately treated as unavailable by select pruning.
+    """
     try:
         lt = stat.logical_type
         if lt is None:
@@ -1603,7 +1621,25 @@ def _logical_type_name(stat) -> str:
         name = getattr(lt, "type", None)
         if name is None or str(name).upper() == "NONE":
             return ""
-        return str(name)
+        name = str(name).upper()
+        if name == "TIMESTAMP":
+            try:
+                payload = json.loads(lt.to_json())
+                adjusted = payload.get("isAdjustedToUTC")
+                unit = {
+                    "MILLISECONDS": "MILLIS",
+                    "MICROSECONDS": "MICROS",
+                    "NANOSECONDS": "NANOS",
+                }.get(str(payload.get("timeUnit") or "").upper())
+                if adjusted is True and unit:
+                    return f"TIMESTAMP_TZ_{unit}"
+                if adjusted is False and unit:
+                    return f"TIMESTAMP_NTZ_{unit}"
+            except Exception:
+                # An ambiguous marker is retained in the artifact for
+                # observability, but select pruning will not trust it.
+                pass
+        return name
     except Exception:
         return ""
 
@@ -1653,7 +1689,17 @@ def _route_stats(stat) -> Tuple[Optional[str], object, object]:
     if isinstance(mn, bool):
         return "bigint", int(mn), int(mx)
     if isinstance(mn, int):
-        return "bigint", int(mn), int(mx)
+        # STATS_SCHEMA stores signed Int64.  PyArrow decodes UInt64 footer
+        # values as Python ints too; attempting to append values above 2**63-1
+        # raises while building the stats frame and can abort an otherwise
+        # valid write.  Out-of-lane integers are simply unsupported: every
+        # pruning consumer then retains the file.
+        lo, hi = int(mn), int(mx)
+        if not (-(2**63) <= lo <= 2**63 - 1) or not (
+            -(2**63) <= hi <= 2**63 - 1
+        ):
+            return None, None, None
+        return "bigint", lo, hi
     if isinstance(mn, float):
         return "double", float(mn), float(mx)
     if isinstance(mn, str):
@@ -1696,18 +1742,24 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
             name = col.path_in_schema
             if name in _STATS_SYSTEM_COLUMNS:
                 continue
-            stat = col.statistics if col.is_stats_set else None
+            try:
+                stat = col.statistics if col.is_stats_set else None
+            except Exception:
+                stat = None
             row = {k: None for k in STATS_SCHEMA}
             row["file_path"] = file_path
             row["row_group_id"] = int(rg)
             row["column_name"] = name
             row["physical_type"] = str(col.physical_type or "")
             row["logical_type"] = _logical_type_name(stat) if stat is not None else ""
-            row["null_count"] = (
-                int(stat.null_count)
-                if stat is not None and stat.null_count is not None
-                else 0
-            )
+            try:
+                row["null_count"] = (
+                    int(stat.null_count)
+                    if stat is not None and stat.null_count is not None
+                    else None
+                )
+            except Exception:
+                row["null_count"] = None
             row["row_group_rows"] = rg_rows
             # On-disk (compressed) bytes of this column-chunk — the bytes a
             # projection-pushdown scan actually fetches for this column.
@@ -1726,8 +1778,16 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
             row["max_is_exact"] = True
             row["stats_available"] = False
 
-            if stat is not None and stat.has_min_max:
-                category, mn, mx = _route_stats(stat)
+            try:
+                routed = (
+                    _route_stats(stat)
+                    if stat is not None and stat.has_min_max
+                    else (None, None, None)
+                )
+            except Exception:
+                routed = (None, None, None)
+            category, mn, mx = routed
+            if category is not None:
                 if category == "bigint":
                     row["min_bigint"], row["max_bigint"] = mn, mx
                     row["stats_available"] = True
@@ -1750,21 +1810,66 @@ def _empty_stats_df() -> polars.DataFrame:
 
 
 def _conform_stats_schema(df: polars.DataFrame) -> polars.DataFrame:
-    """Project *df* onto ``STATS_SCHEMA``, adding any absent column as a typed
-    all-null column.
+    """Safely project a legacy/corrupt frame onto ``STATS_SCHEMA``.
 
-    Lets a stats artifact written before a schema *addition* (e.g.
-    ``compressed_bytes``) carry forward without a ``ColumnNotFoundError`` — the
-    older rows simply get NULLs for the new column, and consumers treat NULL as
-    "unknown" (falling back to whole-file sizing).  Only ever adds columns the
-    schema gained; it never drops or reorders the sealed set.
+    Absent columns are typed NULL, wrong-typed columns are conservatively cast
+    (bad values become NULL), and rows lacking their file/column/row-group
+    identity are discarded.  Consumers treat all resulting NULL stats as
+    unknown, so carrying a damaged artifact forward can only reduce pruning.
     """
-    missing = [name for name in STATS_SCHEMA if name not in df.columns]
-    if missing:
-        df = df.with_columns(
-            [polars.lit(None).cast(STATS_SCHEMA[name]).alias(name) for name in missing]
-        )
-    return df.select(list(STATS_SCHEMA.keys()))
+    expressions = []
+    for name, dtype in STATS_SCHEMA.items():
+        if name not in df.columns:
+            expressions.append(polars.lit(None).cast(dtype).alias(name))
+            continue
+        col = polars.col(name)
+        if df.schema[name] != dtype:
+            # Legacy/corrupt artifacts may carry an existing column with the
+            # wrong dtype.  Coerce parseable values and turn anything malformed
+            # into NULL; every pruning consumer treats NULL stats as unknown.
+            # Text-to-boolean is unsupported by Polars, so only accept the
+            # unambiguous legacy 0/1 integer representation for booleans.
+            source_dtype = df.schema[name]
+            if dtype == polars.Boolean and source_dtype.is_integer():
+                col = (
+                    polars.when(col == 1).then(True)
+                    .when(col == 0).then(False)
+                    .otherwise(None)
+                )
+            elif dtype == polars.Boolean:
+                col = polars.lit(None).cast(dtype)
+            elif dtype == polars.Int64 and not source_dtype.is_integer():
+                col = polars.lit(None).cast(dtype)
+            elif dtype == polars.Float64 and not source_dtype.is_float():
+                col = polars.lit(None).cast(dtype)
+            elif dtype == polars.Utf8 and source_dtype != polars.Utf8:
+                col = polars.lit(None).cast(dtype)
+            elif isinstance(dtype, polars.Datetime):
+                safe_temporal_source = (
+                    source_dtype == polars.Date
+                    or (
+                        isinstance(source_dtype, polars.Datetime)
+                        and source_dtype.time_zone is None
+                        and source_dtype.time_unit in ("ms", "us")
+                    )
+                )
+                if not safe_temporal_source:
+                    # Unitless integers/strings do not encode a trustworthy
+                    # epoch unit; nanoseconds are lossy in STATS_SCHEMA's us
+                    # lane; zoned legacy values lack a normalisation contract.
+                    col = polars.lit(None).cast(dtype)
+            else:
+                col = col.cast(dtype, strict=False)
+        expressions.append(col.alias(name))
+    conformed = df.select(expressions)
+    # Rows without a usable identity cannot match a data file/column and only
+    # add work.  Drop them from the successor stats artifact; actual data files
+    # remain referenced by the snapshot and therefore scan conservatively.
+    return conformed.filter(
+        polars.col("file_path").is_not_null()
+        & polars.col("column_name").is_not_null()
+        & polars.col("row_group_id").is_not_null()
+    )
 
 
 def extract_stats_rows(
@@ -1947,6 +2052,8 @@ def probe_ranges_from_df(
       - any NULL present (footer min/max exclude NULLs, but overwrite equality
         uses ``nulls_equal=True``: a NULL key could match a file whose range
         doesn't cover it → must retain);
+      - any NaN present in a floating column (Parquet footer min/max commonly
+        omit NaNs while DuckDB/Polars equality can match NaN to NaN);
       - unsupported dtype (decimal / UInt64 / binary → :func:`_probe_lane_for_dtype`
         returns None);
       - empty column (min/max are None).
@@ -1970,6 +2077,9 @@ def probe_ranges_from_df(
         if col.null_count() > 0:
             out[name] = None
             continue
+        if lane == "double" and bool(col.is_nan().any()):
+            out[name] = None
+            continue
         lo, hi = col.min(), col.max()
         if lo is None or hi is None:
             out[name] = None
@@ -1989,17 +2099,182 @@ def _stored_lane(row: dict) -> Optional[Tuple[str, object, object]]:
     False, or no lane populated) — meaning the file/row-group can't be excluded
     on that column.
     """
-    if not row.get("stats_available"):
+    if row.get("stats_available") is not True:
         return None
-    if row.get("min_bigint") is not None and row.get("max_bigint") is not None:
-        return "bigint", row["min_bigint"], row["max_bigint"]
-    if row.get("min_double") is not None and row.get("max_double") is not None:
-        return "double", row["min_double"], row["max_double"]
-    if row.get("min_timestamp") is not None and row.get("max_timestamp") is not None:
-        return "timestamp", row["min_timestamp"], row["max_timestamp"]
-    if row.get("min_string") is not None and row.get("max_string") is not None:
-        return "string", row["min_string"], row["max_string"]
+    lane_specs = (
+        (
+            "bigint", "min_bigint", "max_bigint",
+            lambda value: isinstance(value, int) and not isinstance(value, bool),
+        ),
+        (
+            "double", "min_double", "max_double",
+            lambda value: isinstance(value, float),
+        ),
+        (
+            "timestamp", "min_timestamp", "max_timestamp",
+            lambda value: isinstance(value, datetime),
+        ),
+        (
+            "string", "min_string", "max_string",
+            lambda value: isinstance(value, str),
+        ),
+    )
+    populated = []
+    for lane, min_name, max_name, valid_type in lane_specs:
+        lo, hi = row.get(min_name), row.get(max_name)
+        if lo is None and hi is None:
+            continue
+        # A half-populated lane or a value in the wrong physical Python type is
+        # a corrupt/legacy row, not a range that may exclude data.
+        if lo is None or hi is None or not valid_type(lo) or not valid_type(hi):
+            return None
+        populated.append((lane, lo, hi))
+    # Exactly one typed lane must describe the column.  Multiple populated
+    # lanes can arise after a damaged schema migration and are ambiguous.
+    if len(populated) != 1:
+        return None
+    stored = populated[0]
+
+    # Footer ranges are usable only when they form a valid closed interval.
+    # Corrupt/legacy artifacts can contain reversed, NaN/NaT, or incomparable
+    # endpoints.  Letting such a range reach an overlap test can produce a false
+    # "disjoint" result and drop a contributing file.  Every malformed case is
+    # therefore unknown and retains the file.
+    _lane, lo, hi = stored
+    try:
+        if lo != lo or hi != hi:  # NaN / NaT / other non-reflexive sentinel
+            return None
+        if not bool(lo <= hi):
+            return None
+    except Exception:
+        return None
+    return stored
+
+
+def _stored_select_lane_values(
+        stats_available: object,
+        physical_type: object,
+        logical_type: object,
+        min_bigint: object,
+        max_bigint: object,
+        min_timestamp: object,
+        max_timestamp: object,
+        other_lane_populated: object = False,
+) -> Optional[Tuple[str, object, object]]:
+    """Tuple-oriented SELECT lane decoder used by stats hot loops.
+
+    ``DataFrame.iter_rows(named=True)`` allocates a dictionary for every stats
+    row.  Read pruning commonly examines tens of thousands of rows, so its
+    callers project these values in the exact argument order above and iterate
+    ordinary tuples instead.  Keep every validation here equivalent to the
+    mapping-based :func:`_stored_select_lane`: malformed, ambiguous, lossy, or
+    executor-incompatible ranges remain unknown and therefore retain files.
+    """
+    if other_lane_populated is True or stats_available is not True:
+        return None
+
+    bigint_populated = min_bigint is not None or max_bigint is not None
+    timestamp_populated = (
+        min_timestamp is not None or max_timestamp is not None
+    )
+    # Zero populated lanes means absent stats; two means corrupt/ambiguous
+    # stats.  Avoid building a short-lived list on this per-row hot path.
+    if bigint_populated == timestamp_populated:
+        return None
+    if bigint_populated:
+        if (
+            min_bigint is None
+            or max_bigint is None
+            or not isinstance(min_bigint, int)
+            or isinstance(min_bigint, bool)
+            or not isinstance(max_bigint, int)
+            or isinstance(max_bigint, bool)
+        ):
+            return None
+        lane, lo, hi = "bigint", min_bigint, max_bigint
+    else:
+        if (
+            min_timestamp is None
+            or max_timestamp is None
+            or not isinstance(min_timestamp, datetime)
+            or not isinstance(max_timestamp, datetime)
+        ):
+            return None
+        lane, lo, hi = "timestamp", min_timestamp, max_timestamp
+    try:
+        if lo != lo or hi != hi:
+            return None
+        if not bool(lo <= hi):
+            return None
+    except Exception:
+        return None
+
+    physical = str(physical_type or "").upper()
+    logical = str(logical_type or "").upper()
+    if lane == "bigint":
+        if physical not in {"BOOLEAN", "INT32", "INT64"}:
+            return None
+        if logical not in {"", "INT"}:
+            return None
+        return lane, lo, hi
+    if logical == "DATE" and physical == "INT32":
+        return "date", lo, hi
+    if (
+        logical in ("TIMESTAMP_NTZ_MILLIS", "TIMESTAMP_NTZ_MICROS")
+        and physical == "INT64"
+    ):
+        return "timestamp", lo, hi
+    if (
+        logical in ("TIMESTAMP_TZ_MILLIS", "TIMESTAMP_TZ_MICROS")
+        and physical == "INT64"
+    ):
+        return "timestamptz", lo, hi
     return None
+
+
+def _stored_select_lane(row: dict) -> Optional[Tuple[str, object, object]]:
+    """Return a footer range only when SELECT semantics can trust its order.
+
+    This is intentionally stricter than :func:`_stored_lane`, which is also
+    used by the write-path equality probe under Polars' type-stable semantics.
+    A read may execute in DuckDB or Spark and may involve implicit casts and
+    connection collation, so a footer lane is eligible only when the range
+    ordering is identical to the executor's equality/filter semantics:
+
+    * signed bigint ranges are exact;
+    * DATE, naïve TIMESTAMP and TIMESTAMPTZ are distinct lanes, and only new
+      unambiguous millisecond/microsecond markers are accepted (the stats
+      artifact stores microseconds, so nanosecond bounds would be lossy);
+    * doubles are unavailable because Parquet footer min/max can omit NaNs and
+      mixed bigint/double equality can round beyond 2**53;
+    * strings are unavailable because DuckDB connections use the ``nocase``
+      collation while Parquet footer bounds use binary UTF-8 order.
+
+    Returning ``None`` never drops data: callers treat it as unknown and retain
+    the row group/file.
+    """
+    # Direct callers still pass the full stats mapping.  Fold the rejected
+    # typed slots into the same poison bit used by narrow DataFrame projections
+    # so a corrupt row with multiple lanes cannot become trusted.
+    other_lane_populated = (
+        row.get(_SELECT_OTHER_LANE_COL) is True
+        or any(
+            row.get(name) is not None
+            for name in (
+                "min_double", "max_double", "min_string", "max_string",
+            )
+        )
+    )
+    return _stored_select_lane_values(
+        row.get("stats_available"),
+        row.get("physical_type"),
+        row.get("logical_type"),
+        row.get("min_bigint"),
+        row.get("max_bigint"),
+        row.get("min_timestamp"),
+        row.get("max_timestamp"),
+        other_lane_populated,
+    )
 
 
 def prune_overlapping_files_by_stats(
@@ -2101,15 +2376,22 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
     """
     p_lane = pred.lane
     s_lane, s_min, s_max = stored
-    if p_lane == "numeric" and s_lane in ("bigint", "double"):
-        # Compare the raw values: Python int/float cross-type comparison is
-        # exact by value.  A float() coercion would round int64s past 2**53
-        # onto shared floats and let a strict bound falsely exclude a file
-        # (e.g. ``k > 2**53`` vs a stored value of ``2**53 + 1``).
+    if p_lane in ("numeric", "numeric_cast") and s_lane == "bigint":
+        # Integer literals/ranges compare exactly.  A floating predicate bound
+        # against BIGINT is deliberately incomparable: DuckDB may coerce the
+        # bigint to double, where values past 2**53 collapse together.
+        if any(
+            isinstance(v, float)
+            for v in (pred.lo, pred.hi)
+            if v is not None
+        ):
+            return True
+        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+    elif p_lane == "date" and s_lane == "date":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     elif p_lane == "timestamp" and s_lane == "timestamp":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
-    elif p_lane == "string" and s_lane == "string":
+    elif p_lane == "timestamptz" and s_lane == "timestamptz":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     else:
         return True  # incomparable lanes → cannot exclude
@@ -2189,14 +2471,90 @@ def prune_files_by_predicates(
     if stored_stats_df is None or stored_stats_df.height == 0:
         return file_keys
 
-    constrained_cols = sorted({c for occ in occurrences for c in occ})
-    needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
+    # SQL identifiers are case-insensitive in the supported engines.  Normalize
+    # both sides before indexing, but fail open if one occurrence itself has a
+    # collision (choosing either constraint could exclude the wrong column).
+    normalized_occurrences: List[Dict[str, PredInterval]] = []
+    for occurrence in occurrences:
+        normalized: Dict[str, PredInterval] = {}
+        for column, predicate in occurrence.items():
+            if not isinstance(column, str):
+                return file_keys
+            column_lower = column.lower()
+            if column_lower in normalized:
+                return file_keys
+            normalized[column_lower] = predicate
+        normalized_occurrences.append(normalized)
+
+    constrained_cols = sorted({
+        column for occurrence in normalized_occurrences for column in occurrence
+    })
+    if not {"file_path", "row_group_id", "column_name"}.issubset(
+        stored_stats_df.columns
+    ):
+        return file_keys
+    # Only signed integers and explicitly typed temporal ranges are eligible
+    # for SELECT pruning.  Avoid converting the rejected double/string lanes
+    # (and unrelated stats metadata) into Python dictionaries.
+    lane_columns = (
+        "file_path", "row_group_id", "stats_available",
+        "physical_type", "logical_type",
+        "min_bigint", "max_bigint", "min_timestamp", "max_timestamp",
+    )
+    expressions = [
+        polars.col("column_name").str.to_lowercase().alias("__column_lower")
+    ] + [
+        (
+            polars.col(column)
+            if column in stored_stats_df.columns
+            else polars.lit(None).alias(column)
+        )
+        for column in lane_columns
+    ]
+    rejected_lane_columns = [
+        column for column in (
+            "min_double", "max_double", "min_string", "max_string",
+        )
+        if column in stored_stats_df.columns
+    ]
+    expressions.append(
+        (
+            polars.any_horizontal(
+                [polars.col(column).is_not_null()
+                 for column in rejected_lane_columns]
+            )
+            if rejected_lane_columns else polars.lit(False)
+        ).alias(_SELECT_OTHER_LANE_COL)
+    )
+    needed = (
+        stored_stats_df
+        .filter(
+            polars.col("column_name").str.to_lowercase().is_in(constrained_cols)
+        )
+        .select(expressions)
+    )
     index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
-    for row in needed.iter_rows(named=True):
-        fp = row["file_path"]
-        rg = row["row_group_id"]
-        col = row["column_name"]
-        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+    for (
+        col, fp, rg, stats_available, physical_type, logical_type,
+        min_bigint, max_bigint, min_timestamp, max_timestamp,
+        other_lane_populated,
+    ) in needed.iter_rows():
+        rg_cols = index.setdefault(fp, {}).setdefault(rg, {})
+        if col in rg_cols:
+            # Never let iteration order choose between physical footer columns
+            # that collide after case folding (e.g. externally written ID/id).
+            rg_cols[col] = None
+        else:
+            rg_cols[col] = _stored_select_lane_values(
+                stats_available,
+                physical_type,
+                logical_type,
+                min_bigint,
+                max_bigint,
+                min_timestamp,
+                max_timestamp,
+                other_lane_populated,
+            )
 
     kept: List[str] = []
     pruned = 0
@@ -2205,7 +2563,10 @@ def prune_files_by_predicates(
         if not rgs:
             kept.append(fk)  # no stats for this file → cannot prove absence
             continue
-        if all(_occurrence_excludes_file(occ, rgs) for occ in occurrences):
+        if all(
+            _occurrence_excludes_file(occurrence, rgs)
+            for occurrence in normalized_occurrences
+        ):
             pruned += 1
         else:
             kept.append(fk)
@@ -2213,6 +2574,8 @@ def prune_files_by_predicates(
     # Never empty a table's file list — pruning is an optimisation, and the
     # estimator treats zero files as an error.  Retain all if we pruned all.
     if not kept:
+        return file_keys
+    if pruned == 0:
         return file_keys
     p.add("read_pruned_files", pruned)
     return kept
@@ -2333,6 +2696,17 @@ def load_stats(
         return cached
     p.add("stats_cache_miss", 1)
     df = _read_parquet_safe(stats_path, profiler=p)
+    if df is not None and df.schema != STATS_SCHEMA:
+        try:
+            df = _conform_stats_schema(df)
+        except Exception as e:
+            # Stats are an optional optimisation.  An artifact whose legacy or
+            # corrupt schema cannot be made conservative must behave as absent,
+            # never abort a SELECT/write or feed untyped values into pruning.
+            logging.warning(
+                f"[stats] incompatible stats schema at {stats_path}: {e}"
+            )
+            return None
     if df is not None and allow_cache:
         _STATS_CACHE.put(stats_path, df)
     return df

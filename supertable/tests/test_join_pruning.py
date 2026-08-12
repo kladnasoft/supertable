@@ -85,6 +85,7 @@ def _rows_for_file(file_path: str, colspecs: Dict[str, Tuple]) -> List[dict]:
             row["min_double"], row["max_double"] = float(spec[1]), float(spec[2])
         elif lane == "timestamp":
             row["min_timestamp"], row["max_timestamp"] = spec[1], spec[2]
+            row["logical_type"] = "TIMESTAMP_NTZ_MICROS"
         elif lane == "string":
             row["min_string"], row["max_string"] = str(spec[1]), str(spec[2])
         elif lane == "unknown":
@@ -416,6 +417,50 @@ def test_all_null_row_group_does_not_poison_the_export():
         {src: _stats_df(rows), dst: _stats_df(dst_rows)},
     )
     assert plan.survivors[dst] == ["dst/f5.parquet"]
+
+
+def test_corrupt_null_cardinality_does_not_hide_unknown_join_keys():
+    """Impossible footer cardinalities are uncertainty, not all-NULL proof."""
+    src_rows = _rows_for_file(
+        "src/known.parquet", {"k": ("bigint", 10, 10)}
+    )
+    corrupt = {k: None for k in STATS_SCHEMA}
+    corrupt.update({
+        "file_path": "src/corrupt.parquet",
+        "row_group_id": 0,
+        "column_name": "k",
+        "physical_type": "INT64",
+        "logical_type": "",
+        # This cannot describe a valid row group.  The range is unknown and
+        # must remain unbounded; the former >= check mislabeled it all-NULL.
+        "null_count": 101,
+        "row_group_rows": 100,
+        "compressed_bytes": 10,
+        "min_is_exact": True,
+        "max_is_exact": True,
+        "stats_available": False,
+    })
+    src_rows.append(corrupt)
+    dst_rows = (
+        _rows_for_file("dst/known.parquet", {"k": ("bigint", 10, 10)})
+        + _rows_for_file("dst/could-match.parquet", {"k": ("bigint", 99, 99)})
+    )
+    src, dst = (SUPER, "src"), (SUPER, "dst")
+
+    plan = prune_files_across_joins(
+        [JoinEdge(src, "k", dst, "k")],
+        {},
+        {
+            src: ["src/known.parquet", "src/corrupt.parquet"],
+            dst: ["dst/known.parquet", "dst/could-match.parquet"],
+        },
+        {src: _stats_df(src_rows), dst: _stats_df(dst_rows)},
+        allow_empty=False,
+    )
+
+    assert plan.survivors[dst] == [
+        "dst/known.parquet", "dst/could-match.parquet"
+    ]
 
 
 # ---------------------------------------------------------------------------

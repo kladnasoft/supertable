@@ -1,5 +1,5 @@
 # route: supertable.utils.sql_parser
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 import sqlglot
@@ -45,23 +45,43 @@ def _split_and(node: exp.Expression) -> List[exp.Expression]:
     return [node]
 
 
-def _parse_datetime_literal(s: str) -> Optional[datetime]:
-    """Parse an ISO-ish date/datetime string into a tz-naive microsecond
-    ``datetime``; ``None`` when it doesn't look like a date."""
+def _parse_datetime_literal(
+        s: str,
+        *,
+        timezone_mode: str = "naive",
+) -> Optional[datetime]:
+    """Parse an ISO-ish temporal literal into the stats representation.
+
+    Parquet stores zoned timestamp bounds as UTC instants with the timezone
+    removed by :func:`supertable.processing._to_us_datetime`.  An explicit
+    offset can therefore be normalised safely.  A TIMESTAMPTZ literal without
+    an offset depends on the executor session timezone, which the parser does
+    not know, so it deliberately yields ``None`` (no pruning).  Conversely an
+    offset-bearing value cannot be compared as a naïve TIMESTAMP/DATE.
+    """
     txt = s.strip().replace("T", " ")
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(txt, fmt)
-        except ValueError:
-            continue
-    return None
+    if txt.endswith(("Z", "z")):
+        txt = txt[:-1] + "+00:00"
+    try:
+        value = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+
+    if timezone_mode == "aware":
+        if value.tzinfo is None:
+            return None
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    if value.tzinfo is not None:
+        return None
+    return value
 
 
 def _literal_to_lane_value(node: exp.Expression) -> Optional[Tuple[str, object]]:
     """Reduce a literal-ish expression to ``(lane, value)`` or ``None``.
 
-    Lanes: ``numeric`` (ints/floats/bools), ``string`` (quoted strings) and
-    ``timestamp`` (DATE/TIMESTAMP casts of date-shaped strings).  Any expression
+    Lanes: ``numeric`` (bare ints/floats/bools), ``numeric_cast`` (a numeric
+    value whose CAST provenance matters to executor overflow rules), ``string``
+    (quoted strings), ``date``, ``timestamp`` and ``timestamptz``.  Any expression
     that isn't a pure literal (a column, a function, an arithmetic node, a
     subquery) yields ``None`` → that predicate contributes no constraint.
     """
@@ -80,12 +100,46 @@ def _literal_to_lane_value(node: exp.Expression) -> Optional[Tuple[str, object]]
         to = node.args.get("to")
         type_name = ""
         if to is not None and getattr(to, "this", None) is not None:
-            type_name = str(to.this).upper()
+            type_value = getattr(to.this, "value", to.this)
+            type_name = str(type_value).upper()
         inner = node.this
-        if any(t in type_name for t in ("DATE", "TIMESTAMP", "DATETIME")):
+        temporal_lane = None
+        timezone_mode = "naive"
+        if type_name == "DATE":
+            temporal_lane = "date"
+        elif type_name in ("TIMESTAMPTZ", "TIMESTAMP_TZ") or (
+                "TIMESTAMP" in type_name and "TIME ZONE" in type_name):
+            temporal_lane = "timestamptz"
+            timezone_mode = "aware"
+        elif "TIMESTAMP" in type_name or "DATETIME" in type_name:
+            temporal_lane = "timestamp"
+        if temporal_lane is not None:
+            # Resolution-changing casts cannot use the literal text's parsed
+            # microsecond value as their comparison bound.  DuckDB rounds, for
+            # example, TIMESTAMP_MS '...00.123456' to ...00.123000 and
+            # TIMESTAMP_S to the nearest second.  A parameterized TIMESTAMP(3)
+            # does the same.  TIMESTAMP_NS has the opposite problem: Python's
+            # datetime parser silently truncates fractional digits beyond
+            # microseconds, so e.g. a strict bound at ``...1234567`` cannot be
+            # represented exactly.  Reproducing every executor's precision
+            # conversion (including rollover and pre-epoch cases) is
+            # unnecessary risk for an optional optimisation, so reject every
+            # explicitly resolution-qualified/parameterized form.
+            temporal_params = to.args.get("expressions") or []
+            if type_name in {
+                "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS",
+            } or temporal_params:
+                return None
             if isinstance(inner, exp.Literal) and inner.is_string:
-                dt = _parse_datetime_literal(inner.this)
-                return ("timestamp", dt) if dt is not None else None
+                dt = _parse_datetime_literal(
+                    inner.this, timezone_mode=timezone_mode)
+                if temporal_lane == "date" and dt is not None:
+                    # DuckDB accepts a datetime-shaped DATE literal but
+                    # truncates it to the calendar date.  Mirror that exact
+                    # value; retaining the time-of-day could exclude the file
+                    # containing midnight on an equality predicate.
+                    dt = datetime(dt.year, dt.month, dt.day)
+                return (temporal_lane, dt) if dt is not None else None
             return None
         inner_lv = _literal_to_lane_value(inner)
         if inner_lv is None:
@@ -95,14 +149,21 @@ def _literal_to_lane_value(node: exp.Expression) -> Optional[Tuple[str, object]]
         # live there too — falling through to the inner literal's lane would
         # e.g. turn CAST('1.5' AS DOUBLE) into a STRING constraint whose
         # byte-order pruning excludes a numerically matching '1.50'.
-        if any(t in type_name for t in
-               ("INT", "DOUBLE", "FLOAT", "REAL", "DECIMAL", "NUMERIC")):
+        if any(t in type_name for t in ("DOUBLE", "FLOAT", "REAL")):
+            # A floating cast can round an integral-looking source before the
+            # executor compares it to a BIGINT column.  Keeping the original
+            # Python int here is unsound past 2**53; the SELECT-safe stats path
+            # does not prune floating lanes anyway, so fail open immediately.
+            return None
+        if any(t in type_name for t in ("INT", "DECIMAL", "NUMERIC")):
             if lane == "numeric":
+                return "numeric_cast", value
+            if lane == "numeric_cast":
                 return inner_lv
             if lane == "string":
                 try:
                     text = value.strip()
-                    return "numeric", (float(text) if any(
+                    return "numeric_cast", (float(text) if any(
                         c in text for c in (".", "e", "E")) else int(text))
                 except (TypeError, ValueError, AttributeError):
                     return None
@@ -245,9 +306,16 @@ class SQLParser:
 
         self.default_super_name: str = super_name
         self.original_query: str = query
+        self.dialect: str = dialect
 
         # Internal parsed expression
         self._parsed: exp.Expression = self._parse_query(query, dialect)
+
+        # Predicate and join pruning analyses consume the same sqlglot scope
+        # graph and are strictly read-only.  Build it lazily and retain an
+        # immutable outer container so a normal parser user pays nothing, while
+        # DataReader avoids traversing every CTE/subquery twice.
+        self._pruning_scopes: Optional[Tuple[object, ...]] = None
 
         # alias -> (supertable, table)
         self._alias_to_table: Dict[str, Tuple[str, str]] = {}
@@ -334,6 +402,19 @@ class SQLParser:
         if isinstance(db_expr, exp.Expression) and hasattr(db_expr, "name"):
             return db_expr.name
         return None
+
+    def _get_pruning_scopes(self) -> Tuple[object, ...]:
+        """Return the lazily built scope graph shared by pruning analyses.
+
+        ``traverse_scope`` is eager in the supported sqlglot version, and both
+        consumers only read each Scope/AST node.  Caching the tuple therefore
+        cannot change bindings; it only removes a duplicate traversal.
+        Exceptions deliberately propagate to each public method's existing
+        fail-open guard, which turns analysis failure into no pruning.
+        """
+        if self._pruning_scopes is None:
+            self._pruning_scopes = tuple(traverse_scope(self._parsed))
+        return self._pruning_scopes
 
     # ---------------- Table extraction ----------------
 
@@ -748,6 +829,10 @@ class SQLParser:
             if lane_value is None:
                 return None
             lane, value = lane_value
+            if self.dialect == "spark" and lane in {
+                "numeric_cast", "date", "timestamp", "timestamptz",
+            }:
+                return None
             if flip:
                 op = _FLIP_OP[op]
             return alias, col.name, _interval_for_op(op, lane, value)
@@ -763,6 +848,10 @@ class SQLParser:
             lo_lv = _literal_to_lane_value(node.args.get("low"))
             hi_lv = _literal_to_lane_value(node.args.get("high"))
             if lo_lv is None or hi_lv is None or lo_lv[0] != hi_lv[0]:
+                return None
+            if self.dialect == "spark" and lo_lv[0] in {
+                "numeric_cast", "date", "timestamp", "timestamptz",
+            }:
                 return None
             return alias, col.name, PredInterval(lo_lv[0], lo_lv[1], True, hi_lv[1], True)
 
@@ -784,6 +873,10 @@ class SQLParser:
             if len(lanes) != 1:
                 return None
             lane = lanes.pop()
+            if self.dialect == "spark" and lane in {
+                "numeric_cast", "date", "timestamp", "timestamptz",
+            }:
+                return None
             values = [lv[1] for lv in lanes_values]
             return alias, col.name, PredInterval(lane, min(values), True, max(values), True)
 
@@ -804,13 +897,27 @@ class SQLParser:
         """
         result: Dict[Tuple[str, str], List[Dict[str, PredInterval]]] = {}
         try:
-            scopes = traverse_scope(self._parsed)
+            scopes = self._get_pruning_scopes()
         except Exception:
             return result
 
         for scope in scopes:
             select = scope.expression
             if not isinstance(select, exp.Select):
+                # sqlglot gives an aliased parenthesized joined-table group,
+                # e.g. ``(b JOIN c ON ...) x``, its own non-SELECT scope.  The
+                # executor still registers one shared physical view for b.  If
+                # b is also filtered through another alias outside the group,
+                # omitting this unconstrained occurrence would prune files x
+                # needs.  We cannot safely map predicates through the group's
+                # derived alias, so record each direct physical source as an
+                # empty (full-scan) occurrence.
+                for src in scope.sources.values():
+                    if not isinstance(src, exp.Table):
+                        continue
+                    db = self._get_db_name(src) or self.default_super_name
+                    key = (db.lower(), src.name.lower())
+                    result.setdefault(key, []).append({})
                 continue
 
             alias_to_phys: Dict[str, Tuple[str, str]] = {}
@@ -922,7 +1029,7 @@ class SQLParser:
         pruning), so this never breaks a query.
         """
         try:
-            scopes = traverse_scope(self._parsed)
+            scopes = self._get_pruning_scopes()
         except Exception:
             return []
 
@@ -933,17 +1040,23 @@ class SQLParser:
         scope_aliases: List[Dict[str, Optional[Tuple[str, str]]]] = []
         for scope in scopes:
             alias_to_phys: Dict[str, Optional[Tuple[str, str]]] = {}
-            if isinstance(scope.expression, exp.Select):
-                for name, src in scope.sources.items():
-                    if not isinstance(src, exp.Table):
-                        continue
-                    db = self._get_db_name(src) or self.default_super_name
-                    key = (db.lower(), src.name.lower())
+            for name, src in scope.sources.items():
+                if not isinstance(src, exp.Table):
+                    continue
+                db = self._get_db_name(src) or self.default_super_name
+                key = (db.lower(), src.name.lower())
+                # Count physical sources in every scope, including sqlglot's
+                # non-SELECT scope for an aliased parenthesized table group
+                # such as ``(b JOIN c) x``.  The executor still gives every
+                # occurrence of b one shared physical file list; missing the
+                # grouped occurrence would let an edge on another alias prune
+                # files that x needs.
+                occurrence_count[key] = occurrence_count.get(key, 0) + 1
+                if isinstance(scope.expression, exp.Select):
                     lname = name.lower()
                     alias_to_phys[lname] = (
                         None if lname in alias_to_phys else key
                     )
-                    occurrence_count[key] = occurrence_count.get(key, 0) + 1
             scope_aliases.append(alias_to_phys)
 
         # edge dedup key -> [endpoints, l_prunable, r_prunable]; grants OR.
@@ -966,7 +1079,7 @@ class SQLParser:
         def add_eq_conjunct(
             node: exp.Expression,
             alias_to_phys: Dict[str, Optional[Tuple[str, str]]],
-            own_alias: Optional[str],
+            own_aliases: Optional[Set[str]],
             own_prunable: bool,
             outer_prunable: bool,
         ) -> None:
@@ -990,11 +1103,56 @@ class SQLParser:
                 return
             if l_key == r_key:
                 return  # self-join: no cross-table propagation
+            # Directional joins are safe only when the join node's complete
+            # RHS ownership is known.  In particular, treating every endpoint
+            # as the accumulated/outer side is unsound for RIGHT / RIGHT ANTI:
+            # their RHS is preserved.  Opaque derived tables and other complex
+            # operands therefore produce no asymmetric edge rather than a
+            # guessed direction.
+            if own_aliases is None and own_prunable != outer_prunable:
+                return
             add_edge(
                 l_key, left.name.lower(), r_key, right.name.lower(),
-                own_prunable if la == own_alias else outer_prunable,
-                own_prunable if ra == own_alias else outer_prunable,
+                own_prunable if own_aliases is not None and la in own_aliases
+                else outer_prunable,
+                own_prunable if own_aliases is not None and ra in own_aliases
+                else outer_prunable,
             )
+
+        def join_operand_aliases(
+            node: exp.Expression,
+            alias_to_phys: Dict[str, Optional[Tuple[str, str]]],
+        ) -> Optional[Set[str]]:
+            """Physical aliases structurally owned by one JOIN operand.
+
+            sqlglot represents an unaliased parenthesized join such as
+            ``(b JOIN c ON ...)`` as ``Subquery(Table(b, joins=[c]))`` in the
+            *same* scope.  Both ``b`` and ``c`` belong to that JOIN node's own
+            side, which matters for RIGHT/FULL/ANTI preservation semantics.
+
+            Only that transparent table/join-group shape is traversed.  A real
+            SELECT/UNION subquery, an aliased group (which sqlglot scopes
+            separately), or any alias that cannot be resolved to a physical
+            table returns ``None`` so asymmetric pruning fails closed.
+            """
+            node = _unwrap_paren(node)
+            if isinstance(node, exp.Subquery):
+                if node.alias:
+                    return None
+                return join_operand_aliases(node.this, alias_to_phys)
+            if not isinstance(node, exp.Table):
+                return None
+
+            alias = (node.alias or node.name).lower()
+            if alias_to_phys.get(alias) is None:
+                return None
+            aliases = {alias}
+            for nested_join in node.args.get("joins") or []:
+                nested = join_operand_aliases(nested_join.this, alias_to_phys)
+                if nested is None:
+                    return None
+                aliases.update(nested)
+            return aliases
 
         for scope, alias_to_phys in zip(scopes, scope_aliases):
             select = scope.expression
@@ -1011,16 +1169,19 @@ class SQLParser:
                 preceding.append((from_expr.this.alias or from_expr.this.name).lower())
 
             for join in select.args.get("joins") or []:
-                own_alias: Optional[str] = None
-                if isinstance(join.this, exp.Table):
-                    own_alias = (join.this.alias or join.this.name).lower()
+                own_aliases = join_operand_aliases(join.this, alias_to_phys)
+                own_alias = (
+                    next(iter(own_aliases))
+                    if own_aliases is not None and len(own_aliases) == 1
+                    else None
+                )
                 own_prunable, outer_prunable = self._join_prunability(join)
 
                 on = join.args.get("on")
                 if on is not None:
                     for conj in _split_and(on):
                         add_eq_conjunct(
-                            conj, alias_to_phys, own_alias,
+                            conj, alias_to_phys, own_aliases,
                             own_prunable, outer_prunable,
                         )
 
@@ -1047,7 +1208,7 @@ class SQLParser:
             where = select.args.get("where")
             if where is not None:
                 for conj in _split_and(where.this):
-                    add_eq_conjunct(conj, alias_to_phys, None, True, True)
+                    add_eq_conjunct(conj, alias_to_phys, set(), True, True)
 
         result: List[JoinEdge] = []
         for ((l_key, l_col), (r_key, r_col)), (l_pr, r_pr) in edges.items():

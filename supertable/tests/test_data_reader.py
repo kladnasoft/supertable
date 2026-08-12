@@ -1614,6 +1614,7 @@ class TestExecuteExecutorArgs:
             tables=physical_tables,
             predicate_constraints={},
             join_edges=[],
+            join_pruning_lanes={"numeric"},
             plan_stats=MockPlanStats.return_value,
         )
 

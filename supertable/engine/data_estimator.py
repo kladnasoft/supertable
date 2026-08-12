@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Iterable, Set, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -128,6 +129,7 @@ class DataEstimator:
         predicate_constraints: Optional[Dict] = None,
         join_edges: Optional[List[JoinEdge]] = None,
         plan_stats: Optional[PlanStats] = None,
+        join_pruning_lanes: Optional[Set[str]] = None,
     ):
         self.organization = organization
         self.storage = storage
@@ -141,6 +143,10 @@ class DataEstimator:
         # is propagated across these edges to prune its partners (cross-table
         # file pruning).  Empty ⇒ no propagation (single-table or un-joined).
         self.join_edges: List[JoinEdge] = join_edges or []
+        # Optional executor-specific whitelist passed to the join kernel.
+        # Disabled lanes become unknown and therefore retain files.  ``None``
+        # preserves the kernel's full safe-lane set for standalone callers.
+        self.join_pruning_lanes = join_pruning_lanes
         self.timer: Optional[Timer] = None
         # When the caller (DataReader) injects its PlanStats, estimator stats —
         # REFLECTIONS, REFLECTION_SIZE and the read-pruning counters — land on
@@ -148,6 +154,10 @@ class DataEstimator:
         # read monitoring payload. Standalone callers get a fresh PlanStats.
         self.plan_stats: Optional[PlanStats] = plan_stats
         self.catalog = RedisCatalog()
+        # Lazily populated only when storage helpers cannot resolve keys.  These
+        # settings/storage attributes are invariant for one estimator run; do
+        # not rediscover them for every file in a large scan.
+        self._fallback_url_config: Optional[Tuple[Optional[str], Optional[str], bool, bool]] = None
 
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
         """Normalize schema representations into a {name: type} dict."""
@@ -209,7 +219,7 @@ class DataEstimator:
 
         # 2) Environment variable
         if settings.STORAGE_ENDPOINT_URL:
-            return self._normalize_endpoint_for_s3(env_single)
+            return self._normalize_endpoint_for_s3(settings.STORAGE_ENDPOINT_URL)
 
         return None
 
@@ -259,16 +269,26 @@ class DataEstimator:
                 try:
                     url = fn(key)  # key in, URL out (not presigned)
                     if isinstance(url, str) and url:
-                        logger.info(f"[estimate.resolve] storage.{attr} → {url}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"[estimate.resolve] storage.{attr} → {url}"
+                            )
                         return url
                 except Exception as e:
                     logger.debug(f"[estimate.resolve] storage.{attr} failed: {e}")
 
         # 4) Construct URL from endpoint/bucket
-        endpoint_raw = self._detect_endpoint()
-        bucket = self._detect_bucket()
-        use_http = settings.SUPERTABLE_DUCKDB_USE_HTTPFS
-        scheme = "https" if self._detect_ssl() else "http"
+        fallback = getattr(self, "_fallback_url_config", None)
+        if fallback is None:
+            fallback = (
+                self._detect_endpoint(),
+                self._detect_bucket(),
+                settings.SUPERTABLE_DUCKDB_USE_HTTPFS,
+                self._detect_ssl(),
+            )
+            self._fallback_url_config = fallback
+        endpoint_raw, bucket, use_http, use_ssl = fallback
+        scheme = "https" if use_ssl else "http"
         key_norm = key.lstrip("/")
 
         if endpoint_raw and bucket:
@@ -344,7 +364,7 @@ class DataEstimator:
         occurrences = self.predicate_constraints.get(
             (super_name.lower(), simple_name.lower())
         )
-        if not occurrences:
+        if not self._has_potential_select_predicate(occurrences):
             return raw_keys
         try:
             return prune_files_by_predicates(
@@ -353,6 +373,204 @@ class DataEstimator:
         except Exception as e:
             logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
             return raw_keys
+
+    @staticmethod
+    def _has_potential_select_predicate(occurrences) -> bool:
+        """Whether every shared scan occurrence has a usable SELECT lane.
+
+        ``prune_files_by_predicates`` unions the files needed by physical-table
+        occurrences.  One empty occurrence, or one occurrence containing only
+        comparison lanes SELECT deliberately distrusts (string/double), makes
+        file elimination impossible.  Detect that before loading or scanning a
+        stats artifact.  This mirrors the processing layer's conservative lane
+        gates; returning ``False`` can only skip a guaranteed no-op.
+        """
+        if not occurrences:
+            return False
+        try:
+            for occurrence in occurrences:
+                if not occurrence:
+                    return False
+                occurrence_can_prune = False
+                for predicate in occurrence.values():
+                    lane = predicate.lane
+                    if lane in ("date", "timestamp", "timestamptz"):
+                        occurrence_can_prune = True
+                        break
+                    if lane in ("numeric", "numeric_cast") and not any(
+                        isinstance(bound, float)
+                        for bound in (predicate.lo, predicate.hi)
+                        if bound is not None
+                    ):
+                        occurrence_can_prune = True
+                        break
+                if not occurrence_can_prune:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _validated_file_subset(
+        original: Iterable[str], candidate: Iterable[str],
+    ) -> Optional[List[str]]:
+        """Return the candidate list only when it is a multiset subset.
+
+        File pruning is allowed to remove input occurrences, never to introduce
+        or duplicate them.  Treating the lists as multisets also covers corrupt
+        snapshots that happen to repeat a resource key.  ``None`` means the
+        pruning result violated that contract and must be discarded wholesale.
+        """
+        try:
+            # Every fail-open/no-op path intentionally returns the exact input
+            # list.  Avoid allocating two Counters on the overwhelmingly common
+            # unfiltered-table path.
+            if candidate is original and isinstance(original, list):
+                return original
+            original_list = list(original)
+            candidate_list = list(candidate)
+            if Counter(candidate_list) - Counter(original_list):
+                return None
+        except Exception:
+            # File keys are strings in valid snapshots.  Any unhashable or
+            # otherwise malformed value is not safe to apply as a pruning plan.
+            return None
+        return candidate_list
+
+    @staticmethod
+    def _stats_for_complete_files(
+        stats_df: Optional["polars.DataFrame"],
+        resource_rows: Dict[str, Optional[int]],
+    ) -> Optional["polars.DataFrame"]:
+        """Keep stats only for files whose row-group manifest is complete.
+
+        The table-level ``stats_rows`` count detects a truncated artifact, but
+        not a same-height substitution (for example, one missing row-group row
+        replaced by a duplicate belonging to another file).  Treat a file's
+        stats as absence proof only when their structure agrees with the
+        snapshot resource's independently recorded physical row count:
+
+        * the resource row count is an exact non-negative integer;
+        * row-group ids are exactly ``0..N-1``;
+        * every row in a row group reports the same non-negative row count and
+          those counts sum to the resource row count;
+        * every row group has the identical, exact footer column-name set; and
+        * every ``(row_group_id, column_name)`` slot occurs exactly once.
+
+        Rows for an invalid or unmanifested file are removed.  All pruning
+        consumers interpret an absent file as unknown and retain it; a join
+        source with an absent file similarly exports an unknown range.  Any
+        validation failure returns ``None`` and disables stats use table-wide.
+        """
+        if stats_df is None:
+            return None
+        if not isinstance(stats_df, polars.DataFrame):
+            return None
+        if stats_df.height == 0:
+            return stats_df
+
+        required = {
+            "file_path", "row_group_id", "column_name", "row_group_rows",
+        }
+        if not required.issubset(stats_df.columns):
+            return None
+
+        manifest = {
+            file_path: rows
+            for file_path, rows in resource_rows.items()
+            if isinstance(file_path, str)
+            and isinstance(rows, int)
+            and not isinstance(rows, bool)
+            and rows >= 0
+        }
+        if not manifest:
+            # Preserve the input schema so downstream consumers can take their
+            # normal empty-frame fast path without special casing this guard.
+            return stats_df.head(0)
+
+        try:
+            # Keep the validation columnar.  A stats artifact can have millions
+            # of (row-group x column) rows; only the final trusted file names
+            # need to cross into Python for the optional filter.
+            manifested_stats = stats_df.filter(
+                polars.col("file_path").is_in(list(manifest))
+            )
+            groups = (
+                manifested_stats
+                .select(list(required))
+                .group_by(["file_path", "row_group_id"])
+                .agg([
+                    polars.len().alias("__slots"),
+                    polars.col("column_name").n_unique().alias("__unique_slots"),
+                    polars.col("column_name").unique().sort().alias("__columns"),
+                    polars.col("row_group_rows").n_unique().alias("__row_counts"),
+                    polars.col("row_group_rows").first().alias("__rows"),
+                    polars.col("column_name").is_not_null().all().alias("__names_valid"),
+                    (
+                        polars.col("row_group_rows").is_not_null()
+                        & (polars.col("row_group_rows") >= 0)
+                    ).all().alias("__rows_valid"),
+                ])
+            )
+            expected = polars.DataFrame({
+                "file_path": list(manifest),
+                "__expected_rows": list(manifest.values()),
+            }, schema={"file_path": polars.Utf8, "__expected_rows": polars.Int64})
+            trusted_frame = (
+                groups
+                .group_by("file_path")
+                .agg([
+                    polars.len().alias("__group_count"),
+                    polars.col("row_group_id").min().alias("__min_group"),
+                    polars.col("row_group_id").max().alias("__max_group"),
+                    polars.col("row_group_id").is_not_null().all().alias("__ids_valid"),
+                    (polars.col("row_group_id") >= 0).all().alias("__ids_nonnegative"),
+                    polars.col("__rows").sum().alias("__total_rows"),
+                    (polars.col("__slots") == polars.col("__unique_slots"))
+                    .all().alias("__slots_valid"),
+                    (polars.col("__row_counts") == 1).all().alias("__counts_valid"),
+                    polars.col("__names_valid").all().alias("__all_names_valid"),
+                    polars.col("__rows_valid").all().alias("__all_rows_valid"),
+                    polars.col("__columns").n_unique().alias("__column_sets"),
+                ])
+                .join(expected, on="file_path", how="inner")
+                .filter(
+                    polars.col("__ids_valid")
+                    & polars.col("__ids_nonnegative")
+                    & polars.col("__slots_valid")
+                    & polars.col("__counts_valid")
+                    & polars.col("__all_names_valid")
+                    & polars.col("__all_rows_valid")
+                    & (polars.col("__min_group") == 0)
+                    & (
+                        polars.col("__max_group")
+                        == polars.col("__group_count") - 1
+                    )
+                    & (polars.col("__column_sets") == 1)
+                    & (
+                        polars.col("__total_rows")
+                        == polars.col("__expected_rows")
+                    )
+                )
+                .select("file_path")
+            )
+            if trusted_frame.height == 0:
+                return stats_df.head(0)
+            trusted = trusted_frame.get_column("file_path").to_list()
+            # The normal healthy-artifact path avoids a second frame filter and
+            # allocation.  A resource absent from the artifact does not matter:
+            # its data file is unknown and retained by downstream consumers.
+            if (
+                manifested_stats.height == stats_df.height
+                and len(trusted) == groups.get_column("file_path").n_unique()
+            ):
+                return stats_df
+            return manifested_stats.filter(
+                polars.col("file_path").is_in(trusted)
+            )
+        except Exception:
+            # Stats are optional and cannot be allowed to fail or narrow a read.
+            return None
 
     # ----------------------- projection-aware sizing -----------------------
 
@@ -423,6 +641,7 @@ class DataEstimator:
         self,
         stats_df: Optional["polars.DataFrame"],
         selected_cols: Set[str],
+        file_keys: Optional[Iterable[str]] = None,
     ) -> Tuple[Set[str], Dict[str, int]]:
         """Sum per-column ``compressed_bytes`` for the selected columns per file.
 
@@ -431,7 +650,9 @@ class DataEstimator:
         subset of files for which that sum is *trustworthy* — every matched row
         carried a non-NULL ``compressed_bytes``.  A file with any NULL (an older
         carried-forward row) is omitted so the caller falls back to a whole-file
-        ratio rather than under-counting it as zero.
+        ratio rather than under-counting it as zero.  When *file_keys* is given,
+        rows for files already removed by predicate/join pruning are discarded
+        before aggregation.
         """
         if (
             stats_df is None
@@ -439,8 +660,18 @@ class DataEstimator:
             or "compressed_bytes" not in stats_df.columns
         ):
             return set(), {}
+        projected = stats_df.select(
+            ["file_path", "column_name", "compressed_bytes"]
+        )
+        if file_keys is not None:
+            survivor_keys = list(file_keys)
+            if not survivor_keys:
+                return set(), {}
+            projected = projected.filter(
+                polars.col("file_path").is_in(survivor_keys)
+            )
         sel = (
-            stats_df.select(["file_path", "column_name", "compressed_bytes"])
+            projected
             .with_columns(polars.col("column_name").str.to_lowercase().alias("__cn"))
             .filter(polars.col("__cn").is_in(list(selected_cols)))
         )
@@ -449,16 +680,25 @@ class DataEstimator:
         agg = sel.group_by("file_path").agg(
             [
                 polars.col("compressed_bytes").sum().alias("__b"),
-                polars.col("compressed_bytes").is_null().sum().alias("__nulls"),
+                (
+                    polars.col("compressed_bytes").is_null()
+                    | (polars.col("compressed_bytes") < 0)
+                ).sum().alias("__invalid"),
             ]
         )
         tier3_files: Set[str] = set()
         proj: Dict[str, int] = {}
         for r in agg.iter_rows(named=True):
-            if int(r["__nulls"] or 0) == 0:
+            projected_bytes = r["__b"]
+            if (
+                int(r["__invalid"] or 0) == 0
+                and isinstance(projected_bytes, int)
+                and not isinstance(projected_bytes, bool)
+                and projected_bytes >= 0
+            ):
                 fp = r["file_path"]
                 tier3_files.add(fp)
-                proj[fp] = int(r["__b"] or 0)
+                proj[fp] = projected_bytes
         return tier3_files, proj
 
     def _ratio_bytes(
@@ -472,18 +712,45 @@ class DataEstimator:
         type-width share of the table schema.  Used only when precise
         per-column ``compressed_bytes`` are unavailable for *file_key*."""
         full = int(key_size.get(file_key, 0))
-        if full <= 0 or not schema_types:
-            return full
+        return self._ratio_bytes_with_widths(
+            full,
+            self._projection_widths(selected_cols, schema_types),
+        )
+
+    def _projection_widths(
+        self,
+        selected_cols: Set[str],
+        schema_types: Dict[str, str],
+    ) -> Optional[Tuple[int, int]]:
+        """Return ``(selected_width, total_width)`` for fallback sizing.
+
+        ``None`` means the schema cannot establish a useful projection share,
+        so callers conservatively charge each file's full size.  The result is
+        table-constant and should be computed once for a batch of files.
+        """
+        if not schema_types:
+            return None
         all_cols = {
             c: ty for c, ty in schema_types.items()
             if c not in (ROWID_COL, TIMESTAMP_COL)
         }
         total_w = sum(self._type_width(ty) for ty in all_cols.values())
         if total_w <= 0:
-            return full
+            return None
         sel_w = sum(self._type_width(all_cols[c]) for c in selected_cols if c in all_cols)
         if sel_w <= 0:
+            return None
+        return sel_w, total_w
+
+    @staticmethod
+    def _ratio_bytes_with_widths(
+        full: int,
+        widths: Optional[Tuple[int, int]],
+    ) -> int:
+        """Apply precomputed projection *widths* to one whole-file size."""
+        if full <= 0 or widths is None:
             return full
+        sel_w, total_w = widths
         return int(full * sel_w / total_w)
 
     # ----------------------- main API -----------------------
@@ -510,13 +777,32 @@ class DataEstimator:
 
         super_map = self._get_supertable_map()
 
-        # Tables that participate in a join edge need their stats loaded even for
-        # a bare SELECT * with no WHERE: their surviving files still bound the
-        # join keys they export to their partners during cross-table pruning.
-        # Gated on the master switch — with pruning off nothing consumes them.
-        join_table_keys: Set[Tuple[str, str]] = set()
+        # Tables that participate in a *usable* join edge need their stats loaded
+        # even for a bare SELECT * with no WHERE: their surviving files still
+        # bound the join keys they export to partners during cross-table pruning.
+        # Edges that cannot prune either endpoint (for example FULL OUTER JOIN)
+        # consume no stats and never need to enter the kernel.  A physical table
+        # mentioned more than once is also ambiguous here: records and join maps
+        # use one normalized key, so collapsing occurrences could export the
+        # wrong filtered range.  Disable every edge touching such a key.
+        table_key_counts = Counter(
+            (t.super_name.lower(), t.simple_name.lower()) for t in self.tables
+        )
+        duplicate_table_keys = {
+            key for key, count in table_key_counts.items() if count > 1
+        }
+        candidate_join_edges: List[JoinEdge] = []
         if settings.SUPERTABLE_READ_PRUNING_ENABLED:
-            for _edge in self.join_edges:
+            candidate_join_edges = [
+                edge for edge in self.join_edges
+                if (edge.prune_left or edge.prune_right)
+                and edge.left_table not in duplicate_table_keys
+                and edge.right_table not in duplicate_table_keys
+            ]
+
+        join_table_keys: Set[Tuple[str, str]] = set()
+        if candidate_join_edges:
+            for _edge in candidate_join_edges:
                 join_table_keys.add(_edge.left_table)
                 join_table_keys.add(_edge.right_table)
 
@@ -546,7 +832,9 @@ class DataEstimator:
                 schema_types: Dict[str, str] = {}
                 raw_keys: List[str] = []
                 key_size: Dict[str, int] = {}
+                resource_rows: Dict[str, Optional[int]] = {}
                 stats_file: Optional[str] = None
+                expected_stats_rows: Optional[int] = None
 
                 current_version = 0
                 for snapshot in snapshots:
@@ -570,6 +858,16 @@ class DataEstimator:
                     sf = current_snapshot_data.get("stats_file")
                     if sf:
                         stats_file = sf
+                        recorded_stats_rows = current_snapshot_data.get(
+                            "stats_rows"
+                        )
+                        expected_stats_rows = (
+                            recorded_stats_rows
+                            if isinstance(recorded_stats_rows, int)
+                            and not isinstance(recorded_stats_rows, bool)
+                            and recorded_stats_rows >= 0
+                            else None
+                        )
 
                     resources = current_snapshot_data.get("resources", []) or []
                     for resource in resources:
@@ -578,6 +876,21 @@ class DataEstimator:
                             continue
                         raw_keys.append(file_key)
                         key_size[file_key] = int(resource.get("file_size", 0))
+                        rows_value = resource.get("rows")
+                        valid_rows = (
+                            rows_value
+                            if isinstance(rows_value, int)
+                            and not isinstance(rows_value, bool)
+                            and rows_value >= 0
+                            else None
+                        )
+                        if file_key in resource_rows:
+                            # A repeated resource key with conflicting or
+                            # missing cardinality has no unambiguous manifest.
+                            if resource_rows[file_key] != valid_rows:
+                                resource_rows[file_key] = None
+                        else:
+                            resource_rows[file_key] = valid_rows
 
                 key = (super_name.lower(), simple_name.lower())
 
@@ -588,7 +901,9 @@ class DataEstimator:
                     selected_cols is not None
                     and settings.SUPERTABLE_READ_PROJECTION_SIZING_ENABLED
                 )
-                has_predicate = bool(self.predicate_constraints.get(key))
+                has_predicate = self._has_potential_select_predicate(
+                    self.predicate_constraints.get(key)
+                )
 
                 # Load the stats artifact ONCE per table and reuse it for predicate
                 # pruning, projection sizing AND cross-table join propagation
@@ -597,17 +912,91 @@ class DataEstimator:
                 # SELECT * that neither filters nor joins stays free.
                 stats_df: Optional["polars.DataFrame"] = None
                 if stats_file and (need_projection or has_predicate or key in join_table_keys):
-                    stats_df = load_stats(stats_file, allow_cache=True, profiler=prune_profiler)
+                    try:
+                        stats_df = load_stats(
+                            stats_file, allow_cache=True, profiler=prune_profiler,
+                        )
+                    except Exception as stats_err:
+                        # Stats are an optional optimisation artifact.  A stale,
+                        # corrupt, unavailable, or malformed pointer must never
+                        # turn a valid SELECT into an error or a narrower scan.
+                        logger.warning(
+                            f"[estimate.stats] stats unavailable for "
+                            f"{super_name}.{simple_name}; pruning and precise "
+                            f"projection sizing skipped: {stats_err}"
+                        )
+                        stats_df = None
+
+                if stats_df is not None and expected_stats_rows is not None:
+                    try:
+                        actual_stats_rows = int(stats_df.height)
+                    except Exception:
+                        actual_stats_rows = -1
+                    if actual_stats_rows != expected_stats_rows:
+                        # A stats parquet may still be syntactically readable
+                        # after a bad copy/truncation.  Its snapshot records the
+                        # immutable artifact's exact row count; disagreement
+                        # means it is incomplete/foreign and therefore cannot
+                        # prove a data file absent.  Projection sizing also
+                        # falls back rather than under-counting from it.
+                        logger.warning(
+                            f"[estimate.stats] stats row-count mismatch for "
+                            f"{super_name}.{simple_name}: expected "
+                            f"{expected_stats_rows}, got {actual_stats_rows}; "
+                            f"pruning and precise projection sizing skipped"
+                        )
+                        stats_df = None
+
+                if stats_df is not None:
+                    # A table-level row count cannot identify a missing slot
+                    # replaced by a duplicate elsewhere.  Remove every file
+                    # whose stats do not form a complete per-resource manifest;
+                    # absent stats always retain the data file.
+                    stats_df = self._stats_for_complete_files(
+                        stats_df, resource_rows,
+                    )
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
                 # satisfy this table's own WHERE before any cross-table step.
                 # The span accumulates the wall-clock of the per-table pruning
                 # (predicate eval) across every table in the query.
+                literal_count_before = prune_profiler.counts.get(
+                    "read_pruned_files", 0,
+                )
                 with prune_profiler.span("read.prune"):
                     literal_survivors = self._prune_files(
                         super_name, simple_name, raw_keys, stats_df,
                         profiler=prune_profiler,
                     )
+                # Validate again at the estimator boundary so even an overridden
+                # or future _prune_files implementation cannot inject files or
+                # make the aggregate counters negative.
+                validated_literal = self._validated_file_subset(
+                    raw_keys, literal_survivors,
+                )
+                invalid_literal = (
+                    validated_literal is None
+                    or (raw_keys and not validated_literal)
+                )
+                if invalid_literal:
+                    logger.warning(
+                        f"[estimate.prune] invalid survivor set for "
+                        f"{super_name}.{simple_name}; keeping all candidate files"
+                    )
+                    literal_survivors = list(raw_keys)
+                else:
+                    literal_survivors = validated_literal
+                # Reconcile observability from the validated boundary result,
+                # rather than trusting an inner implementation to update the
+                # profiler exactly once.  This also keeps custom/no-op pruners
+                # from reporting removals that were never applied.
+                literal_count_after = literal_count_before + (
+                    len(raw_keys) - len(literal_survivors)
+                )
+                if literal_count_after:
+                    prune_profiler.counts["read_pruned_files"] = literal_count_after
+                else:
+                    prune_profiler.counts.pop("read_pruned_files", None)
                 files_before_prune += len(raw_keys)
 
                 records.append({
@@ -622,6 +1011,7 @@ class DataEstimator:
                     "stats_df": stats_df,
                     "selected_cols": selected_cols,
                     "need_projection": need_projection,
+                    "files_before": len(raw_keys),
                     "survivors": literal_survivors,
                 })
 
@@ -633,36 +1023,99 @@ class DataEstimator:
         # execution time rather than as a zero-file estimate error.
         join_files_removed = 0
         join_iterations = 0
-        if settings.SUPERTABLE_READ_PRUNING_ENABLED and self.join_edges and records:
+        # Re-check uniqueness on the concrete records before constructing maps:
+        # dictionary comprehensions must never silently collapse two records.
+        records_by_key: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+        for record in records:
+            records_by_key[record["key"]].append(record)
+        runnable_join_edges = [
+            edge for edge in candidate_join_edges
+            if len(records_by_key.get(edge.left_table, [])) == 1
+            and len(records_by_key.get(edge.right_table, [])) == 1
+        ]
+        if runnable_join_edges:
             # Same contract as _prune_files: a pruning failure must degrade to
             # "no pruning" (keep the Pass-1 survivors), never break the read.
+            committed_join_plan = False
+            join_count_before = prune_profiler.counts.get(
+                "read_join_pruned_files", 0,
+            )
             try:
-                table_files = {r["key"]: list(r["survivors"]) for r in records}
-                table_stats = {r["key"]: r["stats_df"] for r in records}
+                joined_keys = {
+                    key
+                    for edge in runnable_join_edges
+                    for key in (edge.left_table, edge.right_table)
+                }
+                joined_records = {
+                    key: records_by_key[key][0] for key in joined_keys
+                }
+                table_files = {
+                    key: list(record["survivors"])
+                    for key, record in joined_records.items()
+                }
+                table_stats = {
+                    key: record["stats_df"]
+                    for key, record in joined_records.items()
+                }
                 with prune_profiler.span("read.join_prune"):
                     join_plan = prune_files_across_joins(
-                        self.join_edges,
+                        runnable_join_edges,
                         {},  # own-WHERE pruning already applied per-table above
                         table_files,
                         table_stats,
                         allow_empty=False,
+                        allowed_lanes=getattr(
+                            self, "join_pruning_lanes", None,
+                        ),
                     )
-                join_iterations = join_plan.iterations
-                counted_keys: Set[Tuple[str, str]] = set()
-                for r in records:
-                    pruned = join_plan.survivors.get(r["key"])
-                    if pruned is None:
-                        continue
-                    removed = len(r["survivors"]) - len(pruned)
-                    # Guard the counter against duplicate records sharing one
-                    # lowered key (case-variant spellings of the same table).
-                    if removed > 0 and r["key"] not in counted_keys:
-                        join_files_removed += removed
-                    counted_keys.add(r["key"])
-                    r["survivors"] = pruned
-                if join_plan.steps:
-                    logger.debug("[estimate.join_prune]\n" + join_plan.summary())
+
+                # Stage and validate every table before mutating any record.
+                # If one endpoint violates the subset contract, reject the whole
+                # propagation plan: applying a partial fixpoint can be unsound.
+                if set(join_plan.survivors) != set(table_files):
+                    raise ValueError(
+                        "join pruner returned an incomplete or foreign table set"
+                    )
+                staged_survivors: Dict[Tuple[str, str], List[str]] = {}
+                staged_removed = 0
+                for key, record in joined_records.items():
+                    original = table_files[key]
+                    proposed = join_plan.survivors[key]
+                    validated = self._validated_file_subset(original, proposed)
+                    if validated is None or (original and not validated):
+                        raise ValueError(
+                            f"join pruner returned an invalid survivor set for "
+                            f"{key[0]}.{key[1]}"
+                        )
+                    staged_survivors[key] = validated
+                    staged_removed += len(original) - len(validated)
+
+                staged_iterations = max(0, int(join_plan.iterations))
+                staged_summary = (
+                    join_plan.summary()
+                    if join_plan.steps and logger.isEnabledFor(logging.DEBUG)
+                    else None
+                )
+
+                # Atomic commit after all endpoints have passed validation.
+                for key, survivors in staged_survivors.items():
+                    joined_records[key]["survivors"] = survivors
+                committed_join_plan = True
+                join_files_removed = staged_removed
+                join_iterations = staged_iterations
+                prune_profiler.add("read_join_pruned_files", join_files_removed)
+                if staged_summary:
+                    logger.debug("[estimate.join_prune]\n" + staged_summary)
             except Exception as jp_err:
+                if committed_join_plan:
+                    # Even instrumentation/logging failures after assignment
+                    # must roll the records back to their Pass-1 survivors.
+                    for key, original in table_files.items():
+                        joined_records[key]["survivors"] = original
+                    if join_count_before:
+                        prune_profiler.counts["read_join_pruned_files"] = join_count_before
+                    else:
+                        prune_profiler.counts.pop("read_join_pruned_files", None)
                 join_files_removed = 0
                 join_iterations = 0
                 logger.warning(f"[estimate.join_prune] cross-table pruning skipped: {jp_err}")
@@ -688,7 +1141,36 @@ class DataEstimator:
             tier3_files: Set[str] = set()
             proj: Dict[str, int] = {}
             if need_projection:
-                tier3_files, proj = self._projected_bytes_index(stats_df, selected_cols)
+                try:
+                    tier3_files, proj = self._projected_bytes_index(
+                        stats_df,
+                        selected_cols,
+                        file_keys=(
+                            survivors
+                            if len(survivors) < r["files_before"]
+                            else None
+                        ),
+                    )
+                except Exception as projection_err:
+                    # Projection stats only improve routing precision.  Fall
+                    # back to schema-width/whole-file sizing if a legacy or
+                    # malformed artifact cannot provide a trustworthy index.
+                    logger.warning(
+                        f"[estimate.projection] precise sizing skipped for "
+                        f"{super_name}.{simple_name}: {projection_err}"
+                    )
+                    tier3_files, proj = set(), {}
+
+            # The fallback width share depends only on this table's schema and
+            # selected columns, not on a file.  Hoist it out of the survivor
+            # loop; wide schemas with thousands of files otherwise repeat the
+            # same dictionary/filter/sum work for every file lacking tier-3
+            # compressed-byte stats.
+            projection_widths = (
+                self._projection_widths(selected_cols, schema_types)
+                if need_projection
+                else None
+            )
 
             parquet_files: List[str] = []
             for file_key in survivors:
@@ -700,8 +1182,8 @@ class DataEstimator:
                 elif file_key in tier3_files:
                     reflection_file_size += proj.get(file_key, 0)
                 else:
-                    reflection_file_size += self._ratio_bytes(
-                        file_key, key_size, selected_cols, schema_types
+                    reflection_file_size += self._ratio_bytes_with_widths(
+                        full, projection_widths,
                     )
             files_kept += len(survivors)
 
@@ -719,6 +1201,12 @@ class DataEstimator:
         # after BOTH own-WHERE and cross-table join pruning. The difference is the
         # total number of files eliminated.
         files_pruned = files_before_prune - files_kept
+        if files_pruned < 0:  # defensive; subset validation above makes this unreachable
+            logger.warning(
+                "[estimate.prune] kept-file count exceeded candidates; "
+                "reporting zero files pruned"
+            )
+            files_pruned = 0
 
         # Validate requested columns
         missing_info = get_missing_columns(self.tables, supers)
@@ -769,8 +1257,8 @@ class DataEstimator:
             })
             # Cross-table join pruning observability — only when the query
             # carried join edges, so single-table reads don't emit empty stats.
-            if self.join_edges:
-                self.plan_stats.add_stat({"JOIN_EDGES": len(self.join_edges)})
+            if runnable_join_edges:
+                self.plan_stats.add_stat({"JOIN_EDGES": len(runnable_join_edges)})
                 self.plan_stats.add_stat({"JOIN_FILES_PRUNED": join_files_removed})
                 self.plan_stats.add_stat({"JOIN_PRUNE_ITERATIONS": join_iterations})
                 self.plan_stats.add_stat({
