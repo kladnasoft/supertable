@@ -19,7 +19,7 @@ long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
     name="supertable",
-    version="2.3.9",
+    version="2.4.0",
     description="SuperTable — versioned data lake library for SQL analytics on Parquet + Redis.",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -60,6 +60,12 @@ setup(
             "supertable-demo-webshop-generate=supertable.demo.webshop.generate:main",
             "supertable-demo-webshop-load=supertable.demo.webshop.load:main",
             "supertable-demo-webshop-topup=supertable.demo.webshop.topup:main",
+            "supertable-demo-medcenter-generate=supertable.demo.medcenter.generate:main",
+            "supertable-demo-medcenter-load=supertable.demo.medcenter.load:main",
+            "supertable-demo-medcenter-transform=supertable.demo.medcenter.transform:main",
+            "supertable-demo-medcenter-quality=supertable.demo.medcenter.quality:main",
+            "supertable-demo-medcenter-export=supertable.demo.medcenter.export_accounting:main",
+            "supertable-demo-medcenter-run=supertable.demo.medcenter.run:main",
         ],
     },
 )

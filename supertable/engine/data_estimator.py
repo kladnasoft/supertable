@@ -19,7 +19,9 @@ from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
 
+from supertable.data_classes import JoinEdge
 from supertable.utils.sql_parser import TableDefinition
+from supertable.engine.join_pruner import prune_files_across_joins
 from supertable.processing import (
     load_stats,
     prune_files_by_predicates,
@@ -124,6 +126,7 @@ class DataEstimator:
         storage,
         tables: List[TableDefinition],
         predicate_constraints: Optional[Dict] = None,
+        join_edges: Optional[List[JoinEdge]] = None,
         plan_stats: Optional[PlanStats] = None,
     ):
         self.organization = organization
@@ -133,6 +136,11 @@ class DataEstimator:
         # query's WHERE clauses; used to prune files by the stats artifact.
         # None / empty ⇒ no read-path pruning.
         self.predicate_constraints = predicate_constraints or {}
+        # Equi-join links between the query's tables.  After each table is
+        # pruned by its own WHERE, a filtered table's surviving join-key range
+        # is propagated across these edges to prune its partners (cross-table
+        # file pruning).  Empty ⇒ no propagation (single-table or un-joined).
+        self.join_edges: List[JoinEdge] = join_edges or []
         self.timer: Optional[Timer] = None
         # When the caller (DataReader) injects its PlanStats, estimator stats —
         # REFLECTIONS, REFLECTION_SIZE and the read-pruning counters — land on
@@ -502,7 +510,22 @@ class DataEstimator:
 
         super_map = self._get_supertable_map()
 
-        # Discover snapshots
+        # Tables that participate in a join edge need their stats loaded even for
+        # a bare SELECT * with no WHERE: their surviving files still bound the
+        # join keys they export to their partners during cross-table pruning.
+        # Gated on the master switch — with pruning off nothing consumes them.
+        join_table_keys: Set[Tuple[str, str]] = set()
+        if settings.SUPERTABLE_READ_PRUNING_ENABLED:
+            for _edge in self.join_edges:
+                join_table_keys.add(_edge.left_table)
+                join_table_keys.add(_edge.right_table)
+
+        # ---- Pass 1: discover snapshots + per-table (own-WHERE) pruning --------
+        # Each record carries everything Pass 2 needs to size files and build the
+        # SuperSnapshot, plus the own-WHERE survivors + loaded stats that feed the
+        # cross-table join propagation that runs between the two passes.
+        records: List[Dict[str, object]] = []
+
         for super_name, tables in super_map:
             # Collect snapshots ONCE per super_name (avoid redundant SCAN per simple table)
             all_snapshots = self._collect_snapshots_from_redis(organization=self.organization, super_name=super_name)
@@ -556,6 +579,8 @@ class DataEstimator:
                         raw_keys.append(file_key)
                         key_size[file_key] = int(resource.get("file_size", 0))
 
+                key = (super_name.lower(), simple_name.lower())
+
                 # Which columns does the query actually read? None => SELECT *
                 # (whole table, no projection savings).
                 selected_cols = self._selected_columns(super_name, simple_name)
@@ -563,66 +588,137 @@ class DataEstimator:
                     selected_cols is not None
                     and settings.SUPERTABLE_READ_PROJECTION_SIZING_ENABLED
                 )
-                has_predicate = bool(
-                    self.predicate_constraints.get((super_name.lower(), simple_name.lower()))
-                )
+                has_predicate = bool(self.predicate_constraints.get(key))
 
-                # Load the stats artifact ONCE per table and reuse it for BOTH
-                # predicate pruning and projection sizing (cache-backed: a repeated
-                # read of the same table is a memory hit). Only load when at least
-                # one consumer needs it, so a SELECT * with no WHERE stays free.
+                # Load the stats artifact ONCE per table and reuse it for predicate
+                # pruning, projection sizing AND cross-table join propagation
+                # (cache-backed: a repeated read of the same table is a memory
+                # hit). Only load when at least one consumer needs it, so a
+                # SELECT * that neither filters nor joins stays free.
                 stats_df: Optional["polars.DataFrame"] = None
-                if stats_file and (need_projection or has_predicate):
+                if stats_file and (need_projection or has_predicate or key in join_table_keys):
                     stats_df = load_stats(stats_file, allow_cache=True, profiler=prune_profiler)
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
-                # satisfy the query's WHERE before resolving them to scan URLs.
-                # The span accumulates the wall-clock of the whole pruning step
+                # satisfy this table's own WHERE before any cross-table step.
+                # The span accumulates the wall-clock of the per-table pruning
                 # (predicate eval) across every table in the query.
                 with prune_profiler.span("read.prune"):
-                    survivors = self._prune_files(
+                    literal_survivors = self._prune_files(
                         super_name, simple_name, raw_keys, stats_df,
                         profiler=prune_profiler,
                     )
                 files_before_prune += len(raw_keys)
-                files_pruned += len(raw_keys) - len(survivors)
-                files_kept += len(survivors)
 
-                # Projection-aware size: a query selecting specific columns scans
-                # only those columns' on-disk (compressed) chunks, not the whole
-                # multi-column file. Precise path sums per-column compressed_bytes
-                # from the stats artifact; files predating that column (or with no
-                # stats) fall back to a type-width ratio of the whole-file size.
-                # SELECT * keeps every column (full file).
-                tier3_files: Set[str] = set()
-                proj: Dict[str, int] = {}
-                if need_projection:
-                    tier3_files, proj = self._projected_bytes_index(stats_df, selected_cols)
+                records.append({
+                    "super_name": super_name,
+                    "simple_name": simple_name,
+                    "key": key,
+                    "schema": schema,
+                    "schema_types": schema_types,
+                    "key_size": key_size,
+                    "current_version": current_version,
+                    "has_snapshots": bool(snapshots),
+                    "stats_df": stats_df,
+                    "selected_cols": selected_cols,
+                    "need_projection": need_projection,
+                    "survivors": literal_survivors,
+                })
 
-                parquet_files: List[str] = []
-                for file_key in survivors:
-                    parquet_files.append(self._to_duckdb_path(file_key))
-                    full = int(key_size.get(file_key, 0))
-                    reflection_file_size_raw += full
-                    if not need_projection:
-                        reflection_file_size += full
-                    elif file_key in tier3_files:
-                        reflection_file_size += proj.get(file_key, 0)
-                    else:
-                        reflection_file_size += self._ratio_bytes(
-                            file_key, key_size, selected_cols, schema_types
-                        )
+        # ---- Cross-table join pruning (ON by default under the read switch) ----
+        # Propagate every surviving file-set's join-key min/max across the query's
+        # equi-join edges to a fixpoint, so a table narrowed by its own WHERE also
+        # narrows its join partners. ``allow_empty=False`` keeps the estimator's
+        # "never empty a table" guard — a genuinely empty join surfaces at
+        # execution time rather than as a zero-file estimate error.
+        join_files_removed = 0
+        join_iterations = 0
+        if settings.SUPERTABLE_READ_PRUNING_ENABLED and self.join_edges and records:
+            # Same contract as _prune_files: a pruning failure must degrade to
+            # "no pruning" (keep the Pass-1 survivors), never break the read.
+            try:
+                table_files = {r["key"]: list(r["survivors"]) for r in records}
+                table_stats = {r["key"]: r["stats_df"] for r in records}
+                with prune_profiler.span("read.join_prune"):
+                    join_plan = prune_files_across_joins(
+                        self.join_edges,
+                        {},  # own-WHERE pruning already applied per-table above
+                        table_files,
+                        table_stats,
+                        allow_empty=False,
+                    )
+                join_iterations = join_plan.iterations
+                counted_keys: Set[Tuple[str, str]] = set()
+                for r in records:
+                    pruned = join_plan.survivors.get(r["key"])
+                    if pruned is None:
+                        continue
+                    removed = len(r["survivors"]) - len(pruned)
+                    # Guard the counter against duplicate records sharing one
+                    # lowered key (case-variant spellings of the same table).
+                    if removed > 0 and r["key"] not in counted_keys:
+                        join_files_removed += removed
+                    counted_keys.add(r["key"])
+                    r["survivors"] = pruned
+                if join_plan.steps:
+                    logger.debug("[estimate.join_prune]\n" + join_plan.summary())
+            except Exception as jp_err:
+                join_files_removed = 0
+                join_iterations = 0
+                logger.warning(f"[estimate.join_prune] cross-table pruning skipped: {jp_err}")
 
-                # SuperSnapshot is created ONCE per (super_name, simple_name) after
-                # all snapshot iterations have accumulated their files and schema.
-                # Creating it inside the loop caused duplicate SuperSnapshot entries
-                # with cumulatively growing file lists (each iteration re-sharing the
-                # same mutable parquet_files list), inflating total_reflections and
-                # confusing the executor's snapshots_by_key lookup.
-                if snapshots:
-                    super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
-                                                   simple_version=current_version, files=parquet_files, columns=schema)
-                    supers.append(super_snapshot)
+        # ---- Pass 2: resolve survivors to scan URLs, size, build snapshots -----
+        for r in records:
+            super_name = r["super_name"]
+            simple_name = r["simple_name"]
+            survivors = r["survivors"]
+            key_size = r["key_size"]
+            schema = r["schema"]
+            schema_types = r["schema_types"]
+            selected_cols = r["selected_cols"]
+            need_projection = r["need_projection"]
+            stats_df = r["stats_df"]
+
+            # Projection-aware size: a query selecting specific columns scans only
+            # those columns' on-disk (compressed) chunks, not the whole
+            # multi-column file. Precise path sums per-column compressed_bytes from
+            # the stats artifact; files predating that column (or with no stats)
+            # fall back to a type-width ratio of the whole-file size. SELECT *
+            # keeps every column (full file).
+            tier3_files: Set[str] = set()
+            proj: Dict[str, int] = {}
+            if need_projection:
+                tier3_files, proj = self._projected_bytes_index(stats_df, selected_cols)
+
+            parquet_files: List[str] = []
+            for file_key in survivors:
+                parquet_files.append(self._to_duckdb_path(file_key))
+                full = int(key_size.get(file_key, 0))
+                reflection_file_size_raw += full
+                if not need_projection:
+                    reflection_file_size += full
+                elif file_key in tier3_files:
+                    reflection_file_size += proj.get(file_key, 0)
+                else:
+                    reflection_file_size += self._ratio_bytes(
+                        file_key, key_size, selected_cols, schema_types
+                    )
+            files_kept += len(survivors)
+
+            # SuperSnapshot is created ONCE per (super_name, simple_name) after all
+            # snapshot iterations have accumulated their files and schema. Creating
+            # it inside the loop caused duplicate SuperSnapshot entries with
+            # cumulatively growing file lists, inflating total_reflections and
+            # confusing the executor's snapshots_by_key lookup.
+            if r["has_snapshots"]:
+                super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
+                                               simple_version=r["current_version"], files=parquet_files, columns=schema)
+                supers.append(super_snapshot)
+
+        # files_before_prune counts raw candidates; files_kept the final survivors
+        # after BOTH own-WHERE and cross-table join pruning. The difference is the
+        # total number of files eliminated.
+        files_pruned = files_before_prune - files_kept
 
         # Validate requested columns
         missing_info = get_missing_columns(self.tables, supers)
@@ -671,6 +767,17 @@ class DataEstimator:
                     prune_profiler.timings.get("read.prune", 0.0) * 1000, 3
                 )
             })
+            # Cross-table join pruning observability — only when the query
+            # carried join edges, so single-table reads don't emit empty stats.
+            if self.join_edges:
+                self.plan_stats.add_stat({"JOIN_EDGES": len(self.join_edges)})
+                self.plan_stats.add_stat({"JOIN_FILES_PRUNED": join_files_removed})
+                self.plan_stats.add_stat({"JOIN_PRUNE_ITERATIONS": join_iterations})
+                self.plan_stats.add_stat({
+                    "JOIN_PRUNE_DURATION_MS": round(
+                        prune_profiler.timings.get("read.join_prune", 0.0) * 1000, 3
+                    )
+                })
             prune_counts = prune_profiler.emit_counts()
             if prune_counts:
                 self.plan_stats.add_stat({"PRUNE_COUNTS": prune_counts})

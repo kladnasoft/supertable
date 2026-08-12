@@ -282,12 +282,22 @@ class DataReader:
                 logger.debug(self._lp(f"[prune] predicate extraction failed: {pc_err}"))
                 predicate_constraints = {}
 
+            # Derive equi-join links so the estimator can propagate a filtered
+            # table's join-key ranges to its partners (cross-table file pruning).
+            # Never let this break a read.
+            try:
+                join_edges = parser.get_join_edges()
+            except Exception as je_err:
+                logger.debug(self._lp(f"[prune] join-edge extraction failed: {je_err}"))
+                join_edges = []
+
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
                 organization=self.organization,
                 storage=self.storage,
                 tables=physical_tables,
                 predicate_constraints=predicate_constraints,
+                join_edges=join_edges,
                 plan_stats=self.plan_stats,
             )
             reflection = estimator.estimate()

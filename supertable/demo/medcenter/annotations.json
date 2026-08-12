@@ -1,0 +1,596 @@
+{
+  "version": 1,
+  "generated_at": "2026-08-11T10:00:00Z",
+  "source": "supertable/demo/medcenter (generator + transform code)",
+  "tables": [
+    {
+      "name": "raw_mobimed_invoices",
+      "description": "Patient invoices exported monthly from the Mobimed practice-management system. One row per invoice. German column names, semicolon CSV feed, dates as dd.mm.yyyy strings.",
+      "synonyms": ["patient invoices", "doctor invoices", "Arztrechnungen"],
+      "measures": [
+        { "name": "patient_gross_revenue", "sql": "SUM(\"SummeUmsatzinklUSt\")", "unit": "EUR", "description": "Gross patient billing including VAT" }
+      ],
+      "dimensions": [
+        { "name": "by_doctor", "columns": ["doctor_name"], "description": "Doctor who issued the invoice" },
+        { "name": "by_patient_category", "columns": ["Patientenkategorie"], "description": "Insurance or self-payer segment" }
+      ],
+      "joins": [
+        { "to_table": "stg_mobimed_invoices", "from_column": "Rechnungsnummer", "to_column": "invoice_number", "kind": "one_to_one" }
+      ],
+      "column_units": [
+        { "column": "SummeUmsatzinklUSt", "unit": "EUR", "scale": 1 },
+        { "column": "Umsatz0", "unit": "EUR", "scale": 1 },
+        { "column": "Umsatz10", "unit": "EUR", "scale": 1 },
+        { "column": "Umsatz20", "unit": "EUR", "scale": 1 },
+        { "column": "MwSt10", "unit": "EUR", "scale": 1 },
+        { "column": "MwSt20", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "unique", "column": "Rechnungsnummer", "severity": "critical" }
+      ],
+      "policies": [
+        "prefer stg_mobimed_invoices for analytics: it has typed dates, the derived category and the entity tag; this raw table keeps dd.mm.yyyy date strings",
+        "rows with a non-empty Stornogrund are cancelled invoices - exclude them from revenue unless the user asks for cancellations",
+        "the arithmetic invariant is SummeUmsatzinklUSt = Umsatz0 + Umsatz10 + Umsatz20 + MwSt10 + MwSt20"
+      ],
+      "columns": [
+        { "name": "Datum", "description": "Invoice date as a dd.mm.yyyy string; parse with strptime before date arithmetic" },
+        { "name": "Rechnungsnummer", "description": "Invoice number: 3-letter prefix + year + 5-digit sequence (e.g. UNI2026-00042). The prefix drives the category rule: UNI=UNIQA, AME=AMED, PRO=own products, others=normal invoices" },
+        { "name": "Patient", "description": "Patient full name", "pii": "high", "pii_categories": ["name", "health"] },
+        { "name": "Patientenkategorie", "description": "Patient segment label, e.g. UNIQA Versichert, AMED Firmenkunde, Selbstzahler, Wahlarzt" },
+        { "name": "Positionen", "description": "Billed positions as one text field; an invoice can contain several treatments or products" },
+        { "name": "SummeUmsatzinklUSt", "description": "Gross invoice total in EUR including VAT" },
+        { "name": "Umsatz0", "description": "Net revenue at 0 percent VAT (exempt medical services)" },
+        { "name": "Umsatz10", "description": "Net revenue at 10 percent VAT (e.g. supplements)" },
+        { "name": "Umsatz20", "description": "Net revenue at 20 percent VAT (e.g. cosmetics, devices, attests)" },
+        { "name": "MwSt10", "description": "VAT amount at 10 percent, equals 10 percent of Umsatz10" },
+        { "name": "MwSt20", "description": "VAT amount at 20 percent, equals 20 percent of Umsatz20" },
+        { "name": "Stornogrund", "description": "Cancellation reason; empty string means the invoice is valid" },
+        { "name": "Invoice_open", "description": "True when the invoice is still unpaid (open accounts receivable)" }
+      ]
+    },
+    {
+      "name": "raw_mobimed_payments",
+      "description": "Front-desk payment receipts from Mobimed. One row per receipt. Dates are dd.mm.yyyy strings.",
+      "synonyms": ["receipts", "front-desk payments", "Zahlungen"],
+      "measures": [
+        { "name": "receipts_total", "sql": "SUM(\"betrag\")", "unit": "EUR", "description": "Total collected at the front desk" }
+      ],
+      "dimensions": [
+        { "name": "by_payment_category", "columns": ["Payment_Category"], "description": "How the patient paid" }
+      ],
+      "column_units": [
+        { "column": "betrag", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "unique", "column": "belegnr", "severity": "critical" },
+        { "rule": "enum", "column": "Payment_Category", "severity": "warning",
+          "spec": { "values": ["Hobex", "Banküberweisung", "Barzahlung", "Kartenzahlung"] } }
+      ],
+      "policies": [
+        "Hobex receipts are card-terminal payments: they are settled daily in raw_hobex_settlements grouped by ClearingDate, and the settlement net lands on the bank statement one day later"
+      ],
+      "columns": [
+        { "name": "belegnr", "description": "Receipt number, year-scoped sequence (BEL2026-00001)" },
+        { "name": "belegdatum", "description": "Receipt date as dd.mm.yyyy string" },
+        { "name": "Payment_Category", "description": "Payment method: Hobex = card terminal, Banküberweisung = bank transfer, Barzahlung = cash, Kartenzahlung = card" },
+        { "name": "ClearingDate", "description": "Date the payment cleared, dd.mm.yyyy string; the grouping key for Hobex settlements" }
+      ]
+    },
+    {
+      "name": "raw_chargebee_subscriptions",
+      "description": "Individual healthcare memberships from Chargebee. One row per subscription with the customer embedded.",
+      "synonyms": ["memberships", "subscriptions"],
+      "measures": [
+        { "name": "total_mrr", "sql": "SUM(\"mrr\")", "unit": "EUR", "description": "Monthly recurring revenue of the membership base" },
+        { "name": "subscription_count", "sql": "COUNT(*)", "unit": "count" }
+      ],
+      "dimensions": [
+        { "name": "by_plan", "columns": ["plan_name"] },
+        { "name": "by_status", "columns": ["status"] }
+      ],
+      "column_units": [
+        { "column": "mrr", "unit": "EUR", "scale": 1 }
+      ],
+      "columns": [
+        { "name": "customer_name", "description": "Member full name", "pii": "medium", "pii_categories": ["name"] },
+        { "name": "customer_email", "description": "Member e-mail address", "pii": "medium", "pii_categories": ["email"] },
+        { "name": "mrr", "description": "Monthly recurring revenue of this subscription; annual plans are divided by 12" }
+      ]
+    },
+    {
+      "name": "raw_chargebee_invoices",
+      "description": "Membership invoices from Chargebee with line items. Grain: one row per invoice LINE; invoice-level fields (total, dates, status) repeat on every line of the same invoice.",
+      "synonyms": ["membership invoices", "MR invoices"],
+      "time_column": { "column": "date_issued", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "membership_gross_billed", "sql": "SUM(\"line_amount\" + \"line_tax_amount\")", "unit": "EUR", "description": "Gross billed amount; additive across lines and equal to the sum of invoice totals" }
+      ],
+      "dimensions": [
+        { "name": "by_status", "columns": ["status"] }
+      ],
+      "joins": [
+        { "to_table": "raw_chargebee_subscriptions", "from_column": "subscription_id", "to_column": "subscription_id", "kind": "many_to_one" }
+      ],
+      "column_units": [
+        { "column": "line_amount", "unit": "EUR", "scale": 1 },
+        { "column": "line_tax_amount", "unit": "EUR", "scale": 1 },
+        { "column": "total", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "enum", "column": "status", "severity": "warning",
+          "spec": { "values": ["paid", "payment_due", "void"] } }
+      ],
+      "policies": [
+        "one row per invoice line: for invoice-level counts or totals deduplicate by invoice_number first, otherwise multi-line invoices are double counted",
+        "void invoices are not revenue - exclude them unless the user asks",
+        "the MR prefix of invoice_number is how bank statement references identify Chargebee payments"
+      ],
+      "columns": [
+        { "name": "invoice_number", "description": "Membership invoice number, MR + year + 5-digit sequence (MR2026-00001)" },
+        { "name": "customer_name", "description": "Member full name", "pii": "medium", "pii_categories": ["name"] },
+        { "name": "service_period_start", "description": "Start of the period this invoice pays for; basis for revenue timing (deferred revenue)" },
+        { "name": "service_period_end", "description": "End of the paid service period; annual memberships span 12 months" },
+        { "name": "total", "description": "Invoice-level gross total; repeated on every line of the invoice" },
+        { "name": "pdf_url", "description": "Link to the invoice PDF (the actual bill)" }
+      ]
+    },
+    {
+      "name": "raw_chargebee_credit_notes",
+      "description": "Chargebee credit notes (MRGS numbers) - negative invoices that reverse part or all of a membership invoice. One row per credit note.",
+      "synonyms": ["refunds", "Gutschriften"],
+      "joins": [
+        { "to_table": "raw_chargebee_invoices", "from_column": "reference_invoice_number", "to_column": "invoice_number", "kind": "many_to_one" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "credit note amounts are stored positive; subtract them from invoice revenue for net figures"
+      ],
+      "columns": [
+        { "name": "credit_note_number", "description": "Credit note number, MRGS + year + sequence" },
+        { "name": "reference_invoice_number", "description": "The MR invoice this credit note reverses" }
+      ]
+    },
+    {
+      "name": "raw_chargebee_transactions",
+      "description": "Chargebee payment transactions. One row per gateway payment of a membership invoice; the gateway is always Stripe, so every transaction has a matching Stripe charge.",
+      "joins": [
+        { "to_table": "raw_chargebee_invoices", "from_column": "invoice_number", "to_column": "invoice_number", "kind": "many_to_one" },
+        { "to_table": "raw_stripe_charges", "from_column": "gateway_txn_id", "to_column": "charge_id", "kind": "one_to_one" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "columns": [
+        { "name": "gateway", "description": "Payment gateway; always stripe - Stripe is the payment rail underneath Chargebee" },
+        { "name": "gateway_txn_id", "description": "The Stripe charge id this transaction became; join key into raw_stripe_charges" }
+      ]
+    },
+    {
+      "name": "raw_stripe_charges",
+      "description": "Stripe card charges. One row per charge. Two businesses blend in this one account: Chargebee membership payments and the weight-loss program - source_class separates them.",
+      "synonyms": ["card payments", "stripe payments"],
+      "time_column": { "column": "created", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "charged_gross", "sql": "SUM(\"amount\")", "unit": "EUR", "description": "Gross card volume before Stripe fees" }
+      ],
+      "dimensions": [
+        { "name": "by_source_class", "columns": ["source_class"], "description": "Which business the charge belongs to" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "enum", "column": "source_class", "severity": "critical",
+          "spec": { "values": ["chargebee", "medcenter_weight"] } }
+      ],
+      "policies": [
+        "always split or filter by source_class - memberships and the weight program share this Stripe account and mixing them misstates both revenue streams"
+      ],
+      "columns": [
+        { "name": "source_class", "description": "chargebee = membership payment routed through Chargebee; medcenter_weight = weight-program sale" },
+        { "name": "source_invoice_number", "description": "The originating invoice: an MR number for chargebee charges, a MEDWEIGHT number for weight charges" },
+        { "name": "customer_name", "description": "Cardholder name", "pii": "medium", "pii_categories": ["name"] }
+      ]
+    },
+    {
+      "name": "raw_stripe_balance_transactions",
+      "description": "Stripe balance movements. One row per charge with the Stripe fee and the net amount that will be paid out; net = amount - fee.",
+      "joins": [
+        { "to_table": "raw_stripe_charges", "from_column": "charge_id", "to_column": "charge_id", "kind": "one_to_one" },
+        { "to_table": "raw_stripe_payouts", "from_column": "payout_id", "to_column": "payout_id", "kind": "many_to_one" }
+      ],
+      "measures": [
+        { "name": "stripe_fees", "sql": "SUM(\"fee\")", "unit": "EUR", "description": "Total Stripe processing fees" },
+        { "name": "net_after_fees", "sql": "SUM(\"net\")", "unit": "EUR", "description": "Amount that reaches the bank after fees" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 },
+        { "column": "fee", "unit": "EUR", "scale": 1 },
+        { "column": "net", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "the fee column explains gross-versus-net differences between charged amounts and the bank statement"
+      ],
+      "columns": [
+        { "name": "available_on", "description": "Date the net amount becomes available for payout, typically 2 days after the charge" },
+        { "name": "payout_id", "description": "The weekly payout this balance movement is bundled into" }
+      ]
+    },
+    {
+      "name": "raw_stripe_payouts",
+      "description": "Weekly Stripe payouts to the bank. One row per payout; the amount equals the sum of the net amounts of its balance transactions and appears on the bank statement as a STRIPE credit on the arrival date.",
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "to explain a payout, join raw_stripe_balance_transactions on payout_id and follow charge_id back to the charges and their invoices"
+      ],
+      "columns": [
+        { "name": "arrival_date", "description": "Date the payout lands on the Erste Bank statement" }
+      ]
+    },
+    {
+      "name": "raw_stripe_invoices",
+      "description": "Weight-loss program invoices (MEDWEIGHT numbers), billed upfront through Stripe. One row per invoice.",
+      "synonyms": ["weight program", "haelsi weight", "MEDWEIGHT invoices"],
+      "time_column": { "column": "date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "weight_gross_billed", "sql": "SUM(\"amount\")", "unit": "EUR", "description": "Gross weight-program billing incl. voids" }
+      ],
+      "joins": [
+        { "to_table": "raw_stripe_charges", "from_column": "charge_id", "to_column": "charge_id", "kind": "one_to_one" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "enum", "column": "status", "severity": "warning", "spec": { "values": ["paid", "void"] } }
+      ],
+      "policies": [
+        "void invoices enter the accounting import as negative rows; exclude them from revenue otherwise",
+        "programs are billed upfront for 1 to 6 months - use the service period columns for revenue timing"
+      ],
+      "columns": [
+        { "name": "invoice_number", "description": "Weight-program invoice number, MEDWEIGHT-year-sequence" },
+        { "name": "customer_name", "description": "Program participant name", "pii": "medium", "pii_categories": ["name", "health"] },
+        { "name": "service_period_start", "description": "Start of the prepaid program period" },
+        { "name": "service_period_end", "description": "End of the prepaid program period" },
+        { "name": "pdf_url", "description": "Link to the invoice PDF (the actual bill)" }
+      ]
+    },
+    {
+      "name": "raw_zoho_contacts",
+      "description": "Business customers invoiced through Zoho Books: companies buying occupational health services, corporate memberships, and insurers. One row per customer.",
+      "synonyms": ["business customers", "B2B customers", "Firmenkunden"],
+      "columns": [
+        { "name": "legal_entity", "description": "Which medcenter legal entity serves this customer: medcenter_gmbh or medcenter_labs" },
+        { "name": "email", "description": "Accounting contact e-mail", "pii": "low", "pii_categories": ["email"] }
+      ]
+    },
+    {
+      "name": "raw_zoho_invoices",
+      "description": "B2B invoices from Zoho Books with line positions. Grain: one row per invoice LINE; invoice-level fields (total, balance, status, dates) repeat on every line.",
+      "synonyms": ["B2B invoices", "FK invoices", "corporate invoices"],
+      "time_column": { "column": "invoice_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "b2b_gross_billed", "sql": "SUM(\"line_total\")", "unit": "EUR", "description": "Gross billed amount; additive across lines and equal to the sum of invoice totals" }
+      ],
+      "dimensions": [
+        { "name": "by_status", "columns": ["status"] },
+        { "name": "by_entity", "columns": ["legal_entity"] },
+        { "name": "by_category", "columns": ["category"] }
+      ],
+      "joins": [
+        { "to_table": "raw_zoho_contacts", "from_column": "customer_id", "to_column": "customer_id", "kind": "many_to_one" }
+      ],
+      "column_units": [
+        { "column": "line_rate", "unit": "EUR", "scale": 1 },
+        { "column": "line_total", "unit": "EUR", "scale": 1 },
+        { "column": "total", "unit": "EUR", "scale": 1 },
+        { "column": "balance", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "enum", "column": "status", "severity": "warning",
+          "spec": { "values": ["draft", "sent", "paid", "overdue", "partially_paid", "void"] } }
+      ],
+      "policies": [
+        "one row per invoice line: deduplicate by invoice_number for invoice-level figures, otherwise multi-line invoices are double counted",
+        "draft and void invoices are not revenue",
+        "balance is the open (unpaid) remainder of the invoice - the basis for accounts receivable and payment reminders",
+        "the FK prefix of invoice_number is how bank statement references identify Zoho payments",
+        "cf_service_start and cf_service_end are the service-period custom fields that power deferred-revenue timing"
+      ],
+      "columns": [
+        { "name": "invoice_number", "description": "B2B invoice number, FK + year + 5-digit sequence (FK2026-00001)" },
+        { "name": "cf_service_start", "description": "Custom field: start of the contracted service period" },
+        { "name": "cf_service_end", "description": "Custom field: end of the contracted service period; spans 1 to 12 months" },
+        { "name": "balance", "description": "Open amount still unpaid on this invoice; 0 when fully paid" },
+        { "name": "legal_entity", "description": "medcenter_gmbh or medcenter_labs - determines which bank account receives the payment" },
+        { "name": "pdf_url", "description": "Link to the invoice PDF (the actual bill)" }
+      ]
+    },
+    {
+      "name": "raw_zoho_payments",
+      "description": "Customer payments recorded in Zoho Books. One row per payment, applied to one invoice; paid by bank transfer, so each payment has a matching bank statement credit.",
+      "joins": [
+        { "to_table": "raw_zoho_invoices", "from_column": "invoice_numbers_applied", "to_column": "invoice_number", "kind": "many_to_one" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "columns": [
+        { "name": "invoice_numbers_applied", "description": "The FK invoice this payment settles" }
+      ]
+    },
+    {
+      "name": "raw_zoho_credit_notes",
+      "description": "Zoho credit notes (CN numbers) reversing part of a paid B2B invoice. One row per credit note; amounts stored positive.",
+      "joins": [
+        { "to_table": "raw_zoho_invoices", "from_column": "reference_invoice_number", "to_column": "invoice_number", "kind": "many_to_one" }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ]
+    },
+    {
+      "name": "raw_erste_camt053",
+      "description": "Erste Bank statement entries parsed from camt.053. One row per statement line across both accounts (one IBAN per legal entity). Amounts are always positive; credit_debit gives the direction.",
+      "synonyms": ["bank statement", "bank transactions", "Kontoauszug"],
+      "time_column": { "column": "booking_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "cash_in", "sql": "SUM(CASE WHEN \"credit_debit\" = 'CRDT' THEN \"amount\" ELSE 0 END)", "unit": "EUR", "description": "Total credited to the accounts" },
+        { "name": "cash_out", "sql": "SUM(CASE WHEN \"credit_debit\" = 'DBIT' THEN \"amount\" ELSE 0 END)", "unit": "EUR", "description": "Total debited from the accounts" }
+      ],
+      "dimensions": [
+        { "name": "by_account", "columns": ["account_iban"] },
+        { "name": "by_direction", "columns": ["credit_debit"] }
+      ],
+      "column_units": [
+        { "column": "amount", "unit": "EUR", "scale": 1 }
+      ],
+      "quality_rules": [
+        { "rule": "unique", "column": "entry_id", "severity": "critical" },
+        { "rule": "enum", "column": "credit_debit", "severity": "critical", "spec": { "values": ["CRDT", "DBIT"] } }
+      ],
+      "policies": [
+        "amounts are always positive - use credit_debit (CRDT = money in, DBIT = money out) for direction, never the sign",
+        "remittance_structured carries the paid invoice number: MR prefix means Chargebee, FK prefix means Zoho; prefer mart_bank_reconciliation which has this matching precomputed",
+        "counterparty HOBEX AG credits are daily card-terminal settlements; STRIPE PAYMENTS credits are weekly Stripe payouts"
+      ],
+      "columns": [
+        { "name": "account_iban", "description": "Receiving account; AT61...3201 belongs to medcenter_gmbh, AT05...5432 to medcenter_labs" },
+        { "name": "remittance_structured", "description": "Structured payment reference; carries the invoice number when the payer entered it correctly" },
+        { "name": "remittance_unstructured", "description": "Free-text payment reference; mangled or partial invoice references end up here" },
+        { "name": "counterparty_name", "description": "Payer or payee name; members paying by transfer appear with their personal name", "pii": "medium", "pii_categories": ["name", "financial"] }
+      ]
+    },
+    {
+      "name": "raw_domonda_invoices",
+      "description": "Supplier (purchase) invoices from the Domonda invoice inbox. One row per document; the payable side of the business.",
+      "synonyms": ["supplier invoices", "purchase invoices", "Eingangsrechnungen"],
+      "time_column": { "column": "invoice_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "supplier_spend_gross", "sql": "SUM(\"gross_amount\")", "unit": "EUR", "description": "Gross supplier spend" }
+      ],
+      "dimensions": [
+        { "name": "by_supplier", "columns": ["supplier_name"] },
+        { "name": "by_account", "columns": ["account_assignment"] }
+      ],
+      "column_units": [
+        { "column": "net_amount", "unit": "EUR", "scale": 1 },
+        { "column": "tax_amount", "unit": "EUR", "scale": 1 },
+        { "column": "gross_amount", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "paid supplier invoices reappear as DBIT lines on the bank statement with the supplier as counterparty"
+      ],
+      "columns": [
+        { "name": "account_assignment", "description": "Expense account the invoice is booked to (7xxx cost accounts)" },
+        { "name": "document_url", "description": "Link to the scanned invoice document" }
+      ]
+    },
+    {
+      "name": "raw_bmd_journal",
+      "description": "Booking journal exported from BMD, the external accountants' bookkeeping software - the official books. One row per booking; covers both legal entities via company_id.",
+      "synonyms": ["general ledger", "booking journal", "Buchungsjournal", "official books"],
+      "measures": [
+        { "name": "debit_total", "sql": "SUM(\"debit\")", "unit": "EUR", "description": "Total debit side" },
+        { "name": "credit_total", "sql": "SUM(\"credit\")", "unit": "EUR", "description": "Total credit side" }
+      ],
+      "dimensions": [
+        { "name": "by_symbol", "columns": ["booking_symbol"], "description": "AR = outgoing invoice, ER = incoming supplier invoice" },
+        { "name": "by_company", "columns": ["company_id"] }
+      ],
+      "column_units": [
+        { "column": "debit", "unit": "EUR", "scale": 1 },
+        { "column": "credit", "unit": "EUR", "scale": 1 },
+        { "column": "tax_amount", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "company_id 1 is medcenter_gmbh, company_id 2 is medcenter_labs",
+        "AR rows carry the source-system invoice number in document_number: MR numbers come from Chargebee, FK from Zoho, three-letter medical prefixes from Mobimed - this is how the books reconcile back to the source systems",
+        "the text column contains patient names - treat this table as personal data"
+      ],
+      "columns": [
+        { "name": "booking_symbol", "description": "AR = Ausgangsrechnung (outgoing invoice), ER = Eingangsrechnung (supplier invoice)" },
+        { "name": "document_number", "description": "Source document number; for AR rows this equals the invoice number in the originating system" },
+        { "name": "text", "description": "Booking text; contains patient or customer names", "pii": "high", "pii_categories": ["name", "health"] },
+        { "name": "contra_account", "description": "Contra account: 4100 memberships, 4200 B2B, 4300 patient revenue, 33001 payables" }
+      ]
+    },
+    {
+      "name": "raw_hobex_settlements",
+      "description": "Daily card-terminal settlements from Hobex. One row per terminal per day: transaction count, gross, fee and net; net = gross - fee, and net is credited to the bank the next day.",
+      "synonyms": ["card settlements", "terminal settlements"],
+      "time_column": { "column": "settlement_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "settled_gross", "sql": "SUM(\"gross_amount\")", "unit": "EUR" },
+        { "name": "hobex_fees", "sql": "SUM(\"fee_amount\")", "unit": "EUR", "description": "Card-terminal fees (about 1.85 percent of gross)" },
+        { "name": "settled_net", "sql": "SUM(\"net_amount\")", "unit": "EUR", "description": "Amount that reaches the bank" }
+      ],
+      "column_units": [
+        { "column": "gross_amount", "unit": "EUR", "scale": 1 },
+        { "column": "fee_amount", "unit": "EUR", "scale": 1 },
+        { "column": "net_amount", "unit": "EUR", "scale": 1 }
+      ],
+      "policies": [
+        "gross_amount equals the sum of Mobimed Hobex receipts clearing that day; mart_settlement_recon has the three-way comparison against Mobimed and the bank precomputed"
+      ]
+    },
+    {
+      "name": "stg_mobimed_invoices",
+      "description": "Canonical Mobimed staging table: typed dates, rounded amounts, the derived invoice category and the legal-entity tag. One row per patient invoice. Use this instead of the raw table for analytics.",
+      "synonyms": ["patient invoices typed", "mobimed staging"],
+      "time_column": { "column": "invoice_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "patient_gross_revenue", "sql": "SUM(\"gross_total\")", "unit": "EUR", "description": "Gross patient billing including VAT" },
+        { "name": "invoice_count", "sql": "COUNT(*)", "unit": "count" }
+      ],
+      "dimensions": [
+        { "name": "by_category", "columns": ["category"], "description": "The canonical business category derived from the invoice-number prefix" },
+        { "name": "by_doctor", "columns": ["doctor_name"] },
+        { "name": "by_month", "columns": ["invoice_month"] }
+      ],
+      "quality_rules": [
+        { "rule": "unique", "column": "invoice_number", "severity": "critical" },
+        { "rule": "enum", "column": "category", "severity": "critical",
+          "spec": { "values": ["UNIQA", "AMED", "Eigenprodukte", "Normal_Invoices"] } }
+      ],
+      "policies": [
+        "category is the single canonical derivation (UNI prefix = UNIQA, AME = AMED, PRO = Eigenprodukte, everything else = Normal_Invoices) - never re-derive it from the invoice number downstream",
+        "storno_reason IS NOT NULL marks cancelled invoices - exclude them from revenue unless asked",
+        "is_open marks unpaid invoices (open accounts receivable)"
+      ],
+      "columns": [
+        { "name": "invoice_month", "description": "Invoice month as a YYYY-MM string; the standard monthly grouping key" },
+        { "name": "patient_name", "description": "Patient full name", "pii": "high", "pii_categories": ["name", "health"] },
+        { "name": "category", "description": "Business category: UNIQA, AMED, Eigenprodukte (own products) or Normal_Invoices" },
+        { "name": "legal_entity", "description": "Owning legal entity; constant medcenter_gmbh for Mobimed" }
+      ]
+    },
+    {
+      "name": "mart_mobimed_monthly",
+      "description": "Monthly patient-revenue mart: one row per month, category and legal entity, with net revenue split by VAT rate (0, 10, 20 percent) and the VAT amounts. Cancelled invoices are included and counted in storno_count.",
+      "synonyms": ["monthly VAT split", "category monthly totals"],
+      "time_column": { "column": "invoice_month", "grain": "month", "epoch_unit": null },
+      "measures": [
+        { "name": "gross_revenue", "sql": "SUM(\"gross_total\")", "unit": "EUR" },
+        { "name": "own_product_vat20", "sql": "SUM(\"vat20_amount\")", "unit": "EUR", "description": "VAT collected at 20 percent" }
+      ],
+      "dimensions": [
+        { "name": "by_category", "columns": ["category"] }
+      ],
+      "policies": [
+        "the Eigenprodukte rows split by VAT rate are the basis of the monthly own-product sales summary and the VAT return"
+      ]
+    },
+    {
+      "name": "mart_revenue_monthly",
+      "description": "Top-level revenue view: one row per month, source system (chargebee, stripe_weight, zoho, mobimed) and legal entity. Voids, drafts and cancelled invoices are excluded.",
+      "synonyms": ["revenue by system", "revenue overview"],
+      "time_column": { "column": "month", "grain": "month", "epoch_unit": null },
+      "measures": [
+        { "name": "gross_revenue", "sql": "SUM(\"gross_total\")", "unit": "EUR" }
+      ],
+      "dimensions": [
+        { "name": "by_system", "columns": ["system"] },
+        { "name": "by_entity", "columns": ["entity"] }
+      ],
+      "policies": [
+        "this is the first table to reach for any where-does-revenue-come-from question"
+      ]
+    },
+    {
+      "name": "mart_bank_reconciliation",
+      "description": "Every bank statement line classified: matched to its invoice via the payment reference (MR = Chargebee, FK = Zoho), recognised by counterparty (Hobex settlements, Stripe payouts), outgoing, or left for manual review. One row per statement line.",
+      "synonyms": ["payment matching", "bank matching", "reconciliation"],
+      "time_column": { "column": "booking_date", "grain": "day", "epoch_unit": null },
+      "dimensions": [
+        { "name": "by_matched_system", "columns": ["matched_system"] },
+        { "name": "by_match_method", "columns": ["match_method"] }
+      ],
+      "joins": [
+        { "to_table": "raw_erste_camt053", "from_column": "entry_id", "to_column": "entry_id", "kind": "one_to_one" }
+      ],
+      "quality_rules": [
+        { "rule": "enum", "column": "match_method", "severity": "warning",
+          "spec": { "values": ["reference", "counterparty", "review", "n/a"] } }
+      ],
+      "policies": [
+        "match_method review is the manual work queue: credits nobody could match automatically - this list is what finance reviews by hand",
+        "matched_invoice holds an MR number when matched_system is chargebee and an FK number when it is zoho; join the respective invoice table for details"
+      ],
+      "columns": [
+        { "name": "matched_system", "description": "Where the money came from or went: chargebee, zoho, hobex, stripe_payout, outgoing, or unmatched" },
+        { "name": "match_method", "description": "reference = invoice number found in the payment reference; counterparty = recognised sender; review = needs a human; n/a = outgoing payment" },
+        { "name": "matched_invoice", "description": "The invoice number the payment was matched to, when found" }
+      ]
+    },
+    {
+      "name": "mart_open_invoices",
+      "description": "All unpaid invoices across the three AR systems (chargebee, zoho, mobimed) in one view: one row per open invoice with counterparty, due date and open amount. The basis for payment reminders and AR aging.",
+      "synonyms": ["accounts receivable", "unpaid invoices", "AR aging", "offene Posten"],
+      "time_column": { "column": "due_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "open_amount", "sql": "SUM(\"amount_open\")", "unit": "EUR", "description": "Total outstanding receivables" }
+      ],
+      "dimensions": [
+        { "name": "by_system", "columns": ["system"] }
+      ],
+      "columns": [
+        { "name": "counterparty", "description": "Customer, company or patient the invoice is addressed to", "pii": "medium", "pii_categories": ["name"] },
+        { "name": "amount_open", "description": "Outstanding amount: full total for unpaid invoices, remaining balance for partially paid ones" }
+      ]
+    },
+    {
+      "name": "mart_doctor_monthly",
+      "description": "Doctor billing: one row per month and doctor with gross patient billing, the fee the center retains (30 percent take rate) and the doctor payout. Cancelled invoices excluded.",
+      "synonyms": ["doctor billing", "Honorarnoten", "take rate"],
+      "time_column": { "column": "month", "grain": "month", "epoch_unit": null },
+      "measures": [
+        { "name": "doctor_gross", "sql": "SUM(\"gross_total\")", "unit": "EUR" },
+        { "name": "center_fee", "sql": "SUM(\"medcenter_fee\")", "unit": "EUR", "description": "Fee retained by the center (take rate)" },
+        { "name": "payout", "sql": "SUM(\"doctor_payout\")", "unit": "EUR", "description": "Amount owed to the doctors" }
+      ],
+      "policies": [
+        "medcenter_fee is a flat 30 percent demo take rate; the real per-doctor rates are a finance-owned rule"
+      ]
+    },
+    {
+      "name": "mart_deferred_revenue",
+      "description": "Revenue timing: one row per month and system splitting billed amounts into revenue earned in the billing month versus deferred to future months, based on each invoice's service period. billed_total = revenue_current_month + deferred_to_future.",
+      "synonyms": ["revenue timing", "deferred revenue", "Abgrenzung"],
+      "time_column": { "column": "month", "grain": "month", "epoch_unit": null },
+      "measures": [
+        { "name": "billed", "sql": "SUM(\"billed_total\")", "unit": "EUR" },
+        { "name": "earned_now", "sql": "SUM(\"revenue_current_month\")", "unit": "EUR" },
+        { "name": "deferred", "sql": "SUM(\"deferred_to_future\")", "unit": "EUR", "description": "Billed now but belonging to future months (e.g. annual memberships)" }
+      ],
+      "policies": [
+        "the split is proportional to calendar days of the service period falling inside the billing month"
+      ]
+    },
+    {
+      "name": "mart_settlement_recon",
+      "description": "Three-way card-settlement reconciliation: one row per Hobex settlement day comparing the terminal settlement against Mobimed card receipts (delta_gross) and against the bank credit (delta_net). Both deltas should be zero.",
+      "synonyms": ["card settlement reconciliation", "hobex reconciliation"],
+      "time_column": { "column": "settlement_date", "grain": "day", "epoch_unit": null },
+      "measures": [
+        { "name": "unexplained_gross", "sql": "SUM(ABS(\"delta_gross\"))", "unit": "EUR", "description": "Settlement gross not explained by Mobimed receipts" },
+        { "name": "unexplained_net", "sql": "SUM(ABS(\"delta_net\"))", "unit": "EUR", "description": "Settlement net not found on the bank statement" }
+      ],
+      "policies": [
+        "non-zero delta_gross or delta_net indicates a reconciliation break that needs investigation"
+      ]
+    }
+  ],
+  "global_policies": [
+    "all monetary amounts are EUR",
+    "invoice-number prefixes identify the source system: MR = Chargebee memberships, MRGS = Chargebee credit notes, FK = Zoho B2B, CN = Zoho credit notes, MEDWEIGHT = Stripe weight program, three-letter medical prefixes (UNI, AME, PRO, ORD, ...) = Mobimed patient invoices",
+    "the group has two legal entities, medcenter_gmbh and medcenter_labs, each with its own bank account; keep them separate unless the user asks for group totals",
+    "there is no shared customer or patient id across systems - never merge identities across sources; matching happens only via explicit invoice-number references"
+  ]
+}

@@ -1716,7 +1716,12 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
                 row["compressed_bytes"] = int(tcs) if tcs is not None else None
             except Exception:
                 row["compressed_bytes"] = None
-            # We never truncate footer stats, so min/max are always exact.
+            # Writers may truncate long string stats (polars caps them at 64
+            # bytes: prefix min, byte-incremented max). Truncated values are
+            # still valid BOUNDS (min <= all values <= max) — all any pruning
+            # consumer relies on — but not necessarily exact. pyarrow's
+            # Statistics does not expose the exactness bit, so these flags are
+            # optimistic placeholders; nothing may treat them as authoritative.
             row["min_is_exact"] = True
             row["max_is_exact"] = True
             row["stats_available"] = False
@@ -2097,9 +2102,11 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
     p_lane = pred.lane
     s_lane, s_min, s_max = stored
     if p_lane == "numeric" and s_lane in ("bigint", "double"):
-        smin, smax = float(s_min), float(s_max)
-        plo = None if pred.lo is None else float(pred.lo)
-        phi = None if pred.hi is None else float(pred.hi)
+        # Compare the raw values: Python int/float cross-type comparison is
+        # exact by value.  A float() coercion would round int64s past 2**53
+        # onto shared floats and let a strict bound falsely exclude a file
+        # (e.g. ``k > 2**53`` vs a stored value of ``2**53 + 1``).
+        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     elif p_lane == "timestamp" and s_lane == "timestamp":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     elif p_lane == "string" and s_lane == "string":

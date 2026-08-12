@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
 class PredInterval(NamedTuple):
@@ -18,6 +18,34 @@ class PredInterval(NamedTuple):
     lo_incl: bool
     hi: object
     hi_incl: bool
+
+
+class JoinEdge(NamedTuple):
+    """One equi-join link ``left_table.left_col = right_table.right_col`` between
+    two *different* physical tables, used for join-aware (cross-table) file
+    pruning.
+
+    A table is identified by its ``(super_name.lower(), simple_name.lower())``
+    key — the same key :meth:`SQLParser.get_predicate_constraints` uses — so an
+    edge can be matched directly against the per-table file/stats maps.  Column
+    names are lowercased.
+
+    ``prune_left`` / ``prune_right`` say which endpoints may be *pruned* by the
+    range the partner exports.  Ranges always flow both ways, but a preserved
+    outer-join side (LEFT's left, RIGHT's right, both sides of FULL, ANTI's
+    preserved side) must keep every file — its non-matching rows appear in the
+    result — so :meth:`SQLParser.get_join_edges` clears its flag.  The flag is
+    also cleared for any table the query binds more than once (the executor
+    scans ONE shared file list per physical table, so pruning it to what a
+    single occurrence needs would starve the others).  ``True``/``True`` (the
+    default) is plain inner-join semantics.
+    """
+    left_table: Tuple[str, str]
+    left_col: str
+    right_table: Tuple[str, str]
+    right_col: str
+    prune_left: bool = True
+    prune_right: bool = True
 
 
 @dataclass

@@ -1,6 +1,6 @@
 # SuperTable demos
 
-Self-contained demonstrations bundled with `pip install supertable`. Both
+Self-contained demonstrations bundled with `pip install supertable`. All
 demos talk to a live Redis + storage backend, so configure your environment
 first — see [../../docs/02_configuration.md](../../docs/02_configuration.md).
 
@@ -75,3 +75,87 @@ supertable-demo-webshop-topup --sleep-minutes 5
 The `WebshopDataGenerator` engine itself lives in
 `supertable.demo.webshop.core`; shared connection / output settings are in
 `supertable.demo.webshop.defaults`.
+
+## medcenter
+
+A medical-center group's full finance stack, built entirely from
+specification — fully synthetic data, no real records anywhere. Eight
+source systems are generated with realistic cross-links and loaded into
+one SuperTable:
+
+```
+ Chargebee   Stripe    Zoho     Mobimed      Erste Bank    Domonda    BMD       Hobex
+ (parquet)  (parquet) (parquet) (CSV)      (camt.053 CSV) (parquet)  (CSV)     (CSV)
+     |          |        |         |             |            |         |         |
+     +----------+--------+---------+------+------+------------+---------+---------+
+                                          v
+                     raw_* tables (18) — idempotent upsert loads
+                                          v
+              stg_mobimed_invoices  +  7 finance marts (documented SQL)
+```
+
+The cross-links are the point: bank statement lines carry real `MR…`/`FK…`
+invoice numbers in their remittance (a few deliberately mangled → review
+queue), Hobex settlements tie out against Mobimed card receipts and the
+bank credit, Stripe payouts equal the sum of their balance transactions,
+BMD journal rows link back via document numbers, and every invoice row
+carries a `pdf_url` to the demo bill host — so a workbench (e.g.
+Lighthouse) can drill from any figure to "the actual bill".
+`demo_queries.md` in the package is a ready-made question/query pack for
+that session.
+
+`annotations.json` is the matching business-semantics layer for
+Lighthouse: table descriptions with grain and synonyms, canonical
+measures and dimensions, every cross-table join, EUR units, PII
+classification (patient names, bank counterparties, BMD booking texts),
+data-quality rules, and MUST-FOLLOW policies (line-item grain dedup,
+storno/void exclusion, MR/FK reference semantics, the two-entity split).
+Upload it on Lighthouse's `/annotations` page via **Import annotations
+from JSON** (`POST /api/annotation/import`) after connecting the
+`medcenter` super — the catalog crawls the structure itself; this file
+supplies what the structure can't say.
+
+Marts: `mart_revenue_monthly`, `mart_bank_reconciliation`,
+`mart_open_invoices`, `mart_doctor_monthly`, `mart_deferred_revenue`,
+`mart_settlement_recon`, `mart_mobimed_monthly` — plus the three
+12-column accounting-import CSVs (chargebee, stripe_weight,
+eigenprodukte) and a 20+-test data-quality suite that seals the
+arithmetic and every cross-system link.
+
+| Console script | Module | Purpose |
+|---|---|---|
+| `supertable-demo-medcenter-generate` | `supertable.demo.medcenter.generate` | Synthesize all eight sources (seeded, reproducible; `--year` for 12 months) |
+| `supertable-demo-medcenter-load` | `supertable.demo.medcenter.load` | Load fixtures into the 18 `raw_*` tables (idempotent upsert) |
+| `supertable-demo-medcenter-transform` | `supertable.demo.medcenter.transform` | Build the staging table + all seven marts |
+| `supertable-demo-medcenter-quality` | `supertable.demo.medcenter.quality` | Run the data-quality suite (arithmetic, cross-links, acceptance) |
+| `supertable-demo-medcenter-export` | `supertable.demo.medcenter.export_accounting` | Write the three 12-column accounting-import CSVs |
+| `supertable-demo-medcenter-run` | `supertable.demo.medcenter.run` | Full end-to-end demo; `--teardown` drops the demo tables |
+
+Typical flow:
+
+```bash
+# Everything in one go: generate → load → transform → tests → showcase
+# views → exports → idempotency proof
+supertable-demo-medcenter-run
+
+# Prove reproducibility: drop the tables, then run again — identical results
+supertable-demo-medcenter-run --teardown
+supertable-demo-medcenter-run
+
+# Full year: 12 months, continuous year-scoped numbering everywhere
+supertable-demo-medcenter-run --year 2026
+```
+
+Single-month and full-year modes mix freely: seeds and document-number
+sequences derive from the calendar month itself, so `--month 2026-07`
+produces byte-identical files to the July slice of `--year 2026`. Running
+the default (single-month) demo on top of a year load is simply an
+idempotent refresh of that month — the acceptance test then reconciles
+the mart against **all** fixture months in the data folder, so keep the
+fixture folder and the loaded tables in sync (or `--teardown` and clear
+the folder for a full reset).
+
+The Mobimed generator lives in `supertable.demo.medcenter.core`, the other
+seven sources in `supertable.demo.medcenter.finance_sources`; connection
+settings, table names, upsert keys, and the demo category rule are in
+`supertable.demo.medcenter.defaults`.

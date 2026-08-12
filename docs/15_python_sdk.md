@@ -321,7 +321,7 @@ pipe.create(
 
 ## Demos
 
-The package ships two runnable demos under `supertable.demo`:
+The package ships three runnable demos under `supertable.demo`:
 
 - `supertable.demo.quickstart` — numbered API tutorial. Run via the
   `supertable-demo-quickstart` console script or `python -m
@@ -329,6 +329,17 @@ The package ships two runnable demos under `supertable.demo`:
 - `supertable.demo.webshop` — synthetic webshop dataset generator + loader.
   Console scripts: `supertable-demo-webshop-generate`,
   `supertable-demo-webshop-load`, `supertable-demo-webshop-topup`.
+- `supertable.demo.medcenter` — a medical-center group's full finance
+  stack on fully synthetic data: eight cross-linked source systems
+  (Chargebee, Stripe, Zoho, Mobimed, bank camt.053, Domonda, BMD, Hobex)
+  → 18 idempotent `raw_*` loads → staging + seven finance marts (bank
+  reconciliation with review queue, deferred revenue, doctor billing,
+  settlement recon, …), a 20+-test quality suite, and the 12-column
+  accounting-import exports. Console scripts:
+  `supertable-demo-medcenter-generate`, `-load`, `-transform`, `-quality`,
+  `-export`, and `supertable-demo-medcenter-run` (full end-to-end incl.
+  idempotency proof; `--teardown` drops the demo tables; `--year` runs
+  twelve months).
 
 Each individual quickstart step can also be invoked directly, e.g.
 `python -m supertable.demo.quickstart.s03_08_read_snapshot_history`.
@@ -393,3 +404,4 @@ every script (`organization`, `super_name`, `simple_name`, `role_name`,
 - `supertable/monitoring_writer.py` — `MonitoringWriter` (daily-partitioned RPUSH), `get_monitoring_logger` singleton factory, `NullMonitoringLogger` fallback.
 - `supertable/demo/quickstart/` — numbered API tutorial steps.
 - `supertable/demo/webshop/` — synthetic webshop dataset demo.
+- `supertable/demo/medcenter/` — medical-center finance demo (8 cross-linked sources → raw → staging → marts).

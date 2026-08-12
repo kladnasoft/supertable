@@ -6,7 +6,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
-from supertable.data_classes import PredInterval, TableDefinition
+from supertable.data_classes import JoinEdge, PredInterval, TableDefinition
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +87,31 @@ def _literal_to_lane_value(node: exp.Expression) -> Optional[Tuple[str, object]]
                 dt = _parse_datetime_literal(inner.this)
                 return ("timestamp", dt) if dt is not None else None
             return None
-        # Numeric / textual cast → fall through to the inner literal.
-        return _literal_to_lane_value(inner)
+        inner_lv = _literal_to_lane_value(inner)
+        if inner_lv is None:
+            return None
+        lane, value = inner_lv
+        # The engine compares in the CAST's target lane, so the constraint must
+        # live there too — falling through to the inner literal's lane would
+        # e.g. turn CAST('1.5' AS DOUBLE) into a STRING constraint whose
+        # byte-order pruning excludes a numerically matching '1.50'.
+        if any(t in type_name for t in
+               ("INT", "DOUBLE", "FLOAT", "REAL", "DECIMAL", "NUMERIC")):
+            if lane == "numeric":
+                return inner_lv
+            if lane == "string":
+                try:
+                    text = value.strip()
+                    return "numeric", (float(text) if any(
+                        c in text for c in (".", "e", "E")) else int(text))
+                except (TypeError, ValueError, AttributeError):
+                    return None
+            return None
+        if any(t in type_name for t in ("CHAR", "TEXT", "STRING")):
+            # A numeric rendered as text is dialect-formatting territory
+            # ('1.50' vs '1.5') — only pass through genuine string literals.
+            return inner_lv if lane == "string" else None
+        return None  # unknown target type → no constraint (retain)
 
     if isinstance(node, exp.Literal):
         if node.is_string:
@@ -826,4 +849,211 @@ class SQLParser:
                 key = (db.lower(), tbl.lower())
                 result.setdefault(key, []).append(per_alias[alias])
 
+        return result
+
+    # ---------------- Join-edge extraction (cross-table file pruning) ----------------
+
+    @staticmethod
+    def _join_prunability(join: exp.Join) -> Tuple[bool, bool]:
+        """``(own_prunable, outer_prunable)`` for one JOIN node.
+
+        ``own`` is the join node's own operand (the table written after the JOIN
+        keyword — the null-supplying side of a LEFT join); ``outer`` is
+        everything already joined before it.  An endpoint may be pruned only
+        when its rows are NOT preserved without a match:
+
+        * INNER / comma / CROSS+ON — both sides must match → both prunable.
+        * SEMI — an existence filter; result rows on either side must match →
+          both prunable (regardless of a LEFT/RIGHT spelling).
+        * ANTI — the preserved side's NON-matching rows are the result → it is
+          never prunable; the probe side only feeds the existence test, so
+          dropping its provably-unmatchable files is sound.
+        * LEFT / RIGHT / FULL OUTER — the preserved side(s) keep every row
+          (null-extended), so only a null-supplying side is prunable.
+        """
+        side = (join.args.get("side") or "").upper()
+        kind = (join.args.get("kind") or "").upper()
+        if kind == "SEMI":
+            return True, True
+        if kind == "ANTI":
+            # Preserved side = outer, unless spelled RIGHT ANTI.
+            return (False, True) if side == "RIGHT" else (True, False)
+        if side == "LEFT":
+            return True, False
+        if side == "RIGHT":
+            return False, True
+        if side == "FULL":
+            return False, False
+        return True, True
+
+    def get_join_edges(self) -> List[JoinEdge]:
+        """Equi-join links (``a.x = b.y``) between two *different* physical tables.
+
+        Collected from every scope's ``JOIN ... ON`` / ``USING`` conditions and
+        its ``WHERE`` clause (the ``FROM a, b WHERE a.x = b.y`` form).  Only
+        ``=`` between two **alias-qualified** columns that resolve to distinct
+        tables in the same scope is an edge; anything else (``a.x < b.y`` range
+        joins, ``col = literal``, self-joins, an unqualified side, functions,
+        db-qualified 3-part references — DuckDB parses the struct-field access
+        ``a.s.id`` the same way, so they cannot be bound safely) is ignored.
+        ``USING (c)`` is translated only when the accumulated left side is a
+        single plain table (the first hop), where the equality is unambiguous.
+        Alias resolution is case-insensitive (DuckDB identifiers are).
+
+        Soundness gating — each endpoint carries a *prunable* flag:
+
+        * the preserved side of an outer/anti join is never prunable (its
+          non-matching rows appear in the result), per
+          :meth:`_join_prunability`; a WHERE-clause equality is null-rejecting
+          (effectively inner), so it grants both sides.  Grants for the same
+          endpoint pair OR together — they all constrain the same scope's
+          result;
+        * a physical table bound MORE than once (second alias, UNION branch,
+          subquery — any scope) is never prunable: the executor scans one
+          shared file list for all occurrences, and pruning it to what one
+          occurrence needs would drop files another occurrence reads.
+
+        Each :class:`JoinEdge` keys its endpoints by
+        ``(super_name.lower(), simple_name.lower())`` — the same key
+        :meth:`get_predicate_constraints` emits — so the result maps directly
+        onto the per-table file/stats dicts a cross-table pruner works with.
+
+        Always returns safely: any parse/scope error yields ``[]`` (no join
+        pruning), so this never breaks a query.
+        """
+        try:
+            scopes = traverse_scope(self._parsed)
+        except Exception:
+            return []
+
+        # Occurrence census + per-scope alias maps (lowercased alias -> key).
+        # A lowercase alias collision (illegal in DuckDB, but be defensive)
+        # poisons that alias to None so nothing resolves through it.
+        occurrence_count: Dict[Tuple[str, str], int] = {}
+        scope_aliases: List[Dict[str, Optional[Tuple[str, str]]]] = []
+        for scope in scopes:
+            alias_to_phys: Dict[str, Optional[Tuple[str, str]]] = {}
+            if isinstance(scope.expression, exp.Select):
+                for name, src in scope.sources.items():
+                    if not isinstance(src, exp.Table):
+                        continue
+                    db = self._get_db_name(src) or self.default_super_name
+                    key = (db.lower(), src.name.lower())
+                    lname = name.lower()
+                    alias_to_phys[lname] = (
+                        None if lname in alias_to_phys else key
+                    )
+                    occurrence_count[key] = occurrence_count.get(key, 0) + 1
+            scope_aliases.append(alias_to_phys)
+
+        # edge dedup key -> [endpoints, l_prunable, r_prunable]; grants OR.
+        edges: Dict[Tuple, List] = {}
+
+        def add_edge(
+            l_key, l_col, r_key, r_col, l_prunable: bool, r_prunable: bool
+        ) -> None:
+            endpoints = sorted([(l_key, l_col, l_prunable), (r_key, r_col, r_prunable)],
+                               key=lambda e: (e[0], e[1]))
+            dedup_key = ((endpoints[0][0], endpoints[0][1]),
+                         (endpoints[1][0], endpoints[1][1]))
+            entry = edges.get(dedup_key)
+            if entry is None:
+                edges[dedup_key] = [endpoints[0][2], endpoints[1][2]]
+            else:
+                entry[0] = entry[0] or endpoints[0][2]
+                entry[1] = entry[1] or endpoints[1][2]
+
+        def add_eq_conjunct(
+            node: exp.Expression,
+            alias_to_phys: Dict[str, Optional[Tuple[str, str]]],
+            own_alias: Optional[str],
+            own_prunable: bool,
+            outer_prunable: bool,
+        ) -> None:
+            node = _unwrap_paren(node)
+            if not isinstance(node, exp.EQ):
+                return
+            left, right = node.left, node.right
+            if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+                return
+            # A db-qualified column (a.s.id) is ambiguous: sqlglot binds it by
+            # its MIDDLE segment, but DuckDB may resolve it as a struct-field
+            # access on table a.  Never build an edge from one.
+            if left.args.get("db") or right.args.get("db"):
+                return
+            la, ra = left.table.lower(), right.table.lower()
+            if not la or not ra:
+                return  # both sides must be qualified to resolve a table
+            l_key = alias_to_phys.get(la)
+            r_key = alias_to_phys.get(ra)
+            if l_key is None or r_key is None:
+                return
+            if l_key == r_key:
+                return  # self-join: no cross-table propagation
+            add_edge(
+                l_key, left.name.lower(), r_key, right.name.lower(),
+                own_prunable if la == own_alias else outer_prunable,
+                own_prunable if ra == own_alias else outer_prunable,
+            )
+
+        for scope, alias_to_phys in zip(scopes, scope_aliases):
+            select = scope.expression
+            if not isinstance(select, exp.Select):
+                continue
+            if sum(1 for v in alias_to_phys.values() if v is not None) < 2:
+                continue  # need at least two real tables for a cross-table join
+
+            # The accumulated left side, for USING resolution: starts with the
+            # FROM operand, grows by each join's own operand.
+            from_expr = select.args.get("from")
+            preceding: List[str] = []
+            if from_expr is not None and isinstance(from_expr.this, exp.Table):
+                preceding.append((from_expr.this.alias or from_expr.this.name).lower())
+
+            for join in select.args.get("joins") or []:
+                own_alias: Optional[str] = None
+                if isinstance(join.this, exp.Table):
+                    own_alias = (join.this.alias or join.this.name).lower()
+                own_prunable, outer_prunable = self._join_prunability(join)
+
+                on = join.args.get("on")
+                if on is not None:
+                    for conj in _split_and(on):
+                        add_eq_conjunct(
+                            conj, alias_to_phys, own_alias,
+                            own_prunable, outer_prunable,
+                        )
+
+                # USING (c): own.c = other.c — only safe when the accumulated
+                # left side is a single plain table (both sides then provably
+                # carry column c).  Deeper chain hops would need schema
+                # knowledge to bind c to the right left-side table.
+                using = join.args.get("using") or []
+                if using and own_alias is not None and len(preceding) == 1:
+                    l_key = alias_to_phys.get(preceding[0])
+                    r_key = alias_to_phys.get(own_alias)
+                    if l_key is not None and r_key is not None and l_key != r_key:
+                        for ident in using:
+                            col = ident.name.lower()
+                            add_edge(
+                                l_key, col, r_key, col,
+                                outer_prunable, own_prunable,
+                            )
+
+                preceding.append(own_alias if own_alias is not None else "")
+
+            # WHERE equality is null-rejecting → effectively inner: both sides
+            # prunable (even after an outer join — rows failing it are gone).
+            where = select.args.get("where")
+            if where is not None:
+                for conj in _split_and(where.this):
+                    add_eq_conjunct(conj, alias_to_phys, None, True, True)
+
+        result: List[JoinEdge] = []
+        for ((l_key, l_col), (r_key, r_col)), (l_pr, r_pr) in edges.items():
+            result.append(JoinEdge(
+                l_key, l_col, r_key, r_col,
+                prune_left=l_pr and occurrence_count.get(l_key, 0) == 1,
+                prune_right=r_pr and occurrence_count.get(r_key, 0) == 1,
+            ))
         return result

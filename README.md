@@ -97,7 +97,7 @@ df, status, message = dr.execute(role_name="superadmin", engine=engine.AUTO)
 
 ## Demos
 
-The package ships two runnable demos under `supertable.demo`:
+The package ships three runnable demos under `supertable.demo`:
 
 ```bash
 # Numbered tutorial — runs the full lifecycle end-to-end.
@@ -109,9 +109,13 @@ python -m supertable.demo.quickstart
 supertable-demo-webshop-generate    # build ~1.2M rows on disk
 supertable-demo-webshop-load        # load them into SuperTable
 supertable-demo-webshop-topup       # continuous incremental refresh
+
+# Medical-center finance demo (raw → staging → mart, fully synthetic).
+supertable-demo-medcenter-run       # generate → load → transform → tests →
+                                    # accounting export → idempotency proof
 ```
 
-Both demos are also runnable as module steps. Examples:
+All demos are also runnable as module steps. Examples:
 
 ```bash
 python -m supertable.demo.quickstart.s01_01_01_create_super_table
