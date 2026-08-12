@@ -16,6 +16,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 import pytest
+import redis
 
 from supertable.locking.redis_lock import RedisLocking
 
@@ -262,6 +263,17 @@ class TestExtend:
     def test_extend_missing_key(self, locker):
         assert locker.extend("missing", "tok", ttl_ms=5_000) is False
 
+    def test_extend_transport_error_is_not_reported_as_definitive_loss(
+            self, locker, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            locker,
+            "_extend_if_token",
+            lambda **kwargs: (_ for _ in ()).throw(redis.TimeoutError("reply lost")),
+        )
+        with pytest.raises(redis.TimeoutError, match="reply lost"):
+            locker.extend("k", "tok", ttl_ms=5_000)
+
 
 # ---------------------------------------------------------------------------
 # Heartbeat
@@ -289,6 +301,98 @@ class TestHeartbeat:
         # when there are no remaining held locks.
         assert locker._hb_thread is None
 
+    def test_release_stop_race_restarts_for_newly_acquired_key(
+        self, locker, monkeypatch,
+    ):
+        first = locker.acquire("first", ttl_s=5, timeout_s=2)
+        entered_stop = threading.Event()
+        resume_stop = threading.Event()
+        original_stop = locker._stop_heartbeat
+
+        def paused_stop(*, restart_if_held=False):
+            entered_stop.set()
+            assert resume_stop.wait(timeout=2)
+            return original_stop(restart_if_held=restart_if_held)
+
+        monkeypatch.setattr(locker, "_stop_heartbeat", paused_stop)
+        release_thread = threading.Thread(
+            target=lambda: locker.release("first", first), daemon=True,
+        )
+        release_thread.start()
+        assert entered_stop.wait(timeout=2)
+
+        second = locker.acquire("second", ttl_s=5, timeout_s=2)
+        assert second is not None
+        resume_stop.set()
+        release_thread.join(timeout=2)
+
+        assert not release_thread.is_alive()
+        assert locker._hb_thread is not None
+        assert locker._hb_thread.is_alive()
+        assert locker._held["second"][0] == second
+
+    def test_natural_heartbeat_exit_cannot_orphan_concurrent_acquire(
+        self, locker, fake_redis, monkeypatch,
+    ):
+        """A dying-but-still-alive generation must not suppress its successor."""
+        loop_returned = threading.Event()
+        allow_thread_exit = threading.Event()
+        original_loop = locker._hb_loop
+
+        def pause_after_loop(stop_event):
+            original_loop(stop_event)
+            loop_returned.set()
+            assert allow_thread_exit.wait(timeout=3)
+
+        monkeypatch.setattr(locker, "_hb_loop", pause_after_loop)
+        first = locker.acquire("first", ttl_s=1, timeout_s=2)
+        first_thread = locker._hb_thread
+        assert first is not None and first_thread is not None
+
+        # Force extend() to report the first lease lost. The heartbeat removes
+        # it, reaches a natural exit, then our wrapper keeps the Thread itself
+        # alive to expose the teardown interleaving deterministically.
+        fake_redis.delete("first")
+        assert loop_returned.wait(timeout=3)
+
+        second = locker.acquire("second", ttl_s=5, timeout_s=2)
+        second_thread = locker._hb_thread
+        assert second is not None
+        assert second_thread is not None
+        assert second_thread is not first_thread
+        assert second_thread.is_alive()
+
+        allow_thread_exit.set()
+        first_thread.join(timeout=2)
+        assert not first_thread.is_alive()
+        assert locker._hb_thread is second_thread
+        assert locker._held["second"][0] == second
+
+    def test_transient_extend_error_keeps_tracking_and_retries(
+            self, locker, monkeypatch,
+    ):
+        token = locker.acquire("slow-drain", ttl_s=2, timeout_s=2)
+        original = locker._extend_if_token
+        failed_once = threading.Event()
+        succeeded_after = threading.Event()
+        attempts = 0
+
+        def flaky(*, keys, args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                failed_once.set()
+                raise redis.TimeoutError("transient")
+            result = original(keys=keys, args=args)
+            succeeded_after.set()
+            return result
+
+        monkeypatch.setattr(locker, "_extend_if_token", flaky)
+        assert failed_once.wait(timeout=3)
+        assert locker._held["slow-drain"][0] == token
+        assert succeeded_after.wait(timeout=2)
+        assert locker._held["slow-drain"][0] == token
+
 
 # ---------------------------------------------------------------------------
 # Error handling
@@ -312,7 +416,7 @@ class TestErrorHandling:
         finally:
             rl._on_exit()
 
-    def test_extend_swallows_redis_errors(self, fake_redis, monkeypatch):
+    def test_extend_propagates_ambiguous_redis_errors(self, fake_redis, monkeypatch):
         import redis as _redis
 
         rl = RedisLocking(fake_redis)
@@ -323,6 +427,7 @@ class TestErrorHandling:
                 raise _redis.RedisError("boom")
 
             monkeypatch.setattr(rl, "_extend_if_token", boom)
-            assert rl.extend("k", "irrelevant", ttl_ms=5_000) is False
+            with pytest.raises(_redis.RedisError, match="boom"):
+                rl.extend("k", "irrelevant", ttl_ms=5_000)
         finally:
             rl._on_exit()

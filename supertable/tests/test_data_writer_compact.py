@@ -57,7 +57,9 @@ def _resource(file: str, file_size: int = 1_000, rows: int = 100) -> dict:
     }
 
 
-def _snapshot(resources: list, *, tombstone: str | None = None) -> dict:
+def _snapshot(
+    resources: list, *, tombstone: str | None = None, tombstone_rows: int = 1,
+) -> dict:
     snap = {
         "simple_name": "orders",
         "snapshot_version": 1,
@@ -69,12 +71,21 @@ def _snapshot(resources: list, *, tombstone: str | None = None) -> dict:
         # reads it via ``_read_parquet_safe`` and gates draining purely
         # on whether that frame has rows (tombstone_rows > 0).
         snap["tombstone"] = tombstone
+        frame = _dv_frame(
+            tombstone_rows, file=resources[0]["file"] if resources else "a"
+        )
+        from supertable.processing import tombstone_digest
+        snap["tombstone_rows"] = frame.height
+        snap["tombstone_digest"] = tombstone_digest(frame)
     return snap
 
 
-def _dv_frame(n_rows: int):
+def _dv_frame(n_rows: int, file: str = "a"):
     """A stand-in deletion-vector frame whose ``.height`` is ``n_rows``."""
-    return pl.DataFrame({"__rowid__": list(range(n_rows))})
+    return pl.DataFrame(
+        {"__file__": [file] * n_rows, "__rowid__": list(range(1, n_rows + 1))},
+        schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+    )
 
 
 def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
@@ -82,6 +93,7 @@ def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
     """Build a SimpleTable mock returning the given snapshot."""
     mock = MagicMock()
     mock.data_dir = data_dir
+    mock._last_snapshot_leaf = {"version": 1, "path": snap_path}
     mock.get_simple_table_snapshot.return_value = (snap, snap_path)
     # ``update`` returns (new_snapshot_dict, new_snapshot_path).
     # Callers patch this further if they care.
@@ -104,11 +116,42 @@ def _build_writer():
     dw = DataWriter.__new__(DataWriter)
     dw.super_table = MagicMock(super_name="warehouse", organization="acme")
     dw.super_table.storage = MagicMock()
-    dw.catalog = MagicMock()
+    class AtomicCatalogDouble:
+        def __init__(self):
+            self.acquire_simple_lock = MagicMock(return_value="tok")
+            self.release_simple_lock = MagicMock(return_value=True)
+            self.commit_snapshot_mock = MagicMock(return_value=(2, 2))
+            self.set_leaf_payload_cas = MagicMock()
+            self.bump_root = MagicMock()
+            self.root_exists = MagicMock()
+            self.leaf_exists = MagicMock()
+            self._mirrors = []
+            self.mirror_state_events = []
+
+        def commit_snapshot(self, *args, **kwargs):
+            result = self.commit_snapshot_mock(*args, **kwargs)
+            if kwargs.get("mirror_publication"):
+                self.mirror_state_events.append("core_committed")
+            return result
+
+        def get_mirrors(self, organization, super_name):
+            return list(self._mirrors)
+
+        def prepare_mirror_publication(self, *args, **kwargs):
+            self.mirror_state_events.append("prepared")
+            return {"status": "prepared"}
+
+        def complete_mirror_publication(self, *args, **kwargs):
+            self.mirror_state_events.append("complete")
+            return {"status": "complete"}
+
+        def fail_mirror_publication(self, *args, **kwargs):
+            self.mirror_state_events.append("failed")
+            return {"status": "failed"}
+
+    dw.catalog = AtomicCatalogDouble()
     dw.catalog.acquire_simple_lock.return_value = "tok"
     dw.catalog.release_simple_lock.return_value = True
-    dw.catalog.set_leaf_payload_cas.return_value = 1
-    dw.catalog.bump_root.return_value = 1
     dw._table_config_cache = {}
     return dw
 
@@ -320,7 +363,7 @@ class TestTombstoneGating:
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a"), _resource("b")],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=1,
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(1)  # 1 tombstoned row
@@ -349,7 +392,7 @@ class TestTombstoneGating:
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a")],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=2,
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(2)  # 2 tombstoned rows
@@ -378,7 +421,7 @@ class TestTombstoneGating:
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a")],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=3,
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(3)
@@ -408,12 +451,9 @@ class TestTombstoneGating:
         Two ways to have no rows: an empty DV frame, or no ``tombstone``
         pointer at all. Both must skip compact_tombstones."""
         dw = _build_writer()
-        snap = _snapshot(
-            [_resource("a")],
-            tombstone="/d/tombstone.parquet",
-        )
+        snap = _snapshot([_resource("a")])
         MockSimple.return_value = _mk_simple_mock(snap)
-        mock_read_pq.return_value = _dv_frame(0)  # empty deletion-vector
+        mock_read_pq.return_value = _dv_frame(0)  # no pointer means no read
         dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
@@ -520,6 +560,51 @@ class TestSnapshotCommit:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
+    def test_mirror_failure_reports_committed_compaction_and_releases_lock(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        """Mirror failure is not success, but cannot roll back the core commit."""
+        from supertable.mirroring.mirror_formats import MirrorPublicationError
+
+        dw = _build_writer()
+        dw.catalog._mirrors = ["PARQUET"]
+        snap = _snapshot([_resource("a"), _resource("b")])
+        mock_simple = _mk_simple_mock(snap)
+        MockSimple.return_value = mock_simple
+        mock_compact_res.return_value = (
+            2,
+            200,
+            [{"file": "c.parquet", "file_size": 5000, "columns": [{"name": "id"}]}],
+            {"a", "b"},
+        )
+        MockMirror.mirror_if_enabled.side_effect = OSError("mirror unavailable")
+        dw._get_table_config = MagicMock(return_value={})
+
+        with pytest.raises(MirrorPublicationError) as raised:
+            dw.compact("admin", "tbl")
+
+        error = raised.value
+        assert error.core_committed is True
+        assert error.snapshot_path == "/snap/v2.json"
+        assert error.mirrors == ("PARQUET",)
+        assert error.core_result["files_after"] == 1
+        assert isinstance(error.__cause__, OSError)
+        dw.catalog.commit_snapshot_mock.assert_called_once()
+        dw.catalog.release_simple_lock.assert_called_once()
+        mock_audit.assert_called_once()
+        assert dw.catalog.mirror_state_events == [
+            "prepared", "core_committed", "failed",
+        ]
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
     def test_update_simpletable_called_with_aggregated_results(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
@@ -565,10 +650,9 @@ class TestSnapshotCommit:
 
         result = dw.compact("admin", "tbl")
 
-        # No snapshot update, no leaf CAS, no root bump
+        # No snapshot update and no atomic catalog publication.
         mock_simple.update.assert_not_called()
-        dw.catalog.set_leaf_payload_cas.assert_not_called()
-        dw.catalog.bump_root.assert_not_called()
+        dw.catalog.commit_snapshot_mock.assert_not_called()
         # The result still has files_before / files_after equal
         assert result["files_before"] == 2
         assert result["files_after"] == 2
@@ -616,7 +700,7 @@ class TestSnapshotCommit:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_leaf_cas_and_bump_root_after_successful_compaction(
+    def test_atomic_fenced_commit_after_successful_compaction(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
@@ -631,8 +715,7 @@ class TestSnapshotCommit:
 
         dw.compact("admin", "tbl")
 
-        dw.catalog.set_leaf_payload_cas.assert_called_once()
-        dw.catalog.bump_root.assert_called_once()
+        dw.catalog.commit_snapshot_mock.assert_called_once()
 
 
 # ===========================================================================
@@ -976,11 +1059,11 @@ class TestTwoPhaseAggregation:
             [_resource("A", file_size=2_000_000),
              _resource("B", file_size=1_000_000),
              _resource("C", file_size=1_000_000)],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=1,
         )
         mock_simple = _mk_simple_mock(snap)
         MockSimple.return_value = mock_simple
-        mock_read_pq.return_value = _dv_frame(1)  # DV has rows → drains
+        mock_read_pq.return_value = _dv_frame(1, "A")  # DV has rows → drains
 
         # Phase A: tombstone compaction rewrites A → F
         F_resource = {
@@ -1049,11 +1132,11 @@ class TestTwoPhaseAggregation:
         snap = _snapshot(
             [_resource("A", file_size=2_000_000),
              _resource("B", file_size=500_000)],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=1,
         )
         mock_simple = _mk_simple_mock(snap)
         MockSimple.return_value = mock_simple
-        mock_read_pq.return_value = _dv_frame(1)  # DV has rows → drains
+        mock_read_pq.return_value = _dv_frame(1, "A")  # DV has rows → drains
 
         F_resource = {
             "file": "F", "file_size": 20_000_000,  # large
@@ -1126,7 +1209,7 @@ class TestResultShape:
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a"), _resource("b"), _resource("c")],
-            tombstone="/d/tombstone.parquet",
+            tombstone="/d/tombstone.parquet", tombstone_rows=1,
         )
         mock_simple = _mk_simple_mock(snap)
         mock_simple.update.return_value = (

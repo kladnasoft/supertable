@@ -5,9 +5,12 @@
   "business_key_columns": [
     "id"
   ],
-  "comparison_columns": [],
-  "expected_kind": "error",
-  "expected_row_count": null,
+  "comparison_columns": [
+    "id",
+    "val"
+  ],
+  "expected_kind": "result",
+  "expected_row_count": 0,
   "ordering": {
     "mode": "ordered",
     "stable_sort_columns": [
@@ -15,7 +18,7 @@
     ]
   },
   "input_checksum": "sha256:271999360eb3c25613f7c3000b3e490c417754802604056ab49bd890fd31ad27",
-  "expected_checksum": "sha256:0b26296c07106ae374d1724847333ee2a9b706010bf46415c8c37d86f61dec93",
+  "expected_checksum": "sha256:df1d8995fbce85b6da39368de43968e20e8f7eb3ec6025d6060b4a239a2f61a5",
   "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

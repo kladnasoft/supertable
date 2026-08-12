@@ -79,6 +79,7 @@ class TestLoadDefaultsFromEnv:
             MAX_MEMORY_CHUNK_SIZE=12345,
             MAX_OVERLAPPING_FILES=7,
             MAX_TOMBSTONE_ROWS=999,
+            TOMBSTONE_COMPACTION_WORKERS=4,
             DEFAULT_TIMEOUT_SEC=11,
             DEFAULT_LOCK_DURATION_SEC=22,
             IS_SHOW_TIMING=False,
@@ -91,6 +92,7 @@ class TestLoadDefaultsFromEnv:
         assert d.MAX_MEMORY_CHUNK_SIZE == 12345
         assert d.MAX_OVERLAPPING_FILES == 7
         assert d.MAX_TOMBSTONE_ROWS == 999
+        assert d.TOMBSTONE_COMPACTION_WORKERS == 4
         assert d.DEFAULT_TIMEOUT_SEC == 11
         assert d.DEFAULT_LOCK_DURATION_SEC == 22
         assert d.IS_SHOW_TIMING is False
@@ -104,6 +106,7 @@ class TestLoadDefaultsFromEnv:
             MAX_MEMORY_CHUNK_SIZE=1,
             MAX_OVERLAPPING_FILES=1,
             MAX_TOMBSTONE_ROWS=1,
+            TOMBSTONE_COMPACTION_WORKERS=1,
             DEFAULT_TIMEOUT_SEC=1,
             DEFAULT_LOCK_DURATION_SEC=1,
             IS_SHOW_TIMING=False,
@@ -125,6 +128,7 @@ class TestLoadDefaultsFromEnv:
             MAX_MEMORY_CHUNK_SIZE=1,
             MAX_OVERLAPPING_FILES=1,
             MAX_TOMBSTONE_ROWS=1,
+            TOMBSTONE_COMPACTION_WORKERS=1,
             DEFAULT_TIMEOUT_SEC=1,
             DEFAULT_LOCK_DURATION_SEC=1,
             IS_SHOW_TIMING=False,

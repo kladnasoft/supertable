@@ -82,6 +82,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("meta_root_pattern_for_org",    RK.meta_root_pattern_for_org(ORG),    f"supertable:{ORG}:lakes:*:meta:root"),
         ("meta_root_pattern_all_orgs",   RK.meta_root_pattern_all_orgs(),      f"supertable:*:lakes:*:meta:root"),
         ("meta_mirrors",                 RK.meta_mirrors(ORG, SUP),            f"{lake_pre}:meta:mirrors"),
+        ("meta_mirror_publication",      RK.meta_mirror_publication(ORG, SUP, SIMPLE), f"{lake_pre}:meta:mirror_publication:doc:{SIMPLE}"),
         ("meta_table_names",             RK.meta_table_names(ORG, SUP),        f"{lake_pre}:meta:table_names"),
         ("meta_leaf",                    RK.meta_leaf(ORG, SUP, SIMPLE),       f"{lake_pre}:meta:leaf:doc:{SIMPLE}"),
         ("meta_leaf_pattern",            RK.meta_leaf_pattern(ORG, SUP),       f"{lake_pre}:meta:leaf:doc:*"),

@@ -116,26 +116,24 @@ def _check_operation_access(
 
 def _check_readonly_guard(super_name: str, organization: str, label: str) -> None:
     """Block mutations on read-only SuperTables (snapshot clones, replicas, locked)."""
-    try:
-        from supertable.redis_catalog import RedisCatalog
-        root = RedisCatalog().get_root(organization, super_name)
-        if root and root.get("read_only"):
-            clone_type = root.get("clone_type", "")
-            if clone_type == "replica":
-                reason = "live replica"
-            elif clone_type == "readonly":
-                reason = "read-only snapshot clone"
-            elif root.get("cloned_from"):
-                reason = "read-only clone"
-            else:
-                reason = "locked"
-            raise PermissionError(
-                f"This SuperTable is {reason}. Cannot {label}."
-            )
-    except PermissionError:
-        raise
-    except Exception:
-        pass  # Never block on guard failures
+    from supertable.redis_catalog import RedisCatalog
+    # Read-only/replica state controls whether a mutation is legal. Treating an
+    # unavailable or corrupt root as writable can modify the wrong physical
+    # table or diverge a replica, so lookup ambiguity must fail closed.
+    root = RedisCatalog().get_root(organization, super_name)
+    if root and root.get("read_only"):
+        clone_type = root.get("clone_type", "")
+        if clone_type == "replica":
+            reason = "live replica"
+        elif clone_type == "readonly":
+            reason = "read-only snapshot clone"
+        elif root.get("cloned_from"):
+            reason = "read-only clone"
+        else:
+            reason = "locked"
+        raise PermissionError(
+            f"This SuperTable is {reason}. Cannot {label}."
+        )
 
 
 def check_control_access(

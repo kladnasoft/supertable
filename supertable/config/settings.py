@@ -117,6 +117,7 @@ class Settings:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024  # MAX_MEMORY_CHUNK_SIZE
     MAX_OVERLAPPING_FILES: int = 100               # MAX_OVERLAPPING_FILES
     MAX_TOMBSTONE_ROWS: int = 1_000_000            # MAX_TOMBSTONE_ROWS
+    TOMBSTONE_COMPACTION_WORKERS: int = 2           # TOMBSTONE_COMPACTION_WORKERS
     DEFAULT_TIMEOUT_SEC: int = 60                  # DEFAULT_TIMEOUT_SEC
     DEFAULT_LOCK_DURATION_SEC: int = 30            # DEFAULT_LOCK_DURATION_SEC
     IS_SHOW_TIMING: bool = False                   # IS_SHOW_TIMING
@@ -184,6 +185,9 @@ class Settings:
     #     retains only the last N rather than all of them.
     # <= 0 disables the cache entirely (inline read_parquet fallback).
     SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE: int = 8  # SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
+    # Process/connection-wide entry ceiling across every logical table.  This
+    # bounds residency when many tables are queried inside the TTL window.
+    SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES: int = 128  # SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES
     # Idle TTL (seconds): a cached deletion-vector is dropped once it has gone
     # unqueried for this long; every query that uses it refreshes the timer.
     # Applies to every entry (a table's latest included), so an abandoned table
@@ -310,6 +314,7 @@ class Settings:
     # versions are always read fresh and never cached).  Mirrors the stats cache
     # so a process writing in a loop skips the carry-forward read.  0 disables.
     SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES
+    SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES: int = 256 * 1024 * 1024  # SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES
 
     # Read-path file pruning: when True the estimator uses the stats artifact to
     # drop parquet files that provably can't satisfy a query's WHERE predicates.
@@ -431,6 +436,9 @@ def _build_settings() -> Settings:
         MAX_MEMORY_CHUNK_SIZE=_env_int("MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024),
         MAX_OVERLAPPING_FILES=_env_int("MAX_OVERLAPPING_FILES", 100),
         MAX_TOMBSTONE_ROWS=_env_int("MAX_TOMBSTONE_ROWS", 1_000_000),
+        TOMBSTONE_COMPACTION_WORKERS=_env_int(
+            "TOMBSTONE_COMPACTION_WORKERS", 2
+        ),
         DEFAULT_TIMEOUT_SEC=_env_int("DEFAULT_TIMEOUT_SEC", 60),
         DEFAULT_LOCK_DURATION_SEC=_env_int("DEFAULT_LOCK_DURATION_SEC", 30),
         IS_SHOW_TIMING=_env_bool("IS_SHOW_TIMING", True),
@@ -474,6 +482,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
+        SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES", 128),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),
 
@@ -581,6 +590,9 @@ def _build_settings() -> Settings:
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES=_env_int(
+            "SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES", 256 * 1024 * 1024
+        ),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
         SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=_env_bool("SUPERTABLE_READ_PROJECTION_SIZING_ENABLED", True),
 

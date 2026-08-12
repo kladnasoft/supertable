@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import time
+import hashlib
+import weakref
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -24,16 +26,135 @@ from supertable.config.defaults import logger
 # Module-level singleton for the pro executor so the persistent
 # connection survives across Executor instances (which are per-request).
 _pro_singleton: Optional[DuckDBPro] = None
+_pro_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDBPro]" = (
+    weakref.WeakValueDictionary()
+)
 _pro_lock = __import__("threading").Lock()
+_lite_singleton: Optional[DuckDBLite] = None
+_lite_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDBLite]" = (
+    weakref.WeakValueDictionary()
+)
+_lite_lock = __import__("threading").Lock()
 
 
-def _get_pro(storage: Optional[object] = None) -> DuckDBPro:
+def _fingerprint(values) -> str:
+    """Hash a length-framed credential tuple without retaining its contents."""
+    digest = hashlib.sha256()
+    for value in values:
+        if value is None:
+            raw = b""
+        elif isinstance(value, bytes):
+            raw = value
+        else:
+            raw = str(value).encode("utf-8")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _storage_identity(storage: Optional[object]) -> tuple:
+    """Return a conservative identity for a storage backend.
+
+    Connections carry credentials, endpoints, and cached views.  Sharing one
+    merely because two requests both selected "Pro" can expose another org or
+    backend's files.  Known immutable routing attributes allow safe reuse;
+    opaque/custom storage objects are isolated by object identity.
+    """
+    if storage is None:
+        return ("none",)
+    module = storage.__class__.__module__
+    qualname = storage.__class__.__qualname__
+    parts = [module, qualname]
+    for name in (
+        "bucket_name", "container_name", "base_prefix", "endpoint_url",
+        "region", "url_style", "secure", "project_id", "account_name",
+    ):
+        try:
+            value = getattr(storage, name)
+        except Exception:
+            continue
+        if value is None or isinstance(value, (str, int, float, bool)):
+            parts.append((name, value))
+    # Built-in local storage has no auth state.  Its namespace is the absolute
+    # process working directory because LocalStorage resolves every key there.
+    if module == "supertable.storage.local_storage" and qualname == "LocalStorage":
+        parts.append(("local_root", os.path.realpath(os.getcwd())))
+        return tuple(parts)
+
+    # S3/MinIO connection state is completely represented by the route above
+    # plus the full credential tuple below.  Fingerprinting the tuple makes
+    # independently constructed equivalent storage objects reuse an engine,
+    # while any access/secret/session-token change creates a hard boundary.
+    if module in {
+        "supertable.storage.s3_storage",
+        "supertable.storage.minio_storage",
+    }:
+        credential_names = (
+            "_aws_access_key_id", "_aws_secret_access_key",
+            "_aws_session_token", "_access_key", "_secret_key",
+        )
+        values = []
+        for name in credential_names:
+            try:
+                values.append(getattr(storage, name, None))
+            except Exception:
+                values.append(None)
+        if any(value not in (None, "", b"") for value in values):
+            parts.append(("auth_fingerprint", _fingerprint(values)))
+        else:
+            # Dependency-injected SDK clients may carry credentials that the
+            # wrapper never received as constructor values.  Treat them as
+            # opaque auth contexts rather than merging on route alone.
+            parts.append(("client_object_id", id(getattr(storage, "client", storage))))
+        return tuple(parts)
+
+    # GCS/Azure/custom SDK clients can carry opaque refreshable credentials not
+    # exposed by the storage wrapper.  Isolate those by client identity; this
+    # sacrifices some reuse but never crosses authorization contexts.
+    for name in ("client", "svc"):
+        try:
+            client = getattr(storage, name)
+        except Exception:
+            continue
+        if client is not None:
+            parts.append((f"{name}_object_id", id(client)))
+    if len(parts) == 2:
+        parts.append(("object_id", id(storage)))
+    return tuple(parts)
+
+
+def _get_pro(
+        storage: Optional[object] = None, organization: str = "",
+) -> DuckDBPro:
     global _pro_singleton
-    if _pro_singleton is None:
-        with _pro_lock:
-            if _pro_singleton is None:
-                _pro_singleton = DuckDBPro(storage=storage)
-    return _pro_singleton
+    key = (str(organization or ""), _storage_identity(storage))
+    with _pro_lock:
+        # Keep the historical reset hook used by tests/operators: assigning
+        # _pro_singleton=None clears every scoped singleton on the next access.
+        if _pro_singleton is None and _pro_singletons:
+            _pro_singletons.clear()
+        pro = _pro_singletons.get(key)
+        if pro is None:
+            pro = DuckDBPro(storage=storage)
+            _pro_singletons[key] = pro
+        _pro_singleton = pro
+        return pro
+
+
+def _get_lite(
+        storage: Optional[object] = None, organization: str = "",
+) -> DuckDBLite:
+    global _lite_singleton
+    key = (str(organization or ""), _storage_identity(storage))
+    with _lite_lock:
+        if _lite_singleton is None and _lite_singletons:
+            _lite_singletons.clear()
+        lite = _lite_singletons.get(key)
+        if lite is None:
+            lite = DuckDBLite(storage=storage)
+            _lite_singletons[key] = lite
+        _lite_singleton = lite
+        return lite
 
 
 class Executor:
@@ -44,7 +165,7 @@ class Executor:
     def __init__(self, storage: Optional[object] = None, organization: str = ""):
         self.storage = storage
         self.organization = organization
-        self.lite_exec = DuckDBLite(storage=storage)
+        self.lite_exec = _get_lite(storage=storage, organization=organization)
         self.spark_exec = None
         self._catalog = None  # lazily created RedisCatalog for live config reads
 
@@ -147,7 +268,17 @@ class Executor:
 
         # --- Spark fleet: the registered clusters decide availability + floor ---
         active_clusters = self._active_spark_clusters()
-        spark_available = bool(active_clusters)
+        # Spark currently cannot prove the canonical source-file side of a
+        # composite deletion-vector anti-join.  Explicit Spark reads fail
+        # closed; AUTO must remain usable by routing active-DV snapshots to a
+        # DuckDB engine that can validate and apply the composite identity.
+        has_active_tombstone = any(
+            getattr(tombstone, "tombstone_path", None)
+            for tombstone in (
+                getattr(reflection, "tombstone_views", None) or {}
+            ).values()
+        )
+        spark_available = bool(active_clusters) and not has_active_tombstone
         spark_min = self._spark_min_bytes(cfg, active_clusters)
 
         # --- freshness: how long ago was the most recent snapshot updated ---
@@ -219,7 +350,7 @@ class Executor:
             used = "duckdb_lite"
 
         elif chosen == Engine.DUCKDB_PRO:
-            pro = _get_pro(storage=self.storage)
+            pro = _get_pro(storage=self.storage, organization=self.organization)
             df = pro.execute(
                 reflection=reflection,
                 parser=parser,

@@ -79,21 +79,23 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
     canonical method) so that standard backends always succeed.
     """
     rels: Set[str] = set()
-    try:
-        entries: List[str] = []
-        if hasattr(storage, "ls"):
-            entries = storage.ls(table_files_dir) or []
-        elif hasattr(storage, "listdir"):
-            entries = ["/".join((table_files_dir.rstrip("/"), e)) for e in (storage.listdir(table_files_dir) or [])]
-        elif hasattr(storage, "list_files"):
-            # StorageInterface canonical listing method
-            entries = storage.list_files(table_files_dir, "*") or []
-        for p in entries:
-            fn = p.rstrip("/").split("/")[-1]
-            if fn:
-                rels.add("/".join(("files", fn)))
-    except Exception:
-        pass
+    if hasattr(storage, "ls"):
+        entries = storage.ls(table_files_dir) or []
+    elif hasattr(storage, "listdir"):
+        entries = [
+            "/".join((table_files_dir.rstrip("/"), e))
+            for e in (storage.listdir(table_files_dir) or [])
+        ]
+    elif hasattr(storage, "list_files"):
+        entries = storage.list_files(table_files_dir, "*") or []
+    else:
+        raise RuntimeError(
+            "Parquet mirroring requires a reliable directory-listing method"
+        )
+    for p in entries:
+        fn = p.rstrip("/").split("/")[-1]
+        if fn:
+            rels.add("/".join(("files", fn)))
     return rels
 
 
@@ -169,15 +171,34 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
         if not rel.startswith("files/"):
             rel = "/".join(("files", rel.rstrip("/").split("/")[-1]))
         abs_path = os.path.join(base, rel)
-        try:
-            if hasattr(super_table.storage, "exists") and not super_table.storage.exists(abs_path):
-                # Fallback: try raw filename under files_dir
-                alt_abs = os.path.join(files_dir, rel.split("/")[-1])
-                if super_table.storage.exists(alt_abs):
-                    abs_path = alt_abs
-            super_table.storage.delete(abs_path)
-        except Exception as e:
-            logger.warning(f"[mirror][parquet] failed to delete obsolete {rel}: {e}")
+        if hasattr(super_table.storage, "exists") and not super_table.storage.exists(abs_path):
+            # Fallback: try raw filename under files_dir
+            alt_abs = os.path.join(files_dir, rel.split("/")[-1])
+            if super_table.storage.exists(alt_abs):
+                abs_path = alt_abs
+        super_table.storage.delete(abs_path)
+        if (
+            hasattr(super_table.storage, "exists")
+            and super_table.storage.exists(abs_path)
+        ):
+            raise RuntimeError(
+                f"Obsolete Parquet mirror file is still visible after delete: {abs_path}"
+            )
+
+    # Some storage adapters expose ``delete`` without ``exists`` and may
+    # return success even when an object was not removed.  Reuse the same
+    # mandatory listing primitive that produced ``prev_paths`` so a flat
+    # Parquet mirror never reports success while obsolete row-bearing files
+    # remain visible.
+    remaining_obsolete = (
+        set(to_remove) & _list_co_located_paths(super_table.storage, files_dir)
+        if to_remove else set()
+    )
+    if remaining_obsolete:
+        raise RuntimeError(
+            "Obsolete Parquet mirror files remain visible after delete: "
+            f"{sorted(remaining_obsolete)!r}"
+        )
 
     logger.info(
         f"[mirror][parquet] updated '{table_name}' (files now={len(current_paths)}, removed={len(to_remove)})"

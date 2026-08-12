@@ -770,19 +770,25 @@ def _make_tomb_source(con, table: str) -> None:
     """Source reflection table with system columns + 4 user rows."""
     con.execute(
         f'CREATE TABLE {table} '
-        f'(id INTEGER, name VARCHAR, "__rowid__" BIGINT, "__timestamp__" BIGINT)'
+        f'(id INTEGER, name VARCHAR, "__rowid__" BIGINT, "__timestamp__" BIGINT, '
+        f'"__supertable_source_file__" VARCHAR)'
     )
     con.execute(
         f"INSERT INTO {table} VALUES "
-        f"(1,'a',10,100),(2,'b',20,100),(3,'c',30,100),(4,'d',40,100)"
+        f"(1,'a',10,100,'org/super/simple/data/f.parquet'),"
+        f"(2,'b',20,100,'org/super/simple/data/f.parquet'),"
+        f"(3,'c',30,100,'org/super/simple/data/f.parquet'),"
+        f"(4,'d',40,100,'org/super/simple/data/f.parquet')"
     )
 
 
 def _write_dv_parquet(con, path: str, rowids) -> None:
-    """Write a deletion-vector parquet of the given __rowid__ values."""
+    """Write a production-shaped deletion-vector parquet."""
     values = ",".join(f"({r})" for r in rowids)
     con.execute(
-        f'COPY (SELECT * FROM (VALUES {values}) AS t("__rowid__")) '
+        f"COPY (SELECT CAST('org/super/simple/data/f.parquet' AS VARCHAR) AS \"__file__\", "
+        f'CAST("__rowid__" AS BIGINT) AS "__rowid__" '
+        f'FROM (VALUES {values}) AS t("__rowid__")) '
         f"TO '{path}' (FORMAT PARQUET)"
     )
 
@@ -803,7 +809,11 @@ class TestCreateTombstoneView:
         _make_tomb_source(duckdb_con, "src_b")
         dv = str(tmp_path / "dv_b.parquet")
         _write_dv_parquet(duckdb_con, dv, [20, 40])
-        tomb = TombstoneDef(tombstone_path=dv, cache_key="bare/b")
+        tomb = TombstoneDef(
+            tombstone_path=dv,
+            cache_key="bare/b",
+            resource_keys=("org/super/simple/data/f.parquet",),
+        )
         # dv_table=None → inline read_parquet anti-join
         create_tombstone_view(duckdb_con, "src_b", "tv_b", tomb, dv_table=None)
         df = duckdb_con.execute("SELECT * FROM tv_b ORDER BY id").fetchdf()
@@ -817,7 +827,11 @@ class TestCreateTombstoneView:
         _make_tomb_source(duckdb_con, "src_c")
         dv = str(tmp_path / "dv_c.parquet")
         _write_dv_parquet(duckdb_con, dv, [20, 40])
-        tomb = TombstoneDef(tombstone_path=dv, cache_key="bare/c")
+        tomb = TombstoneDef(
+            tombstone_path=dv,
+            cache_key="bare/c",
+            resource_keys=("org/super/simple/data/f.parquet",),
+        )
 
         create_tombstone_view(duckdb_con, "src_c", "tv_inline", tomb, dv_table=None)
         inline = duckdb_con.execute("SELECT * FROM tv_inline ORDER BY id").fetchdf()
@@ -874,18 +888,15 @@ class TestTombstoneCacheUnit:
         assert cache.acquire(duckdb_con, None, "/p") is None
         assert cache.acquire(duckdb_con, "k", None) is None
 
-    def test_acquire_materializes_distinct_rowids(self, duckdb_con, tmp_path):
+    def test_acquire_rejects_duplicate_rowids(self, duckdb_con, tmp_path):
         init_connection(duckdb_con, temp_dir=str(tmp_path))
         dv = str(tmp_path / "dv.parquet")
         _write_dv_parquet(duckdb_con, dv, [1, 2, 2, 3])  # dup 2
         cache = TombstoneCache(capacity=4)
-        name = cache.acquire(duckdb_con, self.V1, dv)
-        assert name == dv_table_name(self.V1)
-        assert _dv_table_exists(duckdb_con, name)
-        count = duckdb_con.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
-        assert count == 3  # DISTINCT
-        snap = cache.snapshot()
-        assert len(snap) == 1 and snap[0]["ref_count"] == 1
+        with pytest.raises(RuntimeError, match="not unique"):
+            cache.acquire(duckdb_con, self.V1, dv)
+        assert not _dv_table_exists(duckdb_con, dv_table_name(self.V1))
+        assert cache.snapshot() == []
 
     def test_hit_reuses_single_entry_and_refcounts(self, duckdb_con, tmp_path):
         init_connection(duckdb_con, temp_dir=str(tmp_path))
@@ -1160,14 +1171,11 @@ class TestConfigureHttpfsAndS3:
         configure_httpfs_and_s3(con, [])
         con.execute.assert_not_called()
 
-    def test_local_paths_installs_httpfs_but_no_s3_config(self):
+    def test_local_paths_do_not_load_httpfs(self):
         con = MagicMock()
         configure_httpfs_and_s3(con, ["/local/file.parquet"])
         calls = [str(c) for c in con.execute.call_args_list]
-        # With a MagicMock connection, LOAD httpfs succeeds silently so INSTALL
-        # is never called.  The relevant assertion is that httpfs IS loaded and
-        # that no S3-specific settings are applied for local paths.
-        assert any("LOAD httpfs" in s for s in calls)
+        assert not any("LOAD httpfs" in s for s in calls)
         assert not any("s3_endpoint" in s for s in calls)
 
 
@@ -1302,6 +1310,8 @@ class TestDataEstimator:
                  "snapshot_version": 1,
                  "schema": {"existing_col": "string"},
                  "resources": [{"file": "/data.parquet", "file_size": 100}],
+                 "tombstone": None, "tombstone_rows": 0,
+                 "tombstone_digest": None,
              }},
         ]
         with pytest.raises(RuntimeError, match="Missing required column"):
@@ -1315,6 +1325,8 @@ class TestDataEstimator:
                  "snapshot_version": 1,
                  "schema": {"col_a": "string"},
                  "resources": [{"file": "/data.parquet", "file_size": 500}],
+                 "tombstone": None, "tombstone_rows": 0,
+                 "tombstone_digest": None,
              }},
         ]
         reflection = est.estimate()
@@ -1323,7 +1335,7 @@ class TestDataEstimator:
         assert reflection.total_reflections == 1
         assert len(reflection.supers) == 1
 
-    def test_estimate_no_files_raises(self):
+    def test_estimate_authoritative_empty_snapshot_succeeds(self):
         est = _make_estimator([TableDefinition("s", "t", "a", columns=["col_a"])])
         est.catalog.scan_leaf_items.return_value = [
             {"simple": "t", "path": "/snap.json", "version": 1, "ts": 0,
@@ -1331,10 +1343,16 @@ class TestDataEstimator:
                  "snapshot_version": 1,
                  "schema": {"col_a": "string"},
                  "resources": [],
+                 "tombstone": None, "tombstone_rows": 0,
+                 "tombstone_digest": None,
              }},
         ]
-        with pytest.raises(RuntimeError, match="No parquet files"):
-            est.estimate()
+        reflection = est.estimate()
+        assert reflection.total_reflections == 0
+        assert reflection.reflection_bytes == 0
+        assert len(reflection.supers) == 1
+        assert reflection.supers[0].files == []
+        assert reflection.supers[0].column_types == {"col_a": "string"}
 
     def test_to_duckdb_path_empty(self):
         assert _make_estimator([])._to_duckdb_path("") == ""

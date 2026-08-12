@@ -772,20 +772,20 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     )
 
 
-# Patch the original entrypoint to *also* attempt writing standard Iceberg.
+# Keep the legacy writer available for explicit migrations/read compatibility,
+# but do not silently substitute it for a failed standard Iceberg publication.
 _write_iceberg_table_iceberg_lite = write_iceberg_table
 
 
 def write_iceberg_table(super_table, table_name: str, simple_snapshot: Dict[str, Any]) -> None:  # type: ignore[override]
     """
-    Mirror as:
-    1) Standard Iceberg v2 (metadata + Avro manifests) under metadata/ + data/
-    2) Iceberg-lite JSON (legacy) under metadata/ + manifests/ (best-effort fallback)
+    Publish the configured mirror as standard Iceberg v2.
+
+    A standard publication can have written immutable data/manifests before a
+    later metadata or pointer write fails.  Falling back to the legacy JSON
+    layout in that situation used to return success even though standard
+    Iceberg readers still observed the previous snapshot (and its deleted
+    rows).  Propagate the failure so DataWriter reports a post-core-commit
+    mirror error and the exact snapshot can be reconciled safely.
     """
-    try:
-        _write_iceberg_standard(super_table, table_name, simple_snapshot)
-        return  # standard writer succeeded; its latest.json is authoritative
-    except Exception as e:
-        logger.warning(f"[mirror][iceberg] standard writer failed, falling back to iceberg-lite: {e}")
-    # Fallback: write the legacy mirror only when the standard writer failed
-    _write_iceberg_table_iceberg_lite(super_table, table_name, simple_snapshot)
+    _write_iceberg_standard(super_table, table_name, simple_snapshot)

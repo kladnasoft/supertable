@@ -175,7 +175,8 @@ def _basic() -> List[Scenario]:
         sql="SELECT id, val FROM t ORDER BY id", ordered=True,
     ))
 
-    # Zero-file catalog: a table whose snapshot lists NO resources.
+    # Zero-file catalog: an authoritative schema-bearing snapshot with no
+    # resources is the valid post-delete-all state and must read as typed empty.
     out.append(Scenario(
         scenario_id="basic_zero_file_catalog", category="basic",
         description="A table whose snapshot lists no parquet resources at all.",
@@ -184,7 +185,6 @@ def _basic() -> List[Scenario]:
             schema={"id": "Int64", "val": "String"},
         )],
         sql="SELECT id, val FROM t ORDER BY id", ordered=True,
-        expect_error=ErrorExpectation("RuntimeError", "No parquet files found", "execution"),
     ))
 
     return out

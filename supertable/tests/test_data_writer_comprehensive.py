@@ -114,6 +114,9 @@ class FakeCatalog:
         self._table_configs: Dict[str, Dict] = {}
         self._simple_tables: set = set()
         self._rowid_counter: int = 0
+        self._mirrors: list[str] = []
+        self._mirror_publication: Dict | None = None
+        self.mirror_state_events: list[str] = []
 
         # Tracking
         self.bump_root_calls: list = []
@@ -123,9 +126,15 @@ class FakeCatalog:
         self.leaf_payload_cas_should_fail: bool = False
 
     def reserve_rowids(self, org, sup, simple, count) -> int:
-        start = self._rowid_counter
+        start = self._rowid_counter + 1
         self._rowid_counter += count
         return start
+
+    def reserve_rowids_at_least(self, org, sup, simple, count, floor):
+        self._rowid_counter = max(self._rowid_counter, int(floor))
+        start = self._rowid_counter + 1
+        self._rowid_counter += int(count)
+        return start, self._rowid_counter
 
     def acquire_simple_lock(self, org, sup, simple, ttl_s=30, timeout_s=60) -> Optional[str]:
         key = f"{org}:{sup}:{simple}"
@@ -158,6 +167,61 @@ class FakeCatalog:
         self._leaves[key] = {"version": ver, "path": path, "payload": payload}
         return ver
 
+    def commit_snapshot(
+            self, org, sup, simple, payload, path, *, expected_version,
+            expected_path, lock_token, commit_id=None,
+            mirror_publication=False, now_ms=None,
+    ):
+        """Test-double implementation of the production atomic primitive."""
+        key = f"{org}:{sup}:{simple}"
+        if self._locks.get(key) != lock_token:
+            raise RuntimeError("lost lock")
+        # Individual tests exercise the writer orchestration with a mocked
+        # SimpleTable snapshot. Preserve their call tracking while exposing the
+        # required fenced API; production Redis atomicity is covered separately.
+        version = self.set_leaf_payload_cas(
+            org, sup, simple, payload, path, now_ms=now_ms,
+        )
+        self.bump_root(org, sup, now_ms=now_ms)
+        if mirror_publication:
+            assert self._mirror_publication["commit_id"] == commit_id
+            self._mirror_publication["status"] = "core_committed"
+            self._mirror_publication["core_committed"] = True
+            self.mirror_state_events.append("core_committed")
+        return version, 1
+
+    def prepare_mirror_publication(
+            self, org, sup, simple, *, commit_id, snapshot_path, mirrors,
+            lock_token, now_ms=None,
+    ):
+        self._mirror_publication = {
+            "status": "prepared", "commit_id": commit_id,
+            "snapshot_path": snapshot_path, "mirrors": list(mirrors),
+            "core_committed": False,
+        }
+        self.mirror_state_events.append("prepared")
+        return dict(self._mirror_publication)
+
+    def complete_mirror_publication(
+            self, org, sup, simple, *, commit_id, lock_token, now_ms=None,
+    ):
+        assert self._mirror_publication["commit_id"] == commit_id
+        self._mirror_publication["status"] = "complete"
+        self.mirror_state_events.append("complete")
+        return dict(self._mirror_publication)
+
+    def fail_mirror_publication(
+            self, org, sup, simple, *, commit_id, lock_token, failure_stage,
+            error, now_ms=None,
+    ):
+        assert self._mirror_publication["commit_id"] == commit_id
+        self._mirror_publication.update({
+            "status": "failed", "failure_stage": failure_stage,
+            "error": {"type": type(error).__name__, "message": str(error)},
+        })
+        self.mirror_state_events.append("failed")
+        return dict(self._mirror_publication)
+
     def set_leaf_path_cas(self, org, sup, simple, path, now_ms=None):
         self.set_leaf_path_cas_calls.append((org, sup, simple, path))
         key = f"{org}:{sup}:{simple}"
@@ -183,6 +247,9 @@ class FakeCatalog:
     def set_table_config(self, org, sup, simple, config) -> bool:
         self._table_configs[f"{org}:{sup}:{simple}"] = config
         return True
+
+    def get_mirrors(self, org, sup):
+        return list(self._mirrors)
 
     def delete_simple_table(self, org, sup, simple):
         key = f"{org}:{sup}:{simple}"
@@ -266,6 +333,7 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         initial_path = "testorg/testsuper/tables/t1/snapshots/init.json"
         simple_inst = MockSimpleTable.return_value
         simple_inst.get_simple_table_snapshot.return_value = (initial_snapshot, initial_path)
+        simple_inst._last_snapshot_leaf = {"version": 0, "path": initial_path}
         simple_inst.data_dir = "testorg/testsuper/tables/t1/data"
         simple_inst.snapshot_dir = "testorg/testsuper/tables/t1/snapshots"
         simple_inst.update.return_value = (
@@ -287,8 +355,23 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         mock_resolve.side_effect = _resolve_passthrough
         # identify_all_rowids (delete-all path) returns (file, __rowid__) pairs.
         mock_delete_all.return_value = []
-        # build_tombstone_file returns (tombstone_path, combined_df).
-        mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
+        # build_tombstone_file returns the full validated frame whenever it
+        # publishes a new immutable pointer (the writer hashes that frame).
+        def _build_tombstone(**kwargs):
+            pairs = kwargs.get("new_pairs") or []
+            if not pairs:
+                return kwargs.get("prev_tombstone_path"), None
+            return (
+                "/d/tombstone/t.parquet",
+                pl.DataFrame(
+                    {
+                        "__file__": [f for f, _ in pairs],
+                        "__rowid__": [rid for _, rid in pairs],
+                    },
+                    schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+                ),
+            )
+        mock_build_tombstone.side_effect = _build_tombstone
 
         from supertable.data_writer import DataWriter
         dw = DataWriter.__new__(DataWriter)
@@ -510,6 +593,29 @@ class TestConfigureTable:
         assert cfg["max_memory_chunk_size"] == 4096
         assert cfg["max_overlapping_files"] == 200
 
+    @pytest.mark.parametrize("value", [0, 9, -1, True, 1.5, "2"])
+    def test_tombstone_compaction_workers_rejects_invalid_values(
+        self, fake_catalog, value,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="integer from 1 to 8"):
+                dw.configure_table(
+                    "admin", "t1", tombstone_compaction_workers=value,
+                )
+
+    @pytest.mark.parametrize("value", [1, 2, 8])
+    def test_tombstone_compaction_workers_is_stored(
+        self, fake_catalog, value,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            dw.configure_table(
+                "admin", "t1", tombstone_compaction_workers=value,
+            )
+        cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
+        assert cfg["tombstone_compaction_workers"] == value
+
 
 # ===========================================================================
 # Tests: _get_table_config()
@@ -652,20 +758,33 @@ class TestWriteDeleteOnly:
 
     def test_delete_only_without_overwrite_columns_deletes_all(self, writer):
         """delete_only with no overwrite_columns is the delete-all path: it
-        tombstones every existing row via identify_all_rowids and inserts
-        nothing."""
+        sunsets every current resource directly and inserts nothing, avoiding
+        an O(rows) intermediate deletion-vector."""
         data = _simple_arrow(3)
         mock_delete_all = writer._mocks["delete_all"]
         mock_delete_all.return_value = [("old.parquet", 1), ("old.parquet", 2)]
+        simple = writer._mocks["simple_inst"]
+        simple.get_simple_table_snapshot.return_value = (
+            {
+                "simple_name": "t1",
+                "schema": [],
+                "resources": [{"file": "old.parquet", "rows": 2}],
+            },
+            "snapshots/old.json",
+        )
+        simple._last_snapshot_leaf = {
+            "version": 0, "path": "snapshots/old.json",
+        }
 
         result = writer.write("admin", "t1", data, overwrite_columns=[], delete_only=True)
 
-        assert mock_delete_all.called
+        assert not mock_delete_all.called
         # The overwrite-resolve probe must NOT run on the delete-all path.
         assert not writer._mocks["resolve"].called
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 0
         assert deleted == 2
+        assert simple.update.call_args.args[1] == {"old.parquet"}
 
 
 class TestWriteNewerThan:
@@ -747,14 +866,16 @@ class TestWriteLocking:
 
 class TestWriteCASFallback:
 
-    def test_payload_cas_fallback_to_path_cas(self, writer, fake_catalog):
-        """When set_leaf_payload_cas fails, it falls back to set_leaf_path_cas."""
+    def test_ambiguous_payload_cas_failure_never_weakly_retries(
+        self, writer, fake_catalog,
+    ):
+        """An ambiguous commit failure aborts; path-only retry can lose metadata."""
         fake_catalog.leaf_payload_cas_should_fail = True
 
         data = _simple_arrow(3)
-        result = writer.write("admin", "t1", data, overwrite_columns=[])
-        assert result is not None
-        assert len(fake_catalog.set_leaf_path_cas_calls) == 1
+        with pytest.raises(Exception, match="payload CAS not supported"):
+            writer.write("admin", "t1", data, overwrite_columns=[])
+        assert len(fake_catalog.set_leaf_path_cas_calls) == 0
 
     def test_payload_cas_success_no_fallback(self, writer, fake_catalog):
         fake_catalog.leaf_payload_cas_should_fail = False
@@ -771,18 +892,72 @@ class TestWriteCASFallback:
 
 class TestWriteMirroring:
 
-    def test_mirror_failure_does_not_break_write(self, writer):
-        """MirrorFormats.mirror_if_enabled failure should be non-fatal."""
+    def test_outbox_prepare_failure_prevents_core_commit(
+        self, writer, fake_catalog,
+    ):
+        fake_catalog._mirrors = ["PARQUET"]
+        fake_catalog.prepare_mirror_publication = MagicMock(
+            side_effect=OSError("Redis unavailable")
+        )
+
+        with pytest.raises(OSError, match="Redis unavailable"):
+            writer.write("admin", "t1", _simple_arrow(3), overwrite_columns=[])
+
+        assert not fake_catalog.set_leaf_payload_cas_calls
+        assert fake_catalog.release_calls
+
+    def test_outbox_completion_failure_is_reported_as_post_commit_ambiguity(
+        self, writer, fake_catalog,
+    ):
+        from supertable.mirroring.mirror_formats import MirrorPublicationError
+
+        fake_catalog._mirrors = ["PARQUET"]
+        fake_catalog.complete_mirror_publication = MagicMock(
+            side_effect=OSError("completion reply lost")
+        )
+
+        with pytest.raises(MirrorPublicationError) as raised:
+            writer.write("admin", "t1", _simple_arrow(3), overwrite_columns=[])
+
+        assert raised.value.core_committed is True
+        assert isinstance(raised.value.cause, OSError)
+        assert fake_catalog.set_leaf_payload_cas_calls
+        assert fake_catalog._mirror_publication["status"] == "failed"
+        assert fake_catalog._mirror_publication["failure_stage"] == "outbox_complete"
+        assert fake_catalog.release_calls
+
+    def test_mirror_failure_reports_core_commit_explicitly(
+        self, writer, fake_catalog,
+    ):
+        """A failed mirror raises only after the core snapshot is committed."""
+        from supertable.mirroring.mirror_formats import MirrorPublicationError
+
+        fake_catalog._mirrors = ["PARQUET"]
         mock_mirror = writer._mocks["mirror"]
         mock_mirror.mirror_if_enabled.side_effect = Exception("mirror failed")
 
         with patch("supertable.data_writer.MirrorFormats", mock_mirror):
             data = _simple_arrow(3)
-            result = writer.write("admin", "t1", data, overwrite_columns=[])
-            # Write should still succeed
-            assert result is not None
+            with pytest.raises(MirrorPublicationError) as raised:
+                writer.write("admin", "t1", data, overwrite_columns=[])
 
-    def test_mirror_called_with_correct_args(self, writer):
+        error = raised.value
+        assert error.core_committed is True
+        assert error.core_result is not None
+        assert error.snapshot_path.endswith("snapshots/new.json")
+        assert error.mirrors == ("PARQUET",)
+        assert "do not blindly retry" in str(error)
+        assert fake_catalog.set_leaf_payload_cas_calls
+        assert fake_catalog.release_calls
+        assert fake_catalog._mirror_publication["status"] == "failed"
+        assert fake_catalog._mirror_publication["core_committed"] is True
+        assert fake_catalog._mirror_publication["error"]["message"] == "mirror failed"
+        assert fake_catalog.mirror_state_events == [
+            "prepared", "core_committed", "failed",
+        ]
+
+    def test_mirror_called_with_correct_args(self, writer, fake_catalog):
+        fake_catalog._mirrors = ["PARQUET"]
         mock_mirror = writer._mocks["mirror"]
 
         with patch("supertable.data_writer.MirrorFormats", mock_mirror):
@@ -792,6 +967,9 @@ class TestWriteMirroring:
         assert mock_mirror.mirror_if_enabled.called
         call_kwargs = mock_mirror.mirror_if_enabled.call_args
         assert call_kwargs.kwargs["table_name"] == "t1"
+        assert fake_catalog.mirror_state_events == [
+            "prepared", "core_committed", "complete",
+        ]
 
 
 # ===========================================================================

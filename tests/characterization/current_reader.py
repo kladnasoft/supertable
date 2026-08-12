@@ -16,6 +16,8 @@ import time).
 from __future__ import annotations
 
 import json
+import hashlib
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,7 +43,70 @@ def load_catalog(catalog_path: str | Path) -> dict:
         return json.load(fh)
 
 
-def inject_catalog(catalog: dict, catalog_dir: Path) -> None:
+def _normalized_tombstone(
+    *,
+    source: Path,
+    destination_dir: Path,
+    table_identity: str,
+    resource_keys: Dict[str, str],
+) -> tuple[str, int, str]:
+    """Copy a legacy golden DV into the current sealed identity format.
+
+    Golden vectors deliberately remain immutable and name their source files
+    using fixture-relative keys.  Current readers use the absolute resource
+    keys injected into the leaf payload and require a count + digest seal, so
+    the harness creates a short-lived normalized artifact instead of changing
+    the historical fixture.
+    """
+    import polars as pl
+
+    from supertable.processing import (
+        TOMBSTONE_FILE_COL,
+        ROWID_COL,
+        TOMBSTONE_SCHEMA,
+        tombstone_digest,
+        validate_tombstone_frame,
+    )
+
+    original = pl.read_parquet(source)
+    validate_tombstone_frame(
+        original,
+        expected_rows=original.height,
+        allowed_files=set(resource_keys),
+        source=f"sealed golden deletion-vector {source}",
+    )
+    if original.height <= 0:
+        raise ValueError(f"Active golden deletion-vector is empty: {source}")
+
+    normalized = pl.DataFrame(
+        {
+            TOMBSTONE_FILE_COL: [
+                resource_keys[file_key]
+                for file_key in original.get_column(TOMBSTONE_FILE_COL).to_list()
+            ],
+            ROWID_COL: original.get_column(ROWID_COL).to_list(),
+        },
+        schema=TOMBSTONE_SCHEMA,
+    )
+    validate_tombstone_frame(
+        normalized,
+        expected_rows=normalized.height,
+        allowed_files=set(resource_keys.values()),
+        source=f"normalized golden deletion-vector {source}",
+    )
+    digest = tombstone_digest(normalized, assume_valid=True)
+    suffix = hashlib.sha256(table_identity.encode("utf-8")).hexdigest()
+    destination = destination_dir / f"normalized-dv-{suffix}.parquet"
+    normalized.write_parquet(destination)
+    return str(destination.resolve()), normalized.height, digest
+
+
+def inject_catalog(
+    catalog: dict,
+    catalog_dir: Path,
+    *,
+    temporary_dir: Path,
+) -> None:
     """Bootstrap the supertable + write every table's config + leaf payload into
     the currently-patched (fake) Redis, exactly as the writer would shape it."""
     from supertable.super_table import SuperTable
@@ -62,8 +127,10 @@ def inject_catalog(catalog: dict, catalog_dir: Path) -> None:
         )
 
         resources = []
+        resource_keys: Dict[str, str] = {}
         for r in t["resources"]:
             abs_file = str((catalog_dir / r["file"]).resolve())
+            resource_keys[str(r["file"])] = abs_file
             entry = {"file": abs_file, "rows": r.get("rows"), "columns": r.get("columns")}
             try:
                 entry["file_size"] = Path(abs_file).stat().st_size
@@ -83,7 +150,13 @@ def inject_catalog(catalog: dict, catalog_dir: Path) -> None:
             "location": f"{org}/{sup}/tables/{simple_name}",
             "simple_name": simple_name,
             "schema": t.get("schema", {}),
-            "snapshot_version": 1,
+            # set_leaf_payload_cas creates the initial leaf at version zero.
+            # The cached snapshot version must agree with that leaf or the
+            # hardened reader correctly rejects it as a stale/partial cache.
+            "snapshot_version": 0,
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
         }
 
         # Deletion-vector pointer: when the scenario tombstones any row the read
@@ -91,8 +164,15 @@ def inject_catalog(catalog: dict, catalog_dir: Path) -> None:
         # __rowid__ against it (the sole row-removal mechanism — no key dedup).
         tomb_file = t.get("tombstone_file")
         if tomb_file:
-            payload["tombstone"] = str((catalog_dir / tomb_file).resolve())
-            payload["tombstone_rows"] = int(t.get("tombstone_rows") or 0)
+            tombstone_path, tombstone_rows, digest = _normalized_tombstone(
+                source=(catalog_dir / tomb_file).resolve(),
+                destination_dir=temporary_dir,
+                table_identity=f"{org}/{sup}/{simple_name}",
+                resource_keys=resource_keys,
+            )
+            payload["tombstone"] = tombstone_path
+            payload["tombstone_rows"] = tombstone_rows
+            payload["tombstone_digest"] = digest
         cat.set_leaf_payload_cas(
             org, sup, simple_name, payload,
             path=f"{org}/{sup}/tables/{simple_name}/snapshots/sealed.json",
@@ -161,23 +241,24 @@ def read_current_table(
         # A clean catalog per call so repeated reads never see stale state.
         install_fake_redis()
 
-    inject_catalog(catalog, catalog_dir)
+    with tempfile.TemporaryDirectory(prefix="supertable-golden-dv-") as tmp:
+        inject_catalog(catalog, catalog_dir, temporary_dir=Path(tmp))
 
-    if spark_cluster is not None:
-        register_spark_cluster(catalog, spark_cluster)
+        if spark_cluster is not None:
+            register_spark_cluster(catalog, spark_cluster)
 
-    from supertable.data_reader import query_sql
+        from supertable.data_reader import query_sql
 
-    statement = build_sql(table_name, projection, filters, sql)
-    columns, rows, columns_meta = query_sql(
-        organization=catalog["organization"],
-        super_name=catalog["super_name"],
-        sql=statement,
-        limit=limit,
-        engine=_engine(engine),
-        role_name="superadmin",
-    )
-    return TableResult.from_columns_rows(columns, rows)
+        statement = build_sql(table_name, projection, filters, sql)
+        columns, rows, columns_meta = query_sql(
+            organization=catalog["organization"],
+            super_name=catalog["super_name"],
+            sql=statement,
+            limit=limit,
+            engine=_engine(engine),
+            role_name="superadmin",
+        )
+        return TableResult.from_columns_rows(columns, rows)
 
 
 def read_scenario(

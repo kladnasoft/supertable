@@ -122,10 +122,9 @@ def new_fake_redis():
 def reset_engine_singletons() -> None:
     """Drop cached engine/connection singletons so each test starts clean.
 
-    The Lite executor keeps a persistent DuckDB connection *per Executor
-    instance* (created fresh per request), but the Pro executor and the Redis
-    client factory keep process-level singletons that must be reset between
-    tests pointed at different fake-Redis instances.
+    Lite and Pro keep organization/storage-scoped persistent connections, and
+    the Redis client factory is process-global.  All must be reset between
+    tests pointed at different fake-Redis instances and storage homes.
     """
     # Redis client cache (keyed by options; our patch bypasses it, but clear
     # anyway so a stale real client can never be returned).
@@ -136,16 +135,29 @@ def reset_engine_singletons() -> None:
     except Exception:
         pass
 
-    # DuckDB Pro persistent connection singleton.
+    # DuckDB persistent connection singletons.  Both engines are scoped and
+    # shared across per-request Executor instances; characterization swaps the
+    # entire Redis catalog and storage home per test, so no connection/cache
+    # may survive that boundary.
     try:
         import supertable.engine.executor as ex
 
-        if getattr(ex, "_pro_singleton", None) is not None:
+        engines = {
+            *list(getattr(ex, "_pro_singletons", {}).values()),
+            *list(getattr(ex, "_lite_singletons", {}).values()),
+        }
+        for engine in engines:
             try:
-                ex._pro_singleton._con and ex._pro_singleton._con.close()
+                if hasattr(engine, "drop_all"):
+                    engine.drop_all()
+                else:
+                    engine._reset_connection()
             except Exception:
                 pass
-            ex._pro_singleton = None
+        getattr(ex, "_pro_singletons", {}).clear()
+        getattr(ex, "_lite_singletons", {}).clear()
+        ex._pro_singleton = None
+        ex._lite_singleton = None
     except Exception:
         pass
 

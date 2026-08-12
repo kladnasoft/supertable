@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import Counter, defaultdict
 from typing import Iterable, Set, List, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import polars
 
@@ -15,6 +16,7 @@ from supertable.config.settings import settings
 from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
+from supertable.utils.snapshot import complete_snapshot_payload
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
@@ -29,6 +31,20 @@ from supertable.processing import (
     ROWID_COL,
     TIMESTAMP_COL,
 )
+
+
+def _safe_path_for_log(value: object) -> str:
+    """Render a storage path without leaking presign/SAS credentials."""
+    text = str(value or "")
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme in ("http", "https") and (parsed.query or parsed.fragment):
+            return urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
+            )
+    except Exception:
+        pass
+    return text
 
 
 from typing import Dict, List, Optional, Set, Tuple
@@ -252,14 +268,19 @@ class DataEstimator:
                 try:
                     url = presign_fn(key)  # key, not URL
                     if isinstance(url, str) and url:
-                        logger.debug(f"[estimate.resolve] presigned → {url[:96]}...")
+                        logger.debug(
+                            f"[estimate.resolve] presigned → {_safe_path_for_log(url)}"
+                        )
                         return url
                 except Exception as e:
-                    logger.warning(f"[estimate.resolve] presign failed; falling back: {e}")
+                    logger.warning(
+                        "[estimate.resolve] presign failed; falling back: "
+                        f"{_safe_path_for_log(e)}"
+                    )
 
         # 2) If already URL, return as-is.
         if "://" in key:
-            logger.debug(f"[estimate.resolve] already URL: {key}")
+            logger.debug(f"[estimate.resolve] already URL: {_safe_path_for_log(key)}")
             return key
 
         # 3) storage helpers
@@ -271,11 +292,15 @@ class DataEstimator:
                     if isinstance(url, str) and url:
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
-                                f"[estimate.resolve] storage.{attr} → {url}"
+                                f"[estimate.resolve] storage.{attr} → "
+                                f"{_safe_path_for_log(url)}"
                             )
                         return url
                 except Exception as e:
-                    logger.debug(f"[estimate.resolve] storage.{attr} failed: {e}")
+                    logger.debug(
+                        f"[estimate.resolve] storage.{attr} failed: "
+                        f"{_safe_path_for_log(e)}"
+                    )
 
         # 4) Construct URL from endpoint/bucket
         fallback = getattr(self, "_fallback_url_config", None)
@@ -835,6 +860,12 @@ class DataEstimator:
                 resource_rows: Dict[str, Optional[int]] = {}
                 stats_file: Optional[str] = None
                 expected_stats_rows: Optional[int] = None
+                pinned_snapshot_metadata: List[Dict[str, object]] = []
+                # A zero-resource manifest is a valid, committed table state
+                # after metadata-only delete-all.  Keep this proof separate
+                # from ``not raw_keys``: a corrupt/legacy snapshot that omits
+                # ``resources`` must not be silently reinterpreted as empty.
+                authoritative_empty = bool(snapshots)
 
                 current_version = 0
                 for snapshot in snapshots:
@@ -842,10 +873,109 @@ class DataEstimator:
                     if ts > max_freshness_ms:
                         max_freshness_ms = ts
                     current_snapshot_path = snapshot["path"]
-                    current_snapshot_data = snapshot.get("payload")
-                    if not (isinstance(current_snapshot_data, dict) and isinstance(
-                            current_snapshot_data.get("resources"), list)):
+                    leaf_payload = snapshot.get("payload")
+                    current_snapshot_data = complete_snapshot_payload(
+                        leaf_payload,
+                        expected_version=snapshot.get("version"),
+                    )
+                    if current_snapshot_data is None:
                         current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
+
+                    # Pin deletion metadata from the exact snapshot document
+                    # whose resources are accumulated below.  In particular,
+                    # path-only Redis leaves take this branch and therefore do
+                    # not lose tombstones that live only in the heavy JSON.
+                    raw_tombstone = current_snapshot_data.get("tombstone")
+                    if raw_tombstone is not None and not isinstance(raw_tombstone, str):
+                        raise RuntimeError(
+                            f"Invalid tombstone pointer for {super_name}.{simple_name}"
+                        )
+                    tombstone_key = raw_tombstone or None
+
+                    raw_tombstone_rows = current_snapshot_data.get("tombstone_rows")
+                    tombstone_rows: Optional[int]
+                    if raw_tombstone_rows is None:
+                        if tombstone_key:
+                            raise RuntimeError(
+                                f"Snapshot for {super_name}.{simple_name} references "
+                                "a deletion vector without an exact row count"
+                            )
+                        tombstone_rows = None
+                    elif (
+                        isinstance(raw_tombstone_rows, int)
+                        and not isinstance(raw_tombstone_rows, bool)
+                        and raw_tombstone_rows >= 0
+                    ):
+                        tombstone_rows = int(raw_tombstone_rows)
+                    else:
+                        # Tombstone metadata is a sealed state machine even when
+                        # the pointer is absent.  Treating malformed/positive
+                        # counts as a legacy placeholder would erase evidence of
+                        # deletes and expose their physical rows.  Only missing,
+                        # None, or the exact non-bool integer zero is valid.
+                        raise RuntimeError(
+                            f"Invalid tombstone row count for "
+                            f"{super_name}.{simple_name}"
+                        )
+
+                    if tombstone_key and not tombstone_rows:
+                        # The writer never publishes an active pointer for an
+                        # empty deletion vector.  Accepting pointer+0 would let
+                        # an attacker/corrupt snapshot attach an unsealed file
+                        # while claiming there is nothing to validate.
+                        raise RuntimeError(
+                            f"Snapshot for {super_name}.{simple_name} references "
+                            "a deletion vector without a positive row count"
+                        )
+
+                    if not tombstone_key and tombstone_rows and tombstone_rows > 0:
+                        raise RuntimeError(
+                            f"Snapshot for {super_name}.{simple_name} records "
+                            f"{tombstone_rows} tombstoned rows but no tombstone pointer"
+                        )
+
+                    raw_tombstone_digest = current_snapshot_data.get(
+                        "tombstone_digest"
+                    )
+                    if tombstone_key:
+                        if not (
+                            isinstance(raw_tombstone_digest, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", raw_tombstone_digest)
+                        ):
+                            raise RuntimeError(
+                                f"Snapshot for {super_name}.{simple_name} references "
+                                "a deletion vector without a valid SHA-256 digest"
+                            )
+                        tombstone_digest = raw_tombstone_digest
+                    else:
+                        if raw_tombstone_digest not in (None, ""):
+                            raise RuntimeError(
+                                f"Snapshot for {super_name}.{simple_name} records "
+                                "a deletion-vector digest without a pointer"
+                            )
+                        tombstone_digest = None
+
+                    # Share policy is an overlay stored in the atomic Redis leaf
+                    # payload.  Prefer it there even when resources must fall
+                    # back to the heavy snapshot JSON.
+                    share_row_filter = None
+                    if isinstance(leaf_payload, dict):
+                        candidate_filter = leaf_payload.get("_row_filter")
+                        if isinstance(candidate_filter, str) and candidate_filter:
+                            share_row_filter = candidate_filter
+                    if share_row_filter is None:
+                        candidate_filter = current_snapshot_data.get("_row_filter")
+                        if isinstance(candidate_filter, str) and candidate_filter:
+                            share_row_filter = candidate_filter
+
+                    pinned_snapshot_metadata.append({
+                        "path": current_snapshot_path,
+                        "table_name": snapshot.get("table_name"),
+                        "tombstone_key": tombstone_key,
+                        "tombstone_rows": tombstone_rows,
+                        "tombstone_digest": tombstone_digest,
+                        "share_row_filter": share_row_filter,
+                    })
 
                     current_version = current_snapshot_data.get("snapshot_version", 0)
                     current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
@@ -869,7 +999,17 @@ class DataEstimator:
                             else None
                         )
 
-                    resources = current_snapshot_data.get("resources", []) or []
+                    resources_value = current_snapshot_data.get("resources")
+                    manifest_is_authoritative_empty = (
+                        isinstance(resources_value, list)
+                        and not resources_value
+                        and bool(current_schema)
+                        and not tombstone_key
+                    )
+                    authoritative_empty = (
+                        authoritative_empty and manifest_is_authoritative_empty
+                    )
+                    resources = resources_value if isinstance(resources_value, list) else []
                     for resource in resources:
                         file_key = resource.get("file")
                         if not file_key:
@@ -1008,10 +1148,13 @@ class DataEstimator:
                     "key_size": key_size,
                     "current_version": current_version,
                     "has_snapshots": bool(snapshots),
+                    "pinned_snapshot_metadata": pinned_snapshot_metadata,
                     "stats_df": stats_df,
                     "selected_cols": selected_cols,
                     "need_projection": need_projection,
                     "files_before": len(raw_keys),
+                    "snapshot_resource_keys": list(raw_keys),
+                    "authoritative_empty": authoritative_empty and not raw_keys,
                     "survivors": literal_survivors,
                 })
 
@@ -1193,8 +1336,40 @@ class DataEstimator:
             # cumulatively growing file lists, inflating total_reflections and
             # confusing the executor's snapshots_by_key lookup.
             if r["has_snapshots"]:
-                super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
-                                               simple_version=r["current_version"], files=parquet_files, columns=schema)
+                pinned_metadata = r["pinned_snapshot_metadata"]
+                if len(pinned_metadata) == 1:
+                    pinned = pinned_metadata[0]
+                else:
+                    # ``super == simple`` is the legacy all-simple-tables scan
+                    # and can accumulate multiple independently-versioned
+                    # snapshots into one reflection.  One rowid-only DV cannot
+                    # safely represent that set (rowids are table-local), so a
+                    # tombstone or share filter on any member must fail closed.
+                    if any(
+                        meta.get("tombstone_key") or meta.get("share_row_filter")
+                        for meta in pinned_metadata
+                    ):
+                        raise RuntimeError(
+                            f"Cannot safely combine independently filtered "
+                            f"snapshots for {super_name}.{simple_name}"
+                        )
+                    pinned = {}
+
+                super_snapshot = SuperSnapshot(
+                    super_name=super_name,
+                    simple_name=simple_name,
+                    simple_version=r["current_version"],
+                    files=parquet_files,
+                    columns=schema,
+                    column_types=dict(schema_types),
+                    resource_keys=list(survivors),
+                    snapshot_resource_keys=list(r["snapshot_resource_keys"]),
+                    snapshot_path=pinned.get("path"),
+                    tombstone_key=pinned.get("tombstone_key"),
+                    tombstone_rows=pinned.get("tombstone_rows"),
+                    tombstone_digest=pinned.get("tombstone_digest"),
+                    share_row_filter=pinned.get("share_row_filter"),
+                )
                 supers.append(super_snapshot)
 
         # files_before_prune counts raw candidates; files_kept the final survivors
@@ -1214,8 +1389,19 @@ class DataEstimator:
         # Total parquet files across all selected snapshots
         total_reflections = sum(len(s.files) for s in supers)
 
-        # Ensure every selected snapshot has at least one file
-        all_have_files = all(bool(s.files) for s in supers)
+        # A committed zero-resource manifest with a preserved schema is a
+        # valid table, not a missing-data error.  Only records that proved the
+        # resources field was explicitly an empty list may take this path.
+        authoritative_empty_keys = {
+            record["key"] for record in records
+            if record.get("authoritative_empty")
+        }
+        all_have_files = all(
+            bool(s.files)
+            or (s.super_name.lower(), s.simple_name.lower())
+            in authoritative_empty_keys
+            for s in supers
+        )
 
         if not supers or missing_info or not all_have_files:
             if not supers:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import threading
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from supertable.engine.engine_common import (
     create_tombstone_view,
     rbac_view_name,
     TombstoneCache,
+    create_typed_empty_view,
 )
 
 
@@ -44,8 +46,30 @@ class _ProCacheEntry:
     super_name: str
     simple_name: str
     version: int
+    # Stable logical survivor identity.  Prefer raw snapshot resource keys so
+    # alternating predicates can reuse their exact views across requests.
+    file_signature: str = ""
+    # Exact concrete paths embedded in the DuckDB view.  Presigned URLs are
+    # executable capabilities with an expiry, so a fresh URL for the same raw
+    # resource must never reuse a view that still contains the old literal.
+    resolved_signature: str = ""
     ref_count: int = 0      # number of in-flight queries using this view
     stale: bool = False      # marked for removal once ref_count hits 0
+
+
+def _paths_signature(paths: List[str]) -> str:
+    """Hash an ordered path list without retaining or logging URL secrets."""
+    signature_hash = hashlib.sha256()
+    for path in paths:
+        encoded = str(path).encode("utf-8")
+        signature_hash.update(len(encoded).to_bytes(8, "big"))
+        signature_hash.update(encoded)
+    return signature_hash.hexdigest()
+
+
+def _view_signature(file_signature: str, resolved_signature: str) -> str:
+    """Bind a Pro view name to both logical files and embedded path literals."""
+    return _paths_signature([file_signature, resolved_signature])
 
 
 # =========================================================
@@ -87,6 +111,7 @@ class DuckDBPro:
         self._tombstone_cache = TombstoneCache(
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES,
         )
 
         # Temp dir for spill — set on first query
@@ -118,6 +143,11 @@ class DuckDBPro:
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
         """Configure httpfs once per connection lifetime."""
+        if not any(
+            str(path).lower().startswith(("s3://", "s3a://", "http://", "https://"))
+            for path in paths
+        ):
+            return
         if not self._httpfs_configured:
             configure_httpfs_and_s3(con, paths)
             self._httpfs_configured = True
@@ -156,34 +186,86 @@ class DuckDBPro:
             version: int,
             files: List[str],
             log_prefix: str = "",
+            column_types: Optional[Dict[str, str]] = None,
+            resource_keys: Optional[List[str]] = None,
     ) -> str:
         """
         Ensure a reflection VIEW exists for (super, simple, version).
         Returns the DuckDB view name to use.
 
-        If the version matches the cached entry, returns it immediately —
-        the view is already registered on the connection and costs nothing.
-        Otherwise creates a new lazy view (no data read at creation time)
-        and marks old entries as stale for deferred cleanup.
+        A cached view is reusable only when the catalog version, logical
+        survivor set, and exact concrete paths embedded in the view all match.
+        The latter matters for presigned URLs: their raw resource keys stay
+        stable while the executable URL rotates or expires.
         """
         key = (super_name, simple_name)
-        current = self._current_entry(key)
-
-        if current is not None and current.version == version:
-            return current.table_name
-
-        # New version needed
-        view_name = pro_table_name(super_name, simple_name, version)
-
-        # Check if this exact view already exists (e.g. race between threads)
+        identity_paths = (
+            resource_keys
+            if resource_keys and len(resource_keys) == len(files)
+            else files
+        )
+        file_signature = _paths_signature(identity_paths)
+        requested_resolved_signature = _paths_signature(files)
         entries = self._registry.get(key, [])
-        for entry in entries:
-            if entry.table_name == view_name and not entry.stale:
+
+        # Search all retained survivor signatures, not only the newest one:
+        # alternating predicates at one version deliberately keep a small MRU
+        # set.  Concrete-path equality is mandatory because the view stores
+        # those literals and DuckDB will keep using them after a presign rotates.
+        for entry in reversed(entries):
+            if (
+                not entry.stale
+                and entry.version == version
+                and entry.file_signature == file_signature
+                and entry.resolved_signature == requested_resolved_signature
+            ):
                 return entry.table_name
 
-        # Mark all existing entries for this key as stale.
+        # Give each concrete path generation its own ownership boundary.  This
+        # avoids CREATE OR REPLACE touching an in-flight view when a presigned
+        # URL rotates but the raw key and catalog version remain unchanged.
+        view_name = pro_table_name(
+            super_name,
+            simple_name,
+            version,
+            file_signature=_view_signature(
+                file_signature, requested_resolved_signature,
+            ),
+        )
+
+        # A generated identifier may already be owned by a stale/in-flight view
+        # (or a test may force a collision).  Never CREATE OR REPLACE it.
         for entry in entries:
-            if not entry.stale:
+            if entry.table_name != view_name:
+                continue
+            if (
+                not entry.stale
+                and entry.version == version
+                and entry.file_signature == file_signature
+                and entry.resolved_signature == requested_resolved_signature
+            ):
+                return entry.table_name
+            # The generated identifier is already owned by another exact
+            # signature (possible under monkeypatching/corruption and formerly
+            # under the truncated hash). Allocate a private name; never replace
+            # an in-flight view or reuse its wrong survivor set.
+            view_name = f"{view_name}_{_uuid.uuid4().hex}"
+            break
+
+        # A table version may have several logical survivor signatures as WHERE
+        # predicates alternate.  Retain those views for reuse.  Concrete path
+        # generations of the *same* survivor set are replacements, however:
+        # mark the old generation stale while preserving it until in-flight
+        # readers release their reference.
+        for entry in entries:
+            replaced_resolution = (
+                entry.version == version
+                and entry.file_signature == file_signature
+                and entry.resolved_signature != requested_resolved_signature
+            )
+            if not entry.stale and (
+                entry.version != version or replaced_resolution
+            ):
                 entry.stale = True
                 logger.debug(
                     f"{log_prefix}[duckdb.pro] marked stale: {entry.table_name} "
@@ -192,9 +274,15 @@ class DuckDBPro:
 
         # Create new lazy view — no data is read from remote storage here.
         # DuckDB will apply projection and predicate pushdown at query time.
-        self._ensure_httpfs(con, files)
+        embedded_files = files
+        self._ensure_httpfs(con, embedded_files)
         try:
-            create_reflection_view(con, view_name, files)
+            if embedded_files:
+                create_reflection_view(
+                    con, view_name, embedded_files, resource_keys=resource_keys,
+                )
+            else:
+                create_typed_empty_view(con, view_name, dict(column_types or {}))
         except Exception as e:
             msg = str(e)
             if any(tok in msg for tok in (
@@ -204,7 +292,10 @@ class DuckDBPro:
                 logger.warning(f"{log_prefix}[duckdb.pro] presign fallback for {view_name}: {msg}")
                 presigned_files = make_presigned_list(self.storage, files)
                 self._ensure_httpfs(con, presigned_files)
-                create_reflection_view(con, view_name, presigned_files)
+                create_reflection_view(
+                    con, view_name, presigned_files, resource_keys=resource_keys,
+                )
+                embedded_files = presigned_files
             else:
                 raise
 
@@ -213,6 +304,8 @@ class DuckDBPro:
             super_name=super_name,
             simple_name=simple_name,
             version=version,
+            file_signature=file_signature,
+            resolved_signature=_paths_signature(embedded_files),
         )
 
         if key not in self._registry:
@@ -226,6 +319,24 @@ class DuckDBPro:
 
         # Eagerly drop stale views with zero refs
         self._drop_unreferenced_stale(con, log_prefix)
+
+        # Bound alternate survivor signatures within one catalog version.  An
+        # old predicate view is cheap but not free; keep a small MRU working
+        # set and never evict an in-flight view.
+        live_same_version = [
+            entry for entry in self._registry.get(key, [])
+            if not entry.stale and entry.version == version
+        ]
+        max_signatures = 8
+        if len(live_same_version) > max_signatures:
+            excess = len(live_same_version) - max_signatures
+            for entry in live_same_version:
+                if excess <= 0:
+                    break
+                if entry is not new_entry and entry.ref_count == 0:
+                    entry.stale = True
+                    excess -= 1
+            self._drop_unreferenced_stale(con, log_prefix)
 
         return view_name
 
@@ -281,15 +392,39 @@ class DuckDBPro:
             log_prefix: str = "",
             engine_config=None,
     ) -> pd.DataFrame:
+        return self._execute_serialized(
+            reflection=reflection,
+            parser=parser,
+            query_manager=query_manager,
+            timer_capture=timer_capture,
+            log_prefix=log_prefix,
+            engine_config=engine_config,
+        )
+
+    def _execute_serialized(
+            self,
+            reflection: Reflection,
+            parser: SQLParser,
+            query_manager: QueryPlanManager,
+            timer_capture,
+            log_prefix: str = "",
+            engine_config=None,
+    ) -> pd.DataFrame:
         tables_used: Set[str] = set()
 
         with self._lock:
             try:
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
+                root_con = self._get_connection(temp_dir=query_manager.temp_dir)
             except Exception:
                 # Connection corrupted — reset and retry once
                 self._reset_connection()
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
+                root_con = self._get_connection(temp_dir=query_manager.temp_dir)
+
+            # Each request gets an independent result handle while sharing the
+            # persistent catalog/cache.  Using the root connection directly
+            # lets concurrent execute()/fetchdf() calls swap result state;
+            # serialising all queries would fix that but destroy concurrency.
+            con = root_con.cursor()
 
             timer_capture("CONNECTING")
 
@@ -310,6 +445,8 @@ class DuckDBPro:
                 table_name = self._ensure_view(
                     con, sup.super_name, sup.simple_name,
                     sup.simple_version, list(sup.files), log_prefix,
+                    column_types=dict(getattr(sup, "column_types", {}) or {}),
+                    resource_keys=list(getattr(sup, "resource_keys", ()) or ()),
                 )
                 alias_to_table_name[td.alias] = table_name
                 tables_used.add(table_name)
@@ -330,7 +467,10 @@ class DuckDBPro:
             query_alias_to_name = dict(alias_to_table_name)
             # Per-query suffix so concurrent queries never collide on a shared
             # view name (CREATE OR REPLACE would corrupt a sibling's view).
-            query_suffix = _uuid.uuid4().hex[:8]
+            # Request-private DDL must retain the full UUID.  A 32-bit suffix
+            # can collide and CREATE OR REPLACE another in-flight tombstone or
+            # RBAC view, changing its rows rather than merely its cache hit rate.
+            query_suffix = _uuid.uuid4().hex
 
             # Tombstone / system-column view — created for EVERY alias so the
             # system columns (__rowid__, __timestamp__) are always stripped and
@@ -348,8 +488,13 @@ class DuckDBPro:
                 # under the connection lock, matching Pro's serialised model.
                 cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
                 tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
+                expected_rows = getattr(tomb_def, "expected_rows", None) if tomb_def else None
+                expected_digest = getattr(tomb_def, "tombstone_digest", None) if tomb_def else None
                 with self._lock:
-                    dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+                    dv_table = self._tombstone_cache.acquire(
+                        con, cache_key, tomb_path, expected_rows=expected_rows,
+                        expected_digest=expected_digest,
+                    )
                     if dv_table:
                         acquired_dv_keys.append(cache_key)
                     create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
@@ -432,6 +577,10 @@ class DuckDBPro:
             with self._lock:
                 self._release_refs(tables_used)
                 self._drop_unreferenced_stale(con, log_prefix)
+            try:
+                con.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------------------
     # Diagnostics
@@ -448,6 +597,7 @@ class DuckDBPro:
                         "super_name": entry.super_name,
                         "simple_name": entry.simple_name,
                         "version": entry.version,
+                        "file_signature": entry.file_signature,
                         "ref_count": entry.ref_count,
                         "stale": entry.stale,
                     })

@@ -27,6 +27,7 @@ from supertable.processing import (
     resolve_overwrite_writes,
     identify_all_rowids,
     build_tombstone_file,
+    persist_tombstone_frame,
     reclaim_fully_dead_files,
     build_stats_file,
     extract_stats_rows,
@@ -36,16 +37,25 @@ from supertable.processing import (
     cache_stats,
     load_tombstone,
     cache_tombstone,
+    evict_tombstone,
     write_parquet_and_collect_resources,
     compact_resources,
     compact_tombstones,
     should_compact_small_files,
     _max_tombstone_rows,
     _read_parquet_safe,
+    validate_tombstone_frame,
+    tombstone_digest,
+    stats_for_complete_files,
+    ROWID_COL,
+    TOMBSTONE_FILE_COL,
 )
 from supertable.rbac.access_control import check_write_access  # noqa: F401
 from supertable.redis_catalog import RedisCatalog
-from supertable.mirroring.mirror_formats import MirrorFormats
+from supertable.mirroring.mirror_formats import (
+    MirrorFormats,
+    MirrorPublicationError,
+)
 from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
 
 
@@ -68,6 +78,345 @@ class DataWriter:
 
     timer = Timer()
 
+    @staticmethod
+    def _declared_tombstone_rows(snapshot: dict):
+        """Return the sealed DV count, rejecting ambiguous active pointers."""
+        if not snapshot.get("tombstone"):
+            value = snapshot.get("tombstone_rows")
+            if value not in (None, 0):
+                raise ValueError(
+                    "Snapshot has tombstone_rows without a deletion-vector pointer"
+                )
+            return None
+        value = snapshot.get("tombstone_rows")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                "Active deletion-vector is missing a valid tombstone_rows seal; "
+                "explicit metadata recovery is required"
+            )
+        return value
+
+    @staticmethod
+    def _declared_tombstone_digest(snapshot: dict):
+        """Return the canonical digest seal for an active deletion-vector."""
+        if not snapshot.get("tombstone"):
+            value = snapshot.get("tombstone_digest")
+            if value not in (None, ""):
+                raise ValueError(
+                    "Snapshot has tombstone_digest without a deletion-vector pointer"
+                )
+            return None
+        value = snapshot.get("tombstone_digest")
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or value != value.lower()
+            or any(ch not in "0123456789abcdef" for ch in value)
+        ):
+            raise ValueError(
+                "Active deletion-vector is missing a valid tombstone_digest seal; "
+                "explicit metadata recovery is required"
+            )
+        return value
+
+    @staticmethod
+    def _snapshot_resource_files(snapshot: dict) -> set[str]:
+        return {
+            resource.get("file")
+            for resource in (snapshot.get("resources") or [])
+            if isinstance(resource, dict) and resource.get("file")
+        }
+
+    @staticmethod
+    def _tombstone_referenced_files(frame: polars.DataFrame) -> set[str]:
+        """Materialize only distinct file keys into Python memory."""
+        return set(
+            frame.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+        )
+
+    def _get_enabled_mirrors(self, operation: str) -> list[str]:
+        """Read mirror config once; an ambiguous failure aborts the mutation."""
+        mirror_lookup = getattr(type(self.catalog), "get_mirrors", None)
+        if not callable(mirror_lookup):
+            # Compatibility for intentionally minimal third-party/test catalogs.
+            return []
+        try:
+            configured = mirror_lookup(
+                self.catalog,
+                self.super_table.organization,
+                self.super_table.super_name,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot safely determine enabled mirrors for {operation}"
+            ) from exc
+        if not isinstance(configured, (list, tuple, set)):
+            raise RuntimeError("Catalog returned an invalid mirror configuration")
+        return list(configured)
+
+    def _derive_legacy_rowid_high_watermark(
+            self,
+            snapshot: dict,
+            *,
+            profiler: Profiler,
+    ) -> int:
+        """Prove the row-id floor for a snapshot predating durable allocation.
+
+        This migration is intentionally strict and paid only once: every live
+        resource is read under the table lock, rowids must be canonical Int64,
+        non-null and table-global unique, and the current deletion-vector must be
+        readable/valid.  A partial scan cannot safely establish a recovery floor.
+        """
+        seen: set[int] = set()
+        high = 0
+        for resource in snapshot.get("resources") or []:
+            file_path = resource.get("file") if isinstance(resource, dict) else None
+            if not file_path:
+                raise ValueError("Cannot derive rowid high-watermark from an invalid resource")
+            frame = _read_parquet_safe(
+                file_path,
+                file_size=int(resource.get("file_size") or 0),
+                columns=[ROWID_COL],
+                required=True,
+                profiler=profiler,
+            )
+            if frame is None or ROWID_COL not in frame.columns:
+                raise ValueError(
+                    f"Cannot derive rowid high-watermark: {file_path!r} lacks {ROWID_COL!r}"
+                )
+            rowids = frame.get_column(ROWID_COL)
+            if rowids.dtype != polars.Int64 or rowids.null_count() > 0:
+                raise ValueError(
+                    f"Cannot derive rowid high-watermark: {file_path!r} has invalid rowids"
+                )
+            values = rowids.to_list()
+            if (
+                (values and min(values) <= 0)
+                or len(values) != len(set(values))
+                or seen.intersection(values)
+            ):
+                raise ValueError(
+                    "Cannot derive rowid high-watermark: physical rowids must "
+                    "be positive and table-global unique"
+                )
+            seen.update(values)
+            if values:
+                high = max(high, max(values))
+
+        tombstone_path = snapshot.get("tombstone")
+        if tombstone_path:
+            tombstone_df = load_tombstone(
+                tombstone_path,
+                allow_cache=True,
+                required=True,
+                expected_rows=self._declared_tombstone_rows(snapshot),
+                expected_digest=self._declared_tombstone_digest(snapshot),
+                allowed_files=self._snapshot_resource_files(snapshot),
+                profiler=profiler,
+            )
+            if tombstone_df is not None and tombstone_df.height:
+                high = max(high, int(tombstone_df.get_column(ROWID_COL).max()))
+        if high < 0:
+            raise ValueError("Cannot derive rowid high-watermark from negative rowids")
+        return high
+
+    def _reserve_snapshot_rowids(
+            self,
+            *,
+            snapshot: dict,
+            simple_name: str,
+            count: int,
+            profiler: Profiler,
+            require_floor: bool = False,
+    ) -> tuple[int, int | None]:
+        """Reserve a block above the durable floor and return start/new floor."""
+        reserve_at_least = getattr(type(self.catalog), "reserve_rowids_at_least", None)
+        raw_floor = snapshot.get("rowid_high_watermark")
+        if count <= 0 and raw_floor is None and not require_floor:
+            # A delete-only mutation allocates no IDs. Do not pay an all-resource
+            # migration scan or persist an unproven zero; the next real insert
+            # derives the legacy floor under lock (delete-all will leave no files).
+            return 0, None
+        if count > 0 and not callable(reserve_at_least):
+            # A plain increment cannot atomically recover above the immutable
+            # snapshot floor after Redis restore/reset. Even a returned value
+            # above a persisted floor is unsafe for legacy snapshots whose
+            # floor must first be derived from every physical row and DV.
+            raise RuntimeError(
+                "Catalog does not support floor-fenced rowid reservation"
+            )
+        if raw_floor is None:
+            floor = self._derive_legacy_rowid_high_watermark(
+                snapshot, profiler=profiler
+            )
+        else:
+            try:
+                floor = int(raw_floor)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Snapshot has an invalid rowid_high_watermark") from exc
+            if floor < 0:
+                raise ValueError("Snapshot has a negative rowid_high_watermark")
+
+        if count <= 0:
+            return 0, floor
+
+        start, new_high = self.catalog.reserve_rowids_at_least(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+            count,
+            floor,
+        )
+        start, new_high = int(start), int(new_high)
+        if start <= floor or new_high != start + count - 1:
+            raise RuntimeError("Catalog returned an unsafe rowid reservation")
+        return start, new_high
+
+    @staticmethod
+    def _unpack_tombstone_compaction(result):
+        """Accept current four-field result and old unit-test doubles."""
+        if len(result) == 4:
+            return result
+        if len(result) == 3:
+            removed, resources, sunset = result
+            residual = polars.DataFrame(
+                schema={TOMBSTONE_FILE_COL: polars.Utf8, ROWID_COL: polars.Int64}
+            )
+            return removed, resources, sunset, residual
+        raise RuntimeError("Invalid tombstone compaction result")
+
+    def _publish_snapshot(
+            self,
+            *,
+            simple_table: SimpleTable,
+            simple_name: str,
+            payload: dict,
+            path: str,
+            base_path: str,
+            lock_token: str,
+            commit_id: str,
+            now_ms: int,
+            mirrors: list[str] | None = None,
+    ) -> None:
+        """Publish a snapshot through the fenced atomic catalog primitive.
+
+        Every mutation requires this primitive.  Falling back to separate leaf
+        and root writes would lose the pinned base-version/lock-token fence and
+        could let a late writer overwrite a newer deletion vector, resurrecting
+        rows.  Catalog adapters must implement the same atomic contract.
+        """
+        atomic_commit = getattr(type(self.catalog), "commit_snapshot", None)
+        if callable(atomic_commit):
+            leaf = getattr(simple_table, "_last_snapshot_leaf", None)
+            if not isinstance(leaf, dict):
+                raise RuntimeError("Missing exact base leaf for fenced snapshot commit")
+            expected_path = str(leaf.get("path") or "")
+            if expected_path != str(base_path or ""):
+                raise RuntimeError(
+                    "Snapshot base pointer changed while loading the current snapshot"
+                )
+            try:
+                expected_version = int(leaf.get("version", -1))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Current leaf has an invalid version") from exc
+            mirror_formats = list(mirrors or [])
+            if mirror_formats:
+                prepare = getattr(
+                    type(self.catalog), "prepare_mirror_publication", None
+                )
+                fail = getattr(type(self.catalog), "fail_mirror_publication", None)
+                if not callable(prepare) or not callable(fail):
+                    raise RuntimeError(
+                        "Catalog does not support durable mirror publication state"
+                    )
+                self.catalog.prepare_mirror_publication(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    commit_id=commit_id,
+                    snapshot_path=path,
+                    mirrors=mirror_formats,
+                    lock_token=lock_token,
+                    now_ms=now_ms,
+                )
+            commit_kwargs = {
+                "expected_version": expected_version,
+                "expected_path": expected_path,
+                "lock_token": lock_token,
+                "commit_id": commit_id,
+                "now_ms": now_ms,
+            }
+            if mirror_formats:
+                commit_kwargs["mirror_publication"] = True
+            try:
+                self.catalog.commit_snapshot(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    payload,
+                    path,
+                    **commit_kwargs,
+                )
+            except Exception as exc:
+                if mirror_formats:
+                    try:
+                        self.catalog.fail_mirror_publication(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            commit_id=commit_id,
+                            lock_token=lock_token,
+                            failure_stage="core_commit",
+                            error=exc,
+                        )
+                    except Exception as state_exc:
+                        logger.error(
+                            "Failed to persist mirror core-commit failure for "
+                            f"{simple_name}: {state_exc}"
+                        )
+                raise
+            return
+
+        raise RuntimeError(
+            "Catalog does not support fenced atomic snapshot commits; "
+            "refusing an unsafe tombstone mutation"
+        )
+
+    def _fail_mirror_publication(
+            self, *, simple_name: str, commit_id: str, lock_token: str,
+            stage: str, error: Exception,
+    ) -> None:
+        fail = getattr(type(self.catalog), "fail_mirror_publication", None)
+        if not callable(fail):
+            raise RuntimeError(
+                "Catalog does not support durable mirror failure state"
+            )
+        self.catalog.fail_mirror_publication(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+            commit_id=commit_id,
+            lock_token=lock_token,
+            failure_stage=stage,
+            error=error,
+        )
+
+    def _complete_mirror_publication(
+            self, *, simple_name: str, commit_id: str, lock_token: str,
+    ) -> None:
+        complete = getattr(type(self.catalog), "complete_mirror_publication", None)
+        if not callable(complete):
+            raise RuntimeError(
+                "Catalog does not support durable mirror completion state"
+            )
+        self.catalog.complete_mirror_publication(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+            commit_id=commit_id,
+            lock_token=lock_token,
+        )
+
     # ---- Table configuration (per-table limits) -----------------------------
 
     def configure_table(
@@ -77,6 +426,7 @@ class DataWriter:
             max_memory_chunk_size: int | None = None,
             max_overlapping_files: int | None = None,
             max_tombstone_rows: int | None = None,
+            tombstone_compaction_workers: int | None = None,
     ) -> None:
         """Set per-table limit overrides.
 
@@ -96,6 +446,9 @@ class DataWriter:
                 before physical compaction is triggered.  Overrides
                 MAX_TOMBSTONE_ROWS (default 1,000,000) for this table.
                 None leaves the existing value unchanged.
+            tombstone_compaction_workers: Bounded worker count for independent
+                tombstone file rewrites. Must be an integer from 1 through 8.
+                The global default remains 2 for bounded memory use.
         """
         check_write_access(
             super_name=self.super_table.super_name,
@@ -106,7 +459,12 @@ class DataWriter:
 
         # Only fetch existing Redis config when a limit override is being set,
         # preserving the cache-population guarantee for callers that omit them.
-        if max_memory_chunk_size is not None or max_overlapping_files is not None or max_tombstone_rows is not None:
+        if (
+            max_memory_chunk_size is not None
+            or max_overlapping_files is not None
+            or max_tombstone_rows is not None
+            or tombstone_compaction_workers is not None
+        ):
             existing = self.catalog.get_table_config(
                 self.super_table.organization,
                 self.super_table.super_name,
@@ -127,6 +485,16 @@ class DataWriter:
             if max_tombstone_rows <= 0:
                 raise ValueError("max_tombstone_rows must be a positive integer")
             config["max_tombstone_rows"] = int(max_tombstone_rows)
+        if tombstone_compaction_workers is not None:
+            if (
+                isinstance(tombstone_compaction_workers, bool)
+                or not isinstance(tombstone_compaction_workers, int)
+                or not 1 <= tombstone_compaction_workers <= 8
+            ):
+                raise ValueError(
+                    "tombstone_compaction_workers must be an integer from 1 to 8"
+                )
+            config["tombstone_compaction_workers"] = tombstone_compaction_workers
 
         self.catalog.set_table_config(
             self.super_table.organization,
@@ -274,6 +642,12 @@ class DataWriter:
                     source_files    — list of upstream file paths/URIs
                     schema_version  — version tag of the incoming schema
                     tags            — free-form dict for filtering/grouping
+
+        Raises:
+            MirrorPublicationError: the authoritative core snapshot committed,
+                but at least one configured mirror failed. Callers must not
+                blindly retry the mutation; use the exception's snapshot and
+                commit identifiers to reconcile the mirror.
         """
         qid = str(uuid.uuid4())
         lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
@@ -295,6 +669,8 @@ class DataWriter:
         token = None
         result_tuple = None
         stats_payload = None
+        mirror_error: Exception | None = None
+        mirror_snapshot_path: str | None = None
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
@@ -319,27 +695,6 @@ class DataWriter:
             # range of the per-table Redis id counter.
             self.validation(dataframe, simple_name, overwrite_columns, newer_than, delete_only)
             mark("validate")
-
-            # --- Assign table-unique __rowid__ --------------------------------
-            # Reserve a contiguous block of ids from the per-table Redis
-            # counter (INCRBY) so every inserted row gets a value unique
-            # within the table, even across concurrent writers. Skipped for
-            # delete_only writes, whose dataframe carries only delete-predicate
-            # columns (no rows are inserted). with_columns overwrites any
-            # caller-supplied __rowid__ so uniqueness is always enforced.
-            if not delete_only and incoming_rows > 0:
-                start_rowid = self.catalog.reserve_rowids(
-                    self.super_table.organization,
-                    self.super_table.super_name,
-                    simple_name,
-                    incoming_rows,
-                )
-                dataframe = dataframe.with_columns(
-                    polars.int_range(
-                        start_rowid, start_rowid + incoming_rows, dtype=polars.Int64
-                    ).alias("__rowid__")
-                )
-            mark("rowid")
 
             # --- Inject __timestamp__ system column ---------------------------
             # Added to every non-delete write (drives the date-partitioned
@@ -375,7 +730,44 @@ class DataWriter:
             # --- Read last snapshot (via leaf pointer) ------------------------
             simple_table = SimpleTable(self.super_table, simple_name)
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
+            # A current deletion-vector is immutable correctness metadata.  Do
+            # not let a mutation bless a legacy/unsealed pointer into a new
+            # snapshot: recovery must first supply both independent seals.
+            prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
+            prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             mark("snapshot")
+
+            enabled_mirrors = self._get_enabled_mirrors("this mutation")
+
+            # Reserve only after acquiring the table lock and pinning the exact
+            # base snapshot.  The immutable high-watermark recovers safely when
+            # Redis is flushed/restored and prevents a new row from reusing an ID
+            # still referenced by data or a deletion-vector.
+            reserve_count = 0 if delete_only else incoming_rows
+            delete_all = bool(delete_only and not overwrite_columns)
+            # A targeted delete allocates no new IDs but can publish a deletion
+            # vector and keeps physical resources alive.  Legacy snapshots must
+            # therefore derive and persist their exact global floor now.  Only
+            # delete-all may skip the one-time scan because its successor keeps
+            # no physical rows and emits no vector.
+            start_rowid, rowid_high_watermark = self._reserve_snapshot_rowids(
+                snapshot=last_simple_table,
+                simple_name=simple_name,
+                count=reserve_count,
+                profiler=profiler,
+                require_floor=not delete_all,
+            )
+            if rowid_high_watermark is not None:
+                last_simple_table["rowid_high_watermark"] = rowid_high_watermark
+            if reserve_count > 0:
+                dataframe = dataframe.with_columns(
+                    polars.int_range(
+                        start_rowid,
+                        start_rowid + reserve_count,
+                        dtype=polars.Int64,
+                    ).alias(ROWID_COL)
+                )
+            mark("rowid")
 
             # --- Detect overlaps ----------------------------------------------
             overlapping_files = find_overlapping_files(
@@ -406,6 +798,22 @@ class DataWriter:
                 stats_file = last_simple_table.get("stats_file")
                 if stats_file:
                     stored_stats_df = load_stats(stats_file, allow_cache=True, profiler=profiler)
+                    if stored_stats_df is not None and "stats_rows" in last_simple_table:
+                        expected_stats_rows = int(last_simple_table.get("stats_rows") or 0)
+                        if stored_stats_df.height != expected_stats_rows:
+                            logger.warning(lp(
+                                "stats artifact row-count mismatch; overwrite pruning disabled"
+                            ))
+                            stored_stats_df = None
+                    if stored_stats_df is not None:
+                        stored_stats_df = stats_for_complete_files(
+                            stored_stats_df,
+                            {
+                                r.get("file"): r.get("rows")
+                                for r in (last_simple_table.get("resources") or [])
+                                if isinstance(r, dict) and r.get("file")
+                            },
+                        )
                     if stored_stats_df is not None and stored_stats_df.height > 0:
                         probe = probe_ranges_from_df(dataframe, overwrite_columns)
                         _probe_desc = {
@@ -437,6 +845,28 @@ class DataWriter:
                     ))
                 mark("stats_prune")
 
+            prev_tombstone_path = last_simple_table.get("tombstone")
+            current_resources = last_simple_table.get("resources") or []
+            # Conflict resolution must see the logical live relation.  A dead
+            # physical row with a larger newer_than value cannot make a valid
+            # reinsertion stale, and must not be tombstoned again.
+            prev_dv_df = (
+                load_tombstone(
+                    prev_tombstone_path,
+                    allow_cache=True,
+                    required=True,
+                    expected_rows=prior_tombstone_rows,
+                    expected_digest=prior_tombstone_digest,
+                    allowed_files=self._snapshot_resource_files(last_simple_table),
+                    profiler=profiler,
+                )
+                if (
+                    prev_tombstone_path
+                    and not delete_all
+                    and (overwrite_columns or delete_only or enabled_mirrors)
+                ) else None
+            )
+
             # File cache: used only by delete_only's identify_all_rowids below.
             file_cache = {}
 
@@ -457,6 +887,7 @@ class DataWriter:
                     overwrite_columns=overwrite_columns,
                     newer_than_col=newer_than,
                     profiler=profiler,
+                    existing_tombstones=prev_dv_df,
                 )
                 mark("resolve_overwrite")
                 _counts = profiler.counts
@@ -517,9 +948,15 @@ class DataWriter:
             # dead rows are physically dropped only at the compaction threshold.
             # Skip if early exit already set result_tuple (all rows were stale).
             if result_tuple is None:
-                prev_tombstone_path = last_simple_table.get("tombstone")
                 new_resources = []
-                sunset_files = set()
+                # A whole-table delete has a much stronger proof than a rowid
+                # vector: the successor references none of the current physical
+                # files.  Sunset them directly and clear the DV; reading every
+                # rowid and uploading an intermediate vector is wasted O(N) I/O.
+                sunset_files = {
+                    r.get("file") for r in current_resources
+                    if isinstance(r, dict) and r.get("file")
+                } if delete_all else set()
 
                 # Load the current deletion-vector once: used both to exclude
                 # already-tombstoned rows from this write's deletes (below) and,
@@ -532,20 +969,6 @@ class DataWriter:
                 # (seeded below after the pointer is pinned), so this is a hit
                 # with no storage round-trip.  required=True preserves the
                 # carry-forward safety on a genuine miss (abort, never truncate).
-                prev_dv_df = (
-                    load_tombstone(prev_tombstone_path, allow_cache=True, required=True, profiler=profiler)
-                    if prev_tombstone_path else None
-                )
-                # The rowid set is consumed only by the idempotency filter below,
-                # which runs only when this write actually tombstones rows
-                # (overwrite or delete_only).  Pure appends tombstone nothing, so
-                # skip materialising the whole deletion-vector as a Python set —
-                # prev_dv_df is still carried forward into build_tombstone_file.
-                prev_dv_rowids = set()
-                if (overwrite_columns or delete_only) and prev_dv_df is not None \
-                        and "__rowid__" in prev_dv_df.columns:
-                    prev_dv_rowids = set(prev_dv_df.get_column("__rowid__").to_list())
-
                 # 1. Identify which existing rows this write deletes/replaces.
                 #    overwrite_columns drives the anti-join key (delete + upsert);
                 #    pure appends (no overwrite_columns) tombstone nothing.  The
@@ -555,31 +978,31 @@ class DataWriter:
                 if overwrite_columns:
                     new_delete_pairs = resolved_delete_pairs or []
                 elif delete_only:
-                    # delete-all: no overwrite_columns → tombstone every row.
-                    new_delete_pairs = identify_all_rowids(
-                        last_simple_table.get("resources", []),
-                        file_cache=file_cache,
-                        profiler=profiler,
-                    )
+                    # delete-all is represented by sunsetting every resource,
+                    # not by constructing an O(rows) intermediate vector.
+                    new_delete_pairs = []
 
-                # Never re-tombstone rows already in the deletion-vector.  The
-                # overlap probe (and identify_all_rowids) scan the *physical*
-                # files, which still hold logically-deleted rows until
-                # compaction; without this filter every write re-counts those
-                # already-dead rows — inflating ``deleted`` and forcing a
-                # needless tombstone rewrite even when nothing live was removed.
-                # Excluding them makes ``deleted`` the true count of live rows
-                # removed and lets unchanged writes carry the vector forward.
-                if new_delete_pairs and prev_dv_rowids:
-                    new_delete_pairs = [
-                        (f, rid) for (f, rid) in new_delete_pairs
-                        if rid not in prev_dv_rowids
-                    ]
-                deleted = len(new_delete_pairs)
+                # ``resolve_overwrite_writes`` anti-joins the physical matches
+                # against the existing vector by composite (file, rowid), in
+                # DuckDB and in its Polars fallback.  Do not build a second
+                # table-wide Python set here: at the threshold that expands one
+                # million compact Int64 values into tens of MiB of Python
+                # objects while the table lock is held.
+                if delete_all:
+                    physical_rows = sum(
+                        max(0, int(r.get("rows") or 0))
+                        for r in current_resources if isinstance(r, dict)
+                    )
+                    previously_dead = max(
+                        0, int(last_simple_table.get("tombstone_rows", 0) or 0)
+                    )
+                    deleted = max(0, physical_rows - previously_dead)
+                else:
+                    deleted = len(new_delete_pairs)
                 mark("identify_deletes")
                 logger.debug(lp(
                     f"step[deletes]: tombstoning {deleted} live row(s) this write "
-                    f"(excluded {len(prev_dv_rowids)} row(s) already in the deletion-vector)"
+                    "(existing deletion-vector applied by composite identity)"
                 ))
 
                 # 2. + 3.  Write the incoming rows as a new data file (insert/
@@ -601,6 +1024,18 @@ class DataWriter:
                 footer_md_cache = {}
                 tombstone_dir = os.path.join(simple_table.simple_dir, "tombstone")
                 do_insert = (not delete_only and dataframe.height > 0)
+                projected_tombstone_rows = (
+                    (prev_dv_df.height if prev_dv_df is not None else 0)
+                    + len(new_delete_pairs)
+                )
+                defer_tombstone_upload = bool(
+                    new_delete_pairs
+                    and (
+                        projected_tombstone_rows
+                        >= _max_tombstone_rows(table_config)
+                        or enabled_mirrors
+                    )
+                )
 
                 def _write_data_branch():
                     sub = Profiler()
@@ -619,6 +1054,16 @@ class DataWriter:
                 def _write_tombstone_branch():
                     sub = Profiler()
                     t = time.perf_counter()
+                    if delete_all:
+                        return None, None, sub, time.perf_counter() - t
+                    if not new_delete_pairs:
+                        # Most writes are pure appends to a table without a DV.
+                        # Carry an existing immutable pointer directly as well;
+                        # no builder call, object-store read, or executor task.
+                        return (
+                            prev_tombstone_path, None, sub,
+                            time.perf_counter() - t,
+                        )
                     tp, cdf = build_tombstone_file(
                         tombstone_dir=tombstone_dir,
                         prev_tombstone_path=prev_tombstone_path,
@@ -626,10 +1071,12 @@ class DataWriter:
                         compression_level=compression_level,
                         profiler=sub,
                         prev_df=prev_dv_df,
+                        persist=not defer_tombstone_upload,
                     )
                     return tp, cdf, sub, time.perf_counter() - t
 
-                if do_insert:
+                tombstone_work = bool(not delete_all and new_delete_pairs)
+                if do_insert and tombstone_work:
                     with ThreadPoolExecutor(max_workers=2) as _ex:
                         _f_data = _ex.submit(_write_data_branch)
                         _f_tomb = _ex.submit(_write_tombstone_branch)
@@ -643,6 +1090,13 @@ class DataWriter:
                         )
                     profiler.merge(data_sub)
                     profiler.merge(tomb_sub)
+                    inserted = dataframe.height
+                elif do_insert:
+                    data_sub, data_secs = _write_data_branch()
+                    profiler.merge(data_sub)
+                    tombstone_path = prev_tombstone_path
+                    combined_tombstone_df = None
+                    tomb_secs = 0.0
                     inserted = dataframe.height
                 else:
                     tombstone_path, combined_tombstone_df, tomb_sub, tomb_secs = (
@@ -668,9 +1122,18 @@ class DataWriter:
                 # New deletes → combined_tombstone_df is the full deduped DV
                 # (exact count); pure carry-forward → reuse the previous count.
                 tombstone_rows = (
-                    combined_tombstone_df.height
-                    if combined_tombstone_df is not None
-                    else int(last_simple_table.get("tombstone_rows", 0) or 0)
+                    0 if delete_all else (
+                        combined_tombstone_df.height
+                        if combined_tombstone_df is not None
+                        else (
+                            prev_dv_df.height
+                            if (
+                                prev_dv_df is not None
+                                and prior_tombstone_rows is None
+                            )
+                            else int(prior_tombstone_rows or 0)
+                        )
+                    )
                 )
                 logger.debug(lp(
                     f"step[tombstone]: deletion-vector now {tombstone_rows} row(s) "
@@ -686,7 +1149,12 @@ class DataWriter:
                 #     overwrite probe.  Only runs when the vector changed this
                 #     write (combined_tombstone_df is not None) — a carry-forward
                 #     can create no newly-dead file.
-                if combined_tombstone_df is not None:
+                if (
+                    combined_tombstone_df is not None
+                    and not delete_all
+                    and projected_tombstone_rows < _max_tombstone_rows(table_config)
+                    and not enabled_mirrors
+                ):
                     reclaimed_files, reclaimed_tomb_path, reclaimed_dv = (
                         reclaim_fully_dead_files(
                             resources=last_simple_table.get("resources") or [],
@@ -694,6 +1162,7 @@ class DataWriter:
                             tombstone_dir=tombstone_dir,
                             compression_level=compression_level,
                             profiler=profiler,
+                            persist=not defer_tombstone_upload,
                         )
                     )
                     if reclaimed_files:
@@ -727,8 +1196,7 @@ class DataWriter:
                     post_write_resources, table_config
                 )
                 tombstone_threshold_hit = (
-                    combined_tombstone_df is not None
-                    and combined_tombstone_df.height >= _max_tombstone_rows(table_config)
+                    tombstone_rows >= _max_tombstone_rows(table_config)
                 )
 
                 # Snapshot the shared I/O counters BEFORE the compaction phases so
@@ -748,11 +1216,13 @@ class DataWriter:
                 _comp_considered = 0
                 _comp_files_written = 0
                 _comp_rows = 0
+                residual_tombstone_files: set[str] = set()
 
                 # Phase A — drain the deletion-vector when either trigger fires
                 # and a vector is actually live (freshly built this write OR
                 # carried forward from a prior one).
-                if tombstone_threshold_hit or compaction_gate:
+                mirror_requires_drain = bool(enabled_mirrors and tombstone_rows > 0)
+                if tombstone_threshold_hit or compaction_gate or mirror_requires_drain:
                     dv_to_drain = combined_tombstone_df
                     if dv_to_drain is None and tombstone_path:
                         # Pure carry-forward: the pointer is unchanged, so the
@@ -764,21 +1234,66 @@ class DataWriter:
                         dv_to_drain = (
                             prev_dv_df
                             if prev_dv_df is not None
-                            else _read_parquet_safe(tombstone_path, profiler=profiler)
+                            else load_tombstone(
+                                tombstone_path,
+                                allow_cache=True,
+                                required=True,
+                                expected_rows=tombstone_rows,
+                                expected_digest=(
+                                    prior_tombstone_digest
+                                    if tombstone_path == prev_tombstone_path
+                                    else None
+                                ),
+                                allowed_files=self._snapshot_resource_files(
+                                    last_simple_table
+                                ),
+                                profiler=profiler,
+                            )
                         )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
-                        removed, tomb_new, tomb_sunset = compact_tombstones(
-                            snapshot=last_simple_table,
-                            tombstone_df=dv_to_drain,
-                            data_dir=simple_table.data_dir,
-                            compression_level=compression_level,
-                            table_config=table_config,
-                            profiler=profiler,
+                        removed, tomb_new, tomb_sunset, residual_dv = (
+                            self._unpack_tombstone_compaction(compact_tombstones(
+                                snapshot=last_simple_table,
+                                tombstone_df=dv_to_drain,
+                                data_dir=simple_table.data_dir,
+                                compression_level=compression_level,
+                                table_config=table_config,
+                                profiler=profiler,
+                                return_residual=True,
+                            ))
                         )
                         new_resources.extend(tomb_new)
                         sunset_files |= tomb_sunset
-                        tombstone_path = None  # deletion-vector fully consumed
-                        tombstone_rows = 0
+                        if residual_dv.height > 0:
+                            residual_tombstone_files = (
+                                self._tombstone_referenced_files(residual_dv)
+                            )
+                            if tomb_new or tomb_sunset or tombstone_path is None:
+                                # Some groups were physically consumed. Publish a
+                                # successor vector containing only the untouched
+                                # groups; the old pointer must never be cleared.
+                                tombstone_path, combined_tombstone_df = (
+                                    persist_tombstone_frame(
+                                        tombstone_dir=tombstone_dir,
+                                        frame=residual_dv,
+                                        compression_level=compression_level,
+                                        profiler=profiler,
+                                    )
+                                )
+                            else:
+                                # Nothing was consumed. Keep the existing/newly
+                                # built immutable vector as-is.
+                                combined_tombstone_df = dv_to_drain
+                            tombstone_rows = residual_dv.height
+                        else:
+                            tombstone_path = None
+                            combined_tombstone_df = None
+                            tombstone_rows = 0
+                        if mirror_requires_drain and residual_dv.height > 0:
+                            raise RuntimeError(
+                                "Cannot publish a mirror while deletion-vector "
+                                "entries remain physically undrained"
+                            )
                         _tomb_phase_ran = True
                         _tomb_removed = removed
                         _tomb_files_touched = len(tomb_sunset)
@@ -797,6 +1312,34 @@ class DataWriter:
                 #    and its row count.
                 last_simple_table["tombstone"] = tombstone_path
                 last_simple_table["tombstone_rows"] = tombstone_rows
+                if tombstone_path:
+                    digest_frame = (
+                        combined_tombstone_df
+                        if combined_tombstone_df is not None else prev_dv_df
+                    )
+                    if (
+                        tombstone_path == prev_tombstone_path
+                        and combined_tombstone_df is None
+                        and prior_tombstone_digest
+                    ):
+                        # The immutable pointer did not change and was already
+                        # verified while loading. Preserve its seal instead of
+                        # sorting and hashing the entire vector again.
+                        last_simple_table["tombstone_digest"] = prior_tombstone_digest
+                    elif digest_frame is not None:
+                        last_simple_table["tombstone_digest"] = tombstone_digest(
+                            digest_frame, assume_valid=True
+                        )
+                    elif tombstone_path == prev_tombstone_path:
+                        # Pure append below threshold: preserve the already
+                        # validated immutable seal without loading a large DV.
+                        last_simple_table["tombstone_digest"] = prior_tombstone_digest
+                    else:
+                        raise RuntimeError(
+                            "Cannot seal successor deletion-vector without its frame"
+                        )
+                else:
+                    last_simple_table["tombstone_digest"] = None
                 # Seed the in-process cache so the NEXT write's carry-forward read
                 # (prev_dv_df above) is a pure memory hit.  The frame is the fresh
                 # build/reclaim result when this write changed the vector, else the
@@ -805,6 +1348,12 @@ class DataWriter:
                 cache_tombstone(
                     tombstone_path,
                     combined_tombstone_df if combined_tombstone_df is not None else prev_dv_df,
+                    expected_rows=tombstone_rows if tombstone_path else None,
+                    expected_digest=(
+                        last_simple_table.get("tombstone_digest")
+                        if tombstone_path else None
+                    ),
+                    assume_valid=bool(tombstone_path),
                 )
                 mark("compact_tombstones")
 
@@ -819,9 +1368,12 @@ class DataWriter:
                     live_resources = [
                         r for r in (last_simple_table.get("resources") or [])
                         if r.get("file") not in sunset_files
+                        and r.get("file") not in residual_tombstone_files
                     ]
                     live_resources += [
-                        r for r in new_resources if r.get("file") not in sunset_files
+                        r for r in new_resources
+                        if r.get("file") not in sunset_files
+                        and r.get("file") not in residual_tombstone_files
                     ]
                     considered, comp_rows, comp_new, comp_sunset = compact_resources(
                         snapshot={"resources": live_resources},
@@ -868,6 +1420,8 @@ class DataWriter:
                         _triggers.append("tombstone_threshold")
                     if compaction_gate:
                         _triggers.append("small_file_gate")
+                    if mirror_requires_drain:
+                        _triggers.append("mirror_requires_clean_files")
                     _cio_files = profiler.counts.get("files_written", 0) - _cio_files0
                     _cio_bw = profiler.counts.get("bytes_written", 0) - _cio_bw0
                     _cio_fr = profiler.counts.get("files_read", 0) - _cio_fr0
@@ -889,27 +1443,33 @@ class DataWriter:
                 #    Read the footers of the newly written data files, drop the
                 #    rows of any sunset file, and append the new ones. No new
                 #    files and nothing sunset → reuse the previous stats file.
-                stats_dir = os.path.join(simple_table.simple_dir, "stats")
-                new_data_files = [
-                    r.get("file") for r in new_resources
-                    if isinstance(r, dict) and r.get("file")
-                ]
-                new_stats_rows = extract_stats_rows(
-                    new_data_files, profiler=profiler, footer_md_cache=footer_md_cache
-                )
-                stats_path, combined_stats_df = build_stats_file(
-                    stats_dir=stats_dir,
-                    prev_stats_path=last_simple_table.get("stats_file"),
-                    new_rows=new_stats_rows,
-                    removed_files=sunset_files,
-                    compression_level=compression_level,
-                    profiler=profiler,
-                )
-                stats_rows = (
-                    combined_stats_df.height
-                    if combined_stats_df is not None
-                    else int(last_simple_table.get("stats_rows", 0) or 0)
-                )
+                if delete_all:
+                    # No successor resource can use prior footer statistics.
+                    # Clearing the pointer is exact and avoids reading + writing
+                    # an empty intermediate stats parquet.
+                    stats_path, combined_stats_df, stats_rows = None, None, 0
+                else:
+                    stats_dir = os.path.join(simple_table.simple_dir, "stats")
+                    new_data_files = [
+                        r.get("file") for r in new_resources
+                        if isinstance(r, dict) and r.get("file")
+                    ]
+                    new_stats_rows = extract_stats_rows(
+                        new_data_files, profiler=profiler, footer_md_cache=footer_md_cache
+                    )
+                    stats_path, combined_stats_df = build_stats_file(
+                        stats_dir=stats_dir,
+                        prev_stats_path=last_simple_table.get("stats_file"),
+                        new_rows=new_stats_rows,
+                        removed_files=sunset_files,
+                        compression_level=compression_level,
+                        profiler=profiler,
+                    )
+                    stats_rows = (
+                        combined_stats_df.height
+                        if combined_stats_df is not None
+                        else int(last_simple_table.get("stats_rows", 0) or 0)
+                    )
                 last_simple_table["stats_file"] = stats_path
                 last_simple_table["stats_rows"] = stats_rows
                 # Seed the in-process cache so the next read (this process's next
@@ -966,33 +1526,25 @@ class DataWriter:
                 )
                 mark("update_simple")
 
-                # --- CAS set leaf pointer + atomic root bump ----------------------
+                # --- Fenced atomic snapshot publication --------------------------
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
                 payload = new_snapshot_dict
 
                 with profiler.span("redis.set_leaf"):
-                    try:
-                        self.catalog.set_leaf_payload_cas(
-                            self.super_table.organization,
-                            self.super_table.super_name,
-                            simple_name,
-                            payload,
-                            new_snapshot_path,
-                            now_ms=now_ms,
-                        )
-                    except Exception:
-                        # Backward compatible fallback.
-                        self.catalog.set_leaf_path_cas(
-                            self.super_table.organization,
-                            self.super_table.super_name,
-                            simple_name,
-                            new_snapshot_path,
-                            now_ms=now_ms,
-                        )
-
-                with profiler.span("redis.bump_root"):
-                    self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
+                    self._publish_snapshot(
+                        simple_table=simple_table,
+                        simple_name=simple_name,
+                        payload=payload,
+                        path=new_snapshot_path,
+                        base_path=last_simple_table_path,
+                        lock_token=token,
+                        commit_id=qid,
+                        now_ms=now_ms,
+                        mirrors=enabled_mirrors,
+                    )
+                if prev_tombstone_path and prev_tombstone_path != tombstone_path:
+                    evict_tombstone(prev_tombstone_path)
                 mark("bump_root")
 
                 # --- Store schema + table name in Redis (permanent, not cache) ---
@@ -1014,15 +1566,66 @@ class DataWriter:
                 except Exception as e:
                     logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
 
-                # --- Optional mirroring -------------------------------------------
-                try:
-                    MirrorFormats.mirror_if_enabled(
-                        super_table=self.super_table,
-                        table_name=simple_name,
-                        simple_snapshot=new_snapshot_dict,
-                    )
-                except Exception as e:
-                    logger.error(lp(f"mirroring failed: {e}"))
+                # --- Optional mirroring ---------------------------------------
+                # The core snapshot is already authoritative at this point.
+                # Preserve it on mirror failure, but never return an ambiguous
+                # success: after monitoring/audit and lock release we raise a
+                # structured post-commit error carrying the reconciliation key.
+                mirror_snapshot_path = new_snapshot_path
+                if enabled_mirrors:
+                    try:
+                        MirrorFormats.mirror_if_enabled(
+                            super_table=self.super_table,
+                            table_name=simple_name,
+                            simple_snapshot=new_snapshot_dict,
+                            mirrors=enabled_mirrors,
+                        )
+                    except Exception as e:
+                        mirror_error = e
+                        failed_format = getattr(e, "failed_format", None)
+                        stage = (
+                            f"mirror:{failed_format}" if failed_format else "mirror"
+                        )
+                        try:
+                            self._fail_mirror_publication(
+                                simple_name=simple_name,
+                                commit_id=qid,
+                                lock_token=token,
+                                stage=stage,
+                                error=e,
+                            )
+                        except Exception as state_exc:
+                            logger.error(lp(
+                                "failed to persist mirror failure state: "
+                                f"{state_exc}"
+                            ))
+                        logger.error(lp(f"mirroring failed after core commit: {e}"))
+                    else:
+                        try:
+                            self._complete_mirror_publication(
+                                simple_name=simple_name,
+                                commit_id=qid,
+                                lock_token=token,
+                            )
+                        except Exception as e:
+                            mirror_error = e
+                            try:
+                                self._fail_mirror_publication(
+                                    simple_name=simple_name,
+                                    commit_id=qid,
+                                    lock_token=token,
+                                    stage="outbox_complete",
+                                    error=e,
+                                )
+                            except Exception as state_exc:
+                                logger.error(lp(
+                                    "failed to persist mirror completion error: "
+                                    f"{state_exc}"
+                                ))
+                            logger.error(lp(
+                                "mirror data published but durable completion "
+                                f"state failed: {e}"
+                            ))
                 mark("mirror")
 
                 # Prepare monitoring payload (NOT writing, only enqueue later)
@@ -1148,6 +1751,18 @@ class DataWriter:
         except Exception:
             pass  # Never fail a write due to audit
 
+        if mirror_error is not None:
+            failure = MirrorPublicationError(
+                organization=self.super_table.organization,
+                super_name=self.super_table.super_name,
+                table_name=simple_name,
+                mirrors=enabled_mirrors,
+                commit_id=qid,
+                snapshot_path=str(mirror_snapshot_path or ""),
+                core_result=result_tuple,
+                cause=mirror_error,
+            )
+            raise failure from mirror_error
         return result_tuple
 
     def compact(
@@ -1221,6 +1836,9 @@ class DataWriter:
             TableNotFoundError: the simple table does not exist.
                 Compaction never bootstraps a missing table.
             PermissionError: RBAC check denied write access.
+            MirrorPublicationError: the authoritative core snapshot committed,
+                but at least one configured mirror failed. The exception
+                identifies the committed snapshot for reconciliation.
         """
         qid = str(uuid.uuid4())
         lp = lambda msg: (
@@ -1241,6 +1859,8 @@ class DataWriter:
 
         token = None
         stats_payload: dict | None = None
+        mirror_error: Exception | None = None
+        mirror_snapshot_path: str | None = None
         result: dict = {
             "query_id": qid,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -1318,10 +1938,13 @@ class DataWriter:
             last_simple_table, last_simple_table_path = (
                 simple_table.get_simple_table_snapshot()
             )
+            prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
+            prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             table_config = self._get_table_config(simple_name)
             files_before = len(last_simple_table.get("resources") or [])
             result["files_before"] = files_before
             mark("snapshot")
+            enabled_mirrors = self._get_enabled_mirrors("compaction")
 
             # --- Phase A: tombstone compaction -------------------------------
             # Physically remove tombstoned rows from the data files named in
@@ -1330,13 +1953,14 @@ class DataWriter:
             # rewrites data files without consulting the vector, so a file
             # named in ``__file__`` that Phase B sunsets would carry its dead
             # rows into the new compacted file while the vector keeps pointing
-            # at the (now gone) original. The rows would stay hidden on read
-            # (anti-join is rowid-only) but become permanently unreclaimable.
+            # at the (now gone) original. The composite anti-join would no
+            # longer match them, so draining first is a correctness boundary.
             # Draining the vector first guarantees Phase B only ever sees clean
             # survivor files. The lazy ``max_tombstone_rows`` threshold gates
             # the *write* path; compact() is explicit maintenance and always
             # consumes the vector.
             tombstone_path = last_simple_table.get("tombstone")
+            previous_tombstone_path = tombstone_path
             # required=True: a DV that exists but cannot be read must abort the
             # compaction, never be treated as empty. A swallowed read here would
             # set should_run_tombstones=False, skipping both Phase A and the
@@ -1344,12 +1968,16 @@ class DataWriter:
             # new file while the vector kept pointing at the sunset __file__ —
             # leaving them permanently unreclaimable. Failing loud leaves the
             # prior snapshot + vector intact for a retry, and matches the
-            # write-path carry-forward read (required=True) above.  Read directly
-            # (not via the in-process cache): compact() always drains the vector,
-            # so there is no carry-forward hit to gain and it never re-seeds the
-            # cache after draining — the loop-caching win lives on the write path.
+            # write-path carry-forward read (required=True) above. Validation also
+            # seals schema, non-null/uniqueness, and the snapshot-declared count.
             tombstone_df = (
-                _read_parquet_safe(tombstone_path, required=True)
+                validate_tombstone_frame(
+                    _read_parquet_safe(tombstone_path, required=True),
+                    expected_rows=prior_tombstone_rows,
+                    expected_digest=prior_tombstone_digest,
+                    allowed_files=self._snapshot_resource_files(last_simple_table),
+                    source=f"deletion-vector {tombstone_path}",
+                )
                 if tombstone_path else None
             )
             tombstone_rows = (
@@ -1359,16 +1987,46 @@ class DataWriter:
             tomb_new_resources: list = []
             tomb_sunset: set = set()
             tomb_compacted_rows = 0
+            residual_dv = polars.DataFrame(
+                schema={TOMBSTONE_FILE_COL: polars.Utf8, ROWID_COL: polars.Int64}
+            )
+            residual_tombstone_files: set[str] = set()
 
             should_run_tombstones = tombstone_rows > 0
             if should_run_tombstones:
-                tomb_compacted_rows, tomb_new_resources, tomb_sunset = compact_tombstones(
-                    snapshot=last_simple_table,
-                    tombstone_df=tombstone_df,
-                    data_dir=simple_table.data_dir,
-                    compression_level=compression_level,
-                    table_config=table_config,
+                (
+                    tomb_compacted_rows,
+                    tomb_new_resources,
+                    tomb_sunset,
+                    residual_dv,
+                ) = self._unpack_tombstone_compaction(compact_tombstones(
+                        snapshot=last_simple_table,
+                        tombstone_df=tombstone_df,
+                        data_dir=simple_table.data_dir,
+                        compression_level=compression_level,
+                        table_config=table_config,
+                        return_residual=True,
+                    )
                 )
+                if residual_dv.height:
+                    residual_tombstone_files = (
+                        self._tombstone_referenced_files(residual_dv)
+                    )
+                    if tomb_new_resources or tomb_sunset:
+                        tombstone_path, residual_dv = persist_tombstone_frame(
+                            tombstone_dir=os.path.join(
+                                simple_table.simple_dir, "tombstone"
+                            ),
+                            frame=residual_dv,
+                            compression_level=compression_level,
+                        )
+                else:
+                    tombstone_path = None
+                if enabled_mirrors and residual_dv.height > 0:
+                    raise RuntimeError(
+                        "Cannot publish a mirror while deletion-vector entries "
+                        "remain physically undrained"
+                    )
                 logger.info(lp(
                     f"tombstone compaction removed {tomb_compacted_rows} rows "
                     f"from {len(tomb_sunset)} file(s)"
@@ -1391,7 +2049,12 @@ class DataWriter:
             # --- Phase B: small-file compaction ------------------------------
             considered, small_total_rows, small_new_resources, small_sunset = (
                 compact_resources(
-                    snapshot=last_simple_table,
+                    snapshot={
+                        "resources": [
+                            r for r in (last_simple_table.get("resources") or [])
+                            if r.get("file") not in residual_tombstone_files
+                        ]
+                    },
                     data_dir=simple_table.data_dir,
                     compression_level=compression_level,
                     table_config=table_config,
@@ -1465,12 +2128,18 @@ class DataWriter:
                         "write_id": qid,
                     }
 
-                # Clear the deletion-vector pointer now that the dead rows
-                # have been physically dropped. ``simple_table.update`` writes
-                # the updated snapshot (with tombstone=None) below.
+                # Publish either the residual vector or a cleared pointer.  An
+                # entry is removed only after its exact source row was physically
+                # omitted from a successor resource.
                 if should_run_tombstones:
-                    last_simple_table["tombstone"] = None
-                    last_simple_table["tombstone_rows"] = 0
+                    last_simple_table["tombstone"] = tombstone_path
+                    last_simple_table["tombstone_rows"] = residual_dv.height
+                    if tombstone_path:
+                        last_simple_table["tombstone_digest"] = tombstone_digest(
+                            residual_dv, assume_valid=True
+                        )
+                    else:
+                        last_simple_table["tombstone_digest"] = None
 
                 # Carry forward + extend the external column-statistics parquet
                 # for the compacted file set: drop rows of every sunset file and
@@ -1533,42 +2202,83 @@ class DataWriter:
                 )
                 mark("update_simple")
 
-                # --- CAS set leaf pointer + atomic root bump ---------------------
+                # --- Fenced atomic snapshot publication -------------------------
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 payload = new_snapshot_dict
-                try:
-                    self.catalog.set_leaf_payload_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        payload,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
-                except Exception:
-                    self.catalog.set_leaf_path_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
-                self.catalog.bump_root(
-                    self.super_table.organization,
-                    self.super_table.super_name,
+                self._publish_snapshot(
+                    simple_table=simple_table,
+                    simple_name=simple_name,
+                    payload=payload,
+                    path=new_snapshot_path,
+                    base_path=last_simple_table_path,
+                    lock_token=token,
+                    commit_id=qid,
                     now_ms=now_ms,
+                    mirrors=enabled_mirrors,
                 )
+                if (
+                    previous_tombstone_path
+                    and previous_tombstone_path != tombstone_path
+                ):
+                    evict_tombstone(previous_tombstone_path)
                 mark("bump_root")
 
                 # --- Mirroring ---------------------------------------------------
-                try:
-                    MirrorFormats.mirror_if_enabled(
-                        super_table=self.super_table,
-                        table_name=simple_name,
-                        simple_snapshot=new_snapshot_dict,
-                    )
-                except Exception as e:
-                    logger.error(lp(f"mirroring failed: {e}"))
+                mirror_snapshot_path = new_snapshot_path
+                if enabled_mirrors:
+                    try:
+                        MirrorFormats.mirror_if_enabled(
+                            super_table=self.super_table,
+                            table_name=simple_name,
+                            simple_snapshot=new_snapshot_dict,
+                            mirrors=enabled_mirrors,
+                        )
+                    except Exception as e:
+                        mirror_error = e
+                        failed_format = getattr(e, "failed_format", None)
+                        stage = (
+                            f"mirror:{failed_format}" if failed_format else "mirror"
+                        )
+                        try:
+                            self._fail_mirror_publication(
+                                simple_name=simple_name,
+                                commit_id=qid,
+                                lock_token=token,
+                                stage=stage,
+                                error=e,
+                            )
+                        except Exception as state_exc:
+                            logger.error(lp(
+                                "failed to persist mirror failure state: "
+                                f"{state_exc}"
+                            ))
+                        logger.error(lp(f"mirroring failed after core commit: {e}"))
+                    else:
+                        try:
+                            self._complete_mirror_publication(
+                                simple_name=simple_name,
+                                commit_id=qid,
+                                lock_token=token,
+                            )
+                        except Exception as e:
+                            mirror_error = e
+                            try:
+                                self._fail_mirror_publication(
+                                    simple_name=simple_name,
+                                    commit_id=qid,
+                                    lock_token=token,
+                                    stage="outbox_complete",
+                                    error=e,
+                                )
+                            except Exception as state_exc:
+                                logger.error(lp(
+                                    "failed to persist mirror completion error: "
+                                    f"{state_exc}"
+                                ))
+                            logger.error(lp(
+                                "mirror data published but durable completion "
+                                f"state failed: {e}"
+                            ))
                 mark("mirror")
 
                 # --- Final stats payload -----------------------------------------
@@ -1641,6 +2351,18 @@ class DataWriter:
         except Exception:
             pass
 
+        if mirror_error is not None:
+            failure = MirrorPublicationError(
+                organization=self.super_table.organization,
+                super_name=self.super_table.super_name,
+                table_name=simple_name,
+                mirrors=enabled_mirrors,
+                commit_id=qid,
+                snapshot_path=str(mirror_snapshot_path or ""),
+                core_result=result,
+                cause=mirror_error,
+            )
+            raise failure from mirror_error
         return result
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):
@@ -1656,6 +2378,19 @@ class DataWriter:
             )
         if isinstance(overwrite_columns, str):
             raise ValueError("overwrite columns must be list")
+        reserved = {ROWID_COL.casefold(), "__timestamp__", TOMBSTONE_FILE_COL.casefold()}
+        reserved_collisions = [
+            str(column) for column in dataframe.columns
+            if (
+                str(column).casefold() in reserved
+                or str(column).casefold().startswith("__supertable_")
+            )
+        ]
+        if reserved_collisions:
+            raise ValueError(
+                "Input contains reserved system column(s), including a "
+                f"case-insensitive collision: {reserved_collisions!r}"
+            )
         if overwrite_columns and not all(col in dataframe.columns for col in overwrite_columns):
             raise ValueError("Some overwrite columns are not present in the dataset")
         # delete_only with no overwrite_columns is the delete-all path (tombstone

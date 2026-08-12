@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -36,6 +37,8 @@ from supertable.data_writer import DataWriter
 from supertable.demo.quickstart.dummy_data import get_dummy_data
 from supertable.simple_table import SimpleTable
 from supertable.super_table import SuperTable
+from supertable.processing import tombstone_digest
+from supertable.engine.engine_common import validate_tombstone_relation
 
 ORG = "kladna-soft"
 SUPER = "demo"
@@ -114,8 +117,8 @@ def _write_all_passes(n_passes: int) -> List[List[int]]:
 def _read_live(st: SimpleTable) -> pl.DataFrame:
     query = f"SELECT day, client, value, datastream_name FROM {SIMPLE}"
     dr = DataReader(super_name=SUPER, organization=ORG, query=query)
-    df, status, _msg = dr.execute(role_name=ROLE, with_scan=False, engine=engine.AUTO)
-    assert str(status).endswith("OK"), f"read failed: {status}"
+    df, status, message = dr.execute(role_name=ROLE, with_scan=False, engine=engine.AUTO)
+    assert str(status).endswith("OK"), f"read failed: {status}: {message}"
     return df if isinstance(df, pl.DataFrame) else pl.from_pandas(df)
 
 
@@ -153,8 +156,25 @@ def test_demo_tombstone_end_state(n_passes):
     assert int(snap.get("tombstone_rows") or 0) == EXPECTED_TOMBSTONE_ROWS
     tomb_path = snap.get("tombstone")
     assert tomb_path and st.storage.exists(tomb_path)
+    leaf_payload = (
+        st.catalog.get_leaf(ORG, SUPER, SIMPLE) or {}
+    ).get("payload") or {}
+    assert leaf_payload.get("tombstone") == tomb_path
+    assert leaf_payload.get("tombstone_rows") == snap.get("tombstone_rows")
+    assert leaf_payload.get("tombstone_digest") == snap.get("tombstone_digest")
     dv = _as_polars(st.storage.read_parquet(tomb_path))
     assert dv.height == EXPECTED_TOMBSTONE_ROWS
+    assert snap.get("tombstone_digest") == tombstone_digest(dv)
+    escaped_tombstone = str(tomb_path).replace("'", "''")
+    digest_con = duckdb.connect()
+    try:
+        _rows, duckdb_digest = validate_tombstone_relation(
+            digest_con,
+            f"read_parquet('{escaped_tombstone}', hive_partitioning=false)",
+        )
+    finally:
+        digest_con.close()
+    assert duckdb_digest == snap.get("tombstone_digest")
     # rowids are table-unique and never reused, so the vector holds no dups.
     assert dv.get_column("__rowid__").n_unique() == EXPECTED_TOMBSTONE_ROWS
     # dead rows live in exactly four files, in a fixed 2/2/2/3 distribution.

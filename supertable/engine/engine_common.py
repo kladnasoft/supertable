@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import os
+import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import duckdb
 import sqlglot
@@ -52,6 +55,394 @@ def escape_parquet_path(path: str) -> str:
     return path.replace(chr(39), chr(39) + chr(39))
 
 
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def redact_url_credentials(value: object) -> str:
+    """Remove presign/SAS query strings before a value reaches a log."""
+    text = str(value or "")
+
+    def replace(match: re.Match) -> str:
+        raw = match.group(0)
+        url = raw.rstrip(").,;]}")
+        suffix = raw[len(url):]
+        try:
+            parsed = urlsplit(url)
+            if parsed.query or parsed.fragment:
+                url = urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
+                )
+        except Exception:
+            if "?" in url:
+                url = url.split("?", 1)[0] + "?<redacted>"
+        return url + suffix
+
+    return _URL_IN_TEXT_RE.sub(replace, text)
+
+
+_SNAPSHOT_TO_DUCKDB_TYPE = {
+    "string": "VARCHAR",
+    "boolean": "BOOLEAN",
+    "byte": "TINYINT",
+    "short": "SMALLINT",
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "long": "BIGINT",
+    "float": "FLOAT",
+    "double": "DOUBLE",
+    "date": "DATE",
+    "timestamp": "TIMESTAMP",
+    "binary": "BLOB",
+    # Polars ``str(dtype)`` values emitted by collect_schema.
+    "int8": "TINYINT",
+    "int16": "SMALLINT",
+    "int32": "INTEGER",
+    "int64": "BIGINT",
+    "uint8": "UTINYINT",
+    "uint16": "USMALLINT",
+    "uint32": "UINTEGER",
+    "uint64": "UBIGINT",
+    "float32": "FLOAT",
+    "float64": "DOUBLE",
+    # Match DuckDB's types when it scans Parquet emitted by Polars.  Duration
+    # is parameterized and is handled below after validating its time unit.
+    "null": "INTEGER",
+    "time": "TIME",
+    "categorical": "VARCHAR",
+    "string": "VARCHAR",
+    "utf8": "VARCHAR",
+    # Common pandas schema strings retained by older snapshots.
+    "bool": "BOOLEAN",
+    "object": "VARCHAR",
+    "datetime64[ns]": "TIMESTAMP_NS",
+}
+
+
+class _PolarsDTypeParser:
+    """Tiny closed grammar for persisted ``str(polars_dtype)`` values."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+
+    def _ws(self) -> None:
+        while self.pos < len(self.text) and self.text[self.pos].isspace():
+            self.pos += 1
+
+    def _take(self, token: str) -> None:
+        self._ws()
+        if not self.text.startswith(token, self.pos):
+            raise ValueError(f"expected {token!r} at offset {self.pos}")
+        self.pos += len(token)
+
+    def _ident(self) -> str:
+        self._ws()
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", self.text[self.pos:])
+        if not match:
+            raise ValueError(f"expected type identifier at offset {self.pos}")
+        self.pos += len(match.group(0))
+        return match.group(0)
+
+    def _string(self) -> str:
+        self._ws()
+        if self.pos >= len(self.text) or self.text[self.pos] not in "'\"":
+            raise ValueError(f"expected quoted field name at offset {self.pos}")
+        start = self.pos
+        quote = self.text[self.pos]
+        self.pos += 1
+        escaped = False
+        while self.pos < len(self.text):
+            ch = self.text[self.pos]
+            self.pos += 1
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                value = ast.literal_eval(self.text[start:self.pos])
+                if not isinstance(value, str):
+                    raise ValueError("struct field name is not a string")
+                return value
+        raise ValueError("unterminated struct field name")
+
+    def _balanced_args(self) -> str:
+        self._take("(")
+        start = self.pos
+        depth = 1
+        quote = None
+        escaped = False
+        while self.pos < len(self.text):
+            ch = self.text[self.pos]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    value = self.text[start:self.pos]
+                    self.pos += 1
+                    return value
+            self.pos += 1
+        raise ValueError("unterminated type parameters")
+
+    def parse_type(self):
+        name = self._ident()
+        lowered = name.casefold()
+        self._ws()
+        if lowered == "list":
+            self._take("(")
+            inner = self.parse_type()
+            self._take(")")
+            return ("list", inner)
+        if lowered == "array":
+            self._take("(")
+            inner = self.parse_type()
+            self._take(",")
+            if self._ident().casefold() != "shape":
+                raise ValueError("Array requires shape=")
+            self._take("=")
+            self._take("(")
+            shape = []
+            while True:
+                self._ws()
+                match = re.match(r"[1-9][0-9]*", self.text[self.pos:])
+                if not match:
+                    break
+                shape.append(int(match.group(0)))
+                self.pos += len(match.group(0))
+                self._ws()
+                if not self.text.startswith(",", self.pos):
+                    break
+                self.pos += 1
+            self._take(")")
+            self._take(")")
+            if not shape:
+                raise ValueError("Array shape must contain positive dimensions")
+            return ("array", inner, tuple(shape))
+        if lowered == "struct":
+            self._take("(")
+            self._take("{")
+            fields = []
+            self._ws()
+            while not self.text.startswith("}", self.pos):
+                field_name = self._string()
+                self._take(":")
+                fields.append((field_name, self.parse_type()))
+                self._ws()
+                if self.text.startswith(",", self.pos):
+                    self.pos += 1
+                    self._ws()
+                    continue
+                break
+            self._take("}")
+            self._take(")")
+            if not fields:
+                raise ValueError("empty Struct has no representable field schema")
+            return ("struct", tuple(fields))
+        if lowered in {"decimal", "datetime", "duration", "enum"}:
+            args = self._balanced_args()
+            return (lowered, args)
+        if self.pos < len(self.text) and self.text[self.pos] == "(":
+            raise ValueError(f"unsupported parameterized dtype {name!r}")
+        return ("scalar", name)
+
+    def parse(self):
+        node = self.parse_type()
+        self._ws()
+        if self.pos != len(self.text):
+            raise ValueError(f"unexpected dtype text at offset {self.pos}")
+        return node
+
+
+def _dtype_ast(type_name: str):
+    return _PolarsDTypeParser(str(type_name or "").strip()).parse()
+
+
+def _decimal_from_args(args: str) -> tuple[int, int]:
+    normalized = args.strip().lower()
+    match = re.fullmatch(r"(\d{1,3}),\s*(\d{1,3})", normalized)
+    if not match:
+        match = re.fullmatch(
+            r"precision=(\d{1,3}),\s*scale=(\d{1,3})", normalized,
+        )
+    if not match:
+        raise ValueError("invalid Decimal parameters")
+    precision, scale = map(int, match.groups())
+    if not (1 <= precision <= 38 and 0 <= scale <= precision):
+        raise ValueError("Decimal precision/scale out of range")
+    return precision, scale
+
+
+def _datetime_has_timezone(args: str) -> bool:
+    match = re.fullmatch(
+        r"time_unit='(?:ns|us|ms)',\s*time_zone=(none|'[^']+')",
+        args.strip().lower(),
+    )
+    if not match:
+        raise ValueError("invalid Datetime parameters")
+    return match.group(1) != "none"
+
+
+def _duration_unit(args: str) -> str:
+    """Validate the closed set of units emitted by ``str(pl.Duration)``."""
+    match = re.fullmatch(
+        r"time_unit\s*=\s*(['\"])(ns|us|ms)\1",
+        args.strip().lower(),
+    )
+    if not match:
+        raise ValueError("invalid Duration parameters")
+    return match.group(2)
+
+
+def _validate_enum_args(args: str) -> None:
+    """Accept only the literal string category list emitted by Polars."""
+    match = re.fullmatch(r"categories\s*=\s*(.+)", args.strip(), re.DOTALL)
+    if not match:
+        raise ValueError("invalid Enum parameters")
+    try:
+        categories = ast.literal_eval(match.group(1))
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError("invalid Enum category list") from exc
+    if (
+        not isinstance(categories, list)
+        or any(not isinstance(category, str) for category in categories)
+        or len(categories) != len(set(categories))
+    ):
+        raise ValueError("invalid Enum category list")
+
+
+def _render_dtype(node, dialect: str) -> str:
+    kind = node[0]
+    if kind == "scalar":
+        normalized = node[1].casefold()
+        if dialect == "duckdb":
+            value = _SNAPSHOT_TO_DUCKDB_TYPE.get(normalized)
+        else:
+            # Deliberately omit Polars Null and Time.  Spark rejects their
+            # Parquet logical annotations, so inventing an empty-only type
+            # would make delete-all queries behave unlike non-empty snapshots.
+            value = {
+                "string": "string", "utf8": "string", "boolean": "boolean",
+                "bool": "boolean", "byte": "byte", "int8": "byte",
+                "short": "short", "int16": "short", "integer": "int",
+                "int": "int", "int32": "int", "long": "long", "int64": "long",
+                "uint8": "short", "uint16": "int", "uint32": "long",
+                "uint64": "decimal(20,0)", "float": "float", "float32": "float",
+                "double": "double", "float64": "double", "date": "date",
+                "timestamp": "timestamp", "binary": "binary", "object": "string",
+                "datetime64[ns]": "timestamp", "categorical": "string",
+            }.get(normalized)
+        if not value:
+            raise ValueError(f"unsupported scalar dtype {node[1]!r}")
+        return value
+    if kind == "decimal":
+        precision, scale = _decimal_from_args(node[1])
+        return f"DECIMAL({precision},{scale})" if dialect == "duckdb" else f"decimal({precision},{scale})"
+    if kind == "datetime":
+        with_tz = _datetime_has_timezone(node[1])
+        if dialect == "duckdb":
+            return "TIMESTAMPTZ" if with_tz else "TIMESTAMP"
+        return "timestamp"
+    if kind == "duration":
+        _duration_unit(node[1])
+        # Polars writes Duration to Parquet as its signed INT64 storage value.
+        # DuckDB and Spark expose that physical representation as BIGINT/long;
+        # INTERVAL would silently change the non-empty table's query type.
+        return "BIGINT" if dialect == "duckdb" else "long"
+    if kind == "enum":
+        _validate_enum_args(node[1])
+        # Polars materializes both Enum and Categorical Parquet columns as
+        # strings for these engines; category metadata is not a SQL enum type.
+        return "VARCHAR" if dialect == "duckdb" else "string"
+    if kind == "list":
+        inner = _render_dtype(node[1], dialect)
+        return f"{inner}[]" if dialect == "duckdb" else f"array<{inner}>"
+    if kind == "array":
+        inner = _render_dtype(node[1], dialect)
+        if dialect == "duckdb":
+            return inner + "".join(f"[{size}]" for size in node[2])
+        # Spark has no fixed-size array type; its array preserves element
+        # semantics for a typed empty relation, which is all we construct here.
+        for _ in node[2]:
+            inner = f"array<{inner}>"
+        return inner
+    if kind == "struct":
+        if dialect == "duckdb":
+            fields = ", ".join(
+                f"{quote_if_needed(name)} {_render_dtype(child, dialect)}"
+                for name, child in node[1]
+            )
+            return f"STRUCT({fields})"
+        fields = ", ".join(
+            f"`{name.replace('`', '``')}`:{_render_dtype(child, dialect)}"
+            for name, child in node[1]
+        )
+        return f"struct<{fields}>"
+    raise ValueError(f"unsupported dtype node {kind!r}")
+
+
+def snapshot_duckdb_type(type_name: str) -> str:
+    """Map persisted Spark/Polars types to safe DuckDB SQL."""
+    normalized = str(type_name or "").strip().lower()
+    direct = _SNAPSHOT_TO_DUCKDB_TYPE.get(normalized)
+    if direct:
+        return direct
+    try:
+        return _render_dtype(_dtype_ast(type_name), "duckdb")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Unsupported snapshot column type for empty table: {type_name!r}"
+        ) from exc
+
+
+def snapshot_spark_type(type_name: str) -> str:
+    """Map persisted Spark/Polars types to a closed, safe Spark SQL type."""
+    try:
+        return _render_dtype(_dtype_ast(type_name), "spark")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Unsupported snapshot column type for empty Spark table: {type_name!r}"
+        ) from exc
+
+
+def create_typed_empty_view(
+        con: duckdb.DuckDBPyConnection,
+        view_name: str,
+        column_types: Dict[str, str],
+        columns: Optional[List[str]] = None,
+) -> None:
+    """Create a typed zero-row view for a valid snapshot with no resources."""
+    if not column_types:
+        raise RuntimeError(
+            "Cannot construct an empty reflection: pinned snapshot has no schema"
+        )
+    requested = None if not columns else {str(c).lower() for c in columns}
+    expressions = []
+    for name, type_name in column_types.items():
+        if requested is not None and str(name).lower() not in requested:
+            continue
+        expressions.append(
+            f"CAST(NULL AS {snapshot_duckdb_type(type_name)}) AS {quote_if_needed(str(name))}"
+        )
+    if not expressions:
+        raise RuntimeError(
+            "Cannot construct an empty reflection: requested columns are absent from schema"
+        )
+    con.execute(
+        f"CREATE OR REPLACE VIEW {view_name} AS SELECT "
+        + ", ".join(expressions)
+        + " WHERE FALSE;"
+    )
+
+
 # =========================================================
 # Table naming
 # =========================================================
@@ -73,10 +464,20 @@ def pro_table_name(
         super_name: str,
         simple_name: str,
         simple_version: int,
+        file_signature: str = "",
 ) -> str:
-    """Generate a deterministic table name for pro mode (all columns, version-scoped)."""
-    key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    """Generate a deterministic Pro view name for an exact snapshot.
+
+    A catalog version alone is insufficient: fail-open snapshot recovery and
+    mocked/legacy catalogs can return a different file list at the same
+    version.  Including the exact file signature prevents replacing an
+    in-flight view with different data under the same DuckDB identifier.
+    """
+    key = f"{super_name}_{simple_name}_{file_signature}"
+    # Full SHA-256 keeps this identifier a practical ownership boundary. A
+    # truncated name can collide across survivor signatures; reusing or
+    # replacing that view would return the wrong file set to a SELECT.
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     return f"pro_{digest}_v{simple_version}"
 
 
@@ -215,6 +616,15 @@ def configure_httpfs_and_s3(
     if not for_paths:
         return
 
+    # Core DuckDB can read local parquet files without httpfs.  Loading the
+    # extension for a local-only query is both wasted work and, on an offline
+    # installation where the extension was not seeded, turns a valid local
+    # read into an avoidable failure.
+    any_s3 = any(str(p).lower().startswith(("s3://", "s3a://")) for p in for_paths)
+    any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
+    if not (any_s3 or any_http):
+        return
+
     # Load httpfs.  It is baked into the image and seeded into the DuckDB
     # extension dir (see the container entrypoint), so LOAD normally succeeds
     # with no network access.
@@ -252,12 +662,6 @@ def configure_httpfs_and_s3(
                 "or set SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=true to permit a "
                 f"one-time online install. Underlying DuckDB error: {load_err}"
             ) from load_err
-
-    any_s3 = any(str(p).lower().startswith("s3://") for p in for_paths)
-    any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
-
-    if not (any_s3 or any_http):
-        return
 
     try:
         supported = {
@@ -394,7 +798,10 @@ def make_presigned_list(storage, paths: List[str]) -> List[str]:
                 out.append(presign_fn(key))
             except Exception as e:
                 out.append(p)
-                logger.warning(f"[presign] failed for '{p}': {e}")
+                logger.warning(
+                    f"[presign] failed for '{redact_url_credentials(p)}': "
+                    f"{redact_url_credentials(e)}"
+                )
         else:
             out.append(p)
 
@@ -418,7 +825,11 @@ def _reflection_select_cols(columns: Optional[List[str]]) -> str:
     if not columns:
         return "*"
     system = {ROWID_COL, TIMESTAMP_COL}
-    public = [c for c in columns if c and c.strip() and c not in system]
+    internal = {SOURCE_FILE_COL, SCAN_FILENAME_COL}
+    public = [
+        c for c in columns
+        if c and c.strip() and c not in system and c not in internal
+    ]
     wants_system = any(c in system for c in columns)
     parts = [quote_if_needed(c) for c in public]
     if wants_system:
@@ -426,11 +837,62 @@ def _reflection_select_cols(columns: Optional[List[str]]) -> str:
     return ", ".join(parts) if parts else "*"
 
 
+def _reflection_source_identity_sql(
+        files: List[str], resource_keys: Optional[List[str]], select_cols: str,
+) -> tuple[str, str]:
+    """Return (projection, parquet filename option) for canonical file identity."""
+    if not resource_keys:
+        return select_cols, ""
+    if len(files) != len(resource_keys) or any(not str(k) for k in resource_keys):
+        raise RuntimeError(
+            "Resolved reflection files and stable resource keys must correspond one-for-one"
+        )
+    path_to_key: Dict[str, str] = {}
+    seen_keys = set()
+    for path, raw_key in zip(files, resource_keys):
+        path = str(path)
+        raw_key = str(raw_key)
+        prior = path_to_key.setdefault(path, raw_key)
+        if prior != raw_key:
+            raise RuntimeError(
+                "Resolved reflection path maps to multiple stable resource keys; "
+                "composite tombstone identity is ambiguous"
+            )
+        if raw_key in seen_keys:
+            raise RuntimeError(
+                "Snapshot contains a duplicate stable resource key; composite "
+                "tombstone identity is ambiguous"
+            )
+        seen_keys.add(raw_key)
+    scan_col = quote_if_needed(SCAN_FILENAME_COL)
+    source_col = quote_if_needed(SOURCE_FILE_COL)
+    if select_cols == "*":
+        select_cols = (
+            f"COLUMNS(c -> c NOT IN ('{SCAN_FILENAME_COL}', '{SOURCE_FILE_COL}'))"
+        )
+    cases = " ".join(
+        f"WHEN ({scan_col} COLLATE \"binary\") = "
+        f"('{escape_parquet_path(str(path))}' COLLATE \"binary\") "
+        f"THEN '{escape_parquet_path(str(raw_key))}'"
+        for path, raw_key in zip(files, resource_keys)
+    )
+    # Any filename DuckDB reports differently from the exact scan input makes
+    # source identity unprovable.  Abort instead of silently retaining/deleting
+    # the wrong row under a composite tombstone key.
+    mapping = (
+        f"CASE {cases} "
+        "ELSE error('unrecognized reflection source filename') END "
+        f"AS {source_col}"
+    )
+    return f"{select_cols}, {mapping}", f", filename='{SCAN_FILENAME_COL}'"
+
+
 def create_reflection_table(
         con: duckdb.DuckDBPyConnection,
         table_name: str,
         files: List[str],
         columns: Optional[List[str]] = None,
+        resource_keys: Optional[List[str]] = None,
 ) -> None:
     """CREATE TABLE ... AS SELECT ... FROM parquet_scan(...)."""
     if not files:
@@ -438,12 +900,15 @@ def create_reflection_table(
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
     select_cols = _reflection_select_cols(columns)
+    select_cols, filename_option = _reflection_source_identity_sql(
+        files, resource_keys, select_cols,
+    )
 
     sql = (
         f"CREATE TABLE {table_name} AS "
         f"SELECT {select_cols} "
         f"FROM parquet_scan([{parquet_files_str}], "
-        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE);"
+        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE{filename_option});"
     )
     con.execute(sql)
 
@@ -455,6 +920,7 @@ def create_reflection_table_with_presign_retry(
         files: List[str],
         columns: Optional[List[str]] = None,
         log_prefix: str = "",
+        resource_keys: Optional[List[str]] = None,
 ) -> bool:
     """
     Create a reflection table with automatic presign fallback on HTTP errors.
@@ -464,18 +930,23 @@ def create_reflection_table_with_presign_retry(
     tried_presign = False
 
     try:
-        create_reflection_table(con, table_name, files, columns)
+        create_reflection_table(con, table_name, files, columns, resource_keys)
     except Exception as e:
         msg = str(e)
         if any(tok in msg for tok in (
                 "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
                 "AccessDenied", "SignatureDoesNotMatch", "403", "400",
         )):
-            logger.warning(f"{log_prefix}[duckdb.retry] presign fallback for {table_name}: {msg}")
+            logger.warning(
+                f"{log_prefix}[duckdb.retry] presign fallback for {table_name}: "
+                f"{redact_url_credentials(msg)}"
+            )
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
-            create_reflection_table(con, table_name, presigned_files, columns)
+            create_reflection_table(
+                con, table_name, presigned_files, columns, resource_keys,
+            )
         else:
             raise
 
@@ -491,6 +962,7 @@ def create_reflection_view(
         view_name: str,
         files: List[str],
         columns: Optional[List[str]] = None,
+        resource_keys: Optional[List[str]] = None,
 ) -> None:
     """CREATE OR REPLACE VIEW ... AS SELECT ... FROM parquet_scan(...).
 
@@ -507,12 +979,15 @@ def create_reflection_view(
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
     select_cols = _reflection_select_cols(columns)
+    select_cols, filename_option = _reflection_source_identity_sql(
+        files, resource_keys, select_cols,
+    )
 
     sql = (
         f"CREATE OR REPLACE VIEW {view_name} AS "
         f"SELECT {select_cols} "
         f"FROM parquet_scan([{parquet_files_str}], "
-        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE);"
+        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE{filename_option});"
     )
     con.execute(sql)
 
@@ -524,6 +999,7 @@ def create_reflection_view_with_presign_retry(
         files: List[str],
         columns: Optional[List[str]] = None,
         log_prefix: str = "",
+        resource_keys: Optional[List[str]] = None,
 ) -> bool:
     """
     Create a lazy reflection VIEW with automatic presign fallback on HTTP errors.
@@ -538,25 +1014,30 @@ def create_reflection_view_with_presign_retry(
     materialize = settings.SUPERTABLE_DUCKDB_MATERIALIZE
     if materialize == "table":
         return create_reflection_table_with_presign_retry(
-            con, storage, view_name, files, columns, log_prefix
+            con, storage, view_name, files, columns, log_prefix, resource_keys
         )
 
     configure_httpfs_and_s3(con, files)
     tried_presign = False
 
     try:
-        create_reflection_view(con, view_name, files, columns)
+        create_reflection_view(con, view_name, files, columns, resource_keys)
     except Exception as e:
         msg = str(e)
         if any(tok in msg for tok in (
                 "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
                 "AccessDenied", "SignatureDoesNotMatch", "403", "400",
         )):
-            logger.warning(f"{log_prefix}[duckdb.retry] presign fallback (view) for {view_name}: {msg}")
+            logger.warning(
+                f"{log_prefix}[duckdb.retry] presign fallback (view) for {view_name}: "
+                f"{redact_url_credentials(msg)}"
+            )
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
-            create_reflection_view(con, view_name, presigned_files, columns)
+            create_reflection_view(
+                con, view_name, presigned_files, columns, resource_keys,
+            )
         else:
             raise
 
@@ -1224,6 +1705,240 @@ def rbac_view_name(base_table_name: str) -> str:
 
 ROWID_COL = "__rowid__"
 TIMESTAMP_COL = "__timestamp__"
+TOMBSTONE_FILE_COL = "__file__"
+SOURCE_FILE_COL = "__supertable_source_file__"
+SCAN_FILENAME_COL = "__supertable_scan_filename__"
+
+
+class ValidatedTombstoneTable(str):
+    """Marker returned only after :class:`TombstoneCache` validates a DV.
+
+    It deliberately remains a ``str`` so existing engine/view plumbing stays
+    simple.  The marker lets ``create_tombstone_view`` avoid an O(N) validation
+    scan on every cache hit while still fully validating an arbitrary table
+    name supplied by a direct caller.
+    """
+
+    def __new__(
+            cls, value: str, row_count: int = -1, digest: Optional[str] = None,
+            referenced_files=None,
+    ):
+        obj = str.__new__(cls, value)
+        obj.row_count = int(row_count)
+        obj.digest = digest
+        obj.referenced_files = frozenset(referenced_files or ())
+        return obj
+
+
+def _describe_relation(
+        con: duckdb.DuckDBPyConnection, relation_sql: str,
+) -> List[tuple]:
+    try:
+        return list(con.execute(f"DESCRIBE SELECT * FROM {relation_sql}").fetchall())
+    except Exception as exc:
+        raise RuntimeError(f"Unable to read deletion-vector schema: {exc}") from exc
+
+
+def _validate_tombstone_relation_details(
+        con: duckdb.DuckDBPyConnection,
+        relation_sql: str,
+        *,
+        expected_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        allowed_files: Optional[List[str]] = None,
+        validate_rows: bool = True,
+) -> tuple[int, str, frozenset[str]]:
+    """Validate a deletion-vector relation, raising on any ambiguity.
+
+    A malformed or truncated deletion vector must never silently become an
+    empty/partial anti-join: that would resurrect deleted rows.  Current
+    vectors have exactly ``(__file__ VARCHAR, __rowid__ BIGINT)`` and row ids
+    are unique table-wide.  ``expected_rows`` is checked when a pinned
+    snapshot supplies it; older snapshots lack that field, so the remaining
+    structural/count invariants are still enforced.
+    """
+    rows = _describe_relation(con, relation_sql)
+    actual = [(str(r[0]), str(r[1]).upper()) for r in rows]
+    required = [(TOMBSTONE_FILE_COL, "VARCHAR"), (ROWID_COL, "BIGINT")]
+    if actual != required:
+        raise RuntimeError(
+            "Invalid deletion-vector schema: expected exactly "
+            f"{required}, got {actual}"
+        )
+
+    if not validate_rows:
+        return -1, "", frozenset()
+
+    file_col = quote_if_needed(TOMBSTONE_FILE_COL)
+    rowid_col = quote_if_needed(ROWID_COL)
+    # DuckDB's ordered string_agg can merge worker-local states in chunk order
+    # when `threads > 1`, despite the aggregate ORDER BY.  That produced a
+    # different digest from the writer for the same nine-row DV and made valid
+    # SELECTs fail nondeterministically with the runtime thread setting.  Make
+    # order a data operation instead: collect records in arbitrary order, sort
+    # the completed fixed-format strings, then join.  Lexicographic record
+    # order is exactly the v1 contract (base64 file, then 16-hex-digit rowid).
+    digest_sql = (
+        "sha256('supertable-tombstone-v1' || chr(10) || coalesce("
+        "array_to_string(list_sort(list("
+        f"to_base64(encode({file_col})) || ':' || "
+        f"printf('%016x', {rowid_col}))), chr(10)), ''))"
+    )
+    allowed = None if allowed_files is None else {str(path) for path in allowed_files}
+    try:
+        (
+            total, files, rowids, distinct_rowids, empty_files,
+            invalid_rowids, actual_digest, referenced_file_values,
+        ) = con.execute(
+            "SELECT count(*), "
+            f"count({file_col}), count({rowid_col}), "
+            f"count(DISTINCT {rowid_col}), "
+            f"count(*) FILTER (WHERE length({file_col}) = 0) "
+            f", count(*) FILTER (WHERE {rowid_col} <= 0) "
+            f", {digest_sql}, list(DISTINCT {file_col}) FROM {relation_sql}",
+        ).fetchone()
+    except Exception as exc:
+        raise RuntimeError(f"Unable to validate deletion-vector rows: {exc}") from exc
+
+    total = int(total)
+    if (
+        int(files) != total
+        or int(rowids) != total
+        or int(empty_files) != 0
+        or int(invalid_rowids) != 0
+    ):
+        raise RuntimeError(
+            "Invalid deletion vector: __file__ and __rowid__ must be non-null "
+            "__file__ must be non-empty, and __rowid__ must be positive"
+        )
+    if int(distinct_rowids) != total:
+        # The reader currently uses the writer's table-global row-id invariant.
+        # Duplicate ids (especially across files) make that boundary ambiguous.
+        raise RuntimeError("Invalid deletion vector: __rowid__ values are not unique")
+    if expected_rows is not None:
+        try:
+            expected = int(expected_rows)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid deletion-vector expected row count") from exc
+        if expected < 0 or total != expected:
+            raise RuntimeError(
+                f"Invalid deletion-vector row count: expected {expected}, got {total}"
+            )
+
+    actual_digest = str(actual_digest).lower()
+    if expected_digest is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected_digest)):
+            raise RuntimeError("Invalid expected deletion-vector SHA-256 digest")
+        if actual_digest != str(expected_digest):
+            raise RuntimeError(
+                "Invalid deletion-vector digest: immutable artifact does not "
+                f"match the pinned snapshot (expected {expected_digest}, "
+                f"got {actual_digest})"
+            )
+
+    referenced_files = frozenset(
+        str(path) for path in (referenced_file_values or ())
+    )
+    if allowed is not None and not referenced_files.issubset(allowed):
+        raise RuntimeError(
+            "Invalid deletion vector: __file__ contains resources outside "
+            "the pinned table snapshot"
+        )
+    return total, actual_digest, referenced_files
+
+
+def validate_tombstone_relation(
+        con: duckdb.DuckDBPyConnection,
+        relation_sql: str,
+        *,
+        expected_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        allowed_files: Optional[List[str]] = None,
+        validate_rows: bool = True,
+) -> tuple[int, str]:
+    """Validate a deletion vector and return its exact count and digest.
+
+    The private details variant also returns the referenced-file set so a
+    cache miss can seal count, digest, and membership with one aggregate scan.
+    Keeping this public return shape stable avoids making cache metadata part
+    of the engine helper API.
+    """
+    count, digest, _files = _validate_tombstone_relation_details(
+        con,
+        relation_sql,
+        expected_rows=expected_rows,
+        expected_digest=expected_digest,
+        allowed_files=allowed_files,
+        validate_rows=validate_rows,
+    )
+    return count, digest
+
+
+def _validate_tombstone_source_rowids(
+        con: duckdb.DuckDBPyConnection,
+        source_table: str,
+        *,
+        selected_resource_keys: List[str],
+        referenced_dv_files: frozenset[str],
+) -> None:
+    """Fail closed when a DV key could identify more than one source row.
+
+    The persisted deletion-vector identity is ``(__file__, __rowid__)``.  Its
+    own schema/count/digest seal cannot prove that an older immutable data file
+    does not contain the same row id twice.  If it does, anti-joining one DV
+    entry removes both physical rows and silently loses the unrelated one.
+
+    Scan only selected files that the pinned vector actually references.  The
+    reflection exposes their exact stable keys through ``SOURCE_FILE_COL``;
+    binary collation preserves case-sensitive object-key identity even on the
+    pooled connections whose default collation is ``nocase``.  No process cache
+    is used here because snapshots currently carry no immutable content seal
+    (etag/digest) for data resources with which to fence such a cache safely.
+    """
+    selected_referenced = [
+        str(path) for path in selected_resource_keys
+        if str(path) in referenced_dv_files
+    ]
+    if not selected_referenced:
+        return
+
+    source = quote_if_needed(source_table)
+    source_file = quote_if_needed(SOURCE_FILE_COL)
+    rowid = quote_if_needed(ROWID_COL)
+    try:
+        invalid = con.execute(
+            "SELECT count(*) AS total_rows, "
+            f"count(src.{rowid}) AS nonnull_rows, "
+            f"count(DISTINCT src.{rowid}) AS unique_rows, "
+            f"min(src.{rowid}) AS min_rowid "
+            f"FROM {source} AS src "
+            "SEMI JOIN unnest(?) AS dv(__file__) ON "
+            f"(src.{source_file} COLLATE \"binary\") = "
+            "(dv.__file__ COLLATE \"binary\") "
+            f"GROUP BY src.{source_file} COLLATE \"binary\" "
+            f"HAVING count(*) <> count(src.{rowid}) "
+            f"OR count(*) <> count(DISTINCT src.{rowid}) "
+            f"OR min(src.{rowid}) IS NULL OR min(src.{rowid}) <= 0 "
+            "LIMIT 1",
+            [selected_referenced],
+        ).fetchone()
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to prove deletion-vector source row-id integrity"
+        ) from exc
+
+    if invalid is not None:
+        total, nonnull, unique, minimum = invalid
+        if int(nonnull) != int(total):
+            defect = "NULL"
+        elif minimum is None or int(minimum) <= 0:
+            defect = "non-positive"
+        else:
+            defect = "duplicate"
+        raise RuntimeError(
+            "Cannot safely apply deletion vector: a referenced source file "
+            f"contains {defect} __rowid__ values"
+        )
 
 
 def create_tombstone_view(
@@ -1251,14 +1966,14 @@ def create_tombstone_view(
          columns are stripped.  The deletion-vector comes from one of two
          sources, in priority order:
 
-         * *dv_table* — a pre-materialised ``DISTINCT __rowid__`` table
-           (see :class:`TombstoneCache`).  Built once and reused across
-           queries, avoiding a parquet re-read per query.
+         * *dv_table* — a validated, pre-materialised
+           ``(__file__, __rowid__)`` table (see :class:`TombstoneCache`). Built
+           once and reused across queries, avoiding a parquet re-read per query.
          * *tombstone_def.tombstone_path* — inline ``read_parquet`` of the
            deletion-vector parquet.  Used when the cache is disabled or has
            no stable key.  This is the legacy path and is semantically
-           identical to the cached one (same ``DISTINCT __rowid__`` set,
-           same anti-join, same ``__dv__`` alias).
+           identical to the cached one (same composite identities, same
+           anti-join, same ``__dv__`` alias).
 
     This view sits directly on top of the reflection table (before RBAC),
     so the anti-join still has ``__rowid__`` available and RBAC never sees
@@ -1278,34 +1993,169 @@ def create_tombstone_view(
     # table's columns reach the output, so the unqualified ``COLUMNS()`` never
     # picks up the deletion-vector's ``__rowid__``.
     live_cols = (
-        f"COLUMNS(c -> c NOT IN ('{ROWID_COL}', '{TIMESTAMP_COL}'))"
+        f"COLUMNS(c -> c NOT IN ('{ROWID_COL}', '{TIMESTAMP_COL}', "
+        f"'{TOMBSTONE_FILE_COL}', '{SOURCE_FILE_COL}', '{SCAN_FILENAME_COL}'))"
     )
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    expected_rows = getattr(tombstone_def, "expected_rows", None) if tombstone_def else None
+    expected_digest = getattr(tombstone_def, "tombstone_digest", None) if tombstone_def else None
+    resource_keys = list(getattr(tombstone_def, "resource_keys", ()) or ()) if tombstone_def else []
+    raw_snapshot_keys = (
+        getattr(tombstone_def, "snapshot_resource_keys", None)
+        if tombstone_def else None
+    )
+    allowed_dv_files = (
+        list(raw_snapshot_keys)
+        if raw_snapshot_keys is not None
+        else (resource_keys or None)
+    )
     rid = quote_if_needed(ROWID_COL)
+    file_col = quote_if_needed(TOMBSTONE_FILE_COL)
+    source_file_col = quote_if_needed(SOURCE_FILE_COL)
+    source_desc = _describe_relation(con, quote_if_needed(source_table))
+    canonical_reserved = {
+        ROWID_COL.casefold(): ROWID_COL,
+        TIMESTAMP_COL.casefold(): TIMESTAMP_COL,
+        SOURCE_FILE_COL.casefold(): SOURCE_FILE_COL,
+        SCAN_FILENAME_COL.casefold(): SCAN_FILENAME_COL,
+        TOMBSTONE_FILE_COL.casefold(): TOMBSTONE_FILE_COL,
+    }
+    seen_reserved = set()
+    for row in source_desc:
+        name = str(row[0])
+        folded = name.casefold()
+        is_reserved = folded in canonical_reserved or folded.startswith("__supertable_")
+        if not is_reserved:
+            continue
+        expected = canonical_reserved.get(folded)
+        if expected is None or name != expected or folded in seen_reserved:
+            raise RuntimeError(
+                f"Invalid reserved system column in reflection schema: {name!r}"
+            )
+        seen_reserved.add(folded)
+    if tomb_path:
+        rowid_rows = [row for row in source_desc if str(row[0]) == ROWID_COL]
+        if len(rowid_rows) != 1 or str(rowid_rows[0][1]).upper() != "BIGINT":
+            raise RuntimeError(
+                "Cannot apply deletion vector: source requires canonical "
+                "__rowid__ BIGINT"
+            )
+        if not resource_keys:
+            raise RuntimeError(
+                "Cannot apply deletion vector without positional canonical "
+                "resource keys for a composite anti-join"
+            )
+    if tomb_path and resource_keys:
+        source_schema = {
+            str(row[0]) for row in source_desc
+        }
+        if SOURCE_FILE_COL not in source_schema:
+            raise RuntimeError(
+                "Cannot apply composite deletion vector: reflection has no "
+                "canonical source-file identity"
+            )
 
+    referenced_dv_files: frozenset[str] = frozenset()
     if dv_table:
-        # Cached deletion-vector: anti-join the already-materialised table.
-        # Semantically identical to the inline subquery below — the table is
-        # exactly `SELECT DISTINCT __rowid__ FROM read_parquet(...)`.
+        # Tables returned by TombstoneCache were fully checked once when they
+        # were materialised.  Direct callers receive the same full validation
+        # here instead of being able to smuggle a partial/malformed relation
+        # into the anti-join.
+        if not isinstance(dv_table, ValidatedTombstoneTable):
+            _, _, referenced_dv_files = _validate_tombstone_relation_details(
+                con,
+                quote_if_needed(str(dv_table)),
+                expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                allowed_files=allowed_dv_files,
+                validate_rows=True,
+            )
+        else:
+            referenced_dv_files = dv_table.referenced_files
+        if (
+            isinstance(dv_table, ValidatedTombstoneTable)
+            and expected_rows is not None
+            and dv_table.row_count != int(expected_rows)
+        ):
+            raise RuntimeError(
+                "Invalid deletion-vector row count: expected "
+                f"{int(expected_rows)}, got {dv_table.row_count}"
+            )
+        if (
+            isinstance(dv_table, ValidatedTombstoneTable)
+            and expected_digest is not None
+            and dv_table.digest != expected_digest
+        ):
+            raise RuntimeError(
+                "Invalid deletion-vector digest: cached artifact does not match "
+                "the pinned snapshot"
+            )
+        if (
+            isinstance(dv_table, ValidatedTombstoneTable)
+            and allowed_dv_files is not None
+        ):
+            if not dv_table.referenced_files.issubset(
+                {str(path) for path in allowed_dv_files}
+            ):
+                raise RuntimeError(
+                    "Invalid deletion vector: __file__ contains resources "
+                    "outside the pinned table snapshot"
+                )
+        # Cached deletion-vector: anti-join the already-materialised composite
+        # identity table. It is semantically identical to the inline subquery.
+        join_clause = f"{source_table}.{rid} = __dv__.{rid}"
+        if resource_keys:
+            join_clause += (
+                f" AND ({source_table}.{source_file_col} COLLATE \"binary\") "
+                f"= (__dv__.{file_col} COLLATE \"binary\")"
+            )
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table} "
             f"ANTI JOIN {dv_table} AS __dv__ "
-            f"ON {source_table}.{rid} = __dv__.{rid};"
+            f"ON {join_clause};"
         )
     elif tomb_path:
         escaped = escape_parquet_path(tomb_path)
+        # Tombstones are physically stored below Hive-looking
+        # year=/month=/day=/hour= directories.  Those path components are not
+        # DV columns; inference would widen the relation's sealed two-column
+        # schema and can make cached/inline validation disagree.
+        relation = (
+            f"read_parquet('{escaped}', hive_partitioning=false)"
+        )
+        _, _, referenced_dv_files = _validate_tombstone_relation_details(
+            con, relation, expected_rows=expected_rows,
+            expected_digest=expected_digest,
+            allowed_files=allowed_dv_files, validate_rows=True,
+        )
+        dv_projection = f"DISTINCT {rid}"
+        join_clause = f"{source_table}.{rid} = __dv__.{rid}"
+        if resource_keys:
+            dv_projection = f"DISTINCT {file_col}, {rid}"
+            join_clause += (
+                f" AND ({source_table}.{source_file_col} COLLATE \"binary\") "
+                f"= (__dv__.{file_col} COLLATE \"binary\")"
+            )
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table} "
-            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet('{escaped}')) AS __dv__ "
-            f"ON {source_table}.{rid} = __dv__.{rid};"
+            f"ANTI JOIN (SELECT {dv_projection} FROM "
+            f"read_parquet('{escaped}', hive_partitioning=false)) AS __dv__ "
+            f"ON {join_clause};"
         )
     else:
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table};"
+        )
+    if tomb_path:
+        _validate_tombstone_source_rowids(
+            con,
+            source_table,
+            selected_resource_keys=resource_keys,
+            referenced_dv_files=referenced_dv_files,
         )
     con.execute(sql)
 
@@ -1327,7 +2177,10 @@ class _DVCacheEntry:
 
 def dv_table_name(cache_key: str) -> str:
     """Deterministic DuckDB table name for a deletion-vector cache key."""
-    h = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:16]
+    # Keep the full digest.  A shortened name is not merely a cache miss risk:
+    # CREATE OR REPLACE on a collision can swap the DV under an in-flight query
+    # and either resurrect a deleted row or hide a live one.
+    h = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
     return f"dv_{h}"
 
 
@@ -1343,6 +2196,14 @@ def dv_table_id(cache_key: str) -> str:
     relaxes the per-table cap for that key — never a correctness issue, since
     the materialised DV table is keyed by the path hash regardless).
     """
+    # New artifacts are hour-partitioned below ``tombstone/``.  Group all
+    # hours/versions of one table together rather than treating each hour as a
+    # different logical table and accidentally multiplying the cache cap.
+    normalized = cache_key.replace("\\", "/")
+    marker = "/tombstone/"
+    marker_idx = normalized.lower().find(marker)
+    if marker_idx >= 0:
+        return normalized[:marker_idx + len("/tombstone")]
     idx = max(cache_key.rfind("/"), cache_key.rfind("\\"))
     return cache_key[:idx] if idx > 0 else cache_key
 
@@ -1354,15 +2215,12 @@ class TombstoneCache:
     Why a table and not the inline subquery?  The tombstone parquet is
     re-read on every query in the inline form.  Because the tombstone path is
     stable across pure appends (the writer carries forward the previous
-    deletion-vector when a write adds no new deletes), the same
-    ``DISTINCT __rowid__`` set is recomputed needlessly.  Materialising it
-    once — ``CREATE TABLE dv_<hash> AS SELECT DISTINCT __rowid__ FROM
-    read_parquet(path)`` — lets every subsequent tombstone view ANTI JOIN the
-    table directly.  The anti-join result is bit-identical to the inline form.
+    deletion-vector when a write adds no new deletes), the same validated
+    composite identity relation is recomputed needlessly. Materialising it
+    once lets every subsequent tombstone view ANTI JOIN the table directly.
+    The anti-join result is bit-identical to the inline form.
 
-    Eviction is entirely per logical table — a frequently-changing table can
-    never evict a slowly-changing table's cached deletion-vector — and rests on
-    two independent, table-local rules:
+    Eviction combines table-local fairness with a process-wide safety ceiling:
 
       * **Idle TTL.**  Every entry carries ``expires_at = now + ttl``, refreshed
         on every acquire.  The lazy sweep drops any unreferenced entry past its
@@ -1377,9 +2235,9 @@ class TombstoneCache:
         and touches no other table.  ``capacity <= 0`` disables the cache
         entirely (callers fall back to the inline ``read_parquet`` path).
 
-    There is no global ceiling: total residency is bounded by the number of
-    tables queried within the TTL window times ``capacity`` versions each,
-    reclaimed by the idle TTL or by a connection reset.
+      * **Global cap.** At most ``global_capacity`` entries remain resident;
+        the oldest unreferenced entry is evicted across tables when necessary.
+        In-flight entries are never dropped, so a brief overage is allowed.
 
     Thread-safe: every registry mutation and the DDL it triggers is guarded
     by an internal lock.  The lock is only ever acquired *after* an engine's
@@ -1390,11 +2248,13 @@ class TombstoneCache:
             self,
             capacity: int,
             ttl_seconds: int = 0,
+            global_capacity: int = 128,
             *,
             time_fn: Callable[[], float] = time.monotonic,
     ):
         self.capacity = capacity
         self.ttl_seconds = ttl_seconds
+        self.global_capacity = global_capacity
         self._time = time_fn
         self._lock = threading.Lock()
         self._registry: Dict[str, _DVCacheEntry] = {}   # cache_key -> entry
@@ -1409,6 +2269,8 @@ class TombstoneCache:
             con: duckdb.DuckDBPyConnection,
             cache_key: Optional[str],
             duckdb_path: Optional[str],
+            expected_rows: Optional[int] = None,
+            expected_digest: Optional[str] = None,
     ) -> Optional[str]:
         """Return the DV table name for *cache_key*, materialising it on miss,
         refreshing its idle TTL, and incrementing its ref count.  Returns
@@ -1421,19 +2283,90 @@ class TombstoneCache:
         with self._lock:
             entry = self._registry.get(cache_key)
             if entry is None:
-                table_name = dv_table_name(cache_key)
+                base_table_name = dv_table_name(cache_key)
+                table_name = base_table_name
+                occupied_names = {
+                    str(existing.table_name)
+                    for existing in self._registry.values()
+                }
+                if table_name in occupied_names:
+                    table_name = f"{base_table_name}_{uuid.uuid4().hex}"
                 rid = quote_if_needed(ROWID_COL)
+                file_col = quote_if_needed(TOMBSTONE_FILE_COL)
                 escaped = escape_parquet_path(duckdb_path)
-                con.execute(
-                    f"CREATE TABLE IF NOT EXISTS {table_name} AS "
-                    f"SELECT DISTINCT {rid} FROM read_parquet('{escaped}');"
+                relation = (
+                    f"read_parquet('{escaped}', hive_partitioning=false)"
                 )
+                # Materialise privately, validate, and only then publish a
+                # registry entry.  Validating the table (rather than scanning
+                # the parquet first and then CTAS-ing it) keeps a cache miss to
+                # one remote read. CTAS retains both fields because DuckDB
+                # reflections expose the stable key required by the composite
+                # anti-join.
+                # CREATE (never CREATE OR REPLACE) is the ownership boundary:
+                # an unregistered table can still be referenced by an
+                # in-flight cursor after a connection/cache reset.  If the
+                # deterministic name is already present, allocate a private
+                # suffix and retry; never overwrite or DROP the unknown table.
+                while True:
+                    try:
+                        con.execute(
+                            f"CREATE TABLE {table_name} AS "
+                            f"SELECT {file_col}, {rid} FROM {relation};"
+                        )
+                        break
+                    except duckdb.CatalogException as create_err:
+                        if "already exists" not in str(create_err).lower():
+                            raise
+                        table_name = (
+                            f"{base_table_name}_{uuid.uuid4().hex}"
+                        )
+                try:
+                    (
+                        row_count,
+                        digest,
+                        referenced_files,
+                    ) = _validate_tombstone_relation_details(
+                        con, quote_if_needed(table_name),
+                        expected_rows=expected_rows,
+                        expected_digest=expected_digest,
+                        validate_rows=True,
+                    )
+                except Exception:
+                    try:
+                        con.execute(f"DROP TABLE IF EXISTS {table_name};")
+                    except Exception:
+                        pass
+                    raise
                 entry = _DVCacheEntry(
-                    table_name=table_name,
+                    table_name=ValidatedTombstoneTable(
+                        table_name, row_count, digest,
+                        referenced_files,
+                    ),
                     cache_key=cache_key,
                     table_id=dv_table_id(cache_key),
                 )
                 self._registry[cache_key] = entry
+
+            if expected_rows is not None:
+                table_count = getattr(entry.table_name, "row_count", -1)
+                try:
+                    expected = int(expected_rows)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("Invalid deletion-vector expected row count") from exc
+                if expected < 0 or table_count != expected:
+                    raise RuntimeError(
+                        f"Invalid deletion-vector row count: expected {expected}, "
+                        f"got {table_count}"
+                    )
+
+            if expected_digest is not None:
+                cached_digest = getattr(entry.table_name, "digest", None)
+                if cached_digest != expected_digest:
+                    raise RuntimeError(
+                        "Invalid deletion-vector digest: cached artifact does "
+                        "not match the pinned snapshot"
+                    )
 
             entry.ref_count += 1
             self._tick += 1
@@ -1500,6 +2433,18 @@ class TombstoneCache:
             entries.sort(key=lambda e: e.last_used)   # oldest first
             excess = len(entries) - self.capacity
             for e in entries:
+                if excess <= 0:
+                    break
+                if e.ref_count == 0:
+                    self._drop_entry_locked(con, e)
+                    excess -= 1
+
+        if self.global_capacity > 0 and len(self._registry) > self.global_capacity:
+            excess = len(self._registry) - self.global_capacity
+            global_lru = sorted(
+                self._registry.values(), key=lambda e: e.last_used,
+            )
+            for e in global_lru:
                 if excess <= 0:
                     break
                 if e.ref_count == 0:

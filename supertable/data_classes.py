@@ -66,6 +66,36 @@ class SuperSnapshot:
     simple_version: int
     files: List[str] = field(default_factory=list)
     columns: Set[str] = field(default_factory=set)
+    # Stable catalog object keys corresponding one-for-one with ``files``.
+    # Executors use these to prove that every deletion-vector entry belongs to
+    # a resource in the pinned snapshot; resolved/presigned scan URLs are not a
+    # stable identity boundary.
+    resource_keys: List[str] = field(default_factory=list)
+    # Snapshot schema types keyed by column name.  Needed to construct a typed
+    # zero-row reflection after a metadata-only delete-all sunsets every file.
+    column_types: Dict[str, str] = field(default_factory=dict)
+    # Complete raw resource set from the pinned snapshot, before WHERE/join
+    # pruning.  DV file binding is checked against this set because a valid DV
+    # may contain deletes for files irrelevant to the current query.
+    # ``None`` means legacy/unavailable; an empty list is authoritative.
+    snapshot_resource_keys: Optional[List[str]] = None
+    # Metadata below is pinned from the *same* immutable snapshot document as
+    # ``files``.  Keeping it on the reflection prevents DataReader from doing a
+    # second Redis leaf lookup and accidentally combining one version's files
+    # with a newer version's deletion-vector.
+    snapshot_path: Optional[str] = None
+    # Bare/stable object key as recorded in the snapshot.  DataReader resolves
+    # it for the selected engine/storage and uses it as the DV cache key.
+    tombstone_key: Optional[str] = None
+    # Exact row count recorded beside ``tombstone_key``.  ``None`` supports
+    # snapshots written before the count was introduced.
+    tombstone_rows: Optional[int] = None
+    # SHA-256 of the canonical deletion-vector row stream pinned beside the
+    # pointer/count. Required for active modern deletion vectors.
+    tombstone_digest: Optional[str] = None
+    # Linked-share policy is leaf payload metadata and must be pinned alongside
+    # the data snapshot for the same split-read reason.
+    share_row_filter: Optional[str] = None
 
 
 @dataclass
@@ -101,9 +131,19 @@ class TombstoneDef:
       returns the previous tombstone), so DuckDB engines use it to key the
       materialised deletion-vector table cache.  ``None`` disables caching
       for this alias (falls back to inline ``read_parquet``).
+    - expected_rows: snapshot-pinned deletion-vector cardinality, when the
+      writer recorded it.  Executors can use this to validate the immutable
+      artifact before applying it; ``None`` is the legacy/unknown case.
     """
     tombstone_path: Optional[str] = None
     cache_key: Optional[str] = None
+    expected_rows: Optional[int] = None
+    tombstone_digest: Optional[str] = None
+    # Stable raw resource keys from the exact pinned snapshot.  A deletion
+    # vector naming a foreign/sunset file is rejected before it can hide a live
+    # row with a coincidentally equal row id.
+    resource_keys: Tuple[str, ...] = field(default_factory=tuple)
+    snapshot_resource_keys: Optional[Tuple[str, ...]] = None
 
 
 @dataclass

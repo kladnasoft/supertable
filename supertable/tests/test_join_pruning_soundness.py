@@ -324,6 +324,9 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
                     {"file": f, "file_size": 1000, "rows": 100}
                     for f in a_files
                 ],
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
             },
         },
         {
@@ -337,6 +340,9 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
                 "resources": [
                     {"file": "b/f00.parquet", "file_size": 1000, "rows": 100}
                 ],
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
             },
         },
     ]

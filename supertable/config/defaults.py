@@ -30,6 +30,7 @@ class Default:
     MAX_MEMORY_CHUNK_SIZE: int = 16 * 1024 * 1024
     MAX_OVERLAPPING_FILES: int = 100
     MAX_TOMBSTONE_ROWS: int = 1_000_000
+    TOMBSTONE_COMPACTION_WORKERS: int = 2
     DEFAULT_TIMEOUT_SEC: int = 60
     DEFAULT_LOCK_DURATION_SEC: int = 30
     LOG_LEVEL: str = "INFO"
@@ -59,6 +60,7 @@ def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = Tr
         MAX_MEMORY_CHUNK_SIZE=settings.MAX_MEMORY_CHUNK_SIZE,
         MAX_OVERLAPPING_FILES=settings.MAX_OVERLAPPING_FILES,
         MAX_TOMBSTONE_ROWS=settings.MAX_TOMBSTONE_ROWS,
+        TOMBSTONE_COMPACTION_WORKERS=settings.TOMBSTONE_COMPACTION_WORKERS,
         DEFAULT_TIMEOUT_SEC=settings.DEFAULT_TIMEOUT_SEC,
         DEFAULT_LOCK_DURATION_SEC=settings.DEFAULT_LOCK_DURATION_SEC,
         LOG_LEVEL=log_level,

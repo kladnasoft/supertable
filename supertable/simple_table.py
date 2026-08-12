@@ -10,6 +10,7 @@ from supertable.errors import TableNotFoundError
 from supertable.redis_catalog import RedisCatalog
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
+from supertable.utils.snapshot import complete_snapshot_payload
 from supertable.utils.profiler import Profiler, get_null_profiler
 import json
 from typing import Any, Dict, List, Optional
@@ -177,6 +178,12 @@ class SimpleTable:
             "resources": [],
             "tombstone": None,
             "tombstone_rows": 0,
+            "tombstone_digest": None,
+            # Durable recovery floor for the Redis-backed fast row-id
+            # allocator.  Writers atomically reserve strictly above this value,
+            # so restoring/losing the Redis counter cannot reuse an identifier
+            # that immutable Parquet data may still contain.
+            "rowid_high_watermark": 0,
             "stats_file": None,
             "stats_rows": 0,
         }
@@ -184,9 +191,12 @@ class SimpleTable:
 
         # CAS set leaf to that path (version becomes 0)
         now_ms = int(datetime.now().timestamp() * 1000)
-        try:
-            # Prefer storing snapshot payload in Redis so readers can avoid storage reads.
-            self.catalog.set_leaf_payload_cas(
+        payload_setter = getattr(self.catalog, "set_leaf_payload_cas", None)
+        if callable(payload_setter):
+            # Once publication is attempted, every exception is propagated: a
+            # timeout may mean Redis committed the payload, and retrying a
+            # weaker path-only update would make the outcome ambiguous.
+            payload_setter(
                 self.super_table.organization,
                 self.super_table.super_name,
                 self.simple_name,
@@ -194,14 +204,10 @@ class SimpleTable:
                 new_simple_path,
                 now_ms=now_ms,
             )
-        except Exception:
-            # Backward compatible fallback.
-            self.catalog.set_leaf_path_cas(
-                self.super_table.organization,
-                self.super_table.super_name,
-                self.simple_name,
-                new_simple_path,
-                now_ms=now_ms,
+        else:
+            raise RuntimeError(
+                "Catalog does not support atomic initialize-only leaf payloads; "
+                "refusing to create an ambiguous table snapshot"
             )
 
     def delete(self, role_name: str) -> None:
@@ -240,17 +246,19 @@ class SimpleTable:
         ptr = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
         if not ptr or not ptr.get("path"):
             raise FileNotFoundError("No path found in simple table leaf pointer.")
+        # Preserve the exact leaf document that selected this snapshot.  The
+        # writer uses its path/version as the compare-and-swap base when it
+        # atomically publishes the successor.  Re-fetching later would create
+        # a time-of-check/time-of-use gap after lock expiry or takeover.
+        self._last_snapshot_leaf = dict(ptr)
         path = ptr["path"]
 
-        payload = ptr.get("payload") if isinstance(ptr, dict) else None
-        if isinstance(payload, dict):
-            # Common: payload is the snapshot dict itself.
-            if isinstance(payload.get("resources"), list):
-                return payload, path
-            # Also support nested snapshot shapes.
-            snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
-            if isinstance(snap, dict) and isinstance(snap.get("resources"), list):
-                return snap, path
+        payload = complete_snapshot_payload(
+            ptr.get("payload") if isinstance(ptr, dict) else None,
+            expected_version=ptr.get("version") if isinstance(ptr, dict) else None,
+        )
+        if payload is not None:
+            return payload, path
 
         data = self.storage.read_json(path)
         return data, path
@@ -282,7 +290,12 @@ class SimpleTable:
             ``dict`` with ``files`` (list of written paths),
             ``files_written``, ``total_rows`` and ``total_bytes``.
         """
-        from supertable.processing import compact_resources, ROWID_COL, _read_parquet_safe
+        from supertable.processing import (
+            compact_resources,
+            ROWID_COL,
+            TOMBSTONE_FILE_COL,
+            load_tombstone,
+        )
 
         snapshot, _path = self.get_simple_table_snapshot()
         table_config = self.catalog.get_table_config(
@@ -293,12 +306,28 @@ class SimpleTable:
 
         # Read the deletion-vector (if any) so its rows are dropped from
         # the export rather than copied verbatim.
-        dead_rowids = None
+        dead_rowids_by_file = None
         tombstone_path = snapshot.get("tombstone")
         if tombstone_path:
-            tomb_df = _read_parquet_safe(tombstone_path)
-            if tomb_df is not None and ROWID_COL in tomb_df.columns:
-                dead_rowids = set(tomb_df.get_column(ROWID_COL).drop_nulls().to_list())
+            tomb_df = load_tombstone(
+                tombstone_path,
+                allow_cache=False,
+                required=True,
+                expected_rows=snapshot.get("tombstone_rows"),
+                expected_digest=snapshot.get("tombstone_digest"),
+                allowed_files={
+                    resource.get("file")
+                    for resource in (snapshot.get("resources") or [])
+                    if isinstance(resource, dict) and resource.get("file")
+                },
+            )
+            if tomb_df is None:  # defensive: required=True must raise instead
+                raise RuntimeError("Required deletion-vector could not be loaded")
+            dead_rowids_by_file = {}
+            for file_key, rowid in tomb_df.select(
+                [TOMBSTONE_FILE_COL, ROWID_COL]
+            ).iter_rows():
+                dead_rowids_by_file.setdefault(str(file_key), set()).add(int(rowid))
 
         _considered, total_rows, new_resources, _sunset = compact_resources(
             snapshot=snapshot,
@@ -306,7 +335,8 @@ class SimpleTable:
             compression_level=compression_level,
             table_config=table_config,
             small_only=small_only,
-            dead_rowids=dead_rowids,
+            dead_rowids_by_file=dead_rowids_by_file,
+            required_reads=True,
         )
 
         files = [r.get("file") for r in new_resources if isinstance(r, dict) and r.get("file")]

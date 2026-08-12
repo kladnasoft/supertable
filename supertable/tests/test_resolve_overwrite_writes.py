@@ -203,27 +203,50 @@ class TestLegacyFiles:
     def test_legacy_key_newer_than_modern(self, tmp_path):
         m, lnt, lnr = self._legacy_set(tmp_path)
         incoming = pl.DataFrame({"user_id": [10], "v": [1], "updated_at": [100]})
-        _compare(incoming, {m, lnt, lnr}, ["user_id"], "updated_at")
+        with pytest.raises((ValueError, Exception), match="rowid|__rowid__|column"):
+            resolve_overwrite_writes(incoming, {m, lnt, lnr}, ["user_id"], "updated_at")
 
     def test_legacy_key_stale_against_legacy_ts(self, tmp_path):
         m, lnt, lnr = self._legacy_set(tmp_path)
         # legacy_no_rowid carries updated_at=99 for user 10 → incoming 50 is stale.
         incoming = pl.DataFrame({"user_id": [10], "v": [1], "updated_at": [50]})
-        filt, pairs, _ = _compare(incoming, {m, lnt, lnr}, ["user_id"], "updated_at")
-        assert filt.height == 0 and pairs == []
+        with pytest.raises((ValueError, Exception), match="rowid|__rowid__|column"):
+            resolve_overwrite_writes(incoming, {m, lnt, lnr}, ["user_id"], "updated_at")
 
     def test_legacy_missing_newer_than_treated_new(self, tmp_path):
         m, lnt, lnr = self._legacy_set(tmp_path)
         # user 5 has ts=7 (modern) and a legacy row lacking ts; incoming 8 > 7.
         _compare(incoming=pl.DataFrame({"user_id": [5], "v": [1], "updated_at": [8]}),
-                 files={m, lnt, lnr}, keys=["user_id"], ntc="updated_at")
+                 files={m, lnt}, keys=["user_id"], ntc="updated_at")
 
     def test_no_newer_than_delete_upsert(self, tmp_path):
         m, lnt, lnr = self._legacy_set(tmp_path)
         # No newer_than: every matching existing rowid is tombstoned; rows kept.
         incoming = pl.DataFrame({"user_id": [5, 10], "v": [1, 2]})
-        filt, pairs, _ = _compare(incoming, {m, lnt, lnr}, ["user_id"], None)
+        filt, pairs, _ = _compare(incoming, {m, lnt}, ["user_id"], None)
         assert filt.height == 2  # nothing filtered without newer_than
+
+    def test_missing_key_plus_incoming_null_aborts_instead_of_false_tombstone(self, tmp_path):
+        modern = _write(tmp_path, "modern.parquet", pl.DataFrame(
+            {"__rowid__": [1], "user_id": pl.Series([5], dtype=pl.Int64)}))
+        missing_key = _write(tmp_path, "missing_key.parquet", pl.DataFrame(
+            {"__rowid__": [2], "value": ["unrelated"]}))
+        incoming = pl.DataFrame({
+            "user_id": pl.Series([None], dtype=pl.Int64), "value": ["new"],
+        })
+
+        with pytest.raises((ValueError, Exception), match="user_id|column"):
+            resolve_overwrite_writes(
+                incoming, {modern, missing_key}, ["user_id"], None
+            )
+
+    def test_missing_rowid_aborts_instead_of_partial_overwrite(self, tmp_path):
+        legacy = _write(tmp_path, "missing_rowid.parquet", pl.DataFrame(
+            {"user_id": [5], "value": ["old"]}))
+        incoming = pl.DataFrame({"user_id": [5], "value": ["new"]})
+
+        with pytest.raises((ValueError, Exception), match="rowid|__rowid__|column"):
+            resolve_overwrite_writes(incoming, {legacy}, ["user_id"], None)
 
 
 # ---------------------------------------------------------------------------
@@ -254,3 +277,117 @@ class TestNullKeys:
             "user_id": pl.Series([None], dtype=pl.Int64), "v": [1], "updated_at": [6]})
         filt, pairs, _ = _compare(incoming, {f}, ["user_id"], "updated_at")
         assert filt.height == 0 and pairs == []
+
+
+class TestProbeStrictEquivalence:
+
+    def test_duplicate_source_rowid_aborts_before_emitting_tombstone(
+            self, tmp_path,
+    ):
+        source = _write(tmp_path, "duplicate-rowid.parquet", pl.DataFrame({
+            "__rowid__": pl.Series([7, 7], dtype=pl.Int64),
+            "key": [1, 2],
+        }))
+
+        with pytest.raises(ValueError, match="duplicate rowids"):
+            resolve_overwrite_writes(
+                pl.DataFrame({"key": [1]}),
+                {source},
+                ["key"],
+                None,
+            )
+
+    def test_dead_newer_row_cannot_make_valid_reinsertion_stale(self, tmp_path):
+        f = _write(tmp_path, "dead-newer.parquet", pl.DataFrame({
+            "__rowid__": [1], "key": [7], "version": [100],
+        }))
+        incoming = pl.DataFrame({"key": [7], "version": [50]})
+        tombstones = pl.DataFrame(
+            {"__file__": [f[0]], "__rowid__": [1]},
+            schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+        )
+        filtered, pairs = resolve_overwrite_writes(
+            incoming, {f}, ["key"], "version",
+            existing_tombstones=tombstones,
+        )
+        assert filtered.rows() == [(7, 50)]
+        assert pairs == []
+
+    def test_polars_fallback_does_not_expand_full_vector_to_python_sets(
+            self, tmp_path, monkeypatch,
+    ):
+        f = _write(tmp_path, "dead.parquet", pl.DataFrame({
+            "__rowid__": [1], "key": [7], "version": [100],
+        }))
+        incoming = pl.DataFrame({"key": [7], "version": [50]})
+        tombstones = pl.DataFrame(
+            {
+                "__file__": [f[0]] + ["unrelated.parquet"] * 1_000,
+                "__rowid__": list(range(1, 1_002)),
+            },
+            schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+        )
+        monkeypatch.setattr(
+            st_processing,
+            "settings",
+            dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=False),
+        )
+        original_to_list = pl.Series.to_list
+
+        def reject_large_python_expansion(series):
+            if len(series) > 10:
+                raise AssertionError("full deletion vector expanded to Python objects")
+            return original_to_list(series)
+
+        monkeypatch.setattr(pl.Series, "to_list", reject_large_python_expansion)
+        filtered, pairs = resolve_overwrite_writes(
+            incoming, {f}, ["key"], "version",
+            existing_tombstones=tombstones,
+        )
+
+        assert filtered.rows() == [(7, 50)]
+        assert pairs == []
+
+    def test_noninjective_resolved_paths_fall_back_without_wrong_file_key(
+            self, tmp_path, monkeypatch,
+    ):
+        a = _write(tmp_path, "a.parquet", pl.DataFrame({
+            "__rowid__": [1], "key": [7],
+        }))
+        b = _write(tmp_path, "b.parquet", pl.DataFrame({
+            "__rowid__": [2], "key": [7],
+        }))
+        monkeypatch.setattr(
+            st_processing, "_storage_duckdb_path",
+            lambda storage, key, force_presign=False: "same-resolved-url",
+        )
+        prof = Profiler()
+        filtered, pairs = resolve_overwrite_writes(
+            pl.DataFrame({"key": [7]}),
+            {a, b},
+            ["key"],
+            None,
+            profiler=prof,
+        )
+
+        assert filtered.rows() == [(7,)]
+        assert sorted(pairs) == sorted([(a[0], 1), (b[0], 2)])
+        assert prof.emit_counts().get("overwrite_resolve_fallback") == 1
+
+    def test_string_keys_remain_case_sensitive_under_nocase_connection(self, tmp_path):
+        f = _write(tmp_path, "case.parquet", pl.DataFrame(
+            {"__rowid__": [1], "key": ["A"], "value": ["old"]}))
+        incoming = pl.DataFrame({"key": ["a"], "value": ["new"]})
+        filtered, pairs, _ = _compare(incoming, {f}, ["key"], None)
+        assert filtered.height == 1
+        assert pairs == []
+
+    def test_key_type_mismatch_uses_strict_fallback(self, tmp_path):
+        f = _write(tmp_path, "int32.parquet", pl.DataFrame({
+            "__rowid__": [1],
+            "key": pl.Series([5], dtype=pl.Int32),
+        }))
+        incoming = pl.DataFrame({"key": pl.Series([5], dtype=pl.Int64)})
+        filtered, pairs = resolve_overwrite_writes(incoming, {f}, ["key"], None)
+        assert filtered.height == 1
+        assert pairs == [(f[0], 1)]

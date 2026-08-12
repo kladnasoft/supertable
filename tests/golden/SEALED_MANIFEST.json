@@ -45,8 +45,8 @@
     },
     "basic_zero_file_catalog": {
       "files": {
-        "basic_zero_file_catalog/expected/error.json": "0b26296c07106ae374d1724847333ee2a9b706010bf46415c8c37d86f61dec93",
-        "basic_zero_file_catalog/expected/manifest.json": "6112b8ed30cb6dd6cf67fc85e6553ea6f55b39a99206bb3513c2ba78fb516e01",
+        "basic_zero_file_catalog/expected/manifest.json": "9fea8c0e5d0ac9d37d75bddba1c90dce720076ff120c1d30ecd3bc2310729175",
+        "basic_zero_file_catalog/expected/result.json": "df1d8995fbce85b6da39368de43968e20e8f7eb3ec6025d6060b4a239a2f61a5",
         "basic_zero_file_catalog/input/catalog.json": "271999360eb3c25613f7c3000b3e490c417754802604056ab49bd890fd31ad27"
       }
     },

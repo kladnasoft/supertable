@@ -310,6 +310,12 @@ class SQLParser:
 
         # Internal parsed expression
         self._parsed: exp.Expression = self._parse_query(query, dialect)
+        if not isinstance(self._parsed, exp.Query):
+            raise ValueError(
+                "Only read-only SELECT/WITH/set-operation queries are allowed "
+                "on the supertable read path"
+            )
+        self._reject_unmanaged_table_sources()
 
         # Predicate and join pruning analyses consume the same sqlglot scope
         # graph and are strictly read-only.  Build it lazily and retain an
@@ -327,6 +333,54 @@ class SQLParser:
         self._extract_tables()
         self._cte_names: Set[str] = self._collect_cte_names()
         self._extract_columns()
+
+    def _reject_unmanaged_table_sources(self) -> None:
+        """Reject table functions and path literals on the catalog read path.
+
+        Executors enforce tombstones/RBAC by replacing catalog table nodes
+        with managed views.  A source such as ``read_parquet('/path')`` is not
+        such a node and would execute unchanged, bypassing both protections.
+        Keep scalar/row-generating expressions available, but require every
+        physical table source to be an identifier that can be resolved and
+        rewritten by the catalog pipeline.
+        """
+        for table in self._parsed.find_all(exp.Table):
+            if (
+                table.args.get("version") is not None
+                or table.args.get("when") is not None
+            ):
+                # The catalog currently pins only the current immutable
+                # resource+tombstone snapshot.  Leaving an AS OF clause on the
+                # rewritten temporary view would either error or ask the SQL
+                # backend for unrelated history while applying current delete
+                # state.  Reject until historical resources and their exact DV
+                # can be resolved atomically together.
+                raise ValueError(
+                    "VERSION/TIMESTAMP AS OF is not supported until historical "
+                    "supertable snapshots and deletion vectors can be pinned together"
+                )
+            source = table.this
+            if not isinstance(source, exp.Identifier):
+                rendered = table.sql(dialect=self.dialect)
+                raise ValueError(
+                    "External or table-valued sources are not allowed in "
+                    f"supertable SELECT queries: {rendered}"
+                )
+
+            # DuckDB accepts a quoted filename directly in FROM.  Although it
+            # parses as an Identifier, it is still an unmanaged external scan.
+            name = str(source.this or "")
+            lowered = name.lower()
+            if source.args.get("quoted") and (
+                "/" in name
+                or "\\" in name
+                or lowered.startswith(("s3:", "s3a:", "http:", "https:"))
+                or lowered.endswith((".parquet", ".csv", ".json"))
+            ):
+                raise ValueError(
+                    "External file sources are not allowed in supertable "
+                    f"SELECT queries: {table.sql(dialect=self.dialect)}"
+                )
 
     # ---------------- Parsing helpers ----------------
 
@@ -428,6 +482,7 @@ class SQLParser:
             - If no alias is present, alias = table name.
         """
         alias_to_table: Dict[str, Tuple[str, str]] = {}
+        alias_bindings: Dict[str, Tuple[str, str]] = {}
 
         for table in self._parsed.find_all(exp.Table):
             table_name = table.name
@@ -437,7 +492,16 @@ class SQLParser:
             db_name = self._get_db_name(table) or self.default_super_name
             alias = self._get_alias(table) or table_name
 
-            alias_to_table[alias] = (db_name, table_name)
+            physical = (db_name, table_name)
+            folded_alias = alias.casefold()
+            existing = alias_bindings.get(folded_alias)
+            if existing is not None and existing != physical:
+                raise ValueError(
+                    f"Table alias {alias!r} resolves to multiple physical tables: "
+                    f"{existing[0]}.{existing[1]} and {db_name}.{table_name}"
+                )
+            alias_bindings[folded_alias] = physical
+            alias_to_table[alias] = physical
 
         if not alias_to_table:
             raise ValueError("No tables found in SQL query.")

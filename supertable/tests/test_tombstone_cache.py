@@ -19,6 +19,7 @@ from unittest.mock import patch
 import polars as pl
 import pytest
 
+from supertable import processing
 from supertable.processing import load_tombstone, cache_tombstone, _TOMBSTONE_CACHE
 
 _MOD = "supertable.processing"
@@ -59,6 +60,53 @@ class TestLoadTombstone:
             out = load_tombstone("t/tombstone/v1.parquet")
             mock_read.assert_not_called()
         assert out is df
+
+    def test_sealed_cache_hit_does_not_rescan_or_rehash_vector(self):
+        df = _dv(1)
+        digest = processing.tombstone_digest(df)
+        cache_tombstone(
+            "t/tombstone/v1.parquet",
+            df,
+            expected_rows=1,
+            expected_digest=digest,
+            assume_valid=True,
+        )
+
+        with (
+            patch(f"{_MOD}.validate_tombstone_frame", side_effect=AssertionError("scan")),
+            patch(f"{_MOD}._tombstone_digest_validated", side_effect=AssertionError("hash")),
+            patch(f"{_MOD}._read_parquet_safe", side_effect=AssertionError("read")),
+        ):
+            out = load_tombstone(
+                "t/tombstone/v1.parquet",
+                required=True,
+                expected_rows=1,
+                expected_digest=digest,
+                allowed_files={"f1.parquet"},
+            )
+        assert out is df
+
+    def test_sealed_cache_hit_rejects_conflicting_snapshot_contract(self):
+        df = _dv(1)
+        digest = processing.tombstone_digest(df)
+        cache_tombstone(
+            "t/tombstone/v1.parquet",
+            df,
+            expected_rows=1,
+            expected_digest=digest,
+            assume_valid=True,
+        )
+
+        with pytest.raises(ValueError, match="row-count mismatch"):
+            load_tombstone("t/tombstone/v1.parquet", expected_rows=2)
+        with pytest.raises(ValueError, match="digest mismatch"):
+            load_tombstone(
+                "t/tombstone/v1.parquet", expected_digest="0" * 64,
+            )
+        with pytest.raises(ValueError, match="outside the current snapshot"):
+            load_tombstone(
+                "t/tombstone/v1.parquet", allowed_files={"other.parquet"},
+            )
 
     def test_new_version_misses_and_replaces_latest(self):
         v1, v2 = _dv(1), _dv(2)

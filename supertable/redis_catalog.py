@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import redis
 from supertable.config.defaults import logger
+from supertable.errors import LockLostError, SnapshotCommitConflictError
 
 try:
     from .redis_connector import RedisConnector, RedisOptions
@@ -112,17 +113,12 @@ local new_path = ARGV[1]
 local now_ms = tonumber(ARGV[2])
 
 local cur = redis.call('GET', key)
-local old_version = -1
 if cur then
-  local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj and obj['version'] then
-    old_version = tonumber(obj['version'])
-  end
+  return -1
 end
-local new_version = old_version + 1
-local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path})
+local new_val = cjson.encode({version=0, ts=now_ms, path=new_path})
 redis.call('SET', key, new_val)
-return new_version
+return 0
 """
 
     _LUA_LEAF_PAYLOAD_CAS_SET = """
@@ -132,14 +128,9 @@ local new_path = ARGV[2]
 local now_ms = tonumber(ARGV[3])
 
 local cur = redis.call('GET', key)
-local old_version = -1
 if cur then
-  local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj and obj['version'] then
-    old_version = tonumber(obj['version'])
-  end
+  return -1
 end
-local new_version = old_version + 1
 
 local payload = {}
 local okp, pobj = pcall(cjson.decode, payload_json)
@@ -147,9 +138,9 @@ if okp and pobj then
   payload = pobj
 end
 
-local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path, payload=payload})
+local new_val = cjson.encode({version=0, ts=now_ms, path=new_path, payload=payload})
 redis.call('SET', key, new_val)
-return new_version
+return 0
 """
 
     _LUA_ROOT_BUMP = """
@@ -168,6 +159,282 @@ local new_version = old_version + 1
 local new_val = cjson.encode({version=new_version, ts=now_ms})
 redis.call('SET', key, new_val)
 return new_version
+"""
+
+    # Publish the leaf payload and invalidate the supertable root in one
+    # fenced transaction.  KEYS deliberately include the table lock: checking
+    # it in the same script as the writes closes the expiry/heartbeat race
+    # between a Python ownership check and publication.
+    #
+    # Return codes:
+    #   1  committed
+    #  -1  stale base leaf (path/version changed)
+    #  -2  fencing lock lost
+    #  -3  corrupt existing catalog JSON
+    #  -4  invalid new payload JSON
+    #  -5  missing/wrong mirror publication intent
+    #  -6  mirror publication intent is not prepared
+    _LUA_SNAPSHOT_COMMIT = """
+local leaf_key = KEYS[1]
+local root_key = KEYS[2]
+local lock_key = KEYS[3]
+local mirror_key = KEYS[4]
+
+local payload_json = ARGV[1]
+local new_path = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+local expected_version = tonumber(ARGV[4])
+local expected_path = ARGV[5]
+local lock_token = ARGV[6]
+local commit_id = ARGV[7]
+local mirror_required = ARGV[8]
+
+local held_token = redis.call('GET', lock_key)
+if not held_token or held_token ~= lock_token then
+  return {-2, 0, 0}
+end
+
+local old_version = -1
+local old_path = ''
+local cur = redis.call('GET', leaf_key)
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if not ok or type(obj) ~= 'table' then
+    return {-3, 0, 0}
+  end
+  if obj['version'] ~= nil then
+    old_version = tonumber(obj['version'])
+  end
+  if obj['path'] ~= nil then
+    old_path = tostring(obj['path'])
+  end
+end
+
+if old_version ~= expected_version or old_path ~= expected_path then
+  return {-1, old_version, 0}
+end
+
+local okp, payload = pcall(cjson.decode, payload_json)
+if not okp or type(payload) ~= 'table' then
+  return {-4, 0, 0}
+end
+
+local mirror = nil
+if mirror_required == '1' then
+  local raw_mirror = redis.call('GET', mirror_key)
+  if not raw_mirror then
+    return {-5, 0, 0}
+  end
+  local okm, parsed_mirror = pcall(cjson.decode, raw_mirror)
+  if not okm or type(parsed_mirror) ~= 'table'
+      or tostring(parsed_mirror['commit_id'] or '') ~= commit_id then
+    return {-5, 0, 0}
+  end
+  if parsed_mirror['status'] ~= 'prepared' then
+    return {-6, 0, 0}
+  end
+  mirror = parsed_mirror
+end
+
+local root = {}
+local root_version = -1
+local raw_root = redis.call('GET', root_key)
+if raw_root then
+  local okr, parsed_root = pcall(cjson.decode, raw_root)
+  if not okr or type(parsed_root) ~= 'table' then
+    return {-3, 0, 0}
+  end
+  root = parsed_root
+  if root['version'] ~= nil then
+    root_version = tonumber(root['version'])
+  end
+end
+
+local new_leaf_version = old_version + 1
+local new_root_version = root_version + 1
+local leaf = {
+  version = new_leaf_version,
+  ts = now_ms,
+  path = new_path,
+  payload = payload,
+  commit_id = commit_id
+}
+root['version'] = new_root_version
+root['ts'] = now_ms
+root['commit_id'] = commit_id
+
+if mirror ~= nil then
+  mirror['status'] = 'core_committed'
+  mirror['core_committed'] = true
+  mirror['core_committed_at_ms'] = now_ms
+  mirror['updated_at_ms'] = now_ms
+  mirror['leaf_version'] = new_leaf_version
+  mirror['root_version'] = new_root_version
+end
+
+redis.call('SET', leaf_key, cjson.encode(leaf))
+redis.call('SET', root_key, cjson.encode(root))
+if mirror ~= nil then
+  redis.call('SET', mirror_key, cjson.encode(mirror))
+end
+return {1, new_leaf_version, new_root_version}
+"""
+
+    _LUA_MIRROR_PUBLICATION_PREPARE = """
+local state_key = KEYS[1]
+local lock_key = KEYS[2]
+local record_json = ARGV[1]
+local lock_token = ARGV[2]
+local commit_id = ARGV[3]
+
+local held_token = redis.call('GET', lock_key)
+if not held_token or held_token ~= lock_token then
+  return -2
+end
+
+local okr, record = pcall(cjson.decode, record_json)
+if not okr or type(record) ~= 'table'
+    or tostring(record['commit_id'] or '') ~= commit_id
+    or record['status'] ~= 'prepared' then
+  return -4
+end
+
+local current_raw = redis.call('GET', state_key)
+if current_raw then
+  local okc, current = pcall(cjson.decode, current_raw)
+  if not okc or type(current) ~= 'table' then
+    return -3
+  end
+  if tostring(current['commit_id'] or '') == commit_id then
+    if tostring(current['snapshot_path'] or '')
+          ~= tostring(record['snapshot_path'] or '') then
+      return -4
+    end
+    local current_mirrors = current['mirrors'] or {}
+    local new_mirrors = record['mirrors'] or {}
+    if #current_mirrors ~= #new_mirrors then
+      return -4
+    end
+    for i = 1, #current_mirrors do
+      if tostring(current_mirrors[i]) ~= tostring(new_mirrors[i]) then
+        return -4
+      end
+    end
+    return 2
+  end
+  if current['status'] ~= 'complete'
+      and not (current['status'] == 'failed'
+          and current['core_committed'] ~= true) then
+    return -1
+  end
+end
+
+redis.call('SET', state_key, record_json)
+return 1
+"""
+
+    _LUA_MIRROR_PUBLICATION_TRANSITION = """
+local state_key = KEYS[1]
+local lock_key = KEYS[2]
+local commit_id = ARGV[1]
+local target_status = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+local lock_token = ARGV[4]
+local failure_stage = ARGV[5]
+local error_type = ARGV[6]
+local error_message = ARGV[7]
+
+local held_token = redis.call('GET', lock_key)
+if not held_token or held_token ~= lock_token then
+  return -2
+end
+
+local raw = redis.call('GET', state_key)
+if not raw then
+  return -1
+end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then
+  return -3
+end
+if tostring(record['commit_id'] or '') ~= commit_id then
+  return -1
+end
+
+local current_status = tostring(record['status'] or '')
+if target_status == 'complete' then
+  if current_status == 'complete' then
+    return 2
+  end
+  if current_status ~= 'core_committed'
+      and not (current_status == 'failed' and record['core_committed'] == true) then
+    return -4
+  end
+  record['status'] = 'complete'
+  record['completed_at_ms'] = now_ms
+  record['updated_at_ms'] = now_ms
+  record['error'] = cjson.null
+elseif target_status == 'failed' then
+  if current_status == 'complete' then
+    return -4
+  end
+  record['status'] = 'failed'
+  record['updated_at_ms'] = now_ms
+  record['failed_at_ms'] = now_ms
+  record['failure_stage'] = failure_stage
+  record['error'] = {type=error_type, message=error_message}
+else
+  return -4
+end
+
+redis.call('SET', state_key, cjson.encode(record))
+return 1
+"""
+
+    _LUA_RESERVE_ROWIDS_AT_LEAST = """
+local key = KEYS[1]
+local floor = ARGV[1]
+local count = ARGV[2]
+local cur = redis.call('GET', key) or '0'
+
+-- Lua numbers lose integer precision above 2^53.  Row ids are signed Int64,
+-- so compare their non-negative decimal strings by length/lexicographic order
+-- and let Redis INCRBY perform the exact 64-bit addition/overflow check.
+local function normalize_decimal(value)
+  local normalized = string.gsub(value, '^0+', '')
+  if normalized == '' then
+    return '0'
+  end
+  return normalized
+end
+local function decimal_lt(a, b)
+  a = normalize_decimal(a)
+  b = normalize_decimal(b)
+  if string.len(a) ~= string.len(b) then
+    return string.len(a) < string.len(b)
+  end
+  return a < b
+end
+
+-- Never let a corrupt/negative Redis counter generate zero, negative, or
+-- reused row ids.  Redis INCRBY is exact for signed Int64 values, but it will
+-- happily increment a negative integer unless we reject it first.
+if not string.match(cur, '^%d+$')
+    or not string.match(floor, '^%d+$')
+    or not string.match(count, '^%d+$') then
+  return redis.error_reply('invalid non-negative rowid sequence')
+end
+
+cur = normalize_decimal(cur)
+floor = normalize_decimal(floor)
+if decimal_lt(cur, floor) then
+  cur = floor
+  redis.call('SET', key, cur)
+end
+redis.call('INCRBY', key, count)
+local new_value = redis.call('GET', key)
+-- Return strings so the Redis/Lua boundary cannot round either value.
+return {cur, new_value}
 """
 
     # ------------- RBAC Lua scripts ------------- #
@@ -290,6 +557,16 @@ return 1
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
+        self._snapshot_commit = self.r.register_script(self._LUA_SNAPSHOT_COMMIT)
+        self._mirror_publication_prepare = self.r.register_script(
+            self._LUA_MIRROR_PUBLICATION_PREPARE
+        )
+        self._mirror_publication_transition = self.r.register_script(
+            self._LUA_MIRROR_PUBLICATION_TRANSITION
+        )
+        self._reserve_rowids_at_least = self.r.register_script(
+            self._LUA_RESERVE_ROWIDS_AT_LEAST
+        )
 
         # Distributed locking (delegates to supertable.locking.redis_lock)
         self._locker = RedisLocking(self.r)
@@ -343,9 +620,10 @@ return 1
         """Initialize meta:root if missing with version=0."""
         key = RK.meta_root(org, sup)
         try:
-            if not self.r.exists(key):
-                init = {"version": 0, "ts": _now_ms()}
-                self.r.set(key, json.dumps(init))
+            init = {"version": 0, "ts": _now_ms()}
+            # One atomic initialize-only write. A concurrent creator or a
+            # stale absence observation can never overwrite root version/flags.
+            self.r.set(key, json.dumps(init), nx=True)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] ensure_root failed: {e}")
             raise
@@ -356,7 +634,7 @@ return 1
             return bool(self.r.exists(RK.meta_root(org, sup)))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] root_exists error: {e}")
-            return False
+            raise
 
     def leaf_exists(self, org: str, sup: str, simple: str) -> bool:
         """Check existence of meta:leaf key for a simple table (replica-aware)."""
@@ -373,15 +651,22 @@ return 1
             return bool(self.r.exists(RK.meta_leaf(org, sup, simple)))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_exists error: {e}")
-            return False
+            raise
 
     def get_root(self, org: str, sup: str) -> Optional[Dict]:
         try:
             raw = self.r.get(RK.meta_root(org, sup))
-            return json.loads(raw) if raw else None
+            if not raw:
+                return None
+            root = json.loads(raw)
+            if not isinstance(root, dict):
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            return root
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_root error: {e}")
-            return None
+            raise
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}") from exc
 
     def update_root_flags(self, org: str, sup: str, flags: Dict[str, Any]) -> bool:
         """Merge *flags* into the existing meta:root JSON document.
@@ -438,6 +723,263 @@ return 1
             logger.error(f"[redis-catalog] root_bump error: {e}")
             raise
 
+    def commit_snapshot(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            payload: Dict[str, Any],
+            path: str,
+            *,
+            expected_version: int,
+            expected_path: str,
+            lock_token: str,
+            commit_id: Optional[str] = None,
+            mirror_publication: bool = False,
+            now_ms: Optional[int] = None,
+    ) -> tuple[int, int]:
+        """Atomically publish one fenced table snapshot and bump its root.
+
+        ``expected_version`` and ``expected_path`` identify the exact leaf
+        snapshot from which the writer derived its immutable successor.
+        ``lock_token`` must still own the per-table Redis lock when the Lua
+        script executes.  The comparison, fencing check, leaf update, and root
+        invalidation happen in one Redis transaction, so readers can never
+        combine a new leaf with an old root generation (or vice versa).
+
+        Ambiguous client/network failures are deliberately propagated.  The
+        immutable ``commit_id`` stored in both documents lets a caller or
+        operator reconcile whether such a commit reached Redis; retrying as a
+        different, payload-less write would be unsafe.
+        """
+        if not lock_token:
+            raise LockLostError("snapshot publication requires a fencing lock token")
+        try:
+            payload_json = json.dumps(payload or {})
+        except Exception as exc:
+            raise ValueError("snapshot payload is not JSON serializable") from exc
+
+        if mirror_publication and not commit_id:
+            raise ValueError(
+                "mirror-tracked snapshot publication requires an explicit commit_id"
+            )
+        cid = commit_id or secrets.token_hex(16)
+        try:
+            raw = self._snapshot_commit(
+                keys=[
+                    RK.meta_leaf(org, sup, simple),
+                    RK.meta_root(org, sup),
+                    RK.lock_leaf(org, sup, simple),
+                    RK.meta_mirror_publication(org, sup, simple),
+                ],
+                args=[
+                    payload_json,
+                    path,
+                    int(now_ms or _now_ms()),
+                    int(expected_version),
+                    expected_path or "",
+                    lock_token,
+                    cid,
+                    "1" if mirror_publication else "0",
+                ],
+            )
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] snapshot commit error: {exc}")
+            raise
+
+        try:
+            code, leaf_version, root_version = [int(v) for v in raw]
+        except Exception as exc:
+            raise RuntimeError(f"Invalid snapshot commit result: {raw!r}") from exc
+        if code == 1:
+            return leaf_version, root_version
+        if code == -1:
+            raise SnapshotCommitConflictError(
+                f"Snapshot base changed for {org}/{sup}/{simple}: "
+                f"expected version={expected_version}, path={expected_path!r}; "
+                f"current version={leaf_version}"
+            )
+        if code == -2:
+            raise LockLostError(
+                f"Lost fencing lock before publishing {org}/{sup}/{simple}"
+            )
+        if code == -3:
+            raise RuntimeError(f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}")
+        if code == -4:
+            raise ValueError("Redis rejected invalid snapshot payload JSON")
+        if code == -5:
+            raise RuntimeError(
+                f"Missing or mismatched mirror publication intent for "
+                f"{org}/{sup}/{simple} commit {cid}"
+            )
+        if code == -6:
+            raise RuntimeError(
+                f"Mirror publication intent is not prepared for "
+                f"{org}/{sup}/{simple} commit {cid}"
+            )
+        raise RuntimeError(f"Unknown snapshot commit status {code}")
+
+    def prepare_mirror_publication(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            commit_id: str,
+            snapshot_path: str,
+            mirrors: List[str],
+            lock_token: str,
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Durably prepare one mirror outbox record under the table lock.
+
+        A previous non-complete record blocks replacement. This deliberately
+        forces explicit reconciliation instead of losing evidence that a
+        latest-only mirror may expose an older snapshot.
+        """
+        if not commit_id or not snapshot_path or not lock_token:
+            raise ValueError("mirror publication requires commit, snapshot, and lock")
+        normalized: List[str] = []
+        for value in mirrors or []:
+            fmt = str(value).upper()
+            if fmt not in ("DELTA", "ICEBERG", "PARQUET"):
+                raise ValueError(f"Unsupported mirror format: {value!r}")
+            if fmt not in normalized:
+                normalized.append(fmt)
+        if not normalized:
+            raise ValueError("mirror publication requires at least one format")
+        timestamp = int(now_ms or _now_ms())
+        record: Dict[str, Any] = {
+            "schema_version": 1,
+            "status": "prepared",
+            "organization": org,
+            "super_name": sup,
+            "table_name": simple,
+            "commit_id": commit_id,
+            "snapshot_path": snapshot_path,
+            "mirrors": normalized,
+            "core_committed": False,
+            "created_at_ms": timestamp,
+            "updated_at_ms": timestamp,
+            "error": None,
+        }
+        raw = self._mirror_publication_prepare(
+            keys=[
+                RK.meta_mirror_publication(org, sup, simple),
+                RK.lock_leaf(org, sup, simple),
+            ],
+            args=[json.dumps(record), lock_token, commit_id],
+        )
+        code = int(raw or 0)
+        if code in (1, 2):
+            return self.get_mirror_publication(org, sup, simple) or record
+        if code == -1:
+            raise SnapshotCommitConflictError(
+                f"Unresolved mirror publication blocks {org}/{sup}/{simple}"
+            )
+        if code == -2:
+            raise LockLostError(
+                f"Lost fencing lock before preparing mirror publication for "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -3:
+            raise RuntimeError(
+                f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        raise RuntimeError(f"Invalid mirror publication prepare status {code}")
+
+    def get_mirror_publication(
+            self, org: str, sup: str, simple: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest durable mirror outbox record, if any."""
+        raw = self.r.get(RK.meta_mirror_publication(org, sup, simple))
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        return record
+
+    def _transition_mirror_publication(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            commit_id: str,
+            status: str,
+            lock_token: str,
+            failure_stage: str = "",
+            error_type: str = "",
+            error_message: str = "",
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        raw = self._mirror_publication_transition(
+            keys=[
+                RK.meta_mirror_publication(org, sup, simple),
+                RK.lock_leaf(org, sup, simple),
+            ],
+            args=[
+                commit_id,
+                status,
+                int(now_ms or _now_ms()),
+                lock_token,
+                failure_stage,
+                error_type,
+                error_message[:4096],
+            ],
+        )
+        code = int(raw or 0)
+        if code in (1, 2):
+            record = self.get_mirror_publication(org, sup, simple)
+            if record is None:
+                raise RuntimeError("Mirror publication state disappeared")
+            return record
+        if code == -1:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication commit changed for {org}/{sup}/{simple}"
+            )
+        if code == -2:
+            raise LockLostError(
+                f"Lost fencing lock while updating mirror publication for "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -3:
+            raise RuntimeError(
+                f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        raise RuntimeError(
+            f"Invalid mirror publication transition {status!r} from current state"
+        )
+
+    def complete_mirror_publication(
+            self, org: str, sup: str, simple: str, *, commit_id: str,
+            lock_token: str, now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._transition_mirror_publication(
+            org, sup, simple, commit_id=commit_id, status="complete",
+            lock_token=lock_token, now_ms=now_ms,
+        )
+
+    def fail_mirror_publication(
+            self, org: str, sup: str, simple: str, *, commit_id: str,
+            lock_token: str, failure_stage: str, error: Exception,
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._transition_mirror_publication(
+            org, sup, simple, commit_id=commit_id, status="failed",
+            lock_token=lock_token, failure_stage=failure_stage,
+            error_type=type(error).__name__, error_message=str(error),
+            now_ms=now_ms,
+        )
+
     # ------------- Replica resolution ------------------------------------
 
     def _resolve_replica_info(self, org: str, sup: str) -> Optional[tuple]:
@@ -447,16 +989,13 @@ return 1
         is itself a replica, we stop — one level only).
         Single get_root() call — avoids redundant Redis reads.
         """
-        try:
-            root = self.get_root(org, sup)
-            if root and root.get("clone_type") == "replica":
-                source = root.get("cloned_from", "")
-                if source and source != sup:
-                    tables = root.get("replica_tables")
-                    allowed = tables if isinstance(tables, list) and tables else None
-                    return (source, allowed)
-        except Exception:
-            pass
+        root = self.get_root(org, sup)
+        if root and root.get("clone_type") == "replica":
+            source = root.get("cloned_from", "")
+            if source and source != sup:
+                tables = root.get("replica_tables")
+                allowed = tables if isinstance(tables, list) and tables else None
+                return (source, allowed)
         return None
 
     # Keep backward-compatible wrappers for gc.py and other callers
@@ -497,6 +1036,44 @@ return 1
         new_val = int(self.r.incrby(RK.meta_rowid_seq(org, sup, simple), count))
         return new_val - count + 1
 
+    def reserve_rowids_at_least(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            count: int,
+            floor: int,
+    ) -> tuple[int, int]:
+        """Reserve IDs strictly above a snapshot-persisted high-water mark.
+
+        Redis is the fast allocator, while ``floor`` is the durable recovery
+        boundary stored in the immutable table snapshot.  If Redis was flushed
+        or restored from an older backup, this atomic max-and-increment prevents
+        reusing identifiers that existing Parquet rows may still carry.
+        Returns ``(first_reserved, new_high_watermark)``.
+        """
+        if count <= 0:
+            safe_floor = max(0, int(floor or 0))
+            return 0, safe_floor
+        safe_floor = max(0, int(floor or 0))
+        int64_max = (1 << 63) - 1
+        if safe_floor > int64_max:
+            raise OverflowError("rowid high-watermark exceeds signed Int64")
+        if int(count) > int64_max - safe_floor:
+            raise OverflowError("rowid reservation exceeds signed Int64")
+        raw = self._reserve_rowids_at_least(
+            keys=[RK.meta_rowid_seq(org, sup, simple)],
+            args=[str(safe_floor), str(int(count))],
+        )
+        try:
+            previous, new_high = [int(v) for v in raw]
+            start = previous + 1
+        except Exception as exc:
+            raise RuntimeError(f"Invalid rowid reservation result: {raw!r}") from exc
+        if new_high > int64_max or new_high != previous + int(count):
+            raise RuntimeError(f"Unsafe rowid reservation result: {raw!r}")
+        return start, new_high
+
     def delete_leaf(self, org: str, sup: str, simple: str) -> bool:
         """Delete a leaf pointer (used when unlinking shared tables)."""
         try:
@@ -507,9 +1084,14 @@ return 1
 
     def set_leaf_path_cas(self, org: str, sup: str, simple: str, path: str, now_ms: Optional[int] = None) -> int:
         try:
-            return int(
+            result = int(
                 self._leaf_cas_set(keys=[RK.meta_leaf(org, sup, simple)], args=[path, int(now_ms or _now_ms())]) or 0
             )
+            if result < 0:
+                raise SnapshotCommitConflictError(
+                    f"Cannot initialize existing table {org}/{sup}/{simple}"
+                )
+            return result
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_cas_set error: {e}")
             raise
@@ -530,16 +1112,18 @@ return 1
             payload_json = "{}"
 
         try:
-            return int(
+            result = int(
                 self._leaf_payload_cas_set(
                     keys=[RK.meta_leaf(org, sup, simple)],
                     args=[payload_json, path, int(now_ms or _now_ms())],
                 )
                 or 0
             )
-        except AttributeError:
-            # Backward compatible fallback if script isn't registered for some reason.
-            return self.set_leaf_path_cas(org, sup, simple, path, now_ms=now_ms)
+            if result < 0:
+                raise SnapshotCommitConflictError(
+                    f"Cannot initialize existing table {org}/{sup}/{simple}"
+                )
+            return result
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
             raise
@@ -553,20 +1137,32 @@ return 1
             if not raw:
                 return []
             obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                raise ValueError("Mirror configuration must be a JSON object")
             formats = obj.get("formats", [])
+            if not isinstance(formats, list):
+                raise ValueError("Mirror configuration formats must be a list")
             seen = set()
             out: List[str] = []
             for f in (formats or []):
                 fu = str(f).upper()
-                if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
+                if fu not in ("DELTA", "ICEBERG", "PARQUET"):
+                    raise ValueError(f"Unsupported configured mirror format: {f!r}")
+                if fu not in seen:
                     seen.add(fu)
                     out.append(fu)
             return out
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_mirrors error: {e}")
-            return []
-        except Exception:
-            return []
+            # Mirror state is part of the write's correctness decision: an
+            # enabled latest-only mirror must force the deletion vector to be
+            # physically drained before resources are copied.  Treating an
+            # unavailable/corrupt setting as "disabled" could publish a stale
+            # mirror that resurrects deleted rows.
+            raise
+        except Exception as e:
+            logger.error(f"[redis-catalog] invalid mirror configuration: {e}")
+            raise
 
     def set_mirrors(self, org: str, sup: str, formats: List[str], now_ms: Optional[int] = None) -> List[str]:
         """Atomically set enabled mirror formats."""
@@ -574,7 +1170,9 @@ return 1
         ordered: List[str] = []
         for f in formats or []:
             fu = str(f).upper()
-            if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
+            if fu not in ("DELTA", "ICEBERG", "PARQUET"):
+                raise ValueError(f"Unsupported mirror format: {f!r}")
+            if fu not in seen:
                 seen.add(fu)
                 ordered.append(fu)
         try:
@@ -589,7 +1187,7 @@ return 1
         cur = self.get_mirrors(org, sup)
         fu = str(fmt).upper()
         if fu not in ("DELTA", "ICEBERG", "PARQUET"):
-            return cur
+            raise ValueError(f"Unsupported mirror format: {fmt!r}")
         if fu in cur:
             return cur
         return self.set_mirrors(org, sup, cur + [fu])
@@ -597,6 +1195,8 @@ return 1
     def disable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
         cur = self.get_mirrors(org, sup)
         fu = str(fmt).upper()
+        if fu not in ("DELTA", "ICEBERG", "PARQUET"):
+            raise ValueError(f"Unsupported mirror format: {fmt!r}")
         nxt = [x for x in cur if x != fu]
         if nxt == cur:
             return cur
@@ -1084,10 +1684,28 @@ return 1
                     break
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] SCAN error: {e}")
-            return
+            raise
 
     def scan_leaf_items(self, org: str, sup: str, count: int = 1000) -> Iterator[Dict]:
-        """Iterates SCAN pages and fetches values in batches (pipeline)."""
+        """Iterate one root-generation-consistent set of leaf documents.
+
+        Redis SCAN is incremental and may otherwise return a successful partial
+        table set when a page/pipeline fails or a writer changes the catalog
+        mid-enumeration.  Reads must fail/retry instead of silently omitting
+        physical tables (and their deletion vectors).
+        """
+        info = self._resolve_replica_info(org, sup)
+        effective_sup = info[0] if info else sup
+        root_key = RK.meta_root(org, effective_sup)
+        try:
+            root_before = self.r.get(root_key)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] root generation read error: {e}")
+            raise
+        if not root_before:
+            raise RuntimeError(
+                f"Missing catalog root while enumerating {org}/{effective_sup}"
+            )
         batch: List[str] = []
         for key in self.scan_leaf_keys(org, sup, count=count):
             batch.append(key)
@@ -1096,6 +1714,16 @@ return 1
                 batch = []
         if batch:
             yield from self._fetch_batch(batch)
+        try:
+            root_after = self.r.get(root_key)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] root generation recheck error: {e}")
+            raise
+        if root_after != root_before:
+            raise SnapshotCommitConflictError(
+                f"Catalog changed while enumerating {org}/{effective_sup}; "
+                "refusing a partial snapshot"
+            )
 
     def _fetch_batch(self, keys: List[str]) -> Iterator[Dict]:
         try:
@@ -1105,23 +1733,33 @@ return 1
                 vals = p.execute()
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] pipeline GET error: {e}")
-            return
+            raise
 
+        if len(vals) != len(keys):
+            raise RuntimeError("Redis leaf batch returned an incomplete result")
         for k, raw in zip(keys, vals):
             if not raw:
-                continue
+                raise RuntimeError(
+                    f"Catalog leaf disappeared during snapshot enumeration: {k}"
+                )
             try:
                 obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    raise ValueError("leaf is not a JSON object")
                 simple = k.rsplit("meta:leaf:doc:", 1)[-1]
-                yield {
+                item = {
                     "simple": simple,
                     "version": int(obj.get("version", -1)),
                     "ts": int(obj.get("ts", 0)),
                     "path": obj.get("path", ""),
                     "payload": obj.get("payload"),
                 }
-            except Exception:
-                continue
+                if item["version"] < 0 or not isinstance(item["path"], str) \
+                        or not item["path"]:
+                    raise ValueError("leaf has invalid version/path")
+                yield item
+            except Exception as exc:
+                raise RuntimeError(f"Malformed catalog leaf {k}") from exc
 
     # ------------- Deletions (dangerous) -------------
 

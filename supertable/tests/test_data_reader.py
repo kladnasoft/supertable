@@ -415,6 +415,7 @@ class TestExecuteTombstoneResolution:
         _mock_data_reader_redis,
     ):
         from types import SimpleNamespace
+        from supertable.data_classes import SuperSnapshot
 
         td = SimpleNamespace(alias="t", super_name="s", simple_name="tbl")
         mock_parser = MagicMock()
@@ -427,15 +428,26 @@ class TestExecuteTombstoneResolution:
         MockPlanStats.return_value = MagicMock()
         MockQPM.return_value = MagicMock(query_id="q", query_hash="h")
 
-        # Catalog leaf carries a deletion-vector pointer (a bare object key).
+        # A newer leaf may exist by the time execution wiring runs.  The reader
+        # must use the pointer pinned by the estimator, not re-read this leaf.
         raw_tomb_key = "o/s/tables/tbl/tombstone/123_abc_deleted.parquet"
         _mock_data_reader_redis.return_value.get_leaf.return_value = {
-            "payload": {"tombstone": raw_tomb_key},
+            "payload": {"tombstone": "newer/dv.parquet"},
         }
 
         # Estimator resolver presigns (object-store behaviour) — the SAME method
         # the estimator applies to data files at data_estimator.py:426.
-        reflection = _make_reflection()
+        reflection = _make_reflection(supers=[SuperSnapshot(
+            super_name="s",
+            simple_name="tbl",
+            simple_version=1,
+            files=["data/f1.parquet"],
+            columns={"id"},
+            snapshot_path="snap-v1.json",
+            tombstone_key=raw_tomb_key,
+            tombstone_rows=7,
+            tombstone_digest="0" * 64,
+        )])
         mock_est = MagicMock()
         mock_est.estimate.return_value = reflection
         mock_est._to_duckdb_path.side_effect = lambda k: f"https://signed/{k}"
@@ -460,6 +472,8 @@ class TestExecuteTombstoneResolution:
         # cache_key is the BARE (pre-presign) key — stable across appends,
         # so the DuckDB DV-table cache keys on it, not the rotating URL.
         assert reflection.tombstone_views["t"].cache_key == raw_tomb_key
+        assert reflection.tombstone_views["t"].expected_rows == 7
+        _mock_data_reader_redis.return_value.get_leaf.assert_not_called()
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -478,6 +492,7 @@ class TestExecuteTombstoneResolution:
         # LOCAL contract: no presign → _to_duckdb_path returns the key as-is,
         # so the tombstone path stays readable from disk (golden-test path).
         from types import SimpleNamespace
+        from supertable.data_classes import SuperSnapshot
 
         td = SimpleNamespace(alias="t", super_name="s", simple_name="tbl")
         mock_parser = MagicMock()
@@ -495,7 +510,16 @@ class TestExecuteTombstoneResolution:
             "payload": {"tombstone": raw_tomb_key},
         }
 
-        reflection = _make_reflection()
+        reflection = _make_reflection(storage_type="LocalStorage", supers=[SuperSnapshot(
+            super_name="s",
+            simple_name="tbl",
+            simple_version=1,
+            files=["data/f1.parquet"],
+            columns={"id"},
+            tombstone_key=raw_tomb_key,
+            tombstone_rows=1,
+            tombstone_digest="0" * 64,
+        )])
         mock_est = MagicMock()
         mock_est.estimate.return_value = reflection
         mock_est._to_duckdb_path.side_effect = lambda k: k  # LOCAL no-op

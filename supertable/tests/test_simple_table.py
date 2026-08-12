@@ -230,6 +230,22 @@ class TestSimpleTableInit:
         st.storage.makedirs.assert_not_called()
         st.storage.write_json.assert_not_called()
 
+    @patch(_P_REDIS_CAT)
+    def test_leaf_existence_failure_never_bootstraps_over_unknown_state(self, MockCat):
+        from supertable.simple_table import SimpleTable
+
+        mock_cat = MagicMock()
+        mock_cat.leaf_exists.side_effect = TimeoutError("catalog unavailable")
+        MockCat.return_value = mock_cat
+        st = _mock_super("org", "sup")
+
+        with pytest.raises(TimeoutError, match="catalog unavailable"):
+            SimpleTable(st, "events")
+
+        st.storage.makedirs.assert_not_called()
+        st.storage.write_json.assert_not_called()
+        mock_cat.set_leaf_payload_cas.assert_not_called()
+
     @patch(_P_GEN_FILENAME, return_value="12345_abc_tables.json")
     @patch(_P_REDIS_CAT)
     def test_slow_path_leaf_absent_initializes(self, MockCat, mock_gen):
@@ -261,8 +277,8 @@ class TestSimpleTableInit:
 
     @patch(_P_GEN_FILENAME, return_value="snap.json")
     @patch(_P_REDIS_CAT)
-    def test_slow_path_cas_fallback(self, MockCat, mock_gen):
-        """set_leaf_payload_cas fails → falls back to set_leaf_path_cas."""
+    def test_slow_path_payload_failure_is_not_retried(self, MockCat, mock_gen):
+        """An attempted publication may have committed before its error."""
         from supertable.simple_table import SimpleTable
 
         mock_cat = MagicMock()
@@ -273,9 +289,10 @@ class TestSimpleTableInit:
         st = _mock_super()
         st.storage.exists.return_value = False
 
-        obj = SimpleTable(st, "tbl")
+        with pytest.raises(TypeError, match="old catalog"):
+            SimpleTable(st, "tbl")
 
-        mock_cat.set_leaf_path_cas.assert_called_once()
+        mock_cat.set_leaf_path_cas.assert_not_called()
 
     @patch(_P_REDIS_CAT)
     def test_directory_layout(self, MockCat):
@@ -369,19 +386,15 @@ class TestInitSimpleTable:
         assert "snap.json" in args[4]
 
     @patch(_P_GEN_FILENAME, return_value="snap.json")
-    def test_cas_payload_fails_falls_back_to_path(self, mock_gen):
+    def test_cas_payload_failure_is_not_retried_as_path_only(self, mock_gen):
         obj = _make_simple("tbl", "org", "sup")
         obj.storage.exists.return_value = True
         obj.catalog.set_leaf_payload_cas.side_effect = Exception("old redis")
 
-        obj.init_simple_table()
+        with pytest.raises(Exception, match="old redis"):
+            obj.init_simple_table()
 
-        obj.catalog.set_leaf_path_cas.assert_called_once()
-        args = obj.catalog.set_leaf_path_cas.call_args[0]
-        assert args[0] == "org"
-        assert args[1] == "sup"
-        assert args[2] == "tbl"
-        assert "snap.json" in args[3]
+        obj.catalog.set_leaf_path_cas.assert_not_called()
 
     @patch(_P_GEN_FILENAME, return_value="snap.json")
     def test_initial_snapshot_has_location(self, mock_gen):
@@ -521,9 +534,17 @@ class TestGetSimpleTableSnapshot:
     def test_payload_with_resources_returns_directly(self):
         """Redis leaf has payload.resources → no storage read."""
         obj = _make_simple()
-        payload = {"resources": [{"file": "f1"}], "schema": {}}
+        payload = {
+            "snapshot_version": 1,
+            "resources": [{"file": "f1"}],
+            "schema": {},
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        }
         obj.catalog.get_leaf.return_value = {
             "path": "/snap.json",
+            "version": 1,
             "payload": payload,
         }
 
@@ -536,9 +557,17 @@ class TestGetSimpleTableSnapshot:
     def test_payload_nested_snapshot_returns(self):
         """Redis leaf has payload.snapshot.resources → returns nested snapshot."""
         obj = _make_simple()
-        snap = {"resources": [{"file": "f2"}]}
+        snap = {
+            "snapshot_version": 2,
+            "resources": [{"file": "f2"}],
+            "schema": {},
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        }
         obj.catalog.get_leaf.return_value = {
             "path": "/snap.json",
+            "version": 2,
             "payload": {"snapshot": snap},
         }
 
@@ -547,6 +576,32 @@ class TestGetSimpleTableSnapshot:
         assert data is snap
         assert path == "/snap.json"
         obj.storage.read_json.assert_not_called()
+
+    def test_partial_payload_falls_back_to_heavy_active_tombstone(self):
+        """Cached resources alone cannot override the authoritative DV state."""
+        obj = _make_simple()
+        partial = {
+            "snapshot_version": 3,
+            "resources": [{"file": "data/f.parquet"}],
+            "schema": {"id": "Int64"},
+        }
+        heavy = {
+            **partial,
+            "tombstone": "tombstone/v3.parquet",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        }
+        obj.catalog.get_leaf.return_value = {
+            "path": "/snap.json", "version": 3, "payload": partial,
+        }
+        obj.storage.read_json.return_value = heavy
+
+        data, path = obj.get_simple_table_snapshot()
+
+        assert data is heavy
+        assert data["tombstone"] == "tombstone/v3.parquet"
+        assert path == "/snap.json"
+        obj.storage.read_json.assert_called_once_with("/snap.json")
 
     def test_no_payload_falls_back_to_storage(self):
         """No usable payload → read from storage."""
@@ -592,8 +647,17 @@ class TestGetSimpleTableSnapshot:
     def test_empty_resources_list_still_counts(self):
         """Payload with resources=[] → returns directly, no storage fallback."""
         obj = _make_simple()
-        payload = {"resources": []}
-        obj.catalog.get_leaf.return_value = {"path": "/snap.json", "payload": payload}
+        payload = {
+            "snapshot_version": 0,
+            "schema": [],
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        }
+        obj.catalog.get_leaf.return_value = {
+            "path": "/snap.json", "version": 0, "payload": payload,
+        }
 
         data, path = obj.get_simple_table_snapshot()
 
@@ -670,10 +734,15 @@ class TestUpdate:
         obj = _make_simple()
         obj.catalog.get_leaf.return_value = {
             "path": "/existing/snap.json",
+            "version": 1,
             "payload": {
                 "resources": [{"file": "f1.parquet"}],
                 "simple_name": "events",
                 "snapshot_version": 1,
+                "schema": [],
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
             },
         }
 

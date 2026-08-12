@@ -102,6 +102,9 @@ def orders_on_disk(tmp_path):
             {"file": p, "file_size": os.path.getsize(p), "rows": 100}
             for p in files
         ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
     }
     leaf_item = {
         "simple": _SIMPLE,

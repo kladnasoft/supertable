@@ -124,7 +124,7 @@ class RedisLocking:
                     with self._held_lock:
                         self._held[key] = (token, ttl_ms)
                         if self._hb_thread is None or not self._hb_thread.is_alive():
-                            self._start_heartbeat()
+                            self._start_heartbeat_locked()
                     return token
             except redis.RedisError as e:
                 logger.debug(f"[redis-lock] acquire error on {key}: {e}")
@@ -161,7 +161,10 @@ class RedisLocking:
                 should_stop_hb = True
 
         if should_stop_hb:
-            self._stop_heartbeat()
+            # Another acquire can race between the empty-held decision above
+            # and stopping the old thread.  Recheck/restart after joining so a
+            # newly acquired long-running mutation never loses lease renewal.
+            self._stop_heartbeat(restart_if_held=True)
 
         return released
 
@@ -174,27 +177,59 @@ class RedisLocking:
         Uses a Lua script for atomic compare-and-extend.
         Returns ``True`` if the TTL was extended, ``False`` otherwise.
         """
-        try:
-            res = self._extend_if_token(keys=[key], args=[token, int(ttl_ms)])
-            return int(res or 0) == 1
-        except redis.RedisError as e:
-            logger.debug(f"[redis-lock] extend error on {key}: {e}")
-            return False
+        # A Lua 0 is definitive: the key is absent or another token owns it.
+        # A transport exception is ambiguous (Redis may even have applied the
+        # PEXPIRE before the reply was lost), so propagate it. The heartbeat
+        # retains tracking and retries; treating ambiguity as False would
+        # abandon a valid long-running compaction lease after one timeout.
+        res = self._extend_if_token(keys=[key], args=[token, int(ttl_ms)])
+        return int(res or 0) == 1
 
     # ------------------------------------------------------------------ heartbeat
 
+    def _start_heartbeat_locked(self) -> None:
+        """Start one heartbeat generation while ``_held_lock`` is owned."""
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._hb_loop, args=(stop_event,), daemon=True,
+        )
+        self._hb_stop = stop_event
+        self._hb_thread = thread
+        thread.start()
+
     def _start_heartbeat(self) -> None:
-        self._hb_stop.clear()
-        self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
-        self._hb_thread.start()
+        """Compatibility wrapper used by tests and maintenance callers."""
+        with self._held_lock:
+            if self._hb_thread is None or not self._hb_thread.is_alive():
+                self._start_heartbeat_locked()
 
-    def _stop_heartbeat(self) -> None:
-        self._hb_stop.set()
-        if self._hb_thread is not None and self._hb_thread.is_alive():
-            self._hb_thread.join(timeout=2.0)
-        self._hb_thread = None
+    def _stop_heartbeat(self, *, restart_if_held: bool = False) -> None:
+        """Stop the captured heartbeat generation without clobbering a newer one.
 
-    def _hb_loop(self) -> None:
+        ``release`` passes ``restart_if_held=True`` to close the race where a
+        second key is acquired after release observed an empty held set but
+        before the old heartbeat was joined.  Direct callers may intentionally
+        disable renewal for expiry tests, so the default remains no restart.
+        """
+        with self._held_lock:
+            thread = self._hb_thread
+            stop_event = self._hb_stop
+        if thread is None:
+            return
+        stop_event.set()
+        if thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=2.0)
+        with self._held_lock:
+            # An acquire may already have installed a new generation.  Never
+            # clear its pointer or signal its distinct stop event.
+            if self._hb_thread is thread:
+                self._hb_thread = None
+            if restart_if_held and self._held and (
+                self._hb_thread is None or not self._hb_thread.is_alive()
+            ):
+                self._start_heartbeat_locked()
+
+    def _hb_loop(self, stop_event: threading.Event) -> None:
         """
         Refresh all held locks at half their TTL.
 
@@ -202,35 +237,60 @@ class RedisLocking:
         held locks.  Uses ``Event.wait`` so ``_stop_heartbeat`` can interrupt
         immediately without waiting for the full interval.
         """
-        while not self._hb_stop.is_set():
-            # Compute sleep interval from held locks
-            with self._held_lock:
-                if not self._held:
+        current = threading.current_thread()
+        retry_delay_s: Optional[float] = None
+        try:
+            while not stop_event.is_set():
+                # Compute sleep interval from held locks
+                with self._held_lock:
+                    if not self._held:
+                        break
+                    min_ttl_ms = min(ttl_ms for _, ttl_ms in self._held.values())
+
+                # Sleep for half the shortest TTL
+                interval_s = (
+                    retry_delay_s
+                    if retry_delay_s is not None
+                    else max(1.0, (min_ttl_ms / 1000.0) / 2.0)
+                )
+                stop_event.wait(timeout=interval_s)
+                if stop_event.is_set():
                     break
-                min_ttl_ms = min(ttl_ms for _, ttl_ms in self._held.values())
+                retry_delay_s = None
 
-            # Sleep for half the shortest TTL
-            interval_s = max(1.0, (min_ttl_ms / 1000.0) / 2.0)
-            self._hb_stop.wait(timeout=interval_s)
-            if self._hb_stop.is_set():
-                break
+                # Snapshot held locks under the lock, then extend outside of it
+                with self._held_lock:
+                    snapshot = dict(self._held)
 
-            # Snapshot held locks under the lock, then extend outside of it
+                for key, (token, ttl_ms) in snapshot.items():
+                    try:
+                        ok = self.extend(key, token, ttl_ms)
+                        if not ok:
+                            # Lock expired or was stolen — remove from tracking
+                            logger.debug(f"[redis-lock] heartbeat: lost lock on {key}")
+                            with self._held_lock:
+                                held_entry = self._held.get(key)
+                                if held_entry is not None and held_entry[0] == token:
+                                    del self._held[key]
+                    except Exception as e:
+                        logger.debug(f"[redis-lock] heartbeat error on {key}: {e}")
+                        # Unknown ownership state: retain the entry and retry
+                        # well before the remaining lease could expire. Repeated
+                        # failures still end safely at the fenced commit.
+                        retry_delay_s = min(
+                            1.0, max(0.1, (ttl_ms / 1000.0) / 10.0)
+                        )
+        finally:
+            # A natural exit has a narrow teardown window: the Thread is still
+            # alive, so a concurrent acquire could add a new lock, observe this
+            # generation as alive, and skip starting its replacement. Publish
+            # termination under the same lock used by acquire; if this was not
+            # an intentional stop, hand any newly-held locks to a new generation.
             with self._held_lock:
-                snapshot = dict(self._held)
-
-            for key, (token, ttl_ms) in snapshot.items():
-                try:
-                    ok = self.extend(key, token, ttl_ms)
-                    if not ok:
-                        # Lock expired or was stolen — remove from tracking
-                        logger.debug(f"[redis-lock] heartbeat: lost lock on {key}")
-                        with self._held_lock:
-                            held_entry = self._held.get(key)
-                            if held_entry is not None and held_entry[0] == token:
-                                del self._held[key]
-                except Exception as e:
-                    logger.debug(f"[redis-lock] heartbeat error on {key}: {e}")
+                if self._hb_thread is current:
+                    self._hb_thread = None
+                    if self._held and not stop_event.is_set():
+                        self._start_heartbeat_locked()
 
     # ------------------------------------------------------------------ cleanup
 

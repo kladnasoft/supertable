@@ -6,6 +6,7 @@ import math
 import re
 from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 
@@ -48,6 +49,31 @@ _DUCKDB_JOIN_PRUNING_LANES = frozenset({
     "numeric", "date", "timestamp", "timestamptz",
 })
 _COMMON_JOIN_PRUNING_LANES = frozenset({"numeric"})
+
+_URL_IN_ERROR_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def _redact_storage_credentials(message: object) -> str:
+    """Remove presign/SAS query strings from logs and public read errors."""
+    text = str(message or "")
+
+    def replace(match: re.Match) -> str:
+        raw = match.group(0)
+        # Error prose commonly places punctuation immediately after a URL.
+        url = raw.rstrip(").,;]}")
+        suffix = raw[len(url):]
+        try:
+            parsed = urlsplit(url)
+            if parsed.query or parsed.fragment:
+                url = urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
+                )
+        except Exception:
+            # Even an unparsable URL must not retain a potential credential.
+            url = url.split("?", 1)[0] + ("?<redacted>" if "?" in url else "")
+        return url + suffix
+
+    return _URL_IN_ERROR_RE.sub(replace, text)
 
 
 def _engine_safe_join_pruning_lanes(requested_engine: engine):
@@ -386,61 +412,113 @@ class DataReader:
             # executors create filtered views for restricted roles.
             reflection.rbac_views = rbac_views
 
-            # --- Tombstone (deletion-vector): look up snapshot metadata ------
-            try:
-                catalog = RedisCatalog()
-                for td in tables:
-                    # Tombstone filtering: read the deletion-vector pointer from
-                    # the snapshot payload in the Redis leaf.  When present, the
-                    # executor anti-joins the data on __rowid__ against it.
-                    payload = None
-                    try:
-                        leaf = catalog.get_leaf(
-                            self.organization, td.super_name, td.simple_name,
+            # --- Tombstone/share policy from the estimator-pinned snapshot ---
+            # Never re-read the Redis leaf here.  A writer can commit between
+            # estimation and execution; combining old files with a new DV would
+            # hide the old row while omitting its replacement file.
+            snapshots_by_key = {
+                (sup.super_name.lower(), sup.simple_name.lower()): sup
+                for sup in reflection.supers
+            }
+            resolved_tombstones = {}
+            for td in tables:
+                table_key = (td.super_name.lower(), td.simple_name.lower())
+                sup = snapshots_by_key.get(table_key)
+                if sup is None:
+                    # CTE aliases have no physical snapshot of their own.
+                    continue
+
+                tombstone_key = getattr(sup, "tombstone_key", None)
+                tombstone_rows = getattr(sup, "tombstone_rows", None)
+                tombstone_digest = getattr(sup, "tombstone_digest", None)
+                if tombstone_key and not (
+                    isinstance(tombstone_rows, int)
+                    and not isinstance(tombstone_rows, bool)
+                    and tombstone_rows > 0
+                ):
+                    raise RuntimeError(
+                        f"Snapshot for {td.super_name}.{td.simple_name} references "
+                        "a deletion vector without an exact positive row count"
+                    )
+                if tombstone_key and not (
+                    isinstance(tombstone_digest, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", tombstone_digest)
+                ):
+                    raise RuntimeError(
+                        f"Snapshot for {td.super_name}.{td.simple_name} references "
+                        "a deletion vector without a valid SHA-256 digest"
+                    )
+                if not tombstone_key and tombstone_rows and tombstone_rows > 0:
+                    raise RuntimeError(
+                        f"Snapshot for {td.super_name}.{td.simple_name} records "
+                        f"tombstoned rows but has no deletion-vector pointer"
+                    )
+
+                if tombstone_key:
+                    resolved_tombstone = resolved_tombstones.get(table_key)
+                    if resolved_tombstone is None:
+                        try:
+                            resolved_tombstone = estimator._to_duckdb_path(
+                                tombstone_key
+                            )
+                        except Exception as resolve_err:
+                            raise RuntimeError(
+                                f"Unable to resolve required deletion-vector for "
+                                f"{td.super_name}.{td.simple_name}"
+                            ) from resolve_err
+                        if (
+                            not isinstance(resolved_tombstone, str)
+                            or not resolved_tombstone
+                        ):
+                            raise RuntimeError(
+                                f"Unable to resolve required deletion-vector for "
+                                f"{td.super_name}.{td.simple_name}"
+                            )
+                        # A bare relative key is a valid LOCAL path, but for an
+                        # object-store reflection it means every URL/presign
+                        # resolver failed.  Do not let DuckDB accidentally read
+                        # a same-named local file and apply a foreign DV.
+                        storage_type = (reflection.storage_type or "").lower()
+                        if (
+                            "://" not in resolved_tombstone
+                            and not resolved_tombstone.startswith("/")
+                            and "local" not in storage_type
+                        ):
+                            raise RuntimeError(
+                                f"Unable to resolve required deletion-vector for "
+                                f"{td.super_name}.{td.simple_name}"
+                            )
+                        resolved_tombstones[table_key] = resolved_tombstone
+                    reflection.tombstone_views[td.alias] = TombstoneDef(
+                        tombstone_path=resolved_tombstone,
+                        cache_key=tombstone_key,
+                        expected_rows=tombstone_rows,
+                        tombstone_digest=tombstone_digest,
+                        resource_keys=tuple(getattr(sup, "resource_keys", ()) or ()),
+                        snapshot_resource_keys=(
+                            None
+                            if getattr(sup, "snapshot_resource_keys", None) is None
+                            else tuple(getattr(sup, "snapshot_resource_keys"))
+                        ),
+                    )
+
+                # Linked-share policy is pinned alongside the same resources.
+                share_row_filter = getattr(sup, "share_row_filter", None)
+                if share_row_filter:
+                    existing_rbac = reflection.rbac_views.get(td.alias)
+                    if existing_rbac:
+                        if existing_rbac.where_clause:
+                            existing_rbac.where_clause = (
+                                f"({existing_rbac.where_clause}) AND "
+                                f"({share_row_filter})"
+                            )
+                        else:
+                            existing_rbac.where_clause = share_row_filter
+                    else:
+                        reflection.rbac_views[td.alias] = RbacViewDef(
+                            allowed_columns=["*"],
+                            where_clause=share_row_filter,
                         )
-                        payload = (leaf or {}).get("payload") if isinstance(leaf, dict) else None
-                        if isinstance(payload, dict):
-                            tomb_path = payload.get("tombstone")
-                            if tomb_path:
-                                # Resolve the deletion-vector key exactly like the
-                                # data files (estimator._to_duckdb_path, see
-                                # data_estimator.py:426): the catalog stores a bare
-                                # object key, which DuckDB/Spark cannot read against
-                                # an object store and must be presigned. LOCAL
-                                # storage returns the key unchanged.
-                                reflection.tombstone_views[td.alias] = TombstoneDef(
-                                    tombstone_path=estimator._to_duckdb_path(tomb_path),
-                                    # Bare key (pre-presign) is stable across
-                                    # appends → safe deletion-vector cache key.
-                                    cache_key=tomb_path,
-                                )
-                    except Exception as te:
-                        logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))
-
-                    # Linked-share row filter: the provider may have set a
-                    # row_filter on the share.  Inject it as a synthetic RBAC
-                    # WHERE clause so the executor enforces it automatically.
-                    try:
-                        if isinstance(payload, dict):
-                            share_row_filter = payload.get("_row_filter")
-                            if share_row_filter and isinstance(share_row_filter, str):
-                                existing_rbac = reflection.rbac_views.get(td.alias)
-                                if existing_rbac:
-                                    # Merge: AND the share filter with existing RBAC filter
-                                    if existing_rbac.where_clause:
-                                        existing_rbac.where_clause = f"({existing_rbac.where_clause}) AND ({share_row_filter})"
-                                    else:
-                                        existing_rbac.where_clause = share_row_filter
-                                else:
-                                    reflection.rbac_views[td.alias] = RbacViewDef(
-                                        allowed_columns=["*"],
-                                        where_clause=share_row_filter,
-                                    )
-                    except Exception as rf_err:
-                        logger.debug(self._lp(f"[share-filter] row filter injection failed for {td.alias}: {rf_err}"))
-
-            except Exception as e:
-                logger.warning(self._lp(f"[dedup] config lookup failed, skipping dedup: {e}"))
 
             if not reflection.supers:
                 message = "No parquet files found"
@@ -466,8 +544,8 @@ class DataReader:
             )
             status = Status.OK
         except Exception as e:
-            message = str(e)
-            logger.error(self._lp(f"Exception: {e}"))
+            message = _redact_storage_credentials(e)
+            logger.error(self._lp(f"Exception: {message}"))
             result_df = pd.DataFrame()
 
         # Extend plan + timings

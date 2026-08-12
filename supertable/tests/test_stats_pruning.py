@@ -150,16 +150,16 @@ class TestProbeLaneForDtype:
         (pl.UInt8, "bigint"), (pl.UInt16, "bigint"), (pl.UInt32, "bigint"),
         (pl.Boolean, "bigint"),
         (pl.Float32, "double"), (pl.Float64, "double"),
-        (pl.Date, "timestamp"),
         (pl.Utf8, "string"),
     ])
     def test_supported(self, dtype, lane):
         assert _probe_lane_for_dtype(dtype) == lane
 
     def test_datetime_variants(self):
-        assert _probe_lane_for_dtype(pl.Datetime("us")) == "timestamp"
-        assert _probe_lane_for_dtype(pl.Datetime("ns")) == "timestamp"
-        assert _probe_lane_for_dtype(pl.Datetime("us", "UTC")) == "timestamp"
+        assert _probe_lane_for_dtype(pl.Date) is None
+        assert _probe_lane_for_dtype(pl.Datetime("us")) is None
+        assert _probe_lane_for_dtype(pl.Datetime("ns")) is None
+        assert _probe_lane_for_dtype(pl.Datetime("us", "UTC")) is None
 
     def test_uint64_unsupported(self):
         # UInt64 can exceed Int64 → never prune on it.
@@ -190,21 +190,25 @@ class TestProbeRangesFromDf:
     def test_int_and_string_lanes(self):
         df = pl.DataFrame({"a": [3, 1, 2], "b": ["c", "a", "b"]})
         pr = probe_ranges_from_df(df, ["a", "b"])
-        assert pr["a"] == ("bigint", 1, 3)
-        assert pr["b"] == ("string", "a", "c")
+        assert pr["a"] == ("bigint", 1, 3, "int64")
+        assert pr["b"] == ("string", "a", "c", "string")
 
     def test_float_lane(self):
         df = pl.DataFrame({"a": [2.5, 1.5, 3.5]})
-        assert probe_ranges_from_df(df, ["a"])["a"] == ("double", 1.5, 3.5)
+        assert probe_ranges_from_df(df, ["a"])["a"] == (
+            "double", 1.5, 3.5, "float64"
+        )
 
     def test_bool_lane(self):
         df = pl.DataFrame({"a": [True, False, True]})
-        assert probe_ranges_from_df(df, ["a"])["a"] == ("bigint", 0, 1)
+        assert probe_ranges_from_df(df, ["a"])["a"] == (
+            "bigint", 0, 1, "boolean"
+        )
 
     def test_date_lane_midnight(self):
         df = pl.DataFrame({"a": [date(2026, 1, 5), date(2026, 1, 1)]})
         assert probe_ranges_from_df(df, ["a"])["a"] == (
-            "timestamp", datetime(2026, 1, 1), datetime(2026, 1, 5))
+            "timestamp", datetime(2026, 1, 1), datetime(2026, 1, 5), "date")
 
     def test_timestamp_lane(self):
         df = pl.DataFrame(
@@ -212,15 +216,15 @@ class TestProbeRangesFromDf:
             schema={"a": pl.Datetime("us")},
         )
         assert probe_ranges_from_df(df, ["a"])["a"] == (
-            "timestamp", datetime(2026, 1, 1, 10), datetime(2026, 1, 2, 11))
+            "timestamp", datetime(2026, 1, 1, 10), datetime(2026, 1, 2, 11),
+            "timestamp_ntz_us")
 
     def test_tz_aware_normalised(self):
         df = pl.DataFrame(
             {"a": [datetime(2026, 1, 1, 10, tzinfo=timezone.utc)]},
             schema={"a": pl.Datetime("us", "UTC")},
         )
-        lane, lo, hi = probe_ranges_from_df(df, ["a"])["a"]
-        assert lane == "timestamp" and lo.tzinfo is None and lo == datetime(2026, 1, 1, 10)
+        assert probe_ranges_from_df(df, ["a"])["a"] is None
 
     def test_null_disables_column(self):
         # A NULL key could match a file whose footer range excludes NULL, so the
@@ -464,7 +468,7 @@ class TestDifferentialTombstoneIdentity:
 
     def test_disjoint_file_is_pruned_without_changing_result(self):
         files = {
-            "A.parquet": self._file_with_rowids([1, 2, 3], 0),
+            "A.parquet": self._file_with_rowids([1, 2, 3], 1),
             "B.parquet": self._file_with_rowids([100, 101, 102], 100),
         }
         incoming = pl.DataFrame({"a": [2, 3]})
@@ -474,7 +478,7 @@ class TestDifferentialTombstoneIdentity:
 
     def test_match_in_both_files_keeps_both(self):
         files = {
-            "A.parquet": self._file_with_rowids([1, 2, 3], 0),
+            "A.parquet": self._file_with_rowids([1, 2, 3], 1),
             "B.parquet": self._file_with_rowids([3, 4, 5], 100),
         }
         incoming = pl.DataFrame({"a": [3]})
@@ -486,7 +490,7 @@ class TestDifferentialTombstoneIdentity:
     def test_random_differential_identity(self, seed):
         rng = random.Random(1000 + seed)
         files = {}
-        rid = 0
+        rid = 1
         for i in range(rng.randint(1, 5)):
             keys = [rng.randint(0, 80) for _ in range(rng.randint(1, 25))]
             files[f"f{i}.parquet"] = self._file_with_rowids(keys, rid)

@@ -1,6 +1,7 @@
 # processing.py
 
 import decimal
+import hashlib
 import json
 import logging
 import os
@@ -9,8 +10,9 @@ import time
 import threading
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timezone
-from typing import Callable, Dict, List, Set, Tuple, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Set, Tuple, Optional
 
 import polars
 import pyarrow as pa
@@ -119,7 +121,7 @@ def _align_to_schema(df: polars.DataFrame, target_schema: Dict[str, polars.DataT
 
     For every column in *target_schema*:
       - present in *df* with the target dtype → keep the existing series
-      - present in *df* with a different dtype → cast (strict=False, so unconvertible values become null)
+      - present in *df* with a different dtype → lossless/representable cast
       - absent in *df*                          → fill with a typed null literal
 
     The resulting frame's column order is **exactly** ``list(target_schema.keys())``.
@@ -144,7 +146,20 @@ def _align_to_schema(df: polars.DataFrame, target_schema: Dict[str, polars.DataT
     for col, dtype in target_schema.items():
         if col in df.columns:
             if df.schema[col] != dtype:
-                exprs.append(polars.col(col).cast(dtype, strict=False))
+                # Compaction is a physical rewrite, so replacing values that do
+                # not fit the chosen union dtype with NULL would be permanent
+                # data loss.  Strict casting catches invalid representations;
+                # an exact round-trip also catches valid-but-lossy conversions
+                # such as Int64(2**53+1) -> Float64.
+                source = df.get_column(col)
+                casted = source.cast(dtype, strict=True).alias(col)
+                roundtrip = casted.cast(source.dtype, strict=True).alias(col)
+                if not source.equals(roundtrip, check_dtypes=True):
+                    raise ValueError(
+                        f"Compaction would change values in column {col!r} "
+                        f"while casting {source.dtype!r} to {dtype!r}"
+                    )
+                exprs.append(casted)
             else:
                 exprs.append(polars.col(col))
         else:
@@ -236,18 +251,17 @@ def _read_parquet_safe(
 ) -> Optional[polars.DataFrame]:
     """Read a parquet object into polars, or ``None`` when it is absent.
 
-    When *required* is True a genuine read failure — the object exists but cannot
-    be read (corrupt body, transient/persistent backend error) — is re-raised
-    instead of being swallowed to ``None``.  Absence still returns ``None`` even
-    when required (a missing object, or one sunset by a concurrent writer, is a
-    legitimate "no previous artifact" signal).  Carry-forward callers that would
-    otherwise silently drop a still-referenced artifact — the deletion-vector —
-    must pass ``required=True`` so a failed read aborts the write rather than
-    persisting a truncated successor (which would resurrect deleted rows).
+    When *required* is True, both absence and a genuine read failure are raised.
+    Callers use that mode only for objects referenced by the locked current
+    snapshot, where treating NotFound as an empty artifact/file would truncate a
+    deletion decision and can resurrect rows.  Optional/race-tolerant callers use
+    the default mode and continue to receive ``None`` for absence/failure.
     """
     p = profiler or get_null_profiler()
     if not _safe_exists(path, profiler=p, strict=required):
         logging.info(f"[race] file already sunset by another writer: {path}")
+        if required:
+            raise FileNotFoundError(f"Required parquet object is missing: {path}")
         return None
     try:
         with p.span("io.read_parquet"):
@@ -266,6 +280,8 @@ def _read_parquet_safe(
         return df
     except FileNotFoundError:
         logging.info(f"[race] file vanished before read: {path}")
+        if required:
+            raise
         return None
     except Exception as e:
         logging.warning(f"[read] failed to read parquet at {path}: {e}")
@@ -419,6 +435,8 @@ def compact_resources(
         table_config: Optional[dict] = None,
         small_only: bool = True,
         dead_rowids: Optional[Set[int]] = None,
+        dead_rowids_by_file: Optional[Dict[str, Set[int]]] = None,
+        required_reads: bool = False,
         profiler: Optional[Profiler] = None,
 ) -> Tuple[int, int, List[Dict], Set[str]]:
     """Compact small parquet files in a snapshot's resources list.
@@ -446,6 +464,14 @@ def compact_resources(
             files contain no logically-deleted rows. Used by ``export_to``
             to bake the deletion-vector into a standalone copy. ``None``
             (default) preserves every row.
+        dead_rowids_by_file: canonical deletion-vector identity mapping from
+            source file key to its dead rowids. Prefer this over ``dead_rowids``:
+            the same legacy/corrupt rowid in another file remains live.
+        required_reads: when True, every snapshot-referenced source must be
+            readable.  Logical materialisations such as export use this mode so
+            a transient NotFound/backend error cannot produce a successful but
+            incomplete copy.  Best-effort maintenance compaction keeps the
+            default and conservatively leaves unreadable resources live.
         profiler: optional :class:`Profiler`.  When supplied, the reads of
             the small candidate files and the writes of the merged chunks are
             counted into the shared ``files_read``/``bytes_read``/
@@ -516,41 +542,111 @@ def compact_resources(
     chunk_df: Optional[polars.DataFrame] = None
 
     p.add("compact_small_candidates", len(candidates))
-    for file_path, file_size in candidates:
-        existing_df = _read_parquet_safe(file_path, profiler=p, file_size=file_size)
-        if existing_df is None:
-            # Race: another writer already sunset this file. Skip and
-            # leave it out of sunset_files — the snapshot still
-            # references it; the next compaction will retry.
-            continue
 
-        # Physically drop logically-deleted rows when a deletion-vector
-        # is supplied (export bakes the vector into the copy).
-        if dead_rowids and ROWID_COL in existing_df.columns:
-            existing_df = existing_df.filter(
-                ~polars.col(ROWID_COL).is_in(list(dead_rowids))
+    def _prove_safe_compacted_rowids(frame: polars.DataFrame) -> None:
+        """Prevent composite file identity collapsing duplicate legacy IDs.
+
+        A deletion vector distinguishes ``(source file, rowid)``. Once rows
+        from several files are merged, the successor file becomes their shared
+        identity; duplicate rowids inside it would make one future tombstone
+        delete every colliding live row. Legacy-only chunks without any rowid
+        column remain readable, but a modern/mixed chunk must prove the exact
+        canonical invariant before it is written.
+        """
+        folded_rowids = [
+            column for column in frame.columns
+            if str(column).casefold() == ROWID_COL.casefold()
+        ]
+        if not folded_rowids:
+            return
+        if folded_rowids != [ROWID_COL]:
+            raise ValueError(
+                "Compaction encountered an ambiguous reserved rowid column"
+            )
+        rowids = frame.get_column(ROWID_COL)
+        if rowids.dtype != polars.Int64:
+            raise ValueError("Compaction requires canonical __rowid__ Int64")
+        if rowids.null_count() > 0:
+            raise ValueError(
+                "Compaction cannot merge modern and rowid-less legacy rows"
+            )
+        minimum = rowids.min()
+        if minimum is None or minimum <= 0:
+            raise ValueError("Compaction requires positive __rowid__ values")
+        if rowids.n_unique() != frame.height:
+            raise ValueError(
+                "Compaction would merge duplicate __rowid__ values into one "
+                "file and make future tombstones over-delete live rows"
             )
 
-        if chunk_df is None or chunk_df.height == 0:
-            # Seed the buffer with the first survivor. Using
-            # ``concat_with_union`` even for the seed keeps the schema
-            # behaviour identical to the merge path (no column drop on
-            # the first file).
-            chunk_df = (
-                existing_df if chunk_df is None
-                else concat_with_union(chunk_df, existing_df)
+    try:
+        for file_path, file_size in candidates:
+            existing_df = _read_parquet_safe(
+                file_path,
+                profiler=p,
+                file_size=file_size,
+                required=required_reads,
             )
-        else:
-            chunk_df = concat_with_union(chunk_df, existing_df)
+            if existing_df is None:
+                # Race: another writer already sunset this file. Skip and
+                # leave it out of sunset_files — the snapshot still
+                # references it; the next compaction will retry.
+                continue
 
-        sunset_files.add(file_path)
-        chunk_size_bytes += int(file_size or 0)
+            # Physically drop logically-deleted rows when a deletion-vector
+            # is supplied (export bakes the vector into the copy).
+            has_deletion_vector = (
+                dead_rowids_by_file is not None or dead_rowids is not None
+            )
+            if has_deletion_vector:
+                if ROWID_COL not in existing_df.columns:
+                    raise ValueError(
+                        f"Cannot apply deletion-vector while materialising "
+                        f"{file_path!r}: missing canonical {ROWID_COL!r} column"
+                    )
+                if existing_df.get_column(ROWID_COL).null_count() > 0:
+                    raise ValueError(
+                        f"Cannot apply deletion-vector while materialising "
+                        f"{file_path!r}: NULL rowids are not allowed"
+                    )
+                file_dead_rowids = (
+                    set(dead_rowids_by_file.get(file_path, set()))
+                    if dead_rowids_by_file is not None else set(dead_rowids or set())
+                )
+                if file_dead_rowids:
+                    existing_df = existing_df.filter(
+                        ~polars.col(ROWID_COL).is_in(list(file_dead_rowids))
+                    )
 
-        # Flush when the buffered chunk exceeds the per-table memory cap.
-        if chunk_size_bytes >= max_mem:
+            if chunk_df is None or chunk_df.height == 0:
+                chunk_df = (
+                    existing_df if chunk_df is None
+                    else concat_with_union(chunk_df, existing_df)
+                )
+            else:
+                chunk_df = concat_with_union(chunk_df, existing_df)
+
+            sunset_files.add(file_path)
+            chunk_size_bytes += int(file_size or 0)
+
+            if chunk_size_bytes >= max_mem:
+                _prove_safe_compacted_rowids(chunk_df)
+                total_rows += chunk_df.shape[0]
+                write_parquet_and_collect_resources(
+                    write_df=chunk_df,
+                    overwrite_columns=[],
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
+                chunk_df = None
+                chunk_size_bytes = 0
+
+        # Final flush — if anything remains in the buffer, write it out.
+        if chunk_df is not None and chunk_df.height > 0:
+            _prove_safe_compacted_rowids(chunk_df)
             total_rows += chunk_df.shape[0]
-            # No overwrite columns for plain compaction — we don't need to pin
-            # a specific key for the resulting file.
             write_parquet_and_collect_resources(
                 write_df=chunk_df,
                 overwrite_columns=[],
@@ -559,20 +655,25 @@ def compact_resources(
                 compression_level=compression_level,
                 profiler=p,
             )
-            chunk_df = None
-            chunk_size_bytes = 0
-
-    # Final flush — if anything remains in the buffer, write it out.
-    if chunk_df is not None and chunk_df.height > 0:
-        total_rows += chunk_df.shape[0]
-        write_parquet_and_collect_resources(
-            write_df=chunk_df,
-            overwrite_columns=[],
-            data_dir=data_dir,
-            new_resources=new_resources,
-            compression_level=compression_level,
-            profiler=p,
-        )
+    except Exception:
+        if required_reads and new_resources:
+            # A logical materialisation must be all-or-nothing from the caller's
+            # perspective. Delete only keys minted by this invocation; never
+            # enumerate or touch pre-existing target contents.
+            delete = getattr(_get_storage(), "delete", None)
+            if callable(delete):
+                for resource in new_resources:
+                    generated = resource.get("file") if isinstance(resource, dict) else None
+                    if not generated:
+                        continue
+                    try:
+                        delete(generated)
+                    except Exception as cleanup_error:
+                        logging.warning(
+                            f"[materialize] failed to clean orphan {generated}: "
+                            f"{cleanup_error}"
+                        )
+        raise
 
     return len(sunset_files), total_rows, new_resources, sunset_files
 
@@ -681,58 +782,42 @@ def _write_single_parquet_file(
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
 
-    # Write to the active storage backend
-    try:
-        with p.span("write.to_arrow"):
-            arrow_tbl: pa.Table = write_df.to_arrow()
-        with p.span("write.parquet_encode"):
-            buf = io.BytesIO()
-            pq.write_table(
-                arrow_tbl,
-                buf,
-                compression="zstd",
-                compression_level=int(compression_level),
-                use_dictionary=True,
-                write_statistics=True,
-                row_group_size=_PARQUET_ROW_GROUP_SIZE,
-            )
-            data = buf.getvalue()
+    # Write to the active storage backend.  Encoding and upload are deliberately
+    # separate: a failed object-store PUT must abort the mutation, never fall back
+    # to writing the bare object key on the writer's local filesystem.
+    with p.span("write.to_arrow"):
+        arrow_tbl: pa.Table = write_df.to_arrow()
+    with p.span("write.parquet_encode"):
+        buf = io.BytesIO()
+        pq.write_table(
+            arrow_tbl,
+            buf,
+            compression="zstd",
+            compression_level=int(compression_level),
+            use_dictionary=True,
+            write_statistics=True,
+            row_group_size=_PARQUET_ROW_GROUP_SIZE,
+        )
+        data = buf.getvalue()
 
-        if hasattr(_get_storage(), "write_bytes"):
-            with p.span("write.upload_bytes"):
-                _get_storage().write_bytes(new_parquet_path, data)
-            # The uploaded bytes ARE ``data`` here, so parse the footer in memory
-            # (footer-only, no decode, no network round-trip) for stats reuse.
-            # ONLY on this path: the write_parquet / polars fallbacks below
-            # re-encode via a different writer, so their on-disk row-group layout
-            # and statistics need not match ``data`` — reusing it there could
-            # mis-prune row groups on read.
-            if footer_md_out is not None:
-                try:
-                    footer_md_out[new_parquet_path] = pq.read_metadata(io.BytesIO(data))
-                except Exception:
-                    pass
-        elif hasattr(_get_storage(), "write_parquet"):
-            with p.span("write.upload_parquet"):
-                _get_storage().write_parquet(arrow_tbl, new_parquet_path)
-        else:
-            with p.span("write.local_fallback"):
-                write_df.write_parquet(
-                    file=new_parquet_path,
-                    compression="zstd",
-                    compression_level=int(compression_level),
-                    statistics=True,
-                    row_group_size=_PARQUET_ROW_GROUP_SIZE,
-                )
-    except Exception:
-        with p.span("write.local_fallback"):
-            write_df.write_parquet(
-                file=new_parquet_path,
-                compression="zstd",
-                compression_level=int(compression_level),
-                statistics=True,
-                row_group_size=_PARQUET_ROW_GROUP_SIZE,
-            )
+    storage = _get_storage()
+    write_bytes = getattr(storage, "write_bytes", None)
+    write_parquet = getattr(storage, "write_parquet", None)
+    if callable(write_bytes):
+        with p.span("write.upload_bytes"):
+            write_bytes(new_parquet_path, data)
+        # The uploaded bytes ARE ``data`` here, so parse the footer in memory
+        # (footer-only, no decode, no network round-trip) for stats reuse.
+        if footer_md_out is not None:
+            try:
+                footer_md_out[new_parquet_path] = pq.read_metadata(io.BytesIO(data))
+            except Exception:
+                pass
+    elif callable(write_parquet):
+        with p.span("write.upload_parquet"):
+            write_parquet(arrow_tbl, new_parquet_path)
+    else:
+        raise RuntimeError("Configured storage provides no parquet write method")
 
     # Determine file size
     try:
@@ -773,6 +858,8 @@ def filter_stale_incoming_rows(
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
         read_columns: Optional[List[str]] = None,
+        required: bool = False,
+        dead_rowids_by_file: Optional[Dict[str, polars.Series]] = None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -807,9 +894,27 @@ def filter_stale_incoming_rows(
     # Read and collect relevant rows from overlapping files
     existing_parts: List[polars.DataFrame] = []
     for file_path, file_size in overlap_true_files:
-        part = _read_parquet_safe(file_path, profiler=p, file_size=file_size, columns=read_columns)
+        part = _read_parquet_safe(
+            file_path,
+            profiler=p,
+            file_size=file_size,
+            columns=read_columns,
+            required=required,
+        )
         if part is None:
             continue
+        # Validate the complete projected source before excluding already-dead
+        # rows.  Validating the filtered frame could hide a duplicate whose
+        # other occurrence is already in the deletion vector.
+        if required or ROWID_COL in part.columns:
+            _validate_mutation_source_rowids(part, file_path)
+        dead_ids = (dead_rowids_by_file or {}).get(file_path)
+        if dead_ids is not None and len(dead_ids) > 0 and ROWID_COL in part.columns:
+            part = part.join(
+                dead_ids.alias(ROWID_COL).to_frame(),
+                on=ROWID_COL,
+                how="anti",
+            )
         # Cache the full DataFrame for downstream reuse (avoids double-read)
         if file_cache is not None:
             file_cache[file_path] = part
@@ -819,6 +924,11 @@ def filter_stale_incoming_rows(
         # Select only the columns we need, filtering to matching keys
         available_cols = [c for c in needed_cols if c in part.columns]
         if not all(c in available_cols for c in overwrite_columns):
+            if required:
+                missing = [c for c in overwrite_columns if c not in available_cols]
+                raise ValueError(
+                    f"Mutation candidate {file_path!r} lacks overwrite column(s) {missing!r}"
+                )
             continue
         existing_parts.append(part.select(available_cols))
 
@@ -868,6 +978,257 @@ def filter_stale_incoming_rows(
 
 ROWID_COL = "__rowid__"
 TOMBSTONE_FILE_COL = "__file__"
+TOMBSTONE_SCHEMA: Dict[str, polars.DataType] = {
+    TOMBSTONE_FILE_COL: polars.Utf8,
+    ROWID_COL: polars.Int64,
+}
+
+# (logical row count, canonical digest, referenced immutable data-file keys).
+# Stored next to an immutable cached frame so a cache hit can re-check the
+# pinned snapshot contract without scanning the deletion vector again.
+_TombstoneCacheSeal = Tuple[int, str, FrozenSet[str]]
+
+
+def _empty_tombstone_df() -> polars.DataFrame:
+    """Return an empty deletion-vector frame with the sealed schema."""
+    return polars.DataFrame(schema=TOMBSTONE_SCHEMA)
+
+
+def _validate_mutation_source_rowids(
+        frame: polars.DataFrame,
+        file_path: str,
+) -> None:
+    """Prove that one immutable source file is safe to tombstone by row id.
+
+    A deletion vector identifies a physical row by ``(file, __rowid__)``.  If
+    one file contains the same row id twice, a predicate matching only one of
+    those rows would still hide both.  This validation therefore runs over the
+    *complete projected row-id column* before any live/dead filtering or key
+    matching.  Snapshot high-watermarks prevent future allocation reuse but do
+    not prove that a legacy or previously compacted file is collision-free.
+    """
+    if ROWID_COL not in frame.columns:
+        raise ValueError(
+            f"Mutation candidate {file_path!r} has no required {ROWID_COL!r} column"
+        )
+    rowids = frame.get_column(ROWID_COL)
+    if rowids.dtype != polars.Int64:
+        raise ValueError(
+            f"Mutation candidate {file_path!r} has non-Int64 rowids"
+        )
+    if rowids.null_count() > 0:
+        raise ValueError(
+            f"Mutation candidate {file_path!r} contains NULL rowids"
+        )
+    if frame.height and (
+        rowids.min() is None
+        or int(rowids.min()) <= 0
+        or rowids.n_unique() != frame.height
+    ):
+        raise ValueError(
+            f"Mutation candidate {file_path!r} contains non-positive or "
+            "duplicate rowids"
+        )
+
+
+def _checked_tombstone_expected_rows(
+        expected_rows: Optional[int], *, source: str,
+) -> Optional[int]:
+    if expected_rows is None:
+        return None
+    if isinstance(expected_rows, bool):
+        raise ValueError(f"{source} has invalid expected row count")
+    try:
+        expected = int(expected_rows)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} has invalid expected row count") from exc
+    if expected < 0:
+        raise ValueError(f"{source} has invalid expected row count")
+    return expected
+
+
+def _checked_tombstone_expected_digest(
+        expected_digest: Optional[str], *, source: str,
+) -> Optional[str]:
+    if expected_digest is None:
+        return None
+    if (
+        not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+        or expected_digest != expected_digest.lower()
+        or any(ch not in "0123456789abcdef" for ch in expected_digest)
+    ):
+        raise ValueError(f"{source} has an invalid expected digest")
+    return expected_digest
+
+
+def validate_tombstone_frame(
+        df: polars.DataFrame,
+        *,
+        expected_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        allowed_files: Optional[Set[str]] = None,
+        source: str = "deletion-vector",
+) -> polars.DataFrame:
+    """Validate the persisted deletion-vector before it can affect data.
+
+    Tombstones are correctness metadata, not an optional optimisation.  A
+    malformed or truncated vector must therefore abort the operation instead
+    of being interpreted as an empty/partial set (which would resurrect rows).
+
+    ``__rowid__`` is additionally required to be globally unique as a writer,
+    allocation, and legacy-migration integrity invariant.  This stronger
+    requirement also proves composite ``(__file__``, ``__rowid__``)
+    uniqueness without a second cardinality scan.
+    """
+    if not isinstance(df, polars.DataFrame):
+        raise ValueError(f"{source} is not a Polars DataFrame")
+    if list(df.columns) != list(TOMBSTONE_SCHEMA):
+        raise ValueError(
+            f"{source} has invalid columns {df.columns!r}; "
+            f"expected {list(TOMBSTONE_SCHEMA)!r}"
+        )
+    if df.schema != TOMBSTONE_SCHEMA:
+        raise ValueError(
+            f"{source} has invalid schema {df.schema!r}; "
+            f"expected {TOMBSTONE_SCHEMA!r}"
+        )
+    expected_digest = _checked_tombstone_expected_digest(
+        expected_digest, source=source,
+    )
+    expected = _checked_tombstone_expected_rows(expected_rows, source=source)
+    if expected is not None:
+        if df.height != expected:
+            raise ValueError(
+                f"{source} row-count mismatch: expected {expected}, got {df.height}"
+            )
+    if df.height == 0:
+        if expected_digest is not None:
+            actual_digest = _tombstone_digest_validated(df)
+            if actual_digest != expected_digest:
+                raise ValueError(
+                    f"{source} digest mismatch: expected {expected_digest}, "
+                    f"got {actual_digest}"
+                )
+        return df
+    integrity = df.select([
+        polars.col(TOMBSTONE_FILE_COL).null_count().alias("null_files"),
+        polars.col(ROWID_COL).null_count().alias("null_rowids"),
+        (polars.col(TOMBSTONE_FILE_COL).str.len_chars() == 0)
+        .sum().alias("empty_files"),
+        polars.col(ROWID_COL).n_unique().alias("rowid_unique"),
+        polars.col(ROWID_COL).min().alias("min_rowid"),
+    ]).row(0, named=True)
+    if integrity["null_files"] or integrity["null_rowids"]:
+        raise ValueError(f"{source} contains NULL file/rowid values")
+    if integrity["empty_files"]:
+        raise ValueError(f"{source} contains an empty file key")
+    if integrity["rowid_unique"] != df.height:
+        raise ValueError(
+            f"{source} contains duplicate (file, rowid) entries or reuses a "
+            "rowid across files; writer integrity requires table-global rowid "
+            "uniqueness"
+        )
+    if integrity["min_rowid"] <= 0:
+        raise ValueError(f"{source} contains non-positive rowids")
+    if allowed_files is not None:
+        referenced = set(df.get_column(TOMBSTONE_FILE_COL).unique().to_list())
+        foreign = referenced.difference(set(allowed_files))
+        if foreign:
+            raise ValueError(
+                f"{source} references file(s) outside the current snapshot: "
+                f"{sorted(foreign)!r}"
+            )
+    if expected_digest is not None:
+        actual_digest = _tombstone_digest_validated(df)
+        if actual_digest != expected_digest:
+            raise ValueError(
+                f"{source} digest mismatch: expected {expected_digest}, "
+                f"got {actual_digest}"
+            )
+    return df
+
+
+def _tombstone_digest_validated(df: polars.DataFrame) -> str:
+    """Hash a frame already validated against :data:`TOMBSTONE_SCHEMA`."""
+    # Keep sorting in Polars' columnar engine instead of allocating a Python
+    # tuple for every record. Feed the digest incrementally so a threshold-size
+    # vector never creates a second monolithic body bytes object.
+    ordered = (
+        df.select([
+            polars.col(TOMBSTONE_FILE_COL).str.encode("base64").alias("__b64file__"),
+            polars.col(ROWID_COL),
+        ])
+        .sort(["__b64file__", ROWID_COL])
+    )
+    digest = hashlib.sha256(b"supertable-tombstone-v1\n")
+    separator = ""
+    for encoded_file, rowid in ordered.iter_rows():
+        # One bounded record allocation and one OpenSSL/Python boundary per
+        # row.  The bytes remain exactly ``[newline]base64(file):hex(rowid)``.
+        digest.update(
+            f"{separator}{encoded_file}:{int(rowid):016x}".encode("ascii")
+        )
+        separator = "\n"
+    return digest.hexdigest()
+
+
+def tombstone_digest(
+    df: polars.DataFrame, *, assume_valid: bool = False,
+) -> str:
+    """Return the canonical ``st-dv-v1`` logical deletion-vector digest."""
+    validated = (
+        df if assume_valid else
+        validate_tombstone_frame(df, source="deletion-vector to digest")
+    )
+    return _tombstone_digest_validated(validated)
+
+
+def _tombstone_cache_seal(
+        df: polars.DataFrame,
+        *,
+        known_digest: Optional[str] = None,
+        source: str,
+) -> _TombstoneCacheSeal:
+    """Build immutable cache metadata for an already validated frame."""
+    digest = _checked_tombstone_expected_digest(known_digest, source=source)
+    if digest is None:
+        digest = _tombstone_digest_validated(df)
+    referenced = frozenset(
+        df.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+    ) if df.height else frozenset()
+    return int(df.height), digest, referenced
+
+
+def _validate_cached_tombstone_seal(
+        seal: _TombstoneCacheSeal,
+        *,
+        expected_rows: Optional[int],
+        expected_digest: Optional[str],
+        allowed_files: Optional[Set[str]],
+        source: str,
+) -> None:
+    """Validate a pinned snapshot against cached immutable metadata only."""
+    rows, digest, referenced = seal
+    expected = _checked_tombstone_expected_rows(expected_rows, source=source)
+    wanted_digest = _checked_tombstone_expected_digest(
+        expected_digest, source=source,
+    )
+    if expected is not None and rows != expected:
+        raise ValueError(
+            f"{source} row-count mismatch: expected {expected}, got {rows}"
+        )
+    if wanted_digest is not None and digest != wanted_digest:
+        raise ValueError(
+            f"{source} digest mismatch: expected {wanted_digest}, got {digest}"
+        )
+    if allowed_files is not None:
+        foreign = referenced.difference(frozenset(allowed_files))
+        if foreign:
+            raise ValueError(
+                f"{source} references file(s) outside the current snapshot: "
+                f"{sorted(foreign)!r}"
+            )
 
 
 def _max_tombstone_rows(table_config: Optional[dict]) -> int:
@@ -895,30 +1256,32 @@ def _write_df_parquet(
     p = profiler or get_null_profiler()
     data = None
     wrote_exact_bytes = False
-    try:
-        with p.span("tombstone.encode"):
-            arrow_tbl = write_df.to_arrow()
-            buf = io.BytesIO()
-            pq.write_table(
-                arrow_tbl, buf,
-                compression="zstd",
-                compression_level=int(compression_level),
-                use_dictionary=True,
-                write_statistics=True,
-                row_group_size=_PARQUET_ROW_GROUP_SIZE,
-            )
-            data = buf.getvalue()
-        if hasattr(_get_storage(), "write_bytes"):
-            _get_storage().write_bytes(path, data)
-            # We PUT exactly these bytes, so len(data) IS the object size —
-            # no need for a follow-up size() HEAD round-trip below.
-            wrote_exact_bytes = True
-        elif hasattr(_get_storage(), "write_parquet"):
-            _get_storage().write_parquet(arrow_tbl, path)
-        else:
-            write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
-    except Exception:
-        write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
+    with p.span("tombstone.encode"):
+        arrow_tbl = write_df.to_arrow()
+        buf = io.BytesIO()
+        pq.write_table(
+            arrow_tbl, buf,
+            compression="zstd",
+            compression_level=int(compression_level),
+            use_dictionary=True,
+            write_statistics=True,
+            row_group_size=_PARQUET_ROW_GROUP_SIZE,
+        )
+        data = buf.getvalue()
+
+    storage = _get_storage()
+    write_bytes = getattr(storage, "write_bytes", None)
+    write_parquet = getattr(storage, "write_parquet", None)
+    if callable(write_bytes):
+        # Upload failures are authoritative.  Never reinterpret a failed remote
+        # PUT as a local relative-path write: that can publish a snapshot whose
+        # object key was created only on the writer's local filesystem.
+        write_bytes(path, data)
+        wrote_exact_bytes = True
+    elif callable(write_parquet):
+        write_parquet(arrow_tbl, path)
+    else:
+        raise RuntimeError("Configured storage provides no parquet write method")
     # Fast path: the write_bytes backend (MinIO/S3/local) stored precisely
     # `data`, so return its length and skip the extra HEAD.  Only the
     # write_parquet / fallback branches (which may re-encode) consult size().
@@ -940,6 +1303,8 @@ def identify_deleted_rowids(
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
         read_columns: Optional[List[str]] = None,
+        required: bool = False,
+        dead_rowids_by_file: Optional[Dict[str, polars.Series]] = None,
 ) -> List[Tuple[str, int]]:
     """Find the ``(file, __rowid__)`` pairs of existing rows matching a delete predicate.
 
@@ -971,13 +1336,40 @@ def identify_deleted_rowids(
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.get(file)
         else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size, columns=read_columns)
+            existing_df = _read_parquet_safe(
+                file,
+                profiler=p,
+                file_size=file_size,
+                columns=read_columns,
+                required=required,
+            )
         if existing_df is None:
             continue
         if ROWID_COL not in existing_df.columns:
+            if required:
+                raise ValueError(
+                    f"Mutation candidate {file!r} has no required {ROWID_COL!r} column"
+                )
             continue
         if not all(c in existing_df.columns for c in overwrite_columns):
+            if required:
+                missing = [c for c in overwrite_columns if c not in existing_df.columns]
+                raise ValueError(
+                    f"Mutation candidate {file!r} lacks overwrite column(s) {missing!r}"
+                )
             continue
+        # This frame contains every projected row from the source file (or was
+        # cached only after the same validation in stale filtering).  Never
+        # emit a deletion-vector pair unless one row id identifies exactly one
+        # physical row in that file.
+        _validate_mutation_source_rowids(existing_df, file)
+        dead_ids = (dead_rowids_by_file or {}).get(file)
+        if dead_ids is not None and len(dead_ids) > 0:
+            existing_df = existing_df.join(
+                dead_ids.alias(ROWID_COL).to_frame(),
+                on=ROWID_COL,
+                how="anti",
+            )
 
         with p.span("delete.semi_join"):
             # nulls_equal=True so a NULL in an overwrite key matches an existing
@@ -999,6 +1391,7 @@ def identify_all_rowids(
         resources: list,
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
+        required: bool = False,
 ) -> List[Tuple[str, int]]:
     """Collect every ``(file, __rowid__)`` pair across all data files.
 
@@ -1024,10 +1417,24 @@ def identify_all_rowids(
             # A delete-all can touch every file; a full-width read would pull all
             # columns of every file into memory for nothing.
             existing_df = _read_parquet_safe(
-                file, profiler=p, file_size=file_size, columns=[ROWID_COL]
+                file,
+                profiler=p,
+                file_size=file_size,
+                columns=[ROWID_COL],
+                required=required,
             )
-        if existing_df is None or ROWID_COL not in existing_df.columns:
+        if existing_df is None:
             continue
+        if ROWID_COL not in existing_df.columns:
+            if required:
+                raise ValueError(
+                    f"Mutation candidate {file!r} has no required {ROWID_COL!r} column"
+                )
+            continue
+        if existing_df.get_column(ROWID_COL).null_count() > 0:
+            if required:
+                raise ValueError(f"Mutation candidate {file!r} contains NULL rowids")
+            existing_df = existing_df.filter(polars.col(ROWID_COL).is_not_null())
         rowids = existing_df.get_column(ROWID_COL).drop_nulls().to_list()
         pairs.extend((file, int(rid)) for rid in rowids)
         p.add("delete_rows_matched", len(rowids))
@@ -1106,6 +1513,7 @@ def _duckdb_probe_overlap_matches(
         overwrite_columns: List[str],
         newer_than_col: Optional[str],
         incoming_keys: polars.DataFrame,
+        incoming_schema: Optional[Dict[str, polars.DataType]] = None,
         profiler: Optional[Profiler] = None,
 ) -> Optional[polars.DataFrame]:
     """Column-projected pushdown probe over the overlapping data files.
@@ -1123,6 +1531,39 @@ def _duckdb_probe_overlap_matches(
     p = profiler or get_null_profiler()
     if not overlap_true_files or not overwrite_columns:
         return None
+
+    exact_duckdb_types = {
+        polars.Boolean: "BOOLEAN",
+        polars.Int8: "TINYINT",
+        polars.Int16: "SMALLINT",
+        polars.Int32: "INTEGER",
+        polars.Int64: "BIGINT",
+        polars.UInt8: "UTINYINT",
+        polars.UInt16: "USMALLINT",
+        polars.UInt32: "UINTEGER",
+        polars.UInt64: "UBIGINT",
+        polars.Utf8: "VARCHAR",
+    }
+    expected_types: Dict[str, str] = {}
+    source_schema = incoming_schema or dict(incoming_keys.schema)
+    typed_columns = list(overwrite_columns)
+    if newer_than_col and (
+        incoming_schema is not None or newer_than_col in source_schema
+    ):
+        typed_columns.append(newer_than_col)
+    for column in typed_columns:
+        dtype = source_schema.get(column)
+        expected = exact_duckdb_types.get(dtype)
+        if expected is None:
+            # DuckDB may coerce temporal, floating, decimal, or nested values
+            # differently from Polars' strict mutation oracle. Acceleration is
+            # optional; use the required=True path for exact semantics.
+            logging.info(
+                f"[write-probe] unsupported exact key type {column}={dtype}; "
+                "using strict polars path"
+            )
+            return None
+        expected_types[column] = expected
 
     try:
         import duckdb  # noqa: F401  (imported for availability check / errors)
@@ -1148,27 +1589,149 @@ def _duckdb_probe_overlap_matches(
         """
         d2k: Dict[str, str] = {}
         paths: List[str] = []
+        seen_keys: Set[str] = set()
         for k in file_keys:
+            if k in seen_keys:
+                raise ValueError(
+                    "duplicate mutation resource key makes tombstone identity ambiguous"
+                )
+            seen_keys.add(k)
             dp = _storage_duckdb_path(storage, k, force_presign=force_presign)
+            prior = d2k.get(dp)
+            if prior is not None and prior != k:
+                raise ValueError(
+                    "resolved mutation path maps to multiple resource keys; "
+                    "tombstone identity is ambiguous"
+                )
             d2k[dp] = k
             paths.append(dp)
         return paths, d2k
 
     # Proactive: honours SUPERTABLE_DUCKDB_PRESIGNED exactly like the read path.
-    duck_paths, duck_to_key = _resolve(force_presign=False)
+    # Identity ambiguity disables only the optional accelerator; the strict
+    # storage-SDK fallback below still reads each raw resource key separately.
+    try:
+        duck_paths, duck_to_key = _resolve(force_presign=False)
+    except Exception as e:
+        logging.info(
+            f"[write-probe] unsafe path identity, using polars path: {e}"
+        )
+        return None
 
     select_cols = ["filename", quote_if_needed(ROWID_COL)]
     select_cols += [quote_if_needed(c) for c in overwrite_columns]
     if newer_than_col:
         select_cols.append(quote_if_needed(newer_than_col))
+    def _join_operand(alias: str, column: str) -> str:
+        operand = f"{alias}.{quote_if_needed(column)}"
+        if expected_types.get(column) == "VARCHAR":
+            # Pooled connections use default_collation=nocase for SELECT. Polars
+            # overwrite equality is case-sensitive; force binary/C collation so
+            # enabling the probe cannot turn A and a into the same mutation key.
+            return f"({operand} COLLATE c)"
+        return operand
+
     join_cond = " AND ".join(
-        f"src.{quote_if_needed(c)} IS NOT DISTINCT FROM k.{quote_if_needed(c)}"
+        f"{_join_operand('src', c)} IS NOT DISTINCT FROM {_join_operand('k', c)}"
         for c in overwrite_columns
     )
     ik_name = f"__st_ik_{uuid.uuid4().hex}"
 
     def _run(paths):
         files_sql = ", ".join(f"'{escape_parquet_path(dp)}'" for dp in paths)
+        # ``union_by_name`` materialises columns absent from one file as NULL.
+        # That is unsafe for mutation keys: an incoming NULL can then match a
+        # synthetic NULL and tombstone an unrelated legacy row; a synthetic
+        # NULL rowid can also make a partial mutation appear successful. Inspect
+        # each footer first and accept pushdown only when every physical file
+        # has the canonical rowid plus every overwrite key. Any uncertainty
+        # falls through to the required=True oracle, which aborts on absence.
+        schema_sql = (
+            "SELECT file_name, name, duckdb_type FROM "
+            f"parquet_schema([{files_sql}]) WHERE column_id > 0"
+        )
+        with p.span("io.duckdb_probe_schema"):
+            schema_rows = con.execute(schema_sql).fetchall()
+        columns_by_file: Dict[str, Dict[str, str]] = {path: {} for path in paths}
+        folded_by_file: Dict[str, Dict[str, int]] = {path: {} for path in paths}
+        for schema_file, column_name, duckdb_type in schema_rows:
+            if schema_file in columns_by_file:
+                columns_by_file[schema_file][column_name] = str(duckdb_type or "").upper()
+                folded = column_name.casefold()
+                folded_by_file[schema_file][folded] = (
+                    folded_by_file[schema_file].get(folded, 0) + 1
+                )
+        required_columns = {ROWID_COL, *overwrite_columns}
+        incomplete = {}
+        for path, columns in columns_by_file.items():
+            problems = []
+            for column in required_columns:
+                if column not in columns:
+                    problems.append(f"missing {column}")
+                    continue
+                expected = "BIGINT" if column == ROWID_COL else expected_types[column]
+                if columns[column] != expected:
+                    problems.append(
+                        f"{column} type {columns[column]} != {expected}"
+                    )
+                if folded_by_file[path].get(column.casefold(), 0) != 1:
+                    problems.append(f"ambiguous case-folded column {column}")
+            if (
+                newer_than_col
+                and newer_than_col in columns
+                and newer_than_col in expected_types
+            ):
+                expected = expected_types[newer_than_col]
+                if columns[newer_than_col] != expected:
+                    problems.append(
+                        f"{newer_than_col} type {columns[newer_than_col]} != {expected}"
+                    )
+            if problems:
+                incomplete[path] = problems
+        if incomplete:
+            raise ValueError(
+                f"mutation candidate schema is incomplete: {incomplete!r}"
+            )
+
+        # Footer type checks are not enough: a legacy/previously compacted
+        # file can contain duplicate positive BIGINT rowids.  A key-filtered
+        # probe might see only one occurrence and then publish a tombstone that
+        # hides an unrelated duplicate.  Scan only the rowid column, but scan
+        # it completely for every candidate before the accelerator may emit a
+        # pair.  Binary collation keeps case-distinct source paths separate
+        # even though pooled SELECT connections default to nocase.
+        integrity_sql = (
+            "SELECT filename COLLATE \"binary\" AS __st_file__, "
+            "count(*) AS __rows__, "
+            f"count({quote_if_needed(ROWID_COL)}) AS __nonnull__, "
+            f"count(DISTINCT {quote_if_needed(ROWID_COL)}) AS __unique__, "
+            f"min({quote_if_needed(ROWID_COL)}) AS __min__ "
+            f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
+            "filename=TRUE, hive_partitioning=FALSE) "
+            "GROUP BY filename COLLATE \"binary\""
+        )
+        with p.span("io.duckdb_probe_rowid_integrity"):
+            integrity_rows = con.execute(integrity_sql).fetchall()
+        checked_paths = set()
+        for source_file, total, nonnull, unique, minimum in integrity_rows:
+            source_file = str(source_file)
+            checked_paths.add(source_file)
+            if (
+                int(total) != int(nonnull)
+                or int(total) != int(unique)
+                or (int(total) > 0 and (minimum is None or int(minimum) <= 0))
+            ):
+                raise ValueError(
+                    f"mutation candidate {source_file!r} contains NULL, "
+                    "non-positive, or duplicate rowids"
+                )
+        # Non-empty inputs must appear exactly once in the binary-collated
+        # aggregate. Empty parquet files cannot match a key and are harmless.
+        unexpected = checked_paths.difference(paths)
+        if unexpected:
+            raise ValueError(
+                f"mutation probe returned unrecognized source file(s): {unexpected!r}"
+            )
         sql = (
             f"SELECT {', '.join(select_cols)} "
             f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
@@ -1234,6 +1797,9 @@ def _duckdb_probe_overlap_matches(
         # A returned filename did not map back — refuse to emit ambiguous
         # tombstones; let the caller fall back to the polars path.
         logging.info("[write-probe] unmapped filename in probe result; using polars path")
+        return None
+    if ROWID_COL not in matched.columns or matched.get_column(ROWID_COL).null_count() > 0:
+        logging.info("[write-probe] missing/NULL rowid in probe result; using strict polars path")
         return None
     p.add("probe_files", len(duck_paths))
     p.add("probe_rows_matched", int(matched.height))
@@ -1326,6 +1892,8 @@ def resolve_overwrite_writes(
         overwrite_columns: List[str],
         newer_than_col: Optional[str] = None,
         profiler: Optional[Profiler] = None,
+        required: bool = True,
+        existing_tombstones: Optional[polars.DataFrame] = None,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
@@ -1365,10 +1933,23 @@ def resolve_overwrite_writes(
     matched = None
     if settings.SUPERTABLE_DUCKDB_WRITE_PROBE:
         matched = _duckdb_probe_overlap_matches(
-            overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
+            overlap_true,
+            overwrite_columns,
+            newer_than_col,
+            incoming_keys,
+            incoming_schema=dict(incoming_df.schema),
+            profiler=p,
         )
     if matched is not None:
         try:
+            if existing_tombstones is not None and existing_tombstones.height:
+                matched = matched.join(
+                    existing_tombstones.select(
+                        [TOMBSTONE_FILE_COL, ROWID_COL]
+                    ),
+                    on=[TOMBSTONE_FILE_COL, ROWID_COL],
+                    how="anti",
+                )
             return _derive_stale_and_deletes(
                 incoming_df, matched, overwrite_columns, newer_than_col, profiler=p,
             )
@@ -1391,6 +1972,21 @@ def resolve_overwrite_writes(
         f"reading only {read_columns}"
     )
     file_cache: Dict[str, polars.DataFrame] = {}
+    dead_rowids_by_file: Dict[str, polars.Series] = {}
+    if existing_tombstones is not None and existing_tombstones.height:
+        # A mutation normally overlaps only a small fraction of a table.  Keep
+        # the million-row vector columnar and partition only the file groups the
+        # fallback will actually read; never materialise every rowid as a Python
+        # ``int``/``set`` under the write lock.
+        overlap_paths = [file_path for file_path, _size in overlap_true]
+        relevant_tombstones = existing_tombstones.filter(
+            polars.col(TOMBSTONE_FILE_COL).is_in(overlap_paths)
+        )
+        for key, group in relevant_tombstones.partition_by(
+            TOMBSTONE_FILE_COL, as_dict=True, maintain_order=False
+        ).items():
+            file_path = key[0] if isinstance(key, tuple) else key
+            dead_rowids_by_file[file_path] = group.get_column(ROWID_COL)
     if newer_than_col:
         filtered = filter_stale_incoming_rows(
             incoming_df=incoming_df,
@@ -1400,12 +1996,16 @@ def resolve_overwrite_writes(
             file_cache=file_cache,
             profiler=p,
             read_columns=read_columns,
+            required=required,
+            dead_rowids_by_file=dead_rowids_by_file,
         )
     else:
         filtered = incoming_df
     pairs = identify_deleted_rowids(
         filtered, overlapping_files, overwrite_columns,
         file_cache=file_cache, profiler=p, read_columns=read_columns,
+        required=required,
+        dead_rowids_by_file=dead_rowids_by_file,
     )
     return filtered, pairs
 
@@ -1438,6 +2038,7 @@ def build_tombstone_file(
         compression_level: int,
         profiler: Optional[Profiler] = None,
         prev_df: Optional[polars.DataFrame] = None,
+        persist: bool = True,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous deletion-vector and append newly deleted rows.
 
@@ -1471,7 +2072,11 @@ def build_tombstone_file(
         # required=True: refuse to build a truncated deletion-vector if the
         # previous one exists but cannot be read (would resurrect dead rows).
         prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p, required=True)
-    if prev_df is not None and prev_df.height > 0 and ROWID_COL in prev_df.columns:
+    if prev_df is not None:
+        prev_df = validate_tombstone_frame(
+            prev_df, source=f"deletion-vector {prev_tombstone_path or '<memory>'}"
+        )
+    if prev_df is not None and prev_df.height > 0:
         combined = polars.concat(
             [prev_df.select([TOMBSTONE_FILE_COL, ROWID_COL]), new_df],
             how="vertical",
@@ -1479,11 +2084,40 @@ def build_tombstone_file(
     else:
         combined = new_df
 
-    combined = combined.unique(subset=[ROWID_COL], keep="first")
+    combined = combined.unique(
+        subset=[TOMBSTONE_FILE_COL, ROWID_COL], keep="first", maintain_order=True
+    )
+    combined = combined.select(
+        polars.col(TOMBSTONE_FILE_COL).cast(polars.Utf8),
+        polars.col(ROWID_COL).cast(polars.Int64, strict=True),
+    )
+    validate_tombstone_frame(combined, source="new deletion-vector")
 
+    if not persist:
+        # Threshold drains can consume this in-memory frame in the same locked
+        # mutation.  Deferring the upload avoids creating a large immutable
+        # artifact that no committed snapshot can ever reference.
+        return None, combined
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     return new_path, combined
+
+
+def persist_tombstone_frame(
+        tombstone_dir: str,
+        frame: polars.DataFrame,
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+) -> Tuple[str, polars.DataFrame]:
+    """Persist an already materialised DV without Python row expansion."""
+    validated = validate_tombstone_frame(
+        frame, source="deletion-vector frame to persist"
+    )
+    if validated.height == 0:
+        raise ValueError("Cannot persist an empty deletion-vector")
+    new_path = _partitioned_new_path(tombstone_dir, "deleted")
+    _write_df_parquet(validated, new_path, compression_level, profiler=profiler)
+    return new_path, validated
 
 
 def reclaim_fully_dead_files(
@@ -1492,6 +2126,7 @@ def reclaim_fully_dead_files(
         tombstone_dir: str,
         compression_level: int,
         profiler: Optional[Profiler] = None,
+        persist: bool = True,
 ) -> Tuple[Set[str], Optional[str], Optional[polars.DataFrame]]:
     """Drop data files whose every physical row is in the deletion-vector.
 
@@ -1516,10 +2151,17 @@ def reclaim_fully_dead_files(
     if combined_dv is None or combined_dv.height == 0 or not resources:
         return set(), None, None
 
-    dead_counts = (
-        combined_dv.group_by(TOMBSTONE_FILE_COL).agg(polars.len().alias("__dead__"))
+    combined_dv = validate_tombstone_frame(
+        combined_dv, source="deletion-vector used for eager reclamation"
     )
-    dead_map = {f: int(n) for f, n in dead_counts.iter_rows()}
+    tombstone_groups = combined_dv.partition_by(
+        TOMBSTONE_FILE_COL, as_dict=True, maintain_order=False
+    )
+    dead_ids_by_file = {
+        (key[0] if isinstance(key, tuple) else key):
+        group.get_column(ROWID_COL)
+        for key, group in tombstone_groups.items()
+    }
 
     fully_dead: Set[str] = set()
     for r in resources:
@@ -1527,7 +2169,44 @@ def reclaim_fully_dead_files(
             continue
         f = r.get("file")
         rows = int(r.get("rows") or 0)
-        if f and rows > 0 and dead_map.get(f, 0) >= rows:
+        dead_ids = dead_ids_by_file.get(f)
+        if not (f and rows > 0 and dead_ids is not None and len(dead_ids) >= rows):
+            continue
+
+        # Resource row counts are metadata and may be stale/corrupt.  They are
+        # only a cheap candidate filter; prove coverage against the physical
+        # rowid column before metadata-sunsetting a file.  Failure to prove is a
+        # conservative retain, because eager reclaim is only an optimisation.
+        physical = _read_parquet_safe(
+            f,
+            profiler=p,
+            file_size=int(r.get("file_size") or 0),
+            columns=[ROWID_COL],
+            required=False,
+        )
+        if physical is None or ROWID_COL not in physical.columns:
+            continue
+        physical_ids = physical.get_column(ROWID_COL)
+        if (
+            physical_ids.dtype != polars.Int64
+            or physical_ids.null_count() > 0
+            or physical_ids.min() is None
+            or physical_ids.min() <= 0
+            or physical_ids.n_unique() != physical.height
+        ):
+            continue
+        # Exact equality proves that every DV entry for this file names one
+        # physical row and every physical row is dead.  A mere subset proof
+        # would discard ghost DV entries while sunsetting the file.
+        physical_frame = physical.select(ROWID_COL)
+        dead_frame = polars.DataFrame({ROWID_COL: dead_ids})
+        physical_missing = physical_frame.join(
+            dead_frame, on=ROWID_COL, how="anti"
+        ).height
+        dead_missing = dead_frame.join(
+            physical_frame, on=ROWID_COL, how="anti"
+        ).height
+        if physical_missing == 0 and dead_missing == 0:
             fully_dead.add(f)
 
     if not fully_dead:
@@ -1538,6 +2217,9 @@ def reclaim_fully_dead_files(
     )
     if survivors.height == 0:
         return fully_dead, None, None
+
+    if not persist:
+        return fully_dead, None, survivors
 
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(survivors, new_path, compression_level, profiler=p)
@@ -1961,6 +2643,12 @@ def build_stats_file(
     else:
         combined = new_df
 
+    if combined.height == 0:
+        # Clearing all live resources/stats needs no empty immutable object.
+        # A null pointer is exact, cheaper, and cannot suffer a remote upload
+        # failure after the data rewrite has already completed.
+        return None, combined
+
     new_path = _partitioned_new_path(stats_dir, "stats")
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     p.add("stats_rows_total", int(combined.height))
@@ -2015,9 +2703,36 @@ def _probe_lane_for_dtype(dtype) -> Optional[str]:
     if dtype in _PROBE_FLOAT_DTYPES:
         return "double"
     if dtype == polars.Date or isinstance(dtype, polars.Datetime):
-        return "timestamp"
+        # Write pruning must preserve Polars' strict key-type semantics. Stored
+        # temporal footer values share one normalised timestamp slot and cannot
+        # prove Date vs naïve/tz-aware Datetime compatibility, so retain files.
+        return None
     if dtype == polars.Utf8:
         return "string"
+    return None
+
+
+def _probe_type_signature(dtype) -> Optional[str]:
+    """Return a footer-verifiable exact mutation-key dtype marker."""
+    if dtype == polars.Boolean:
+        return "boolean"
+    if dtype == polars.Int32:
+        return "int32"
+    if dtype == polars.Int64:
+        return "int64"
+    if dtype == polars.Float32:
+        return "float32"
+    if dtype == polars.Float64:
+        return "float64"
+    if dtype == polars.Utf8:
+        return "string"
+    if dtype == polars.Date:
+        return "date"
+    if isinstance(dtype, polars.Datetime) and dtype.time_zone is None:
+        if dtype.time_unit in ("ms", "us"):
+            return f"timestamp_ntz_{dtype.time_unit}"
+    # Integer annotations narrower/unsigned than Int32, nanosecond timestamps,
+    # and timezone IDs cannot be reconstructed exactly from the stats schema.
     return None
 
 
@@ -2070,8 +2785,13 @@ def probe_ranges_from_df(
             out[name] = None
             continue
         col = df[name]
-        lane = _probe_lane_for_dtype(col.dtype)
-        if lane is None:
+        exact_type = _probe_type_signature(col.dtype)
+        lane = (
+            "timestamp"
+            if exact_type in {"date", "timestamp_ntz_ms", "timestamp_ntz_us"}
+            else _probe_lane_for_dtype(col.dtype)
+        )
+        if lane is None or exact_type is None:
             out[name] = None
             continue
         if col.null_count() > 0:
@@ -2088,8 +2808,28 @@ def probe_ranges_from_df(
         if bounds is None:
             out[name] = None
             continue
-        out[name] = (lane, bounds[0], bounds[1])
+        out[name] = (lane, bounds[0], bounds[1], exact_type)
     return out
+
+
+def _stored_write_type_compatible(row: dict, expected: Optional[str]) -> bool:
+    """Whether footer metadata proves exact Polars mutation-key compatibility."""
+    if expected is None:
+        return True  # compatibility for legacy/manual three-field probes
+    physical = str(row.get("physical_type") or "").upper()
+    logical = str(row.get("logical_type") or "").upper()
+    exact = {
+        "boolean": ("BOOLEAN", ""),
+        "int32": ("INT32", ""),
+        "int64": ("INT64", ""),
+        "float32": ("FLOAT", ""),
+        "float64": ("DOUBLE", ""),
+        "string": ("BYTE_ARRAY", "STRING"),
+        "date": ("INT32", "DATE"),
+        "timestamp_ntz_ms": ("INT64", "TIMESTAMP_NTZ_MILLIS"),
+        "timestamp_ntz_us": ("INT64", "TIMESTAMP_NTZ_MICROS"),
+    }.get(expected)
+    return exact is not None and (physical, logical) == exact
 
 
 def _stored_lane(row: dict) -> Optional[Tuple[str, object, object]]:
@@ -2277,6 +3017,105 @@ def _stored_select_lane(row: dict) -> Optional[Tuple[str, object, object]]:
     )
 
 
+def stats_for_complete_files(
+        stats_df: Optional[polars.DataFrame],
+        resource_rows: Dict[str, Optional[int]],
+) -> Optional[polars.DataFrame]:
+    """Retain stats only where the per-file row-group manifest is provably whole.
+
+    A table-level artifact row count cannot detect a missing row-group slot that
+    was replaced by a duplicate row elsewhere.  Both SELECT and mutation pruning
+    may use a file's stats only when row-group ids, row counts, and exact column
+    slot sets agree with the independently pinned snapshot resource row count.
+    Invalid/absent files disappear from the returned stats; pruning consumers
+    interpret that as unknown and retain the physical file.
+    """
+    if stats_df is None or not isinstance(stats_df, polars.DataFrame):
+        return None
+    if stats_df.height == 0:
+        return stats_df
+    required = {"file_path", "row_group_id", "column_name", "row_group_rows"}
+    if not required.issubset(stats_df.columns):
+        return None
+    manifest = {
+        file_path: rows
+        for file_path, rows in resource_rows.items()
+        if isinstance(file_path, str)
+        and isinstance(rows, int)
+        and not isinstance(rows, bool)
+        and rows >= 0
+    }
+    if not manifest:
+        return stats_df.head(0)
+    try:
+        manifested = stats_df.filter(polars.col("file_path").is_in(list(manifest)))
+        groups = (
+            manifested.select(list(required))
+            .group_by(["file_path", "row_group_id"])
+            .agg([
+                polars.len().alias("__slots"),
+                polars.col("column_name").n_unique().alias("__unique_slots"),
+                polars.col("column_name").unique().sort().alias("__columns"),
+                polars.col("row_group_rows").n_unique().alias("__row_counts"),
+                polars.col("row_group_rows").first().alias("__rows"),
+                polars.col("column_name").is_not_null().all().alias("__names_valid"),
+                (
+                    polars.col("row_group_rows").is_not_null()
+                    & (polars.col("row_group_rows") >= 0)
+                ).all().alias("__rows_valid"),
+            ])
+        )
+        expected = polars.DataFrame(
+            {
+                "file_path": list(manifest),
+                "__expected_rows": list(manifest.values()),
+            },
+            schema={"file_path": polars.Utf8, "__expected_rows": polars.Int64},
+        )
+        trusted_frame = (
+            groups.group_by("file_path")
+            .agg([
+                polars.len().alias("__group_count"),
+                polars.col("row_group_id").min().alias("__min_group"),
+                polars.col("row_group_id").max().alias("__max_group"),
+                polars.col("row_group_id").is_not_null().all().alias("__ids_valid"),
+                (polars.col("row_group_id") >= 0).all().alias("__ids_nonnegative"),
+                polars.col("__rows").sum().alias("__total_rows"),
+                (polars.col("__slots") == polars.col("__unique_slots"))
+                .all().alias("__slots_valid"),
+                (polars.col("__row_counts") == 1).all().alias("__counts_valid"),
+                polars.col("__names_valid").all().alias("__all_names_valid"),
+                polars.col("__rows_valid").all().alias("__all_rows_valid"),
+                polars.col("__columns").n_unique().alias("__column_sets"),
+            ])
+            .join(expected, on="file_path", how="inner")
+            .filter(
+                polars.col("__ids_valid")
+                & polars.col("__ids_nonnegative")
+                & polars.col("__slots_valid")
+                & polars.col("__counts_valid")
+                & polars.col("__all_names_valid")
+                & polars.col("__all_rows_valid")
+                & (polars.col("__min_group") == 0)
+                & (polars.col("__max_group") == polars.col("__group_count") - 1)
+                & (polars.col("__column_sets") == 1)
+                & (polars.col("__total_rows") == polars.col("__expected_rows"))
+            )
+            .select("file_path")
+        )
+        if trusted_frame.height == 0:
+            return stats_df.head(0)
+        trusted = trusted_frame.get_column("file_path").to_list()
+        if (
+            manifested.height == stats_df.height
+            and len(trusted) == groups.get_column("file_path").n_unique()
+        ):
+            return stats_df
+        return manifested.filter(polars.col("file_path").is_in(trusted))
+    except Exception:
+        return None
+
+
 def prune_overlapping_files_by_stats(
         overlapping_files: Set[Tuple[str, bool, int]],
         stored_stats_df: Optional[polars.DataFrame],
@@ -2311,13 +3150,13 @@ def prune_overlapping_files_by_stats(
 
     constrained_cols = list(constraints.keys())
     needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
-    # index: file_path -> row_group_id -> column_name -> (lane,min,max)|None
-    index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
+    # index: file -> row group -> column -> (range, physical/logical row)
+    index: Dict[str, Dict[int, Dict[str, Tuple[object, dict]]]] = {}
     for row in needed.iter_rows(named=True):
         fp = row["file_path"]
         rg = row["row_group_id"]
         col = row["column_name"]
-        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+        index.setdefault(fp, {}).setdefault(rg, {})[col] = (_stored_lane(row), row)
 
     kept: Set[Tuple[str, bool, int]] = set()
     pruned = 0
@@ -2333,10 +3172,17 @@ def prune_overlapping_files_by_stats(
         file_can_match = False
         for _rg_id, cols in rgs.items():
             rg_matches = True
-            for col, (lane, lo, hi) in constraints.items():
-                stored = cols.get(col)
-                if stored is None:
+            for col, constraint in constraints.items():
+                lane, lo, hi = constraint[:3]
+                expected_type = constraint[3] if len(constraint) > 3 else None
+                stored_entry = cols.get(col)
+                if stored_entry is None:
                     continue  # missing / unavailable stat → can't exclude
+                stored, stored_row = stored_entry
+                if stored is None or not _stored_write_type_compatible(
+                    stored_row, expected_type
+                ):
+                    continue
                 s_lane, s_min, s_max = stored
                 if s_lane != lane:
                     continue  # lane mismatch → can't compare → assume overlap
@@ -2615,18 +3461,36 @@ class _PathKeyedFrameCache:
     ``<= 0`` disables the cache.  Backs both the stats and tombstone caches.
     """
 
-    __slots__ = ("_lock", "_entries", "_cap_getter")
+    __slots__ = ("_lock", "_entries", "_cap_getter", "_byte_cap_getter", "_bytes")
 
-    def __init__(self, cap_getter: Callable[[], int]) -> None:
+    def __init__(
+            self,
+            cap_getter: Callable[[], int],
+            byte_cap_getter: Optional[Callable[[], int]] = None,
+    ) -> None:
         self._lock = threading.Lock()
-        # table_key -> (path, DataFrame)
-        self._entries: "OrderedDict[str, Tuple[str, polars.DataFrame]]" = OrderedDict()
+        # table_key -> (path, DataFrame, estimated bytes, immutable metadata).
+        # Stats entries use ``None`` metadata.  Tombstone entries carry a
+        # validation seal so an immutable-path cache hit never rescans or
+        # re-hashes a million-row deletion vector while the write lock is held.
+        self._entries: "OrderedDict[str, Tuple[str, polars.DataFrame, int, Any]]" = OrderedDict()
         self._cap_getter = cap_getter
+        self._byte_cap_getter = byte_cap_getter
+        self._bytes = 0
 
     @staticmethod
     def _key(path: str) -> str:
-        # All versions of a table's artifact live in the same directory.
-        return os.path.dirname(path)
+        # New artifact versions are hour-partitioned.  Collapse the canonical
+        # year/month/day/hour suffix so every immutable version of one table's
+        # stats or deletion-vector shares a single LRU entry.  Legacy flat paths
+        # naturally retain their immediate parent as the key.
+        directory = os.path.dirname(path)
+        for prefix in ("hour=", "day=", "month=", "year="):
+            if os.path.basename(directory).startswith(prefix):
+                directory = os.path.dirname(directory)
+            else:
+                break
+        return directory
 
     def _cap(self) -> int:
         try:
@@ -2634,32 +3498,82 @@ class _PathKeyedFrameCache:
         except Exception:
             return 64
 
+    def _byte_cap(self) -> Optional[int]:
+        if self._byte_cap_getter is None:
+            return None
+        try:
+            return int(self._byte_cap_getter())
+        except Exception:
+            return 256 * 1024 * 1024
+
+    def _trim_locked(self, cap: int, byte_cap: Optional[int]) -> None:
+        while self._entries and (
+            len(self._entries) > cap
+            or (byte_cap is not None and self._bytes > byte_cap)
+        ):
+            _key, (_path, _df, size, _metadata) = self._entries.popitem(last=False)
+            self._bytes -= size
+
     def get(self, path: str) -> Optional[polars.DataFrame]:
         """Return the cached frame iff the cached path matches *exactly*."""
-        if self._cap() <= 0:
+        entry = self.get_entry(path)
+        return entry[0] if entry is not None else None
+
+    def get_entry(self, path: str) -> Optional[Tuple[polars.DataFrame, Any]]:
+        """Return ``(frame, metadata)`` for an exact immutable-path hit."""
+        cap = self._cap()
+        byte_cap = self._byte_cap()
+        if cap <= 0 or (byte_cap is not None and byte_cap <= 0):
+            self.clear()
             return None
         key = self._key(path)
         with self._lock:
+            self._trim_locked(cap, byte_cap)
             entry = self._entries.get(key)
             if entry is not None and entry[0] == path:
                 self._entries.move_to_end(key)
-                return entry[1]
+                return entry[1], entry[3]
         return None
 
-    def put(self, path: str, df: polars.DataFrame) -> None:
+    def put(self, path: str, df: polars.DataFrame, metadata: Any = None) -> None:
         cap = self._cap()
-        if cap <= 0:
+        byte_cap = self._byte_cap()
+        if cap <= 0 or (byte_cap is not None and byte_cap <= 0):
+            self.clear()
             return
+        try:
+            frame_bytes = max(0, int(df.estimated_size()))
+        except Exception:
+            # An unmeasurable frame cannot be admitted to a byte-bounded cache.
+            if byte_cap is not None:
+                return
+            frame_bytes = 0
         key = self._key(path)
         with self._lock:
-            self._entries[key] = (path, df)
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= old[2]
+            if byte_cap is not None and frame_bytes > byte_cap:
+                return
+            self._entries[key] = (path, df, frame_bytes, metadata)
+            self._bytes += frame_bytes
             self._entries.move_to_end(key)
-            while len(self._entries) > cap:
-                self._entries.popitem(last=False)
+            self._trim_locked(cap, byte_cap)
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._bytes = 0
+
+    def discard(self, path: str) -> None:
+        """Evict *path* only if it is the exact cached immutable version."""
+        key = self._key(path)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[0] == path:
+                removed = self._entries.pop(key, None)
+                if removed is not None:
+                    self._bytes -= removed[2]
 
 
 def _stats_cache_cap() -> int:
@@ -2670,8 +3584,19 @@ def _tombstone_cache_cap() -> int:
     return int(settings.SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES)
 
 
+def _tombstone_cache_byte_cap() -> int:
+    configured = getattr(settings, "SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES", None)
+    if not isinstance(configured, (int, str)) or isinstance(configured, bool):
+        configured = os.environ.get(
+            "SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES", str(256 * 1024 * 1024)
+        )
+    return int(configured)
+
+
 _STATS_CACHE = _PathKeyedFrameCache(_stats_cache_cap)
-_TOMBSTONE_CACHE = _PathKeyedFrameCache(_tombstone_cache_cap)
+_TOMBSTONE_CACHE = _PathKeyedFrameCache(
+    _tombstone_cache_cap, _tombstone_cache_byte_cap
+)
 
 
 def load_stats(
@@ -2727,6 +3652,9 @@ def load_tombstone(
         *,
         allow_cache: bool = True,
         required: bool = False,
+        expected_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        allowed_files: Optional[Set[str]] = None,
         profiler: Optional[Profiler] = None,
 ) -> Optional[polars.DataFrame]:
     """Load a table's deletion-vector parquet, serving the latest from memory.
@@ -2736,28 +3664,77 @@ def load_tombstone(
     that version is what gets memoised; time-travel/older reads must pass
     ``allow_cache=False``.
 
-    *required* is forwarded to the reader: when ``True`` a genuine read failure
-    of an object that EXISTS re-raises rather than being swallowed to ``None``
-    (a truncated carried-forward deletion-vector would resurrect deleted rows).
-    Absence still returns ``None``.  A cache hit returns the exact in-memory
-    frame that was previously read/built for this immutable path — never stale,
-    and never an empty truncation — so it satisfies the ``required`` contract.
+    *required* is forwarded to the reader: when ``True``, both absence and a
+    genuine read failure re-raise rather than being swallowed to ``None`` (a
+    truncated carried-forward deletion-vector would resurrect deleted rows).
+    ``expected_rows`` seals the immutable snapshot pointer to its declared row
+    count.  A cache hit is validated against the same schema/count contract.
     """
     if not tombstone_path:
         return None
     p = profiler or get_null_profiler()
-    cached = _TOMBSTONE_CACHE.get(tombstone_path)
-    if cached is not None:
+    cached_entry = _TOMBSTONE_CACHE.get_entry(tombstone_path)
+    if cached_entry is not None:
         p.add("tombstone_cache_hit", 1)
+        cached, metadata = cached_entry
+        source = f"cached deletion-vector {tombstone_path}"
+        if not (
+            isinstance(metadata, tuple)
+            and len(metadata) == 3
+            and isinstance(metadata[0], int)
+            and isinstance(metadata[1], str)
+            and isinstance(metadata[2], frozenset)
+        ):
+            # Backward-compatible repair for an entry inserted through the
+            # generic frame-cache API.  Validate/hash once, then all later hits
+            # use the immutable seal below.
+            cached = validate_tombstone_frame(
+                cached,
+                expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                allowed_files=allowed_files,
+                source=source,
+            )
+            metadata = _tombstone_cache_seal(
+                cached, known_digest=expected_digest, source=source,
+            )
+            _TOMBSTONE_CACHE.put(tombstone_path, cached, metadata)
+        _validate_cached_tombstone_seal(
+            metadata,
+            expected_rows=expected_rows,
+            expected_digest=expected_digest,
+            allowed_files=allowed_files,
+            source=source,
+        )
         return cached
     p.add("tombstone_cache_miss", 1)
     df = _read_parquet_safe(tombstone_path, profiler=p, required=required)
+    if df is not None:
+        df = validate_tombstone_frame(
+            df,
+            expected_rows=expected_rows,
+            expected_digest=expected_digest,
+            allowed_files=allowed_files,
+            source=f"deletion-vector {tombstone_path}",
+        )
     if df is not None and allow_cache:
-        _TOMBSTONE_CACHE.put(tombstone_path, df)
+        seal = _tombstone_cache_seal(
+            df,
+            known_digest=expected_digest,
+            source=f"deletion-vector cache entry {tombstone_path}",
+        )
+        _TOMBSTONE_CACHE.put(tombstone_path, df, seal)
     return df
 
 
-def cache_tombstone(tombstone_path: Optional[str], df: Optional[polars.DataFrame]) -> None:
+def cache_tombstone(
+        tombstone_path: Optional[str],
+        df: Optional[polars.DataFrame],
+        *,
+        expected_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        assume_valid: bool = False,
+) -> None:
     """Seed the cache with a freshly built latest-version deletion-vector frame.
 
     Called by writers right after the tombstone pointer is finalised so the next
@@ -2766,7 +3743,47 @@ def cache_tombstone(tombstone_path: Optional[str], df: Optional[polars.DataFrame
     (``tombstone_path`` is ``None``) or unchanged with no frame in hand.
     """
     if tombstone_path and df is not None:
-        _TOMBSTONE_CACHE.put(tombstone_path, df)
+        source = f"deletion-vector cache seed {tombstone_path}"
+        if assume_valid:
+            # Internal writer fast path: the exact frame was validated and
+            # hashed immediately before this call.  Retain cheap structural and
+            # seal checks, but do not repeat the O(rows) integrity scan/hash.
+            if not isinstance(df, polars.DataFrame) or df.schema != TOMBSTONE_SCHEMA:
+                raise ValueError(f"{source} has invalid schema")
+            checked_rows = _checked_tombstone_expected_rows(
+                expected_rows, source=source,
+            )
+            checked_digest = _checked_tombstone_expected_digest(
+                expected_digest, source=source,
+            )
+            if checked_rows is None or checked_digest is None:
+                raise ValueError(
+                    "assume_valid tombstone cache seeds require row and digest seals"
+                )
+            if df.height != checked_rows:
+                raise ValueError(
+                    f"{source} row-count mismatch: expected {checked_rows}, "
+                    f"got {df.height}"
+                )
+            validated = df
+        else:
+            validated = validate_tombstone_frame(
+                df,
+                expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                source=source,
+            )
+            checked_digest = expected_digest
+        seal = _tombstone_cache_seal(
+            validated, known_digest=checked_digest, source=source,
+        )
+        _TOMBSTONE_CACHE.put(tombstone_path, validated, seal)
+
+
+def evict_tombstone(tombstone_path: Optional[str]) -> None:
+    """Remove a superseded/currently-drained deletion-vector cache entry."""
+    if tombstone_path:
+        _TOMBSTONE_CACHE.discard(tombstone_path)
 
 
 def compact_tombstones(
@@ -2776,7 +3793,8 @@ def compact_tombstones(
         compression_level: int,
         table_config: Optional[dict] = None,
         profiler: Optional[Profiler] = None,
-) -> Tuple[int, List[Dict], Set[str]]:
+        return_residual: bool = False,
+) -> Tuple:
     """Physically drop tombstoned rows from the data files that hold them.
 
     *tombstone_df* is the deletion-vector (columns ``__file__`` + ``__rowid__``).
@@ -2785,14 +3803,27 @@ def compact_tombstones(
     are anti-joined out and the survivors written to a new file; the original
     is sunset. Survivors keep their original ``__rowid__`` (no remapping).
 
-    After this call the caller clears the tombstone pointer: the dead rows no
-    longer exist on disk, so the deletion-vector is fully consumed.
+    Successfully processed groups no longer need tombstones.  Callers that can
+    mutate metadata must request and publish the residual frame before clearing
+    or replacing the old pointer.
 
-    Returns ``(removed_rows, new_resources, sunset_files)``.
+    Returns ``(removed_rows, new_resources, sunset_files)`` for backward
+    compatibility.  With ``return_residual=True`` a fourth item is returned:
+    the validated tombstone entries that could not be safely consumed.
+
+    A file is rewritten only when *every* rowid recorded for it is present in
+    that physical file.  Missing resources are retained as residual entries;
+    missing/unreadable current files raise.  This makes it impossible for a
+    caller to clear an entry merely because one part of a drain was skipped.
     """
     p = profiler or get_null_profiler()
     if tombstone_df is None or tombstone_df.height == 0:
-        return 0, [], set()
+        empty = _empty_tombstone_df()
+        return (0, [], set(), empty) if return_residual else (0, [], set())
+
+    tombstone_df = validate_tombstone_frame(
+        tombstone_df, source="deletion-vector passed to compaction"
+    )
 
     resources = snapshot.get("resources") or []
     by_path = {r.get("file"): r for r in resources if r.get("file")}
@@ -2800,57 +3831,162 @@ def compact_tombstones(
     removed = 0
     new_resources: List[Dict] = []
     sunset_files: Set[str] = set()
+    residual_parts: List[polars.DataFrame] = []
 
-    files_with_deletes = (
-        tombstone_df.select(TOMBSTONE_FILE_COL).unique().get_column(TOMBSTONE_FILE_COL).to_list()
+    # Partition once.  The old implementation filtered all D rows once for
+    # every one of F files (O(F*D)); this builds all file groups in O(D).
+    grouped = tombstone_df.partition_by(
+        TOMBSTONE_FILE_COL, as_dict=True, maintain_order=False
     )
-    p.add("tombstone_files_total", len(files_with_deletes))
+    p.add("tombstone_files_total", len(grouped))
 
-    for file_path in files_with_deletes:
+    def _validate_physical(frame: polars.DataFrame, file_path: str):
+        if ROWID_COL not in frame.columns:
+            raise ValueError(
+                f"Cannot drain deletion-vector: {file_path!r} lacks {ROWID_COL!r}"
+            )
+        physical_ids = frame.get_column(ROWID_COL)
+        if physical_ids.dtype != polars.Int64:
+            raise ValueError(
+                f"Cannot drain deletion-vector: {file_path!r} rowids are not Int64"
+            )
+        if physical_ids.null_count() > 0:
+            raise ValueError(
+                f"Cannot drain deletion-vector: {file_path!r} contains NULL rowids"
+            )
+        if (
+            physical_ids.min() is None
+            or physical_ids.min() <= 0
+            or physical_ids.n_unique() != frame.height
+        ):
+            raise ValueError(
+                f"Cannot drain deletion-vector: {file_path!r} contains "
+                "non-positive or duplicate rowids"
+            )
+        return physical_ids
+
+    def _drain_group(item):
+        group_key, file_tombstones = item
+        file_path = group_key[0] if isinstance(group_key, tuple) else group_key
         resource = by_path.get(file_path)
         if not resource:
-            # File already sunset by an earlier compaction — skip.
-            continue
+            # Do not discard a ghost entry: without its referenced physical file
+            # we cannot prove that the deletion was consumed.  Keeping the whole
+            # group residual is the only conservative action available here.
+            return 0, [], None, file_tombstones, Profiler()
+        sub = Profiler()
         file_size = int(resource.get("file_size") or 0)
-        # required=True: this is the ONLY physical drain (Phase B is row-preserving
-        # and never re-drops these rows), and the callers clear the deletion-vector
-        # pointer unconditionally once the vector was non-empty.  If a transient
-        # backend error here were swallowed to None, this file's tombstoned rows
-        # would be silently skipped yet the pointer cleared -> the rows RESURRECT on
-        # read.  Failing loud aborts the write/compact with the prior snapshot +
-        # vector intact for retry (matches the carry-forward DV-pointer reads).  A
-        # genuine absence still returns None (file already sunset/raced -> its rows
-        # are gone, so skipping it is correct).
-        existing_df = _read_parquet_safe(
-            file_path, profiler=p, file_size=file_size, required=True
-        )
-        if existing_df is None or ROWID_COL not in existing_df.columns:
-            continue
+        dead_ids = file_tombstones.select(ROWID_COL)
 
-        dead_ids = (
-            tombstone_df.filter(polars.col(TOMBSTONE_FILE_COL) == file_path)
-            .select(ROWID_COL)
-            .unique()
+        # Fully-dead fast path: when independent resource metadata agrees with
+        # the DV cardinality, read only the rowid column and prove exact set
+        # equality. A match needs no full decode and no successor parquet write.
+        try:
+            declared_rows = int(resource.get("rows"))
+        except (TypeError, ValueError):
+            declared_rows = -1
+        if declared_rows == file_tombstones.height:
+            projected = _read_parquet_safe(
+                file_path,
+                profiler=sub,
+                file_size=file_size,
+                columns=[ROWID_COL],
+                required=True,
+            )
+            _validate_physical(projected, file_path)
+            projected_ids = projected.select(ROWID_COL)
+            if (
+                projected_ids.join(dead_ids, on=ROWID_COL, how="anti").height == 0
+                and dead_ids.join(
+                    projected_ids, on=ROWID_COL, how="anti"
+                ).height == 0
+            ):
+                sub.add("tombstone_fully_dead_fast_path", 1)
+                sub.add("tombstone_files_touched", 1)
+                return projected.height, [], file_path, None, sub
+            # Count agreed but identities did not: metadata/DV corruption. Do
+            # not rewrite or discard any part of this group.
+            return 0, [], None, file_tombstones, sub
+
+        # required=True: this is the only physical drain.  A transient backend
+        # error or NotFound must abort with the prior snapshot + vector intact;
+        # treating either as an empty source would permit pointer clearing and
+        # row resurrection.
+        existing_df = _read_parquet_safe(
+            file_path, profiler=sub, file_size=file_size, required=True
         )
-        with p.span("tombstone.anti_join"):
+        if existing_df is None:  # defensive; required=True normally raises
+            return 0, [], None, file_tombstones, sub
+        _validate_physical(existing_df, file_path)
+        # A partial match cannot be safely rewritten while retaining only the
+        # unmatched entries: doing so would move survivors to a new file while
+        # the residual still names the sunset source.  Retain the whole group
+        # and retry after the metadata inconsistency is repaired.
+        unmatched = dead_ids.join(
+            existing_df.select(ROWID_COL), on=ROWID_COL, how="anti"
+        )
+        if unmatched.height > 0:
+            return 0, [], None, file_tombstones, sub
+        with sub.span("tombstone.anti_join"):
             kept_df = existing_df.join(dead_ids, on=ROWID_COL, how="anti")
         difference = existing_df.height - kept_df.height
         if difference == 0:
-            continue
+            return 0, [], None, file_tombstones, sub
 
-        removed += difference
-        sunset_files.add(file_path)
-        p.add("tombstone_files_touched", 1)
+        local_resources = []
+        sub.add("tombstone_files_touched", 1)
 
         if kept_df.height > 0:
-            with p.span("tombstone.write_kept"):
+            with sub.span("tombstone.write_kept"):
                 write_parquet_and_collect_resources(
                     write_df=kept_df,
                     overwrite_columns=[],
                     data_dir=data_dir,
-                    new_resources=new_resources,
+                    new_resources=local_resources,
                     compression_level=compression_level,
-                    profiler=p,
+                    profiler=sub,
                 )
+        return difference, local_resources, file_path, None, sub
 
+    items = list(grouped.items())
+    cfg = table_config or {}
+    try:
+        configured_workers = int(
+            cfg.get("tombstone_compaction_workers")
+            or getattr(default, "TOMBSTONE_COMPACTION_WORKERS", 2)
+        )
+    except (TypeError, ValueError):
+        configured_workers = 2
+    # Keep the executor bounded: every worker may hold one decoded data file
+    # plus its successor frame.  The environment/per-table knob lets an
+    # operator match object-store bandwidth without turning a threshold drain
+    # into an unbounded memory fan-out.
+    workers = max(1, min(configured_workers, 8, len(items)))
+    if workers == 1:
+        results = map(_drain_group, items)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        results = executor.map(_drain_group, items)
+    try:
+        for difference, local_resources, sunset, residual_part, sub in results:
+            p.merge(sub)
+            removed += difference
+            new_resources.extend(local_resources)
+            if sunset:
+                sunset_files.add(sunset)
+            if residual_part is not None:
+                residual_parts.append(residual_part)
+    finally:
+        if workers > 1:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    residual = (
+        polars.concat(residual_parts, how="vertical")
+        if residual_parts else _empty_tombstone_df()
+    )
+    residual = validate_tombstone_frame(
+        residual, source="residual deletion-vector after compaction"
+    )
+    if return_residual:
+        return removed, new_resources, sunset_files, residual
     return removed, new_resources, sunset_files

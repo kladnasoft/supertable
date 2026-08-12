@@ -379,24 +379,24 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
     Uses string-splitting on '/' to avoid platform/os.path edge-cases with URIs.
     """
     rels: Set[str] = set()
-    try:
-        entries: List[str] = []
-        if hasattr(storage, "ls"):
-            entries = storage.ls(table_files_dir) or []
-        elif hasattr(storage, "listdir"):
-            # listdir should already return children of table_files_dir
-            entries = ["/".join((table_files_dir.rstrip("/"), e)) for e in (storage.listdir(table_files_dir) or [])]
-        elif hasattr(storage, "list_files"):
-            # StorageInterface canonical listing method
-            entries = storage.list_files(table_files_dir, "*") or []
-        for p in entries:
-            # Normalize to filename and re-prefix with 'files/'
-            fn = p.rstrip("/").split("/")[-1]
-            if fn:
-                rels.add("/".join(("files", fn)))
-    except Exception:
-        # ok to be empty
-        pass
+    if hasattr(storage, "ls"):
+        entries = storage.ls(table_files_dir) or []
+    elif hasattr(storage, "listdir"):
+        entries = [
+            "/".join((table_files_dir.rstrip("/"), e))
+            for e in (storage.listdir(table_files_dir) or [])
+        ]
+    elif hasattr(storage, "list_files"):
+        entries = storage.list_files(table_files_dir, "*") or []
+    else:
+        raise RuntimeError(
+            "Delta mirroring requires a reliable directory-listing method"
+        )
+    for p in entries:
+        # Normalize to filename and re-prefix with 'files/'
+        fn = p.rstrip("/").split("/")[-1]
+        if fn:
+            rels.add("/".join(("files", fn)))
     return rels
 
 
@@ -503,26 +503,6 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         logger.info(f"[mirror][delta] v{version} no-op (no add/remove); skipping commit")
         return
 
-    # Delete obsolete co-located files (physically remove unused parquet from the delta folder)
-    for rp in to_remove:
-        # Normalize any weird inputs (e.g., absolute abfss strings accidentally captured)
-        rel = rp
-        if rel.startswith("abfss://"):
-            rel = "/".join(("files", rel.rstrip("/").split("/")[-1]))
-        # Ensure we only ever delete under the table's files/ dir
-        if not rel.startswith("files/"):
-            rel = "/".join(("files", rel.rstrip("/").split("/")[-1]))
-        abs_path = os.path.join(base, rel)
-        try:
-            if hasattr(super_table.storage, "exists") and not super_table.storage.exists(abs_path):
-                # Best-effort fallback: try raw filename under files_dir
-                alt_abs = os.path.join(files_dir, rel.split("/")[-1])
-                if super_table.storage.exists(alt_abs):
-                    abs_path = alt_abs
-            super_table.storage.delete(abs_path)
-        except Exception as e:
-            logger.warning(f"[mirror][delta] failed to delete obsolete {rel}: {e}")
-
     # Metrics
     num_files = len(to_add)
     num_output_bytes = sum(int(sz) for _, sz, _ in to_add) if to_add else 0
@@ -628,6 +608,32 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
 
         # Write the commit atomically
         super_table.storage.write_bytes(commit_path, s.getvalue().encode("utf-8"))
+
+    # Only after the new Delta log is durable may obsolete physical files be
+    # removed. Deleting first can permanently break the previously committed
+    # mirror if the new log write fails. Cleanup remains best-effort because
+    # Delta readers use remove actions in the log; an undeleted object is not
+    # logically visible in the newly committed table.
+    for rp in to_remove:
+        rel = rp
+        if rel.startswith("abfss://"):
+            rel = "/".join(("files", rel.rstrip("/").split("/")[-1]))
+        if not rel.startswith("files/"):
+            rel = "/".join(("files", rel.rstrip("/").split("/")[-1]))
+        abs_path = os.path.join(base, rel)
+        try:
+            if (
+                hasattr(super_table.storage, "exists")
+                and not super_table.storage.exists(abs_path)
+            ):
+                alt_abs = os.path.join(files_dir, rel.split("/")[-1])
+                if super_table.storage.exists(alt_abs):
+                    abs_path = alt_abs
+            super_table.storage.delete(abs_path)
+        except Exception as exc:
+            logger.warning(
+                f"[mirror][delta] post-commit cleanup failed for {rel}: {exc}"
+            )
 
     # Optional checkpoint (disabled)
     try:

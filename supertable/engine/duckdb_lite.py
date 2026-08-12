@@ -26,6 +26,7 @@ from supertable.engine.engine_common import (
     create_rbac_view,
     create_tombstone_view,
     TombstoneCache,
+    create_typed_empty_view,
 )
 
 
@@ -64,6 +65,7 @@ class DuckDBLite:
         self._tombstone_cache = TombstoneCache(
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
+            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES,
         )
 
     # ------------------------------------------------------------------
@@ -87,6 +89,11 @@ class DuckDBLite:
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
         """Configure httpfs once per connection lifetime, under the lock."""
+        if not any(
+            str(path).lower().startswith(("s3://", "s3a://", "http://", "https://"))
+            for path in paths
+        ):
+            return
         with self._lock:
             if not self._httpfs_configured:
                 configure_httpfs_and_s3(con, paths)
@@ -124,10 +131,11 @@ class DuckDBLite:
 
         with self._lock:
             try:
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
+                root_con = self._get_connection(temp_dir=query_manager.temp_dir)
             except Exception:
                 self._reset_connection()
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
+                root_con = self._get_connection(temp_dir=query_manager.temp_dir)
+            con = root_con.cursor()
 
         timer_capture("CONNECTING")
 
@@ -136,9 +144,19 @@ class DuckDBLite:
             for sup in reflection.supers
         }
         table_defs = parser.get_table_tuples()
+        # Every relation in a Lite query is request-private.  The persistent
+        # root connection is shared across Executor instances, so using only
+        # the snapshot hash here lets concurrent queries CREATE OR REPLACE and
+        # DROP each other's reflection view before either reaches execution.
+        # Keep the full 128-bit request id.  A truncated 32-bit suffix reaches
+        # birthday-collision probability under realistic concurrency; because
+        # the DDL below uses CREATE OR REPLACE, a collision can swap another
+        # query's reflected files or deletion-vector view mid-execution.
+        query_suffix = _uuid.uuid4().hex
 
         alias_to_table_name = {}
         alias_to_files = {}
+        alias_to_resource_keys = {}
         alias_to_columns = {}
 
         for td in table_defs:
@@ -164,8 +182,12 @@ class DuckDBLite:
             name = hashed_table_name(
                 sup.super_name, sup.simple_name, sup.simple_version, cols,
             )
+            name = f"{name}_{query_suffix}"
             alias_to_table_name[td.alias] = name
             alias_to_files[td.alias] = list(sup.files)
+            alias_to_resource_keys[td.alias] = list(
+                getattr(sup, "resource_keys", ()) or ()
+            )
             alias_to_columns[td.alias] = cols
 
         # Ensure httpfs is configured on the persistent connection (once only).
@@ -181,9 +203,19 @@ class DuckDBLite:
                 files = alias_to_files[alias]
                 cols = alias_to_columns[alias]
 
+                if not files:
+                    td = next(t for t in table_defs if t.alias == alias)
+                    sup = snapshots_by_key[(td.super_name, td.simple_name)]
+                    create_typed_empty_view(
+                        con, table_name, dict(getattr(sup, "column_types", {}) or {}), cols,
+                    )
+                    created_views.append(table_name)
+                    continue
+
                 # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
                 used_presign = create_reflection_view_with_presign_retry(
                     con, self.storage, table_name, files, cols, log_prefix,
+                    resource_keys=alias_to_resource_keys[alias],
                 )
                 created_views.append(table_name)
                 if used_presign:
@@ -194,7 +226,6 @@ class DuckDBLite:
             # Per-query suffix so concurrent requests on the same table do not
             # collide on a shared view name (CREATE OR REPLACE would silently
             # corrupt a sibling query's view mid-execution).
-            query_suffix = _uuid.uuid4().hex[:8]
             query_alias_to_name = dict(alias_to_table_name)
 
             # Tombstone / system-column view — created for EVERY alias so the
@@ -211,7 +242,13 @@ class DuckDBLite:
                 # falls back to the inline read_parquet path (dv_table=None).
                 cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
                 tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
-                dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+                expected_rows = getattr(tomb_def, "expected_rows", None) if tomb_def else None
+                expected_digest = getattr(tomb_def, "tombstone_digest", None) if tomb_def else None
+                with self._lock:
+                    dv_table = self._tombstone_cache.acquire(
+                        con, cache_key, tomb_path, expected_rows=expected_rows,
+                        expected_digest=expected_digest,
+                    )
                 if dv_table:
                     acquired_dv_keys.append(cache_key)
                 create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
@@ -285,7 +322,11 @@ class DuckDBLite:
             # gone; this may evict + DROP unreferenced DV tables over capacity.
             for cache_key in acquired_dv_keys:
                 try:
-                    self._tombstone_cache.release(con, cache_key)
+                    with self._lock:
+                        self._tombstone_cache.release(con, cache_key)
                 except Exception:
                     pass
-
+            try:
+                con.close()
+            except Exception:
+                pass

@@ -135,6 +135,9 @@ def _build_world(n: int = 20):
                 "schema": cols,
                 "stats_file": stats_file,
                 "resources": resources,
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
             },
         })
     return snapshots, stats_by_file, schema_by_table

@@ -73,7 +73,83 @@ def _dummy_snapshot(
         "previous_snapshot": None,
         "schema": [],
         "resources": resources or [],
+        # A Redis leaf payload is trusted only when it explicitly seals the
+        # deletion-vector state. Omitting these fields must fall back to the
+        # immutable snapshot JSON rather than assuming "no deletes".
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 0,
     }
+
+
+def _install_writer_catalog_contract(
+    catalog: MagicMock,
+    *,
+    mirrors: list[str] | None = None,
+    commit_error: Exception | None = None,
+) -> MagicMock:
+    """Give one MagicMock the production writer catalog contract.
+
+    DataWriter intentionally detects safety-critical APIs on the catalog type,
+    not through MagicMock's permissive dynamic attributes. Each MagicMock has a
+    private generated subclass, so installing these methods is isolated to this
+    test double.
+    """
+    catalog.get_table_config.return_value = None
+    catalog.reserve_rowids_at_least_mock = MagicMock(
+        side_effect=lambda org, sup, simple, count, floor: (
+            int(floor) + 1,
+            int(floor) + int(count),
+        )
+    )
+    catalog.get_mirrors_mock = MagicMock(return_value=list(mirrors or []))
+    catalog.commit_snapshot_mock = MagicMock()
+    if commit_error is not None:
+        catalog.commit_snapshot_mock.side_effect = commit_error
+    else:
+        catalog.commit_snapshot_mock.return_value = (1, 1)
+    catalog.mirror_state_events = []
+
+    def reserve_rowids_at_least(self, org, sup, simple, count, floor):
+        return self.reserve_rowids_at_least_mock(
+            org, sup, simple, count, floor,
+        )
+
+    def get_mirrors(self, org, sup):
+        return self.get_mirrors_mock(org, sup)
+
+    def prepare_mirror_publication(self, *args, **kwargs):
+        self.mirror_state_events.append("prepared")
+        return {"status": "prepared", "commit_id": kwargs["commit_id"]}
+
+    def commit_snapshot(self, *args, **kwargs):
+        result = self.commit_snapshot_mock(*args, **kwargs)
+        if kwargs.get("mirror_publication"):
+            self.mirror_state_events.append("core_committed")
+        return result
+
+    def complete_mirror_publication(self, *args, **kwargs):
+        self.mirror_state_events.append("complete")
+        return {"status": "complete", "commit_id": kwargs["commit_id"]}
+
+    def fail_mirror_publication(self, *args, **kwargs):
+        self.mirror_state_events.append("failed")
+        return {
+            "status": "failed",
+            "commit_id": kwargs["commit_id"],
+            "failure_stage": kwargs["failure_stage"],
+            "error": str(kwargs["error"]),
+        }
+
+    catalog_type = type(catalog)
+    catalog_type.reserve_rowids_at_least = reserve_rowids_at_least
+    catalog_type.get_mirrors = get_mirrors
+    catalog_type.prepare_mirror_publication = prepare_mirror_publication
+    catalog_type.commit_snapshot = commit_snapshot
+    catalog_type.complete_mirror_publication = complete_mirror_publication
+    catalog_type.fail_mirror_publication = fail_mirror_publication
+    return catalog
 
 
 def _resource_entry(
@@ -563,7 +639,9 @@ class TestSimpleTableGetSnapshot:
         payload = _dummy_snapshot("tbl", resources=[_resource_entry("f.parquet")])
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
-        mock_catalog.get_leaf.return_value = {"path": "snap.json", "payload": payload}
+        mock_catalog.get_leaf.return_value = {
+            "version": 0, "path": "snap.json", "payload": payload,
+        }
         mock_catalog_cls.return_value = mock_catalog
 
         mock_super = MagicMock()
@@ -629,7 +707,9 @@ class TestSimpleTableGetSnapshot:
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
-        mock_catalog.get_leaf.return_value = {"path": "snap.json", "payload": payload}
+        mock_catalog.get_leaf.return_value = {
+            "version": 0, "path": "snap.json", "payload": payload,
+        }
         mock_catalog_cls.return_value = mock_catalog
 
         mock_super = MagicMock()
@@ -662,7 +742,9 @@ class TestSimpleTableUpdate:
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
-        mock_catalog.get_leaf.return_value = {"path": "snap_v1.json", "payload": payload}
+        mock_catalog.get_leaf.return_value = {
+            "version": 1, "path": "snap_v1.json", "payload": payload,
+        }
         mock_catalog_cls.return_value = mock_catalog
 
         mock_super = MagicMock()
@@ -1070,10 +1152,9 @@ class TestDataWriterWrite:
         mock_super_cls.return_value = mock_super
 
         # Setup RedisCatalog mock
-        mock_catalog = MagicMock()
+        mock_catalog = _install_writer_catalog_contract(MagicMock())
         mock_catalog.acquire_simple_lock.return_value = "lock_token_123"
         mock_catalog.release_simple_lock.return_value = True
-        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         # Setup SimpleTable mock
@@ -1082,6 +1163,7 @@ class TestDataWriterWrite:
         snapshot = _dummy_snapshot("tbl", resources=[])
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "snap.json")
         mock_simple.update.return_value = (snapshot, "new_snap.json")
+        mock_simple._last_snapshot_leaf = {"version": 0, "path": "snap.json"}
         mock_simple_cls.return_value = mock_simple
 
         # Setup processing mocks (deletion-vector model)
@@ -1108,7 +1190,7 @@ class TestDataWriterWrite:
         mock_access.assert_called_once()
         mock_catalog.acquire_simple_lock.assert_called_once()
         mock_catalog.release_simple_lock.assert_called_once()
-        mock_catalog.bump_root.assert_called_once()
+        mock_catalog.commit_snapshot_mock.assert_called_once()
 
     @patch("supertable.data_writer.check_write_access")
     @patch("supertable.data_writer.RedisCatalog")
@@ -1216,7 +1298,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
     @patch("supertable.data_writer.SimpleTable")
-    def test_write_mirror_failure_does_not_break_write(
+    def test_write_mirror_failure_reports_committed_core_snapshot(
         self,
         mock_simple_cls,
         mock_super_cls,
@@ -1230,16 +1312,18 @@ class TestDataWriterWrite:
         mock_monitor,
     ):
         from supertable.data_writer import DataWriter
+        from supertable.mirroring.mirror_formats import MirrorPublicationError
 
         mock_super = MagicMock()
         mock_super.super_name = "test_super"
         mock_super.organization = "test_org"
         mock_super_cls.return_value = mock_super
 
-        mock_catalog = MagicMock()
+        mock_catalog = _install_writer_catalog_contract(
+            MagicMock(), mirrors=["PARQUET"],
+        )
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
-        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         mock_simple = MagicMock()
@@ -1247,6 +1331,7 @@ class TestDataWriterWrite:
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
         mock_simple.update.return_value = (snapshot, "ns.json")
+        mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
@@ -1264,10 +1349,16 @@ class TestDataWriterWrite:
 
         dw = DataWriter("test_super", "test_org")
         arrow = _arrow_table({"x": [1]})
-        result = dw.write("user_hash", "my_table", arrow, ["x"])
+        with pytest.raises(MirrorPublicationError) as raised:
+            dw.write("user_hash", "my_table", arrow, ["x"])
 
-        # Write should still succeed
-        assert result is not None
+        assert raised.value.core_committed is True
+        assert raised.value.snapshot_path == "ns.json"
+        assert mock_catalog.commit_snapshot_mock.called
+        assert mock_catalog.mirror_state_events == [
+            "prepared", "core_committed", "failed",
+        ]
+        mock_catalog.release_simple_lock.assert_called_once()
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
@@ -1279,7 +1370,7 @@ class TestDataWriterWrite:
     @patch("supertable.data_writer.RedisCatalog")
     @patch("supertable.data_writer.SuperTable")
     @patch("supertable.data_writer.SimpleTable")
-    def test_write_cas_fallback_to_set_leaf_path(
+    def test_write_atomic_commit_failure_never_falls_back_to_path_only(
         self,
         mock_simple_cls,
         mock_super_cls,
@@ -1299,12 +1390,11 @@ class TestDataWriterWrite:
         mock_super.organization = "test_org"
         mock_super_cls.return_value = mock_super
 
-        mock_catalog = MagicMock()
+        mock_catalog = _install_writer_catalog_contract(
+            MagicMock(), commit_error=RuntimeError("atomic commit unavailable"),
+        )
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
-        mock_catalog.reserve_rowids.return_value = 0
-        # set_leaf_payload_cas fails → fallback to set_leaf_path_cas
-        mock_catalog.set_leaf_payload_cas.side_effect = Exception("not supported")
         mock_catalog_cls.return_value = mock_catalog
 
         mock_simple = MagicMock()
@@ -1312,6 +1402,7 @@ class TestDataWriterWrite:
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
         mock_simple.update.return_value = (snapshot, "ns.json")
+        mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
@@ -1324,10 +1415,14 @@ class TestDataWriterWrite:
 
         dw = DataWriter("test_super", "test_org")
         arrow = _arrow_table({"x": [1]})
-        result = dw.write("user_hash", "my_table", arrow, ["x"])
+        with pytest.raises(RuntimeError, match="atomic commit unavailable"):
+            dw.write("user_hash", "my_table", arrow, ["x"])
 
-        assert result is not None
-        mock_catalog.set_leaf_path_cas.assert_called_once()
+        mock_catalog.commit_snapshot_mock.assert_called_once()
+        mock_catalog.set_leaf_payload_cas.assert_not_called()
+        mock_catalog.set_leaf_path_cas.assert_not_called()
+        mock_catalog.bump_root.assert_not_called()
+        mock_catalog.release_simple_lock.assert_called_once()
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")
@@ -1359,10 +1454,9 @@ class TestDataWriterWrite:
         mock_super.organization = "test_org"
         mock_super_cls.return_value = mock_super
 
-        mock_catalog = MagicMock()
+        mock_catalog = _install_writer_catalog_contract(MagicMock())
         mock_catalog.acquire_simple_lock.return_value = "tok"
         mock_catalog.release_simple_lock.return_value = True
-        mock_catalog.reserve_rowids.return_value = 0
         mock_catalog_cls.return_value = mock_catalog
 
         mock_simple = MagicMock()
@@ -1370,6 +1464,7 @@ class TestDataWriterWrite:
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
         mock_simple.update.return_value = (snapshot, "ns.json")
+        mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
         mock_find_overlap.return_value = set()
@@ -1382,7 +1477,15 @@ class TestDataWriterWrite:
         mock_write_parquet.side_effect = (
             lambda **kw: kw["new_resources"].append(_resource_entry("new.parquet"))
         )
-        mock_build_tombstone.return_value = ("/d/tombstone/t.parquet", None)
+        mock_build_tombstone.return_value = (
+            "/d/tombstone/t.parquet",
+            pl.DataFrame(
+                {
+                    "__file__": ["/tmp/data/old.parquet"] * 2,
+                    "__rowid__": pl.Series([10, 11], dtype=pl.Int64),
+                }
+            ),
+        )
 
         # Monitoring fails
         mock_monitor.side_effect = RuntimeError("monitoring down")
@@ -1475,13 +1578,19 @@ class TestDataReaderExecute:
         mock_extend,
     ):
         import pandas as pd
+        from supertable.data_classes import TableDefinition
         from supertable.data_reader import DataReader, Status
 
         mock_parser = MagicMock()
-        mock_parser.get_table_tuples.return_value = [("super", "tbl", "t")]
+        table = TableDefinition("super", "tbl", "t")
+        mock_parser.get_table_tuples.return_value = [table]
+        mock_parser.get_physical_tables.return_value = [table]
+        mock_parser.get_predicate_constraints.return_value = {}
+        mock_parser.get_join_edges.return_value = []
         mock_parser.original_query = "SELECT * FROM tbl"
         mock_parser_cls.return_value = mock_parser
         mock_get_storage.return_value = MagicMock()
+        mock_restrict.return_value = {}
 
         mock_qpm = MagicMock()
         mock_qpm.query_id = "q1"
@@ -1490,7 +1599,17 @@ class TestDataReaderExecute:
 
         # Estimator returns valid reflection
         mock_reflection = MagicMock()
-        mock_reflection.supers = [MagicMock()]
+        mock_reflection.supers = [types.SimpleNamespace(
+            super_name="super",
+            simple_name="tbl",
+            tombstone_key=None,
+            tombstone_rows=0,
+            tombstone_digest=None,
+            resource_keys=["f.parquet"],
+            snapshot_resource_keys=["f.parquet"],
+            share_row_filter=None,
+        )]
+        mock_reflection.tombstone_views = {}
         mock_reflection.storage_type = "LOCAL"
         mock_reflection.total_reflections = 1
         mock_reflection.reflection_bytes = 1024

@@ -55,7 +55,7 @@ _PATCH_UUID4 = f"{_MOD}.uuid.uuid4"
 # are sunset) are mocked so the tests pin orchestration, not Parquet I/O.
 _PATCH_COMPACT_RES = f"{_MOD}.compact_resources"
 _PATCH_COMPACT_TOMB = f"{_MOD}.compact_tombstones"
-_PATCH_READ_PARQUET = f"{_MOD}._read_parquet_safe"
+_PATCH_LOAD_TOMBSTONE = f"{_MOD}.load_tombstone"
 _PATCH_EXTRACT_STATS = f"{_MOD}.extract_stats_rows"
 _PATCH_BUILD_STATS = f"{_MOD}.build_stats_file"
 
@@ -72,6 +72,60 @@ def _arrow_table(columns: Dict[str, list]) -> pa.Table:
 def _polars_df(columns: Dict[str, list]) -> pl.DataFrame:
     """Helper: build a Polars DataFrame from column dict."""
     return pl.DataFrame(columns)
+
+
+def _tombstone_df(pairs: List[Tuple[str, int]]) -> pl.DataFrame:
+    """Build a deletion vector satisfying the current sealed schema."""
+    return pl.DataFrame(
+        {
+            "__file__": [path for path, _ in pairs],
+            "__rowid__": [rowid for _, rowid in pairs],
+        },
+        schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _hardened_writer_contract_adapter(monkeypatch):
+    """Keep legacy orchestration tests behind today's safety boundary.
+
+    This historical module mocks ``RedisCatalog`` with bare ``MagicMock``
+    instances and originally exercised split leaf/root publication plus the
+    unfenced row-id counter.  Production intentionally refuses both.  The
+    atomic Redis/Lua contracts now have dedicated fault tests, so these older
+    tests use a small in-process adapter and remain focused on orchestration.
+    """
+    from supertable.data_writer import DataWriter
+
+    def reserve(self, *, snapshot, simple_name, count, profiler,
+                require_floor=False):
+        floor = snapshot.get("rowid_high_watermark", 0)
+        floor = int(floor) if isinstance(floor, int) and not isinstance(floor, bool) else 0
+        if count <= 0:
+            return 0, floor
+        return floor + 1, floor + int(count)
+
+    def publish(self, *, simple_table, simple_name, payload, path, base_path,
+                lock_token, commit_id, now_ms, **_kwargs):
+        # Model one successful atomic publication for orchestration assertions.
+        # An injected exception propagates; there is deliberately no path-only
+        # fallback because that would drop snapshot/tombstone metadata.
+        self.catalog.set_leaf_payload_cas(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+            payload,
+            path,
+            now_ms=now_ms,
+        )
+        self.catalog.bump_root(
+            self.super_table.organization,
+            self.super_table.super_name,
+            now_ms=now_ms,
+        )
+
+    monkeypatch.setattr(DataWriter, "_reserve_snapshot_rowids", reserve)
+    monkeypatch.setattr(DataWriter, "_publish_snapshot", publish)
 
 
 @pytest.fixture()
@@ -122,6 +176,9 @@ def snapshot_dict():
         "previous_snapshot": None,
         "schema": [],
         "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
     }
 
 
@@ -407,6 +464,8 @@ class TestWriteHappyPath:
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s1", "o1")
+        dw._get_enabled_mirrors = MagicMock(return_value=["delta"])
+        dw._complete_mirror_publication = MagicMock()
 
         # --- Act ---
         arrow = _arrow_table({"id": [1, 2], "val": ["a", "b"]})
@@ -514,10 +573,11 @@ class TestWriteDeleteOnly:
         # resolve_overwrite_writes returns (filtered_df, [(file, __rowid__)]);
         # one pair → deleted == 1.
         mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 1)])
-        # build_tombstone_file does real parquet I/O against simple_dir (a
-        # MagicMock here), so it must be stubbed.  (path, combined_df) shape;
-        # combined_df=None keeps us below the compaction threshold.
-        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
+        # A new immutable pointer must always be accompanied by the exact frame
+        # so the successor can seal count + digest.
+        mock_build_tomb.return_value = (
+            "/d/tombstone/tomb.parquet", _tombstone_df([("f1", 1)])
+        )
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -927,12 +987,12 @@ class TestWriteCASFallback:
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_falls_back_to_set_leaf_path_cas_on_payload_error(
+    def test_payload_publication_error_never_falls_back_to_path_only(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
     ):
-        """If set_leaf_payload_cas raises, write falls back to set_leaf_path_cas."""
+        """A payload failure aborts; path-only publication would lose the DV."""
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
@@ -957,11 +1017,11 @@ class TestWriteCASFallback:
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s", "o")
-        result = dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
+        with pytest.raises(Exception, match="no payload support"):
+            dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
 
         mock_cat.set_leaf_payload_cas.assert_called_once()
-        mock_cat.set_leaf_path_cas.assert_called_once()
-        assert result is not None
+        mock_cat.set_leaf_path_cas.assert_not_called()
 
 
 # ====================================================================
@@ -979,12 +1039,12 @@ class TestWriteMirroring:
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_mirror_failure_is_swallowed(
+    def test_mirror_failure_reports_committed_core_snapshot(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
     ):
-        """MirrorFormats.mirror_if_enabled failure must not crash the write."""
+        """A post-commit mirror failure is explicit and must not invite retry."""
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         mock_cat = MagicMock()
@@ -1007,11 +1067,16 @@ class TestWriteMirroring:
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
+        from supertable.mirroring.mirror_formats import MirrorPublicationError
         dw = DataWriter("s", "o")
-        result = dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
+        dw._get_enabled_mirrors = MagicMock(return_value=["delta"])
+        dw._fail_mirror_publication = MagicMock()
+        with pytest.raises(MirrorPublicationError) as raised:
+            dw.write("admin", "tbl", _arrow_table({"id": [1]}), ["id"])
 
-        # Should succeed despite mirror failure
-        assert result is not None
+        assert raised.value.core_committed is True
+        assert raised.value.core_result == (1, 1, 1, 0)
+        assert raised.value.mirrors == ("delta",)
         MockMirror.mirror_if_enabled.assert_called_once()
 
 
@@ -1375,7 +1440,10 @@ class TestWriteMonitoringPayload:
         mock_process.side_effect = _append_res
         # One delete pair → deleted == 1; pass incoming through for inserts.
         mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 7)])
-        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
+        mock_build_tomb.return_value = (
+            "/d/tombstone/tomb.parquet",
+            _tombstone_df([("f1", 1), ("f1", 2), ("f2", 3)]),
+        )
 
         # MonitoringWriter is a context manager; in-block instance is
         # accessed via __enter__.return_value
@@ -1744,9 +1812,13 @@ class TestWriteReturnValue:
         mock_simple.update.return_value = ({}, "/np")
         MockSimple.return_value = mock_simple
         mock_find_overlap.return_value = set()
-        # Three delete pairs → deleted == 3.
-        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("f1", 1), ("f1", 2), ("f2", 3)])
-        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
+        # Three delete pairs → deleted == 3.  A newly written immutable DV
+        # always returns its complete frame so the successor can seal it.
+        delete_pairs = [("f1", 1), ("f1", 2), ("f2", 3)]
+        mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], delete_pairs)
+        mock_build_tomb.return_value = (
+            "/d/tombstone/tomb.parquet", _tombstone_df(delete_pairs),
+        )
         mock_get_mon.return_value = MagicMock()
 
         from supertable.data_writer import DataWriter
@@ -1809,7 +1881,10 @@ class TestWriteOverwriteResolution:
 
         # Survives stale filtering and reports one tombstoned existing rowid.
         mock_resolve.side_effect = lambda **kw: (kw["incoming_df"], [("existing.parquet", 1)])
-        mock_build_tomb.return_value = ("/d/tombstone/tomb.parquet", None)
+        mock_build_tomb.return_value = (
+            "/d/tombstone/tomb.parquet",
+            _tombstone_df([("existing.parquet", 1)]),
+        )
         mock_process.return_value = (1, 0, 1, 1, [], set())
         mock_get_mon.return_value = MagicMock()
 
@@ -1863,7 +1938,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_TOMBSTONE)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -1882,7 +1957,7 @@ class TestWriteAutoCompaction:
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_resolve, mock_process,
         MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
-        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_build_stats, mock_load_tombstone, mock_compact_tomb,
         mock_compact_res,
     ):
         """100 accumulated small files → REAL gate trips → compact_resources
@@ -1947,7 +2022,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_TOMBSTONE)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -1966,7 +2041,7 @@ class TestWriteAutoCompaction:
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_resolve, mock_process,
         MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
-        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_build_stats, mock_load_tombstone, mock_compact_tomb,
         mock_compact_res,
     ):
         """A handful of small files stays under both the count and size
@@ -2010,7 +2085,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_TOMBSTONE)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -2029,7 +2104,7 @@ class TestWriteAutoCompaction:
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_resolve, mock_process,
         MockMirror, mock_get_mon, mock_build_tomb, mock_extract_stats,
-        mock_build_stats, mock_read_parquet, mock_compact_tomb,
+        mock_build_stats, mock_load_tombstone, mock_compact_tomb,
         mock_compact_res,
     ):
         """The ordering invariant: when a live deletion-vector is carried
@@ -2049,6 +2124,11 @@ class TestWriteAutoCompaction:
             "resources": _small_resources(100),
             "tombstone": "/d/tombstone/dv.parquet",
             "tombstone_rows": 50,
+            "tombstone_digest": __import__("supertable.processing", fromlist=[
+                "tombstone_digest"
+            ]).tombstone_digest(_tombstone_df([
+                ("small_0.parquet", rowid) for rowid in range(1, 51)
+            ])),
         }
         mock_simple = MagicMock(data_dir="/d")
         mock_simple.get_simple_table_snapshot.return_value = (snap, "/p")
@@ -2063,9 +2143,9 @@ class TestWriteAutoCompaction:
             {"file": "new.parquet", "file_size": 80 * 1024, "rows": 1}
         )
         # Phase A loads the live vector off its pointer to drain it.
-        mock_read_parquet.return_value = _polars_df(
-            {"__rowid__": list(range(50))}
-        )
+        mock_load_tombstone.return_value = _tombstone_df([
+            ("small_0.parquet", rowid) for rowid in range(1, 51)
+        ])
         mock_extract_stats.return_value = MagicMock()
         mock_build_stats.return_value = (None, None)
         mock_get_mon.return_value = MagicMock()
@@ -2092,8 +2172,8 @@ class TestWriteAutoCompaction:
 
         assert result is not None
         # The carried-forward vector was read off its pointer to drain it.
-        mock_read_parquet.assert_called_once()
-        assert mock_read_parquet.call_args[0][0] == "/d/tombstone/dv.parquet"
+        mock_load_tombstone.assert_called_once()
+        assert mock_load_tombstone.call_args[0][0] == "/d/tombstone/dv.parquet"
         # Both phases ran, drain strictly before merge.
         mock_compact_tomb.assert_called_once()
         mock_compact_res.assert_called_once()

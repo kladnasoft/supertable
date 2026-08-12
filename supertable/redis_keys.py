@@ -44,6 +44,8 @@ Hierarchy (v2)
             meta:
               root                                   STRING  root pointer
               mirrors                                STRING  enabled mirror formats
+              mirror_publication:
+                doc:{simple}                         STRING  durable latest mirror outbox
               table_names                            SET     all simple table names
               leaf:
                 doc:{simple}                         STRING  leaf snapshot pointer
@@ -466,6 +468,20 @@ def meta_mirrors(org: str, sup: str) -> str:
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
         f":{_safe('sup', sup)}:meta:mirrors"
+    )
+
+
+def meta_mirror_publication(org: str, sup: str, simple: str) -> str:
+    """Durable mirror-publication state for one table (STRING JSON).
+
+    The per-table mutation lock serializes publications.  A non-complete
+    record is retained until that exact core commit is reconciled, preventing
+    a later mirror-enabled write from erasing evidence of a stale mirror.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:mirror_publication:doc:"
+        f"{_safe('simple', simple)}"
     )
 
 

@@ -57,6 +57,8 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         # Defaults
         "MAX_MEMORY_CHUNK_SIZE",
         "MAX_OVERLAPPING_FILES",
+        "MAX_TOMBSTONE_ROWS",
+        "TOMBSTONE_COMPACTION_WORKERS",
         "DEFAULT_TIMEOUT_SEC",
         "DEFAULT_LOCK_DURATION_SEC",
         "IS_SHOW_TIMING",
@@ -233,6 +235,8 @@ class TestSettingsDataclass:
         assert s.SUPERTABLE_DEFAULT_ENGINE == "AUTO"
         assert s.MAX_MEMORY_CHUNK_SIZE == 16 * 1024 * 1024
         assert s.MAX_OVERLAPPING_FILES == 100
+        assert s.MAX_TOMBSTONE_ROWS == 1_000_000
+        assert s.TOMBSTONE_COMPACTION_WORKERS == 2
         assert s.DEFAULT_TIMEOUT_SEC == 60
         assert s.DEFAULT_LOCK_DURATION_SEC == 30
 
@@ -308,6 +312,7 @@ class TestBuildSettings:
 
     def test_int_and_bool_parsing(self, fresh_env: pytest.MonkeyPatch) -> None:
         fresh_env.setenv("MAX_OVERLAPPING_FILES", "37")
+        fresh_env.setenv("TOMBSTONE_COMPACTION_WORKERS", "6")
         fresh_env.setenv("IS_SHOW_TIMING", "no")
         fresh_env.setenv("STORAGE_FORCE_PATH_STYLE", "yes")
         fresh_env.setenv("STORAGE_USE_SSL", "true")
@@ -315,6 +320,7 @@ class TestBuildSettings:
 
         s = _build_settings()
         assert s.MAX_OVERLAPPING_FILES == 37
+        assert s.TOMBSTONE_COMPACTION_WORKERS == 6
         assert s.IS_SHOW_TIMING is False
         assert s.STORAGE_FORCE_PATH_STYLE is True
         assert s.STORAGE_USE_SSL is True

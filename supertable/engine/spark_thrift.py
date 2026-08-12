@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from typing import Dict, List, Optional
@@ -23,6 +24,7 @@ from supertable.engine.engine_common import (
     quote_if_needed,
     rewrite_query_with_hashed_tables,
     escape_parquet_path,
+    snapshot_spark_type,
 )
 
 from urllib.parse import urlparse, unquote
@@ -75,8 +77,15 @@ def _to_s3a_path(file_path: str) -> str:
     if file_path.startswith("s3a://"):
         return file_path
 
+    if file_path.startswith("gcs://"):
+        return "gs://" + file_path[6:]
+
+    if file_path.startswith(("gs://", "abfss://")):
+        return file_path
+
     if file_path.startswith("http://") or file_path.startswith("https://"):
         parsed = urlparse(file_path)
+        host = (parsed.hostname or "").lower()
         # path is /bucket/key — strip the leading slash, split into bucket + key.
         # urlparse leaves percent-escapes intact, and boto3 presigning encodes
         # the key (Hive partition dirs like ``year=2006`` become ``year%3D2006``).
@@ -85,6 +94,32 @@ def _to_s3a_path(file_path: str) -> str:
         # literally, 404s on the ``%3D`` form. The presign query string is
         # dropped on purpose: Spark authenticates with its own fs.s3a.* creds.
         path = unquote(parsed.path).lstrip("/")
+        if host == "storage.googleapis.com":
+            return f"gs://{path}" if "/" in path else file_path
+        if host.endswith(".storage.googleapis.com"):
+            bucket = host[: -len(".storage.googleapis.com")]
+            return f"gs://{bucket}/{path}" if bucket and path else file_path
+        if host.endswith(".blob.core.windows.net"):
+            account = host[: -len(".blob.core.windows.net")]
+            if account and "/" in path:
+                container, _, key = path.partition("/")
+                return (
+                    f"abfss://{container}@{account}.dfs.core.windows.net/{key}"
+                )
+            return file_path
+        if host.endswith(".dfs.core.windows.net"):
+            # An HTTPS ADLS endpoint still needs a container authority that is
+            # not unambiguously recoverable from all URL shapes.  Leave it as
+            # HTTPS (which may itself be signed) rather than misroute to S3.
+            return file_path
+        # AWS virtual-hosted style: bucket is in the hostname, not URL path.
+        marker = ".s3."
+        if marker in host and host.endswith(".amazonaws.com"):
+            bucket = host.split(marker, 1)[0]
+            return f"s3a://{bucket}/{path}" if bucket and path else file_path
+        if host.endswith(".s3.amazonaws.com"):
+            bucket = host[: -len(".s3.amazonaws.com")]
+            return f"s3a://{bucket}/{path}" if bucket and path else file_path
         if "/" in path:
             return f"s3a://{path}"
         # Degenerate case: only bucket, no key — return as-is
@@ -93,7 +128,9 @@ def _to_s3a_path(file_path: str) -> str:
     return file_path
 
 
-def _resolve_spark_file(storage, file_path: str) -> str:
+def _resolve_spark_file(
+        storage, file_path: str, raw_key: Optional[str] = None,
+) -> str:
     """Resolve one snapshot file path to the form Spark should scan.
 
     ``sup.files`` are resolved once by the estimator using the *DuckDB* presign
@@ -111,20 +148,27 @@ def _resolve_spark_file(storage, file_path: str) -> str:
     Presigning is best-effort: a missing ``presign``, a local path, or an
     unparseable key falls back to the s3a form.
     """
-    s3a = _to_s3a_path(file_path)
-    if not settings.SUPERTABLE_SPARK_PRESIGNED or not s3a.startswith("s3a://"):
-        return s3a
+    direct = _to_s3a_path(file_path)
+    if not settings.SUPERTABLE_SPARK_PRESIGNED:
+        return direct
+
+    is_remote = direct.startswith(("s3a://", "gs://", "abfss://"))
+    if not is_remote:
+        return direct
 
     presign_fn = getattr(storage, "presign", None)
     if not callable(presign_fn):
-        return s3a
+        return direct
 
     # s3a://bucket/full_key → object key.  storage.presign() re-applies
     # base_prefix (like read_bytes), so strip it here — mirroring
     # _read_parquet_schema — to avoid doubling it.
-    full_key = s3a[len("s3a://"):].partition("/")[2]
+    if raw_key:
+        full_key = str(raw_key).lstrip("/")
+    else:
+        full_key = direct.partition("://")[2].partition("/")[2]
     if not full_key:
-        return s3a
+        return direct
     base = (getattr(storage, "base_prefix", "") or "").strip("/")
     rel_key = (
         full_key[len(base) + 1:]
@@ -137,7 +181,7 @@ def _resolve_spark_file(storage, file_path: str) -> str:
             return url
     except Exception as e:  # pragma: no cover - defensive
         logger.debug(f"[spark.thrift] presign failed for {rel_key!r}; using s3a: {e}")
-    return s3a
+    return direct
 
 
 # =========================================================
@@ -223,6 +267,25 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
     return intermediate_views
 
 
+def _spark_create_empty_view(cursor, table_name: str, column_types: Dict[str, str]) -> None:
+    """Create a typed empty Spark view for a snapshot with zero resources."""
+    if not column_types:
+        raise RuntimeError(
+            "Cannot construct an empty Spark reflection: pinned snapshot has no schema"
+        )
+    expressions = []
+    for name, raw_type in column_types.items():
+        type_name = snapshot_spark_type(raw_type)
+        expressions.append(
+            f"CAST(NULL AS {type_name}) AS `{str(name).replace('`', '``')}`"
+        )
+    cursor.execute(
+        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS SELECT "
+        + ", ".join(expressions)
+        + " WHERE 1 = 0"
+    )
+
+
 def _spark_create_rbac_view(
         cursor,
         base_table_name: str,
@@ -270,11 +333,57 @@ def _spark_create_tombstone_view(
     Created on top of the reflection table (before RBAC), so the anti-join
     still has ``__rowid__`` and RBAC never sees the system columns.
     """
+    describe_error = None
+    src_desc = []
     try:
         cursor.execute(f"DESCRIBE {source_table}")
-        src_cols = [row[0] for row in cursor.fetchall()]
-    except Exception:
+        src_desc = cursor.fetchall()
+        src_cols = [str(row[0]) for row in src_desc]
+    except Exception as exc:
+        describe_error = exc
         src_cols = []
+
+    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    if tomb_path and describe_error is not None:
+        # Failing open here used to skip the anti-join and return deleted rows.
+        raise RuntimeError(
+            f"Cannot validate source schema for deletion-vector filtering: {describe_error}"
+        ) from describe_error
+
+    canonical_reserved = {
+        "__rowid__": "__rowid__",
+        "__timestamp__": "__timestamp__",
+        "__file__": "__file__",
+    }
+    seen_reserved = set()
+    for name in src_cols:
+        folded = name.casefold()
+        is_reserved = folded in canonical_reserved or folded.startswith("__supertable_")
+        if not is_reserved:
+            continue
+        expected = canonical_reserved.get(folded)
+        if expected is None or name != expected or folded in seen_reserved:
+            raise RuntimeError(
+                f"Invalid reserved system column in Spark reflection schema: {name!r}"
+            )
+        seen_reserved.add(folded)
+
+    if tomb_path:
+        rowid_rows = [row for row in src_desc if str(row[0]) == "__rowid__"]
+        if len(rowid_rows) != 1 or str(rowid_rows[0][1]).lower() != "bigint":
+            raise RuntimeError(
+                "Cannot apply deletion vector: source requires canonical "
+                "__rowid__ BIGINT"
+            )
+        # Spark's input_file_name() exposes resolved s3a/gs/abfss or signed
+        # URLs, while the DV stores raw catalog keys.  Until an exact mapping is
+        # carried into the Spark reflection, a rowid-only anti-join can hide a
+        # live row in file B when DV contains (file A, same rowid).  Refuse the
+        # read rather than violate the no-data-loss contract.
+        raise RuntimeError(
+            "Spark deletion-vector reads require composite source-file + "
+            "row-id identity and are not supported safely"
+        )
 
     user_cols = [c for c in src_cols if c not in _SPARK_SYSTEM_COLS]
     if user_cols:
@@ -283,21 +392,114 @@ def _spark_create_tombstone_view(
         # Can't introspect — fall back to SELECT * (system columns may leak).
         select_cols = "src.*"
 
-    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
     has_rowid = "__rowid__" in src_cols
 
-    if tomb_path and has_rowid:
+    if tomb_path:
+        if not has_rowid:
+            raise RuntimeError(
+                "Cannot apply deletion vector: source table has no __rowid__ column"
+            )
         # Resolve the deletion-vector pointer the same way as the data files
         # (see the data-file loop in the executor) so Spark reads it through the
         # same access method — direct s3a:// by default, presigned when
         # SUPERTABLE_SPARK_PRESIGNED is on — instead of a bare key or a
         # DuckDB-shaped presigned URL.
-        escaped = _resolve_spark_file(storage, tomb_path).replace("'", "''")
+        escaped = _resolve_spark_file(
+            storage,
+            tomb_path,
+            raw_key=getattr(tombstone_def, "cache_key", None),
+        ).replace("'", "''")
+        relation = f"parquet.`{escaped}`"
+
+        # Validate the immutable DV before exposing a view.  The engine cannot
+        # safely use DV.__file__ for a composite join yet: Spark sees an s3a or
+        # presigned filename while the writer stores the raw object key.  The
+        # writer's table-global row-id invariant remains the conservative
+        # boundary until a canonical source-file column is plumbed through.
+        try:
+            cursor.execute(f"DESCRIBE {relation}")
+            dv_desc = cursor.fetchall()
+            dv_schema = [
+                (str(row[0]), str(row[1]).lower())
+                for row in dv_desc
+                if row and str(row[0]).strip() and not str(row[0]).startswith("#")
+            ]
+            required = [("__file__", "string"), ("__rowid__", "bigint")]
+            if dv_schema != required:
+                raise RuntimeError(
+                    f"Invalid deletion-vector schema: expected exactly {required}, got {dv_schema}"
+                )
+            cursor.execute(
+                "SELECT count(*), count(`__file__`), count(`__rowid__`), "
+                "count(DISTINCT `__rowid__`), "
+                "sum(CASE WHEN length(`__file__`) = 0 THEN 1 ELSE 0 END) "
+                f"FROM {relation}"
+            )
+            count_rows = cursor.fetchall()
+            if len(count_rows) != 1 or len(count_rows[0]) < 5:
+                raise RuntimeError("Invalid deletion-vector count result")
+            total, files, rowids, distinct_rowids, empty_files = count_rows[0][:5]
+            total = int(total)
+            empty_files = int(empty_files or 0)
+            if (
+                int(files) != total
+                or int(rowids) != total
+                or int(distinct_rowids) != total
+                or empty_files != 0
+            ):
+                raise RuntimeError(
+                    "Invalid deletion vector: non-null __file__/__rowid__ and "
+                    "unique __rowid__ values are required"
+                )
+            expected_rows = getattr(tombstone_def, "expected_rows", None)
+            if expected_rows is not None and total != int(expected_rows):
+                raise RuntimeError(
+                    f"Invalid deletion-vector row count: expected {int(expected_rows)}, got {total}"
+                )
+            raw_snapshot_keys = getattr(
+                tombstone_def, "snapshot_resource_keys", None,
+            )
+            selected_keys = getattr(tombstone_def, "resource_keys", ()) or ()
+            allowed_keys = (
+                tuple(str(path) for path in raw_snapshot_keys)
+                if raw_snapshot_keys is not None
+                else (tuple(str(path) for path in selected_keys) or None)
+            )
+            if allowed_keys is not None:
+                if not allowed_keys and total:
+                    raise RuntimeError(
+                        "Invalid deletion vector: __file__ contains resources "
+                        "outside the pinned table snapshot"
+                    )
+                allowed_sql = ", ".join(
+                    "'" + path.replace("'", "''") + "'"
+                    for path in sorted(set(allowed_keys))
+                )
+                if allowed_sql:
+                    cursor.execute(
+                        "SELECT count(DISTINCT `__file__`) "
+                        f"FROM {relation} WHERE `__file__` NOT IN ({allowed_sql})"
+                    )
+                    foreign_rows = cursor.fetchall()
+                    if (
+                        len(foreign_rows) != 1
+                        or not foreign_rows[0]
+                        or int(foreign_rows[0][0]) != 0
+                    ):
+                        raise RuntimeError(
+                            "Invalid deletion vector: __file__ contains resources "
+                            "outside the pinned table snapshot"
+                        )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Unable to validate deletion vector: {exc}") from exc
+
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
             f"SELECT {select_cols} FROM {source_table} AS src "
             f"LEFT ANTI JOIN (SELECT DISTINCT `__rowid__` "
-            f"FROM parquet.`{escaped}`) AS __dv__ "
+            f"FROM {relation}) AS __dv__ "
             f"ON src.`__rowid__` = __dv__.`__rowid__`"
         )
     else:
@@ -858,13 +1060,36 @@ class SparkThriftExecutor:
                 # Resolve to Spark's access form: direct s3a:// by default, or
                 # presigned URLs when SUPERTABLE_SPARK_PRESIGNED is on (handles
                 # s3://, presigned HTTP URLs and bare keys either way).
-                files = [_resolve_spark_file(self.storage, f) for f in sup.files]
+                raw_keys = list(getattr(sup, "resource_keys", ()) or ())
+                if raw_keys and len(raw_keys) != len(sup.files):
+                    raise RuntimeError(
+                        "Resolved Spark files and stable resource keys must "
+                        "correspond one-for-one"
+                    )
+                files = [
+                    _resolve_spark_file(
+                        self.storage,
+                        f,
+                        raw_key=(raw_keys[idx] if raw_keys else None),
+                    )
+                    for idx, f in enumerate(sup.files)
+                ]
 
                 logger.debug(
                     f"{log_prefix}[spark.thrift] creating view {table_name} "
                     f"({len(files)} file(s))"
                 )
-                intermediates = _spark_create_parquet_view(cursor, table_name, files)
+                if files:
+                    intermediates = _spark_create_parquet_view(
+                        cursor, table_name, files,
+                    )
+                else:
+                    _spark_create_empty_view(
+                        cursor,
+                        table_name,
+                        dict(getattr(sup, "column_types", {}) or {}),
+                    )
+                    intermediates = []
                 created_tables.append(table_name)
                 # Track intermediate views (part + batch) for cleanup after query
                 created_views.extend(intermediates)
@@ -938,7 +1163,9 @@ class SparkThriftExecutor:
 
             # 5. Create RBAC views
             query_alias_to_name = dict(alias_to_table_name)
-            query_suffix = uuid.uuid4().hex[:8]
+            # Keep the full request UUID: temporary-view name collisions can
+            # replace another query's tombstone/RBAC view and alter its result.
+            query_suffix = uuid.uuid4().hex
 
             # 5a. Tombstone / system-column views — created for EVERY alias so
             # the system columns (__rowid__/__timestamp__) are always stripped

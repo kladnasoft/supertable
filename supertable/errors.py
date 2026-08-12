@@ -15,6 +15,11 @@ Hierarchy
             ├── SuperTableNotFoundError
             └── TableNotFoundError
 
+    RuntimeError
+      ├── SnapshotCommitConflictError
+      ├── LockLostError
+      └── TombstoneIntegrityError
+
 Inheriting from the stdlib ``LookupError`` means existing
 ``except LookupError`` / ``except KeyError`` callers keep working — every
 SuperTable lookup failure is a "key not found" at heart.
@@ -68,8 +73,34 @@ class TableNotFoundError(SupertableLookupError):
         self.simple_name = simple_name
 
 
+class SnapshotCommitConflictError(RuntimeError):
+    """Raised when a writer tries to publish from a stale base snapshot.
+
+    Snapshot data files are immutable, so a rejected writer may leave
+    unreferenced objects for the retention-aware garbage collector, but it
+    must never overwrite a newer catalog pointer.
+    """
+
+
+class LockLostError(RuntimeError):
+    """Raised when a mutation no longer owns its table fencing lock."""
+
+
+class TombstoneIntegrityError(RuntimeError):
+    """Raised when a referenced deletion vector cannot be trusted.
+
+    Tombstones are required snapshot state.  Treating a missing, malformed,
+    truncated, or foreign vector as empty would resurrect rows; coercing an
+    invalid vector could delete live rows.  Both conditions therefore fail
+    closed with this exception.
+    """
+
+
 __all__ = [
     "SupertableLookupError",
     "SuperTableNotFoundError",
     "TableNotFoundError",
+    "SnapshotCommitConflictError",
+    "LockLostError",
+    "TombstoneIntegrityError",
 ]
