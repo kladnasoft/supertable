@@ -148,6 +148,13 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("monitor_partition_pattern_for_org", RK.monitor_partition_pattern_for_org(ORG),
                                                                                f"supertable:{ORG}:monitor:*:doc:*"),
 
+        # ---- AUTO routing observations (org-level, anonymous) -------
+        ("query_observation_samples", RK.query_observation_samples(
+            ORG, "a" * 16, "islanddb"),
+            f"supertable:{ORG}:system:engine:observations:{'a' * 16}:islanddb"),
+        ("query_observation_index", RK.query_observation_index(ORG),
+            f"supertable:{ORG}:system:engine:observations:index"),
+
         # ---- Platform: dataisland: --------------------------------------
         ("registry",                     RK.registry(ORG, "api", "host1", 1234), f"dataisland:{ORG}:registry:api:host1:1234"),
         ("registry_pattern_for_org",     RK.registry_pattern_for_org(ORG),     f"dataisland:{ORG}:registry:*"),
@@ -351,6 +358,15 @@ def test_monitor_partition_lives_at_org_level():
     # No "lakes" or "system" segment, no super_name segment.
     assert ":lakes:" not in key
     assert ":system:" not in key
+
+
+def test_query_observation_key_rejects_unhashed_or_unknown_dimensions():
+    with pytest.raises(ValueError):
+        RK.query_observation_samples("acme", "raw sql here", "islanddb")
+    with pytest.raises(ValueError):
+        RK.query_observation_samples("acme", "a" * 16, "auto")
+    with pytest.raises(ValueError):
+        RK.query_observation_samples("acme", "a" * 16, "bogus")
 
 
 def test_rowid_seq_not_matched_by_leaf_scan():

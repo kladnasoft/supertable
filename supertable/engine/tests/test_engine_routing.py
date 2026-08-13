@@ -4,10 +4,9 @@
 Under AUTO, the registered Spark Thrift fleet decides routing:
 
   * :meth:`Executor._auto_pick` routes to Spark only when at least one
-    **active** cluster is registered AND the job reaches the fleet's minimum
-    accepted size — the smallest ``min_bytes`` across active clusters
-    (:meth:`Executor._spark_min_bytes`).  With no active cluster, AUTO stays on
-    DuckDB regardless of size.
+    **active, size-window-compatible** cluster is registered AND the candidate
+    scan reaches that eligible fleet's minimum accepted size. With no fitting
+    active cluster, AUTO stays on DuckDB regardless of size.
   * :meth:`RedisCatalog.select_spark_cluster` then picks, at random, one of the
     active clusters whose ``[min_bytes, max_bytes]`` window contains the job.
 
@@ -17,11 +16,20 @@ active cluster is known (in which case AUTO won't pick Spark anyway).
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
+import pytest
+
+import supertable.engine.executor as executor_module
 from supertable.engine.executor import Executor
 from supertable.engine.engine_config import EngineRuntimeConfig
 from supertable.engine.engine_enum import Engine
+from supertable.engine.island_resources import (
+    ExecutionAdvice,
+    ResultMemoryLimitExceeded,
+)
+from supertable.engine.plan_stats import PlanStats
 from supertable.redis_catalog import RedisCatalog
 
 GIB = 1024 ** 3
@@ -142,6 +150,219 @@ def test_auto_never_spark_without_active_cluster_even_when_huge():
     cat = _Catalog([])
     chosen = _executor(cat)._auto_pick(_reflection(500 * GIB), _cfg(10 * GIB))
     assert chosen == Engine.DUCKDB_PRO
+
+
+def test_auto_unknown_source_size_never_routes_spark_or_island(monkeypatch):
+    cat = _Catalog([_active(1)])
+    executor = _executor(cat)
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+    )
+    reflection = _reflection(0)
+    reflection.source_bytes_complete = False
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(reflection, _cfg(0), parser=object())
+
+    assert chosen is Engine.DUCKDB_PRO
+
+
+def _bounded_island_plan():
+    return SimpleNamespace(
+        advice=ExecutionAdvice.ISLAND_IN_MEMORY,
+        cpu_workers=4,
+        io_workers=8,
+    )
+
+
+def test_auto_routes_supported_bounded_query_to_islanddb(monkeypatch):
+    """Decoded working-set bounds, not whole-file warmth, admit IslandDB."""
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(512 * 1024 * 1024), _cfg(10 * GIB), parser=object(),
+    )
+
+    assert chosen is Engine.ISLANDDB
+
+
+def test_auto_uses_range_native_query_without_whole_file_warmth(monkeypatch):
+    """Cold Island scans are eligible because only sealed ranges are fetched."""
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(512 * 1024 * 1024), _cfg(10 * GIB), parser=object(),
+    )
+
+    assert chosen is Engine.ISLANDDB
+
+
+def test_auto_uses_trusted_row_group_size_before_spark_threshold(monkeypatch):
+    """A huge table with one tiny candidate row group is not a huge job."""
+    executor = _executor(_Catalog([_active(1 * GIB)]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
+    )
+    reflection = _reflection(10 * GIB)
+    reflection.row_group_scan_bytes = 8 * 1024 * 1024
+    reflection.row_group_scan_bytes_complete = True
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        reflection, _cfg(0), parser=object(),
+    )
+
+    assert chosen is Engine.ISLANDDB
+
+
+def test_auto_materialized_result_fails_before_fetch_when_streaming_is_required(
+    monkeypatch,
+):
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
+            advice=ExecutionAdvice.STREAM_RESULT,
+            cpu_workers=2,
+            io_workers=2,
+            estimated_spill_bytes=0,
+        ),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+    stats = PlanStats()
+
+    with pytest.raises(ResultMemoryLimitExceeded, match="execute_stream"):
+        executor._auto_pick(
+            _reflection(512 * 1024 * 1024),
+            _cfg(10 * GIB),
+            parser=object(),
+            plan_stats=stats,
+        )
+
+    blocked = next(
+        item["AUTO_ROUTING_BLOCKED"]
+        for item in stats.stats if "AUTO_ROUTING_BLOCKED" in item
+    )
+    assert blocked["reason_code"] == "streaming_result_required"
+
+
+def test_auto_routes_decoded_heavy_small_object_to_spark(monkeypatch):
+    """Compressed bytes cannot override a native decoded/operator warning."""
+    executor = _executor(_Catalog([_active(1)]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
+            advice=ExecutionAdvice.ROUTE_SPARK,
+            cpu_workers=1,
+            io_workers=1,
+        ),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(32 * 1024 * 1024), _cfg(0), parser=object(),
+    )
+
+    assert chosen is Engine.SPARK_SQL
+
+
+@pytest.mark.parametrize(
+    "advice",
+    [
+        ExecutionAdvice.ROUTE_DUCKDB,
+        ExecutionAdvice.ROUTE_SPARK,
+    ],
+)
+def test_auto_never_demotes_native_memory_warning_to_lite_without_spark(
+    monkeypatch, advice,
+):
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
+            advice=advice,
+            cpu_workers=1,
+            io_workers=1,
+        ),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(32 * 1024 * 1024), _cfg(0), parser=object(),
+    )
+
+    assert chosen is Engine.DUCKDB_PRO
+
+
+def test_auto_does_not_route_spark_when_job_fits_no_cluster_window():
+    catalog = _Catalog([
+        _active(1 * GIB, 2 * GIB),
+        _active(5 * GIB, 8 * GIB),
+    ])
+
+    chosen = _executor(catalog)._auto_pick(_reflection(3 * GIB), _cfg(0))
+
+    assert chosen is Engine.DUCKDB_PRO
+
+
+def test_auto_capability_or_cache_probe_error_falls_back_to_pro(monkeypatch):
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: (_ for _ in ()).throw(
+            RuntimeError("optional probe failed")
+        ),
+    )
+    executor._get_file_cache = lambda: SimpleNamespace()
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(512 * 1024 * 1024), _cfg(10 * GIB), parser=object(),
+    )
+
+    assert chosen is Engine.DUCKDB_PRO
 
 
 # --------------------------------------------------------------------------- #

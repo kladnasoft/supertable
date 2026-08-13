@@ -6,7 +6,7 @@ import os
 
 from supertable.config.settings import settings
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 from urllib.parse import urlparse
 
 import boto3
@@ -15,7 +15,15 @@ from botocore.exceptions import ClientError
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+    StorageInterface,
+    normalize_sha256_checksum,
+    read_exact_range_body,
+    validate_range_request,
+    write_all,
+)
 
 
 class S3Storage(StorageInterface):
@@ -487,6 +495,152 @@ class S3Storage(StorageInterface):
             if code in ("404", "NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
+
+    @staticmethod
+    def _metadata_from_response(response: Dict[str, Any]) -> ObjectMetadata:
+        modified = response.get("LastModified")
+        modified_ns = int(modified.timestamp() * 1_000_000_000) if modified else 0
+        etag = str(response.get("ETag") or "").strip('"')
+        checksum_type = str(response.get("ChecksumType") or "").upper()
+        # Multipart COMPOSITE checksums are not the SHA-256 of the complete
+        # object and therefore must not be compared with the downloaded bytes.
+        checksum = ""
+        if checksum_type == "FULL_OBJECT" or (not checksum_type and "-" not in etag):
+            checksum = normalize_sha256_checksum(response.get("ChecksumSHA256"))
+        return ObjectMetadata(
+            size=int(response.get("ContentLength") or 0),
+            version=str(response.get("VersionId") or ""),
+            etag=etag,
+            last_modified_ns=modified_ns,
+            checksum_sha256=checksum,
+        )
+
+    def stat_object(self, path: str) -> ObjectMetadata:
+        path = self._with_base(path)
+        self._ensure_bucket_region()
+        try:
+            response = self._call("head_object", Bucket=self.bucket_name, Key=path)
+            return self._metadata_from_response(response)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                raise FileNotFoundError(f"File not found: {path}") from e
+            raise
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        path = self._with_base(path)
+        self._ensure_bucket_region()
+        request: Dict[str, Any] = {"Bucket": self.bucket_name, "Key": path}
+        if expected is not None:
+            if expected.version:
+                request["VersionId"] = expected.version
+            if expected.etag:
+                etag = expected.etag.strip('"')
+                request["IfMatch"] = f'"{etag}"'
+        try:
+            response = self._call("get_object", **request)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("404", "NoSuchKey", "NotFound", "NoSuchVersion"):
+                raise FileNotFoundError(f"File not found: {path}") from e
+            raise
+
+        body = response["Body"]
+        written = 0
+        try:
+            if expected is not None:
+                response_meta = self._metadata_from_response(response)
+                if response_meta.size != expected.size:
+                    raise OSError(f"Object changed before download: {path}")
+                if response_meta.version and expected.version and response_meta.version != expected.version:
+                    raise OSError(f"Object version changed before download: {path}")
+                if response_meta.etag and expected.etag and response_meta.etag != expected.etag:
+                    raise OSError(f"Object ETag changed before download: {path}")
+            while True:
+                chunk = body.read(chunk_size)
+                if not chunk:
+                    break
+                written += write_all(file_obj, chunk)
+        finally:
+            body.close()
+        expected_size = expected.size if expected is not None else int(response.get("ContentLength") or written)
+        if written != expected_size:
+            raise OSError(
+                f"Short download for {path}: expected {expected_size} bytes, wrote {written}"
+            )
+        return written
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        offset, length = validate_range_request(offset, length, expected)
+        if length == 0:
+            return b""
+        if expected is None or not (expected.version or expected.etag):
+            raise ValueError("S3 range reads require a version or ETag condition")
+        path = self._with_base(path)
+        self._ensure_bucket_region()
+        request: Dict[str, Any] = {
+            "Bucket": self.bucket_name,
+            "Key": path,
+            "Range": f"bytes={offset}-{offset + length - 1}",
+        }
+        if expected is not None:
+            if expected.version:
+                request["VersionId"] = expected.version
+            if expected.etag:
+                request["IfMatch"] = f'"{expected.etag.strip(chr(34))}"'
+        try:
+            response = self._call("get_object", **request)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("PreconditionFailed", "NoSuchVersion") or status == 412:
+                raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+            if code in ("404", "NoSuchKey", "NotFound"):
+                raise FileNotFoundError(f"File not found: {path}") from exc
+            raise
+        body = response["Body"]
+        try:
+            payload = read_exact_range_body(body, length)
+        finally:
+            body.close()
+        if expected is not None:
+            version = str(response.get("VersionId") or "")
+            etag = str(response.get("ETag") or "").strip('"')
+            if expected.version and version and version != expected.version:
+                raise ObjectIdentityMismatch(f"Object version changed: {path}")
+            if expected.etag and etag and etag != expected.etag.strip('"'):
+                raise ObjectIdentityMismatch(f"Object ETag changed: {path}")
+        return payload
+
+    def cache_namespace(self) -> Dict[str, str]:
+        parsed = urlparse(self.endpoint_url or "")
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        namespace = {"provider": "s3", "bucket": self.bucket_name}
+        if host:
+            namespace["endpoint_host"] = host.lower()
+        if self.region:
+            namespace["region"] = str(self.region)
+        if self.base_prefix:
+            namespace["base_prefix"] = self.base_prefix
+        return namespace
 
     def makedirs(self, path: str) -> None:
         # No-op for object storage; see MinIO note if you want folder markers.

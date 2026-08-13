@@ -1,7 +1,125 @@
 # route: supertable.storage.storage_interface
 import abc
-from typing import Any, Dict, List, Optional
+import base64
+import binascii
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Dict, List, Optional
 import pyarrow as pa
+
+
+def write_all(file_obj: BinaryIO, data: bytes | memoryview) -> int:
+    """Write an entire chunk, including to sinks which perform partial writes."""
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        result = file_obj.write(view[written:])
+        if result is None:
+            return len(view)
+        if result <= 0:
+            raise OSError("Binary sink made no progress while writing")
+        written += int(result)
+    return written
+
+
+def normalize_sha256_checksum(value: Any) -> str:
+    """Normalize a hex or base64 SHA-256 digest to lowercase hexadecimal."""
+    text = str(value or "").strip()
+    if len(text) == 64:
+        try:
+            bytes.fromhex(text)
+            return text.lower()
+        except ValueError:
+            return ""
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError, binascii.Error):
+        return ""
+    return decoded.hex() if len(decoded) == 32 else ""
+
+
+@dataclass(frozen=True)
+class ObjectMetadata:
+    """Stable object attributes used to seal entries in the local file cache."""
+
+    size: int
+    version: str = ""
+    etag: str = ""
+    last_modified_ns: int = 0
+    checksum_sha256: str = ""
+
+    def identity_token(self) -> str | None:
+        """Return a deterministic token for this exact observed object version.
+
+        Size alone is deliberately not considered an identity.  Providers should
+        populate every stable version/checksum attribute they expose; combining
+        them makes an in-place local rewrite (same inode) detectable as well.
+        """
+        seals = []
+        if self.version:
+            seals.append(f"version={self.version}")
+        if self.etag:
+            seals.append(f"etag={self.etag}")
+        if self.last_modified_ns:
+            seals.append(f"mtime_ns={self.last_modified_ns}")
+        if self.checksum_sha256:
+            seals.append(f"sha256={self.checksum_sha256}")
+        if not seals:
+            return None
+        return f"size={self.size}|" + "|".join(seals)
+
+
+class ObjectIdentityMismatch(OSError):
+    """A conditional object read did not address the sealed object version.
+
+    Callers must treat this differently from cache or network availability:
+    retrying against the current unconditioned object could mix two snapshots.
+    """
+
+
+def validate_range_request(
+    offset: int,
+    length: int,
+    expected: ObjectMetadata | None,
+) -> tuple[int, int]:
+    """Validate and normalize an exact half-open object byte range."""
+    try:
+        offset = int(offset)
+        length = int(length)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("range offset and length must be integers") from exc
+    if offset < 0 or length < 0:
+        raise ValueError("range offset and length must be non-negative")
+    if expected is not None:
+        if expected.size < 0 or offset > expected.size or length > expected.size - offset:
+            raise ValueError("requested range exceeds the sealed object size")
+        if length and not expected.identity_token():
+            raise ValueError("range reads require a stable object identity seal")
+    return offset, length
+
+
+def read_exact_range_body(body: BinaryIO, length: int) -> bytes:
+    """Read one bounded provider response exactly, detecting ignored ranges.
+
+    Some HTTP wrappers may legally return fewer bytes than requested from one
+    ``read`` call.  Looping avoids false short-read failures, while the final
+    one-byte probe detects a provider/adapter that ignored the Range header
+    without ever draining the rest of the object.
+    """
+    remaining = int(length)
+    chunks = []
+    while remaining:
+        chunk = body.read(remaining)
+        if not chunk:
+            break
+        if len(chunk) > remaining:
+            raise ObjectIdentityMismatch("range response exceeded requested length")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    extra = body.read(1)
+    if remaining or extra:
+        raise ObjectIdentityMismatch("range response length mismatch")
+    return b"".join(chunks)
+
 
 class StorageInterface(abc.ABC):
     """
@@ -192,3 +310,69 @@ class StorageInterface(abc.ABC):
         Return a presigned GET URL for the object.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not implement presign()")
+
+    # -------------------------
+    # Optional shared-file-cache helpers
+    # -------------------------
+    def stat_object(self, path: str) -> ObjectMetadata:
+        """Return cache-relevant metadata without downloading the object.
+
+        This method intentionally remains non-abstract so third-party storage
+        implementations continue to instantiate.  Built-in backends override it
+        to expose their native immutable version and checksum attributes.
+        """
+        return ObjectMetadata(size=self.size(path))
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        """Download *path* into a binary sink and return bytes written.
+
+        This remains non-abstract for third-party subclass compatibility, but
+        deliberately has no whole-object ``read_bytes`` fallback.  Backends
+        admitted to the shared cache must implement true bounded streaming.
+        """
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement streaming download_to_file()"
+        )
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        """Read exactly ``[offset, offset + length)`` without fetching the object.
+
+        Built-in object-store implementations use their provider's bounded
+        range API and apply the strongest available version/ETag condition from
+        ``expected``.  There is deliberately no ``read_bytes`` fallback: that
+        would turn a narrow Parquet footer/column read into a full download.
+        """
+        validate_range_request(offset, length, expected)
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement bounded read_range()"
+        )
+
+    def cache_namespace(self) -> Dict[str, str]:
+        """Return non-secret, non-URL fields that isolate cache key spaces."""
+        namespace = {
+            "provider": f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+        }
+        base_prefix = str(getattr(self, "base_prefix", "") or "")
+        if base_prefix:
+            namespace["base_prefix"] = base_prefix.strip("/")
+        return namespace
+
+    def is_local_storage(self) -> bool:
+        """Whether paths already refer to files on the local filesystem."""
+        return False

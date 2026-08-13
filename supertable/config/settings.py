@@ -203,6 +203,40 @@ class Settings:
     SUPERTABLE_ENGINE_FRESHNESS_SEC: int = 300     # SUPERTABLE_ENGINE_FRESHNESS_SEC
     SUPERTABLE_DEFAULT_ENGINE: str = "AUTO"        # SUPERTABLE_DEFAULT_ENGINE
 
+    # ── IslandDB / shared local Parquet cache ──────────────────────
+    # IslandDB remains explicit-only by default while deployment benchmarks
+    # establish AUTO break-even points. Its complete-object cache is also
+    # consulted (hit-only) by DuckDB so both engines can reuse immutable local
+    # Parquet files; selective remote Island scans use the range cache below.
+    SUPERTABLE_ISLAND_CACHE_ENABLED: bool = True       # SUPERTABLE_ISLAND_CACHE_ENABLED
+    SUPERTABLE_ISLAND_CACHE_DIR: str = ""              # SUPERTABLE_ISLAND_CACHE_DIR
+    SUPERTABLE_ISLAND_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_CACHE_MAX_BYTES
+    SUPERTABLE_ISLAND_CACHE_TTL_SEC: int = 24 * 60 * 60  # SUPERTABLE_ISLAND_CACHE_TTL_SEC
+    SUPERTABLE_ISLAND_CACHE_WORKERS: int = 4            # SUPERTABLE_ISLAND_CACHE_WORKERS
+    SUPERTABLE_ISLAND_AUTO_ENABLED: bool = True         # SUPERTABLE_ISLAND_AUTO_ENABLED
+    # Persistent exact-range cache used by IslandDB's seekable Arrow Parquet
+    # reader.  Unlike the complete-object cache above, a cold selective query
+    # downloads only the footer and compressed column-chunk ranges Arrow asks
+    # for. Every cached interval is sealed to the provider version/ETag.
+    SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED: bool = True   # SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
+    SUPERTABLE_ISLAND_RANGE_CACHE_DIR: str = ""          # SUPERTABLE_ISLAND_RANGE_CACHE_DIR
+    SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES
+    SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC: int = 24 * 60 * 60  # SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC
+
+    # Container-aware native execution budgets.  Zero means auto-detect from
+    # cgroup-v2 and CPU affinity.  These are hard planning limits: IslandDB
+    # routes an unsupported/oversized plan away instead of risking OOM.
+    SUPERTABLE_ISLAND_MEMORY_FRACTION: float = 0.60       # SUPERTABLE_ISLAND_MEMORY_FRACTION
+    SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION: float = 0.80  # SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION
+    SUPERTABLE_ISLAND_MAX_MEMORY_BYTES: int = 0           # SUPERTABLE_ISLAND_MAX_MEMORY_BYTES
+    SUPERTABLE_ISLAND_MAX_RESULT_BYTES: int = 512 * 1024 * 1024  # SUPERTABLE_ISLAND_MAX_RESULT_BYTES
+    SUPERTABLE_ISLAND_CPU_MAX: int = 0                    # SUPERTABLE_ISLAND_CPU_MAX
+    SUPERTABLE_ISLAND_IO_WORKERS_MAX: int = 16            # SUPERTABLE_ISLAND_IO_WORKERS_MAX
+    SUPERTABLE_ISLAND_SPILL_ENABLED: bool = True          # SUPERTABLE_ISLAND_SPILL_ENABLED
+    SUPERTABLE_ISLAND_SPILL_DIR: str = ""                 # SUPERTABLE_ISLAND_SPILL_DIR
+    SUPERTABLE_ISLAND_SPILL_MAX_BYTES: int = 64 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_SPILL_MAX_BYTES
+    SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES: int = 512 * 1024 * 1024  # SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES
+
     # ── Spark Engine ─────────────────────────────────────────────────
     SUPERTABLE_SPARK_QUERY_TIMEOUT: int = 300      # SUPERTABLE_SPARK_QUERY_TIMEOUT
     SUPERTABLE_SPARK_STATEMENT_TIMEOUT: int = 120  # SUPERTABLE_SPARK_STATEMENT_TIMEOUT
@@ -293,6 +327,14 @@ class Settings:
     # ── Monitoring ───────────────────────────────────────────────────
     SUPERTABLE_MONITORING_ENABLED: bool = True    # SUPERTABLE_MONITORING_ENABLED
     SUPERTABLE_MONITOR_CACHE_MAX: int = 256      # SUPERTABLE_MONITOR_CACHE_MAX
+    # Compact scalar-only observations used by AUTO's historical cost model.
+    # The store enforces additional hard ceilings (1024 samples / 365 days),
+    # even if deployment configuration is accidentally larger.
+    SUPERTABLE_QUERY_OBSERVATIONS_ENABLED: bool = True  # SUPERTABLE_QUERY_OBSERVATIONS_ENABLED
+    SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES: int = 64  # SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES
+    SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS: int = 30     # SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS
+    SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES: int = 3   # SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES
+    SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES: int = 4096  # SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES
 
     # ── Rate Limiting ────────────────────────────────────────────────
     SUPERTABLE_API_RATE_LIMIT_ENABLED: bool = False  # SUPERTABLE_API_RATE_LIMIT_ENABLED
@@ -492,6 +534,64 @@ def _build_settings() -> Settings:
         SUPERTABLE_ENGINE_FRESHNESS_SEC=_env_int("SUPERTABLE_ENGINE_FRESHNESS_SEC", 300),
         SUPERTABLE_DEFAULT_ENGINE=_env_str("SUPERTABLE_DEFAULT_ENGINE", "AUTO"),
 
+        # ── IslandDB / shared local Parquet cache ──
+        SUPERTABLE_ISLAND_CACHE_ENABLED=_env_bool("SUPERTABLE_ISLAND_CACHE_ENABLED", True),
+        SUPERTABLE_ISLAND_CACHE_DIR=_env_str("SUPERTABLE_ISLAND_CACHE_DIR"),
+        SUPERTABLE_ISLAND_CACHE_MAX_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
+        ),
+        SUPERTABLE_ISLAND_CACHE_TTL_SEC=_env_int(
+            "SUPERTABLE_ISLAND_CACHE_TTL_SEC", 24 * 60 * 60,
+        ),
+        SUPERTABLE_ISLAND_CACHE_WORKERS=_env_int(
+            "SUPERTABLE_ISLAND_CACHE_WORKERS", 4,
+        ),
+        SUPERTABLE_ISLAND_AUTO_ENABLED=_env_bool(
+            "SUPERTABLE_ISLAND_AUTO_ENABLED", True,
+        ),
+        SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=_env_bool(
+            "SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED", True,
+        ),
+        SUPERTABLE_ISLAND_RANGE_CACHE_DIR=_env_str(
+            "SUPERTABLE_ISLAND_RANGE_CACHE_DIR",
+        ),
+        SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
+        ),
+        SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC=_env_int(
+            "SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC", 24 * 60 * 60,
+        ),
+        SUPERTABLE_ISLAND_MEMORY_FRACTION=_env_float(
+            "SUPERTABLE_ISLAND_MEMORY_FRACTION", 0.60,
+        ),
+        SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION=_env_float(
+            "SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION", 0.80,
+        ),
+        SUPERTABLE_ISLAND_MAX_MEMORY_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_MAX_MEMORY_BYTES", 0,
+        ),
+        SUPERTABLE_ISLAND_MAX_RESULT_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_MAX_RESULT_BYTES", 512 * 1024 * 1024,
+        ),
+        SUPERTABLE_ISLAND_CPU_MAX=_env_int(
+            "SUPERTABLE_ISLAND_CPU_MAX", 0,
+        ),
+        SUPERTABLE_ISLAND_IO_WORKERS_MAX=_env_int(
+            "SUPERTABLE_ISLAND_IO_WORKERS_MAX", 16,
+        ),
+        SUPERTABLE_ISLAND_SPILL_ENABLED=_env_bool(
+            "SUPERTABLE_ISLAND_SPILL_ENABLED", True,
+        ),
+        SUPERTABLE_ISLAND_SPILL_DIR=_env_str(
+            "SUPERTABLE_ISLAND_SPILL_DIR",
+        ),
+        SUPERTABLE_ISLAND_SPILL_MAX_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_SPILL_MAX_BYTES", 64 * 1024 * 1024 * 1024,
+        ),
+        SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES=_env_int(
+            "SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES", 512 * 1024 * 1024,
+        ),
+
         # ── Spark Engine ─────────────────────────────────────────────
         SUPERTABLE_SPARK_QUERY_TIMEOUT=_env_int("SUPERTABLE_SPARK_QUERY_TIMEOUT", 300),
         SUPERTABLE_SPARK_STATEMENT_TIMEOUT=_env_int("SUPERTABLE_SPARK_STATEMENT_TIMEOUT", 120),
@@ -578,6 +678,21 @@ def _build_settings() -> Settings:
         # ── Monitoring ───────────────────────────────────────────────
         SUPERTABLE_MONITORING_ENABLED=_env_bool("SUPERTABLE_MONITORING_ENABLED", True),
         SUPERTABLE_MONITOR_CACHE_MAX=_env_int("SUPERTABLE_MONITOR_CACHE_MAX", 256),
+        SUPERTABLE_QUERY_OBSERVATIONS_ENABLED=_env_bool(
+            "SUPERTABLE_QUERY_OBSERVATIONS_ENABLED", True,
+        ),
+        SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES=_env_int(
+            "SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES", 64,
+        ),
+        SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS=_env_int(
+            "SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS", 30,
+        ),
+        SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES=_env_int(
+            "SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES", 3,
+        ),
+        SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES=_env_int(
+            "SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES", 4096,
+        ),
 
         # ── Rate Limiting ────────────────────────────────────────────
         SUPERTABLE_API_RATE_LIMIT_ENABLED=_env_bool("SUPERTABLE_API_RATE_LIMIT_ENABLED", False),

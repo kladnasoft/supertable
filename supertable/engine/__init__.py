@@ -7,10 +7,14 @@
 from supertable.engine.executor import Engine, Executor  # noqa: F401
 from supertable.engine.plan_stats import PlanStats  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator  # noqa: F401
+from supertable.engine.islanddb import IslandDB  # noqa: F401
+from supertable.engine.island_resources import ArrowBatchStream  # noqa: F401
 
 __all__ = [
     "Engine",
     "Executor",
     "PlanStats",
     "DataEstimator",
+    "IslandDB",
+    "ArrowBatchStream",
 ]

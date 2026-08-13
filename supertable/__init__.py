@@ -3,7 +3,7 @@
 SuperTable stores structured data as versioned Parquet snapshots on object
 storage (S3, MinIO, Azure Blob, GCP Cloud Storage, or local disk), keeps
 metadata and locks in Redis, and queries everything through DuckDB or
-Spark SQL.
+IslandDB, with Spark SQL for fleet-scale workloads.
 
 Quick reference
 ---------------

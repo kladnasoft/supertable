@@ -357,8 +357,28 @@ class DataReader:
         )
 
         try:
+            observation_store = None
+            history_provider = None
+            try:
+                from supertable.engine.query_observations import (
+                    QueryObservationStore,
+                )
+                observation_store = QueryObservationStore(self.organization)
+                if observation_store.enabled:
+                    history_provider = observation_store.history_provider
+            except Exception as observation_error:
+                logger.debug(
+                    self._lp(
+                        "[engine.auto] observation history unavailable: "
+                        f"{observation_error}"
+                    )
+                )
             # Make executor aware of storage for presign retry
-            executor = Executor(storage=self.storage, organization=self.organization)
+            executor = Executor(
+                storage=self.storage,
+                organization=self.organization,
+                auto_history_provider=history_provider,
+            )
 
             # Initialize plan manager and query id/hash (same as before)
             self.query_plan_manager = QueryPlanManager(
@@ -367,6 +387,15 @@ class DataReader:
                 current_meta_path="redis://meta/root",
                 query=parser.original_query,
             )
+            self.query_plan_manager.requested_engine = getattr(
+                engine, "value", str(engine),
+            )
+            self.query_plan_manager.engine_forced = (
+                self.query_plan_manager.requested_engine != "auto"
+            )
+            # Reuse the exact bounded store used by AUTO's history provider;
+            # plan extension records the successful observation after execution.
+            self.query_plan_manager.query_observation_store = observation_store
             # Stamp the call origin so plan_extender records it on the read
             # monitoring entry (defaults to "api" downstream if unset).
             self.query_plan_manager.source_type = self.source
@@ -542,6 +571,17 @@ class DataReader:
                 explain=command.explain,
                 explain_options=command.explain_options,
             )
+            try:
+                result_bytes = int(
+                    result_df.memory_usage(index=False, deep=True).sum()
+                )
+            except Exception:
+                result_bytes = 0
+            self.plan_stats.add_stat({
+                "RESULT_BYTES": max(0, result_bytes),
+                "RESULT_ROWS": max(0, int(result_df.shape[0])),
+                "RESULT_COLUMNS": max(0, int(result_df.shape[1])),
+            })
             status = Status.OK
         except Exception as e:
             message = _redact_storage_credentials(e)
@@ -550,6 +590,11 @@ class DataReader:
 
         # Extend plan + timings
         self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
+        # Capture end-to-end query latency before monitoring itself.  The
+        # normalized cross-engine observation uses this stable field for AUTO
+        # feedback; including Redis enqueue/profile serialization would make
+        # the engine look slower merely because monitoring was slow.
+        self.timer.capture_duration(event="TOTAL_EXECUTE")
         try:
             extend_execution_plan(
                 query_plan_manager=self.query_plan_manager,
@@ -564,7 +609,6 @@ class DataReader:
             logger.error(self._lp(f"extend_execution_plan exception: {e}"))
 
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
-        self.timer.capture_duration(event="TOTAL_EXECUTE")
         return result_df, status, message
 
 def _ensure_sql_limit(sql: str, default_limit: int) -> str:

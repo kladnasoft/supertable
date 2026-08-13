@@ -7,7 +7,7 @@ from supertable.config.settings import settings
 import re
 import json
 import fnmatch
-from typing import Any, Dict, List, Iterable, Optional
+from typing import Any, BinaryIO, Dict, List, Iterable, Optional
 from urllib.parse import urlparse
 from datetime import timedelta
 
@@ -18,7 +18,15 @@ from minio.commonconfig import CopySource
 from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+    StorageInterface,
+    normalize_sha256_checksum,
+    read_exact_range_body,
+    validate_range_request,
+    write_all,
+)
 
 
 class MinioStorage(StorageInterface):
@@ -249,6 +257,148 @@ class MinioStorage(StorageInterface):
             if e.code in ("NoSuchKey", "NotFound"):
                 raise FileNotFoundError(f"File not found: {path}") from e
             raise
+
+    @staticmethod
+    def _metadata_from_stat(stat: Any) -> ObjectMetadata:
+        modified = getattr(stat, "last_modified", None)
+        modified_ns = int(modified.timestamp() * 1_000_000_000) if modified else 0
+        headers = getattr(stat, "metadata", None) or {}
+        checksum_value = (
+            headers.get("x-amz-checksum-sha256")
+            or headers.get("X-Amz-Checksum-Sha256")
+            or ""
+        )
+        checksum_type = str(
+            headers.get("x-amz-checksum-type")
+            or headers.get("X-Amz-Checksum-Type")
+            or ""
+        ).upper()
+        etag = str(getattr(stat, "etag", "") or "").strip('"')
+        checksum = ""
+        if checksum_type == "FULL_OBJECT" or (not checksum_type and "-" not in etag):
+            checksum = normalize_sha256_checksum(checksum_value)
+        return ObjectMetadata(
+            size=int(getattr(stat, "size", 0) or 0),
+            version=str(getattr(stat, "version_id", "") or ""),
+            etag=etag,
+            last_modified_ns=modified_ns,
+            checksum_sha256=str(checksum),
+        )
+
+    def stat_object(self, path: str) -> ObjectMetadata:
+        path = self._with_base(path)
+        try:
+            return self._metadata_from_stat(
+                self.client.stat_object(self.bucket_name, path)
+            )
+        except S3Error as e:
+            if e.code in ("NoSuchKey", "NotFound", "NoSuchVersion"):
+                raise FileNotFoundError(f"File not found: {path}") from e
+            raise
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        path = self._with_base(path)
+        request: Dict[str, Any] = {}
+        if expected is not None:
+            if expected.version:
+                request["version_id"] = expected.version
+            if expected.etag:
+                etag = expected.etag.strip('"')
+                request["request_headers"] = {"If-Match": f'"{etag}"'}
+        try:
+            response = self.client.get_object(self.bucket_name, path, **request)
+        except S3Error as e:
+            if e.code in ("NoSuchKey", "NotFound", "NoSuchVersion"):
+                raise FileNotFoundError(f"File not found: {path}") from e
+            raise
+
+        written = 0
+        try:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                written += write_all(file_obj, chunk)
+        finally:
+            try:
+                response.close()
+            finally:
+                response.release_conn()
+        if expected is not None and written != expected.size:
+            raise OSError(
+                f"Short download for {path}: expected {expected.size} bytes, wrote {written}"
+            )
+        return written
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        offset, length = validate_range_request(offset, length, expected)
+        if length == 0:
+            return b""
+        if expected is None or not (expected.version or expected.etag):
+            raise ValueError("MinIO range reads require a version or ETag condition")
+        path = self._with_base(path)
+        request: Dict[str, Any] = {"offset": offset, "length": length}
+        if expected is not None:
+            if expected.version:
+                request["version_id"] = expected.version
+            if expected.etag:
+                request["request_headers"] = {
+                    "If-Match": f'"{expected.etag.strip(chr(34))}"',
+                }
+        try:
+            response = self.client.get_object(self.bucket_name, path, **request)
+        except S3Error as exc:
+            if exc.code in ("PreconditionFailed", "NoSuchVersion"):
+                raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+            if exc.code in ("NoSuchKey", "NotFound"):
+                raise FileNotFoundError(f"File not found: {path}") from exc
+            raise
+        try:
+            payload = read_exact_range_body(response, length)
+        finally:
+            try:
+                response.close()
+            finally:
+                response.release_conn()
+        return payload
+
+    def cache_namespace(self) -> Dict[str, str]:
+        parsed = urlparse(self.endpoint_url or self._endpoint or "")
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        if not host:
+            # Clients injected directly (rather than via from_env) still carry
+            # a parsed, credential-free endpoint in MinIO's BaseURL helper.
+            base_url = getattr(getattr(self.client, "_base_url", None), "_url", None)
+            sdk_host = getattr(base_url, "hostname", None)
+            sdk_port = getattr(base_url, "port", None)
+            if isinstance(sdk_host, str) and sdk_host:
+                host = f"{sdk_host}:{sdk_port}" if sdk_port else sdk_host
+        namespace = {"provider": "minio", "bucket": self.bucket_name}
+        if host:
+            namespace["endpoint_host"] = host.lower()
+        if self.region:
+            namespace["region"] = str(self.region)
+        if self.base_prefix:
+            namespace["base_prefix"] = self.base_prefix
+        return namespace
 
     def makedirs(self, path: str) -> None:
         # Object storage is flat; no-op

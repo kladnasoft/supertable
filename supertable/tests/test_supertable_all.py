@@ -1530,6 +1530,10 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.DUCKDB_PRO.value == "duckdb_pro"
 
+    def test_islanddb_value(self):
+        from supertable.data_reader import engine
+        assert engine.ISLANDDB.value == "islanddb"
+
     def test_spark_sql_value(self):
         from supertable.data_reader import engine
         assert engine.SPARK_SQL.value == "spark_sql"

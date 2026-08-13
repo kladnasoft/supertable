@@ -26,6 +26,7 @@ from supertable.processing import STATS_SCHEMA, _stats_rows_for_metadata
 # The frozen contract: exact column order + dtypes of the stats artifact.
 _EXPECTED_SCHEMA: list[tuple[str, pl.DataType]] = [
     ("file_path", pl.Utf8),
+    ("footer_sha256", pl.Utf8),
     ("row_group_id", pl.Int64),
     ("column_name", pl.Utf8),
     ("physical_type", pl.Utf8),
@@ -41,6 +42,7 @@ _EXPECTED_SCHEMA: list[tuple[str, pl.DataType]] = [
     ("null_count", pl.Int64),
     ("row_group_rows", pl.Int64),
     ("compressed_bytes", pl.Int64),
+    ("uncompressed_bytes", pl.Int64),
     ("stats_available", pl.Boolean),
     ("min_is_exact", pl.Boolean),
     ("max_is_exact", pl.Boolean),
@@ -108,6 +110,8 @@ def test_built_artifact_matches_schema_and_routes_lanes(tmp_path):
     for r in by_col.values():
         assert r["compressed_bytes"] is not None
         assert r["compressed_bytes"] > 0
+        assert r["uncompressed_bytes"] is not None
+        assert r["uncompressed_bytes"] > 0
 
 
 def test_system_columns_never_emitted(tmp_path):

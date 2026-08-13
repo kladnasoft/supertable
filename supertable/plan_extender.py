@@ -8,8 +8,18 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.engine.plan_stats import PlanStats
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter
+from supertable.engine.query_observations import (
+    QueryObservation,
+    QueryObservationStore,
+    canonical_sql_shape,
+    normalize_query_profile,
+    redact_text,
+    sanitize_profile,
+)
 
 logger = logging.getLogger(__name__)
+
+_MAX_RAW_PROFILE_BYTES = 8 * 1024 * 1024
 
 
 def _query_targets_sink_table(original_table: str) -> bool:
@@ -52,6 +62,11 @@ def _read_local_json(path: str) -> Dict[str, Any]:
     avoiding the remote-storage backend which operates on object-store
     keys (S3, MinIO) and would never find a local temp file.
     """
+    size = os.path.getsize(path)
+    if size > _MAX_RAW_PROFILE_BYTES:
+        raise ValueError(
+            f"profile JSON exceeds {_MAX_RAW_PROFILE_BYTES} byte safety cap"
+        )
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -83,6 +98,10 @@ def extend_execution_plan(
     plan_path = getattr(query_plan_manager, "query_plan_path", None) if query_plan_manager else None
     try:
         if plan_path and os.path.isfile(plan_path):
+            try:
+                os.chmod(plan_path, 0o600)
+            except OSError:
+                pass
             base_plan = _read_local_json(plan_path)
         elif plan_path:
             logger.debug("Plan JSON does not exist at %s", plan_path)
@@ -95,17 +114,38 @@ def extend_execution_plan(
     message = message or ""
     result_shape = result_shape or (0, 0)
 
-    # Stash the parsed plan onto the query_plan_manager so upstream callers
+    # Build the normalized scalar view before sanitizing the diagnostic tree;
+    # extractors need typed metrics such as DuckDB latency/bytes and IslandDB
+    # elapsed/cache counters. Missing fields retain explicit provenance flags.
+    normalized = normalize_query_profile(
+        query=getattr(query_plan_manager, "query", ""),
+        requested_engine=getattr(query_plan_manager, "requested_engine", ""),
+        timing=timing,
+        plan_stats=plan_stats,
+        status=status,
+        result_shape=result_shape,
+        engine_profile=base_plan,
+    )
+    safe_plan = sanitize_profile(base_plan)
+    safe_overview = sanitize_profile(
+        plan_stats.summary() if hasattr(plan_stats, "summary") else plan_stats.stats,
+        max_bytes=32 * 1024,
+    )
+    safe_timing = sanitize_profile(timing, max_bytes=8 * 1024)
+
+    # Stash only the credential-safe, bounded plan onto the manager so API
+    # callers cannot accidentally return signed object-store URLs.
     # (e.g. execute.py API) can include it in the response without re-reading
     # the file (which is deleted below).
     if query_plan_manager is not None:
-        query_plan_manager.query_profile = base_plan
+        query_plan_manager.query_profile = safe_plan
 
     # Build extended (in-memory) representation
     extended_plan = {
-        "execution_timings": timing,
-        "profile_overview": plan_stats.summary() if hasattr(plan_stats, "summary") else plan_stats.stats,
-        "query_profile": base_plan,
+        "execution_timings": safe_timing,
+        "profile_overview": safe_overview,
+        "query_profile": safe_plan,
+        "normalized_profile": normalized.as_dict(),
     }
 
     # Prepare flat metric payload for the monitoring table
@@ -126,19 +166,34 @@ def extend_execution_plan(
             "source_type": getattr(query_plan_manager, "source_type", "api"),
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "table_name": getattr(query_plan_manager, "original_table", ""),
-            "sql": getattr(query_plan_manager, "query", "")[:500],
+            # Preserve workload structure for diagnostics, never literal data.
+            "sql": canonical_sql_shape(
+                getattr(query_plan_manager, "query", ""), limit=500,
+            ),
+            "query_shape_hash": normalized.query_shape_hash,
+            "feature_signature": normalized.feature_signature,
+            "requested_engine": normalized.requested_engine,
+            "selected_engine": normalized.selected_engine,
             "engine": _engine_used,
+            "forced_engine": normalized.forced,
+            "engine_fallback": normalized.fallback,
             "status": status,
-            "message": message,
+            "message": redact_text(message, limit=1_000),
             "result_rows": int(result_shape[0]),
             "result_columns": int(result_shape[1]),
             # Store complex parts as JSON strings to keep row schema flat
             "execution_timings": _safe_json(extended_plan["execution_timings"]),
             "profile_overview": _safe_json(extended_plan["profile_overview"]),
             "query_profile": _safe_json(extended_plan["query_profile"]),
+            "normalized_profile": _safe_json(extended_plan["normalized_profile"]),
         }
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to build monitoring stats payload: %s", e)
+        try:
+            if plan_path and os.path.isfile(plan_path):
+                os.remove(plan_path)
+        except OSError:
+            pass
         return  # nothing else to do safely
 
     # Log the metric (buffered; background writer flushes).
@@ -163,6 +218,24 @@ def extend_execution_plan(
                 logger.debug("Extended plan metrics queued for logging.")
         except Exception as e:  # noqa: BLE001
             logger.warning("Monitoring logging failed (non-fatal): %s", e)
+
+    # Persist only exact, successful, non-fallback AUTO observations in the
+    # compact router store. Forced/failed/fallback executions remain visible in
+    # the normalized plans metric above but cannot train a pure-engine EWMA.
+    try:
+        observation = QueryObservation.from_profile(
+            normalized,
+            query_id=getattr(query_plan_manager, "query_id", ""),
+        )
+        if observation.feedback_eligible:
+            store = getattr(
+                query_plan_manager, "query_observation_store", None,
+            ) or QueryObservationStore(
+                getattr(query_plan_manager, "organization", ""),
+            )
+            store.record(observation)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Query observation persistence skipped: %s", e)
 
     # Delete the raw plan JSON from local disk (best-effort)
     try:

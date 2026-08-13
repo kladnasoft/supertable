@@ -39,6 +39,9 @@ Hierarchy (v2)
             thrifts                                  HASH    Spark Thrift clusters
             plugs                                    HASH    Spark Plug runtimes
             duckdb                                   STRING  DuckDB runtime config
+            observations:
+              {workload_signature}:
+                {engine}                             ZSET    bounded AUTO history
         lakes:                                      ← user-data sentinel
           {sup}:                                    ← supertable scope
             meta:
@@ -906,6 +909,51 @@ def parse_monitor_partition_key(key: str) -> Optional[Tuple[str, str, str]]:
     ):
         return parts[1], parts[3], parts[5]
     return None
+
+
+# --- AUTO routing observations -------------------------------------------- #
+
+_ROUTING_ENGINES: FrozenSet[str] = frozenset(
+    {"duckdb_lite", "duckdb_pro", "islanddb", "spark_sql"}
+)
+_WORKLOAD_SIGNATURE_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16,64}$")
+
+
+def query_observation_samples(
+    org: str, workload_signature: str, engine: str,
+) -> str:
+    """Bounded per-engine observations for one anonymous workload bucket.
+
+    ``workload_signature`` is a SHA-derived digest of query shape plus coarse
+    estimator/cache features.  SQL, table names, paths, and literal values are
+    deliberately absent from both the Redis key and observation payload.
+    Values are ZSET members scored by UTC epoch milliseconds; the writer trims
+    by age and rank on every append and also applies a key TTL.
+    """
+    if (
+        not isinstance(workload_signature, str)
+        or not _WORKLOAD_SIGNATURE_RE.fullmatch(workload_signature)
+    ):
+        raise ValueError(
+            "Invalid workload_signature; expected 16..64 lowercase hex chars"
+        )
+    if engine not in _ROUTING_ENGINES:
+        raise ValueError(
+            f"Invalid routing engine {engine!r}; "
+            f"must be one of {sorted(_ROUTING_ENGINES)}"
+        )
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":engine:observations:{workload_signature}:{engine}"
+    )
+
+
+def query_observation_index(org: str) -> str:
+    """LRU/retention index of workload signatures for one organization."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        ":engine:observations:index"
+    )
 
 
 # =========================================================================== #

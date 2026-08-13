@@ -232,6 +232,20 @@ class TestRatioBytes:
         schema_types = {"a": "BIGINT", ROWID_COL: "BIGINT", TIMESTAMP_COL: "TIMESTAMP"}
         assert est._ratio_bytes("f1", {"f1": 800}, {"a"}, schema_types) == 800
 
+    def test_required_tombstone_rowid_is_charged_when_explicitly_added(self):
+        est = _est()
+        schema_types = {
+            "a": "BIGINT", "b": "BIGINT",
+            ROWID_COL: "BIGINT", TIMESTAMP_COL: "TIMESTAMP",
+        }
+
+        widths = est._projection_widths({"a", ROWID_COL}, schema_types)
+
+        # a + required rowid are 16 of the 24 scanned-width bytes; the hidden
+        # timestamp remains irrelevant when no operator consumes it.
+        assert widths == (16, 24)
+        assert est._ratio_bytes_with_widths(900, widths) == 600
+
     def test_selected_not_in_schema_returns_full(self):
         est = _est()
         # Defensive: selected col absent from schema -> can't scale, keep full.

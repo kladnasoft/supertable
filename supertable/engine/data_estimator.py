@@ -13,7 +13,7 @@ import polars
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
-from supertable.data_classes import Reflection, SuperSnapshot
+from supertable.data_classes import Reflection, SuperSnapshot, RowGroupSelection
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.utils.snapshot import complete_snapshot_payload
@@ -28,6 +28,7 @@ from supertable.engine.join_pruner import prune_files_across_joins
 from supertable.processing import (
     load_stats,
     prune_files_by_predicates,
+    select_row_groups_by_predicates,
     ROWID_COL,
     TIMESTAMP_COL,
 )
@@ -642,8 +643,9 @@ class DataEstimator:
         (an empty ``TableDefinition.columns``), an unrecognised table, or a
         projection that resolves to only system columns.  In every ``None`` case
         the caller uses the whole-file size (no projection savings), which is
-        the safe over-estimate.  System columns (``__rowid__`` / ``__timestamp__``)
-        are stripped: the read view hides them, so they're never scanned.
+        the safe over-estimate.  System columns requested by user SQL are
+        stripped here; Pass 1 adds ``__rowid__`` back when an active composite
+        deletion-vector makes it a real physical scan dependency.
         """
         key = (super_name.lower(), simple_name.lower())
         selected: Set[str] = set()
@@ -726,6 +728,271 @@ class DataEstimator:
                 proj[fp] = projected_bytes
         return tier3_files, proj
 
+    @staticmethod
+    def _row_group_byte_estimate(
+        stats_df: Optional["polars.DataFrame"],
+        file_keys: Iterable[str],
+        selected_cols: Optional[Set[str]],
+        selections: Dict[str, RowGroupSelection],
+        byte_column: str,
+    ) -> Tuple[int, bool]:
+        """Sum one footer byte metric over the exact candidate chunks.
+
+        ``selected_cols is None`` means every physical column.  A missing
+        selection means every group for that resource.  The result is usable
+        only when ``complete`` is true; malformed/legacy stats return a partial
+        value with ``False`` and callers must not use it for a routing limit.
+        The implementation stays columnar so hundreds of files do not cause a
+        Python loop over millions of stats rows.
+        """
+        keys = list(file_keys)
+        if not keys:
+            return 0, True
+        if (
+            stats_df is None
+            or not isinstance(stats_df, polars.DataFrame)
+            or stats_df.height == 0
+            or byte_column not in stats_df.columns
+            or not {"file_path", "row_group_id", "column_name"}.issubset(
+                stats_df.columns
+            )
+        ):
+            return 0, False
+        try:
+            scoped = stats_df.filter(polars.col("file_path").is_in(keys))
+            present_files = set(
+                scoped.get_column("file_path").drop_nulls().unique().to_list()
+            )
+            if present_files != set(keys):
+                return 0, False
+
+            groups = scoped.select(["file_path", "row_group_id"]).unique()
+            narrowed_keys = set(selections).intersection(keys)
+            all_keys = [key for key in keys if key not in narrowed_keys]
+            selected_group_frames: List[polars.DataFrame] = []
+            if all_keys:
+                selected_group_frames.append(
+                    groups.filter(polars.col("file_path").is_in(all_keys))
+                )
+            if narrowed_keys:
+                pairs = [
+                    (key, group_id)
+                    for key in keys
+                    if key in narrowed_keys
+                    for group_id in selections[key].selected_ids
+                ]
+                selected_group_frames.append(polars.DataFrame(
+                    pairs,
+                    schema={"file_path": polars.Utf8, "row_group_id": polars.Int64},
+                    orient="row",
+                ))
+            if not selected_group_frames:
+                return 0, False
+            selected_groups = polars.concat(selected_group_frames).unique()
+            selected_stats = scoped.join(
+                selected_groups,
+                on=["file_path", "row_group_id"],
+                how="inner",
+            )
+            # Every requested group must exist in the validated stats manifest.
+            if selected_stats.select(
+                ["file_path", "row_group_id"]
+            ).unique().height != selected_groups.height:
+                return 0, False
+
+            if selected_cols is not None:
+                selected_stats = selected_stats.filter(
+                    polars.col("column_name").str.to_lowercase().is_in(
+                        sorted(selected_cols)
+                    )
+                )
+                # Zero physical matches is valid only for an empty requested
+                # set (which normal callers represent as SELECT ALL instead).
+                if selected_cols and selected_stats.height == 0:
+                    return 0, False
+            metric = selected_stats.get_column(byte_column)
+            invalid = metric.is_null() | (metric < 0)
+            if invalid.any():
+                return 0, False
+            value = metric.sum()
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                return 0, False
+            return int(value), True
+        except Exception:
+            return 0, False
+
+    @staticmethod
+    def _row_group_row_count_estimate(
+        stats_df: Optional["polars.DataFrame"],
+        file_keys: Iterable[str],
+        selections: Dict[str, RowGroupSelection],
+    ) -> Tuple[int, bool]:
+        """Return physical rows in the selected groups when fully manifested.
+
+        The same ``row_group_rows`` value is repeated for every column chunk.
+        Collapse it once per group and require exact agreement before using it
+        for system-column memory/I/O estimates such as tombstone ``__rowid__``.
+        """
+        keys = list(file_keys)
+        if not keys:
+            return 0, True
+        if (
+            stats_df is None
+            or not isinstance(stats_df, polars.DataFrame)
+            or stats_df.height == 0
+            or not {
+                "file_path", "row_group_id", "row_group_rows",
+            }.issubset(stats_df.columns)
+        ):
+            return 0, False
+        try:
+            groups = (
+                stats_df
+                .filter(polars.col("file_path").is_in(keys))
+                .group_by(["file_path", "row_group_id"])
+                .agg([
+                    polars.col("row_group_rows").n_unique().alias("__counts"),
+                    polars.col("row_group_rows").first().alias("__rows"),
+                    (
+                        polars.col("row_group_rows").is_not_null()
+                        & (polars.col("row_group_rows") >= 0)
+                    ).all().alias("__valid"),
+                ])
+            )
+            if set(groups.get_column("file_path").to_list()) != set(keys):
+                return 0, False
+            if groups.filter(
+                (polars.col("__counts") != 1) | ~polars.col("__valid")
+            ).height:
+                return 0, False
+
+            narrowed = set(selections).intersection(keys)
+            frames: List[polars.DataFrame] = []
+            all_keys = [key for key in keys if key not in narrowed]
+            if all_keys:
+                frames.append(groups.filter(polars.col("file_path").is_in(all_keys)))
+            if narrowed:
+                pairs = polars.DataFrame(
+                    [
+                        (key, group_id)
+                        for key in keys
+                        if key in narrowed
+                        for group_id in selections[key].selected_ids
+                    ],
+                    schema={"file_path": polars.Utf8, "row_group_id": polars.Int64},
+                    orient="row",
+                )
+                frames.append(groups.join(
+                    pairs,
+                    on=["file_path", "row_group_id"],
+                    how="inner",
+                ))
+                expected_pairs = sum(
+                    len(selections[key].selected_ids) for key in narrowed
+                )
+                if frames[-1].height != expected_pairs:
+                    return 0, False
+            selected_groups = polars.concat(frames) if len(frames) > 1 else frames[0]
+            value = selected_groups.get_column("__rows").sum()
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                return 0, False
+            return int(value), True
+        except Exception:
+            return 0, False
+
+    @staticmethod
+    def _decoded_fixed_width(type_name: object) -> Optional[int]:
+        """Return a conservative fixed-width Arrow value size, or unknown.
+
+        Variable-width/nested values cannot be bounded by Parquet's dictionary
+        or RLE page sizes.  They require a write-time logical-byte seal; until
+        one exists their decoded estimate is incomplete and native routing is
+        disabled. The caller adds one byte/value, which safely covers Arrow's
+        optional validity bitmap and alignment slack for primitive arrays.
+        """
+        value = str(type_name or "").strip().casefold()
+        if not value:
+            return None
+        if any(token in value for token in (
+            "string", "utf8", "varchar", "char", "text", "json", "binary",
+            "blob", "list", "array", "struct", "map", "object", "categorical",
+            "enum",
+        )):
+            return None
+        if "bool" in value:
+            return 1
+        if "timestamp" in value or "datetime" in value or "duration" in value:
+            return 8
+        if value == "date" or "date32" in value:
+            return 4
+        if "decimal" in value or "hugeint" in value or "int128" in value:
+            return 16
+        if any(token in value for token in ("int64", "uint64", "bigint", "long", "float64", "double")):
+            return 8
+        if any(token in value for token in ("int32", "uint32", "integer", "float32", "float", "real")):
+            return 4
+        if any(token in value for token in ("int16", "uint16", "smallint")):
+            return 2
+        if any(token in value for token in ("int8", "uint8", "tinyint", "byte")):
+            return 1
+        return None
+
+    def _decoded_row_group_estimate(
+        self,
+        stats_df: Optional["polars.DataFrame"],
+        file_keys: Iterable[str],
+        selected_cols: Optional[Set[str]],
+        selections: Dict[str, RowGroupSelection],
+        schema_types: Dict[str, str],
+    ) -> Tuple[int, bool]:
+        """Bound decoded primitive buffers for the exact candidate groups.
+
+        Parquet ``total_uncompressed_size`` is still encoded (dictionary/RLE)
+        and is not a memory bound.  Fixed-width columns are instead charged by
+        selected physical rows times logical width, plus validity slack.  The
+        encoded-page total remains a lower bound for decoder input/work. Any
+        variable/unknown requested type makes the estimate explicitly
+        incomplete so IslandDB routes to a mature bounded engine.
+        """
+        normalized_types = {
+            str(name).casefold(): type_name
+            for name, type_name in (schema_types or {}).items()
+            if str(name).casefold() not in {
+                ROWID_COL.casefold(), TIMESTAMP_COL.casefold(),
+            }
+        }
+        requested = (
+            set(normalized_types)
+            if selected_cols is None
+            else {str(name).casefold() for name in selected_cols}
+        )
+        if not requested:
+            return 0, False
+        widths: List[int] = []
+        for name in requested:
+            width = self._decoded_fixed_width(normalized_types.get(name))
+            if width is None:
+                return 0, False
+            widths.append(width)
+        rows, rows_complete = self._row_group_row_count_estimate(
+            stats_df, file_keys, selections,
+        )
+        if not rows_complete:
+            return 0, False
+        logical_bytes = rows * sum(width + 1 for width in widths)
+        encoded_bytes, encoded_complete = self._row_group_byte_estimate(
+            stats_df, file_keys, requested, selections, "uncompressed_bytes",
+        )
+        return max(logical_bytes, encoded_bytes if encoded_complete else 0), True
+
     def _ratio_bytes(
         self,
         file_key: str,
@@ -757,7 +1024,7 @@ class DataEstimator:
             return None
         all_cols = {
             c: ty for c, ty in schema_types.items()
-            if c not in (ROWID_COL, TIMESTAMP_COL)
+            if c not in (ROWID_COL, TIMESTAMP_COL) or c in selected_cols
         }
         total_w = sum(self._type_width(ty) for ty in all_cols.values())
         if total_w <= 0:
@@ -795,6 +1062,15 @@ class DataEstimator:
         supers: List[SuperSnapshot] = []
         reflection_file_size = 0        # projected (selected-column) bytes — routing
         reflection_file_size_raw = 0    # whole-file bytes — physical footprint
+        reflection_sizes_complete = True
+        row_group_scan_bytes = 0
+        row_group_scan_bytes_complete = True
+        decoded_bytes = 0
+        decoded_bytes_complete = True
+        selected_decoded_bytes = 0
+        selected_decoded_bytes_complete = True
+        proof_decoded_bytes = 0
+        proof_decoded_bytes_complete = True
         max_freshness_ms = 0
         files_before_prune = 0
         files_pruned = 0
@@ -1015,7 +1291,27 @@ class DataEstimator:
                         if not file_key:
                             continue
                         raw_keys.append(file_key)
-                        key_size[file_key] = int(resource.get("file_size", 0))
+                        raw_size = resource.get("file_size")
+                        valid_size = (
+                            isinstance(raw_size, int)
+                            and not isinstance(raw_size, bool)
+                            and raw_size > 0
+                        )
+                        if valid_size:
+                            key_size[file_key] = int(raw_size)
+                        else:
+                            # Legacy snapshots may lack file_size. Recover it
+                            # through the storage SDK rather than silently route
+                            # a genuinely large scan as zero bytes.
+                            try:
+                                measured = int(self.storage.size(file_key))
+                            except Exception:
+                                measured = 0
+                            if measured > 0:
+                                key_size[file_key] = measured
+                            else:
+                                key_size[file_key] = 0
+                                reflection_sizes_complete = False
                         rows_value = resource.get("rows")
                         valid_rows = (
                             rows_value
@@ -1037,6 +1333,20 @@ class DataEstimator:
                 # Which columns does the query actually read? None => SELECT *
                 # (whole table, no projection savings).
                 selected_cols = self._selected_columns(super_name, simple_name)
+                if (
+                    selected_cols is not None
+                    and any(
+                        meta.get("tombstone_key")
+                        for meta in pinned_snapshot_metadata
+                    )
+                ):
+                    # The visible query may project one tiny user column, but a
+                    # deletion-vector view also reads __rowid__ for the exact
+                    # composite anti join.  Include its compressed chunks in
+                    # the routed scan estimate instead of systematically
+                    # underestimating active-DV queries.
+                    selected_cols = set(selected_cols)
+                    selected_cols.add(ROWID_COL)
                 need_projection = (
                     selected_cols is not None
                     and settings.SUPERTABLE_READ_PROJECTION_SIZING_ENABLED
@@ -1124,8 +1434,27 @@ class DataEstimator:
                         f"{super_name}.{simple_name}; keeping all candidate files"
                     )
                     literal_survivors = list(raw_keys)
+                    literal_row_groups: Dict[str, RowGroupSelection] = {}
                 else:
                     literal_survivors = validated_literal
+                    # Row-group hints come only from this table's literal WHERE.
+                    # Join propagation below may remove whole files, but must not
+                    # manufacture tighter group ids from cross-table ranges.
+                    if not settings.SUPERTABLE_READ_PRUNING_ENABLED:
+                        literal_row_groups = {}
+                    else:
+                        try:
+                            literal_row_groups = select_row_groups_by_predicates(
+                                raw_keys,
+                                stats_df,
+                                self.predicate_constraints.get(key) or [],
+                            )
+                        except Exception as row_group_err:
+                            logger.warning(
+                                f"[estimate.row_groups] selection skipped for "
+                                f"{super_name}.{simple_name}: {row_group_err}"
+                            )
+                            literal_row_groups = {}
                 # Reconcile observability from the validated boundary result,
                 # rather than trusting an inner implementation to update the
                 # profiler exactly once.  This also keeps custom/no-op pruners
@@ -1146,6 +1475,7 @@ class DataEstimator:
                     "schema": schema,
                     "schema_types": schema_types,
                     "key_size": key_size,
+                    "resource_rows": resource_rows,
                     "current_version": current_version,
                     "has_snapshots": bool(snapshots),
                     "pinned_snapshot_metadata": pinned_snapshot_metadata,
@@ -1156,6 +1486,7 @@ class DataEstimator:
                     "snapshot_resource_keys": list(raw_keys),
                     "authoritative_empty": authoritative_empty and not raw_keys,
                     "survivors": literal_survivors,
+                    "row_group_selections": literal_row_groups,
                 })
 
         # ---- Cross-table join pruning (ON by default under the read switch) ----
@@ -1269,11 +1600,18 @@ class DataEstimator:
             simple_name = r["simple_name"]
             survivors = r["survivors"]
             key_size = r["key_size"]
+            resource_rows = r["resource_rows"]
             schema = r["schema"]
             schema_types = r["schema_types"]
             selected_cols = r["selected_cols"]
             need_projection = r["need_projection"]
             stats_df = r["stats_df"]
+            survivor_set = set(survivors)
+            literal_row_groups = {
+                file_key: selection
+                for file_key, selection in r["row_group_selections"].items()
+                if file_key in survivor_set
+            }
 
             # Projection-aware size: a query selecting specific columns scans only
             # those columns' on-disk (compressed) chunks, not the whole
@@ -1316,19 +1654,159 @@ class DataEstimator:
             )
 
             parquet_files: List[str] = []
+            table_reflection_bytes = 0
             for file_key in survivors:
                 parquet_files.append(self._to_duckdb_path(file_key))
                 full = int(key_size.get(file_key, 0))
                 reflection_file_size_raw += full
                 if not need_projection:
                     reflection_file_size += full
+                    table_reflection_bytes += full
                 elif file_key in tier3_files:
-                    reflection_file_size += proj.get(file_key, 0)
+                    projected = proj.get(file_key, 0)
+                    reflection_file_size += projected
+                    table_reflection_bytes += projected
                 else:
-                    reflection_file_size += self._ratio_bytes_with_widths(
+                    projected = self._ratio_bytes_with_widths(
                         full, projection_widths,
                     )
+                    reflection_file_size += projected
+                    table_reflection_bytes += projected
             files_kept += len(survivors)
+
+            # Exact candidate-chunk estimates are separate from the historical
+            # file-level routing estimate.  Include predicate columns even if a
+            # future parser narrows TableDefinition.columns to output-only.
+            scan_columns = None if selected_cols is None else set(selected_cols)
+            if scan_columns is not None:
+                for occurrence in self.predicate_constraints.get(r["key"], []) or []:
+                    scan_columns.update(
+                        str(column).lower() for column in occurrence
+                        if isinstance(column, str)
+                    )
+            stats_scan_columns = (
+                None
+                if scan_columns is None
+                else {
+                    column for column in scan_columns
+                    if column not in (ROWID_COL, TIMESTAMP_COL)
+                }
+            )
+            table_rg_bytes, table_rg_complete = self._row_group_byte_estimate(
+                stats_df,
+                survivors,
+                stats_scan_columns,
+                literal_row_groups,
+                "compressed_bytes",
+            )
+            table_decoded_bytes, table_decoded_complete = (
+                self._decoded_row_group_estimate(
+                    stats_df,
+                    survivors,
+                    stats_scan_columns,
+                    literal_row_groups,
+                    schema_types,
+                )
+            )
+            # Keep selected-query buffers distinct from first-use DV proof work.
+            # The total below remains their sum and retains its conservative
+            # routing meaning.
+            table_selected_decoded_bytes = table_decoded_bytes
+            table_selected_decoded_complete = table_decoded_complete
+            table_proof_decoded_bytes = 0
+            table_proof_decoded_complete = True
+            selected_rows, selected_rows_complete = (
+                self._row_group_row_count_estimate(
+                    stats_df, survivors, literal_row_groups,
+                )
+            )
+            if not selected_rows_complete and not literal_row_groups:
+                # Resource cardinalities are snapshot-pinned and therefore a
+                # safe upper bound even when optional row-group stats are
+                # absent. Predicates may reduce the actual result, but they can
+                # never make this bound too small. This keeps response-limit
+                # and streaming memory decisions bounded for legacy manifests
+                # without inventing row-group precision.
+                manifest_rows_complete = all(
+                    isinstance(resource_rows.get(file_key), int)
+                    and not isinstance(resource_rows.get(file_key), bool)
+                    and resource_rows[file_key] >= 0
+                    for file_key in survivors
+                )
+                if manifest_rows_complete:
+                    selected_rows = sum(
+                        resource_rows[file_key] for file_key in survivors
+                    )
+                    selected_rows_complete = True
+            has_active_tombstone = any(
+                meta.get("tombstone_key")
+                for meta in r["pinned_snapshot_metadata"]
+            )
+            if has_active_tombstone:
+                # Applying a DV requires two source-rowid consumers: the normal
+                # selected-RG anti join and a full-file uniqueness proof for
+                # every referenced immutable resource. Stats deliberately omit
+                # system columns, so use manifest row counts for decoded Int64
+                # buffers and the entire file size as a conservative compressed
+                # upper bound for the proof scan. This is deliberately looser
+                # than the actual range read, but complete: active tombstones on
+                # 100+ files remain eligible for bounded Island planning without
+                # pretending ``8 * rows`` covers Parquet page overhead.
+                full_rows_complete = all(
+                    isinstance(resource_rows.get(file_key), int)
+                    and not isinstance(resource_rows.get(file_key), bool)
+                    and resource_rows[file_key] >= 0
+                    for file_key in survivors
+                )
+                full_sizes_complete = all(
+                    isinstance(key_size.get(file_key), int)
+                    and not isinstance(key_size.get(file_key), bool)
+                    and key_size[file_key] > 0
+                    for file_key in survivors
+                )
+                if selected_rows_complete:
+                    # The actual candidate-row anti join decodes __rowid__ in
+                    # every selected group; it belongs to normal batch width.
+                    table_selected_decoded_bytes += selected_rows * 9
+                else:
+                    table_selected_decoded_complete = False
+                if full_rows_complete:
+                    full_rows = sum(resource_rows[file_key] for file_key in survivors)
+                    # Eight value bytes plus one full byte/value of validity and
+                    # alignment slack for the whole-file source-rowid proof.
+                    table_proof_decoded_bytes += full_rows * 9
+                else:
+                    table_proof_decoded_complete = False
+                if full_sizes_complete:
+                    table_rg_bytes += sum(key_size[file_key] for file_key in survivors)
+                else:
+                    table_rg_complete = False
+            table_decoded_bytes = (
+                table_selected_decoded_bytes + table_proof_decoded_bytes
+            )
+            table_decoded_complete = (
+                table_selected_decoded_complete
+                and table_proof_decoded_complete
+            )
+            if table_rg_complete:
+                row_group_scan_bytes += table_rg_bytes
+            else:
+                # Preserve a conservative, useful compressed fallback while the
+                # completeness bit prevents it being described as row-group exact.
+                row_group_scan_bytes += table_reflection_bytes
+                row_group_scan_bytes_complete = False
+            if table_decoded_complete:
+                decoded_bytes += table_decoded_bytes
+            else:
+                decoded_bytes_complete = False
+            if table_selected_decoded_complete:
+                selected_decoded_bytes += table_selected_decoded_bytes
+            else:
+                selected_decoded_bytes_complete = False
+            if table_proof_decoded_complete:
+                proof_decoded_bytes += table_proof_decoded_bytes
+            else:
+                proof_decoded_bytes_complete = False
 
             # SuperSnapshot is created ONCE per (super_name, simple_name) after all
             # snapshot iterations have accumulated their files and schema. Creating
@@ -1363,12 +1841,16 @@ class DataEstimator:
                     columns=schema,
                     column_types=dict(schema_types),
                     resource_keys=list(survivors),
+                    resource_sizes=[int(key_size.get(k, 0)) for k in survivors],
                     snapshot_resource_keys=list(r["snapshot_resource_keys"]),
                     snapshot_path=pinned.get("path"),
                     tombstone_key=pinned.get("tombstone_key"),
                     tombstone_rows=pinned.get("tombstone_rows"),
                     tombstone_digest=pinned.get("tombstone_digest"),
                     share_row_filter=pinned.get("share_row_filter"),
+                    row_group_selections=literal_row_groups,
+                    candidate_rows=(selected_rows if selected_rows_complete else 0),
+                    candidate_rows_complete=selected_rows_complete,
                 )
                 supers.append(super_snapshot)
 
@@ -1427,6 +1909,24 @@ class DataEstimator:
         # for observability so the two are comparable in the plans payload.
         self.plan_stats.add_stat({"REFLECTION_SIZE": reflection_file_size})
         self.plan_stats.add_stat({"REFLECTION_SIZE_RAW": reflection_file_size_raw})
+        self.plan_stats.add_stat({"ROW_GROUP_SCAN_SIZE": row_group_scan_bytes})
+        self.plan_stats.add_stat({
+            "ROW_GROUP_SCAN_SIZE_COMPLETE": row_group_scan_bytes_complete,
+        })
+        self.plan_stats.add_stat({"DECODED_SIZE": decoded_bytes})
+        self.plan_stats.add_stat({
+            "DECODED_SIZE_COMPLETE": decoded_bytes_complete,
+        })
+        self.plan_stats.add_stat({
+            "SELECTED_DECODED_SIZE": selected_decoded_bytes,
+        })
+        self.plan_stats.add_stat({
+            "SELECTED_DECODED_SIZE_COMPLETE": selected_decoded_bytes_complete,
+        })
+        self.plan_stats.add_stat({"PROOF_DECODED_SIZE": proof_decoded_bytes})
+        self.plan_stats.add_stat({
+            "PROOF_DECODED_SIZE_COMPLETE": proof_decoded_bytes_complete,
+        })
 
         # Read-path pruning observability — only when pruning is engaged, so a
         # disabled-pruning read doesn't litter the payload with noise. Mirrors
@@ -1462,4 +1962,14 @@ class DataEstimator:
             total_reflections=total_reflections,
             supers=supers,
             freshness_ms=max_freshness_ms,
+            source_bytes=int(reflection_file_size_raw),
+            source_bytes_complete=reflection_sizes_complete,
+            row_group_scan_bytes=int(row_group_scan_bytes),
+            row_group_scan_bytes_complete=row_group_scan_bytes_complete,
+            decoded_bytes=int(decoded_bytes),
+            decoded_bytes_complete=decoded_bytes_complete,
+            selected_decoded_bytes=int(selected_decoded_bytes),
+            selected_decoded_bytes_complete=selected_decoded_bytes_complete,
+            proof_decoded_bytes=int(proof_decoded_bytes),
+            proof_decoded_bytes_complete=proof_decoded_bytes_complete,
         )

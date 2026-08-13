@@ -9,7 +9,7 @@ import io
 import time
 import threading
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Set, Tuple, Optional
@@ -23,7 +23,7 @@ from supertable.config.defaults import default
 from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
 from supertable.utils.profiler import Profiler, get_null_profiler
-from supertable.data_classes import PredInterval
+from supertable.data_classes import PredInterval, RowGroupSelection
 
 # Target row-group size for all Parquet writes.
 # 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
@@ -2246,6 +2246,10 @@ TIMESTAMP_COL = "__timestamp__"
 # Schema (column order is significant — keep it stable, the artifact is sealed).
 STATS_SCHEMA: Dict[str, polars.DataType] = {
     "file_path": polars.Utf8,
+    # Strong binding between every row-group hint and the exact Parquet footer
+    # from which these rows were extracted. Legacy NULL seals disable only
+    # row-group hints; file-level conservative pruning remains available.
+    "footer_sha256": polars.Utf8,
     "row_group_id": polars.Int64,
     "column_name": polars.Utf8,
     "physical_type": polars.Utf8,
@@ -2265,6 +2269,10 @@ STATS_SCHEMA: Dict[str, polars.DataType] = {
     # columns scans only the selected columns' chunks, not the whole file.
     # Nullable so a stats file written before this column carries forward.
     "compressed_bytes": polars.Int64,
+    # Parquet's decompressed *encoded-page* size for this column chunk. RLE and
+    # dictionary pages can be orders of magnitude smaller than decoded Arrow
+    # buffers, so this metric is never used alone as a memory upper bound.
+    "uncompressed_bytes": polars.Int64,
     "stats_available": polars.Boolean,
     "min_is_exact": polars.Boolean,
     "max_is_exact": polars.Boolean,
@@ -2413,9 +2421,22 @@ def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None):
         return None
 
 
+def parquet_footer_sha256(md) -> str:
+    """Return a stable SHA-256 seal for one PyArrow Parquet footer."""
+    payload = io.BytesIO()
+    md.write_metadata_file(payload)
+    return hashlib.sha256(payload.getvalue()).hexdigest()
+
+
 def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
     """Build the per-(row_group × column) stats rows for one file's footer."""
     rows: List[dict] = []
+    try:
+        footer_sha256 = parquet_footer_sha256(md)
+    except Exception:
+        # Stats remain usable for conservative file pruning, but no executor may
+        # trust row-group IDs that are not bound to an exact live footer.
+        footer_sha256 = None
     for rg in range(md.num_row_groups):
         g = md.row_group(rg)
         rg_rows = int(g.num_rows)
@@ -2430,6 +2451,7 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
                 stat = None
             row = {k: None for k in STATS_SCHEMA}
             row["file_path"] = file_path
+            row["footer_sha256"] = footer_sha256
             row["row_group_id"] = int(rg)
             row["column_name"] = name
             row["physical_type"] = str(col.physical_type or "")
@@ -2450,6 +2472,11 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
                 row["compressed_bytes"] = int(tcs) if tcs is not None else None
             except Exception:
                 row["compressed_bytes"] = None
+            try:
+                tus = col.total_uncompressed_size
+                row["uncompressed_bytes"] = int(tus) if tus is not None else None
+            except Exception:
+                row["uncompressed_bytes"] = None
             # Writers may truncate long string stats (polars caps them at 64
             # bytes: prefix min, byte-incremented max). Truncated values are
             # still valid BOUNDS (min <= all values <= max) — all any pruning
@@ -3425,6 +3452,265 @@ def prune_files_by_predicates(
         return file_keys
     p.add("read_pruned_files", pruned)
     return kept
+
+
+def select_row_groups_by_predicates(
+        file_keys: List[str],
+        stored_stats_df: Optional[polars.DataFrame],
+        occurrences: List[Dict[str, PredInterval]],
+) -> Dict[str, RowGroupSelection]:
+    """Return conservative literal-WHERE row-group hints keyed by raw object key.
+
+    An absent mapping entry means scan every row group. Missing/colliding slots
+    and unavailable comparison lanes retain the affected group; they do not
+    erase independent disjoint proof from another conjunct. Malformed group
+    identities, incomplete file manifests, an unfiltered physical occurrence,
+    or a selection containing every group all produce the absent/ALL form.
+    Candidates are unioned across physical-table occurrences because the
+    executor builds one shared scan for all aliases/subqueries.
+
+    Empty selections cannot be represented.  When the WHERE ranges disqualify
+    every row group of every file, the complete table plan is rolled back to
+    ALL groups.  This mirrors ``prune_files_by_predicates(... allow_empty=False)``
+    and guarantees that a hint can never turn the estimator's retained fallback
+    files into an accidental empty scan.
+
+    Callers must first pass the artifact through the estimator's complete-file
+    manifest validation.  The checks here are defence in depth and fail open.
+    Join-derived constraints are intentionally not accepted by this API.
+    """
+    if not file_keys or not occurrences:
+        return {}
+    try:
+        if (
+            any(not isinstance(file_key, str) for file_key in file_keys)
+            or len(file_keys) != len(set(file_keys))
+        ):
+            return {}
+    except Exception:
+        return {}
+    if (
+        any(not occurrence for occurrence in occurrences)
+        or stored_stats_df is None
+        or not isinstance(stored_stats_df, polars.DataFrame)
+        or stored_stats_df.height == 0
+    ):
+        return {}
+
+    required = {
+        "file_path", "row_group_id", "column_name", "stats_available",
+        "physical_type", "logical_type", "min_bigint", "max_bigint",
+        "min_timestamp", "max_timestamp", "footer_sha256",
+    }
+    if not required.issubset(stored_stats_df.columns):
+        return {}
+
+    normalized_occurrences: List[Dict[str, PredInterval]] = []
+    try:
+        for occurrence in occurrences:
+            normalized: Dict[str, PredInterval] = {}
+            for column, predicate in occurrence.items():
+                if not isinstance(column, str) or not isinstance(
+                    predicate, PredInterval
+                ):
+                    return {}
+                lower = column.lower()
+                if lower in normalized:
+                    return {}
+                normalized[lower] = predicate
+            normalized_occurrences.append(normalized)
+    except Exception:
+        return {}
+
+    constrained_cols = sorted({
+        column
+        for occurrence in normalized_occurrences
+        for column in occurrence
+    })
+    if not constrained_cols:
+        return {}
+
+    rejected_lane_columns = [
+        column for column in (
+            "min_double", "max_double", "min_string", "max_string",
+        )
+        if column in stored_stats_df.columns
+    ]
+    try:
+        scoped_stats = (
+            stored_stats_df
+            .filter(polars.col("file_path").is_in(file_keys))
+        )
+        all_groups_frame = (
+            scoped_stats
+            .select(["file_path", "row_group_id"])
+            .unique()
+        )
+        groups_by_file: Dict[str, List[int]] = defaultdict(list)
+        for file_path, group_id in all_groups_frame.iter_rows():
+            groups_by_file[file_path].append(group_id)
+
+        # Validate footer seals once per file in one columnar pass. Filtering
+        # the complete stats artifact separately for every file is quadratic
+        # at the 100+ resource scale this optimization is intended to serve.
+        seals_by_file: Dict[str, str] = {}
+        seal_frame = scoped_stats.group_by("file_path").agg([
+            polars.len().alias("__seal_rows"),
+            polars.col("footer_sha256").null_count().alias("__seal_nulls"),
+            polars.col("footer_sha256").n_unique().alias("__seal_unique"),
+            polars.col("footer_sha256").first().alias("__seal"),
+        ])
+        for file_path, rows, nulls, unique, seal in seal_frame.iter_rows():
+            if rows > 0 and nulls == 0 and unique == 1:
+                seals_by_file[file_path] = seal
+
+        expressions = [
+            polars.col("column_name").str.to_lowercase().alias("__column_lower"),
+            polars.col("file_path"),
+            polars.col("row_group_id"),
+            polars.col("stats_available"),
+            polars.col("physical_type"),
+            polars.col("logical_type"),
+            polars.col("min_bigint"),
+            polars.col("max_bigint"),
+            polars.col("min_timestamp"),
+            polars.col("max_timestamp"),
+            (
+                polars.any_horizontal([
+                    polars.col(column).is_not_null()
+                    for column in rejected_lane_columns
+                ])
+                if rejected_lane_columns else polars.lit(False)
+            ).alias(_SELECT_OTHER_LANE_COL),
+        ]
+        needed = (
+            stored_stats_df
+            .filter(
+                polars.col("file_path").is_in(file_keys)
+                & polars.col("column_name").str.to_lowercase().is_in(
+                    constrained_cols
+                )
+            )
+            .select(expressions)
+        )
+    except Exception:
+        return {}
+
+    # file -> group -> lower-column -> trusted lane, with None representing a
+    # duplicate/colliding or unavailable footer slot.
+    index: Dict[
+        str,
+        Dict[int, Dict[str, Optional[Tuple[str, object, object]]]],
+    ] = {}
+    try:
+        for (
+            column, file_path, group_id, stats_available, physical_type,
+            logical_type, min_bigint, max_bigint, min_timestamp,
+            max_timestamp, other_lane_populated,
+        ) in needed.iter_rows():
+            group_columns = index.setdefault(file_path, {}).setdefault(
+                group_id, {}
+            )
+            if column in group_columns:
+                group_columns[column] = None
+            else:
+                group_columns[column] = _stored_select_lane_values(
+                    stats_available,
+                    physical_type,
+                    logical_type,
+                    min_bigint,
+                    max_bigint,
+                    min_timestamp,
+                    max_timestamp,
+                    other_lane_populated,
+                )
+    except Exception:
+        return {}
+
+    selections: Dict[str, RowGroupSelection] = {}
+    any_possible_group = False
+    for file_key in file_keys:
+        raw_group_ids = groups_by_file.get(file_key)
+        if not raw_group_ids:
+            # This object is absent from the validated artifact: ALL.
+            any_possible_group = True
+            continue
+        if any(
+            not isinstance(group_id, int)
+            or isinstance(group_id, bool)
+            or group_id < 0
+            for group_id in raw_group_ids
+        ):
+            any_possible_group = True
+            continue
+        group_ids = sorted(set(raw_group_ids))
+        expected_count = len(group_ids)
+        if group_ids != list(range(expected_count)) or expected_count <= 0:
+            any_possible_group = True
+            continue
+
+        # Every stats slot must be bound to the same footer. A partially legacy
+        # or corrupt file cannot borrow the valid seal carried by its other rows.
+        footer_sha256 = seals_by_file.get(file_key)
+        if (
+            not isinstance(footer_sha256, str)
+            or len(footer_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in footer_sha256)
+        ):
+            any_possible_group = True
+            continue
+
+        file_index = index.get(file_key, {})
+        selected: Set[int] = set()
+        for group_id in group_ids:
+            columns = file_index.get(group_id, {})
+            # A group is retained when ANY physical SQL occurrence can still
+            # match. Within one occurrence (an AND conjunction), one trusted
+            # disjoint predicate is enough to prove it cannot match; missing or
+            # unsupported predicates merely stay "possible" for that group.
+            # This preserves the superset contract while allowing an integer
+            # predicate to prune groups even when a sibling string predicate
+            # has no safe NOCASE stats lane.
+            for occurrence in normalized_occurrences:
+                occurrence_possible = True
+                for column, predicate in occurrence.items():
+                    stored = columns.get(column)
+                    if stored is None:
+                        continue  # unknown is possible, never disjoint proof
+                    try:
+                        overlaps = _pred_overlaps_stored(predicate, stored)
+                    except Exception:
+                        continue
+                    if not overlaps:
+                        occurrence_possible = False
+                        break
+                if occurrence_possible:
+                    selected.add(group_id)
+                    break
+        if not selected:
+            # The containing file should normally be removed by literal file
+            # pruning.  Keep no empty hint; the table-wide rollback below makes
+            # retained fallback files scan ALL.
+            continue
+        any_possible_group = True
+        selected_ids = tuple(sorted(selected))
+        if len(selected_ids) == expected_count:
+            continue  # absence is the canonical ALL representation
+        try:
+            selections[file_key] = RowGroupSelection(
+                expected_row_group_count=expected_count,
+                selected_ids=selected_ids,
+                footer_sha256=footer_sha256,
+            )
+        except (TypeError, ValueError):
+            # A validation failure for one resource is local and fail-open.
+            selections.pop(file_key, None)
+
+    if not any_possible_group:
+        # allow_empty=False: predicates excluded the entire table, so the file
+        # pruner retains all files and row-group hints must do the same.
+        return {}
+    return selections
 
 
 # ===========================================================================

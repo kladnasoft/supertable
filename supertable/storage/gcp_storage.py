@@ -5,15 +5,37 @@ import fnmatch
 import os
 
 from supertable.config.settings import settings
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from google.cloud import storage
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, PreconditionFailed
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+    StorageInterface,
+    validate_range_request,
+    write_all,
+)
+
+
+class _CountingSink:
+    """Transparent file wrapper used because the GCS SDK returns no byte count."""
+
+    def __init__(self, target: BinaryIO) -> None:
+        self.target = target
+        self.written = 0
+
+    def write(self, data: bytes) -> int:
+        count = write_all(self.target, data)
+        self.written += count
+        return count
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
 
 
 class GCSStorage(StorageInterface):
@@ -182,6 +204,105 @@ class GCSStorage(StorageInterface):
             raise FileNotFoundError(f"File not found: {path}")
         # size is populated on the Blob returned by get_blob
         return int(blob.size or 0)
+
+    @staticmethod
+    def _metadata_from_blob(blob: Any) -> ObjectMetadata:
+        modified = getattr(blob, "updated", None)
+        modified_ns = int(modified.timestamp() * 1_000_000_000) if modified else 0
+        return ObjectMetadata(
+            size=int(getattr(blob, "size", 0) or 0),
+            version=str(getattr(blob, "generation", "") or ""),
+            etag=str(getattr(blob, "etag", "") or "").strip('"'),
+            last_modified_ns=modified_ns,
+        )
+
+    def stat_object(self, path: str) -> ObjectMetadata:
+        path = self._with_base(path)
+        try:
+            blob = self.bucket.get_blob(path)
+        except NotFound as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        if blob is None:
+            raise FileNotFoundError(f"File not found: {path}")
+        return self._metadata_from_blob(blob)
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        path = self._with_base(path)
+        blob = self.bucket.blob(path)
+        # Resumable GCS chunks must be multiples of 256 KiB.  For other caller
+        # sizes, retain the SDK default while preserving streaming semantics.
+        if chunk_size % (256 * 1024) == 0:
+            blob.chunk_size = chunk_size
+        request: Dict[str, Any] = {}
+        if expected is not None:
+            if expected.version:
+                request["if_generation_match"] = int(expected.version)
+            elif expected.etag:
+                request["if_etag_match"] = expected.etag
+        sink = _CountingSink(file_obj)
+        try:
+            blob.download_to_file(sink, **request)
+        except NotFound as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        if expected is not None and sink.written != expected.size:
+            raise OSError(
+                f"Short download for {path}: expected {expected.size} bytes, wrote {sink.written}"
+            )
+        return sink.written
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        offset, length = validate_range_request(offset, length, expected)
+        if length == 0:
+            return b""
+        if expected is None or not (expected.version or expected.etag):
+            raise ValueError("GCS range reads require a generation or ETag condition")
+        path = self._with_base(path)
+        blob = self.bucket.blob(path)
+        request: Dict[str, Any] = {
+            "start": offset,
+            "end": offset + length - 1,
+        }
+        if expected is not None:
+            if expected.version:
+                request["if_generation_match"] = int(expected.version)
+            elif expected.etag:
+                request["if_etag_match"] = expected.etag
+        try:
+            payload = blob.download_as_bytes(**request)
+        except PreconditionFailed as exc:
+            raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+        except NotFound as exc:
+            raise FileNotFoundError(f"File not found: {path}") from exc
+        if len(payload) != length:
+            raise ObjectIdentityMismatch(
+                f"Short or oversized conditional range read for {path}"
+            )
+        return payload
+
+    def cache_namespace(self) -> Dict[str, str]:
+        namespace = {"provider": "gcs", "bucket": self.bucket_name}
+        project = getattr(self.client, "project", None)
+        if project:
+            namespace["project"] = str(project)
+        if self.base_prefix:
+            namespace["base_prefix"] = self.base_prefix
+        return namespace
 
     def makedirs(self, path: str) -> None:
         """

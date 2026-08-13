@@ -7,11 +7,18 @@ import pyarrow.parquet as pq
 import shutil
 import tempfile
 import time
+import hashlib
 
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 
 from supertable.config.homedir import app_home
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+    StorageInterface,
+    validate_range_request,
+    write_all,
+)
 
 class LocalStorage(StorageInterface):
     """
@@ -114,6 +121,141 @@ class LocalStorage(StorageInterface):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
         return os.path.getsize(path)
+
+    @staticmethod
+    def _metadata_from_stat(stat_result: os.stat_result) -> ObjectMetadata:
+        return ObjectMetadata(
+            size=int(stat_result.st_size),
+            # ctime fences same-inode, same-size rewrites even on filesystems
+            # whose mtime granularity is too coarse for back-to-back writes.
+            version=(
+                f"{stat_result.st_dev}:{stat_result.st_ino}:"
+                f"{stat_result.st_ctime_ns}"
+            ),
+            last_modified_ns=int(stat_result.st_mtime_ns),
+        )
+
+    @classmethod
+    def _metadata_from_open_file(cls, source: BinaryIO) -> ObjectMetadata:
+        metadata = cls._metadata_from_stat(os.fstat(source.fileno()))
+        # Local files can be rewritten in-place with the same size inside one
+        # filesystem timestamp tick. A bounded head/tail seal catches common
+        # overwrite/replace patterns without reading a multi-GiB local object.
+        sample_bytes = 64 * 1024
+        if hasattr(os, "pread"):
+            head = os.pread(source.fileno(), min(sample_bytes, metadata.size), 0)
+            tail = (
+                os.pread(
+                    source.fileno(),
+                    sample_bytes,
+                    max(0, metadata.size - sample_bytes),
+                )
+                if metadata.size > sample_bytes
+                else b""
+            )
+        else:  # pragma: no cover - POSIX production path uses pread
+            position = source.tell()
+            source.seek(0)
+            head = source.read(min(sample_bytes, metadata.size))
+            tail = b""
+            if metadata.size > sample_bytes:
+                source.seek(max(0, metadata.size - sample_bytes))
+                tail = source.read(sample_bytes)
+            source.seek(position)
+        sample = hashlib.sha256(head + tail).hexdigest()
+        return ObjectMetadata(
+            size=metadata.size,
+            version=f"{metadata.version}:{sample}",
+            last_modified_ns=metadata.last_modified_ns,
+        )
+
+    def stat_object(self, path: str) -> ObjectMetadata:
+        try:
+            source = open(path, "rb")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        with source:
+            return self._metadata_from_open_file(source)
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        try:
+            source = open(path, "rb")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+
+        with source:
+            before = self._metadata_from_open_file(source)
+            if expected is not None and before != expected:
+                raise OSError(f"Object changed before download: {path}")
+            written = 0
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                written += write_all(file_obj, chunk)
+            after = self._metadata_from_open_file(source)
+            if after != before:
+                raise OSError(f"Object changed during download: {path}")
+            if written != before.size:
+                raise OSError(
+                    f"Short download for {path}: expected {before.size} bytes, wrote {written}"
+                )
+            return written
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        offset, length = validate_range_request(offset, length, expected)
+        try:
+            source = open(path, "rb")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"File not found: {path}") from exc
+        with source:
+            before = self._metadata_from_open_file(source)
+            if expected is not None and before.identity_token() != expected.identity_token():
+                raise ObjectIdentityMismatch(f"Object changed before range read: {path}")
+            if offset > before.size or length > before.size - offset:
+                raise ObjectIdentityMismatch(f"Object shrank before range read: {path}")
+            if length == 0:
+                return b""
+            chunks = []
+            remaining = length
+            position = offset
+            while remaining:
+                if hasattr(os, "pread"):
+                    chunk = os.pread(source.fileno(), remaining, position)
+                else:  # pragma: no cover - POSIX production path uses pread
+                    source.seek(position)
+                    chunk = source.read(remaining)
+                if not chunk:
+                    raise ObjectIdentityMismatch(f"Short range read: {path}")
+                chunks.append(chunk)
+                position += len(chunk)
+                remaining -= len(chunk)
+            after = self._metadata_from_open_file(source)
+            if after.identity_token() != before.identity_token():
+                raise ObjectIdentityMismatch(f"Object changed during range read: {path}")
+            return b"".join(chunks)
+
+    def cache_namespace(self) -> Dict[str, str]:
+        return {"provider": "local"}
+
+    def is_local_storage(self) -> bool:
+        return True
 
     def makedirs(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)

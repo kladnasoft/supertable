@@ -80,6 +80,7 @@ from supertable.engine.engine_enum import Engine
 from supertable.engine.executor import Executor, _get_pro
 from supertable.engine.duckdb_lite import DuckDBLite
 from supertable.engine.duckdb_pro import DuckDBPro, _ProCacheEntry
+from supertable.engine.islanddb import IslandUnsupportedError
 from supertable.engine.spark_thrift import (
     _spark_table_name,
     _spark_create_parquet_view,
@@ -1460,6 +1461,7 @@ class TestEngineEnum:
         assert Engine.AUTO.value == "auto"
         assert Engine.DUCKDB_LITE.value == "duckdb_lite"
         assert Engine.DUCKDB_PRO.value == "duckdb_pro"
+        assert Engine.ISLANDDB.value == "islanddb"
         assert Engine.SPARK_SQL.value == "spark_sql"
 
     def test_from_string(self):
@@ -1473,9 +1475,20 @@ class TestEngineEnum:
 
 
 def _exec_fixtures():
+    snapshot = SuperSnapshot("s", "t", 1, ["f.parquet"], {"col"})
+    snapshot.candidate_rows = 1
+    snapshot.candidate_rows_complete = True
     reflection = Reflection(
         storage_type="mock", reflection_bytes=100, total_reflections=1,
-        supers=[SuperSnapshot("s", "t", 1, ["f.parquet"], {"col"})],
+        supers=[snapshot],
+        source_bytes=100,
+        source_bytes_complete=True,
+        row_group_scan_bytes=100,
+        row_group_scan_bytes_complete=True,
+        decoded_bytes=100,
+        decoded_bytes_complete=True,
+        selected_decoded_bytes=100,
+        selected_decoded_bytes_complete=True,
     )
     parser = MagicMock()
     parser.original_query = "SELECT * FROM t"
@@ -1528,6 +1541,108 @@ class TestExecutor:
         r.reflection_bytes = 1000
         _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
         assert used == "duckdb_lite"
+        routing = next(s["AUTO_ROUTING"] for s in ps.stats if "AUTO_ROUTING" in s)
+        outcome = next(
+            s["AUTO_ROUTING_OUTCOME"]
+            for s in ps.stats if "AUTO_ROUTING_OUTCOME" in s
+        )
+        assert routing["selected_engine"] == "duckdb_lite"
+        assert outcome == {
+            "selected_engine": "duckdb_lite",
+            "actual_engine": "duckdb_lite",
+            "fallback": False,
+        }
+
+    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
+    def test_forced_engine_never_reads_auto_history(self, mock_exec):
+        provider = MagicMock(side_effect=RuntimeError("must not be called"))
+        r, p, qm, t, ps = _exec_fixtures()
+
+        _, used = Executor(auto_history_provider=provider).execute(
+            Engine.DUCKDB_LITE, r, p, qm, t, ps, "test",
+        )
+
+        assert used == "duckdb_lite"
+        provider.assert_not_called()
+        assert not any("AUTO_ROUTING" in s for s in ps.stats)
+
+    @patch.object(DuckDBLite, "execute", side_effect=RuntimeError("boom"))
+    def test_failed_forced_execution_retains_data_free_attempt_telemetry(
+        self, mock_exec,
+    ):
+        r, p, qm, t, ps = _exec_fixtures()
+
+        with pytest.raises(RuntimeError, match="boom"):
+            Executor().execute(
+                Engine.DUCKDB_LITE, r, p, qm, t, ps, "test",
+            )
+
+        request = next(
+            stat["ENGINE_REQUEST"] for stat in ps.stats
+            if "ENGINE_REQUEST" in stat
+        )
+        attempt = next(
+            stat["ENGINE_ATTEMPT"] for stat in ps.stats
+            if "ENGINE_ATTEMPT" in stat
+        )
+        assert request == {
+            "requested_engine": "duckdb_lite",
+            "selected_engine": "duckdb_lite",
+            "forced": True,
+        }
+        assert attempt == {"engine": "duckdb_lite", "stage": "primary"}
+        assert not any("ENGINE" in stat for stat in ps.stats)
+
+    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
+    def test_auto_routing_outcome_records_physical_fallback(
+        self, mock_pro, monkeypatch,
+    ):
+        import dataclasses
+        import supertable.engine.executor as mod
+
+        mod._pro_singleton = None
+        monkeypatch.setattr(
+            mod,
+            "settings",
+            dataclasses.replace(
+                mod.settings, SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+            ),
+        )
+        r, p, qm, t, ps = _exec_fixtures()
+        r.reflection_bytes = 512 * 1024 * 1024
+        r.source_bytes_complete = True
+        r.row_group_scan_bytes = r.reflection_bytes
+        r.row_group_scan_bytes_complete = True
+        r.decoded_bytes = r.reflection_bytes
+        r.decoded_bytes_complete = True
+        executor = Executor()
+        executor._file_cache = False
+        capability = MagicMock(supported=True)
+        capability.require.return_value = None
+        executor.island_exec = MagicMock()
+        executor.island_exec.can_execute.return_value = capability
+        executor.island_exec.resource_plan.return_value = MagicMock(
+            advice=MagicMock(value="island_in_memory"),
+            cpu_workers=4,
+            io_workers=4,
+            estimated_spill_bytes=0,
+        )
+        executor.island_exec.execute.side_effect = IslandUnsupportedError(
+            "physical footer gate",
+        )
+
+        _, used = executor.execute(Engine.AUTO, r, p, qm, t, ps, "test")
+
+        assert used == "duckdb_pro"
+        outcome = next(
+            s["AUTO_ROUTING_OUTCOME"]
+            for s in ps.stats if "AUTO_ROUTING_OUTCOME" in s
+        )
+        assert outcome == {
+            "selected_engine": "islanddb",
+            "actual_engine": "duckdb_pro",
+            "fallback": True,
+        }
 
     @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
     def test_auto_picks_pro_for_medium_stable_data(self, mock_exec):

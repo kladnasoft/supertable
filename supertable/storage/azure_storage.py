@@ -5,14 +5,22 @@ import fnmatch
 import os
 
 from supertable.config.settings import settings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+    StorageInterface,
+    validate_range_request,
+    write_all,
+)
 
 
 def _parse_abfss(uri: str) -> Tuple[str, str, str, str]:
@@ -269,6 +277,111 @@ class AzureBlobStorage(StorageInterface):
             return int(props.size)
         except ResourceNotFoundError as e:
             raise FileNotFoundError(f"File not found: {path}") from e
+
+    @staticmethod
+    def _metadata_from_properties(properties: Any) -> ObjectMetadata:
+        modified = getattr(properties, "last_modified", None)
+        modified_ns = int(modified.timestamp() * 1_000_000_000) if modified else 0
+        return ObjectMetadata(
+            size=int(getattr(properties, "size", 0) or 0),
+            version=str(getattr(properties, "version_id", "") or ""),
+            # Azure returns the HTTP entity tag including quotes and expects the
+            # same representation when it builds an If-Match condition.
+            etag=str(getattr(properties, "etag", "") or ""),
+            last_modified_ns=modified_ns,
+        )
+
+    def stat_object(self, path: str) -> ObjectMetadata:
+        path = self._with_base(path)
+        try:
+            properties = self.container.get_blob_client(path).get_blob_properties()
+        except ResourceNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        return self._metadata_from_properties(properties)
+
+    def download_to_file(
+        self,
+        path: str,
+        file_obj: BinaryIO,
+        *,
+        expected: ObjectMetadata | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> int:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        path = self._with_base(path)
+        if expected is not None and expected.version:
+            blob = self.container.get_blob_client(path, version_id=expected.version)
+        else:
+            blob = self.container.get_blob_client(path)
+        request: Dict[str, Any] = {}
+        if expected is not None and expected.etag:
+            request["etag"] = expected.etag
+            request["match_condition"] = MatchConditions.IfNotModified
+        try:
+            downloader = blob.download_blob(**request)
+            written = 0
+            for sdk_chunk in downloader.chunks():
+                # Azure controls HTTP range sizes in the client transfer config;
+                # split SDK chunks so the destination still sees bounded writes.
+                for offset in range(0, len(sdk_chunk), chunk_size):
+                    written += write_all(file_obj, sdk_chunk[offset:offset + chunk_size])
+        except ResourceNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        if expected is not None and written != expected.size:
+            raise OSError(
+                f"Short download for {path}: expected {expected.size} bytes, wrote {written}"
+            )
+        return written
+
+    def read_range(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        expected: ObjectMetadata | None = None,
+    ) -> bytes:
+        offset, length = validate_range_request(offset, length, expected)
+        if length == 0:
+            return b""
+        if expected is None or not (expected.version or expected.etag):
+            raise ValueError("Azure range reads require a version or ETag condition")
+        path = self._with_base(path)
+        if expected is not None and expected.version:
+            blob = self.container.get_blob_client(path, version_id=expected.version)
+        else:
+            blob = self.container.get_blob_client(path)
+        request: Dict[str, Any] = {"offset": offset, "length": length}
+        if expected is not None and expected.etag:
+            request["etag"] = expected.etag
+            request["match_condition"] = MatchConditions.IfNotModified
+        try:
+            payload = blob.download_blob(**request).readall()
+        except ResourceModifiedError as exc:
+            raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+        except ResourceNotFoundError as exc:
+            raise FileNotFoundError(f"File not found: {path}") from exc
+        if len(payload) != length:
+            raise ObjectIdentityMismatch(
+                f"Short or oversized conditional range read for {path}"
+            )
+        return payload
+
+    def cache_namespace(self) -> Dict[str, str]:
+        parsed = urlparse(str(getattr(self.svc, "url", "") or ""))
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        namespace = {"provider": "azure", "container": self.container_name}
+        if host:
+            namespace["account_host"] = host.lower()
+        account_name = getattr(self.svc, "account_name", None)
+        if account_name:
+            namespace["account"] = str(account_name)
+        if self.base_prefix:
+            namespace["base_prefix"] = self.base_prefix
+        return namespace
 
     def makedirs(self, path: str) -> None:
         # No-op for object storage; optionally create a marker blob if desired.

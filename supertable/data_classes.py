@@ -52,6 +52,55 @@ class JoinEdge(NamedTuple):
     prune_right: bool = True
 
 
+@dataclass(frozen=True)
+class RowGroupSelection:
+    """A validated, conservative row-group scan hint for one Parquet object.
+
+    The hint is useful only when the executor proves that the current footer's
+    SHA-256 matches ``footer_sha256`` and it still has
+    ``expected_row_group_count`` groups. ``selected_ids`` is always a non-empty,
+    strictly increasing subset of that range. Scanning *all* row groups is
+    represented by the **absence** of a mapping entry rather than by a selection
+    containing every id; this makes legacy snapshots and every validation
+    failure fail open naturally.
+    """
+
+    expected_row_group_count: int
+    selected_ids: Tuple[int, ...]
+    # SHA-256 of PyArrow's serialized Parquet FileMetaData.  Row-group IDs are
+    # safe only when the executor proves they were derived from this exact
+    # footer; a matching group count or file size is not an identity seal.
+    footer_sha256: str
+
+    def __post_init__(self) -> None:
+        count = self.expected_row_group_count
+        ids = self.selected_ids
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count <= 0
+        ):
+            raise ValueError("expected_row_group_count must be a positive integer")
+        if not isinstance(ids, tuple) or not ids:
+            raise ValueError("selected_ids must be a non-empty tuple")
+        if any(
+            not isinstance(group_id, int)
+            or isinstance(group_id, bool)
+            or group_id < 0
+            or group_id >= count
+            for group_id in ids
+        ):
+            raise ValueError("selected_ids contains an invalid row-group id")
+        if ids != tuple(sorted(set(ids))):
+            raise ValueError("selected_ids must be unique and strictly increasing")
+        if (
+            not isinstance(self.footer_sha256, str)
+            or len(self.footer_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.footer_sha256)
+        ):
+            raise ValueError("footer_sha256 must be a lowercase SHA-256 digest")
+
+
 @dataclass
 class TableDefinition:
     super_name: str
@@ -96,6 +145,23 @@ class SuperSnapshot:
     # Linked-share policy is leaf payload metadata and must be pinned alongside
     # the data snapshot for the same split-read reason.
     share_row_filter: Optional[str] = None
+    # Declared immutable object sizes, corresponding one-for-one with files and
+    # resource_keys.  This new field follows the pre-existing positional API.
+    # The shared cache uses sizes for admission and truncation detection without
+    # re-estimating or reverse-parsing resolved URLs.
+    resource_sizes: List[int] = field(default_factory=list)
+    # Stable raw resource key -> conservative literal-WHERE row-group hint.
+    # A missing key always means ALL row groups.  This is deliberately the last
+    # trailing extension so the pre-existing positional constructor remains
+    # compatible.
+    row_group_selections: Dict[str, RowGroupSelection] = field(default_factory=dict)
+    # Conservative physical-row upper bound for the selected row groups. It is
+    # exact when trusted row-group stats are present and may be the full
+    # snapshot manifest count otherwise. Zero with
+    # ``candidate_rows_complete=False`` means unknown, never an empty relation.
+    # Used for bounded result/join/response-LIMIT planning.
+    candidate_rows: int = 0
+    candidate_rows_complete: bool = False
 
 
 @dataclass
@@ -160,3 +226,35 @@ class Reflection:
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
     # alias -> TombstoneDef.  Empty dict means no tombstone filtering.
     tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
+    # Whole-file physical bytes for the estimator-selected survivors.  New
+    # fields follow the pre-existing positional API (freshness/RBAC/tombstone).
+    # This is intentionally separate from reflection_bytes, which is the
+    # projected compressed scan estimate used by the existing router.
+    source_bytes: int = 0
+    # False when at least one survivor had no trustworthy catalog size and the
+    # storage backend could not recover it. AUTO then avoids Spark/Island size
+    # decisions instead of treating an unknown multi-GB scan as zero bytes.
+    source_bytes_complete: bool = True
+    # Compressed bytes in the literal-WHERE candidate row groups and decoded
+    # (uncompressed) bytes for their required columns.  These estimates are
+    # Island-native planning hints only: ``reflection_bytes`` and
+    # ``source_bytes`` retain their historical file-level meanings for engines
+    # that ignore row-group selections.  Completeness flags prevent unknown
+    # legacy/corrupt stats from being mistaken for a zero-byte scan.
+    row_group_scan_bytes: int = 0
+    row_group_scan_bytes_complete: bool = False
+    decoded_bytes: int = 0
+    decoded_bytes_complete: bool = False
+    # Decoded bytes belonging to the estimator-selected query row groups only.
+    # ``decoded_bytes`` above remains the total work bound and may additionally
+    # include a whole-file system-column integrity pass for an active deletion
+    # vector. Keeping the two separate prevents a large streaming proof from
+    # being divided by a tiny candidate-row count when sizing source batches.
+    selected_decoded_bytes: int = 0
+    selected_decoded_bytes_complete: bool = False
+    # First-use full-file integrity work included in ``decoded_bytes`` but not
+    # in a normal selected-row batch. This is retained separately for routing,
+    # profiling, and future proof-cache-aware planning; it is never subtracted
+    # from the conservative total decoded work bound.
+    proof_decoded_bytes: int = 0
+    proof_decoded_bytes_complete: bool = False

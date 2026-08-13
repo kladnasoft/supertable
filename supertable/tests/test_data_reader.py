@@ -138,6 +138,10 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.DUCKDB_PRO.value == "duckdb_pro"
 
+    def test_islanddb_value(self):
+        from supertable.data_reader import engine
+        assert engine.ISLANDDB.value == "islanddb"
+
     def test_spark_sql_value(self):
         from supertable.data_reader import engine
         assert engine.SPARK_SQL.value == "spark_sql"
@@ -148,7 +152,9 @@ class TestEngineEnum:
 
     def test_engine_members(self):
         from supertable.data_reader import engine
-        assert set(engine.__members__.keys()) == {"AUTO", "DUCKDB_LITE", "DUCKDB_PRO", "SPARK_SQL"}
+        assert set(engine.__members__.keys()) == {
+            "AUTO", "DUCKDB_LITE", "DUCKDB_PRO", "ISLANDDB", "SPARK_SQL",
+        }
 
 
 # ====================================================================
@@ -1573,8 +1579,13 @@ class TestExecuteExecutorArgs:
         dr = DataReader("s", "o", "Q")
         dr.execute("admin", engine=engine.DUCKDB_LITE)
 
-        # Executor constructed with storage and organization
-        MockExecutor.assert_called_once_with(storage=mock_storage, organization="o")
+        # Executor receives the bounded AUTO history provider in addition to
+        # the pre-existing storage/organization execution context.
+        MockExecutor.assert_called_once()
+        constructor = MockExecutor.call_args.kwargs
+        assert constructor["storage"] is mock_storage
+        assert constructor["organization"] == "o"
+        assert callable(constructor["auto_history_provider"])
 
         # Executor.execute called with full set of params
         exec_call = mock_exec.execute.call_args

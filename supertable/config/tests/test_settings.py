@@ -82,6 +82,33 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "SUPERTABLE_SUPERTOKEN",
         "SUPERTABLE_MCP_TOKEN",
         "SUPERTABLE_MCP_AUTH_TOKEN",
+        # Query observation history
+        "SUPERTABLE_QUERY_OBSERVATIONS_ENABLED",
+        "SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES",
+        "SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS",
+        "SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES",
+        "SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES",
+        # IslandDB / shared cache
+        "SUPERTABLE_ISLAND_CACHE_ENABLED",
+        "SUPERTABLE_ISLAND_CACHE_DIR",
+        "SUPERTABLE_ISLAND_CACHE_MAX_BYTES",
+        "SUPERTABLE_ISLAND_CACHE_TTL_SEC",
+        "SUPERTABLE_ISLAND_CACHE_WORKERS",
+        "SUPERTABLE_ISLAND_AUTO_ENABLED",
+        "SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED",
+        "SUPERTABLE_ISLAND_RANGE_CACHE_DIR",
+        "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES",
+        "SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC",
+        "SUPERTABLE_ISLAND_MEMORY_FRACTION",
+        "SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION",
+        "SUPERTABLE_ISLAND_MAX_MEMORY_BYTES",
+        "SUPERTABLE_ISLAND_MAX_RESULT_BYTES",
+        "SUPERTABLE_ISLAND_CPU_MAX",
+        "SUPERTABLE_ISLAND_IO_WORKERS_MAX",
+        "SUPERTABLE_ISLAND_SPILL_ENABLED",
+        "SUPERTABLE_ISLAND_SPILL_DIR",
+        "SUPERTABLE_ISLAND_SPILL_MAX_BYTES",
+        "SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES",
         # API + Redis
         "SUPERTABLE_API_HOST",
         "SUPERTABLE_API_PORT",
@@ -233,12 +260,88 @@ class TestSettingsDataclass:
         assert s.SUPERTABLE_API_PORT == 8051
         assert s.SUPERTABLE_DEFAULT_LIMIT == 200
         assert s.SUPERTABLE_DEFAULT_ENGINE == "AUTO"
+        assert s.SUPERTABLE_QUERY_OBSERVATIONS_ENABLED is True
+        assert s.SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES == 64
+        assert s.SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS == 30
+        assert s.SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES == 3
+        assert s.SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES == 4096
+        assert s.SUPERTABLE_ISLAND_CACHE_ENABLED is True
+        assert s.SUPERTABLE_ISLAND_CACHE_MAX_BYTES == 20 * 1024 * 1024 * 1024
+        assert s.SUPERTABLE_ISLAND_AUTO_ENABLED is True
+        assert s.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED is True
+        assert s.SUPERTABLE_ISLAND_MEMORY_FRACTION == 0.60
+        assert s.SUPERTABLE_ISLAND_MAX_RESULT_BYTES == 512 * 1024 * 1024
+        assert s.SUPERTABLE_ISLAND_SPILL_ENABLED is True
         assert s.MAX_MEMORY_CHUNK_SIZE == 16 * 1024 * 1024
         assert s.MAX_OVERLAPPING_FILES == 100
         assert s.MAX_TOMBSTONE_ROWS == 1_000_000
         assert s.TOMBSTONE_COMPACTION_WORKERS == 2
         assert s.DEFAULT_TIMEOUT_SEC == 60
         assert s.DEFAULT_LOCK_DURATION_SEC == 30
+
+    def test_query_observation_environment_overrides(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_QUERY_OBSERVATIONS_ENABLED", "false")
+        fresh_env.setenv("SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES", "29")
+        fresh_env.setenv("SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS", "11")
+        fresh_env.setenv("SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES", "5")
+        fresh_env.setenv("SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES", "900")
+
+        built = _build_settings()
+
+        assert built.SUPERTABLE_QUERY_OBSERVATIONS_ENABLED is False
+        assert built.SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES == 29
+        assert built.SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS == 11
+        assert built.SUPERTABLE_QUERY_OBSERVATION_MIN_SAMPLES == 5
+        assert built.SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES == 900
+
+    def test_island_cache_environment_overrides(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_ISLAND_CACHE_ENABLED", "false")
+        fresh_env.setenv("SUPERTABLE_ISLAND_CACHE_DIR", "/tmp/island-cache")
+        fresh_env.setenv("SUPERTABLE_ISLAND_CACHE_MAX_BYTES", "123456")
+        fresh_env.setenv("SUPERTABLE_ISLAND_CACHE_TTL_SEC", "77")
+        fresh_env.setenv("SUPERTABLE_ISLAND_CACHE_WORKERS", "3")
+        fresh_env.setenv("SUPERTABLE_ISLAND_AUTO_ENABLED", "true")
+        fresh_env.setenv("SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED", "false")
+        fresh_env.setenv("SUPERTABLE_ISLAND_RANGE_CACHE_DIR", "/tmp/island-ranges")
+        fresh_env.setenv("SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", "456789")
+        fresh_env.setenv("SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC", "88")
+        fresh_env.setenv("SUPERTABLE_ISLAND_MEMORY_FRACTION", "0.55")
+        fresh_env.setenv("SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION", "0.75")
+        fresh_env.setenv("SUPERTABLE_ISLAND_MAX_MEMORY_BYTES", "999999")
+        fresh_env.setenv("SUPERTABLE_ISLAND_MAX_RESULT_BYTES", "111111")
+        fresh_env.setenv("SUPERTABLE_ISLAND_CPU_MAX", "4")
+        fresh_env.setenv("SUPERTABLE_ISLAND_IO_WORKERS_MAX", "6")
+        fresh_env.setenv("SUPERTABLE_ISLAND_SPILL_ENABLED", "false")
+        fresh_env.setenv("SUPERTABLE_ISLAND_SPILL_DIR", "/tmp/island-spill")
+        fresh_env.setenv("SUPERTABLE_ISLAND_SPILL_MAX_BYTES", "222222")
+        fresh_env.setenv("SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES", "333333")
+
+        built = _build_settings()
+
+        assert built.SUPERTABLE_ISLAND_CACHE_ENABLED is False
+        assert built.SUPERTABLE_ISLAND_CACHE_DIR == "/tmp/island-cache"
+        assert built.SUPERTABLE_ISLAND_CACHE_MAX_BYTES == 123456
+        assert built.SUPERTABLE_ISLAND_CACHE_TTL_SEC == 77
+        assert built.SUPERTABLE_ISLAND_CACHE_WORKERS == 3
+        assert built.SUPERTABLE_ISLAND_AUTO_ENABLED is True
+        assert built.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED is False
+        assert built.SUPERTABLE_ISLAND_RANGE_CACHE_DIR == "/tmp/island-ranges"
+        assert built.SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES == 456789
+        assert built.SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC == 88
+        assert built.SUPERTABLE_ISLAND_MEMORY_FRACTION == 0.55
+        assert built.SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION == 0.75
+        assert built.SUPERTABLE_ISLAND_MAX_MEMORY_BYTES == 999999
+        assert built.SUPERTABLE_ISLAND_MAX_RESULT_BYTES == 111111
+        assert built.SUPERTABLE_ISLAND_CPU_MAX == 4
+        assert built.SUPERTABLE_ISLAND_IO_WORKERS_MAX == 6
+        assert built.SUPERTABLE_ISLAND_SPILL_ENABLED is False
+        assert built.SUPERTABLE_ISLAND_SPILL_DIR == "/tmp/island-spill"
+        assert built.SUPERTABLE_ISLAND_SPILL_MAX_BYTES == 222222
+        assert built.SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES == 333333
 
 
 # ---------------------------------------------------------------------------
