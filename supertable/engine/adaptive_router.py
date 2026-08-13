@@ -281,6 +281,7 @@ class RoutingDecision:
     availability: RoutingAvailability
     candidates: Tuple[EngineCandidate, ...]
     policy_version: str = POLICY_VERSION
+    manual_policy: Optional[Mapping[str, object]] = None
 
     def as_dict(self) -> dict:
         return {
@@ -291,6 +292,7 @@ class RoutingDecision:
             "features": asdict(self.features),
             "availability": asdict(self.availability),
             "candidates": [candidate.as_dict() for candidate in self.candidates],
+            "manual_policy": dict(self.manual_policy) if self.manual_policy else None,
         }
 
     def as_plan_stat(self) -> dict:
@@ -487,6 +489,8 @@ class AdaptiveEngineRouter:
         availability: RoutingAvailability,
         *,
         history: Optional[Mapping[Engine, EngineHistory]] = None,
+        manual_engine: Optional[Engine] = None,
+        manual_policy: Optional[Mapping[str, object]] = None,
     ) -> RoutingDecision:
         history = history or {}
         rejections: Dict[Engine, list[str]] = {
@@ -498,7 +502,10 @@ class AdaptiveEngineRouter:
         if not availability.pro_available:
             rejections[Engine.DUCKDB_PRO].append("DuckDB Pro unavailable")
 
-        if not availability.island_enabled:
+        if (
+            not availability.island_enabled
+            and manual_engine is not Engine.ISLANDDB
+        ):
             rejections[Engine.ISLANDDB].append("IslandDB AUTO disabled")
         if not availability.island_supported:
             rejections[Engine.ISLANDDB].append("query outside IslandDB capability subset")
@@ -572,6 +579,15 @@ class AdaptiveEngineRouter:
         # native path is also unavailable, keep the query on persistent Pro:
         # its cached DV relation avoids repeatedly rebuilding a potentially
         # large anti-join in Lite.
+        elif manual_engine is not None and not rejections.get(manual_engine):
+            preferred = manual_engine
+            forced_reason = (
+                f"Redis estimated-scan policy selected {manual_engine.value}"
+            )
+            for engine in self._MODEL:
+                if engine != preferred:
+                    rejections[engine].append("excluded by Redis estimated-scan policy")
+
         elif (
             features.has_active_tombstone
             and rejections[Engine.ISLANDDB]
@@ -645,4 +661,5 @@ class AdaptiveEngineRouter:
             features=features,
             availability=availability,
             candidates=tuple(candidates),
+            manual_policy=manual_policy,
         )

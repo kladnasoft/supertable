@@ -23,7 +23,7 @@ import pytest
 
 import supertable.engine.executor as executor_module
 from supertable.engine.executor import Executor
-from supertable.engine.engine_config import EngineRuntimeConfig
+from supertable.engine.engine_config import AutoRoutingRule, EngineRuntimeConfig
 from supertable.engine.engine_enum import Engine
 from supertable.engine.island_resources import (
     ExecutionAdvice,
@@ -197,6 +197,43 @@ def test_auto_routes_supported_bounded_query_to_islanddb(monkeypatch):
     )
 
     assert chosen is Engine.ISLANDDB
+
+
+def test_redis_policy_selects_island_by_effective_scan_even_when_auto_flag_off(
+    monkeypatch,
+):
+    executor = _executor(_Catalog([]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
+    )
+    disabled = dataclasses.replace(
+        executor_module.settings, SUPERTABLE_ISLAND_AUTO_ENABLED=False,
+    )
+    monkeypatch.setattr(executor_module, "settings", disabled)
+    stats = PlanStats()
+
+    chosen = executor._auto_pick(
+        _reflection(50 * 1024 * 1024),
+        _cfg(10 * GIB),
+        parser=object(),
+        plan_stats=stats,
+        routing_policy=(AutoRoutingRule(0, 100 * 1024 * 1024, Engine.ISLANDDB),),
+    )
+
+    assert chosen is Engine.ISLANDDB
+    routing = next(x["AUTO_ROUTING"] for x in stats.stats if "AUTO_ROUTING" in x)
+    assert routing["manual_policy"]["engine"] == "islanddb"
+
+
+def test_unsafe_redis_spark_rule_falls_back_to_safe_cost_model():
+    # No active Spark fleet: the manual choice cannot bypass availability.
+    chosen = _executor(_Catalog([]))._auto_pick(
+        _reflection(200 * 1024 * 1024),
+        _cfg(0),
+        routing_policy=(AutoRoutingRule(100 * 1024 * 1024, None, Engine.SPARK_SQL),),
+    )
+    assert chosen is not Engine.SPARK_SQL
 
 
 def test_auto_uses_range_native_query_without_whole_file_warmth(monkeypatch):

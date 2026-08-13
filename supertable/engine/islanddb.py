@@ -1442,6 +1442,8 @@ class IslandDB:
             if has_remote else pafs.LocalFileSystem()
         )
         common_schema: Optional[Dict[str, Tuple[str, pl.DataType]]] = None
+        ordered_fields: List[pa.Field] = []
+        seen_fields: set[str] = set()
         local_paths: List[str] = []
         local_to_resource: Dict[str, str] = {}
         pinned_schema: Dict[str, Tuple[str, str]] = {}
@@ -1520,6 +1522,10 @@ class IslandDB:
                 fragment_path, filesystem=filesystem, file_size=file_size,
             )
             physical_arrow_schema = base_fragment.physical_schema
+            for field in physical_arrow_schema:
+                if field.name not in seen_fields:
+                    ordered_fields.append(field)
+                    seen_fields.add(field.name)
             physical_schema = pl.Schema(physical_arrow_schema)
             self._reserved_schema_guard(physical_schema, source=resource_key)
             comparable_schema = {
@@ -1567,7 +1573,12 @@ class IslandDB:
                     )
                 common_schema.update(comparable_schema)
             selected_ids = None
-            if row_group_hints:
+            # Local scans intentionally use Polars' conservative native footer
+            # pruning below. Computing a SHA-256 metadata seal and constructing
+            # a second exact Arrow fragment for every local file is therefore
+            # dead work (severe at 10k+ files). Remote range reads still require
+            # the exact sealed subset because expanding it changes physical I/O.
+            if row_group_hints and has_remote:
                 try:
                     live_footer_sha256 = parquet_footer_sha256(
                         base_fragment.metadata,
@@ -1580,17 +1591,18 @@ class IslandDB:
                     int(base_fragment.num_row_groups),
                     live_footer_sha256,
                 )
-            fragments.append(
-                file_format.make_fragment(
-                    fragment_path,
-                    filesystem=filesystem,
-                    file_size=file_size,
-                    row_groups=(list(selected_ids) if selected_ids else None),
-                    partition_expression=(
-                        pads.field(SOURCE_FILE_COL) == str(resource_key)
-                    ),
+            if has_remote:
+                fragments.append(
+                    file_format.make_fragment(
+                        fragment_path,
+                        filesystem=filesystem,
+                        file_size=file_size,
+                        row_groups=(list(selected_ids) if selected_ids else None),
+                        partition_expression=(
+                            pads.field(SOURCE_FILE_COL) == str(resource_key)
+                        ),
+                    )
                 )
-            )
         missing_pinned = sorted(set(pinned_schema).difference(physical_union))
         if missing_pinned:
             raise IslandUnsupportedError(
@@ -1602,13 +1614,6 @@ class IslandDB:
         # per file and lets 100+ resources participate in one parallel scan.
         # Shared columns were already proven exact above; missing evolution
         # columns are represented as NULL by the dataset schema.
-        ordered_fields: List[pa.Field] = []
-        seen_fields: set[str] = set()
-        for fragment in fragments:
-            for field in fragment.physical_schema:
-                if field.name not in seen_fields:
-                    ordered_fields.append(field)
-                    seen_fields.add(field.name)
         ordered_fields.append(pa.field(SOURCE_FILE_COL, pa.string()))
         dataset_schema = pa.schema(ordered_fields)
         if not has_remote:

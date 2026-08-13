@@ -760,12 +760,17 @@ def _write_single_parquet_file(
     rows = write_df.shape[0]
     columns = write_df.shape[1]
 
+    # Resolve the backend once. Apart from avoiding repeated factory/config
+    # work, this is a correctness boundary: upload and metadata must describe
+    # the same backend instance if a custom storage factory rotates clients.
+    storage = _get_storage()
+
     # Ensure the target directory exists.  makedirs is idempotent on local
     # storage and a no-op on object storage; calling it directly avoids a
     # pointless prefix HEAD (which always 404s) on object stores.
     with p.span("write.ensure_dir"):
         try:
-            _get_storage().makedirs(target_dir)
+            storage.makedirs(target_dir)
         except Exception:
             pass
 
@@ -774,10 +779,18 @@ def _write_single_parquet_file(
 
     # Sort before writing so each row group covers a tight min/max range.
     # DuckDB uses these zonemaps to skip entire row groups during filtered scans.
-    sort_cols = (
-        (["__timestamp__"] if "__timestamp__" in write_df.columns else [])
-        + [c for c in (overwrite_columns or []) if c in write_df.columns and c != "__timestamp__"]
-    )
+    sort_cols = [
+        c for c in (overwrite_columns or [])
+        if c in write_df.columns and c != "__timestamp__"
+    ]
+    if "__timestamp__" in write_df.columns and write_df.height > 1:
+        timestamp = write_df.get_column("__timestamp__")
+        # Ordinary writes inject one timestamp literal for the entire batch, so
+        # sorting it cannot improve row-group zonemaps and only allocates/sorts
+        # a full frame. Compaction can combine batches with different timestamps;
+        # retain the sort there because it materially tightens row-group ranges.
+        if timestamp.min() != timestamp.max():
+            sort_cols.insert(0, "__timestamp__")
     if sort_cols and write_df.height > 0:
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
@@ -800,12 +813,15 @@ def _write_single_parquet_file(
         )
         data = buf.getvalue()
 
-    storage = _get_storage()
     write_bytes = getattr(storage, "write_bytes", None)
     write_parquet = getattr(storage, "write_parquet", None)
     if callable(write_bytes):
         with p.span("write.upload_bytes"):
             write_bytes(new_parquet_path, data)
+        # These are the exact bytes accepted by the backend.  A follow-up
+        # size()/HEAD is both redundant and racy (the object could be replaced
+        # between PUT and HEAD), and adds a full network round-trip remotely.
+        file_size = len(data)
         # The uploaded bytes ARE ``data`` here, so parse the footer in memory
         # (footer-only, no decode, no network round-trip) for stats reuse.
         if footer_md_out is not None:
@@ -816,21 +832,14 @@ def _write_single_parquet_file(
     elif callable(write_parquet):
         with p.span("write.upload_parquet"):
             write_parquet(arrow_tbl, new_parquet_path)
+        # This compatibility branch may re-encode the Arrow table, so only the
+        # backend can report the resulting object size.  Do not silently record
+        # zero or an unrelated local path when that mandatory metadata lookup
+        # fails: the snapshot's resource metadata must remain trustworthy.
+        with p.span("write.size_lookup"):
+            file_size = storage.size(new_parquet_path)
     else:
         raise RuntimeError("Configured storage provides no parquet write method")
-
-    # Determine file size
-    try:
-        with p.span("write.size_lookup"):
-            file_size = _get_storage().size(new_parquet_path)
-    except Exception:
-        try:
-            file_size = os.path.getsize(new_parquet_path)
-        except Exception:
-            try:
-                file_size = len(data)  # type: ignore[name-defined]
-            except Exception:
-                file_size = 0
 
     p.add("files_written", 1)
     p.add("rows_written", int(rows))

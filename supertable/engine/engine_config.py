@@ -60,7 +60,9 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+from supertable.engine.engine_enum import Engine
 
 
 # Optional decimal number followed by an optional byte unit (decimal KB/MB/GB/TB
@@ -129,6 +131,78 @@ DUCKDB_ENGINES: Tuple[str, ...] = ("lite", "pro")
 SHARED_CONFIG_FIELDS: Tuple[str, ...] = tuple(_SHARED_SPEC.keys())
 DUCKDB_CONFIG_FIELDS: Tuple[str, ...] = tuple(_DUCKDB_SPEC.keys())
 ENGINE_CONFIG_FIELDS: Tuple[str, ...] = SHARED_CONFIG_FIELDS + DUCKDB_CONFIG_FIELDS
+
+
+@dataclass(frozen=True)
+class AutoRoutingRule:
+    """One half-open estimated-scan interval persisted in Redis."""
+
+    min_bytes: int
+    max_bytes: Optional[int]
+    engine: Engine
+
+    def matches(self, estimated_scan_bytes: int) -> bool:
+        return (
+            estimated_scan_bytes >= self.min_bytes
+            and (self.max_bytes is None or estimated_scan_bytes < self.max_bytes)
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "min_bytes": self.min_bytes,
+            "max_bytes": self.max_bytes,
+            "engine": self.engine.value,
+        }
+
+
+def normalize_auto_routing_policy(raw: Any) -> Tuple[AutoRoutingRule, ...]:
+    """Validate a non-overlapping Redis AUTO policy.
+
+    Intervals are half-open (``min <= estimate < max``); ``max_bytes=None`` is
+    unbounded and can only be the final rule. Gaps are allowed and deliberately
+    fall through to the adaptive cost model. Invalid documents fail closed by
+    raising instead of being partially applied.
+    """
+    if raw in (None, ""):
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("auto_policy must be a list of routing rules")
+    rules = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"auto_policy[{index}] must be an object")
+        try:
+            minimum = int(item.get("min_bytes", 0))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"auto_policy[{index}].min_bytes is invalid") from exc
+        maximum_raw = item.get("max_bytes")
+        try:
+            maximum = None if maximum_raw in (None, "") else int(maximum_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"auto_policy[{index}].max_bytes is invalid") from exc
+        if minimum < 0 or (maximum is not None and maximum <= minimum):
+            raise ValueError(f"auto_policy[{index}] has an empty/negative interval")
+        try:
+            engine = Engine(str(item.get("engine", "")).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"auto_policy[{index}].engine is invalid") from exc
+        if engine is Engine.AUTO:
+            raise ValueError("auto_policy cannot route AUTO to itself")
+        rules.append(AutoRoutingRule(minimum, maximum, engine))
+    rules.sort(key=lambda rule: rule.min_bytes)
+    previous_max = None
+    for index, rule in enumerate(rules):
+        if index and (previous_max is None or rule.min_bytes < previous_max):
+            raise ValueError("auto_policy intervals overlap or follow an unbounded rule")
+        previous_max = rule.max_bytes
+    return tuple(rules)
+
+
+def match_auto_routing_policy(
+    rules: Tuple[AutoRoutingRule, ...], estimated_scan_bytes: int,
+) -> Optional[AutoRoutingRule]:
+    estimate = max(0, int(estimated_scan_bytes))
+    return next((rule for rule in rules if rule.matches(estimate)), None)
 
 
 @dataclass(frozen=True)
@@ -229,6 +303,30 @@ def resolve_engine_configs(org: str, catalog: Optional[Any] = None) -> Dict[str,
     return {e: _build_runtime(cfg, e) for e in DUCKDB_ENGINES}
 
 
+def resolve_auto_routing_policy(
+    org: str, catalog: Optional[Any] = None,
+) -> Tuple[AutoRoutingRule, ...]:
+    """Resolve the live Redis policy; missing or malformed policy means AUTO."""
+    cfg = _redis_cfg(org, catalog)
+    try:
+        return normalize_auto_routing_policy(cfg.get("auto_policy"))
+    except ValueError:
+        return ()
+
+
+def resolve_engine_bundle(
+    org: str, catalog: Optional[Any] = None,
+) -> Tuple[Dict[str, EngineRuntimeConfig], Tuple[AutoRoutingRule, ...]]:
+    """Resolve runtime configs and manual AUTO policy with one Redis GET."""
+    cfg = _redis_cfg(org, catalog)
+    configs = {e: _build_runtime(cfg, e) for e in DUCKDB_ENGINES}
+    try:
+        policy = normalize_auto_routing_policy(cfg.get("auto_policy"))
+    except ValueError:
+        policy = ()
+    return configs, policy
+
+
 def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "lite") -> EngineRuntimeConfig:
     """Resolve effective config for a single ``engine`` (Redis → env → default).
 
@@ -268,4 +366,13 @@ def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) ->
         section = cfg.get(engine) if isinstance(cfg.get(engine), dict) else {}
         result[engine] = _block(section, _DUCKDB_SPEC)
     result["modified_ms"] = cfg.get("modified_ms")
+    try:
+        result["auto_policy"] = [
+            rule.as_dict()
+            for rule in normalize_auto_routing_policy(cfg.get("auto_policy"))
+        ]
+        result["auto_policy_valid"] = True
+    except ValueError:
+        result["auto_policy"] = []
+        result["auto_policy_valid"] = False
     return result

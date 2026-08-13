@@ -355,7 +355,9 @@ class TestWriteParquetAndCollectResources:
         res = resources[0]
         assert res["rows"] == 2
         assert res["columns"] == 2
-        assert res["file_size"] == 1234
+        uploaded = mock_stor.write_bytes.call_args.args[1]
+        assert res["file_size"] == len(uploaded)
+        mock_stor.size.assert_not_called()
         assert "data.parquet" in res["file"]
         assert "stats" not in res
 

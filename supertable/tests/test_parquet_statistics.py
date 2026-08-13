@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pyarrow.parquet as pq
+import pytest
 
 
 _MOD = "supertable.processing"
@@ -84,3 +85,94 @@ class TestParquetStatisticsAlwaysWritten:
 
         assert mock_write_table.called
         assert mock_write_table.call_args.kwargs.get("write_statistics") is True
+
+
+class TestDataParquetWriteMetadata:
+    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_byte_upload_uses_exact_payload_size_without_head(self, mock_gs, _mock_gen):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        storage = MagicMock()
+        uploaded = {}
+        storage.write_bytes.side_effect = lambda path, data: uploaded.update(
+            path=path, data=data
+        )
+        mock_gs.return_value = storage
+        resources = []
+
+        write_parquet_and_collect_resources(
+            write_df=_df(id=[1, 2], value=["a", "b"]),
+            overwrite_columns=[],
+            data_dir="/data",
+            new_resources=resources,
+            compression_level=1,
+        )
+
+        assert resources[0]["file_size"] == len(uploaded["data"])
+        storage.size.assert_not_called()
+        # Directory setup, upload and metadata all use one pinned backend.
+        mock_gs.assert_called_once_with()
+
+    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_parquet_only_backend_requires_size_metadata(self, mock_gs, _mock_gen):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        class ParquetOnlyStorage:
+            def makedirs(self, _path):
+                pass
+
+            def write_parquet(self, _table, _path):
+                pass
+
+            def size(self, _path):
+                raise OSError("metadata unavailable")
+
+        mock_gs.return_value = ParquetOnlyStorage()
+
+        with pytest.raises(OSError, match="metadata unavailable"):
+            write_parquet_and_collect_resources(
+                write_df=_df(id=[1]),
+                overwrite_columns=[],
+                data_dir="/data",
+                new_resources=[],
+                compression_level=1,
+            )
+
+    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_constant_batch_timestamp_does_not_sort(self, mock_gs, _mock_gen):
+        from supertable.processing import write_parquet_and_collect_resources
+        from supertable.utils.profiler import Profiler
+
+        storage = MagicMock()
+        mock_gs.return_value = storage
+        profiler = Profiler()
+        timestamp = pl.datetime(2026, 1, 1, time_zone="UTC")
+        frame = _df(id=[3, 1, 2]).with_columns(timestamp.alias("__timestamp__"))
+
+        write_parquet_and_collect_resources(
+            frame, [], "/data", [], compression_level=1, profiler=profiler
+        )
+
+        assert "write.sort" not in profiler.timings
+
+    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_compaction_timestamp_range_remains_sorted(self, mock_gs, _mock_gen):
+        from supertable.processing import write_parquet_and_collect_resources
+        from supertable.utils.profiler import Profiler
+
+        storage = MagicMock()
+        mock_gs.return_value = storage
+        profiler = Profiler()
+        frame = _df(id=[3, 1, 2], __timestamp__=[3, 1, 2]).with_columns(
+            pl.col("__timestamp__").cast(pl.Datetime("us"))
+        )
+
+        write_parquet_and_collect_resources(
+            frame, [], "/data", [], compression_level=1, profiler=profiler
+        )
+
+        assert profiler.counts["write.sort.n"] == 1

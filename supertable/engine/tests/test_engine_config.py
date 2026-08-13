@@ -9,13 +9,20 @@ Redis stored them.  The core guarantee is that a bare number can never reach
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock
+
 import duckdb
 import pytest
 
 from supertable.engine.engine_config import (
+    match_auto_routing_policy,
+    normalize_auto_routing_policy,
     normalize_memory_size,
     resolve_engine_configs,
 )
+from supertable.engine.engine_enum import Engine
+from supertable.redis_catalog import RedisCatalog
 
 
 class TestNormalizeMemorySize:
@@ -79,3 +86,52 @@ class TestResolverNormalizes:
         con = duckdb.connect(":memory:")
         con.execute(f"PRAGMA memory_limit='{cfgs['pro'].duckdb_memory_limit}';")
         con.close()
+
+
+class TestAutoRoutingPolicy:
+    def test_half_open_ranges_and_unbounded_tail(self):
+        policy = normalize_auto_routing_policy([
+            {"min_bytes": 100, "max_bytes": None, "engine": "spark_sql"},
+            {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},
+        ])
+        assert match_auto_routing_policy(policy, 0).engine is Engine.ISLANDDB
+        assert match_auto_routing_policy(policy, 99).engine is Engine.ISLANDDB
+        assert match_auto_routing_policy(policy, 100).engine is Engine.SPARK_SQL
+
+    @pytest.mark.parametrize("rules", [
+        [{"min_bytes": 0, "max_bytes": 0, "engine": "islanddb"}],
+        [{"min_bytes": 0, "max_bytes": 100, "engine": "auto"}],
+        [
+            {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},
+            {"min_bytes": 99, "max_bytes": 200, "engine": "duckdb_lite"},
+        ],
+    ])
+    def test_invalid_policy_is_rejected_as_one_document(self, rules):
+        with pytest.raises(ValueError):
+            normalize_auto_routing_policy(rules)
+
+    def test_catalog_persists_canonical_policy_and_preserves_config(self):
+        catalog = RedisCatalog.__new__(RedisCatalog)
+        catalog.r = MagicMock()
+        catalog.get_engine_config = lambda _org: {"lite": {"duckdb_threads": "2"}}
+
+        assert catalog.set_auto_routing_policy("acme", [
+            {"min_bytes": 100, "max_bytes": None, "engine": "spark_sql"},
+            {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},
+        ])
+
+        stored = json.loads(catalog.r.set.call_args.args[1])
+        assert stored["lite"] == {"duckdb_threads": "2"}
+        assert stored["auto_policy"] == [
+            {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},
+            {"min_bytes": 100, "max_bytes": None, "engine": "spark_sql"},
+        ]
+
+    def test_catalog_does_not_mutate_redis_on_invalid_policy(self):
+        catalog = RedisCatalog.__new__(RedisCatalog)
+        catalog.r = MagicMock()
+        with pytest.raises(ValueError):
+            catalog.set_auto_routing_policy("acme", [
+                {"min_bytes": 10, "max_bytes": 5, "engine": "islanddb"},
+            ])
+        catalog.r.set.assert_not_called()

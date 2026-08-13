@@ -19,7 +19,12 @@ from supertable.utils.sql_parser import SQLParser
 from supertable.engine.engine_enum import Engine
 from supertable.engine.duckdb_lite import DuckDBLite
 from supertable.engine.duckdb_pro import DuckDBPro
-from supertable.engine.engine_config import resolve_engine_configs, EngineRuntimeConfig
+from supertable.engine.engine_config import (
+    AutoRoutingRule,
+    EngineRuntimeConfig,
+    match_auto_routing_policy,
+    resolve_engine_bundle,
+)
 from supertable.engine.adaptive_router import (
     AdaptiveEngineRouter,
     EngineHistory,
@@ -297,6 +302,7 @@ class Executor:
         *,
         streaming_result: bool = False,
         plan_stats: Optional[PlanStats] = None,
+        routing_policy: Tuple[AutoRoutingRule, ...] = (),
     ) -> Engine:
         """Choose the lowest predicted-cost engine after hard safety gates.
 
@@ -363,7 +369,13 @@ class Executor:
                     getattr(native, "supported", False) is True
                 )
                 spark_semantics_supported = native_supported
-                if native_supported and settings.SUPERTABLE_ISLAND_AUTO_ENABLED:
+                policy_enables_island = any(
+                    rule.engine is Engine.ISLANDDB for rule in routing_policy
+                )
+                if native_supported and (
+                    settings.SUPERTABLE_ISLAND_AUTO_ENABLED
+                    or policy_enables_island
+                ):
                     island_plan = self.island_exec.resource_plan(
                         reflection,
                         parser,
@@ -527,7 +539,10 @@ class Executor:
             ),
         )
         availability = RoutingAvailability(
-            island_enabled=bool(settings.SUPERTABLE_ISLAND_AUTO_ENABLED),
+            island_enabled=bool(
+                settings.SUPERTABLE_ISLAND_AUTO_ENABLED
+                or any(rule.engine is Engine.ISLANDDB for rule in routing_policy)
+            ),
             island_supported=bool(
                 native is not None
                 and getattr(native, "supported", False) is True
@@ -548,9 +563,31 @@ class Executor:
                 logger.debug(
                     "[engine.auto] historical profile lookup skipped: %s", exc,
                 )
+        matched_rule = match_auto_routing_policy(
+            routing_policy, features.effective_scan_bytes,
+        )
+        policy_metadata = None
+        if matched_rule is not None:
+            policy_metadata = {
+                **matched_rule.as_dict(),
+                "estimated_scan_bytes": features.effective_scan_bytes,
+                "estimate_complete": bool(
+                    features.source_bytes_complete
+                    and (
+                        not features.row_group_bytes_complete
+                        or features.effective_scan_bytes >= 0
+                    )
+                ),
+            }
         decision = AdaptiveEngineRouter(
             lite_max_bytes=cfg.engine_lite_max_bytes,
-        ).decide(features, availability, history=history)
+        ).decide(
+            features,
+            availability,
+            history=history,
+            manual_engine=(matched_rule.engine if matched_rule else None),
+            manual_policy=policy_metadata,
+        )
         chosen = decision.engine
         if plan_stats is not None:
             plan_stats.add_stat(decision.as_plan_stat())
@@ -591,7 +628,9 @@ class Executor:
         # UI changes take effect immediately without restart or cache.  Lite and
         # Pro carry independent DuckDB pragmas; the shared auto-pick thresholds
         # are identical in both, so either may drive the routing decision.
-        cfgs = resolve_engine_configs(self.organization, self._get_catalog())
+        cfgs, routing_policy = resolve_engine_bundle(
+            self.organization, self._get_catalog()
+        )
         lite_cfg = cfgs["lite"]
         pro_cfg = cfgs["pro"]
 
@@ -602,6 +641,7 @@ class Executor:
                 lite_cfg,
                 parser=parser,
                 plan_stats=plan_stats,
+                routing_policy=routing_policy,
             )
         )
         auto_selected = chosen if engine == Engine.AUTO else None
@@ -833,7 +873,9 @@ class Executor:
         accepted only when its bounded router chooses IslandDB; callers never
         receive a silently materialized fallback under a streaming API.
         """
-        cfgs = resolve_engine_configs(self.organization, self._get_catalog())
+        cfgs, routing_policy = resolve_engine_bundle(
+            self.organization, self._get_catalog()
+        )
         chosen = (
             engine
             if engine != Engine.AUTO
@@ -843,6 +885,7 @@ class Executor:
                 parser=parser,
                 streaming_result=True,
                 plan_stats=plan_stats,
+                routing_policy=routing_policy,
             )
         )
         if chosen != Engine.ISLANDDB:

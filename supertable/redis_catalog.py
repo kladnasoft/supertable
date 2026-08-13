@@ -2409,3 +2409,26 @@ return 1
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"[redis-catalog] get_engine_config error: {e}")
         return None
+
+    def set_auto_routing_policy(
+            self, org: str, rules: list[Dict[str, Any]],
+    ) -> bool:
+        """Atomically replace the org-wide estimated-scan AUTO policy.
+
+        Validation is strict and occurs before Redis is mutated. An empty list
+        removes manual range selection and restores the adaptive cost model.
+        """
+        if not org:
+            return False
+        from supertable.engine.engine_config import normalize_auto_routing_policy
+
+        normalized = normalize_auto_routing_policy(rules)
+        try:
+            doc = self.get_engine_config(org) or {}
+            doc["auto_policy"] = [rule.as_dict() for rule in normalized]
+            doc["modified_ms"] = _now_ms()
+            self.r.set(RK.engine_duckdb(org), json.dumps(doc, default=str))
+            return True
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] set_auto_routing_policy error: {e}")
+            return False

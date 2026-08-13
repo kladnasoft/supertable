@@ -38,7 +38,7 @@ Hierarchy (v2)
           engine:
             thrifts                                  HASH    Spark Thrift clusters
             plugs                                    HASH    Spark Plug runtimes
-            duckdb                                   STRING  DuckDB runtime config
+              duckdb                                   STRING  runtime config + AUTO policy
             observations:
               {workload_signature}:
                 {engine}                             ZSET    bounded AUTO history
