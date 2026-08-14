@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
 import os
+import time
 import types
 from contextlib import contextmanager
 from datetime import datetime
@@ -13,6 +15,7 @@ import polars as pl
 import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
+import supertable.engine.islanddb as islanddb_module
 
 from supertable.data_classes import (
     IntegerDomainBound,
@@ -479,6 +482,8 @@ def test_arrow_dataset_applies_validated_row_group_hint_and_exact_filter(tmp_pat
             4, (2,), parquet_footer_sha256(pq.read_metadata(path)),
         ),
     }
+    snapshot.candidate_row_groups = 1
+    snapshot.candidate_row_groups_complete = True
     reflection = _reflection(snapshot)
     reflection.row_group_scan_bytes = os.path.getsize(path)
     reflection.row_group_scan_bytes_complete = True
@@ -490,7 +495,16 @@ def test_arrow_dataset_applies_validated_row_group_hint_and_exact_filter(tmp_pat
     actual, engine = _run_island(tmp_path, reflection, query)
 
     pd.testing.assert_frame_equal(actual, expected)
-    assert engine.last_profile.selected_row_groups == 1
+    # Local Polars deliberately scans the conservative physical superset and
+    # performs its own footer-statistics pruning. Telemetry must describe that
+    # executable plan, not relabel the one-group estimator hint as observed I/O.
+    assert engine.last_profile.planned_row_groups == 4
+    assert engine.last_profile.planned_row_groups_complete is True
+    assert engine.last_profile.selected_row_groups == 4
+    assert engine.last_profile.observed_row_groups is None
+    assert engine.last_profile.observed_row_groups_measured is False
+    assert engine.last_profile.estimated_candidate_row_groups == 1
+    assert engine.last_profile.estimated_candidate_row_groups_complete is True
 
 
 def test_stale_row_group_footer_count_scans_all_and_keeps_result(tmp_path):
@@ -633,13 +647,481 @@ def test_native_numeric_queries_match_duckdb(tmp_path, numeric_reflection, query
     assert engine.last_profile.result_rows == len(actual)
     assert engine.last_profile.result_bytes >= 0
     assert engine.last_profile.peak_memory_bytes >= 0
-    assert engine.last_profile.peak_memory_scope == "process_rss_delta"
+    assert engine.last_profile.peak_memory_scope == (
+        "process_rss_peak_delta_after_admission_until_profile_finalize"
+    )
     assert engine.last_profile.spill_bytes == 0
     assert engine.last_profile.spill_bytes_measured is False
     # Native multi-file execution is one Arrow Dataset scan.  Polars labels
     # that bridge PYTHON SCAN while still pushing projection/predicate into the
     # Arrow scanner (both are visible in the optimized plan).
     assert "SCAN" in engine.last_profile.optimized_plan
+
+
+def test_profile_separates_plan_estimates_observations_and_facade_phases(
+    tmp_path, numeric_reflection,
+):
+    for snapshot in numeric_reflection.supers:
+        snapshot.candidate_row_groups = sum(
+            pq.read_metadata(path).num_row_groups for path in snapshot.files
+        )
+        snapshot.candidate_row_groups_complete = True
+    actual, engine = _run_island(
+        tmp_path,
+        numeric_reflection,
+        "SELECT id, v FROM s.t WHERE id BETWEEN 31 AND 36 ORDER BY id",
+    )
+    profile = engine.last_profile
+
+    assert len(actual) == 6
+    assert profile.planned_files == 2
+    assert profile.planned_files_complete is True
+    assert profile.planned_row_groups == 10
+    assert profile.planned_row_groups_complete is True
+    assert profile.planned_rows == 100
+    assert profile.planned_rows_complete is True
+    assert profile.planned_units_scope == "scan_node_occurrences"
+    assert profile.estimated_candidate_files == 2
+    assert profile.estimated_candidate_files_complete is True
+    assert profile.estimated_candidate_row_groups == 10
+    assert profile.estimated_candidate_row_groups_complete is True
+    assert profile.observed_files is None
+    assert profile.observed_files_measured is False
+    assert profile.observed_row_groups is None
+    assert profile.observed_row_groups_measured is False
+    assert profile.observed_rows_scanned is None
+    assert profile.observed_rows_scanned_measured is False
+    assert profile.estimated_candidate_rows == 100
+    assert profile.estimated_candidate_rows_complete is True
+    assert profile.rows_scanned == 0
+    assert profile.rows_scanned_measured is False
+    assert profile.execution_outcome == "completed"
+    assert profile.result_complete is True
+    assert profile.result_rows == 6
+    assert profile.result_rows_scope == "arrow_output_rows"
+    assert profile.result_batches >= 1
+    assert profile.result_batches_scope == "arrow_output_record_batches"
+    assert profile.result_bytes_scope == "arrow_output_batch_logical_nbytes"
+
+    assert profile.rss_scope == (
+        "process_rss_sampled_10ms_after_admission_until_profile_finalize"
+    )
+    assert profile.rss_measured is True
+    assert profile.rss_baseline_bytes is not None
+    assert profile.rss_peak_bytes is not None
+    assert profile.rss_final_bytes is not None
+    assert profile.rss_peak_bytes >= profile.rss_baseline_bytes
+    assert profile.rss_peak_bytes >= profile.rss_final_bytes
+    assert profile.rss_peak_delta_bytes == (
+        profile.rss_peak_bytes - profile.rss_baseline_bytes
+    )
+    assert profile.rss_retained_delta_bytes == (
+        profile.rss_final_bytes - profile.rss_baseline_bytes
+    )
+    assert profile.peak_memory_bytes == (
+        profile.rss_peak_bytes - profile.rss_baseline_bytes
+    )
+    assert profile.peak_memory_scope == (
+        "process_rss_peak_delta_after_admission_until_profile_finalize"
+    )
+    assert profile.physical_read_scope == (
+        "linux_proc_self_io_block_read_delta_after_admission_"
+        "until_profile_finalize"
+    )
+    assert profile.elapsed_scope == (
+        "engine_after_admission_through_stream_close_"
+        "excludes_facade_and_profile_persist"
+    )
+
+    required_phases = {
+        "range_cache_setup_ms",
+        "prepare_execution_inside_call_ms",
+        "admission_wait_ms",
+        "relation_prepare_and_eager_integrity_ms",
+        "first_batch_acquire_ms",
+        "producer_active_ms",
+        "producer_cleanup_ms",
+        "stream_lifetime_ms",
+        "facade_collect_arrow_table_ms",
+        "facade_arrow_to_polars_ms",
+        "facade_dtype_normalize_ms",
+        "facade_polars_to_pandas_ms",
+        "facade_total_ms",
+        "engine_elapsed_excluding_profile_persist_ms",
+        "total_execution_and_facade_excluding_profile_persist_ms",
+    }
+    assert required_phases <= profile.phase_timings_ms.keys()
+    assert profile.phase_timings_scope == "monotonic_wall_nested_non_additive"
+    assert all(profile.phase_timings_ms[name] >= 0 for name in required_phases)
+    assert profile.profile_persist_ms is not None
+    assert profile.profile_persist_ms_measured is True
+    assert profile.profile_persist_succeeded is True
+    assert profile.phase_timings_ms["profile_persist_ms"] >= 0
+
+    # A single atomic profile write cannot contain its own duration. The
+    # artifact marks that measurement unavailable; only the post-commit
+    # in-memory profile carries it.
+    persisted = json.loads((tmp_path / "island-plan.json").read_text())
+    assert persisted["profile_persist_ms"] is None
+    assert persisted["profile_persist_ms_measured"] is False
+    assert persisted["profile_persist_succeeded"] is None
+    assert "profile_persist_ms" not in persisted["phase_timings_ms"]
+    assert persisted["execution_outcome"] == "completed"
+    assert persisted["result_complete"] is True
+    assert required_phases <= persisted["phase_timings_ms"].keys()
+
+
+def test_process_telemetry_marks_counter_reset_unmeasured(monkeypatch):
+    import supertable.engine.islanddb as island_module
+
+    telemetry = island_module._IslandTelemetry.__new__(
+        island_module._IslandTelemetry
+    )
+    telemetry.cpu_started = time.process_time()
+    telemetry.read_started = 1_000
+    telemetry.rss_started = 200
+    telemetry.rss_peak = 350
+    telemetry._stop = types.SimpleNamespace(set=lambda: None)
+    telemetry._thread = types.SimpleNamespace(join=lambda timeout: None)
+    monkeypatch.setattr(island_module, "_proc_counter", lambda _name: 900)
+    monkeypatch.setattr(island_module, "_process_rss_bytes", lambda: 275)
+
+    measured = telemetry.finish()
+
+    assert measured["physical_read_bytes"] == 0
+    assert measured["physical_read_bytes_measured"] is False
+    assert measured["rss_measured"] is True
+    assert measured["rss_baseline_bytes"] == 200
+    assert measured["rss_peak_bytes"] == 350
+    assert measured["rss_final_bytes"] == 275
+    assert measured["rss_peak_delta_bytes"] == 150
+    assert measured["rss_retained_delta_bytes"] == 75
+
+
+def test_stream_close_before_first_batch_is_profiled_as_partial(
+    tmp_path, numeric_reflection,
+):
+    query = "SELECT id, v FROM s.t ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "early-close-plan.json")
+    engine = IslandDB()
+
+    stream = engine.execute_stream(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+    stream.close()
+
+    assert engine.last_profile.execution_outcome == "closed_early"
+    assert engine.last_profile.result_complete is False
+    assert engine.last_profile.result_rows == 0
+    assert engine.last_profile.observed_rows_scanned is None
+    assert engine.last_profile.observed_rows_scanned_measured is False
+    persisted = json.loads((tmp_path / "early-close-plan.json").read_text())
+    assert persisted["execution_outcome"] == "closed_early"
+    assert persisted["result_complete"] is False
+
+
+def test_stream_cancel_before_first_batch_is_not_a_successful_sample(
+    tmp_path, numeric_reflection,
+):
+    query = "SELECT id, v FROM s.t ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "cancelled-plan.json")
+    engine = IslandDB()
+
+    stream = engine.execute_stream(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+    stream.cancel()
+
+    assert engine.last_profile.execution_outcome == "cancelled"
+    assert engine.last_profile.result_complete is False
+    assert engine.last_profile.result_rows == 0
+    persisted = json.loads((tmp_path / "cancelled-plan.json").read_text())
+    assert persisted["execution_outcome"] == "cancelled"
+    assert persisted["result_complete"] is False
+
+
+def test_stream_lifetime_includes_consumer_idle_but_producer_time_does_not(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "consumer-idle-plan.json")
+    engine = IslandDB()
+    schema = pa.schema([pa.field("id", pa.int64())])
+    batches = [
+        pa.record_batch([pa.array([1])], schema=schema),
+        pa.record_batch([pa.array([2])], schema=schema),
+    ]
+    monkeypatch.setattr(
+        engine, "_lazy_batches", lambda *_args, **_kwargs: (schema, iter(batches)),
+    )
+
+    stream = engine.execute_stream(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+    assert next(stream).column(0).to_pylist() == [1]
+    time.sleep(0.05)
+    assert next(stream).column(0).to_pylist() == [2]
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    phases = engine.last_profile.phase_timings_ms
+    assert engine.last_profile.result_complete is True
+    assert phases["stream_lifetime_ms"] >= 45.0
+    assert phases["producer_active_ms"] < phases["stream_lifetime_ms"] - 30.0
+
+
+def test_stream_producer_failure_is_not_relabelled_as_early_close(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "failed-stream-plan.json")
+    engine = IslandDB()
+
+    def broken_batches(*_args, **_kwargs):
+        def fail():
+            raise RuntimeError("native producer failed")
+            yield  # pragma: no cover - make this a generator
+
+        return pa.schema([pa.field("id", pa.int64())]), fail()
+
+    monkeypatch.setattr(engine, "_lazy_batches", broken_batches)
+    stream = engine.execute_stream(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="native producer failed"):
+        next(stream)
+
+    assert engine.last_profile.execution_outcome == "failed"
+    assert engine.last_profile.result_complete is False
+    persisted = json.loads((tmp_path / "failed-stream-plan.json").read_text())
+    assert persisted["execution_outcome"] == "failed"
+    assert persisted["result_complete"] is False
+
+
+def test_materialized_producer_failure_is_not_relabelled_as_facade_failure(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "failed-materialized-plan.json")
+    engine = IslandDB()
+
+    def broken_batches(*_args, **_kwargs):
+        def fail():
+            raise RuntimeError("materialized producer failed")
+            yield  # pragma: no cover - make this a generator
+
+        return pa.schema([pa.field("id", pa.int64())]), fail()
+
+    monkeypatch.setattr(engine, "_lazy_batches", broken_batches)
+    with pytest.raises(RuntimeError, match="materialized producer failed"):
+        engine.execute(numeric_reflection, parser, manager, lambda _: None)
+
+    assert engine.last_profile.execution_outcome == "failed"
+    assert engine.last_profile.result_complete is False
+    persisted = json.loads(
+        (tmp_path / "failed-materialized-plan.json").read_text()
+    )
+    assert persisted["execution_outcome"] == "failed"
+
+
+def test_materialized_facade_failure_is_profiled_separately(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "failed-facade-plan.json")
+    engine = IslandDB()
+    monkeypatch.setattr(
+        engine,
+        "_to_duckdb_pandas",
+        lambda _result: (_ for _ in ()).throw(RuntimeError("facade failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="facade failed"):
+        engine.execute(numeric_reflection, parser, manager, lambda _: None)
+
+    assert engine.last_profile.execution_outcome == "facade_failed"
+    assert engine.last_profile.result_complete is False
+    persisted = json.loads((tmp_path / "failed-facade-plan.json").read_text())
+    assert persisted["execution_outcome"] == "facade_failed"
+    assert persisted["result_complete"] is False
+
+
+def test_profile_writer_failure_never_fails_materialized_query(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "unwritable-plan.json")
+    engine = IslandDB()
+
+    def fail_profile(*_args, **_kwargs):
+        raise OSError("profile sink unavailable")
+
+    monkeypatch.setattr(engine, "_write_profile", fail_profile)
+    result = engine.execute(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+
+    assert result["n"].iloc[0] == 100
+    assert engine.last_profile.execution_outcome == "completed"
+    assert engine.last_profile.result_complete is True
+    assert engine.last_profile.profile_persist_ms_measured is True
+    assert engine.last_profile.profile_persist_succeeded is False
+    assert manager._island_profile is engine.last_profile
+    assert manager._island_profile_token == engine.last_profile.telemetry_query_id
+    assert not (tmp_path / "unwritable-plan.json").exists()
+
+
+def test_telemetry_failure_never_masks_pre_stream_error_or_leaks_slot(
+    numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    engine = IslandDB()
+    monkeypatch.setattr(
+        engine,
+        "_prepare_lazy_query",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("original engine error")
+        ),
+    )
+    monkeypatch.setattr(
+        islanddb_module._IslandTelemetry,
+        "finish",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("telemetry failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="original engine error"):
+        engine.execute_stream(
+            numeric_reflection, parser, manager, lambda _: None,
+        )
+
+    assert islanddb_module._ISLAND_EXECUTION_SLOT.acquire(blocking=False)
+    islanddb_module._ISLAND_EXECUTION_SLOT.release()
+    assert islanddb_module._ARROW_POOL_LOCK.acquire(blocking=False)
+    islanddb_module._ARROW_POOL_LOCK.release()
+    assert not any(
+        thread.name == "islanddb-telemetry" and thread.is_alive()
+        for thread in __import__("threading").enumerate()
+    )
+
+
+def test_telemetry_constructor_failure_is_fail_open_and_releases_resources(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "no-sampler-profile.json")
+    engine = IslandDB()
+
+    class BrokenTelemetry:
+        def __init__(self):
+            raise RuntimeError("sampler thread unavailable")
+
+    monkeypatch.setattr(islanddb_module, "_IslandTelemetry", BrokenTelemetry)
+    result = engine.execute(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+
+    assert result["n"].iloc[0] == 100
+    assert engine.last_profile.result_complete is True
+    assert engine.last_profile.cpu_time_measured is False
+    assert engine.last_profile.cpu_time_scope == "unavailable"
+    assert engine.last_profile.rss_measured is False
+    assert engine.last_profile.physical_read_bytes_measured is False
+    assert islanddb_module._ISLAND_EXECUTION_SLOT.acquire(blocking=False)
+    islanddb_module._ISLAND_EXECUTION_SLOT.release()
+    assert islanddb_module._ARROW_POOL_LOCK.acquire(blocking=False)
+    islanddb_module._ARROW_POOL_LOCK.release()
+
+
+def test_profile_finalization_failure_cannot_reuse_previous_query_profile(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    engine = IslandDB()
+    first_query = "SELECT count(*) AS n FROM s.t"
+    first_parser = SQLParser("s", first_query, "duckdb")
+    first_manager = QueryPlanManager("s", "island-tests", "", first_query)
+    first_manager.query_plan_path = str(tmp_path / "first-profile.json")
+    first = engine.execute(
+        numeric_reflection, first_parser, first_manager, lambda _: None,
+    )
+    first_profile = first_manager._island_profile
+    assert first["n"].iloc[0] == 100
+    assert first_profile.result_complete is True
+
+    second_query = "SELECT count(*) AS n FROM s.t WHERE id >= 50"
+    second_parser = SQLParser("s", second_query, "duckdb")
+    second_manager = QueryPlanManager("s", "island-tests", "", second_query)
+    second_manager.query_plan_path = str(tmp_path / "second-profile.json")
+    monkeypatch.setattr(
+        islanddb_module._QueryExecutionMetrics,
+        "snapshot",
+        lambda _self: (_ for _ in ()).throw(
+            RuntimeError("profile construction failed")
+        ),
+    )
+    second = engine.execute(
+        numeric_reflection, second_parser, second_manager, lambda _: None,
+    )
+
+    assert second["n"].iloc[0] == 50
+    assert second_manager._island_profile is None
+    assert second_manager._island_profile_token != first_profile.telemetry_query_id
+    assert engine.last_profile.telemetry_query_id == (
+        second_manager._island_profile_token
+    )
+    assert engine.last_profile.execution_outcome == "telemetry_pending"
+
+
+def test_profile_persistence_never_dereferences_shared_last_profile(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "query-local-profile.json")
+    engine = IslandDB()
+    original_write = engine._write_profile
+
+    def clobber_shared_pointer(path, profile):
+        engine.last_profile = islanddb_module.IslandProfile(
+            telemetry_query_id="another-query",
+            execution_outcome="telemetry_pending",
+        )
+        return original_write(path, profile)
+
+    monkeypatch.setattr(engine, "_write_profile", clobber_shared_pointer)
+    result = engine.execute(
+        numeric_reflection, parser, manager, lambda _: None,
+    )
+    persisted = json.loads(
+        (tmp_path / "query-local-profile.json").read_text()
+    )
+
+    assert result["n"].iloc[0] == 100
+    assert persisted["telemetry_query_id"] == manager._island_profile_token
+    assert persisted["execution_outcome"] == "completed"
+    assert manager._island_profile.telemetry_query_id == (
+        manager._island_profile_token
+    )
+    assert engine.last_profile is manager._island_profile
 
 
 def test_projection_and_predicate_are_pushed_into_parquet(tmp_path, numeric_reflection):
@@ -1921,6 +2403,21 @@ def test_public_executor_dispatches_explicit_islanddb(
     assert not any(
         "FILE_CACHE_LOCALIZED_FILES" in item for item in stats.stats
     )
+    telemetry = next(
+        item["ISLAND_TELEMETRY"]
+        for item in stats.stats
+        if "ISLAND_TELEMETRY" in item
+    )
+    assert telemetry["telemetry_query_id"] == manager._island_profile_token
+    assert telemetry["planned_files_complete"] is True
+    assert telemetry["planned_row_groups_complete"] is True
+    assert telemetry["planned_rows_complete"] is True
+    assert telemetry["physical_read_bytes"] >= 0
+    assert telemetry["physical_read_bytes_measured"] is True
+    assert telemetry["physical_read_scope"] == (
+        "linux_proc_self_io_block_read_delta_after_admission_"
+        "until_profile_finalize"
+    )
 
 
 def test_public_executor_arrow_stream_is_batched_and_exact(
@@ -1929,6 +2426,7 @@ def test_public_executor_arrow_stream_is_batched_and_exact(
     query = "SELECT id, v FROM s.t WHERE id >= 95 ORDER BY id"
     parser = SQLParser("s", query, "duckdb")
     manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "executor-stream-plan.json")
     stats = PlanStats()
     stream, used = Executor(
         storage=LocalStorage(), organization="island-tests",
@@ -1948,6 +2446,56 @@ def test_public_executor_arrow_stream_is_batched_and_exact(
     assert used == "islanddb"
     assert table.column("id").to_pylist() == [95, 96, 97, 98, 99]
     assert any(item.get("RESULT_MODE") == "arrow_stream" for item in stats.stats)
+    telemetry = next(
+        item["ISLAND_TELEMETRY"]
+        for item in stats.stats
+        if "ISLAND_TELEMETRY" in item
+    )
+    assert telemetry["result_complete"] is True
+    assert telemetry["execution_outcome"] == "completed"
+    assert telemetry["result_rows"] == 5
+
+
+def test_public_executor_partial_stream_publishes_fallback_when_profile_write_fails(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "missing-stream-profile.json")
+    stats = PlanStats()
+    executor = Executor(
+        storage=LocalStorage(), organization="island-tests",
+    )
+    monkeypatch.setattr(
+        executor.island_exec,
+        "_write_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("profile unavailable")
+        ),
+    )
+
+    stream, used = executor.execute_stream(
+        Engine.ISLANDDB,
+        numeric_reflection,
+        parser,
+        manager,
+        Timer(),
+        stats,
+        "",
+    )
+    stream.close()
+
+    assert used == "islanddb"
+    telemetry = next(
+        item["ISLAND_TELEMETRY"]
+        for item in stats.stats
+        if "ISLAND_TELEMETRY" in item
+    )
+    assert telemetry["result_complete"] is False
+    assert telemetry["execution_outcome"] == "closed_early"
+    assert telemetry["profile_persist_succeeded"] is False
+    assert not (tmp_path / "missing-stream-profile.json").exists()
 
 
 def test_auto_arrow_stream_records_selected_and_actual_engine(

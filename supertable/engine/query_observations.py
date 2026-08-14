@@ -26,10 +26,14 @@ from supertable.engine.adaptive_router import EngineHistory
 from supertable.engine.engine_enum import Engine
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 OBSERVATION_SCHEMA_VERSION = 1
 MAX_SANITIZED_PROFILE_BYTES = 64 * 1024
 MAX_PROFILE_DEPTH = 8
+ISLAND_FEEDBACK_DURATION_SCOPE = (
+    "engine_after_admission_through_stream_close_"
+    "excludes_facade_and_profile_persist"
+)
 MAX_PROFILE_ITEMS = 96
 MAX_PROFILE_STRING = 2_048
 MAX_OBSERVATION_SIGNATURES_HARD = 16_384
@@ -71,6 +75,13 @@ def _integer(value: object, *, maximum: int = (1 << 63) - 1) -> int:
     if number is None:
         return 0
     return min(maximum, max(0, int(number)))
+
+
+def _signed_integer(value: object, *, maximum: int = (1 << 63) - 1) -> int:
+    number = _finite_number(value)
+    if number is None:
+        return 0
+    return max(-maximum, min(maximum, int(number)))
 
 
 def _redact_url(match: re.Match[str]) -> str:
@@ -259,19 +270,46 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
         "duration_source": "unknown",
         "duration_measured": False,
         "cpu_time_us": 0,
+        "cpu_time_measured": False,
+        "cpu_time_scope": "unknown",
         "actual_scan_bytes": 0,
         "actual_scan_bytes_measured": False,
+        "actual_scan_bytes_scope": "unknown",
         "result_bytes": 0,
         "result_bytes_measured": False,
+        "result_bytes_scope": "unknown",
+        "result_rows": 0,
+        "result_rows_measured": False,
+        "result_rows_scope": "unknown",
         "peak_memory_bytes": 0,
         "spill_bytes": 0,
         "spill_bytes_measured": False,
         "rows_scanned": 0,
+        "rows_scanned_measured": False,
         "logical_scan_bytes": 0,
         "logical_scan_bytes_complete": False,
         "physical_read_bytes": 0,
         "physical_read_bytes_measured": False,
+        "physical_read_scope": "unknown",
         "peak_memory_scope": "unknown",
+        "rss_baseline_bytes": 0,
+        "rss_peak_bytes": 0,
+        "rss_final_bytes": 0,
+        "rss_peak_delta_bytes": 0,
+        "rss_retained_delta_bytes": 0,
+        "rss_measured": False,
+        "rss_scope": "unknown",
+        "duration_scope": "unknown",
+        "execution_outcome": "unknown",
+        "result_complete": None,
+        "candidate_rows": 0,
+        "candidate_rows_complete": False,
+        "candidate_files": 0,
+        "candidate_files_complete": False,
+        "candidate_row_groups": 0,
+        "candidate_row_groups_complete": False,
+        "planned_row_groups": 0,
+        "planned_row_groups_complete": False,
     }
     if actual_engine.startswith("duckdb"):
         latency = _finite_number(profile.get("latency"))
@@ -280,18 +318,23 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
                 engine_wall_us=_integer(latency * 1_000_000),
                 duration_source="engine_profile",
                 duration_measured=True,
+                duration_scope="duckdb_engine_profile_latency_excludes_facade",
             )
-        metrics["cpu_time_us"] = _integer(
-            (_finite_number(profile.get("cpu_time")) or 0) * 1_000_000,
-        )
+        cpu_time = _finite_number(profile.get("cpu_time"))
+        if cpu_time is not None and cpu_time >= 0:
+            metrics["cpu_time_us"] = _integer(cpu_time * 1_000_000)
+            metrics["cpu_time_measured"] = True
+            metrics["cpu_time_scope"] = "duckdb_engine_profile_cpu_time"
         if _finite_number(profile.get("total_bytes_read")) is not None:
             metrics["actual_scan_bytes"] = _integer(profile.get("total_bytes_read"))
             metrics["actual_scan_bytes_measured"] = True
-            metrics["physical_read_bytes"] = metrics["actual_scan_bytes"]
-            metrics["physical_read_bytes_measured"] = True
+            metrics["actual_scan_bytes_scope"] = (
+                "duckdb_engine_profile_total_bytes_read"
+            )
         if _finite_number(profile.get("result_set_size")) is not None:
             metrics["result_bytes"] = _integer(profile.get("result_set_size"))
             metrics["result_bytes_measured"] = True
+            metrics["result_bytes_scope"] = "duckdb_engine_result_set_size"
         metrics["peak_memory_bytes"] = _integer(
             profile.get("system_peak_buffer_memory"),
         )
@@ -299,7 +342,11 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
         if _finite_number(profile.get("system_peak_temp_dir_size")) is not None:
             metrics["spill_bytes"] = _integer(profile.get("system_peak_temp_dir_size"))
             metrics["spill_bytes_measured"] = True
-        metrics["rows_scanned"] = _integer(profile.get("cumulative_rows_scanned"))
+        if _finite_number(profile.get("cumulative_rows_scanned")) is not None:
+            metrics["rows_scanned"] = _integer(
+                profile.get("cumulative_rows_scanned")
+            )
+            metrics["rows_scanned_measured"] = True
     elif actual_engine == Engine.ISLANDDB.value:
         elapsed_ms = _finite_number(profile.get("elapsed_ms"))
         if elapsed_ms is not None and elapsed_ms >= 0:
@@ -307,10 +354,39 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
                 engine_wall_us=_integer(elapsed_ms * 1_000),
                 duration_source="engine_profile",
                 duration_measured=True,
+                duration_scope=redact_text(
+                    profile.get("elapsed_scope"), limit=160,
+                ),
             )
-        metrics["cpu_time_us"] = _integer(
-            (_finite_number(profile.get("cpu_time_ms")) or 0) * 1_000,
+        metrics["execution_outcome"] = redact_text(
+            profile.get("execution_outcome"), limit=32,
         )
+        if isinstance(profile.get("result_complete"), bool):
+            metrics["result_complete"] = bool(profile.get("result_complete"))
+            if not metrics["result_complete"]:
+                # A partial/abandoned stream is useful diagnostic telemetry but
+                # cannot be a completed-engine latency sample for AUTO feedback.
+                metrics["duration_measured"] = False
+        cpu_time_ms = _finite_number(profile.get("cpu_time_ms"))
+        cpu_time_measured = bool(profile.get("cpu_time_measured", False))
+        if cpu_time_ms is not None and cpu_time_ms >= 0 and cpu_time_measured:
+            metrics["cpu_time_us"] = _integer(cpu_time_ms * 1_000)
+            metrics["cpu_time_measured"] = True
+            metrics["cpu_time_scope"] = redact_text(
+                profile.get("cpu_time_scope"), limit=96,
+            ) or "process_cpu_delta"
+        if _finite_number(profile.get("result_rows")) is not None:
+            metrics["result_rows"] = _integer(profile.get("result_rows"))
+            metrics["result_rows_measured"] = True
+            metrics["result_rows_scope"] = redact_text(
+                profile.get("result_rows_scope"), limit=80,
+            ) or "arrow_output_rows"
+        if _finite_number(profile.get("result_bytes")) is not None:
+            metrics["result_bytes"] = _integer(profile.get("result_bytes"))
+            metrics["result_bytes_measured"] = True
+            metrics["result_bytes_scope"] = redact_text(
+                profile.get("result_bytes_scope"), limit=96,
+            ) or "arrow_output_batch_logical_nbytes"
         metrics["logical_scan_bytes"] = _integer(
             profile.get("logical_scan_bytes")
         )
@@ -324,6 +400,9 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
             metrics["physical_read_bytes_measured"] = bool(
                 profile.get("physical_read_bytes_measured", False)
             )
+            metrics["physical_read_scope"] = redact_text(
+                profile.get("physical_read_scope"), limit=96,
+            )
         cache = profile.get("cache")
         if isinstance(cache, Mapping):
             remote = (
@@ -335,17 +414,62 @@ def _profile_metrics(profile: Mapping[str, object], actual_engine: str) -> Dict[
             ):
                 metrics["actual_scan_bytes"] = remote
                 metrics["actual_scan_bytes_measured"] = True
-        resources = profile.get("resources")
+                metrics["actual_scan_bytes_scope"] = "remote_fetch_bytes"
         metrics["peak_memory_bytes"] = _integer(profile.get("peak_memory_bytes"))
         metrics["peak_memory_scope"] = redact_text(
-            profile.get("peak_memory_scope"), limit=32,
+            profile.get("peak_memory_scope"), limit=96,
         )
+        metrics["rss_baseline_bytes"] = _integer(
+            profile.get("rss_baseline_bytes")
+        )
+        metrics["rss_peak_bytes"] = _integer(profile.get("rss_peak_bytes"))
+        metrics["rss_final_bytes"] = _integer(profile.get("rss_final_bytes"))
+        metrics["rss_peak_delta_bytes"] = _integer(
+            profile.get("rss_peak_delta_bytes")
+            if profile.get("rss_peak_delta_bytes") is not None
+            else profile.get("peak_memory_bytes")
+        )
+        metrics["rss_retained_delta_bytes"] = _signed_integer(
+            profile.get("rss_retained_delta_bytes")
+        )
+        metrics["rss_measured"] = bool(profile.get("rss_measured", False))
+        metrics["rss_scope"] = redact_text(profile.get("rss_scope"), limit=64)
         if _finite_number(profile.get("spill_bytes")) is not None:
             metrics["spill_bytes"] = _integer(profile.get("spill_bytes"))
             metrics["spill_bytes_measured"] = bool(
                 profile.get("spill_bytes_measured", False)
             )
-        metrics["rows_scanned"] = _integer(profile.get("rows_scanned"))
+        observed_rows = profile.get("observed_rows_scanned")
+        observed_measured = bool(
+            profile.get("observed_rows_scanned_measured", False)
+        )
+        if observed_measured and _finite_number(observed_rows) is not None:
+            metrics["rows_scanned"] = _integer(observed_rows)
+            metrics["rows_scanned_measured"] = True
+        metrics["candidate_rows"] = _integer(
+            profile.get("estimated_candidate_rows")
+        )
+        metrics["candidate_rows_complete"] = bool(
+            profile.get("estimated_candidate_rows_complete", False)
+        )
+        metrics["candidate_files"] = _integer(
+            profile.get("estimated_candidate_files")
+        )
+        metrics["candidate_files_complete"] = bool(
+            profile.get("estimated_candidate_files_complete", False)
+        )
+        metrics["candidate_row_groups"] = _integer(
+            profile.get("estimated_candidate_row_groups")
+        )
+        metrics["candidate_row_groups_complete"] = bool(
+            profile.get("estimated_candidate_row_groups_complete", False)
+        )
+        metrics["planned_row_groups"] = _integer(
+            profile.get("planned_row_groups")
+        )
+        metrics["planned_row_groups_complete"] = bool(
+            profile.get("planned_row_groups_complete", False)
+        )
     return metrics
 
 
@@ -363,33 +487,56 @@ class NormalizedQueryProfile:
     policy_version: str
     duration_source: str
     duration_measured: bool
+    duration_scope: str
     engine_wall_us: int
     total_wall_us: int
     cpu_time_us: int
+    cpu_time_measured: bool
+    cpu_time_scope: str
     estimated_scan_bytes: int
     actual_scan_bytes: int
     actual_scan_bytes_measured: bool
+    actual_scan_bytes_scope: str
     logical_scan_bytes: int
     logical_scan_bytes_complete: bool
     physical_read_bytes: int
     physical_read_bytes_measured: bool
+    physical_read_scope: str
     decoded_bytes: int
     decoded_bytes_complete: bool
     work_bytes: int
     total_files: int
     selected_row_groups: int
+    selected_row_groups_complete: bool
+    planned_row_groups: int
+    planned_row_groups_complete: bool
+    candidate_rows: int
+    candidate_rows_complete: bool
     result_rows: int
+    result_rows_measured: bool
+    result_rows_scope: str
     result_columns: int
     result_bytes: int
     result_bytes_measured: bool
+    result_bytes_scope: str
     peak_memory_bytes: int
     peak_memory_scope: str
+    rss_baseline_bytes: int
+    rss_peak_bytes: int
+    rss_final_bytes: int
+    rss_peak_delta_bytes: int
+    rss_retained_delta_bytes: int
+    rss_measured: bool
+    rss_scope: str
     spill_bytes: int
     spill_bytes_measured: bool
     cache_hits: int
     cache_hit_bytes: int
     cache_remote_bytes: int
     rows_scanned: int
+    rows_scanned_measured: bool
+    execution_outcome: str
+    result_complete: Optional[bool]
     routing_decision: object
 
     def as_dict(self) -> Dict[str, object]:
@@ -433,11 +580,23 @@ def normalize_query_profile(
         request_stat.get("forced", requested != Engine.AUTO.value)
     )
 
-    profile = engine_profile if isinstance(engine_profile, Mapping) else {}
+    # The atomically persisted profile is primary. Executor also carries the
+    # same query-tokenized in-memory document in PlanStats, so an unavailable
+    # profile path does not erase telemetry or fall back to another request.
+    telemetry_fallback = stats.get("ISLAND_TELEMETRY")
+    telemetry_fallback = (
+        telemetry_fallback if isinstance(telemetry_fallback, Mapping) else {}
+    )
+    profile = dict(
+        telemetry_fallback if actual == Engine.ISLANDDB.value else {}
+    )
+    if isinstance(engine_profile, Mapping):
+        profile.update(engine_profile)
     metrics = _profile_metrics(profile, actual)
     if _finite_number(stats.get("RESULT_BYTES")) is not None:
         metrics["result_bytes"] = _integer(stats.get("RESULT_BYTES"))
         metrics["result_bytes_measured"] = True
+        metrics["result_bytes_scope"] = "materialized_pandas_deep_memory_usage"
     executing_s = _timing_seconds(timing, "EXECUTING_QUERY")
     total_s = _timing_seconds(timing, "TOTAL_EXECUTE")
     if not metrics["engine_wall_us"] and executing_s is not None:
@@ -445,13 +604,24 @@ def normalize_query_profile(
             engine_wall_us=_integer(executing_s * 1_000_000),
             duration_source="executing_query",
             duration_measured=True,
+            duration_scope="executing_query_timer",
         )
     elif not metrics["engine_wall_us"] and total_s is not None:
         metrics.update(
             engine_wall_us=_integer(total_s * 1_000_000),
             duration_source="total_execute",
             duration_measured=True,
+            duration_scope="total_execute_timer",
         )
+    if actual == Engine.ISLANDDB.value and (
+        metrics["result_complete"] is not True
+        or metrics["duration_scope"] != ISLAND_FEEDBACK_DURATION_SCOPE
+    ):
+        # Never let a generic outer timer or a scope-incompatible legacy
+        # profile train the same Redis history as the comparable native engine
+        # boundary. Diagnostics remain present; only adaptive eligibility is
+        # removed.
+        metrics["duration_measured"] = False
 
     scan = _integer(
         features.get("effective_scan_bytes")
@@ -468,6 +638,20 @@ def normalize_query_profile(
 
     island_cache = stats.get("ISLAND_CACHE")
     island_cache = island_cache if isinstance(island_cache, Mapping) else {}
+    if (
+        actual == Engine.ISLANDDB.value
+        and not bool(metrics["actual_scan_bytes_measured"])
+        and (
+            "range_remote_bytes" in island_cache
+            or "downloaded_bytes" in island_cache
+        )
+    ):
+        metrics["actual_scan_bytes"] = (
+            _integer(island_cache.get("range_remote_bytes"))
+            + _integer(island_cache.get("downloaded_bytes"))
+        )
+        metrics["actual_scan_bytes_measured"] = True
+        metrics["actual_scan_bytes_scope"] = "remote_fetch_bytes"
     cache_hits = _integer(stats.get("FILE_CACHE_HITS")) + _integer(
         island_cache.get("range_cache_hit_chunks")
         or island_cache.get("cache_hit_chunks")
@@ -493,6 +677,11 @@ def normalize_query_profile(
     rows, columns = (0, 0)
     if isinstance(result_shape, (tuple, list)) and len(result_shape) >= 2:
         rows, columns = _integer(result_shape[0]), _integer(result_shape[1])
+        metrics["result_rows"] = rows
+        metrics["result_rows_measured"] = True
+        metrics["result_rows_scope"] = "materialized_result_shape"
+    elif bool(metrics["result_rows_measured"]):
+        rows = _integer(metrics["result_rows"])
 
     return NormalizedQueryProfile(
         schema_version=PROFILE_SCHEMA_VERSION,
@@ -507,38 +696,76 @@ def normalize_query_profile(
         policy_version=redact_text(routing.get("policy_version"), limit=64),
         duration_source=str(metrics["duration_source"]),
         duration_measured=bool(metrics["duration_measured"]),
+        duration_scope=str(metrics["duration_scope"]),
         engine_wall_us=_integer(metrics["engine_wall_us"]),
         total_wall_us=_integer((total_s or 0) * 1_000_000),
         cpu_time_us=_integer(metrics["cpu_time_us"]),
+        cpu_time_measured=bool(metrics["cpu_time_measured"]),
+        cpu_time_scope=str(metrics["cpu_time_scope"]),
         estimated_scan_bytes=scan,
         actual_scan_bytes=_integer(metrics["actual_scan_bytes"]),
         actual_scan_bytes_measured=bool(metrics["actual_scan_bytes_measured"]),
+        actual_scan_bytes_scope=str(metrics["actual_scan_bytes_scope"]),
         logical_scan_bytes=_integer(metrics["logical_scan_bytes"]),
         logical_scan_bytes_complete=bool(metrics["logical_scan_bytes_complete"]),
         physical_read_bytes=_integer(metrics["physical_read_bytes"]),
         physical_read_bytes_measured=bool(metrics["physical_read_bytes_measured"]),
+        physical_read_scope=str(metrics["physical_read_scope"]),
         decoded_bytes=decoded,
         decoded_bytes_complete=decoded_complete,
         work_bytes=work_bytes,
-        total_files=_integer(
-            features.get("total_files") if features else stats.get("REFLECTIONS")
+        total_files=(
+            _integer(metrics["candidate_files"])
+            if bool(metrics["candidate_files_complete"])
+            else _integer(
+                features.get("total_files")
+                if features else stats.get("REFLECTIONS")
+            )
         ),
-        selected_row_groups=_integer(
-            features.get("selected_row_groups")
-            if features else stats.get("ISLAND_SELECTED_ROW_GROUPS")
+        selected_row_groups=(
+            _integer(metrics["candidate_row_groups"])
+            if bool(metrics["candidate_row_groups_complete"])
+            else _integer(
+                features.get("selected_row_groups")
+                if features else stats.get("ISLAND_SELECTED_ROW_GROUPS")
+            )
         ),
+        selected_row_groups_complete=bool(
+            metrics["candidate_row_groups_complete"]
+        ),
+        planned_row_groups=_integer(metrics["planned_row_groups"]),
+        planned_row_groups_complete=bool(
+            metrics["planned_row_groups_complete"]
+        ),
+        candidate_rows=_integer(metrics["candidate_rows"]),
+        candidate_rows_complete=bool(metrics["candidate_rows_complete"]),
         result_rows=rows,
+        result_rows_measured=bool(metrics["result_rows_measured"]),
+        result_rows_scope=str(metrics["result_rows_scope"]),
         result_columns=columns,
         result_bytes=_integer(metrics["result_bytes"]),
         result_bytes_measured=bool(metrics["result_bytes_measured"]),
+        result_bytes_scope=str(metrics["result_bytes_scope"]),
         peak_memory_bytes=_integer(metrics["peak_memory_bytes"]),
         peak_memory_scope=str(metrics["peak_memory_scope"]),
+        rss_baseline_bytes=_integer(metrics["rss_baseline_bytes"]),
+        rss_peak_bytes=_integer(metrics["rss_peak_bytes"]),
+        rss_final_bytes=_integer(metrics["rss_final_bytes"]),
+        rss_peak_delta_bytes=_integer(metrics["rss_peak_delta_bytes"]),
+        rss_retained_delta_bytes=_signed_integer(
+            metrics["rss_retained_delta_bytes"]
+        ),
+        rss_measured=bool(metrics["rss_measured"]),
+        rss_scope=str(metrics["rss_scope"]),
         spill_bytes=_integer(metrics["spill_bytes"]),
         spill_bytes_measured=bool(metrics["spill_bytes_measured"]),
         cache_hits=cache_hits,
         cache_hit_bytes=cache_hit_bytes,
         cache_remote_bytes=cache_remote_bytes,
         rows_scanned=_integer(metrics["rows_scanned"]),
+        rows_scanned_measured=bool(metrics["rows_scanned_measured"]),
+        execution_outcome=str(metrics["execution_outcome"]),
+        result_complete=metrics["result_complete"],
         routing_decision=sanitize_profile(routing, max_bytes=16 * 1024),
     )
 

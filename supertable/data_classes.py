@@ -323,6 +323,13 @@ class SuperSnapshot:
     # contributing stats row has passed its snapshot footer/count/digest seal.
     # Absence is conservative and preserves the general spill plan.
     integer_domain_bounds: Dict[str, IntegerDomainBound] = field(default_factory=dict)
+    # Exact number of estimator-candidate row groups across ``resource_keys``.
+    # This is planning provenance, not a runtime scanner counter: a native
+    # reader may conservatively open a wider set and apply its own footer/page
+    # pruning.  ``candidate_row_groups_complete=False`` means unknown, never
+    # zero.  Trailing fields preserve the positional constructor contract.
+    candidate_row_groups: int = 0
+    candidate_row_groups_complete: bool = False
 
 
 @dataclass

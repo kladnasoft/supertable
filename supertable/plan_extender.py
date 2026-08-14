@@ -112,7 +112,10 @@ def extend_execution_plan(
     # Normalize inputs
     timing = timing or {}
     message = message or ""
-    result_shape = result_shape or (0, 0)
+    # Preserve an unknown shape through normalization so a streaming engine's
+    # measured output counters are not overwritten by a display-only `(0, 0)`.
+    normalized_result_shape = result_shape
+    display_result_shape = result_shape or (0, 0)
 
     # Build the normalized scalar view before sanitizing the diagnostic tree;
     # extractors need typed metrics such as DuckDB latency/bytes and IslandDB
@@ -123,9 +126,14 @@ def extend_execution_plan(
         timing=timing,
         plan_stats=plan_stats,
         status=status,
-        result_shape=result_shape,
+        result_shape=normalized_result_shape,
         engine_profile=base_plan,
     )
+    if normalized_result_shape is None:
+        display_result_shape = (
+            normalized.result_rows,
+            normalized.result_columns,
+        )
     safe_plan = sanitize_profile(base_plan)
     safe_overview = sanitize_profile(
         plan_stats.summary() if hasattr(plan_stats, "summary") else plan_stats.stats,
@@ -179,8 +187,8 @@ def extend_execution_plan(
             "engine_fallback": normalized.fallback,
             "status": status,
             "message": redact_text(message, limit=1_000),
-            "result_rows": int(result_shape[0]),
-            "result_columns": int(result_shape[1]),
+            "result_rows": int(display_result_shape[0]),
+            "result_columns": int(display_result_shape[1]),
             # Store complex parts as JSON strings to keep row schema flat
             "execution_timings": _safe_json(extended_plan["execution_timings"]),
             "profile_overview": _safe_json(extended_plan["profile_overview"]),

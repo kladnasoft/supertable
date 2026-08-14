@@ -126,6 +126,7 @@ class IslandPreparedQuery:
 
 @dataclass
 class IslandProfile:
+    telemetry_query_id: str = ""
     native: bool = True
     source_bytes: int = 0
     estimated_scan_bytes: int = 0
@@ -135,26 +136,89 @@ class IslandProfile:
     cache: Dict[str, object] = field(default_factory=dict)
     resources: Dict[str, object] = field(default_factory=dict)
     spill: Dict[str, object] = field(default_factory=dict)
+    estimated_candidate_files: int = 0
+    estimated_candidate_files_complete: bool = False
+    estimated_candidate_row_groups: int = 0
+    estimated_candidate_row_groups_complete: bool = False
+    # Physical scan units proven while constructing the executable relation.
+    # These are plan facts, not claims about which units a native scanner
+    # ultimately opened after its own runtime statistics pruning.
+    planned_files: int = 0
+    planned_files_complete: bool = False
+    planned_row_groups: int = 0
+    planned_row_groups_complete: bool = False
+    planned_rows: int = 0
+    planned_rows_complete: bool = False
+    planned_units_scope: str = "scan_node_occurrences"
+    # Polars/Arrow do not currently expose trustworthy runtime file/row-group
+    # counters for every IslandDB path.  Keep unavailable observations nullable
+    # rather than serialising a plausible-looking zero.
+    observed_files: Optional[int] = None
+    observed_files_measured: bool = False
+    observed_row_groups: Optional[int] = None
+    observed_row_groups_measured: bool = False
+    observed_rows_scanned: Optional[int] = None
+    observed_rows_scanned_measured: bool = False
+    execution_outcome: str = "unknown"
+    result_complete: bool = False
+    # Deprecated compatibility alias for ``planned_row_groups``.  It remains
+    # present for older readers but is explicitly labelled in the JSON profile.
     selected_row_groups: int = 0
+    selected_row_groups_scope: str = "deprecated_planned_alias"
     cpu_time_ms: float = 0.0
+    cpu_time_measured: bool = False
+    cpu_time_scope: str = (
+        "process_cpu_delta_after_admission_until_profile_finalize"
+    )
+    estimated_logical_scan_bytes: int = 0
+    estimated_logical_scan_bytes_complete: bool = False
     logical_scan_bytes: int = 0
     logical_scan_bytes_complete: bool = False
     physical_read_bytes: int = 0
     physical_read_bytes_measured: bool = False
+    physical_read_scope: str = (
+        "linux_proc_self_io_block_read_delta_after_admission_"
+        "until_profile_finalize"
+    )
+    estimated_decoded_bytes: int = 0
+    estimated_decoded_bytes_complete: bool = False
     decoded_bytes: int = 0
     decoded_bytes_complete: bool = False
+    estimated_candidate_rows: int = 0
+    estimated_candidate_rows_complete: bool = False
     rows_scanned: int = 0
     rows_scanned_measured: bool = False
     result_rows: int = 0
+    result_rows_scope: str = "arrow_output_rows"
+    result_batches: int = 0
+    result_batches_scope: str = "arrow_output_record_batches"
     result_bytes: int = 0
+    result_bytes_scope: str = "arrow_output_batch_logical_nbytes"
+    rss_baseline_bytes: Optional[int] = None
+    rss_peak_bytes: Optional[int] = None
+    rss_final_bytes: Optional[int] = None
+    rss_peak_delta_bytes: Optional[int] = None
+    rss_retained_delta_bytes: Optional[int] = None
+    rss_measured: bool = False
+    rss_sample_interval_ms: float = 10.0
+    rss_scope: str = "unknown"
     peak_memory_bytes: int = 0
     peak_memory_scope: str = "unknown"
+    elapsed_scope: str = "engine_after_admission_to_result_ready_excludes_profile_persist"
+    phase_timings_ms: Dict[str, float] = field(default_factory=dict)
+    phase_timings_scope: str = "monotonic_wall_nested_non_additive"
+    profile_persist_ms: Optional[float] = None
+    profile_persist_ms_measured: bool = False
+    profile_persist_succeeded: Optional[bool] = None
     spill_bytes: int = 0
     spill_bytes_measured: bool = False
+    spill_bytes_scope: str = "peak_query_temp_footprint"
+    spill_occurred: bool = False
 
     def as_dict(self) -> Dict[str, object]:
         return {
             "engine": "islanddb",
+            "telemetry_query_id": self.telemetry_query_id,
             "native": self.native,
             "source_bytes": int(self.source_bytes),
             "estimated_scan_bytes": int(self.estimated_scan_bytes),
@@ -164,22 +228,124 @@ class IslandProfile:
             "cache": dict(self.cache),
             "resources": dict(self.resources),
             "spill": dict(self.spill),
+            "estimated_candidate_files": int(self.estimated_candidate_files),
+            "estimated_candidate_files_complete": bool(
+                self.estimated_candidate_files_complete
+            ),
+            "estimated_candidate_row_groups": int(
+                self.estimated_candidate_row_groups
+            ),
+            "estimated_candidate_row_groups_complete": bool(
+                self.estimated_candidate_row_groups_complete
+            ),
+            "planned_files": int(self.planned_files),
+            "planned_files_complete": bool(self.planned_files_complete),
+            "planned_row_groups": int(self.planned_row_groups),
+            "planned_row_groups_complete": bool(self.planned_row_groups_complete),
+            "planned_rows": int(self.planned_rows),
+            "planned_rows_complete": bool(self.planned_rows_complete),
+            "planned_units_scope": self.planned_units_scope,
+            "observed_files": (
+                int(self.observed_files) if self.observed_files is not None else None
+            ),
+            "observed_files_measured": bool(self.observed_files_measured),
+            "observed_row_groups": (
+                int(self.observed_row_groups)
+                if self.observed_row_groups is not None else None
+            ),
+            "observed_row_groups_measured": bool(
+                self.observed_row_groups_measured
+            ),
+            "observed_rows_scanned": (
+                int(self.observed_rows_scanned)
+                if self.observed_rows_scanned is not None else None
+            ),
+            "observed_rows_scanned_measured": bool(
+                self.observed_rows_scanned_measured
+            ),
+            "execution_outcome": self.execution_outcome,
+            "result_complete": bool(self.result_complete),
             "selected_row_groups": int(self.selected_row_groups),
+            "selected_row_groups_scope": self.selected_row_groups_scope,
             "cpu_time_ms": round(float(self.cpu_time_ms), 3),
+            "cpu_time_measured": bool(self.cpu_time_measured),
+            "cpu_time_scope": self.cpu_time_scope,
+            "estimated_logical_scan_bytes": int(
+                self.estimated_logical_scan_bytes
+            ),
+            "estimated_logical_scan_bytes_complete": bool(
+                self.estimated_logical_scan_bytes_complete
+            ),
             "logical_scan_bytes": int(self.logical_scan_bytes),
             "logical_scan_bytes_complete": bool(self.logical_scan_bytes_complete),
             "physical_read_bytes": int(self.physical_read_bytes),
             "physical_read_bytes_measured": bool(self.physical_read_bytes_measured),
+            "physical_read_scope": self.physical_read_scope,
+            "estimated_decoded_bytes": int(self.estimated_decoded_bytes),
+            "estimated_decoded_bytes_complete": bool(
+                self.estimated_decoded_bytes_complete
+            ),
             "decoded_bytes": int(self.decoded_bytes),
             "decoded_bytes_complete": bool(self.decoded_bytes_complete),
+            "estimated_candidate_rows": int(self.estimated_candidate_rows),
+            "estimated_candidate_rows_complete": bool(
+                self.estimated_candidate_rows_complete
+            ),
             "rows_scanned": int(self.rows_scanned),
             "rows_scanned_measured": bool(self.rows_scanned_measured),
             "result_rows": int(self.result_rows),
+            "result_rows_scope": self.result_rows_scope,
+            "result_batches": int(self.result_batches),
+            "result_batches_scope": self.result_batches_scope,
             "result_bytes": int(self.result_bytes),
+            "result_bytes_scope": self.result_bytes_scope,
+            "rss_baseline_bytes": (
+                int(self.rss_baseline_bytes)
+                if self.rss_baseline_bytes is not None else None
+            ),
+            "rss_peak_bytes": (
+                int(self.rss_peak_bytes) if self.rss_peak_bytes is not None else None
+            ),
+            "rss_final_bytes": (
+                int(self.rss_final_bytes) if self.rss_final_bytes is not None else None
+            ),
+            "rss_peak_delta_bytes": (
+                int(self.rss_peak_delta_bytes)
+                if self.rss_peak_delta_bytes is not None else None
+            ),
+            "rss_retained_delta_bytes": (
+                int(self.rss_retained_delta_bytes)
+                if self.rss_retained_delta_bytes is not None else None
+            ),
+            "rss_measured": bool(self.rss_measured),
+            "rss_sample_interval_ms": round(
+                float(self.rss_sample_interval_ms), 3,
+            ),
+            "rss_scope": self.rss_scope,
             "peak_memory_bytes": int(self.peak_memory_bytes),
             "peak_memory_scope": self.peak_memory_scope,
+            "elapsed_scope": self.elapsed_scope,
+            "phase_timings_ms": {
+                str(name): round(float(value), 3)
+                for name, value in self.phase_timings_ms.items()
+            },
+            "phase_timings_scope": self.phase_timings_scope,
+            # A profile cannot truthfully contain the duration of the atomic
+            # write which is persisting that same payload.  The artifact marks
+            # it unavailable; ``last_profile`` is updated with the exact
+            # attempt duration immediately after the commit returns.
+            "profile_persist_ms": (
+                round(float(self.profile_persist_ms), 3)
+                if self.profile_persist_ms is not None else None
+            ),
+            "profile_persist_ms_measured": bool(
+                self.profile_persist_ms_measured
+            ),
+            "profile_persist_succeeded": self.profile_persist_succeeded,
             "spill_bytes": int(self.spill_bytes),
             "spill_bytes_measured": bool(self.spill_bytes_measured),
+            "spill_bytes_scope": self.spill_bytes_scope,
+            "spill_occurred": bool(self.spill_occurred),
         }
 
 
@@ -234,22 +400,145 @@ class _IslandTelemetry:
         if rss is not None:
             self.rss_peak = max(self.rss_peak or 0, rss)
         read_finished = _proc_counter("read_bytes")
-        read_measured = self.read_started is not None and read_finished is not None
+        read_measured = (
+            self.read_started is not None
+            and read_finished is not None
+            and int(read_finished) >= int(self.read_started)
+        )
+        rss_measured = (
+            self.rss_started is not None
+            and self.rss_peak is not None
+            and rss is not None
+        )
+        rss_peak_delta = (
+            max(0, int(self.rss_peak) - int(self.rss_started))
+            if rss_measured else None
+        )
+        rss_retained_delta = (
+            int(rss) - int(self.rss_started) if rss_measured else None
+        )
         return {
             "cpu_time_ms": max(0.0, (time.process_time() - self.cpu_started) * 1000.0),
+            "cpu_time_measured": True,
             "physical_read_bytes": (
                 max(0, int(read_finished) - int(self.read_started))
                 if read_measured else 0
             ),
             "physical_read_bytes_measured": read_measured,
-            # RSS is process-wide. The delta is useful and honest under a
-            # dedicated worker; concurrent queries may overlap this sample.
+            "rss_baseline_bytes": self.rss_started,
+            "rss_peak_bytes": self.rss_peak,
+            "rss_final_bytes": rss,
+            "rss_peak_delta_bytes": rss_peak_delta,
+            "rss_retained_delta_bytes": rss_retained_delta,
+            "rss_measured": rss_measured,
+            # RSS is process-wide. Retain the historical delta for compatibility
+            # but publish the absolute samples needed to interpret a warm
+            # worker whose allocator already retains substantial memory.
             "peak_memory_bytes": (
-                max(0, int(self.rss_peak or 0) - int(self.rss_started or 0))
-                if self.rss_started is not None and self.rss_peak is not None else 0
+                int(rss_peak_delta) if rss_peak_delta is not None else 0
             ),
-            "peak_memory_scope": "process_rss_delta" if self.rss_started is not None else "unknown",
+            "rss_scope": (
+                "process_rss_sampled_10ms_after_admission_until_profile_finalize"
+                if rss_measured else "unknown"
+            ),
+            "peak_memory_scope": (
+                "process_rss_peak_delta_after_admission_until_profile_finalize"
+                if self.rss_started is not None else "unknown"
+            ),
         }
+
+
+class _QueryExecutionMetrics:
+    """Query-private physical plan facts and phase durations.
+
+    The counters describe scan nodes built by IslandDB.  They deliberately do
+    not pretend to be native-runtime observations: neither Polars nor every
+    Arrow path exposes comparable post-pruning counters today.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._planned_files = 0
+        self._planned_row_groups = 0
+        self._planned_rows = 0
+        self._planned_complete = True
+        self._relations = 0
+        self._phase_timings_ms: Dict[str, float] = {}
+        self._execution_outcome = "stream_open"
+        self._result_complete = False
+
+    def add_plan(
+        self,
+        *,
+        files: int,
+        row_groups: int,
+        rows: int,
+        complete: bool = True,
+    ) -> None:
+        with self._lock:
+            self._relations += 1
+            self._planned_files += max(0, int(files))
+            self._planned_row_groups += max(0, int(row_groups))
+            self._planned_rows += max(0, int(rows))
+            self._planned_complete = self._planned_complete and bool(complete)
+
+    def add_phase(self, name: str, elapsed_ms: float) -> None:
+        with self._lock:
+            key = str(name)
+            self._phase_timings_ms[key] = (
+                self._phase_timings_ms.get(key, 0.0)
+                + max(0.0, float(elapsed_ms))
+            )
+
+    def mark_complete(self) -> None:
+        with self._lock:
+            self._execution_outcome = "completed"
+            self._result_complete = True
+
+    def mark_closed_early(self) -> None:
+        with self._lock:
+            if self._execution_outcome == "stream_open":
+                self._execution_outcome = "closed_early"
+
+    def mark_failed(self) -> None:
+        with self._lock:
+            self._execution_outcome = "failed"
+            self._result_complete = False
+
+    def mark_cancelled(self) -> None:
+        with self._lock:
+            if self._execution_outcome not in {"failed", "timed_out"}:
+                self._execution_outcome = "cancelled"
+                self._result_complete = False
+
+    def mark_timed_out(self) -> None:
+        with self._lock:
+            self._execution_outcome = "timed_out"
+            self._result_complete = False
+
+    def mark_facade_failed(self) -> None:
+        with self._lock:
+            # A materialized facade sees producer exceptions too. Preserve the
+            # more specific native terminal state instead of relabelling a
+            # timeout/cancellation/producer failure as a conversion failure.
+            if self._execution_outcome not in {
+                "failed", "timed_out", "cancelled",
+            }:
+                self._execution_outcome = "facade_failed"
+                self._result_complete = False
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            complete = self._relations > 0 and self._planned_complete
+            return {
+                "planned_files": self._planned_files,
+                "planned_row_groups": self._planned_row_groups,
+                "planned_rows": self._planned_rows,
+                "planned_complete": complete,
+                "phase_timings_ms": dict(self._phase_timings_ms),
+                "execution_outcome": self._execution_outcome,
+                "result_complete": self._result_complete,
+            }
 
 
 class _QueryRangeMetrics:
@@ -327,6 +616,8 @@ class _LocalScanPlan:
     local_to_resource: Tuple[Tuple[str, str], ...]
     physical_schema: pa.Schema
     file_seals: Tuple[_LocalFileSeal, ...]
+    row_group_count: int
+    row_count: int
     weight_bytes: int
 
 
@@ -2408,6 +2699,7 @@ class IslandDB:
         object_metadata_out: Optional[Dict[str, object]] = None,
         expected_object_metadata: Optional[Dict[str, object]] = None,
         parallel_strategy: str = "auto",
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> pl.LazyFrame:
         """Create a query-private lazy node from a shared immutable descriptor."""
         if object_metadata_out is not None or expected_object_metadata:
@@ -2447,6 +2739,12 @@ class IslandDB:
                     )
             if object_metadata_out is not None:
                 object_metadata_out.update(actual_metadata)
+        if execution_metrics_out is not None:
+            execution_metrics_out.add_plan(
+                files=len(plan.local_paths),
+                row_groups=plan.row_group_count,
+                rows=plan.row_count,
+            )
         return (
             pl.scan_parquet(
                 list(plan.local_paths),
@@ -2475,6 +2773,7 @@ class IslandDB:
         object_metadata_out: Optional[Dict[str, object]] = None,
         expected_object_metadata: Optional[Dict[str, object]] = None,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
         parallel_strategy: str = "auto",
     ) -> pl.LazyFrame:
         """Return a physical relation, reusing only fully validated local plans."""
@@ -2506,6 +2805,7 @@ class IslandDB:
                 object_metadata_out=object_metadata_out,
                 expected_object_metadata=expected_object_metadata,
                 parallel_strategy=parallel_strategy,
+                execution_metrics_out=execution_metrics_out,
             )
 
         built_plan: List[_LocalScanPlan] = []
@@ -2517,6 +2817,7 @@ class IslandDB:
                 object_metadata_out=object_metadata_out,
                 expected_object_metadata=expected_object_metadata,
                 range_metrics_out=range_metrics_out,
+                execution_metrics_out=execution_metrics_out,
                 parallel_strategy=parallel_strategy,
                 local_plan_out=built_plan,
             )
@@ -2546,6 +2847,7 @@ class IslandDB:
         object_metadata_out: Optional[Dict[str, object]] = None,
         expected_object_metadata: Optional[Dict[str, object]] = None,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
         parallel_strategy: str = "auto",
         local_plan_out: Optional[List[_LocalScanPlan]] = None,
     ) -> pl.LazyFrame:
@@ -2594,6 +2896,8 @@ class IslandDB:
                 )
             pinned_schema[folded] = (str(name), str(type_name))
         physical_union: set[str] = set()
+        planned_row_groups = 0
+        planned_rows = 0
         declared_sizes = list(getattr(snapshot, "resource_sizes", None) or [])
         if declared_sizes and len(declared_sizes) != len(snapshot.files):
             raise IslandIntegrityError("snapshot resource sizes are non-bijective")
@@ -2671,6 +2975,8 @@ class IslandDB:
             base_fragment = file_format.make_fragment(
                 fragment_path, filesystem=filesystem, file_size=file_size,
             )
+            file_row_group_count = int(base_fragment.num_row_groups)
+            file_metadata = base_fragment.metadata
             physical_arrow_schema = base_fragment.physical_schema
             for field in physical_arrow_schema:
                 if field.name not in seen_fields:
@@ -2757,15 +3063,27 @@ class IslandDB:
             if row_group_hints and has_remote:
                 try:
                     live_footer_sha256 = parquet_footer_sha256(
-                        base_fragment.metadata,
+                        file_metadata,
                     )
                 except Exception:
                     live_footer_sha256 = ""
                 selected_ids = self._validated_row_group_ids(
                     snapshot,
                     str(resource_key),
-                    int(base_fragment.num_row_groups),
+                    file_row_group_count,
                     live_footer_sha256,
+                )
+            if selected_ids is None:
+                # Metadata already carries both totals. Avoid constructing and
+                # walking every row-group id solely for observability on a
+                # 10k-file/full-scan workload.
+                planned_row_groups += file_row_group_count
+                planned_rows += max(0, int(file_metadata.num_rows))
+            else:
+                planned_row_groups += len(selected_ids)
+                planned_rows += sum(
+                    max(0, int(file_metadata.row_group(group_id).num_rows))
+                    for group_id in selected_ids
                 )
             if has_remote:
                 fragments.append(
@@ -2809,6 +3127,8 @@ class IslandDB:
                 local_to_resource=tuple(local_to_resource.items()),
                 physical_schema=physical_arrow_schema,
                 file_seals=tuple(local_validation_seals),
+                row_group_count=planned_row_groups,
+                row_count=planned_rows,
                 weight_bytes=self._local_scan_plan_weight(
                     local_paths,
                     local_to_resource,
@@ -2827,6 +3147,7 @@ class IslandDB:
                 object_metadata_out=object_metadata_out,
                 expected_object_metadata=expected_object_metadata,
                 parallel_strategy=parallel_strategy,
+                execution_metrics_out=execution_metrics_out,
             )
         dataset = pads.FileSystemDataset(
             fragments,
@@ -2834,6 +3155,12 @@ class IslandDB:
             pads.ParquetFileFormat(),
             filesystem=filesystem,
         )
+        if execution_metrics_out is not None:
+            execution_metrics_out.add_plan(
+                files=len(snapshot.files),
+                row_groups=planned_row_groups,
+                rows=planned_rows,
+            )
         return pl.scan_pyarrow_dataset(
             dataset,
             allow_pyarrow_filter=True,
@@ -2948,6 +3275,7 @@ class IslandDB:
         *,
         object_metadata: Optional[Dict[str, object]] = None,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> None:
         targets = deletion_vector.filter(
             pl.col(TOMBSTONE_FILE_COL).is_in(snapshot.resource_keys)
@@ -3012,6 +3340,7 @@ class IslandDB:
                 if key in missed_keys
             },
             range_metrics_out=range_metrics_out,
+            execution_metrics_out=execution_metrics_out,
         )
         schema = scan.collect_schema()
         if ROWID_COL not in schema or schema[ROWID_COL] != pl.Int64:
@@ -3056,6 +3385,7 @@ class IslandDB:
         object_metadata: Optional[Dict[str, object]] = None,
         query_proofs: Optional[set[Tuple[object, ...]]] = None,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> pl.LazyFrame:
         if tomb_def is not None and getattr(tomb_def, "tombstone_path", None):
             dv = self._load_tombstone(tomb_def)
@@ -3071,6 +3401,7 @@ class IslandDB:
                     dv,
                     object_metadata=object_metadata,
                     range_metrics_out=range_metrics_out,
+                    execution_metrics_out=execution_metrics_out,
                 )
                 if query_proofs is not None:
                     query_proofs.add(query_marker)
@@ -3200,7 +3531,10 @@ class IslandDB:
         return frame
 
     @staticmethod
-    def _write_profile(path: str, profile: IslandProfile) -> None:
+    def _write_profile(path: str, profile: IslandProfile) -> Tuple[float, bool]:
+        started = time.perf_counter()
+        succeeded = False
+        tmp: Optional[Path] = None
         try:
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -3210,8 +3544,15 @@ class IslandDB:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, target)
+            succeeded = True
         except Exception as exc:  # profiling must never break a read
             logger.debug("[islanddb] profile write skipped: %s", exc)
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return (time.perf_counter() - started) * 1000.0, succeeded
 
     # ------------------------------------------------------------------
     # Public execution API
@@ -3227,6 +3568,7 @@ class IslandDB:
         sql_override: Optional[str] = None,
         batch_rows: int = 65_536,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> Tuple[pl.LazyFrame, exp.Select, str, str]:
         snapshots = self._snapshots(reflection)
         table_defs = parser.get_table_tuples()
@@ -3257,6 +3599,7 @@ class IslandDB:
                 batch_rows=batch_rows,
                 object_metadata_out=object_metadata,
                 range_metrics_out=range_metrics_out,
+                execution_metrics_out=execution_metrics_out,
                 parallel_strategy=self._local_scan_parallel_strategy(
                     reflection, required_columns.get(id(snapshot)),
                 ),
@@ -3269,6 +3612,7 @@ class IslandDB:
                 object_metadata=object_metadata,
                 query_proofs=query_rowid_proofs,
                 range_metrics_out=range_metrics_out,
+                execution_metrics_out=execution_metrics_out,
             )
             context.register(physical, relation)
             alias_to_physical[td.alias] = physical
@@ -3437,6 +3781,7 @@ class IslandDB:
         *,
         column_names: Iterable[str],
         batch_rows: int,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> Optional[Tuple[pa.Schema, Iterable[pa.RecordBatch], str]]:
         """Return a sealed Arrow Dataset projection for one simple local scan.
 
@@ -3547,6 +3892,12 @@ class IslandDB:
             f"PROJECT {len(names)}/{len(scan_plan.physical_schema)} COLUMNS\n"
             "ARROW NATIVE DIRECT PROJECTION"
         )
+        if execution_metrics_out is not None:
+            execution_metrics_out.add_plan(
+                files=len(scan_plan.local_paths),
+                row_groups=scan_plan.row_group_count,
+                rows=scan_plan.row_count,
+            )
         return projection_schema, scanner.to_batches(), optimized_plan
 
     def _prepare_spilled_stream(
@@ -3558,6 +3909,7 @@ class IslandDB:
         plan: QueryResourcePlan,
         session: SpillSession,
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> Tuple[ArrowBatchStream, str, str]:
         """Compile the sealed direct-column GROUP/ORDER subset to spill ops."""
         root = sqlglot.parse_one(parser.original_query, read="duckdb")
@@ -3667,6 +4019,7 @@ class IslandDB:
                 root,
                 column_names=direct_projection_names,
                 batch_rows=plan.batch_rows,
+                execution_metrics_out=execution_metrics_out,
             )
             if direct_projection_names is not None else None
         )
@@ -3689,6 +4042,7 @@ class IslandDB:
                 sql_override=pre_sql,
                 batch_rows=plan.batch_rows,
                 range_metrics_out=range_metrics_out,
+                execution_metrics_out=execution_metrics_out,
             )
             input_schema, input_batches = self._lazy_batches(
                 lazy_input, batch_rows=plan.batch_rows,
@@ -3898,9 +4252,13 @@ class IslandDB:
         one-shot stream is exhausted or explicitly closed.  This is the safe
         interface for a result larger than the configured collection budget.
         """
+        prepare_started = time.perf_counter()
         prepared = _prepared or self.prepare_execution(
             reflection, parser, streaming_result=True,
         )
+        prepare_inside_call_ms = (
+            time.perf_counter() - prepare_started
+        ) * 1000.0
         prepared.capability.require()
         plan = prepared.resource_plan
         if plan.advice in {ExecutionAdvice.ROUTE_DUCKDB, ExecutionAdvice.ROUTE_SPARK}:
@@ -3908,6 +4266,16 @@ class IslandDB:
                 f"bounded IslandDB plan routes to {plan.advice.value}: {plan.reason}"
             )
         query_id = uuid.uuid4().hex
+        # The QueryPlanManager is query-private, unlike ``last_profile`` on a
+        # reusable IslandDB instance.  Clear and tokenise this handoff before
+        # admission so Executor can never publish another query's profile when
+        # telemetry finalisation fails or a following query starts promptly.
+        try:
+            query_manager._island_profile_token = query_id
+            query_manager._island_profile = None
+        except Exception:
+            pass
+        admission_started = time.perf_counter()
         admission_timeout = float(max(1, settings.DEFAULT_TIMEOUT_SEC))
         if not _ISLAND_EXECUTION_SLOT.acquire(timeout=admission_timeout):
             raise IslandUnsupportedError(
@@ -3940,6 +4308,16 @@ class IslandDB:
         except BaseException:
             release_execution_slot()
             raise
+        admission_wait_ms = (
+            time.perf_counter() - admission_started
+        ) * 1000.0
+        # Set the compatibility pointer only after the process-global slot is
+        # held. A waiting request must not overwrite the active query's pointer
+        # while that query persists or annotates its local profile.
+        self.last_profile = IslandProfile(
+            telemetry_query_id=query_id,
+            execution_outcome="telemetry_pending",
+        )
         started = time.perf_counter()
         configured_timeout = float(
             settings.SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC
@@ -3980,18 +4358,102 @@ class IslandDB:
                 f"{execution_timeout:g} seconds"
             )
 
-        telemetry = _IslandTelemetry()
+        telemetry: Optional[_IslandTelemetry] = None
+        try:
+            telemetry = _IslandTelemetry()
+        except BaseException as exc:
+            # Diagnostics are fail-open even under thread/resource exhaustion.
+            # The query already owns its reservation and global slots here, so
+            # sampler construction must never escape this boundary.
+            try:
+                logger.debug(
+                    "[islanddb] process telemetry could not start: %s", exc,
+                )
+            except BaseException:
+                pass
+        telemetry_finish_lock = threading.Lock()
+        telemetry_result: Optional[Dict[str, object]] = None
+
+        def finish_telemetry_no_throw() -> Dict[str, object]:
+            """Stop process sampling exactly once without affecting a query."""
+            nonlocal telemetry_result
+            with telemetry_finish_lock:
+                if telemetry_result is not None:
+                    return dict(telemetry_result)
+                unavailable: Dict[str, object] = {
+                    "cpu_time_ms": 0.0,
+                    "cpu_time_measured": False,
+                    "physical_read_bytes": 0,
+                    "physical_read_bytes_measured": False,
+                    "rss_baseline_bytes": None,
+                    "rss_peak_bytes": None,
+                    "rss_final_bytes": None,
+                    "rss_peak_delta_bytes": None,
+                    "rss_retained_delta_bytes": None,
+                    "rss_measured": False,
+                    "peak_memory_bytes": 0,
+                    "rss_scope": "unknown",
+                    "peak_memory_scope": "unknown",
+                }
+                if telemetry is None:
+                    telemetry_result = unavailable
+                    return dict(unavailable)
+                try:
+                    measured = telemetry.finish()
+                    if isinstance(measured, dict):
+                        unavailable.update(measured)
+                except BaseException as exc:
+                    # Faulty diagnostics must neither mask the active engine
+                    # error nor leave their sampler thread running.
+                    try:
+                        telemetry._stop.set()
+                        telemetry._thread.join(timeout=0.1)
+                    except BaseException:
+                        pass
+                    try:
+                        logger.debug(
+                            "[islanddb] process telemetry unavailable: %s", exc,
+                        )
+                    except BaseException:
+                        pass
+                telemetry_result = unavailable
+                return dict(unavailable)
+
         range_cache = None
         query_range_metrics = _QueryRangeMetrics()
+        query_execution_metrics = _QueryExecutionMetrics()
+        query_execution_metrics.add_phase(
+            "prepare_execution_inside_call_ms", prepare_inside_call_ms,
+        )
+        query_execution_metrics.add_phase(
+            "admission_wait_ms", admission_wait_ms,
+        )
         session: Optional[SpillSession] = None
+        session_close_lock = threading.Lock()
+        session_closed = False
+
+        def close_session_once() -> None:
+            nonlocal session_closed
+            with session_close_lock:
+                if session_closed or session is None:
+                    return
+                session_closed = True
+                session.close()
+
         inner_stream: Optional[ArrowBatchStream] = None
         try:
             # Cache construction can touch directories/provider metadata. Keep
             # it inside the reservation/telemetry cleanup boundary so a bad
             # deployment cannot leak a governor slot or sampler thread.
+            phase_started = time.perf_counter()
             range_cache = self._get_range_cache()
+            query_execution_metrics.add_phase(
+                "range_cache_setup_ms",
+                (time.perf_counter() - phase_started) * 1000.0,
+            )
             check_execution_deadline()
             timer_capture("CONNECTING")
+            phase_started = time.perf_counter()
             if plan.advice == ExecutionAdvice.ISLAND_SPILL:
                 if not settings.SUPERTABLE_ISLAND_SPILL_ENABLED:
                     raise IslandUnsupportedError("IslandDB spill is disabled")
@@ -4013,9 +4475,14 @@ class IslandDB:
                     plan,
                     session,
                     range_metrics_out=query_range_metrics,
+                    execution_metrics_out=query_execution_metrics,
                 )
                 check_execution_deadline()
                 schema, batches = inner_stream.schema, inner_stream
+                query_execution_metrics.add_phase(
+                    "spill_pipeline_prepare_or_eager_execution_ms",
+                    (time.perf_counter() - phase_started) * 1000.0,
+                )
             else:
                 lazy_result, _, query, optimized_plan = self._prepare_lazy_query(
                     reflection,
@@ -4024,18 +4491,32 @@ class IslandDB:
                     log_prefix,
                     batch_rows=plan.batch_rows,
                     range_metrics_out=query_range_metrics,
+                    execution_metrics_out=query_execution_metrics,
                 )
                 check_execution_deadline()
+                query_execution_metrics.add_phase(
+                    "relation_prepare_and_eager_integrity_ms",
+                    (time.perf_counter() - phase_started) * 1000.0,
+                )
+                first_batch_started = time.perf_counter()
                 schema, batches = self._lazy_batches(
                     lazy_result, batch_rows=plan.batch_rows,
                 )
+                first_batch_ms = (
+                    time.perf_counter() - first_batch_started
+                ) * 1000.0
+                query_execution_metrics.add_phase(
+                    "first_batch_acquire_ms", first_batch_ms,
+                )
+                query_execution_metrics.add_phase(
+                    "producer_active_ms", first_batch_ms,
+                )
         except IslandSpillError as exc:
-            telemetry.finish()
+            finish_telemetry_no_throw()
             try:
                 if inner_stream is not None:
                     inner_stream.close()
-                if session is not None:
-                    session.close()
+                close_session_once()
             finally:
                 reservation.release()
                 release_execution_slot()
@@ -4045,43 +4526,76 @@ class IslandDB:
                 f"bounded spill could not be honored: {exc}"
             ) from exc
         except BaseException:
-            telemetry.finish()
+            finish_telemetry_no_throw()
             try:
                 if inner_stream is not None:
                     inner_stream.close()
-                if session is not None:
-                    session.close()
+                close_session_once()
             finally:
                 reservation.release()
                 release_execution_slot()
             raise
 
         result_rows = 0
+        result_batches = 0
         result_bytes = 0
+        stream_ready_at = time.perf_counter()
+        stream_closed_at: Optional[float] = None
 
         def measured_batches():
-            nonlocal result_rows, result_bytes
+            nonlocal result_rows, result_batches, result_bytes
             batch_iterator = iter(batches)
             try:
                 while True:
                     check_execution_deadline()
+                    producer_started = time.perf_counter()
                     try:
                         batch = next(batch_iterator)
                     except StopIteration:
                         break
                     except SpillDeadlineExceeded as exc:
                         raise execution_timeout_from(exc) from exc
+                    finally:
+                        query_execution_metrics.add_phase(
+                            "producer_active_ms",
+                            (time.perf_counter() - producer_started) * 1000.0,
+                        )
                     # Native calls are cooperative rather than force-killed.
                     # Check immediately after each call so a batch completed
                     # after the deadline is never exposed to the client.
                     check_execution_deadline()
                     result_rows += int(batch.num_rows)
+                    result_batches += 1
                     result_bytes += int(batch.nbytes)
                     yield batch
+            except GeneratorExit:
+                if query_cancel_event.is_set():
+                    query_execution_metrics.mark_cancelled()
+                else:
+                    query_execution_metrics.mark_closed_early()
+                raise
+            except IslandExecutionTimeout:
+                query_execution_metrics.mark_timed_out()
+                raise
+            except BaseException:
+                query_execution_metrics.mark_failed()
+                raise
+            else:
+                query_execution_metrics.mark_complete()
             finally:
                 close_batches = getattr(batch_iterator, "close", None)
-                if callable(close_batches):
-                    close_batches()
+                close_started = time.perf_counter()
+                try:
+                    if callable(close_batches):
+                        close_batches()
+                except BaseException:
+                    query_execution_metrics.mark_failed()
+                    raise
+                finally:
+                    query_execution_metrics.add_phase(
+                        "producer_cleanup_ms",
+                        (time.perf_counter() - close_started) * 1000.0,
+                    )
 
         def finish_profile() -> None:
             # Per-reader sinks isolate this query even when the process-wide
@@ -4091,21 +4605,66 @@ class IslandDB:
                 f"range_{name}": int(value)
                 for name, value in query_range_metrics.as_dict().items()
             }
-            combined_cache = (
-                cache_metrics.as_dict()
-                if cache_metrics is not None else {}
-            )
+            try:
+                combined_cache = (
+                    cache_metrics.as_dict()
+                    if cache_metrics is not None else {}
+                )
+            except Exception as exc:
+                logger.debug("[islanddb] cache telemetry skipped: %s", exc)
+                combined_cache = {}
             combined_cache.update(range_metrics)
-            execution_metrics = telemetry.finish()
+            finished_at = time.perf_counter()
+            engine_finished_at = stream_closed_at or finished_at
+            query_execution_metrics.add_phase(
+                "engine_setup_to_stream_ready_ms",
+                (stream_ready_at - started) * 1000.0,
+            )
+            if stream_closed_at is not None:
+                query_execution_metrics.add_phase(
+                    "stream_lifetime_ms",
+                    (stream_closed_at - stream_ready_at) * 1000.0,
+                )
+            query_execution_metrics.add_phase(
+                "engine_elapsed_excluding_profile_persist_ms",
+                (engine_finished_at - started) * 1000.0,
+            )
+            query_execution_metrics.add_phase(
+                "total_execution_and_facade_excluding_profile_persist_ms",
+                (finished_at - started) * 1000.0,
+            )
+            plan_metrics = query_execution_metrics.snapshot()
+            execution_metrics = finish_telemetry_no_throw()
             scan_complete = bool(
                 getattr(reflection, "row_group_scan_bytes_complete", False)
             )
             snapshots = tuple(getattr(reflection, "supers", ()) or ())
+            estimated_candidate_files = max(
+                0, int(getattr(reflection, "total_reflections", 0) or 0),
+            )
+            estimated_candidate_files_complete = bool(snapshots) and (
+                estimated_candidate_files
+                == sum(len(getattr(snapshot, "files", ()) or ()) for snapshot in snapshots)
+            )
+            estimated_candidate_row_groups_complete = bool(snapshots) and all(
+                bool(getattr(snapshot, "candidate_row_groups_complete", False))
+                for snapshot in snapshots
+            )
+            estimated_candidate_row_groups = (
+                sum(
+                    max(
+                        0,
+                        int(getattr(snapshot, "candidate_row_groups", 0) or 0),
+                    )
+                    for snapshot in snapshots
+                )
+                if estimated_candidate_row_groups_complete else 0
+            )
             rows_complete = bool(snapshots) and all(
                 bool(getattr(snapshot, "candidate_rows_complete", False))
                 for snapshot in snapshots
             )
-            rows_scanned = (
+            estimated_candidate_rows = (
                 sum(
                     max(0, int(getattr(snapshot, "candidate_rows", 0) or 0))
                     for snapshot in snapshots
@@ -4116,14 +4675,15 @@ class IslandDB:
                 getattr(reflection, "decoded_bytes_complete", False)
             )
             spill_peak = int(session.peak_used_bytes) if session is not None else 0
-            self.last_profile = IslandProfile(
+            profile = IslandProfile(
+                telemetry_query_id=query_id,
                 source_bytes=int(getattr(reflection, "source_bytes", 0) or 0),
                 estimated_scan_bytes=int(
                     getattr(reflection, "row_group_scan_bytes", 0)
                     or reflection.reflection_bytes
                 ),
                 files=int(reflection.total_reflections),
-                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                elapsed_ms=(engine_finished_at - started) * 1000.0,
                 optimized_plan=optimized_plan,
                 cache=combined_cache,
                 resources={
@@ -4142,8 +4702,41 @@ class IslandDB:
                     if plan.advice == ExecutionAdvice.ISLAND_SPILL else
                     {"triggered": False}
                 ),
-                selected_row_groups=self._selected_row_group_count(reflection),
+                estimated_candidate_files=estimated_candidate_files,
+                estimated_candidate_files_complete=(
+                    estimated_candidate_files_complete
+                ),
+                estimated_candidate_row_groups=estimated_candidate_row_groups,
+                estimated_candidate_row_groups_complete=(
+                    estimated_candidate_row_groups_complete
+                ),
+                planned_files=int(plan_metrics["planned_files"]),
+                planned_files_complete=bool(plan_metrics["planned_complete"]),
+                planned_row_groups=int(plan_metrics["planned_row_groups"]),
+                planned_row_groups_complete=bool(
+                    plan_metrics["planned_complete"]
+                ),
+                planned_rows=int(plan_metrics["planned_rows"]),
+                planned_rows_complete=bool(plan_metrics["planned_complete"]),
+                # Compatibility alias: unlike the former estimator-hint
+                # counter, full scans now report their physical planned RGs.
+                selected_row_groups=(
+                    int(plan_metrics["planned_row_groups"])
+                    if bool(plan_metrics["planned_complete"]) else 0
+                ),
                 cpu_time_ms=float(execution_metrics["cpu_time_ms"]),
+                cpu_time_measured=bool(
+                    execution_metrics["cpu_time_measured"]
+                ),
+                cpu_time_scope=(
+                    "process_cpu_delta_after_admission_until_profile_finalize"
+                    if bool(execution_metrics["cpu_time_measured"])
+                    else "unavailable"
+                ),
+                estimated_logical_scan_bytes=int(
+                    getattr(reflection, "row_group_scan_bytes", 0) or 0
+                ),
+                estimated_logical_scan_bytes_complete=scan_complete,
                 logical_scan_bytes=int(
                     getattr(reflection, "row_group_scan_bytes", 0) or 0
                 ),
@@ -4152,37 +4745,149 @@ class IslandDB:
                 physical_read_bytes_measured=bool(
                     execution_metrics["physical_read_bytes_measured"]
                 ),
+                physical_read_scope=(
+                    "linux_proc_self_io_block_read_delta_after_admission_"
+                    "until_profile_finalize"
+                    if bool(execution_metrics["physical_read_bytes_measured"])
+                    else "unavailable"
+                ),
+                estimated_decoded_bytes=int(
+                    getattr(reflection, "decoded_bytes", 0) or 0
+                ),
+                estimated_decoded_bytes_complete=decoded_complete,
                 decoded_bytes=int(getattr(reflection, "decoded_bytes", 0) or 0),
                 decoded_bytes_complete=decoded_complete,
-                rows_scanned=rows_scanned,
-                rows_scanned_measured=rows_complete,
+                estimated_candidate_rows=estimated_candidate_rows,
+                estimated_candidate_rows_complete=rows_complete,
+                # No native scanner counter is available across every path.
+                # Do not relabel the estimator upper bound as a measurement.
+                rows_scanned=0,
+                rows_scanned_measured=False,
+                execution_outcome=str(plan_metrics["execution_outcome"]),
+                result_complete=bool(plan_metrics["result_complete"]),
                 result_rows=result_rows,
+                result_batches=result_batches,
                 result_bytes=result_bytes,
+                rss_baseline_bytes=execution_metrics["rss_baseline_bytes"],
+                rss_peak_bytes=execution_metrics["rss_peak_bytes"],
+                rss_final_bytes=execution_metrics["rss_final_bytes"],
+                rss_peak_delta_bytes=execution_metrics[
+                    "rss_peak_delta_bytes"
+                ],
+                rss_retained_delta_bytes=execution_metrics[
+                    "rss_retained_delta_bytes"
+                ],
+                rss_measured=bool(execution_metrics["rss_measured"]),
+                rss_scope=str(execution_metrics["rss_scope"]),
                 peak_memory_bytes=int(execution_metrics["peak_memory_bytes"]),
                 peak_memory_scope=str(execution_metrics["peak_memory_scope"]),
+                # Preserve the historical/native engine boundary used by AUTO
+                # feedback. Facade conversion is measured separately below so
+                # old/new Island samples and DuckDB engine latency remain
+                # comparable rather than silently changing semantics.
+                elapsed_scope=(
+                    "engine_after_admission_through_stream_close_"
+                    "excludes_facade_and_profile_persist"
+                ),
+                phase_timings_ms=dict(plan_metrics["phase_timings_ms"]),
                 spill_bytes=spill_peak,
                 spill_bytes_measured=session is not None,
+                spill_occurred=session is not None and spill_peak > 0,
             )
-            self._write_profile(query_manager.query_plan_path, self.last_profile)
+            # Query-local ownership is authoritative. ``last_profile`` remains
+            # a compatibility pointer only and is never dereferenced below.
+            self.last_profile = profile
+            try:
+                query_manager._island_profile = profile
+            except Exception:
+                pass
+            # The persisted payload honestly marks its own current atomic-write
+            # duration unavailable. Update only the in-memory profile after the
+            # single commit returns; double-writing would make both timings
+            # self-referential and would distort short-query benchmarks.
+            persist_started = time.perf_counter()
+            persist_succeeded: Optional[bool] = None
+            try:
+                persist_result = self._write_profile(
+                    query_manager.query_plan_path, profile,
+                )
+                if (
+                    isinstance(persist_result, tuple)
+                    and len(persist_result) == 2
+                ):
+                    persist_succeeded = bool(persist_result[1])
+            except Exception as exc:
+                # Accommodate instrumentation monkeypatches as defensively as
+                # the production writer: telemetry can never fail a query.
+                logger.debug("[islanddb] profile persistence failed: %s", exc)
+                persist_succeeded = False
+            persist_ms = (time.perf_counter() - persist_started) * 1000.0
+            profile.profile_persist_ms = persist_ms
+            profile.profile_persist_ms_measured = True
+            profile.profile_persist_succeeded = persist_succeeded
+            profile.phase_timings_ms["profile_persist_ms"] = persist_ms
+            self.last_profile = profile
+
+        finish_lock = threading.Lock()
+        finish_started = False
 
         def finish() -> None:
+            nonlocal finish_started
+            with finish_lock:
+                if finish_started:
+                    return
+                finish_started = True
+            if query_cancel_event.is_set():
+                query_execution_metrics.mark_cancelled()
+            else:
+                # Covers explicit close before first next(), when Python does
+                # not enter the unstarted measured_batches generator at all.
+                query_execution_metrics.mark_closed_early()
             try:
-                finish_profile()
+                try:
+                    finish_profile()
+                except Exception as exc:
+                    # Observability must not turn a successfully produced query
+                    # into an application error or mask the original producer
+                    # failure during ArrowBatchStream finalization.
+                    logger.debug("[islanddb] profile finalization skipped: %s", exc)
             finally:
                 try:
-                    # Profile persistence is diagnostic and must never pin a
-                    # query-private spill directory when it fails.
-                    if session is not None:
-                        session.close()
+                    # Ensure a profile-construction failure cannot strand the
+                    # process sampler. The call is cached after a normal
+                    # finish_profile() path.
+                    finish_telemetry_no_throw()
                 finally:
-                    if not _defer_reservation_release:
-                        reservation.release()
-                        release_execution_slot()
+                    try:
+                        # Profile persistence is diagnostic and must never pin
+                        # a query-private spill directory when it fails.
+                        close_session_once()
+                    finally:
+                        if not _defer_reservation_release:
+                            reservation.release()
+                            release_execution_slot()
+
+        def stream_closed() -> None:
+            nonlocal stream_closed_at
+            if stream_closed_at is None:
+                stream_closed_at = time.perf_counter()
+            if query_cancel_event.is_set():
+                query_execution_metrics.mark_cancelled()
+            else:
+                query_execution_metrics.mark_closed_early()
+            if _defer_reservation_release:
+                # Preserve the pre-telemetry lifecycle: materialized queries
+                # release query-private spill files as soon as the Arrow stream
+                # closes, before facade conversion. Only the governor/slot stay
+                # held through the existing materialization boundary.
+                close_session_once()
+            else:
+                finish()
 
         stream = ArrowBatchStream(
             schema,
             measured_batches(),
-            close_callback=finish,
+            close_callback=stream_closed,
             cancel_event=query_cancel_event,
         )
         if _defer_reservation_release:
@@ -4195,6 +4900,8 @@ class IslandDB:
                     release_execution_slot()
 
             stream._island_release_reservation = release_deferred_resources
+            stream._island_finish_profile = finish
+            stream._island_execution_metrics = query_execution_metrics
         return stream
 
     def execute(
@@ -4229,16 +4936,62 @@ class IslandDB:
             _prepared=prepared,
         )
         release = getattr(stream, "_island_release_reservation", lambda: None)
+        finish_profile = getattr(stream, "_island_finish_profile", lambda: None)
+        execution_metrics = getattr(stream, "_island_execution_metrics", None)
+        facade_started = time.perf_counter()
         try:
-            with stream:
-                table = stream.collect_table(max_bytes=plan.result_memory_bytes)
-            result = pl.from_arrow(table)
+            collect_started = time.perf_counter()
+            try:
+                with stream:
+                    table = stream.collect_table(max_bytes=plan.result_memory_bytes)
+            finally:
+                if execution_metrics is not None:
+                    execution_metrics.add_phase(
+                        "facade_collect_arrow_table_ms",
+                        (time.perf_counter() - collect_started) * 1000.0,
+                    )
+            convert_started = time.perf_counter()
+            try:
+                result = pl.from_arrow(table)
+            finally:
+                if execution_metrics is not None:
+                    execution_metrics.add_phase(
+                        "facade_arrow_to_polars_ms",
+                        (time.perf_counter() - convert_started) * 1000.0,
+                    )
             root = self._query_root(parser)
+            normalize_started = time.perf_counter()
             if isinstance(root, exp.Select):
                 result = self._normalize_aggregate_dtypes(result, root)
-            return self._to_duckdb_pandas(result)
+            if execution_metrics is not None:
+                execution_metrics.add_phase(
+                    "facade_dtype_normalize_ms",
+                    (time.perf_counter() - normalize_started) * 1000.0,
+                )
+            pandas_started = time.perf_counter()
+            try:
+                pandas_result = self._to_duckdb_pandas(result)
+            finally:
+                if execution_metrics is not None:
+                    execution_metrics.add_phase(
+                        "facade_polars_to_pandas_ms",
+                        (time.perf_counter() - pandas_started) * 1000.0,
+                    )
+            return pandas_result
+        except BaseException:
+            if execution_metrics is not None:
+                execution_metrics.mark_facade_failed()
+            raise
         finally:
-            release()
+            if execution_metrics is not None:
+                execution_metrics.add_phase(
+                    "facade_total_ms",
+                    (time.perf_counter() - facade_started) * 1000.0,
+                )
+            try:
+                finish_profile()
+            finally:
+                release()
 
 
 __all__ = [

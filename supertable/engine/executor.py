@@ -202,6 +202,49 @@ class Executor:
         # can never make AUTO or an explicit query unavailable.
         self._auto_history_provider = auto_history_provider
 
+    @staticmethod
+    def _publish_island_profile(
+        plan_stats: PlanStats,
+        query_manager: QueryPlanManager,
+        log_prefix: str,
+    ) -> None:
+        """Publish only the current query's tokenized Island telemetry."""
+        try:
+            profile = getattr(query_manager, "_island_profile", None)
+            expected_token = getattr(
+                query_manager, "_island_profile_token", None,
+            )
+            if (
+                profile is None
+                or not expected_token
+                or getattr(profile, "telemetry_query_id", None)
+                != expected_token
+            ):
+                return
+            profile_doc = profile.as_dict()
+            if profile.resources:
+                plan_stats.add_stat({"ISLAND_RESOURCES": profile.resources})
+            if profile.spill:
+                plan_stats.add_stat({"ISLAND_SPILL": profile.spill})
+            if profile.cache:
+                plan_stats.add_stat({"ISLAND_CACHE": profile.cache})
+            plan_stats.add_stat({
+                "ISLAND_SELECTED_ROW_GROUPS": profile.selected_row_groups,
+            })
+            # Keep one lossless, provenance-complete document. Large/duplicated
+            # plan text and the three legacy top-level sections stay separate.
+            for excluded in (
+                "optimized_plan", "resources", "spill", "cache",
+            ):
+                profile_doc.pop(excluded, None)
+            plan_stats.add_stat({"ISLAND_TELEMETRY": profile_doc})
+        except Exception as telemetry_error:
+            logger.debug(
+                "%s[islanddb] plan telemetry unavailable: %s",
+                log_prefix,
+                telemetry_error,
+            )
+
     def _get_file_cache(self):
         """Return the org/storage-scoped shared Parquet cache, lazily.
 
@@ -788,16 +831,9 @@ class Executor:
                         _prepared=island_prepared,
                     )
                     used = "islanddb"
-                    profile = self.island_exec.last_profile
-                    if profile.resources:
-                        plan_stats.add_stat({"ISLAND_RESOURCES": profile.resources})
-                    if profile.spill:
-                        plan_stats.add_stat({"ISLAND_SPILL": profile.spill})
-                    if profile.cache:
-                        plan_stats.add_stat({"ISLAND_CACHE": profile.cache})
-                    plan_stats.add_stat({
-                        "ISLAND_SELECTED_ROW_GROUPS": profile.selected_row_groups,
-                    })
+                    self._publish_island_profile(
+                        plan_stats, query_manager, log_prefix,
+                    )
                 except (
                     IslandUnsupportedError,
                     IslandResourceError,
@@ -973,7 +1009,12 @@ class Executor:
             try:
                 inner.close()
             finally:
-                cache_context.__exit__(None, None, None)
+                try:
+                    self._publish_island_profile(
+                        plan_stats, query_manager, log_prefix,
+                    )
+                finally:
+                    cache_context.__exit__(None, None, None)
 
         stream = ArrowBatchStream(
             inner.schema,

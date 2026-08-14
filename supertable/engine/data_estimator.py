@@ -860,6 +860,73 @@ class DataEstimator:
             return 0, False
 
     @staticmethod
+    def _row_group_count_estimate(
+        stats_df: Optional["polars.DataFrame"],
+        file_keys: Iterable[str],
+        selections: Dict[str, RowGroupSelection],
+    ) -> Tuple[int, bool]:
+        """Return the exact estimator-candidate row-group count when sealed.
+
+        A missing selection means every manifested group for that resource;
+        an explicit selection contributes only its validated IDs.  This value
+        is observability for the estimator plan, not evidence that a downstream
+        native scanner physically opened exactly that many groups.
+        """
+        keys = list(file_keys)
+        if not keys:
+            return 0, True
+        if (
+            stats_df is None
+            or not isinstance(stats_df, polars.DataFrame)
+            or stats_df.height == 0
+            or not {"file_path", "row_group_id"}.issubset(stats_df.columns)
+            or len(set(keys)) != len(keys)
+        ):
+            return 0, False
+        try:
+            key_set = set(keys)
+            groups = stats_df.filter(
+                polars.col("file_path").is_in(keys)
+            ).select(["file_path", "row_group_id"]).unique()
+            if set(groups.get_column("file_path").to_list()) != key_set:
+                return 0, False
+
+            counts: Dict[str, int] = {}
+            available: Dict[str, Set[int]] = {}
+            for file_key, raw_group_id in groups.iter_rows():
+                if (
+                    file_key not in key_set
+                    or not isinstance(raw_group_id, int)
+                    or isinstance(raw_group_id, bool)
+                    or raw_group_id < 0
+                ):
+                    return 0, False
+                available.setdefault(file_key, set()).add(raw_group_id)
+            for file_key in keys:
+                group_ids = available.get(file_key)
+                if not group_ids:
+                    return 0, False
+                # Parquet group IDs are a dense zero-based sequence.  A hole
+                # means the stats artifact is incomplete and must not produce
+                # a deceptively small telemetry value.
+                if min(group_ids) != 0 or max(group_ids) != len(group_ids) - 1:
+                    return 0, False
+                selection = selections.get(file_key)
+                if selection is None:
+                    counts[file_key] = len(group_ids)
+                    continue
+                if (
+                    not isinstance(selection, RowGroupSelection)
+                    or selection.expected_row_group_count != len(group_ids)
+                    or not set(selection.selected_ids).issubset(group_ids)
+                ):
+                    return 0, False
+                counts[file_key] = len(selection.selected_ids)
+            return sum(counts.values()), True
+        except Exception:
+            return 0, False
+
+    @staticmethod
     def _decoded_fixed_width(type_name: object) -> Optional[int]:
         """Return a conservative fixed-width Arrow value size, or unknown.
 
@@ -1046,6 +1113,8 @@ class DataEstimator:
         selected_decoded_bytes_complete = True
         proof_decoded_bytes = 0
         proof_decoded_bytes_complete = True
+        candidate_row_groups = 0
+        candidate_row_groups_complete = True
         max_freshness_ms = 0
         files_before_prune = 0
         files_pruned = 0
@@ -1798,6 +1867,15 @@ class DataEstimator:
                     stats_df, survivors, literal_row_groups,
                 )
             )
+            table_candidate_row_groups, table_candidate_row_groups_complete = (
+                self._row_group_count_estimate(
+                    stats_df, survivors, literal_row_groups,
+                )
+            )
+            if table_candidate_row_groups_complete:
+                candidate_row_groups += table_candidate_row_groups
+            else:
+                candidate_row_groups_complete = False
             if not selected_rows_complete and not literal_row_groups:
                 # Resource cardinalities are snapshot-pinned and therefore a
                 # safe upper bound even when optional row-group stats are
@@ -1929,6 +2007,13 @@ class DataEstimator:
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),
                     candidate_rows_complete=selected_rows_complete,
+                    candidate_row_groups=(
+                        table_candidate_row_groups
+                        if table_candidate_row_groups_complete else 0
+                    ),
+                    candidate_row_groups_complete=(
+                        table_candidate_row_groups_complete
+                    ),
                     resource_stats_seals={
                         key: seal
                         for key in survivors
@@ -2018,6 +2103,14 @@ class DataEstimator:
         self.plan_stats.add_stat({"PROOF_DECODED_SIZE": proof_decoded_bytes})
         self.plan_stats.add_stat({
             "PROOF_DECODED_SIZE_COMPLETE": proof_decoded_bytes_complete,
+        })
+        self.plan_stats.add_stat({
+            "CANDIDATE_ROW_GROUPS": (
+                candidate_row_groups if candidate_row_groups_complete else 0
+            ),
+        })
+        self.plan_stats.add_stat({
+            "CANDIDATE_ROW_GROUPS_COMPLETE": candidate_row_groups_complete,
         })
 
         # Read-path pruning observability — only when pruning is engaged, so a

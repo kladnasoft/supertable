@@ -71,6 +71,25 @@ returns an `ArrowBatchStream` (also exported from `supertable.engine`) whose
 context lifetime owns cache leases, resource reservations, cancellation, and
 spill cleanup. Closing the stream or its Arrow reader releases all four.
 
+IslandDB telemetry distinguishes estimator candidates, executable physical
+scan-node occurrences, and runtime observations. Candidate files/row groups/
+rows and decoded/compressed byte counts are metadata estimates with explicit
+completeness flags. Planned units come from the footer metadata used to build
+the relation and count repeated scan occurrences; they are not relabelled as
+native-runtime counters. Observed files/row groups/rows remain NULL and
+`measured=false` until the underlying scanner exposes comparable counters.
+The legacy `selected_row_groups`, `logical_scan_bytes`, `decoded_bytes`, and
+`peak_memory_bytes` fields remain compatibility aliases with explicit scopes.
+Profiles also expose result completion/outcome, producer versus stream/facade
+phase timings (some are deliberately nested and therefore non-additive), Linux
+process block-I/O provenance, and absolute process RSS
+baseline/peak/final samples. The atomically persisted JSON cannot contain the
+duration of its own write; that value is available only in the post-commit
+query-tokenized in-memory profile and is marked unavailable in the persisted
+artifact. The legacy `elapsed_ms` keeps the engine-through-stream-close boundary
+used by adaptive history; materialized facade time is reported as a separate
+phase so old/new Island and DuckDB engine samples are not silently mixed.
+
 ### Shared Parquet cache (`file_cache.py`)
 An organization/storage/version-namespaced full-object cache used by both
 DuckDB and IslandDB. It uses stable raw resource keys rather than presigned

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from supertable.engine.benchmarks.runner import (
     _counter_delta,
     _duckdb_memory_limit_text,
     _execute_one,
+    _profile_metrics,
     _proc_io_counters,
     _validate_cold_physical_read,
     assert_exact_parity,
@@ -33,6 +35,43 @@ from supertable.engine.benchmarks.runner import (
     result_digest,
     run_isolated_worker,
 )
+
+
+def test_profile_metrics_preserves_corrected_island_telemetry(tmp_path):
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({
+        "engine": "islanddb",
+        "estimated_candidate_row_groups": 16,
+        "estimated_candidate_row_groups_complete": True,
+        "planned_row_groups": 38,
+        "planned_row_groups_complete": True,
+        "observed_row_groups": None,
+        "observed_row_groups_measured": False,
+        "execution_outcome": "completed",
+        "result_complete": True,
+        "physical_read_scope": "linux_proc_self_io_block_read_delta",
+        "rss_baseline_bytes": 100,
+        "rss_peak_bytes": 250,
+        "rss_final_bytes": 175,
+        "rss_peak_delta_bytes": 150,
+        "rss_retained_delta_bytes": 75,
+        "rss_measured": True,
+        "phase_timings_ms": {"producer_active_ms": 12.5},
+        "profile_persist_ms": None,
+        "profile_persist_ms_measured": False,
+    }), encoding="utf-8")
+
+    metrics = _profile_metrics(path)
+    assert metrics["estimated_candidate_row_groups"] == 16
+    assert metrics["planned_row_groups"] == 38
+    assert metrics["observed_row_groups"] is None
+    assert metrics["observed_row_groups_measured"] is False
+    assert metrics["result_complete"] is True
+    assert metrics["rss_peak_bytes"] == 250
+    assert metrics["phase_timings_ms"]["producer_active_ms"] == {
+        "$float": float(12.5).hex(),
+    }
+    assert metrics["profile_persist_ms"] is None
 
 
 def _tiny_spec(*, seed: int = 17) -> CorpusSpec:

@@ -68,16 +68,45 @@ def _profile(*, fallback: bool = False, status: str = "ok"):
             if fallback else {
                 "engine": "islanddb",
                 "elapsed_ms": 250.0,
+                "elapsed_scope": (
+                    "engine_after_admission_through_stream_close_"
+                    "excludes_facade_and_profile_persist"
+                ),
+                "execution_outcome": "completed",
+                "result_complete": True,
                 "cpu_time_ms": 180.0,
+                "cpu_time_measured": True,
+                "cpu_time_scope": "process_cpu_delta",
                 "logical_scan_bytes": 1_000,
                 "logical_scan_bytes_complete": True,
                 "physical_read_bytes": 512,
                 "physical_read_bytes_measured": True,
+                "physical_read_scope": "linux_proc_self_io_block_read_delta",
                 "peak_memory_bytes": 8_192,
                 "peak_memory_scope": "process_rss_delta",
+                "rss_baseline_bytes": 100_000,
+                "rss_peak_bytes": 108_192,
+                "rss_final_bytes": 104_096,
+                "rss_peak_delta_bytes": 8_192,
+                "rss_retained_delta_bytes": 4_096,
+                "rss_measured": True,
+                "rss_scope": "process_rss_sampled_10ms",
                 "spill_bytes": 2_048,
                 "spill_bytes_measured": True,
-                "rows_scanned": 77,
+                "observed_rows_scanned": 77,
+                "observed_rows_scanned_measured": True,
+                "result_rows": 10,
+                "result_rows_scope": "arrow_output_rows",
+                "result_bytes": 321,
+                "result_bytes_scope": "arrow_output_batch_logical_nbytes",
+                "estimated_candidate_files": 11,
+                "estimated_candidate_files_complete": True,
+                "estimated_candidate_row_groups": 5,
+                "estimated_candidate_row_groups_complete": True,
+                "planned_row_groups": 9,
+                "planned_row_groups_complete": True,
+                "estimated_candidate_rows": 88,
+                "estimated_candidate_rows_complete": True,
                 "cache": {
                     "range_remote_bytes": 600,
                     "range_cache_hit_bytes": 400,
@@ -153,24 +182,206 @@ def test_normalization_prefers_engine_latency_and_tracks_provenance():
     assert profile.total_wall_us == 1_200_000
     assert profile.duration_source == "engine_profile"
     assert profile.duration_measured is True
+    assert profile.duration_scope.endswith(
+        "excludes_facade_and_profile_persist"
+    )
     assert profile.actual_scan_bytes == 600
     assert profile.actual_scan_bytes_measured is True
+    assert profile.actual_scan_bytes_scope == "remote_fetch_bytes"
     assert profile.cpu_time_us == 180_000
+    assert profile.cpu_time_measured is True
+    assert profile.cpu_time_scope == "process_cpu_delta"
     assert profile.logical_scan_bytes == 1_000
     assert profile.logical_scan_bytes_complete is True
     assert profile.physical_read_bytes == 512
     assert profile.physical_read_bytes_measured is True
+    assert profile.physical_read_scope == (
+        "linux_proc_self_io_block_read_delta"
+    )
     assert profile.peak_memory_bytes == 8_192
     assert profile.peak_memory_scope == "process_rss_delta"
+    assert profile.rss_baseline_bytes == 100_000
+    assert profile.rss_peak_bytes == 108_192
+    assert profile.rss_final_bytes == 104_096
+    assert profile.rss_peak_delta_bytes == 8_192
+    assert profile.rss_retained_delta_bytes == 4_096
+    assert profile.rss_measured is True
     assert profile.spill_bytes == 2_048
     assert profile.spill_bytes_measured is True
     assert profile.rows_scanned == 77
+    assert profile.rows_scanned_measured is True
+    assert profile.total_files == 11
+    assert profile.selected_row_groups == 5
+    assert profile.selected_row_groups_complete is True
+    assert profile.planned_row_groups == 9
+    assert profile.planned_row_groups_complete is True
+    assert profile.candidate_rows == 88
+    assert profile.candidate_rows_complete is True
+    assert profile.result_rows_measured is True
+    assert profile.result_rows_scope == "materialized_result_shape"
+    assert profile.result_bytes == 321
+    assert profile.result_bytes_measured is True
+    assert profile.result_bytes_scope == "arrow_output_batch_logical_nbytes"
+    assert profile.execution_outcome == "completed"
+    assert profile.result_complete is True
     assert profile.estimated_scan_bytes == 1_000
     assert profile.work_bytes == 4_000
     assert profile.requested_engine == "auto"
     assert profile.selected_engine == "islanddb"
     assert profile.actual_engine == "islanddb"
     assert profile.feature_signature == SIGNATURE
+
+
+def test_duckdb_engine_bytes_are_not_mislabeled_as_physical_block_io():
+    profile = normalize_query_profile(
+        query="SELECT 1",
+        requested_engine="duckdb",
+        timing=[{"TOTAL_EXECUTE": 0.5}],
+        plan_stats=_stats(fallback=True),
+        status="ok",
+        result_shape=(1, 1),
+        engine_profile={
+            "latency": 0.4,
+            "total_bytes_read": 20_185_624,
+            "cumulative_rows_scanned": 123,
+        },
+    )
+
+    assert profile.actual_scan_bytes == 20_185_624
+    assert profile.actual_scan_bytes_measured is True
+    assert profile.actual_scan_bytes_scope == (
+        "duckdb_engine_profile_total_bytes_read"
+    )
+    assert profile.physical_read_bytes == 0
+    assert profile.physical_read_bytes_measured is False
+    assert profile.physical_read_scope == "unknown"
+    assert profile.rows_scanned == 123
+    assert profile.rows_scanned_measured is True
+
+
+def test_island_plan_stats_profile_is_lossless_fallback_with_provenance():
+    stats = _stats()
+    stats.add_stat({
+        "ISLAND_TELEMETRY": {
+            "engine": "islanddb",
+            "elapsed_ms": 12.0,
+            "elapsed_scope": (
+                "engine_after_admission_through_stream_close_"
+                "excludes_facade_and_profile_persist"
+            ),
+            "execution_outcome": "completed",
+            "result_complete": True,
+            "planned_files": 2,
+            "planned_files_complete": True,
+            "planned_row_groups": 10,
+            "planned_row_groups_complete": True,
+            "planned_rows": 100,
+            "planned_rows_complete": True,
+            "physical_read_bytes": 4_096,
+            "physical_read_bytes_measured": True,
+            "physical_read_scope": "linux_proc_self_io_block_read_delta",
+            "result_rows": 7,
+            "result_rows_scope": "arrow_output_rows",
+            "result_bytes": 512,
+            "result_bytes_scope": "arrow_output_batch_logical_nbytes",
+        },
+    })
+    stats.add_stat({
+        "ISLAND_CACHE": {
+            "range_remote_bytes": 2_048,
+            "range_cache_hit_bytes": 1_024,
+        },
+    })
+    profile = normalize_query_profile(
+        query="SELECT value FROM orders",
+        requested_engine="auto",
+        timing=[],
+        plan_stats=stats,
+        status="ok",
+        result_shape=None,
+        engine_profile=None,
+    )
+
+    assert profile.duration_measured is True
+    assert profile.planned_row_groups == 10
+    assert profile.planned_row_groups_complete is True
+    assert profile.physical_read_bytes == 4_096
+    assert profile.physical_read_bytes_measured is True
+    assert profile.actual_scan_bytes == 2_048
+    assert profile.actual_scan_bytes_measured is True
+    assert profile.actual_scan_bytes_scope == "remote_fetch_bytes"
+    assert profile.result_rows == 7
+    assert profile.result_rows_measured is True
+    assert profile.result_rows_scope == "arrow_output_rows"
+    assert profile.result_bytes == 512
+    assert profile.result_bytes_scope == "arrow_output_batch_logical_nbytes"
+
+
+def test_legacy_island_candidate_rows_are_not_runtime_measurements():
+    profile = normalize_query_profile(
+        query="SELECT value FROM orders",
+        requested_engine="islanddb",
+        timing=[],
+        plan_stats=PlanStats(),
+        status="ok",
+        result_shape=(1, 1),
+        engine_profile={
+            "engine": "islanddb",
+            "elapsed_ms": 1.0,
+            "result_complete": True,
+            # Historical Island profiles set these from estimator metadata;
+            # they never represented a universal native scanner counter.
+            "rows_scanned": 999,
+            "rows_scanned_measured": True,
+        },
+    )
+
+    assert profile.rows_scanned == 0
+    assert profile.rows_scanned_measured is False
+
+
+def test_partial_island_stream_cannot_become_adaptive_feedback():
+    profile = normalize_query_profile(
+        query="SELECT value FROM orders",
+        requested_engine="auto",
+        timing=[{"TOTAL_EXECUTE": 0.5}],
+        plan_stats=_stats(),
+        status="ok",
+        result_shape=(3, 1),
+        engine_profile={
+            "engine": "islanddb",
+            "elapsed_scope": "engine_after_admission_through_stream_close",
+            "execution_outcome": "closed_early",
+            "result_complete": False,
+            "logical_scan_bytes": 1_000,
+            "logical_scan_bytes_complete": True,
+        },
+    )
+    observation = QueryObservation.from_profile(profile, query_id="partial")
+
+    assert profile.execution_outcome == "closed_early"
+    assert profile.result_complete is False
+    assert profile.duration_measured is False
+    assert observation.feedback_eligible is False
+
+
+def test_missing_island_completion_proof_cannot_train_from_outer_timer():
+    profile = normalize_query_profile(
+        query="SELECT value FROM orders",
+        requested_engine="auto",
+        timing=[{"EXECUTING_QUERY": 0.2}],
+        plan_stats=_stats(),
+        status="ok",
+        result_shape=(1, 1),
+        engine_profile=None,
+    )
+
+    assert profile.actual_engine == "islanddb"
+    assert profile.result_complete is None
+    assert profile.duration_measured is False
+    assert QueryObservation.from_profile(
+        profile, query_id="missing-profile",
+    ).feedback_eligible is False
 
 
 def test_forced_failed_and_fallback_profiles_remain_feedback_ineligible():

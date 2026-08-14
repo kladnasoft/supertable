@@ -147,6 +147,53 @@ class TestPlanExtenderSinkGuard:
         mock_mw.log_metric.assert_called_once()
 
     @patch("supertable.plan_extender.MonitoringWriter")
+    def test_unknown_shape_preserves_stream_profile_result_rows(self, MockMW):
+        """Display zeros must not overwrite measured streaming counters."""
+        import json
+
+        from supertable.engine.plan_stats import PlanStats
+        from supertable.plan_extender import extend_execution_plan
+
+        mock_mw = MagicMock()
+        MockMW.return_value.__enter__.return_value = mock_mw
+        MockMW.return_value.__exit__.return_value = False
+        plan_stats = PlanStats()
+        plan_stats.add_stat({"ENGINE": "islanddb"})
+        plan_stats.add_stat({
+            "ISLAND_TELEMETRY": {
+                "engine": "islanddb",
+                "elapsed_ms": 1.0,
+                "elapsed_scope": (
+                    "engine_after_admission_through_stream_close_"
+                    "excludes_facade_and_profile_persist"
+                ),
+                "execution_outcome": "completed",
+                "result_complete": True,
+                "result_rows": 7,
+                "result_rows_scope": "arrow_output_rows",
+                "result_bytes": 56,
+                "result_bytes_scope": "arrow_output_batch_logical_nbytes",
+            },
+        })
+
+        extend_execution_plan(
+            query_plan_manager=self._build_qpm("orders"),
+            role_name="r",
+            timing={},
+            plan_stats=plan_stats,
+            status="ok",
+            message="",
+            result_shape=None,
+        )
+
+        payload = mock_mw.log_metric.call_args.args[0]
+        normalized = json.loads(payload["normalized_profile"])
+        assert payload["result_rows"] == 7
+        assert normalized["result_rows"] == 7
+        assert normalized["result_rows_measured"] is True
+        assert normalized["result_rows_scope"] == "arrow_output_rows"
+
+    @patch("supertable.plan_extender.MonitoringWriter")
     def test_mixed_targets_with_sink_skip(self, MockMW):
         from supertable.engine.plan_stats import PlanStats
         from supertable.plan_extender import extend_execution_plan

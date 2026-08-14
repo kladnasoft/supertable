@@ -267,6 +267,37 @@ def test_row_group_compressed_and_decoded_estimates_use_selected_chunks():
     ) == (44, True)
 
 
+def test_candidate_row_group_count_distinguishes_full_subset_and_unknown():
+    frame = _stats([
+        _stat_row("f", 0, "id", 0, 9),
+        _stat_row("f", 1, "id", 10, 19),
+        _stat_row("g", 0, "id", 20, 29),
+        _stat_row("g", 1, "id", 30, 39),
+        _stat_row("g", 2, "id", 40, 49),
+    ])
+    assert DataEstimator._row_group_count_estimate(
+        frame, ["f", "g"], {},
+    ) == (5, True)
+    assert DataEstimator._row_group_count_estimate(
+        frame,
+        ["f", "g"],
+        {"f": RowGroupSelection(2, (1,), _FOOTER_SEAL)},
+    ) == (4, True)
+    # A missing group in the sealed stats artifact is unknown, not a smaller
+    # count that telemetry may present as authoritative.
+    malformed = frame.filter(
+        ~((pl.col("file_path") == "g") & (pl.col("row_group_id") == 1))
+    )
+    assert DataEstimator._row_group_count_estimate(
+        malformed, ["f", "g"], {},
+    ) == (0, False)
+    assert DataEstimator._row_group_count_estimate(
+        frame,
+        ["f", "g"],
+        {"f": RowGroupSelection(3, (1,), _FOOTER_SEAL)},
+    ) == (0, False)
+
+
 def test_missing_requested_column_slot_cannot_complete_byte_estimates():
     complete = _stats([
         _stat_row("f", 0, "id", 0, 9, compressed=10),
@@ -407,6 +438,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     assert super_snapshot.row_group_selections == {
         "raw/f.parquet": RowGroupSelection(3, (1,), _FOOTER_SEAL),
     }
+    assert super_snapshot.candidate_row_groups == 1
+    assert super_snapshot.candidate_row_groups_complete is True
     assert super_snapshot.resource_stats_seals == {
         "raw/f.parquet": resource_seal,
     }
@@ -441,6 +474,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     )
     disabled = estimator.estimate()
     assert disabled.supers[0].row_group_selections == {}
+    assert disabled.supers[0].candidate_row_groups == 3
+    assert disabled.supers[0].candidate_row_groups_complete is True
     assert disabled.supers[0].integer_domain_bounds["id"].minimum == 0
     assert disabled.supers[0].integer_domain_bounds["id"].maximum == 29
     assert disabled.row_group_scan_bytes == 30
@@ -467,6 +502,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     assert with_tombstone.supers[0].row_group_selections == {
         "raw/f.parquet": RowGroupSelection(3, (1,), _FOOTER_SEAL),
     }
+    assert with_tombstone.supers[0].candidate_row_groups == 1
+    assert with_tombstone.supers[0].candidate_row_groups_complete is True
     assert with_tombstone.row_group_scan_bytes == 10 + 1_000
     assert with_tombstone.row_group_scan_bytes_complete is True
     # The selected scan remains four rows wide even though first use must stream
