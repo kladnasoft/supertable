@@ -17,6 +17,7 @@ one key band per file).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import types
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
@@ -28,7 +29,7 @@ from supertable.config.settings import settings
 from supertable.engine import data_estimator as de_mod
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.plan_stats import PlanStats
-from supertable.processing import STATS_SCHEMA
+from supertable.processing import STATS_SCHEMA, stats_resource_seals
 from supertable.utils.sql_parser import SQLParser
 
 SUPER = "webshop"
@@ -57,6 +58,7 @@ def _rows_for_file(file_path: str, colspecs: Dict[str, Tuple]) -> List[dict]:
         lane = spec[0]
         row = {k: None for k in STATS_SCHEMA}
         row["file_path"] = file_path
+        row["footer_sha256"] = hashlib.sha256(file_path.encode()).hexdigest()
         row["row_group_id"] = 0
         row["column_name"] = col
         row["physical_type"] = "INT64"
@@ -124,7 +126,17 @@ def _build_world(n: int = 20):
             for c in spec:
                 cols[c] = "BIGINT"
         stats_file = f"{table}/_stats.parquet"
-        stats_by_file[stats_file] = polars.DataFrame(rows, schema=STATS_SCHEMA)
+        stats_frame = polars.DataFrame(rows, schema=STATS_SCHEMA)
+        stats_by_file[stats_file] = stats_frame
+        resource_seals = stats_resource_seals(stats_frame)
+        assert resource_seals is not None
+        for resource in resources:
+            seal = resource_seals[resource["file"]]
+            resource.update({
+                "footer_sha256": seal.footer_sha256,
+                "stats_rows": seal.stats_rows,
+                "stats_digest": seal.stats_digest,
+            })
         schema_by_table[table] = cols
         snapshots.append({
             "table_name": table,
@@ -134,6 +146,7 @@ def _build_world(n: int = 20):
                 "snapshot_version": 3,
                 "schema": cols,
                 "stats_file": stats_file,
+                "stats_rows": stats_frame.height,
                 "resources": resources,
                 "tombstone": None,
                 "tombstone_rows": 0,
@@ -176,7 +189,7 @@ def _make_estimator(monkeypatch, *, join_edges, predicate_constraints, pruning=T
     monkeypatch.setattr(de_mod, "SuperTable", _DummySuper)
     monkeypatch.setattr(
         de_mod, "load_stats",
-        lambda path, allow_cache=False, profiler=None: stats_by_file[path],
+        lambda path, **_kwargs: stats_by_file[path],
     )
     # ``settings`` is a frozen dataclass; clone it with the pruning gate toggled
     # and rebind the estimator module's reference to the clone.

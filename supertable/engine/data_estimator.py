@@ -13,7 +13,13 @@ import polars
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
-from supertable.data_classes import Reflection, SuperSnapshot, RowGroupSelection
+from supertable.data_classes import (
+    Reflection,
+    ResourceObjectSeal,
+    ResourceStatsSeal,
+    SuperSnapshot,
+    RowGroupSelection,
+)
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
 from supertable.utils.snapshot import complete_snapshot_payload
@@ -26,9 +32,14 @@ from supertable.data_classes import JoinEdge
 from supertable.utils.sql_parser import TableDefinition
 from supertable.engine.join_pruner import prune_files_across_joins
 from supertable.processing import (
+    integer_domains_from_complete_stats,
     load_stats,
     prune_files_by_predicates,
+    resource_object_seal,
     select_row_groups_by_predicates,
+    resource_stats_seal,
+    stats_for_complete_files,
+    stats_cache_identity,
     ROWID_COL,
     TIMESTAMP_COL,
 )
@@ -467,136 +478,19 @@ class DataEstimator:
     def _stats_for_complete_files(
         stats_df: Optional["polars.DataFrame"],
         resource_rows: Dict[str, Optional[int]],
+        resource_seals: Optional[
+            Dict[str, Optional[ResourceStatsSeal]]
+        ] = None,
+        *,
+        stats_path: Optional[str] = None,
     ) -> Optional["polars.DataFrame"]:
-        """Keep stats only for files whose row-group manifest is complete.
-
-        The table-level ``stats_rows`` count detects a truncated artifact, but
-        not a same-height substitution (for example, one missing row-group row
-        replaced by a duplicate belonging to another file).  Treat a file's
-        stats as absence proof only when their structure agrees with the
-        snapshot resource's independently recorded physical row count:
-
-        * the resource row count is an exact non-negative integer;
-        * row-group ids are exactly ``0..N-1``;
-        * every row in a row group reports the same non-negative row count and
-          those counts sum to the resource row count;
-        * every row group has the identical, exact footer column-name set; and
-        * every ``(row_group_id, column_name)`` slot occurs exactly once.
-
-        Rows for an invalid or unmanifested file are removed.  All pruning
-        consumers interpret an absent file as unknown and retain it; a join
-        source with an absent file similarly exports an unknown range.  Any
-        validation failure returns ``None`` and disables stats use table-wide.
-        """
-        if stats_df is None:
-            return None
-        if not isinstance(stats_df, polars.DataFrame):
-            return None
-        if stats_df.height == 0:
-            return stats_df
-
-        required = {
-            "file_path", "row_group_id", "column_name", "row_group_rows",
-        }
-        if not required.issubset(stats_df.columns):
-            return None
-
-        manifest = {
-            file_path: rows
-            for file_path, rows in resource_rows.items()
-            if isinstance(file_path, str)
-            and isinstance(rows, int)
-            and not isinstance(rows, bool)
-            and rows >= 0
-        }
-        if not manifest:
-            # Preserve the input schema so downstream consumers can take their
-            # normal empty-frame fast path without special casing this guard.
-            return stats_df.head(0)
-
-        try:
-            # Keep the validation columnar.  A stats artifact can have millions
-            # of (row-group x column) rows; only the final trusted file names
-            # need to cross into Python for the optional filter.
-            manifested_stats = stats_df.filter(
-                polars.col("file_path").is_in(list(manifest))
-            )
-            groups = (
-                manifested_stats
-                .select(list(required))
-                .group_by(["file_path", "row_group_id"])
-                .agg([
-                    polars.len().alias("__slots"),
-                    polars.col("column_name").n_unique().alias("__unique_slots"),
-                    polars.col("column_name").unique().sort().alias("__columns"),
-                    polars.col("row_group_rows").n_unique().alias("__row_counts"),
-                    polars.col("row_group_rows").first().alias("__rows"),
-                    polars.col("column_name").is_not_null().all().alias("__names_valid"),
-                    (
-                        polars.col("row_group_rows").is_not_null()
-                        & (polars.col("row_group_rows") >= 0)
-                    ).all().alias("__rows_valid"),
-                ])
-            )
-            expected = polars.DataFrame({
-                "file_path": list(manifest),
-                "__expected_rows": list(manifest.values()),
-            }, schema={"file_path": polars.Utf8, "__expected_rows": polars.Int64})
-            trusted_frame = (
-                groups
-                .group_by("file_path")
-                .agg([
-                    polars.len().alias("__group_count"),
-                    polars.col("row_group_id").min().alias("__min_group"),
-                    polars.col("row_group_id").max().alias("__max_group"),
-                    polars.col("row_group_id").is_not_null().all().alias("__ids_valid"),
-                    (polars.col("row_group_id") >= 0).all().alias("__ids_nonnegative"),
-                    polars.col("__rows").sum().alias("__total_rows"),
-                    (polars.col("__slots") == polars.col("__unique_slots"))
-                    .all().alias("__slots_valid"),
-                    (polars.col("__row_counts") == 1).all().alias("__counts_valid"),
-                    polars.col("__names_valid").all().alias("__all_names_valid"),
-                    polars.col("__rows_valid").all().alias("__all_rows_valid"),
-                    polars.col("__columns").n_unique().alias("__column_sets"),
-                ])
-                .join(expected, on="file_path", how="inner")
-                .filter(
-                    polars.col("__ids_valid")
-                    & polars.col("__ids_nonnegative")
-                    & polars.col("__slots_valid")
-                    & polars.col("__counts_valid")
-                    & polars.col("__all_names_valid")
-                    & polars.col("__all_rows_valid")
-                    & (polars.col("__min_group") == 0)
-                    & (
-                        polars.col("__max_group")
-                        == polars.col("__group_count") - 1
-                    )
-                    & (polars.col("__column_sets") == 1)
-                    & (
-                        polars.col("__total_rows")
-                        == polars.col("__expected_rows")
-                    )
-                )
-                .select("file_path")
-            )
-            if trusted_frame.height == 0:
-                return stats_df.head(0)
-            trusted = trusted_frame.get_column("file_path").to_list()
-            # The normal healthy-artifact path avoids a second frame filter and
-            # allocation.  A resource absent from the artifact does not matter:
-            # its data file is unknown and retained by downstream consumers.
-            if (
-                manifested_stats.height == stats_df.height
-                and len(trusted) == groups.get_column("file_path").n_unique()
-            ):
-                return stats_df
-            return manifested_stats.filter(
-                polars.col("file_path").is_in(trusted)
-            )
-        except Exception:
-            # Stats are optional and cannot be allowed to fail or narrow a read.
-            return None
+        """Apply the shared per-resource cardinality/footer/digest boundary."""
+        return stats_for_complete_files(
+            stats_df,
+            resource_rows,
+            resource_seals,
+            stats_path=stats_path,
+        )
 
     # ----------------------- projection-aware sizing -----------------------
 
@@ -687,8 +581,17 @@ class DataEstimator:
             or "compressed_bytes" not in stats_df.columns
         ):
             return set(), {}
+        requested_cols = {
+            str(column).casefold()
+            for column in selected_cols
+            if str(column).casefold() not in {
+                ROWID_COL.casefold(), TIMESTAMP_COL.casefold(),
+            }
+        }
+        if not requested_cols:
+            return set(), {}
         projected = stats_df.select(
-            ["file_path", "column_name", "compressed_bytes"]
+            ["file_path", "row_group_id", "column_name", "compressed_bytes"]
         )
         if file_keys is not None:
             survivor_keys = list(file_keys)
@@ -700,18 +603,38 @@ class DataEstimator:
         sel = (
             projected
             .with_columns(polars.col("column_name").str.to_lowercase().alias("__cn"))
-            .filter(polars.col("__cn").is_in(list(selected_cols)))
+            .filter(polars.col("__cn").is_in(sorted(requested_cols)))
         )
         if sel.height == 0:
             return set(), {}
-        agg = sel.group_by("file_path").agg(
-            [
+        all_group_counts = (
+            projected.select(["file_path", "row_group_id"])
+            .unique()
+            .group_by("file_path")
+            .agg(polars.len().alias("__expected_groups"))
+        )
+        agg = (
+            sel.group_by(["file_path", "row_group_id"])
+            .agg([
+                polars.len().alias("__slots"),
+                polars.col("__cn").n_unique().alias("__unique_slots"),
                 polars.col("compressed_bytes").sum().alias("__b"),
                 (
                     polars.col("compressed_bytes").is_null()
                     | (polars.col("compressed_bytes") < 0)
                 ).sum().alias("__invalid"),
-            ]
+            ])
+            .group_by("file_path")
+            .agg([
+                polars.len().alias("__matched_groups"),
+                polars.col("__b").sum().alias("__b"),
+                polars.col("__invalid").sum().alias("__invalid"),
+                (
+                    (polars.col("__slots") == len(requested_cols))
+                    & (polars.col("__unique_slots") == len(requested_cols))
+                ).all().alias("__slots_complete"),
+            ])
+            .join(all_group_counts, on="file_path", how="inner")
         )
         tier3_files: Set[str] = set()
         proj: Dict[str, int] = {}
@@ -719,6 +642,9 @@ class DataEstimator:
             projected_bytes = r["__b"]
             if (
                 int(r["__invalid"] or 0) == 0
+                and bool(r["__slots_complete"])
+                and int(r["__matched_groups"] or 0)
+                == int(r["__expected_groups"] or -1)
                 and isinstance(projected_bytes, int)
                 and not isinstance(projected_bytes, bool)
                 and projected_bytes >= 0
@@ -801,14 +727,39 @@ class DataEstimator:
                 return 0, False
 
             if selected_cols is not None:
+                requested_cols = sorted(
+                    str(column).casefold() for column in selected_cols
+                )
+                if not requested_cols:
+                    return 0, False
                 selected_stats = selected_stats.filter(
                     polars.col("column_name").str.to_lowercase().is_in(
-                        sorted(selected_cols)
+                        requested_cols
                     )
                 )
-                # Zero physical matches is valid only for an empty requested
-                # set (which normal callers represent as SELECT ALL instead).
-                if selected_cols and selected_stats.height == 0:
+                if selected_stats.height == 0:
+                    return 0, False
+                slot_health = (
+                    selected_stats
+                    .with_columns(
+                        polars.col("column_name").str.to_lowercase().alias("__cn")
+                    )
+                    .group_by(["file_path", "row_group_id"])
+                    .agg([
+                        polars.len().alias("__slots"),
+                        polars.col("__cn").n_unique().alias("__unique_slots"),
+                    ])
+                )
+                if (
+                    slot_health.height != selected_groups.height
+                    or slot_health.filter(
+                        (polars.col("__slots") != len(requested_cols))
+                        | (
+                            polars.col("__unique_slots")
+                            != len(requested_cols)
+                        )
+                    ).height
+                ):
                     return 0, False
             metric = selected_stats.get_column(byte_column)
             invalid = metric.is_null() | (metric < 0)
@@ -945,6 +896,15 @@ class DataEstimator:
             return 1
         return None
 
+    @staticmethod
+    def _integer_domain_type(type_name: object) -> bool:
+        """Whether a schema spelling can use the signed footer integer lane."""
+        return str(type_name or "").strip().casefold() in {
+            "int8", "int16", "int32", "int64",
+            "uint8", "uint16", "uint32", "uint64",
+            "byte", "short", "integer", "int", "long", "bigint",
+        }
+
     def _decoded_row_group_estimate(
         self,
         stats_df: Optional["polars.DataFrame"],
@@ -952,6 +912,7 @@ class DataEstimator:
         selected_cols: Optional[Set[str]],
         selections: Dict[str, RowGroupSelection],
         schema_types: Dict[str, str],
+        max_value_bytes: Optional[Dict[str, int]] = None,
     ) -> Tuple[int, bool]:
         """Bound decoded primitive buffers for the exact candidate groups.
 
@@ -979,6 +940,20 @@ class DataEstimator:
         widths: List[int] = []
         for name in requested:
             width = self._decoded_fixed_width(normalized_types.get(name))
+            if (
+                width is None
+                and str(normalized_types.get(name) or "").strip().casefold()
+                == "binary"
+            ):
+                bound = (max_value_bytes or {}).get(name)
+                if (
+                    isinstance(bound, int)
+                    and not isinstance(bound, bool)
+                    and bound >= 0
+                ):
+                    # Variable Binary owns a 32-bit offset per value in
+                    # addition to its exactly sealed maximum payload width.
+                    width = int(bound) + 4
             if width is None:
                 return 0, False
             widths.append(width)
@@ -1134,6 +1109,13 @@ class DataEstimator:
                 raw_keys: List[str] = []
                 key_size: Dict[str, int] = {}
                 resource_rows: Dict[str, Optional[int]] = {}
+                resource_seals: Dict[str, Optional[ResourceStatsSeal]] = {}
+                resource_object_seals: Dict[
+                    str, Optional[ResourceObjectSeal]
+                ] = {}
+                resource_value_bounds: Dict[
+                    str, Optional[Dict[str, int]]
+                ] = {}
                 stats_file: Optional[str] = None
                 expected_stats_rows: Optional[int] = None
                 pinned_snapshot_metadata: List[Dict[str, object]] = []
@@ -1327,6 +1309,51 @@ class DataEstimator:
                                 resource_rows[file_key] = None
                         else:
                             resource_rows[file_key] = valid_rows
+                        parsed_seal = resource_stats_seal(resource)
+                        if file_key in resource_seals:
+                            # Duplicate keys are never allowed to borrow one
+                            # occurrence's valid seal. Any disagreement, including
+                            # sealed vs legacy, makes the identity ambiguous.
+                            if resource_seals[file_key] != parsed_seal:
+                                resource_seals[file_key] = None
+                        else:
+                            resource_seals[file_key] = parsed_seal
+                        parsed_object_seal = resource_object_seal(resource)
+                        if file_key in resource_object_seals:
+                            # Never let one duplicate occurrence lend identity
+                            # to another. Sealed-vs-legacy and any field mismatch
+                            # both revert this key to the normal provider stat.
+                            if (
+                                resource_object_seals[file_key]
+                                != parsed_object_seal
+                            ):
+                                resource_object_seals[file_key] = None
+                        else:
+                            resource_object_seals[file_key] = parsed_object_seal
+                        raw_bounds = resource.get("column_max_value_bytes")
+                        parsed_bounds: Optional[Dict[str, int]] = None
+                        if isinstance(raw_bounds, dict):
+                            candidate_bounds: Dict[str, int] = {}
+                            valid_bounds = True
+                            for column_name, bound in raw_bounds.items():
+                                folded = str(column_name).casefold()
+                                if (
+                                    not str(column_name)
+                                    or folded in candidate_bounds
+                                    or not isinstance(bound, int)
+                                    or isinstance(bound, bool)
+                                    or bound < 0
+                                ):
+                                    valid_bounds = False
+                                    break
+                                candidate_bounds[folded] = int(bound)
+                            if valid_bounds:
+                                parsed_bounds = candidate_bounds
+                        if file_key in resource_value_bounds:
+                            if resource_value_bounds[file_key] != parsed_bounds:
+                                resource_value_bounds[file_key] = None
+                        else:
+                            resource_value_bounds[file_key] = parsed_bounds
 
                 key = (super_name.lower(), simple_name.lower())
 
@@ -1361,10 +1388,21 @@ class DataEstimator:
                 # hit). Only load when at least one consumer needs it, so a
                 # SELECT * that neither filters nor joins stays free.
                 stats_df: Optional["polars.DataFrame"] = None
+                stats_identity = (
+                    stats_cache_identity(
+                        stats_file,
+                        organization=self.organization,
+                        storage=self.storage,
+                    )
+                    if stats_file else None
+                )
                 if stats_file and (need_projection or has_predicate or key in join_table_keys):
                     try:
                         stats_df = load_stats(
-                            stats_file, allow_cache=True, profiler=prune_profiler,
+                            stats_file,
+                            allow_cache=True,
+                            cache_identity=stats_identity,
+                            profiler=prune_profiler,
                         )
                     except Exception as stats_err:
                         # Stats are an optional optimisation artifact.  A stale,
@@ -1403,7 +1441,10 @@ class DataEstimator:
                     # whose stats do not form a complete per-resource manifest;
                     # absent stats always retain the data file.
                     stats_df = self._stats_for_complete_files(
-                        stats_df, resource_rows,
+                        stats_df,
+                        resource_rows,
+                        resource_seals,
+                        stats_path=stats_identity,
                     )
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
@@ -1476,6 +1517,9 @@ class DataEstimator:
                     "schema_types": schema_types,
                     "key_size": key_size,
                     "resource_rows": resource_rows,
+                    "resource_seals": resource_seals,
+                    "resource_object_seals": resource_object_seals,
+                    "resource_value_bounds": resource_value_bounds,
                     "current_version": current_version,
                     "has_snapshots": bool(snapshots),
                     "pinned_snapshot_metadata": pinned_snapshot_metadata,
@@ -1603,15 +1647,48 @@ class DataEstimator:
             resource_rows = r["resource_rows"]
             schema = r["schema"]
             schema_types = r["schema_types"]
+            resource_value_bounds = r["resource_value_bounds"]
             selected_cols = r["selected_cols"]
             need_projection = r["need_projection"]
             stats_df = r["stats_df"]
             survivor_set = set(survivors)
+            column_value_bounds = {
+                column_name: max(
+                    resource_value_bounds[file_key][column_name.casefold()]
+                    for file_key in survivors
+                )
+                for column_name, type_name in schema_types.items()
+                if str(type_name).strip().casefold() == "binary"
+                and survivors
+                and all(
+                    isinstance(resource_value_bounds.get(file_key), dict)
+                    and column_name.casefold() in resource_value_bounds[file_key]
+                    for file_key in survivors
+                )
+            }
             literal_row_groups = {
                 file_key: selection
                 for file_key, selection in r["row_group_selections"].items()
                 if file_key in survivor_set
             }
+            # Optional GROUP BY resource proof. The helper accepts only a
+            # complete slot for every selected row group of every survivor;
+            # any legacy/unsealed/malformed resource returns no bounds and the
+            # engine retains its conservative external plan.
+            integer_domain_bounds = integer_domains_from_complete_stats(
+                stats_df,
+                survivors,
+                literal_row_groups,
+                {
+                    str(column_name).casefold()
+                    for column_name, type_name in schema_types.items()
+                    if self._integer_domain_type(type_name)
+                    and (
+                        selected_cols is None
+                        or str(column_name).casefold() in selected_cols
+                    )
+                },
+            )
 
             # Projection-aware size: a query selecting specific columns scans only
             # those columns' on-disk (compressed) chunks, not the whole
@@ -1706,6 +1783,7 @@ class DataEstimator:
                     stats_scan_columns,
                     literal_row_groups,
                     schema_types,
+                    column_value_bounds,
                 )
             )
             # Keep selected-query buffers distinct from first-use DV proof work.
@@ -1851,6 +1929,20 @@ class DataEstimator:
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),
                     candidate_rows_complete=selected_rows_complete,
+                    resource_stats_seals={
+                        key: seal
+                        for key in survivors
+                        for seal in [r["resource_seals"].get(key)]
+                        if isinstance(seal, ResourceStatsSeal)
+                    },
+                    resource_object_seals={
+                        key: seal
+                        for key in survivors
+                        for seal in [r["resource_object_seals"].get(key)]
+                        if isinstance(seal, ResourceObjectSeal)
+                    },
+                    column_max_value_bytes=column_value_bounds,
+                    integer_domain_bounds=integer_domain_bounds,
                 )
                 supers.append(super_snapshot)
 

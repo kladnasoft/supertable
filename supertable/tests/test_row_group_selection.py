@@ -14,7 +14,11 @@ from supertable.engine.data_estimator import DataEstimator
 from supertable.engine import data_estimator as estimator_module
 from supertable.engine.plan_stats import PlanStats
 from supertable.config.settings import settings
-from supertable.processing import STATS_SCHEMA, select_row_groups_by_predicates
+from supertable.processing import (
+    STATS_SCHEMA,
+    select_row_groups_by_predicates,
+    stats_resource_seals,
+)
 
 
 _FOOTER_SEAL = "a" * 64
@@ -203,6 +207,7 @@ def test_corrupt_complete_manifest_fails_open_before_selection():
     for rows in corruptions:
         conformed = DataEstimator._stats_for_complete_files(
             _stats(rows), {"f": 8},
+            stats_resource_seals(_stats(valid)),
         )
         assert conformed is None or conformed.height == 0
         assert select_row_groups_by_predicates(
@@ -224,6 +229,7 @@ def test_random_exact_stats_kept_groups_cover_every_matching_row_group():
         total_rows = sum(map(len, values_by_group))
         frame = DataEstimator._stats_for_complete_files(
             _stats(rows), {"f": total_rows},
+            stats_resource_seals(_stats(rows)),
         )
         assert frame is not None and frame.height == len(rows)
 
@@ -261,6 +267,47 @@ def test_row_group_compressed_and_decoded_estimates_use_selected_chunks():
     ) == (44, True)
 
 
+def test_missing_requested_column_slot_cannot_complete_byte_estimates():
+    complete = _stats([
+        _stat_row("f", 0, "id", 0, 9, compressed=10),
+        _stat_row("f", 0, "payload", 0, 9, compressed=100),
+        _stat_row("f", 1, "id", 10, 19, compressed=11),
+        _stat_row("f", 1, "payload", 10, 19, compressed=101),
+    ])
+    malformed = complete.filter(
+        ~(
+            (pl.col("row_group_id") == 1)
+            & (pl.col("column_name") == "payload")
+        )
+    )
+
+    assert DataEstimator._row_group_byte_estimate(
+        malformed, ["f"], {"id", "payload"}, {}, "compressed_bytes",
+    ) == (0, False)
+    estimator = DataEstimator.__new__(DataEstimator)
+    trusted, projected = estimator._projected_bytes_index(
+        malformed, {"id", "payload"}, ["f"],
+    )
+    assert trusted == set()
+    assert projected == {}
+
+    duplicated = pl.concat([
+        complete,
+        complete.filter(
+            (pl.col("row_group_id") == 1)
+            & (pl.col("column_name") == "payload")
+        ),
+    ])
+    assert DataEstimator._row_group_byte_estimate(
+        duplicated, ["f"], {"id", "payload"}, {}, "compressed_bytes",
+    ) == (0, False)
+    trusted, projected = estimator._projected_bytes_index(
+        duplicated, {"id", "payload"}, ["f"],
+    )
+    assert trusted == set()
+    assert projected == {}
+
+
 def test_legacy_missing_uncompressed_bytes_is_explicitly_incomplete():
     frame = _stats([_stat_row("f", 0, "id", 0, 9)])
     frame = frame.with_columns(pl.lit(None).cast(pl.Int64).alias("uncompressed_bytes"))
@@ -274,9 +321,21 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
         _stat_row(
             "raw/f.parquet", 0, "id", 0, 9, rows=5_000_000,
         ),
+        _stat_row(
+            "raw/f.parquet", 0, "payload", 0, 9, rows=5_000_000,
+            compressed=100, uncompressed=500,
+        ),
         _stat_row("raw/f.parquet", 1, "id", 10, 19),
         _stat_row(
+            "raw/f.parquet", 1, "payload", 10, 19,
+            compressed=101, uncompressed=501,
+        ),
+        _stat_row(
             "raw/f.parquet", 2, "id", 20, 29, rows=5_000_000,
+        ),
+        _stat_row(
+            "raw/f.parquet", 2, "payload", 20, 29, rows=5_000_000,
+            compressed=102, uncompressed=502,
         ),
     ])
     snapshot = {
@@ -286,19 +345,26 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
         "version": 1,
         "payload": {
             "snapshot_version": 1,
-            "schema": {"id": "BIGINT"},
+            "schema": {"id": "BIGINT", "payload": "Binary"},
             "stats_file": "stats.parquet",
-            "stats_rows": 3,
+            "stats_rows": 6,
             "resources": [{
                 "file": "raw/f.parquet",
                 "file_size": 1_000,
                 "rows": 10_000_004,
+                "column_max_value_bytes": {"payload": 257},
             }],
             "tombstone": None,
             "tombstone_rows": 0,
             "tombstone_digest": None,
         },
     }
+    resource_seal = stats_resource_seals(frame)["raw/f.parquet"]
+    snapshot["payload"]["resources"][0].update({
+        "footer_sha256": resource_seal.footer_sha256,
+        "stats_rows": resource_seal.stats_rows,
+        "stats_digest": resource_seal.stats_digest,
+    })
     estimator = DataEstimator.__new__(DataEstimator)
     estimator.organization = "org"
     estimator.storage = types.SimpleNamespace()
@@ -341,6 +407,16 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     assert super_snapshot.row_group_selections == {
         "raw/f.parquet": RowGroupSelection(3, (1,), _FOOTER_SEAL),
     }
+    assert super_snapshot.resource_stats_seals == {
+        "raw/f.parquet": resource_seal,
+    }
+    assert super_snapshot.column_max_value_bytes == {"payload": 257}
+    assert super_snapshot.integer_domain_bounds["id"].minimum == 10
+    assert super_snapshot.integer_domain_bounds["id"].maximum == 19
+    assert (
+        super_snapshot.integer_domain_bounds["id"].cardinality_upper_bound
+        == 10
+    )
     # Existing engines retain file-level projection/source semantics.
     assert reflection.reflection_bytes == 30
     assert reflection.source_bytes == 1_000
@@ -365,6 +441,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     )
     disabled = estimator.estimate()
     assert disabled.supers[0].row_group_selections == {}
+    assert disabled.supers[0].integer_domain_bounds["id"].minimum == 0
+    assert disabled.supers[0].integer_domain_bounds["id"].maximum == 29
     assert disabled.row_group_scan_bytes == 30
 
     # Active deletion vectors require a selected-group rowid anti join plus a
@@ -434,4 +512,38 @@ def test_variable_width_rle_decoded_memory_is_unknown_not_page_sized():
     estimator = DataEstimator.__new__(DataEstimator)
     assert estimator._decoded_row_group_estimate(
         frame, ["f"], {"payload"}, {}, {"payload": "VARCHAR"},
+    ) == (0, False)
+
+
+def test_binary_decoded_memory_uses_exact_snapshot_value_width_bound():
+    frame = _stats([
+        _stat_row(
+            "f", 0, "payload", 1, 1,
+            rows=1_000_000, compressed=128, uncompressed=256,
+        ),
+    ])
+    estimator = DataEstimator.__new__(DataEstimator)
+
+    decoded, complete = estimator._decoded_row_group_estimate(
+        frame,
+        ["f"],
+        {"payload"},
+        {},
+        {"payload": "Binary"},
+        {"payload": 511},
+    )
+
+    assert complete is True
+    # 511 payload bytes + one Arrow 32-bit offset + validity/alignment slack.
+    assert decoded == 1_000_000 * (511 + 4 + 1)
+
+
+@pytest.mark.parametrize("bound", [None, -1, True, "511"])
+def test_binary_decoded_memory_rejects_missing_or_malformed_bound(bound):
+    frame = _stats([_stat_row("f", 0, "payload", 1, 1)])
+    estimator = DataEstimator.__new__(DataEstimator)
+    bounds = {} if bound is None else {"payload": bound}
+
+    assert estimator._decoded_row_group_estimate(
+        frame, ["f"], {"payload"}, {}, {"payload": "Binary"}, bounds,
     ) == (0, False)

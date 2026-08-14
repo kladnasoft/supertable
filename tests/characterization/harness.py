@@ -122,7 +122,7 @@ def new_fake_redis():
 def reset_engine_singletons() -> None:
     """Drop cached engine/connection singletons so each test starts clean.
 
-    Lite and Pro keep organization/storage-scoped persistent connections, and
+    Lite and DuckDB keep organization/storage-scoped persistent connections, and
     the Redis client factory is process-global.  All must be reset between
     tests pointed at different fake-Redis instances and storage homes.
     """
@@ -143,7 +143,7 @@ def reset_engine_singletons() -> None:
         import supertable.engine.executor as ex
 
         engines = {
-            *list(getattr(ex, "_pro_singletons", {}).values()),
+            *list(getattr(ex, "_duckdb_singletons", {}).values()),
             *list(getattr(ex, "_lite_singletons", {}).values()),
         }
         for engine in engines:
@@ -154,9 +154,9 @@ def reset_engine_singletons() -> None:
                     engine._reset_connection()
             except Exception:
                 pass
-        getattr(ex, "_pro_singletons", {}).clear()
+        getattr(ex, "_duckdb_singletons", {}).clear()
         getattr(ex, "_lite_singletons", {}).clear()
-        ex._pro_singleton = None
+        ex._duckdb_singleton = None
         ex._lite_singleton = None
     except Exception:
         pass

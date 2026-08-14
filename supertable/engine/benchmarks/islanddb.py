@@ -1,4 +1,4 @@
-"""Command-line interface for the DuckDB Lite versus IslandDB benchmark."""
+"""Command-line interface for the DuckDB versus IslandDB benchmark."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Sequence
 
 from .corpus import (
     GIB,
+    TIER_TARGET_BYTES,
     CorpusSpec,
     normalize_tiers,
     normalize_workloads,
@@ -40,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m supertable.engine.benchmarks",
         description=(
-            "Generate deterministic Parquet and compare explicit DuckDB Lite "
+            "Generate deterministic Parquet and compare explicit DuckDB "
             "with explicit IslandDB. Exact result parity is checked before timing."
         ),
     )
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="LIST",
-        help="comma-separated tiers: kb,mb,1gib,10gib (default: kb,mb)",
+        help="comma-separated tiers: kb,mb,1gib,10gib,50gib (default: kb,mb)",
     )
     parser.add_argument("--kb", action="store_true", help="include the 512 KiB tier")
     parser.add_argument("--mb", action="store_true", help="include the 64 MiB tier")
@@ -75,14 +76,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly allow corpus tiers of 1 GiB or larger",
     )
     parser.add_argument(
+        "--fifty-gib",
+        "--50gib",
+        "--50gb",
+        dest="fifty_gib",
+        action="store_true",
+        help="include the 50 GiB tier (requires --allow-large)",
+    )
+    parser.add_argument(
         "--workloads",
         action="append",
         default=[],
         metavar="LIST",
         help=(
             "comma-separated workloads: no_match,point,range_1pct,range_1pct_5cols,"
-            "range_10pct,projection "
-            "(default: all)"
+            "range_10pct,projection,full_scan "
+            "(default: no_match,point,range_1pct,range_10pct,projection)"
         ),
     )
     parser.add_argument(
@@ -147,6 +156,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=3600,
         help="seconds allowed for one isolated engine series (default: 3600)",
     )
+    parser.add_argument(
+        "--engine-memory-limit",
+        "--memory-limit",
+        dest="memory_limit",
+        metavar="SIZE",
+        help=(
+            "configure the same internal workspace for both engines, e.g. 6GiB; "
+            "sets DuckDB's memory_limit and IslandDB's resource ceiling"
+        ),
+    )
+    parser.add_argument(
+        "--source-repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "intentionally scan each manifest path N times; records unique and "
+            "logical source sizes separately (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="set equal DuckDB and IslandDB CPU widths (e.g. 8)",
+    )
+    parser.add_argument(
+        "--disable-caches",
+        action="store_true",
+        help="disable DuckDB external and IslandDB local/range caches",
+    )
+    parser.add_argument(
+        "--min-cold-read-fraction",
+        type=float,
+        default=None,
+        metavar="FRACTION",
+        help=(
+            "require each fadvise-cold worker to physically read at least this "
+            "fraction of unique projected bytes, e.g. 0.99"
+        ),
+    )
     return parser
 
 
@@ -160,12 +211,14 @@ def selected_tiers(args: argparse.Namespace) -> list[str]:
         raw.append("1gib")
     if args.ten_gib:
         raw.append("10gib")
+    if args.fifty_gib:
+        raw.append("50gib")
     if not raw:
         raw = ["kb", "mb"]
     tiers = normalize_tiers(raw)
-    if any(tier in ("1gib", "10gib") for tier in tiers) and not args.allow_large:
+    if any(TIER_TARGET_BYTES[tier] >= GIB for tier in tiers) and not args.allow_large:
         raise ValueError(
-            "1 GiB and 10 GiB tiers are opt-in; pass --allow-large after "
+            "GiB-scale tiers are opt-in; pass --allow-large after "
             "confirming disk capacity"
         )
     return tiers
@@ -192,11 +245,16 @@ def _print_prepared(manifest: dict) -> None:
 
 
 def _print_comparison(comparison: dict) -> None:
-    print(
-        f"\n{comparison['tier']}: {comparison['actual_source_bytes']:,} source bytes"
-    )
+    source_repeat = int(comparison.get("source_repeat") or 1)
+    source_text = f"{comparison['actual_source_bytes']:,} unique source bytes"
+    if source_repeat > 1:
+        source_text += (
+            f", {comparison['logical_source_bytes']:,} logical bytes "
+            f"({source_repeat}x intentional path repetition)"
+        )
+    print(f"\n{comparison['tier']}: {source_text}")
     for record in comparison["workloads"]:
-        duck = record["summary"]["duckdb_lite"]["warm_wall_seconds_median"]
+        duck = record["summary"]["duckdb"]["warm_wall_seconds_median"]
         island = record["summary"]["islanddb"]["warm_wall_seconds_median"]
         speedup = record["islanddb_speedup_over_duckdb_warm_median"]
         duck_text = f"{duck * 1000:.2f} ms" if duck is not None else "n/a"
@@ -218,8 +276,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--repeats must be positive")
         if args.worker_timeout <= 0:
             raise ValueError("--worker-timeout must be positive")
+        if args.source_repeat <= 0:
+            raise ValueError("--source-repeat must be positive")
+        if args.threads is not None and args.threads <= 0:
+            raise ValueError("--threads must be positive")
+        if args.min_cold_read_fraction is not None:
+            if not 0 < args.min_cold_read_fraction <= 1:
+                raise ValueError("--min-cold-read-fraction must be in (0, 1]")
+            if args.cold_mode != "fadvise":
+                raise ValueError(
+                    "--min-cold-read-fraction requires --cold-mode fadvise"
+                )
         row_group_bytes = parse_byte_size(args.row_group_bytes)
         shard_bytes = parse_byte_size(args.shard_bytes) if args.shard_bytes else None
+        memory_limit_bytes = (
+            parse_byte_size(args.memory_limit) if args.memory_limit else None
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -259,6 +331,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         workloads=tuple(workloads),
         cold_mode=args.cold_mode,
         timeout_seconds=args.worker_timeout,
+        memory_limit_bytes=memory_limit_bytes,
+        minimum_cold_read_fraction=args.min_cold_read_fraction,
+        source_repeat=args.source_repeat,
+        threads=args.threads,
+        disable_caches=args.disable_caches,
     )
     comparisons = []
     for manifest in manifests:
@@ -287,6 +364,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "payload_width": args.payload_width,
             "row_group_target_bytes": row_group_bytes,
             "shard_target_bytes": shard_bytes,
+            "memory_limit_bytes": memory_limit_bytes,
+            "minimum_cold_read_fraction": args.min_cold_read_fraction,
+            "source_repeat": args.source_repeat,
+            "threads": args.threads,
+            "disable_caches": args.disable_caches,
             "corpus_root": str(corpus_root),
             "cache_root": str(cache_root),
         },

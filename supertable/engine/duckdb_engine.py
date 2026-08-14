@@ -1,4 +1,4 @@
-# supertable/engine/duckdb_lite.py
+# supertable/engine/duckdb_engine.py
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from supertable.engine.engine_common import (
 )
 
 
-class DuckDBLite:
+class DuckDB:
     """
     Per-query DuckDB executor backed by a single persistent connection.
 
@@ -40,8 +40,8 @@ class DuckDBLite:
     overhead of re-fetching parquet footer metadata from remote storage.
 
     Query isolation is preserved: VIEWs are created with unique names and
-    dropped in the finally block after each query.  No materialised TABLE
-    state is retained between queries (contrast with DuckDBPro).
+    dropped in the finally block after each query. No materialised table state
+    is retained between queries.
 
     Cache layers (innermost to outermost):
       1. DuckDB external file cache  -- disk-level data block cache (DuckDB >= 1.3)
@@ -84,7 +84,7 @@ class DuckDBLite:
         # applied here because the httpfs extension is not loaded yet.
         self._con = con
         self._httpfs_configured = False
-        logger.info("[duckdb.lite] persistent connection created")
+        logger.info("[duckdb] persistent connection created")
         return con
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
@@ -110,7 +110,7 @@ class DuckDBLite:
             self._httpfs_configured = False
             # Tables died with the connection — just forget the registry.
             self._tombstone_cache.clear_registry()
-            logger.warning("[duckdb.lite] connection reset")
+            logger.warning("[duckdb] connection reset")
 
     # ------------------------------------------------------------------
     # Core execution
@@ -298,11 +298,11 @@ class DuckDBLite:
             # changes take effect on this persistent connection per query.
             apply_runtime_pragmas(con, engine_config)
 
-            logger.debug(f"{log_prefix}[duckdb.lite] executing: {executing_query}")
+            logger.debug(f"{log_prefix}[duckdb] executing: {executing_query}")
             result = con.execute(executing_query).fetchdf()
 
             if tried_presign:
-                logger.debug(f"{log_prefix}[duckdb.lite] presigned fallback succeeded")
+                logger.debug(f"{log_prefix}[duckdb] presigned fallback succeeded")
 
             return result
 

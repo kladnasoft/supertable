@@ -15,10 +15,10 @@ import polars as pl
 import pytest
 
 from supertable.data_classes import Reflection, SuperSnapshot, TombstoneDef
-from supertable.engine.duckdb_lite import DuckDBLite
-from supertable.engine import duckdb_lite as duckdb_lite_module
-from supertable.engine.duckdb_pro import DuckDBPro
-from supertable.engine import duckdb_pro as duckdb_pro_module
+from supertable.engine.duckdb_engine import DuckDB
+from supertable.engine import duckdb_engine as duckdb_engine_module
+
+
 from supertable.engine import executor as executor_module
 from supertable.engine import engine_common as engine_common_module
 from supertable.engine.engine_enum import Engine
@@ -453,7 +453,7 @@ def test_spark_typed_empty_rejects_types_spark_cannot_scan_safely(
     cursor.execute.assert_not_called()
 
 
-@pytest.mark.parametrize("executor_cls", [DuckDBLite, DuckDBPro])
+@pytest.mark.parametrize("executor_cls", [DuckDB])
 def test_executor_returns_typed_empty_result_for_zero_resource_snapshot(
     executor_cls, tmp_path,
 ):
@@ -472,167 +472,12 @@ def test_executor_returns_typed_empty_result_for_zero_resource_snapshot(
     try:
         result = executor.execute(reflection, parser, qm, lambda _event: None)
     finally:
-        executor.drop_all() if isinstance(executor, DuckDBPro) else executor._reset_connection()
+        executor._reset_connection()
     assert list(result.columns) == ["id"]
     assert result.empty
 
 
-def test_pro_same_version_different_file_signature_rebuilds(tmp_path):
-    pro = DuckDBPro()
-    con = duckdb.connect()
-    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
-    _write_source(con, a, ident=1, rowid=1)
-    _write_source(con, b, ident=2, rowid=2)
-    first = pro._ensure_view(con, "s", "t", 7, [str(a)])
-    second = pro._ensure_view(con, "s", "t", 7, [str(b)])
-    assert first != second
-    assert con.execute(f"SELECT id FROM {second}").fetchone() == (2,)
-
-
-def test_pro_generated_name_collision_never_reuses_or_replaces_wrong_view(
-        tmp_path, monkeypatch,
-):
-    pro = DuckDBPro()
-    con = duckdb.connect()
-    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
-    _write_source(con, a, ident=1, rowid=1)
-    _write_source(con, b, ident=2, rowid=2)
-    monkeypatch.setattr(
-        duckdb_pro_module, "pro_table_name", lambda *args, **kwargs: "forced_name",
-    )
-
-    first = pro._ensure_view(con, "s", "t", 7, [str(a)])
-    second = pro._ensure_view(con, "s", "t", 7, [str(b)])
-
-    assert first != second
-    assert con.execute(f"SELECT id FROM {first}").fetchall() == [(1,)]
-    assert con.execute(f"SELECT id FROM {second}").fetchall() == [(2,)]
-
-
-def test_pro_reuses_alternating_survivor_signatures_at_same_version(tmp_path):
-    pro = DuckDBPro()
-    con = duckdb.connect()
-    paths = []
-    for value in (1, 2):
-        path = tmp_path / f"f{value}.parquet"
-        _write_source(con, path, ident=value, rowid=value)
-        paths.append(str(path))
-    first = pro._ensure_view(
-        con, "s", "t", 7, [paths[0]], resource_keys=["raw/f1"],
-    )
-    second = pro._ensure_view(
-        con, "s", "t", 7, [paths[1]], resource_keys=["raw/f2"],
-    )
-    both = pro._ensure_view(
-        con, "s", "t", 7, paths, resource_keys=["raw/f1", "raw/f2"],
-    )
-    assert pro._ensure_view(
-        con, "s", "t", 7, [paths[0]], resource_keys=["raw/f1"],
-    ) == first
-    assert pro._ensure_view(
-        con, "s", "t", 7, [paths[1]], resource_keys=["raw/f2"],
-    ) == second
-    assert len({first, second, both}) == 3
-    assert len(pro._registry[("s", "t")]) == 3
-
-
-def test_pro_rotating_resolved_url_rebuilds_same_logical_resource(tmp_path):
-    """A fresh capability must replace a view that embeds an invalid old one."""
-    pro = DuckDBPro()
-    con = duckdb.connect()
-    old_path = tmp_path / "signed-old.parquet"
-    fresh_path = tmp_path / "signed-fresh.parquet"
-    _write_source(con, old_path, ident=1, rowid=1)
-    _write_source(con, fresh_path, ident=2, rowid=2)
-
-    first = pro._ensure_view(
-        con, "s", "t", 7, [old_path.as_uri()],
-        resource_keys=["raw/f"],
-    )
-    # Deterministically model expiry/revocation of the first resolved URL.
-    old_path.unlink()
-    second = pro._ensure_view(
-        con, "s", "t", 7, [fresh_path.as_uri()],
-        resource_keys=["raw/f"],
-    )
-
-    assert first != second
-    assert con.execute(f"SELECT id FROM {second}").fetchall() == [(2,)]
-    # Exact stable concrete paths still get the zero-DDL cache hit.
-    assert pro._ensure_view(
-        con, "s", "t", 7, [fresh_path.as_uri()],
-        resource_keys=["raw/f"],
-    ) == second
-
-
-def test_pro_rotating_resolved_url_preserves_inflight_view(tmp_path):
-    """Replacing a capability never CREATE OR REPLACEs an acquired old view."""
-    pro = DuckDBPro()
-    con = duckdb.connect()
-    old_path = tmp_path / "signed-old.parquet"
-    fresh_path = tmp_path / "signed-fresh.parquet"
-    _write_source(con, old_path, ident=1, rowid=1)
-    _write_source(con, fresh_path, ident=2, rowid=2)
-
-    first = pro._ensure_view(
-        con, "s", "t", 7, [old_path.as_uri()], resource_keys=["raw/f"],
-    )
-    pro._acquire_refs({first})
-    second = pro._ensure_view(
-        con, "s", "t", 7, [fresh_path.as_uri()], resource_keys=["raw/f"],
-    )
-
-    assert first != second
-    assert con.execute(f"SELECT id FROM {first}").fetchall() == [(1,)]
-    assert con.execute(f"SELECT id FROM {second}").fetchall() == [(2,)]
-    entries = pro._registry[("s", "t")]
-    old_entry = next(entry for entry in entries if entry.table_name == first)
-    assert old_entry.stale is True
-    assert old_entry.ref_count == 1
-
-    pro._release_refs({first})
-    pro._drop_unreferenced_stale(con)
-    assert [entry.table_name for entry in pro._registry[("s", "t")]] == [second]
-
-
-def test_pro_concurrent_requests_keep_results_isolated(tmp_path):
-    setup = duckdb.connect()
-    paths = []
-    for value in (11, 22):
-        path = tmp_path / f"f{value}.parquet"
-        _write_source(setup, path, ident=value, rowid=value)
-        paths.append(path)
-    pro = DuckDBPro()
-    barrier = threading.Barrier(2)
-
-    def run(idx):
-        value = (11, 22)[idx]
-        table = f"t{idx}"
-        parser = SQLParser("s", f"SELECT id FROM {table}", "duckdb")
-        reflection = Reflection(
-            "local", 1, 1,
-            [SuperSnapshot(
-                "s", table, 1, [str(paths[idx])],
-                {"id", "__rowid__", "__timestamp__"}, [f"raw/{table}"],
-                column_types={"id": "Int64", "__rowid__": "Int64", "__timestamp__": "Int64"},
-            )],
-        )
-        qm = MagicMock(
-            temp_dir=str(tmp_path),
-            query_plan_path=str(tmp_path / f"plan{idx}.json"),
-        )
-        barrier.wait()
-        return pro.execute(reflection, parser, qm, lambda _event: None)["id"].tolist()
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(run, (0, 1)))
-    finally:
-        pro.drop_all()
-    assert results == [[11], [22]]
-
-
-def test_lite_concurrent_same_snapshot_views_are_request_isolated(
+def test_duckdb_concurrent_same_snapshot_views_are_request_isolated(
     tmp_path, monkeypatch,
 ):
     """Same table/version but different survivor files must not share DDL."""
@@ -643,9 +488,9 @@ def test_lite_concurrent_same_snapshot_views_are_request_isolated(
         _write_source(setup, path, ident=value, rowid=value)
         paths.append(path)
 
-    lite = DuckDBLite()
+    engine = DuckDB()
     created = threading.Barrier(2)
-    original_create = duckdb_lite_module.create_reflection_view_with_presign_retry
+    original_create = duckdb_engine_module.create_reflection_view_with_presign_retry
 
     def create_then_align(*args, **kwargs):
         result = original_create(*args, **kwargs)
@@ -653,7 +498,7 @@ def test_lite_concurrent_same_snapshot_views_are_request_isolated(
         return result
 
     monkeypatch.setattr(
-        duckdb_lite_module,
+        duckdb_engine_module,
         "create_reflection_view_with_presign_retry",
         create_then_align,
     )
@@ -674,9 +519,9 @@ def test_lite_concurrent_same_snapshot_views_are_request_isolated(
         )
         qm = MagicMock(
             temp_dir=str(tmp_path),
-            query_plan_path=str(tmp_path / f"lite-plan-{idx}.json"),
+            query_plan_path=str(tmp_path / f"duckdb-plan-{idx}.json"),
         )
-        return lite.execute(
+        return engine.execute(
             reflection, parser, qm, lambda _event: None,
         )["id"].tolist()
 
@@ -684,11 +529,11 @@ def test_lite_concurrent_same_snapshot_views_are_request_isolated(
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(run, (0, 1)))
     finally:
-        lite._reset_connection()
+        engine._reset_connection()
     assert results == [[11], [22]]
 
 
-def test_lite_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
+def test_duckdb_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
         tmp_path, monkeypatch,
 ):
     """UUIDs sharing their first 32 bits must still own distinct DDL names."""
@@ -716,11 +561,11 @@ def test_lite_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
         with uuid_lock:
             return next(uuid_values)
 
-    monkeypatch.setattr(duckdb_lite_module._uuid, "uuid4", next_uuid)
+    monkeypatch.setattr(duckdb_engine_module._uuid, "uuid4", next_uuid)
 
-    lite = DuckDBLite()
+    engine = DuckDB()
     source_created = threading.Barrier(2, timeout=10)
-    original_create = duckdb_lite_module.create_reflection_view_with_presign_retry
+    original_create = duckdb_engine_module.create_reflection_view_with_presign_retry
 
     def create_then_align(*args, **kwargs):
         result = original_create(*args, **kwargs)
@@ -728,7 +573,7 @@ def test_lite_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
         return result
 
     monkeypatch.setattr(
-        duckdb_lite_module,
+        duckdb_engine_module,
         "create_reflection_view_with_presign_retry",
         create_then_align,
     )
@@ -758,7 +603,7 @@ def test_lite_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
             temp_dir=str(tmp_path),
             query_plan_path=str(tmp_path / f"collision-plan-{idx}.json"),
         )
-        return lite.execute(
+        return engine.execute(
             reflection, parser, qm, lambda _event: None,
         )["id"].tolist()
 
@@ -766,16 +611,16 @@ def test_lite_request_names_use_full_uuid_for_concurrent_active_dv_isolation(
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(run, (0, 1)))
     finally:
-        lite._reset_connection()
+        engine._reset_connection()
 
     assert results == [[], [22]]
 
 
-def test_lite_singleton_reuses_validated_dv_across_executors(
+def test_duckdb_singleton_reuses_validated_dv_across_executors(
     tmp_path, monkeypatch,
 ):
     setup = duckdb.connect()
-    source, dv = tmp_path / "lite-source.parquet", tmp_path / "lite-dv.parquet"
+    source, dv = tmp_path / "duckdb-source.parquet", tmp_path / "duckdb-dv.parquet"
     _write_source(setup, source, ident=1, rowid=7)
     rows = [("raw/source", 7)]
     _write_dv(setup, dv, rows)
@@ -814,46 +659,46 @@ def test_lite_singleton_reuses_validated_dv_across_executors(
         "_validate_tombstone_relation_details",
         counted_validate,
     )
-    executor_module._lite_singleton = None
-    executor_module._lite_singletons.clear()
+    executor_module._duckdb_singleton = None
+    executor_module._duckdb_singletons.clear()
     first = executor_module.Executor(organization="org")
     second = executor_module.Executor(organization="org")
-    assert first.lite_exec is second.lite_exec
+    assert first.duckdb_exec is second.duckdb_exec
 
     try:
         for idx, executor in enumerate((first, second)):
             parser = SQLParser("s", "SELECT id FROM t", "duckdb")
             qm = MagicMock(
                 temp_dir=str(tmp_path),
-                query_plan_path=str(tmp_path / f"lite-cache-plan-{idx}.json"),
+                query_plan_path=str(tmp_path / f"duckdb-cache-plan-{idx}.json"),
             )
-            result = executor.lite_exec.execute(
+            result = executor.duckdb_exec.execute(
                 reflection, parser, qm, lambda _event: None,
             )
             assert result.empty
         assert validation_calls == 1
     finally:
-        first.lite_exec._reset_connection()
-        executor_module._lite_singleton = None
-        executor_module._lite_singletons.clear()
+        first.duckdb_exec._reset_connection()
+        executor_module._duckdb_singleton = None
+        executor_module._duckdb_singletons.clear()
 
 
-def test_pro_singletons_are_scoped_by_org_and_storage():
+def test_duckdb_singletons_are_scoped_by_org_and_storage():
     class Storage:
         def __init__(self, bucket):
             self.bucket_name = bucket
             self.base_prefix = ""
 
-    executor_module._pro_singleton = None
-    executor_module._pro_singletons.clear()
-    a = executor_module._get_pro(Storage("a"), organization="org-1")
-    b = executor_module._get_pro(Storage("b"), organization="org-1")
-    c = executor_module._get_pro(Storage("a"), organization="org-2")
+    executor_module._duckdb_singleton = None
+    executor_module._duckdb_singletons.clear()
+    a = executor_module._get_duckdb(Storage("a"), organization="org-1")
+    b = executor_module._get_duckdb(Storage("b"), organization="org-1")
+    c = executor_module._get_duckdb(Storage("a"), organization="org-2")
     assert len({id(a), id(b), id(c)}) == 3
-    for pro in (a, b, c):
-        pro.drop_all()
-    executor_module._pro_singleton = None
-    executor_module._pro_singletons.clear()
+    for engine in (a, b, c):
+        engine._reset_connection()
+    executor_module._duckdb_singleton = None
+    executor_module._duckdb_singletons.clear()
 
 
 def test_builtin_storage_identity_reuses_local_and_seals_full_credentials():
@@ -892,17 +737,17 @@ def test_scoped_lite_registry_releases_unreferenced_noncurrent_scope():
         def __init__(self, bucket):
             self.bucket_name = bucket
 
-    executor_module._lite_singleton = None
-    executor_module._lite_singletons.clear()
-    first = executor_module._get_lite(Storage("first"), "org")
-    second = executor_module._get_lite(Storage("second"), "org")
-    assert len(executor_module._lite_singletons) == 2
+    executor_module._duckdb_singleton = None
+    executor_module._duckdb_singletons.clear()
+    first = executor_module._get_duckdb(Storage("first"), "org")
+    second = executor_module._get_duckdb(Storage("second"), "org")
+    assert len(executor_module._duckdb_singletons) == 2
     del first
     gc.collect()
-    assert list(executor_module._lite_singletons.values()) == [second]
+    assert list(executor_module._duckdb_singletons.values()) == [second]
     second._reset_connection()
-    executor_module._lite_singleton = None
-    executor_module._lite_singletons.clear()
+    executor_module._duckdb_singleton = None
+    executor_module._duckdb_singletons.clear()
 
 
 def test_auto_never_routes_active_tombstone_to_spark(monkeypatch):
@@ -924,12 +769,12 @@ def test_auto_never_routes_active_tombstone_to_spark(monkeypatch):
         },
     )
     cfg = MagicMock(
-        engine_lite_max_bytes=100,
+        engine_island_min_bytes=100,
         engine_spark_min_bytes=1,
         engine_freshness_sec=300,
     )
 
-    assert executor._auto_pick(reflection, cfg) is Engine.DUCKDB_PRO
+    assert executor._auto_pick(reflection, cfg) is Engine.DUCKDB
 
 
 def test_local_paths_never_attempt_httpfs_load():

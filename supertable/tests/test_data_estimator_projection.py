@@ -3,7 +3,7 @@
 Regression + contract for the estimator over-counting fix: a query that selects
 a few columns from a wide table used to be charged the WHOLE on-disk file size
 of every surviving file (all columns), inflating the AUTO-engine size estimate
-by 10-100x and mis-routing small reads to Pro/Spark.  The estimator now charges
+by 10-100x and mis-routing small reads to DuckDB/Spark.  The estimator now charges
 only the selected columns' on-disk (compressed) bytes:
 
   * ``_selected_columns`` resolves the projected column set (``SELECT *`` and
@@ -99,14 +99,30 @@ class TestTypeWidth:
     def test_widths(self, type_name, width):
         assert _est()._type_width(type_name) == width
 
+    @pytest.mark.parametrize(
+        "type_name,eligible",
+        [
+            ("BIGINT", True), ("Int32", True), ("UInt64", True),
+            ("Float64", False), ("Datetime", False), ("Binary", False),
+            ("HUGEINT", False),
+        ],
+    )
+    def test_integer_domain_type_is_narrow_and_explicit(self, type_name, eligible):
+        assert _est()._integer_domain_type(type_name) is eligible
+
 
 class TestProjectedBytesIndex:
 
     def _stats(self, rows):
+        rows = [
+            {"row_group_id": row.get("row_group_id", 0), **row}
+            for row in rows
+        ]
         return pl.DataFrame(
             rows,
             schema={
                 "file_path": pl.Utf8,
+                "row_group_id": pl.Int64,
                 "column_name": pl.Utf8,
                 "compressed_bytes": pl.Int64,
             },
@@ -137,8 +153,8 @@ class TestProjectedBytesIndex:
         # Two row groups of the same column in one file -> summed.
         est = _est()
         stats = self._stats([
-            {"file_path": "f1", "column_name": "a", "compressed_bytes": 40},
-            {"file_path": "f1", "column_name": "a", "compressed_bytes": 60},
+            {"file_path": "f1", "row_group_id": 0, "column_name": "a", "compressed_bytes": 40},
+            {"file_path": "f1", "row_group_id": 1, "column_name": "a", "compressed_bytes": 60},
         ])
         _, proj = est._projected_bytes_index(stats, {"a"})
         assert proj == {"f1": 100}

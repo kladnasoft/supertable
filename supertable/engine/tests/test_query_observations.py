@@ -47,11 +47,11 @@ def _stats(*, fallback: bool = False) -> PlanStats:
     stats.add_stat({
         "AUTO_ROUTING_OUTCOME": {
             "selected_engine": "islanddb",
-            "actual_engine": "duckdb_pro" if fallback else "islanddb",
+            "actual_engine": "duckdb" if fallback else "islanddb",
             "fallback": fallback,
         },
     })
-    stats.add_stat({"ENGINE": "duckdb_pro" if fallback else "islanddb"})
+    stats.add_stat({"ENGINE": "duckdb" if fallback else "islanddb"})
     return stats
 
 
@@ -187,7 +187,7 @@ def test_forced_failed_and_fallback_profiles_remain_feedback_ineligible():
     assert failed.feedback_eligible is False
 
     forced_profile = normalize_query_profile(
-        query="SELECT 1", requested_engine="duckdb_lite",
+        query="SELECT 1", requested_engine="duckdb",
         timing=[{"EXECUTING_QUERY": 0.01}], plan_stats=_stats(),
         status="ok", result_shape=(1, 1), engine_profile={},
     )

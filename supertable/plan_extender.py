@@ -150,7 +150,7 @@ def extend_execution_plan(
 
     # Prepare flat metric payload for the monitoring table
     try:
-        # Extract engine from plan_stats (stored as {"ENGINE": "duckdb_lite"} entry)
+        # Extract engine from plan_stats (stored as {"ENGINE": "duckdb"} entry)
         _engine_used = "unknown"
         for _entry in (plan_stats.stats if hasattr(plan_stats, "stats") else []):
             if isinstance(_entry, dict) and "ENGINE" in _entry:

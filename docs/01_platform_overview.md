@@ -76,7 +76,7 @@ supertable/
 │                        #   admin, consumers, middleware, export, crypto)
 ├── config/              # Configuration (settings, defaults, homedir)
 ├── demo/                # Runnable quickstart + webshop demos
-├── engine/              # Query engines (DuckDB Lite/Pro, Spark Thrift,
+├── engine/              # Query engines (DuckDB/Pro, Spark Thrift,
 │                        #   executor, engine_enum, plan_stats, data_estimator)
 ├── infra/               # Optional infra scaffolding (minio, redis assets)
 ├── locking/             # Distributed locking (Redis + file fallback)
@@ -122,7 +122,7 @@ Write Path:
 
 Read Path:
   DataReader.execute() → resolve tables → build view chain → estimate size
-    → select engine (DuckDB Lite/Pro/Spark) → execute SQL → return DataFrame
+    → select engine (DuckDB/Pro/Spark) → execute SQL → return DataFrame
 
 View Chain (transparent to caller):
   Base Parquet files → Dedup view → Tombstone view → RBAC view → User query
@@ -158,7 +158,7 @@ SuperTable SDK's own state under `supertable:`. See
 | [06 Data Writer](06_data_writer.md) | Write pipeline with locking and dedup |
 | [07 Ingestion](07_ingestion.md) | Staging areas and pipes |
 | [08 Locking](08_locking.md) | Distributed locking (Redis + file) |
-| [09 Query Engine](09_query_engine.md) | DuckDB Lite/Pro, Spark SQL, engine selection |
+| [09 Query Engine](09_query_engine.md) | DuckDB/Pro, Spark SQL, engine selection |
 | [10 Data Reader](10_data_reader.md) | Read facade, view chain, plan stats |
 | [11 RBAC](11_rbac.md) | Roles, users, row/column-level security |
 | [12 Audit](12_audit.md) | Compliance logging, hash chains, SIEM |

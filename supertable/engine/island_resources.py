@@ -260,6 +260,13 @@ class QueryResourceEstimate:
     # must not inflate bytes per selected row.
     selected_decoded_bytes: int = 0
     selected_decoded_bytes_complete: bool = False
+    # A large scan with a provably small integer GROUP domain must still use
+    # IslandDB's bounded batchwise aggregator: handing the whole lazy GROUP to
+    # Polars can transiently materialize the wide input despite its small final
+    # cardinality.  The planner therefore retains the external-operator advice
+    # while budgeting only the sealed compact group state/result.
+    requires_bounded_group_operator: bool = False
+    group_state_bytes_per_key: int = 0
 
     def __post_init__(self) -> None:
         numeric = (
@@ -272,9 +279,21 @@ class QueryResourceEstimate:
             self.estimated_rows,
             self.estimated_result_rows,
             self.selected_decoded_bytes,
+            self.group_state_bytes_per_key,
         )
         if any(value < 0 for value in numeric):
             raise ValueError("resource estimates cannot be negative")
+        if self.requires_bounded_group_operator and not self.has_group_by:
+            raise ValueError(
+                "a bounded group operator requires a GROUP BY estimate"
+            )
+        if (
+            self.requires_bounded_group_operator
+            and self.group_state_bytes_per_key <= 0
+        ):
+            raise ValueError(
+                "a bounded group operator requires a positive per-key bound"
+            )
 
 
 @dataclass(frozen=True)
@@ -303,11 +322,23 @@ class ResourcePolicy:
             self.result_memory_fraction,
             self.operator_memory_fraction,
         )
-        if any(value <= 0 or value > 1 for value in fractions):
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+            or value > 1
+            for value in fractions
+        ):
             raise ValueError("resource fractions must be in (0, 1]")
         if self.result_memory_fraction + self.operator_memory_fraction >= 1:
             raise ValueError("result and operator fractions must leave scan memory")
-        if self.spill_amplification < 1:
+        if (
+            isinstance(self.spill_amplification, bool)
+            or not isinstance(self.spill_amplification, (int, float))
+            or not math.isfinite(float(self.spill_amplification))
+            or self.spill_amplification < 1
+        ):
             raise ValueError("spill amplification must be at least one")
 
 
@@ -392,13 +423,19 @@ class ResourcePlanner:
         operator_memory = int(memory_budget * policy.operator_memory_fraction)
         scan_memory = memory_budget - result_memory - operator_memory
 
-        units = max(1, estimate.selected_row_groups, estimate.selected_files)
-        useful_bytes = max(estimate.compressed_scan_bytes, estimate.decoded_scan_bytes)
-        desired_cpu = max(1, math.ceil(useful_bytes / policy.bytes_per_cpu_worker))
-        cpu_workers = min(self.resources.cpu_count, units, desired_cpu)
+        # Polars and Arrow own process-global worker pools; they cannot be
+        # reduced safely for one query while unrelated queries are running.
+        # Reserve their worst-case CPU width so the governor never admits
+        # several queries on the fiction that each will use only the planner's
+        # estimated subset.  This intentionally serializes in-process IslandDB
+        # scans at the CPU admission boundary.  Hard per-query CPU isolation
+        # would require a separately initialized worker process/cgroup.
+        cpu_workers = max(1, self.resources.cpu_count)
 
-        desired_io = max(1, math.ceil(estimate.compressed_scan_bytes / policy.bytes_per_io_worker))
-        io_workers = min(policy.max_io_workers, max(1, estimate.selected_files), max(1, cpu_workers * 2), desired_io)
+        io_workers = max(
+            1,
+            min(policy.max_io_workers, self.resources.cpu_count * 2),
+        )
         parallel_slots = max(1, cpu_workers + io_workers)
         per_slot_memory = max(1, scan_memory // parallel_slots)
         # min_batch_bytes is a throughput target, never authority to exceed the
@@ -417,13 +454,14 @@ class ResourcePlanner:
             # Bound both source and output batches. A query projecting one input
             # column into hundreds of distinct aliases can expand each output
             # row far beyond its scan width; joins can similarly multiply rows.
-            input_width = math.ceil(
-                batch_decoded_bytes / estimate.estimated_rows
-            )
+            input_width = (
+                batch_decoded_bytes + estimate.estimated_rows - 1
+            ) // estimate.estimated_rows
             output_width = (
-                math.ceil(
-                    estimate.result_bytes / estimate.estimated_result_rows
-                )
+                (
+                    estimate.result_bytes
+                    + estimate.estimated_result_rows - 1
+                ) // estimate.estimated_result_rows
                 if estimate.estimated_result_rows > 0
                 else input_width
             )
@@ -450,15 +488,63 @@ class ResourcePlanner:
 
         oversized_result = estimate.result_bytes > result_memory
         state_excess = max(0, estimate.operator_state_bytes - operator_memory)
+        # external_group_aggregate retains at most one quarter of its operator
+        # workspace as live hash state, reserving the remainder for Arrow
+        # conversion/merge transients. A sealed full-domain estimate that only
+        # fits the larger admission budget can still flush on every batch.
+        bounded_group_retained = bool(
+            estimate.requires_bounded_group_operator
+            and estimate.operator_state_bytes <= max(1, operator_memory // 4)
+        )
         spill_basis = state_excess
-        if estimate.has_sort or estimate.has_group_by:
+        if bounded_group_retained:
+            # Partial aggregation reduces every input batch before retaining
+            # state.  The snapshot-sealed domain already bounds the complete
+            # compact hash table; charge that full bound (plus the separately
+            # bounded grouped result/order state) rather than rewriting the
+            # decoded source.  Amplification below leaves room for an IPC run
+            # and old+new overlap if the compact fallback does spill.
+            spill_basis = max(
+                spill_basis,
+                estimate.operator_state_bytes,
+                estimate.result_bytes,
+            )
+        elif estimate.requires_bounded_group_operator:
+            # When the complete sealed domain does not fit the retained hash
+            # target, the same key may recur in every input batch and therefore
+            # in many partial runs. One domain-sized table is not a spill quota
+            # proof. Charge the worst case of one compact state occurrence per
+            # selected row; the normal disk-cap gate below may route it away.
+            partial_occurrence_bytes = (
+                estimate.estimated_rows * estimate.group_state_bytes_per_key
+            )
+            spill_basis = max(
+                spill_basis,
+                estimate.decoded_scan_bytes,
+                estimate.operator_state_bytes,
+                estimate.result_bytes,
+                partial_occurrence_bytes,
+            )
+        elif estimate.has_sort or estimate.has_group_by:
             # External sort/group writes the full decoded input before merging,
-            # regardless of how little the blocking state exceeds memory. The
-            # amplification covers run framing and old+new multipass overlap.
-            spill_basis = max(spill_basis, estimate.decoded_scan_bytes)
-        estimated_spill = int(math.ceil(
-            spill_basis * policy.spill_amplification,
-        ))
+            # regardless of how little the blocking state exceeds memory. A
+            # high-cardinality group or many duplicate aggregate outputs can
+            # also make compact state/result wider than its narrow source, so
+            # neither streaming output nor compression may hide that quota.
+            # Amplification covers run framing and old+new multipass overlap.
+            spill_basis = max(
+                spill_basis,
+                estimate.decoded_scan_bytes,
+                estimate.operator_state_bytes,
+                estimate.result_bytes,
+            )
+        amplification_numerator, amplification_denominator = float(
+            policy.spill_amplification
+        ).as_integer_ratio()
+        estimated_spill = (
+            spill_basis * amplification_numerator
+            + amplification_denominator - 1
+        ) // amplification_denominator
 
         if oversized_result and not streaming_result:
             return QueryResourcePlan(
@@ -476,7 +562,7 @@ class ResourcePlanner:
                 reason="estimated result exceeds bounded collection memory; use streaming output",
             )
 
-        if state_excess == 0:
+        if state_excess == 0 and not estimate.requires_bounded_group_operator:
             advice = ExecutionAdvice.ISLAND_IN_MEMORY
             return QueryResourcePlan(
                 advice=advice,
@@ -550,7 +636,17 @@ class ResourcePlanner:
             result_memory_bytes=result_memory,
             spill_budget_bytes=estimated_spill,
             estimated_spill_bytes=estimated_spill,
-            reason="operator state requires and fits a bounded spill plan",
+            reason=(
+                "sealed group cardinality fits the retained bounded "
+                "batchwise aggregation state"
+                if bounded_group_retained
+                else (
+                    "sealed group cardinality requires partial runs whose "
+                    "conservative quota fits spill capacity"
+                    if estimate.requires_bounded_group_operator
+                    else "operator state requires and fits a bounded spill plan"
+                )
+            ),
         )
 
 

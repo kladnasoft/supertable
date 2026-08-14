@@ -4,7 +4,7 @@
 suite.  It does not reimplement any read logic: it injects the frozen catalog
 state into the (patched, fake) Redis using the genuine ``RedisCatalog`` API and
 then runs the production ``query_sql`` pipeline
-(``DataReader -> DataEstimator -> Executor -> DuckDBLite``), including the real
+(``DataReader -> DataEstimator -> Executor -> DuckDB``), including the real
 tombstone + dedup view SQL.  The only thing the adapter "owns" is assembling
 inputs and shaping the output into a :class:`TableResult`.
 
@@ -29,10 +29,10 @@ def _engine(engine: str):
     from supertable.engine.engine_enum import Engine
 
     e = (engine or "duckdb").lower()
-    if e in ("duckdb", "duckdb_lite", "lite"):
-        return Engine.DUCKDB_LITE
-    if e in ("duckdb_pro", "pro"):
-        return Engine.DUCKDB_PRO
+    if e in ("duckdb", "duckdb", "lite"):
+        return Engine.DUCKDB
+    if e in ("duckdb", "pro"):
+        return Engine.DUCKDB
     if e in ("spark", "spark_sql"):
         return Engine.SPARK_SQL
     raise ValueError(f"unknown engine {engine!r}")

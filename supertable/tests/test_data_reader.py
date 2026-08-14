@@ -130,13 +130,13 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.AUTO.value == "auto"
 
-    def test_duckdb_lite_value(self):
+    def test_duckdb_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_LITE.value == "duckdb_lite"
+        assert engine.DUCKDB.value == "duckdb"
 
-    def test_duckdb_pro_value(self):
+    def test_duckdb_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_PRO.value == "duckdb_pro"
+        assert engine.DUCKDB.value == "duckdb"
 
     def test_islanddb_value(self):
         from supertable.data_reader import engine
@@ -153,7 +153,7 @@ class TestEngineEnum:
     def test_engine_members(self):
         from supertable.data_reader import engine
         assert set(engine.__members__.keys()) == {
-            "AUTO", "DUCKDB_LITE", "DUCKDB_PRO", "ISLANDDB", "SPARK_SQL",
+            "AUTO", "DUCKDB", "DUCKDB", "ISLANDDB", "SPARK_SQL",
         }
 
 
@@ -382,16 +382,16 @@ class TestExecuteHappyPath:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_PRO)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         exec_call_kwargs = mock_exec.execute.call_args
-        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB_PRO or exec_call_kwargs[0][0] == _Engine.DUCKDB_PRO
+        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB or exec_call_kwargs[0][0] == _Engine.DUCKDB
 
 
 # ====================================================================
@@ -1571,13 +1571,13 @@ class TestExecuteExecutorArgs:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_LITE)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         # Executor receives the bounded AUTO history provider in addition to
         # the pre-existing storage/organization execution context.
@@ -1594,9 +1594,9 @@ class TestExecuteExecutorArgs:
 
         # Engine should be the internal enum
         if "engine" in kwargs:
-            assert kwargs["engine"] == _Engine.DUCKDB_LITE
+            assert kwargs["engine"] == _Engine.DUCKDB
         else:
-            assert args[0] == _Engine.DUCKDB_LITE
+            assert args[0] == _Engine.DUCKDB
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1786,23 +1786,23 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame({"plan": ["x"]}), "duckdb_lite")
+        mock_exec.execute.return_value = (pd.DataFrame({"plan": ["x"]}), "duckdb")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, Status, engine
         from supertable.engine.executor import Engine as _Engine
-        # Request PRO — EXPLAIN must override it to LITE.
+        # Request IslandDB — EXPLAIN must override it to DuckDB.
         dr = DataReader("s", "o", "EXPLAIN SELECT * FROM t")
-        df, status, msg = dr.execute("admin", engine=engine.DUCKDB_PRO)
+        df, status, msg = dr.execute("admin", engine=engine.DUCKDB)
 
         assert status == Status.OK
         # Parser is built on the INNER select only (EXPLAIN prefix stripped).
         assert MockParser.call_args.kwargs["query"] == "SELECT * FROM t"
-        # Executor receives explain flags and is pinned to DuckDB-lite.
+        # Executor receives explain flags and is pinned to DuckDB.
         ekw = mock_exec.execute.call_args.kwargs
         assert ekw["explain"] is True
         assert ekw["explain_options"] == ""
-        assert ekw["engine"] == _Engine.DUCKDB_LITE
+        assert ekw["engine"] == _Engine.DUCKDB
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1831,7 +1831,7 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1856,7 +1856,7 @@ class TestExecuteExplainRouting:
         mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
     ):
         """Regression guard: ordinary SELECT routes with explain=False and the
-        engine the caller requested (no LITE override)."""
+        engine the caller requested (no DuckDB override)."""
         mock_get_storage.return_value = MagicMock()
         mock_parser = MagicMock()
         mock_parser.get_table_tuples.return_value = []
@@ -1871,18 +1871,18 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
+        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "SELECT * FROM t")
-        dr.execute("admin", engine=engine.DUCKDB_PRO)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         ekw = mock_exec.execute.call_args.kwargs
         assert ekw["explain"] is False
         assert ekw["explain_options"] == ""
-        assert ekw["engine"] == _Engine.DUCKDB_PRO  # not overridden
+        assert ekw["engine"] == _Engine.DUCKDB  # not overridden
 
 
 # ====================================================================

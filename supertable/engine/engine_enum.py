@@ -5,8 +5,7 @@ from enum import Enum
 
 class Engine(Enum):
     AUTO = "auto"
-    DUCKDB_LITE = "duckdb_lite"
-    DUCKDB_PRO = "duckdb_pro"
+    DUCKDB = "duckdb"
     # IslandDB is SuperTable's specialised Parquet engine. It consumes the
     # estimator's exact file/row-group set; remote scans use sealed byte ranges.
     ISLANDDB = "islanddb"

@@ -29,7 +29,7 @@ User SQL
 [5] Build views    -- dedup, tombstone, RBAC views attached to Reflection
     |
     v
-[6] Select engine  -- AUTO picks Lite/Pro/Spark based on size + freshness
+[6] Select engine  -- AUTO picks DuckDB/IslandDB/Spark based on size + freshness
     |
     v
 [7] Execute        -- Executor runs query against chosen backend

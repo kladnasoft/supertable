@@ -27,7 +27,7 @@
 
 | # | Document | Description |
 |---|----------|-------------|
-| 09 | [Query Engine](09_query_engine.md) | DuckDB Lite/Pro, Spark SQL, auto selection, view chains |
+| 09 | [Query Engine](09_query_engine.md) | DuckDB/Pro, Spark SQL, auto selection, view chains |
 | 10 | [Data Reader](10_data_reader.md) | Read facade, snapshot history, view chain, plan stats |
 
 ## Security & Compliance

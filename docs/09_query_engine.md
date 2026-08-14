@@ -2,7 +2,7 @@
 
 ## Overview
 
-SuperTable's query engine is a multi-backend execution layer that automatically selects the optimal SQL engine based on data size, data freshness, and runtime availability. It supports three execution backends -- DuckDB Lite, DuckDB Pro, and Spark SQL -- unified behind a single `Executor` facade.
+SuperTable's query engine is a multi-backend execution layer that automatically selects the optimal SQL engine based on data size, query shape, and runtime availability. It supports three execution backends -- DuckDB, IslandDB, and Spark SQL -- unified behind a single `Executor` facade.
 
 The engine layer lives in `supertable/engine/` and is invoked by `DataReader` after the query has been parsed, access control checked, and file lists resolved.
 
@@ -10,45 +10,44 @@ The engine layer lives in `supertable/engine/` and is invoked by `DataReader` af
 
 ### The `Engine` Enum
 
-Defined in `supertable/engine/engine_enum.py`, the `Engine` enum declares four members:
+Defined in `supertable/engine/engine_enum.py`, the `Engine` enum declares four members (AUTO plus three execution engines):
 
 ```python
 class Engine(Enum):
     AUTO       = "auto"
-    DUCKDB_LITE = "duckdb_lite"
-    DUCKDB_PRO  = "duckdb_pro"
+    DUCKDB = "duckdb"
+    ISLANDDB  = "islanddb"
     SPARK_SQL   = "spark_sql"
 ```
 
 Each variant exposes a `dialect` property used by `SQLParser` to select the correct sqlglot grammar. `SPARK_SQL` returns `"spark"`; all others return `"duckdb"`.
 
-### AUTO Mode Decision Matrix
+### AUTO Mode
 
-When the engine is set to `AUTO` (the default), the `Executor._auto_pick()` method in `supertable/engine/executor.py` applies a two-dimensional decision matrix based on **data size** and **data freshness**.
+`Executor._auto_pick()` first applies correctness and availability gates, then
+compares deterministic cost estimates for the remaining engines. Its primary
+work signal is the sealed post-pruning row-group byte estimate when complete;
+otherwise it conservatively uses the selected-file bytes. Query shape, decoded
+bytes, file/row-group fanout, result size, freshness, spill advice, and scoped
+historical observations also participate.
 
-```
-                          Data Freshness
-                     FRESH (<threshold)    STABLE (>=threshold)
-                +-----------------------+-----------------------+
-  Small         |       LITE            |       LITE            |
-  (<100 MB)     |  cheap anyway         |  cheap anyway         |
-                +-----------------------+-----------------------+
-  Medium        |       LITE            |       PRO             |
-  (100 MB-10 GB)|  cache would churn    |  cache pays off       |
-                +-----------------------+-----------------------+
-  Large         |       SPARK *         |       SPARK *         |
-  (>=10 GB)     |  too big for DuckDB   |  too big for DuckDB   |
-                +-----------------------+-----------------------+
+Spark is eligible only when an active registered Thrift cluster accepts the
+job's size window and the SQL is inside the cross-engine equivalence subset.
+IslandDB is eligible only for its statically proven SQL subset and an executable
+resource plan. Missing/incomplete estimates route conservatively to DuckDB.
 
-  * Spark only if pyspark is available; falls back to PRO otherwise.
-```
+Organizations may store non-overlapping half-open `auto_policy` intervals in
+Redis to force an engine for an estimated-scan range. Manual rules remain below
+the same capability, identity, resource, and fleet gates; an unsafe rule falls
+through to the adaptive model.
 
-**Size thresholds** are read from the `Reflection.reflection_bytes` field (total bytes across all referenced parquet files) and compared against configurable limits:
+The shared values below tune the model/fleet fallback; they are not a fixed
+three-tier routing table:
 
 | Threshold | Environment Variable | Default |
 |-----------|---------------------|---------|
-| Lite upper bound | `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | 100 MB (104,857,600 bytes) |
-| Spark lower bound | `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | 10 GB (10,737,418,240 bytes) |
+| IslandDB crossover hint | `SUPERTABLE_ENGINE_ISLAND_MIN_BYTES` | 100 MiB (104,857,600 bytes) |
+| Spark fallback floor | `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | 0 (active fleet `min_bytes` normally wins) |
 
 ### Freshness-Aware Routing
 
@@ -65,10 +64,10 @@ data_is_fresh = age_s < freshness_threshold_s
 
 **Routing logic for the medium tier:**
 
-- **Fresh data** (age < threshold): routed to **LITE**, because the data is still being updated frequently and cached views in Pro would be invalidated before they pay off.
-- **Stable data** (age >= threshold): routed to **PRO**, because the persistent connection and cached views will be reused across multiple queries, amortizing the setup cost.
+- **Fresh data** (age < threshold): routed to **DuckDB**, because the data is still being updated frequently and cached views in IslandDB would be invalidated before they pay off.
+- **Stable data** (age >= threshold): routed to **IslandDB**, because the persistent connection and cached views will be reused across multiple queries, amortizing the setup cost.
 
-When freshness is unknown (`freshness_ms == 0`), the data is assumed stable so that Pro gets a chance to cache.
+When freshness is unknown (`freshness_ms == 0`), the data is assumed stable so that IslandDB gets a chance to cache.
 
 ## The Executor
 
@@ -79,7 +78,8 @@ class Executor:
     def __init__(self, storage=None, organization=""):
         self.storage = storage
         self.organization = organization
-        self.lite_exec = DuckDBLite(storage=storage)
+        self.duckdb_exec = DuckDB(storage=storage)
+        self.island_exec = IslandDB(storage=storage)
         self.spark_exec = None  # lazily initialized
 
     def execute(
@@ -97,17 +97,18 @@ class Executor:
 Key behaviors:
 
 - If `engine == Engine.AUTO`, calls `_auto_pick()` to resolve the actual engine.
-- **DuckDB Lite**: uses a per-Executor `DuckDBLite` instance.
-- **DuckDB Pro**: uses a **module-level singleton** (`_pro_singleton`) so the persistent connection and view cache survive across Executor instances (which are per-request). A threading lock guards creation.
+- **DuckDB**: uses a storage- and organization-scoped shared instance so its connection caches survive across request-scoped `Executor` instances.
+- **IslandDB**: executes supported Parquet query shapes with conservative
+  cgroup-aware admission, bounded result collection, and hard-quota spill.
 - **Spark SQL**: lazily imports `SparkThriftExecutor` (avoiding import cost when Spark is not needed). Passes `force=True` when the user explicitly requested Spark (not via AUTO).
 - Records the engine used in `PlanStats` for query plan reporting.
 
-## DuckDB Lite
+## DuckDB
 
-**Module**: `supertable/engine/duckdb_lite.py`
-**Class**: `DuckDBLite`
+**Module**: `supertable/engine/duckdb_engine.py`
+**Class**: `DuckDB`
 
-DuckDB Lite is the lightweight, transient execution path optimized for small datasets and frequently-changing data.
+DuckDB is the lightweight, transient execution path optimized for small datasets and frequently-changing data.
 
 ### Characteristics
 
@@ -136,53 +137,6 @@ DuckDB Lite is the lightweight, transient execution path optimized for small dat
 ### Connection Recovery
 
 If the connection encounters an unrecoverable error, `_reset_connection()` closes and discards it. The next query will create a fresh connection.
-
-## DuckDB Pro
-
-**Module**: `supertable/engine/duckdb_pro.py`
-**Class**: `DuckDBPro`
-
-DuckDB Pro is the persistent, caching execution path optimized for stable datasets queried repeatedly.
-
-### Characteristics
-
-- **Module-level singleton**: the `DuckDBPro` instance is created once and shared across all request-scoped `Executor` instances via `_get_pro()`.
-- **Version-based view caching**: views are created on first access and reused across queries as long as the data version is unchanged. Because views are lazy (no data is materialized at creation time), DuckDB applies full projection and predicate pushdown on every query.
-- **Graceful version transitions**: when a new version is detected, a new view is created alongside the old one. Old views are dropped only when their reference count reaches zero, preventing in-flight queries from breaking.
-
-### Cache Registry
-
-The internal `_ProCacheEntry` dataclass tracks each cached view:
-
-```python
-@dataclass
-class _ProCacheEntry:
-    table_name: str       # DuckDB view name (e.g. pro_a3f8c1_v5)
-    super_name: str
-    simple_name: str
-    version: int
-    ref_count: int = 0    # in-flight queries using this view
-    stale: bool = False    # marked for removal when ref_count hits 0
-```
-
-The registry is keyed by `(super_name, simple_name)` and may hold multiple entries per key when an old version still has in-flight queries.
-
-### Table Naming
-
-Pro uses `pro_table_name()` from `engine_common.py`:
-
-```python
-def pro_table_name(super_name, simple_name, simple_version) -> str:
-    key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return f"pro_{digest}_v{simple_version}"
-```
-
-### Connection Management
-
-- Memory limit is controlled by `SUPERTABLE_DUCKDB_MEMORY_LIMIT` (shared with Lite).
-- On unrecoverable error, `_reset_connection()` closes the connection and clears the entire registry.
-- httpfs is configured lazily on the first query (same pattern as Lite).
 
 ## Spark Thrift
 
@@ -404,10 +358,10 @@ The `configure_httpfs_and_s3()` function loads the httpfs extension and configur
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | Upper bound for Lite engine selection | 104,857,600 (100 MB) |
-| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | Lower bound for Spark engine selection | 10,737,418,240 (10 GB) |
+| `SUPERTABLE_ENGINE_ISLAND_MIN_BYTES` | Upper bound for DuckDB engine selection | 104,857,600 (100 MB) |
+| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | Spark fallback floor; active fleet `min_bytes` normally wins | 0 |
 | `SUPERTABLE_ENGINE_FRESHNESS_SEC` | Age threshold for fresh vs. stable data | 300 (5 minutes) |
-| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | DuckDB memory limit (shared by Lite and Pro) | `"1GB"` |
+| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | DuckDB memory limit (shared by DuckDB and IslandDB) | `"1GB"` |
 | `SUPERTABLE_DUCKDB_THREADS` | Explicit DuckDB thread count (overrides auto-derive) | Auto |
 | `SUPERTABLE_DUCKDB_IO_MULTIPLIER` | CPU multiplier for IO thread calculation | 3 |
 | `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` | httpfs HTTP timeout in seconds | 30 |
@@ -422,10 +376,11 @@ The `configure_httpfs_and_s3()` function loads the httpfs extension and configur
 
 The multi-engine architecture addresses a fundamental tradeoff in data analytics: **small queries should be fast and cheap, while large queries should be possible at all**.
 
-- **DuckDB Lite** handles the majority of interactive queries (dashboards, ad-hoc exploration) with sub-second latency and zero infrastructure overhead. It is the default path for datasets under 100 MB.
-- **DuckDB Pro** adds persistent view caching for medium-sized stable datasets. This is the sweet spot for production reporting where the same tables are queried repeatedly and the data updates infrequently. The version-aware cache eliminates redundant parquet file downloads.
+- **DuckDB** handles the majority of interactive queries (dashboards, ad-hoc exploration) with sub-second latency and zero infrastructure overhead. It is the default path for datasets under 100 MB.
+- **IslandDB** handles supported selective Parquet workloads with conservative
+  memory admission, range reads, bounded results, and optional hard-quota spill.
 - **Spark SQL** enables queries over datasets that exceed single-node memory limits. It requires a Spark Thrift Server but handles arbitrarily large data volumes.
 
-The freshness-aware routing prevents a common failure mode: caching data that is still being actively ingested. Without this, a dashboard querying a table mid-ingestion would populate the Pro cache, only to invalidate it seconds later when the next batch lands.
+The freshness-aware routing prevents a common failure mode: caching data that is still being actively ingested. Without this, a dashboard querying a table mid-ingestion would populate the IslandDB cache, only to invalidate it seconds later when the next batch lands.
 
 The view chain (base, RBAC, tombstone, dedup) ensures that security filtering and data consistency are enforced at the engine level, not the application level. This means every query path -- SQL editor, API, OData, MCP -- gets identical security and consistency guarantees without duplicating logic.

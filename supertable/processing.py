@@ -6,24 +6,34 @@ import json
 import logging
 import os
 import io
+import struct
 import time
 import threading
 import uuid
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, date, timezone
-from typing import Any, Callable, Dict, FrozenSet, List, Set, Tuple, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Set, Tuple, Optional
 
 import polars
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from supertable.utils.helper import generate_filename, hourly_partition_subpath
 from supertable.config.defaults import default
 from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
+from supertable.storage.storage_interface import ObjectMetadata
 from supertable.utils.profiler import Profiler, get_null_profiler
-from supertable.data_classes import PredInterval, RowGroupSelection
+from supertable.data_classes import (
+    IntegerDomainBound,
+    PredInterval,
+    ResourceObjectSeal,
+    ResourceStatsSeal,
+    RowGroupSelection,
+)
 
 # Target row-group size for all Parquet writes.
 # 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
@@ -31,6 +41,79 @@ from supertable.data_classes import PredInterval, RowGroupSelection
 # larger groups reduce metadata overhead.  120 K is a good balance for the
 # incremental-merge pattern used here.
 _PARQUET_ROW_GROUP_SIZE = 122_880
+_STATS_CACHE_IDENTITY_PREFIX = "__supertable_stats_cache__/"
+_TOMBSTONE_CACHE_IDENTITY_PREFIX = "__supertable_tombstone_cache__/"
+
+
+def _artifact_cache_identity(
+        artifact_path: str,
+        *,
+        prefix: str,
+        organization: str = "",
+        storage: Optional[object] = None,
+) -> str:
+    """Return an organization/storage/auth-scoped immutable artifact key."""
+    value = str(artifact_path or "")
+    if value.startswith(prefix):
+        return value
+    active_storage = storage
+    if active_storage is None:
+        try:
+            active_storage = _get_storage()
+        except Exception:
+            active_storage = None
+    try:
+        # FileCache owns the hardened namespace contract for every built-in
+        # backend, including credential fingerprints and opaque-client isolation.
+        # Constructing it with max_bytes=0 computes hashes without touching disk.
+        from supertable.engine.file_cache import FileCache
+        namespace = FileCache(
+            active_storage, organization, max_bytes=0, workers=1,
+        )
+        scope = f"{namespace._organization_hash}{namespace._storage_hash}"
+    except Exception:
+        fallback = (
+            f"{organization}\0{type(active_storage).__module__}."
+            f"{type(active_storage).__qualname__}\0{id(active_storage)}"
+        )
+        scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+    table_key = _PathKeyedFrameCache._key(value) if value else ""
+    table_hash = hashlib.sha256(table_key.encode("utf-8")).hexdigest()
+    version_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return (
+        f"{prefix}{scope}/"
+        f"{table_hash}/{version_hash}"
+    )
+
+
+def stats_cache_identity(
+        stats_path: str,
+        *,
+        organization: str = "",
+        storage: Optional[object] = None,
+) -> str:
+    """Return an organization/storage/auth-scoped immutable stats cache key."""
+    return _artifact_cache_identity(
+        stats_path,
+        prefix=_STATS_CACHE_IDENTITY_PREFIX,
+        organization=organization,
+        storage=storage,
+    )
+
+
+def tombstone_cache_identity(
+        tombstone_path: str,
+        *,
+        organization: str = "",
+        storage: Optional[object] = None,
+) -> str:
+    """Return an organization/storage/auth-scoped deletion-vector cache key."""
+    return _artifact_cache_identity(
+        tombstone_path,
+        prefix=_TOMBSTONE_CACHE_IDENTITY_PREFIX,
+        organization=organization,
+        storage=storage,
+    )
 
 
 def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:
@@ -815,20 +898,34 @@ def _write_single_parquet_file(
 
     write_bytes = getattr(storage, "write_bytes", None)
     write_parquet = getattr(storage, "write_parquet", None)
+    footer_md = None
+    object_seal = None
     if callable(write_bytes):
         with p.span("write.upload_bytes"):
             write_bytes(new_parquet_path, data)
-        # These are the exact bytes accepted by the backend.  A follow-up
-        # size()/HEAD is both redundant and racy (the object could be replaced
-        # between PUT and HEAD), and adds a full network round-trip remotely.
+        # These are the exact bytes submitted to the backend, so size does not
+        # require another lookup. A remote metadata observation below exists
+        # solely to obtain the provider's conditional-read identity.
         file_size = len(data)
-        # The uploaded bytes ARE ``data`` here, so parse the footer in memory
-        # (footer-only, no decode, no network round-trip) for stats reuse.
-        if footer_md_out is not None:
-            try:
-                footer_md_out[new_parquet_path] = pq.read_metadata(io.BytesIO(data))
-            except Exception:
-                pass
+        # Pin the remote provider identity once, at the write boundary.  This
+        # replaces N future HEADs (one per IslandDB query) with one observation
+        # of the just-uploaded, UUID-named immutable object. Local files keep
+        # their stronger descriptor/stat validation and skip this work.
+        with p.span("write.object_seal"):
+            object_seal = _uploaded_resource_object_seal(
+                storage, new_parquet_path, file_size,
+            )
+        # The uploaded bytes ARE ``data`` here, so this metadata is the exact
+        # immutable footer identity.  Seal it before a snapshot can reference
+        # the resource; an unparseable encoder result may leave an orphan object
+        # but must never publish an ambiguously identified resource.
+        try:
+            footer_md = pq.read_metadata(io.BytesIO(data))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not parse freshly encoded Parquet footer for "
+                f"{new_parquet_path!r}"
+            ) from exc
     elif callable(write_parquet):
         with p.span("write.upload_parquet"):
             write_parquet(arrow_tbl, new_parquet_path)
@@ -838,6 +935,20 @@ def _write_single_parquet_file(
         # fails: the snapshot's resource metadata must remain trustworthy.
         with p.span("write.size_lookup"):
             file_size = storage.size(new_parquet_path)
+        with p.span("write.object_seal"):
+            object_seal = _uploaded_resource_object_seal(
+                storage, new_parquet_path, int(file_size),
+            )
+        # A compatibility backend may re-encode the Arrow table.  Only bytes
+        # read back from that backend can describe its exact footer.  Third-party
+        # implementations without byte reads remain safely unsealed: they are
+        # readable but cannot participate in absence pruning.
+        read_bytes = getattr(storage, "read_bytes", None)
+        if callable(read_bytes):
+            try:
+                footer_md = pq.read_metadata(io.BytesIO(read_bytes(new_parquet_path)))
+            except Exception:
+                footer_md = None
     else:
         raise RuntimeError("Configured storage provides no parquet write method")
 
@@ -845,14 +956,60 @@ def _write_single_parquet_file(
     p.add("rows_written", int(rows))
     p.add("bytes_written", int(file_size))
 
-    new_resources.append(
-        {
-            "file": new_parquet_path,
-            "file_size": int(file_size),
-            "rows": rows,
-            "columns": columns,
+    resource = {
+        "file": new_parquet_path,
+        "file_size": int(file_size),
+        "rows": rows,
+        "columns": columns,
+    }
+    binary_value_bounds: Dict[str, int] = {}
+    for name, column in zip(arrow_tbl.schema.names, arrow_tbl.columns):
+        if not (
+            pa.types.is_binary(column.type)
+            or pa.types.is_large_binary(column.type)
+            or pa.types.is_fixed_size_binary(column.type)
+        ):
+            continue
+        try:
+            lengths = pc.binary_length(column)
+            maximum = pc.max(lengths).as_py()
+        except Exception as exc:
+            # This seal is an execution-memory boundary. A writer capable of
+            # publishing Binary data must not silently omit or guess it after
+            # accepting the new snapshot format.
+            raise RuntimeError(
+                f"Could not compute Binary value-width seal for {name!r}"
+            ) from exc
+        binary_value_bounds[str(name)] = max(0, int(maximum or 0))
+    if binary_value_bounds:
+        resource["column_max_value_bytes"] = binary_value_bounds
+    if object_seal is not None:
+        resource["object_seal"] = {
+            "size": object_seal.size,
+            "version": object_seal.version,
+            "etag": object_seal.etag,
+            "last_modified_ns": object_seal.last_modified_ns,
+            "checksum_sha256": object_seal.checksum_sha256,
         }
-    )
+    if footer_md is not None:
+        exact_stats_rows = _stats_rows_for_metadata(new_parquet_path, footer_md)
+        seal = stats_seal_for_metadata(
+            new_parquet_path, footer_md, rows=exact_stats_rows,
+        )
+        resource.update({
+            "footer_sha256": seal.footer_sha256,
+            "stats_rows": seal.stats_rows,
+            "stats_digest": seal.stats_digest,
+        })
+        if footer_md_out is not None:
+            # Reuse both products of the one footer traversal in the subsequent
+            # combined stats-artifact build. This also covers compatibility
+            # backends whose exact footer was read back after re-encoding.
+            footer_md_out[new_parquet_path] = _FooterStatsCacheEntry(
+                metadata=footer_md,
+                rows=exact_stats_rows,
+            )
+    new_resources.append(resource)
 
 
 # =========================
@@ -2255,9 +2412,10 @@ TIMESTAMP_COL = "__timestamp__"
 # Schema (column order is significant — keep it stable, the artifact is sealed).
 STATS_SCHEMA: Dict[str, polars.DataType] = {
     "file_path": polars.Utf8,
-    # Strong binding between every row-group hint and the exact Parquet footer
-    # from which these rows were extracted. Legacy NULL seals disable only
-    # row-group hints; file-level conservative pruning remains available.
+    # Strong binding between every stats row and the exact Parquet footer from
+    # which it was extracted.  A row is usable for absence pruning only when the
+    # owning snapshot resource also pins this footer plus its complete canonical
+    # stats-row digest. Legacy NULL/unpinned seals disable all absence pruning.
     "footer_sha256": polars.Utf8,
     "row_group_id": polars.Int64,
     "column_name": polars.Utf8,
@@ -2288,6 +2446,333 @@ STATS_SCHEMA: Dict[str, polars.DataType] = {
 }
 
 STATS_FILE_PATH_COL = "file_path"
+
+
+@dataclass(frozen=True)
+class _FooterStatsCacheEntry:
+    """Writer-local reuse of one parsed footer and its canonical stats rows."""
+
+    metadata: Any
+    rows: List[dict]
+
+# Domain-separate the per-resource digest from every other SHA-256 used by the
+# storage format.  Bumping this marker is mandatory if the canonical encoding
+# below ever changes.  The schema declaration itself is included once per
+# digest, so a column addition/reorder cannot accidentally validate an older
+# resource seal.
+_STATS_RESOURCE_DIGEST_DOMAIN = b"supertable.stats-resource.v1\x00"
+_STATS_EPOCH = datetime(1970, 1, 1)
+
+
+def _digest_length_prefixed(buffer: bytearray, payload: bytes) -> None:
+    buffer.extend(struct.pack(">Q", len(payload)))
+    buffer.extend(payload)
+
+
+def _canonical_stats_row_bytes(row: Tuple[object, ...]) -> bytes:
+    """Encode one exact ``STATS_SCHEMA`` row without JSON/locale ambiguity."""
+    if len(row) != len(STATS_SCHEMA):
+        raise ValueError("stats row width does not match STATS_SCHEMA")
+    out = bytearray()
+    for value, dtype in zip(row, STATS_SCHEMA.values()):
+        if value is None:
+            out.append(0)
+            continue
+        out.append(1)
+        if dtype == polars.Utf8:
+            if not isinstance(value, str):
+                raise ValueError("stats string lane contains a non-string value")
+            _digest_length_prefixed(out, value.encode("utf-8"))
+        elif dtype == polars.Int64:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("stats integer lane contains a non-integer value")
+            out.extend(struct.pack(">q", value))
+        elif dtype == polars.Float64:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("stats float lane contains a non-numeric value")
+            out.extend(struct.pack(">d", float(value)))
+        elif isinstance(dtype, polars.Datetime):
+            if not isinstance(value, datetime) or value.tzinfo is not None:
+                raise ValueError("stats timestamp lane is not a naive datetime")
+            delta = value - _STATS_EPOCH
+            micros = (
+                (delta.days * 86_400 + delta.seconds) * 1_000_000
+                + delta.microseconds
+            )
+            out.extend(struct.pack(">q", micros))
+        elif dtype == polars.Boolean:
+            if not isinstance(value, bool):
+                raise ValueError("stats boolean lane contains a non-boolean value")
+            out.append(1 if value else 0)
+        else:  # pragma: no cover - guarded by the frozen STATS_SCHEMA test
+            raise ValueError(f"unsupported canonical stats dtype: {dtype!r}")
+    return bytes(out)
+
+
+def _new_stats_resource_hasher(file_path: str):
+    if not isinstance(file_path, str) or not file_path:
+        raise ValueError("stats resource path must be a non-empty string")
+    digest = hashlib.sha256()
+    digest.update(_STATS_RESOURCE_DIGEST_DOMAIN)
+    schema_marker = "\x1f".join(
+        f"{name}:{dtype!s}" for name, dtype in STATS_SCHEMA.items()
+    ).encode("utf-8")
+    digest.update(struct.pack(">Q", len(schema_marker)))
+    digest.update(schema_marker)
+    encoded_path = file_path.encode("utf-8")
+    digest.update(struct.pack(">Q", len(encoded_path)))
+    digest.update(encoded_path)
+    return digest
+
+
+def stats_resource_seals(
+        stats_df: Optional[polars.DataFrame],
+) -> Optional[Dict[str, ResourceStatsSeal]]:
+    """Return deterministic seals for every complete per-file row stream.
+
+    Rows are ordered by their canonical identity before hashing, so Parquet row
+    order and Polars chunking cannot affect the result.  A file with NULL or
+    conflicting footer hashes is omitted from the returned mapping.  Callers
+    treat omission as unknown and retain that physical resource.
+    """
+    if stats_df is None or not isinstance(stats_df, polars.DataFrame):
+        return None
+    if list(stats_df.columns) != list(STATS_SCHEMA) or stats_df.schema != STATS_SCHEMA:
+        return None
+    if stats_df.height == 0:
+        return {}
+    try:
+        ordered = stats_df.sort(
+            ["file_path", "row_group_id", "column_name"],
+            maintain_order=True,
+        )
+        file_index = list(STATS_SCHEMA).index("file_path")
+        footer_index = list(STATS_SCHEMA).index("footer_sha256")
+        result: Dict[str, ResourceStatsSeal] = {}
+        current_path: Optional[str] = None
+        current_digest = None
+        current_rows = 0
+        current_footer: Optional[str] = None
+        footer_valid = True
+
+        def finish() -> None:
+            if current_path is None or current_digest is None or not footer_valid:
+                return
+            try:
+                result[current_path] = ResourceStatsSeal(
+                    footer_sha256=current_footer,
+                    stats_rows=current_rows,
+                    stats_digest=current_digest.hexdigest(),
+                )
+            except (TypeError, ValueError):
+                # Invalid footer strings are deliberately unsealed/fail-open.
+                return
+
+        for row in ordered.iter_rows(buffer_size=1024):
+            file_path = row[file_index]
+            if not isinstance(file_path, str) or not file_path:
+                return None
+            if file_path != current_path:
+                finish()
+                current_path = file_path
+                current_digest = _new_stats_resource_hasher(file_path)
+                current_rows = 0
+                current_footer = None
+                footer_valid = True
+            footer = row[footer_index]
+            if current_rows == 0:
+                current_footer = footer if isinstance(footer, str) else None
+            elif footer != current_footer:
+                footer_valid = False
+            if not isinstance(footer, str):
+                footer_valid = False
+            current_digest.update(_canonical_stats_row_bytes(row))
+            current_rows += 1
+        finish()
+        return result
+    except Exception:
+        # Statistics are optional.  Any malformed canonical value disables their
+        # use instead of surfacing an error or narrowing a scan.
+        return None
+
+
+def resource_stats_seal(resource: object) -> Optional[ResourceStatsSeal]:
+    """Parse one resource dict's three-field seal, returning ``None`` for legacy."""
+    if not isinstance(resource, dict):
+        return None
+    try:
+        return ResourceStatsSeal(
+            footer_sha256=resource.get("footer_sha256"),
+            stats_rows=resource.get("stats_rows"),
+            stats_digest=resource.get("stats_digest"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def resource_object_seal(resource: object) -> Optional[ResourceObjectSeal]:
+    """Parse a snapshot resource's optional provider identity seal.
+
+    The duplicated size is intentional: it binds the provider metadata to the
+    same bytes described by ``file_size``. Any legacy, malformed, or disagreeing
+    value disables only the HEAD-elision optimization.
+    """
+    if not isinstance(resource, dict):
+        return None
+    raw = resource.get("object_seal")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        seal = ResourceObjectSeal(
+            size=raw.get("size"),
+            version=raw.get("version", ""),
+            etag=raw.get("etag", ""),
+            last_modified_ns=raw.get("last_modified_ns", 0),
+            checksum_sha256=raw.get("checksum_sha256", ""),
+        )
+    except (TypeError, ValueError):
+        return None
+    declared_size = resource.get("file_size")
+    if (
+        not isinstance(declared_size, int)
+        or isinstance(declared_size, bool)
+        or declared_size < 0
+        or seal.size != declared_size
+    ):
+        return None
+    return seal
+
+
+def _uploaded_resource_object_seal(
+    storage: object,
+    path: str,
+    expected_size: int,
+) -> Optional[ResourceObjectSeal]:
+    """Observe one newly uploaded immutable object without making it required.
+
+    Object identity is a performance seal, never a commit prerequisite. A
+    backend that cannot expose stable conditional-read metadata stays readable
+    through IslandDB's existing per-query ``stat_object`` path.
+    """
+    is_local = getattr(storage, "is_local_storage", None)
+    if callable(is_local):
+        try:
+            if is_local() is True:
+                return None
+        except Exception:
+            # Unknown storage locality is treated as remote; the stat attempt
+            # below remains optional and safely fails open.
+            pass
+    stat_object = getattr(storage, "stat_object", None)
+    if not callable(stat_object):
+        return None
+    try:
+        metadata = stat_object(path)
+    except Exception as exc:
+        logging.warning(
+            "[write.object_seal] immutable object metadata unavailable for %r: %s",
+            path,
+            exc,
+        )
+        return None
+    # StorageInterface's contract is deliberately strict here. Duck-typing an
+    # arbitrary SDK response could serialize a repr or an unstable timestamp
+    # and later use it as a conditional-read authority.
+    if not isinstance(metadata, ObjectMetadata):
+        return None
+    if metadata.size != expected_size:
+        logging.warning(
+            "[write.object_seal] uploaded object size mismatch for %r: "
+            "encoded=%d observed=%d; HEAD elision disabled",
+            path,
+            expected_size,
+            metadata.size,
+        )
+        return None
+    try:
+        return ResourceObjectSeal(
+            size=metadata.size,
+            version=metadata.version,
+            etag=metadata.etag,
+            last_modified_ns=metadata.last_modified_ns,
+            checksum_sha256=metadata.checksum_sha256,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class _StatsFrameValidation:
+    """Cold validation result memoised for one immutable stats artifact."""
+
+    resource_seals: Optional[Dict[str, ResourceStatsSeal]]
+    complete_resource_rows: Dict[str, int]
+
+
+def _validate_stats_frame_once(stats_df: polars.DataFrame) -> _StatsFrameValidation:
+    """Compute digest and structural completeness indexes in one cold pass."""
+    seals = stats_resource_seals(stats_df)
+    if seals is None or stats_df.height == 0:
+        return _StatsFrameValidation(seals, {})
+    required = ["file_path", "row_group_id", "column_name", "row_group_rows"]
+    try:
+        groups = (
+            stats_df.select(required)
+            .group_by(["file_path", "row_group_id"])
+            .agg([
+                polars.len().alias("__slots"),
+                polars.col("column_name").n_unique().alias("__unique_slots"),
+                polars.col("column_name").unique().sort().alias("__columns"),
+                polars.col("row_group_rows").n_unique().alias("__row_counts"),
+                polars.col("row_group_rows").first().alias("__rows"),
+                polars.col("column_name").is_not_null().all().alias("__names_valid"),
+                (
+                    polars.col("row_group_rows").is_not_null()
+                    & (polars.col("row_group_rows") >= 0)
+                ).all().alias("__rows_valid"),
+            ])
+        )
+        complete = (
+            groups.group_by("file_path")
+            .agg([
+                polars.len().alias("__group_count"),
+                polars.col("row_group_id").min().alias("__min_group"),
+                polars.col("row_group_id").max().alias("__max_group"),
+                polars.col("row_group_id").is_not_null().all().alias("__ids_valid"),
+                (polars.col("row_group_id") >= 0).all().alias("__ids_nonnegative"),
+                polars.col("__rows").sum().alias("__total_rows"),
+                (polars.col("__slots") == polars.col("__unique_slots"))
+                .all().alias("__slots_valid"),
+                (polars.col("__row_counts") == 1).all().alias("__counts_valid"),
+                polars.col("__names_valid").all().alias("__all_names_valid"),
+                polars.col("__rows_valid").all().alias("__all_rows_valid"),
+                polars.col("__columns").n_unique().alias("__column_sets"),
+            ])
+            .filter(
+                polars.col("__ids_valid")
+                & polars.col("__ids_nonnegative")
+                & polars.col("__slots_valid")
+                & polars.col("__counts_valid")
+                & polars.col("__all_names_valid")
+                & polars.col("__all_rows_valid")
+                & (polars.col("__min_group") == 0)
+                & (polars.col("__max_group") == polars.col("__group_count") - 1)
+                & (polars.col("__column_sets") == 1)
+            )
+            .select(["file_path", "__total_rows"])
+        )
+        complete_rows = {
+            file_path: int(rows)
+            for file_path, rows in complete.iter_rows()
+            if isinstance(file_path, str)
+            and isinstance(rows, int)
+            and not isinstance(rows, bool)
+            and rows >= 0
+            and file_path in seals
+        }
+        return _StatsFrameValidation(seals, complete_rows)
+    except Exception:
+        return _StatsFrameValidation(None, {})
 
 # Narrow SELECT-pruning projections do not materialize the rejected
 # double/string bounds into Python.  They carry this boolean instead so a
@@ -2523,6 +3008,32 @@ def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
     return rows
 
 
+def stats_seal_for_metadata(
+        file_path: str,
+        md,
+        *,
+        rows: Optional[List[dict]] = None,
+) -> ResourceStatsSeal:
+    """Build the exact footer + canonical stats-row seal for a new resource."""
+    footer_sha256 = parquet_footer_sha256(md)
+    exact_rows = _stats_rows_for_metadata(file_path, md) if rows is None else rows
+    if not exact_rows:
+        # A system-column-only file has no STATS_SCHEMA rows.  Seal that exact
+        # empty stream anyway, although absence pruning will remain unavailable
+        # because there are no user-column ranges to prove anything.
+        return ResourceStatsSeal(
+            footer_sha256=footer_sha256,
+            stats_rows=0,
+            stats_digest=_new_stats_resource_hasher(file_path).hexdigest(),
+        )
+    frame = polars.DataFrame(exact_rows, schema=STATS_SCHEMA)
+    seals = stats_resource_seals(frame)
+    seal = seals.get(file_path) if seals is not None else None
+    if seal is None or seal.footer_sha256 != footer_sha256:
+        raise ValueError(f"could not seal statistics for resource {file_path!r}")
+    return seal
+
+
 def _empty_stats_df() -> polars.DataFrame:
     return polars.DataFrame(schema=STATS_SCHEMA)
 
@@ -2613,14 +3124,28 @@ def extract_stats_rows(
     for path in file_paths:
         if not path:
             continue
-        md = cache.get(path)
+        cached_entry = cache.get(path)
+        cached_rows = (
+            cached_entry.rows
+            if isinstance(cached_entry, _FooterStatsCacheEntry)
+            else None
+        )
+        md = (
+            cached_entry.metadata
+            if isinstance(cached_entry, _FooterStatsCacheEntry)
+            else cached_entry
+        )
         if md is None:
             md = _read_footer_metadata(path, profiler=p)
         else:
             p.add("stats_footer_cache_hit", 1)
         if md is None:
             continue
-        all_rows.extend(_stats_rows_for_metadata(path, md))
+        all_rows.extend(
+            cached_rows
+            if cached_rows is not None
+            else _stats_rows_for_metadata(path, md)
+        )
     if not all_rows:
         return _empty_stats_df()
     p.add("stats_rows_extracted", len(all_rows))
@@ -2634,6 +3159,7 @@ def build_stats_file(
         removed_files: Optional[Set[str]],
         compression_level: int,
         profiler: Optional[Profiler] = None,
+        prev_cache_identity: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous stats parquet and apply this write's delta.
 
@@ -2663,7 +3189,15 @@ def build_stats_file(
     # with no storage round-trip.  prev_stats_path is the table's CURRENT latest
     # version here, so allow_cache=True is correct; a genuine miss falls through
     # to a fresh read (identical to the former _read_parquet_safe behaviour).
-    prev_df = load_stats(prev_stats_path, allow_cache=True, profiler=p) if prev_stats_path else None
+    prev_df = (
+        load_stats(
+            prev_stats_path,
+            allow_cache=True,
+            profiler=p,
+            cache_identity=prev_cache_identity,
+        )
+        if prev_stats_path else None
+    )
     if prev_df is not None and prev_df.height > 0 and STATS_FILE_PATH_COL in prev_df.columns:
         # Conform (not a bare select): a stats file written before a schema
         # addition lacks the new column, so add it as NULL rather than raise.
@@ -3056,100 +3590,265 @@ def _stored_select_lane(row: dict) -> Optional[Tuple[str, object, object]]:
 def stats_for_complete_files(
         stats_df: Optional[polars.DataFrame],
         resource_rows: Dict[str, Optional[int]],
+        resource_seals: Optional[Dict[str, Optional[ResourceStatsSeal]]] = None,
+        *,
+        stats_path: Optional[str] = None,
 ) -> Optional[polars.DataFrame]:
-    """Retain stats only where the per-file row-group manifest is provably whole.
+    """Retain only snapshot-bound, complete per-file statistics manifests.
 
     A table-level artifact row count cannot detect a missing row-group slot that
-    was replaced by a duplicate row elsewhere.  Both SELECT and mutation pruning
-    may use a file's stats only when row-group ids, row counts, and exact column
-    slot sets agree with the independently pinned snapshot resource row count.
-    Invalid/absent files disappear from the returned stats; pruning consumers
-    interpret that as unknown and retain the physical file.
+    was replaced by a duplicate row elsewhere, nor a same-height artifact copied
+    from another table. Both SELECT and mutation pruning may use a file's stats
+    only when row-group ids, physical row counts and exact column slots agree AND
+    every canonical row matches the resource's snapshot-pinned count, footer
+    SHA-256 and cryptographic digest. Legacy/unsealed resources are deliberately
+    absent from the result and therefore scan conservatively.
     """
     if stats_df is None or not isinstance(stats_df, polars.DataFrame):
         return None
     if stats_df.height == 0:
         return stats_df
-    required = {"file_path", "row_group_id", "column_name", "row_group_rows"}
-    if not required.issubset(stats_df.columns):
+    required = [
+        "file_path", "footer_sha256", "row_group_id", "column_name",
+        "row_group_rows",
+    ]
+    if not set(required).issubset(stats_df.columns):
         return None
+    seals = resource_seals or {}
     manifest = {
-        file_path: rows
+        file_path: (rows, seals.get(file_path))
         for file_path, rows in resource_rows.items()
         if isinstance(file_path, str)
         and isinstance(rows, int)
         and not isinstance(rows, bool)
         and rows >= 0
+        and isinstance(seals.get(file_path), ResourceStatsSeal)
     }
     if not manifest:
         return stats_df.head(0)
     try:
-        manifested = stats_df.filter(polars.col("file_path").is_in(list(manifest)))
-        groups = (
-            manifested.select(list(required))
-            .group_by(["file_path", "row_group_id"])
-            .agg([
-                polars.len().alias("__slots"),
-                polars.col("column_name").n_unique().alias("__unique_slots"),
-                polars.col("column_name").unique().sort().alias("__columns"),
-                polars.col("row_group_rows").n_unique().alias("__row_counts"),
-                polars.col("row_group_rows").first().alias("__rows"),
-                polars.col("column_name").is_not_null().all().alias("__names_valid"),
-                (
-                    polars.col("row_group_rows").is_not_null()
-                    & (polars.col("row_group_rows") >= 0)
-                ).all().alias("__rows_valid"),
-            ])
+        validation = _stats_validation_for_frame(
+            stats_df, stats_path=stats_path,
         )
-        expected = polars.DataFrame(
-            {
-                "file_path": list(manifest),
-                "__expected_rows": list(manifest.values()),
-            },
-            schema={"file_path": polars.Utf8, "__expected_rows": polars.Int64},
-        )
-        trusted_frame = (
-            groups.group_by("file_path")
-            .agg([
-                polars.len().alias("__group_count"),
-                polars.col("row_group_id").min().alias("__min_group"),
-                polars.col("row_group_id").max().alias("__max_group"),
-                polars.col("row_group_id").is_not_null().all().alias("__ids_valid"),
-                (polars.col("row_group_id") >= 0).all().alias("__ids_nonnegative"),
-                polars.col("__rows").sum().alias("__total_rows"),
-                (polars.col("__slots") == polars.col("__unique_slots"))
-                .all().alias("__slots_valid"),
-                (polars.col("__row_counts") == 1).all().alias("__counts_valid"),
-                polars.col("__names_valid").all().alias("__all_names_valid"),
-                polars.col("__rows_valid").all().alias("__all_rows_valid"),
-                polars.col("__columns").n_unique().alias("__column_sets"),
-            ])
-            .join(expected, on="file_path", how="inner")
-            .filter(
-                polars.col("__ids_valid")
-                & polars.col("__ids_nonnegative")
-                & polars.col("__slots_valid")
-                & polars.col("__counts_valid")
-                & polars.col("__all_names_valid")
-                & polars.col("__all_rows_valid")
-                & (polars.col("__min_group") == 0)
-                & (polars.col("__max_group") == polars.col("__group_count") - 1)
-                & (polars.col("__column_sets") == 1)
-                & (polars.col("__total_rows") == polars.col("__expected_rows"))
-            )
-            .select("file_path")
-        )
-        if trusted_frame.height == 0:
+        if validation.resource_seals is None:
+            return None
+        trusted = [
+            file_path
+            for file_path, (expected_rows, expected_seal) in manifest.items()
+            if validation.complete_resource_rows.get(file_path) == expected_rows
+            and validation.resource_seals.get(file_path) == expected_seal
+        ]
+        if not trusted:
             return stats_df.head(0)
-        trusted = trusted_frame.get_column("file_path").to_list()
+        manifested = stats_df.filter(polars.col("file_path").is_in(list(manifest)))
         if (
             manifested.height == stats_df.height
-            and len(trusted) == groups.get_column("file_path").n_unique()
+            and len(trusted) == len(manifest)
         ):
             return stats_df
         return manifested.filter(polars.col("file_path").is_in(trusted))
     except Exception:
         return None
+
+
+def integer_domains_from_complete_stats(
+    stats_df: Optional[polars.DataFrame],
+    file_keys: Iterable[str],
+    selections: Optional[Dict[str, RowGroupSelection]] = None,
+    column_names: Optional[Iterable[str]] = None,
+) -> Dict[str, IntegerDomainBound]:
+    """Derive complete integer domains for the selected row groups.
+
+    ``stats_df`` must already be the output of
+    :func:`stats_for_complete_files` for the pinned snapshot.  This second
+    boundary intentionally revalidates every selected (file, row-group,
+    column) slot it uses: a missing/duplicate slot, bad NULL count, ambiguous
+    lane, inexact extremum, or absent selected group omits that column's proof.
+    ``column_names`` narrows this metadata work to planner-relevant integer
+    candidates; it never relaxes the all-groups/all-files completeness check.
+    The result is an optional planning optimisation only, so every exception
+    fails closed to an empty mapping.
+
+    Integer footer extrema are exact for Parquet INT32/INT64 columns.  A range
+    can contain holes, therefore the consumer may use ``max - min + 1`` only as
+    an upper bound on distinct non-NULL keys.  SQL NULL contributes at most one
+    additional GROUP BY key.
+    """
+    keys = list(file_keys)
+    if not keys:
+        return {}
+    required = {
+        "file_path", "row_group_id", "column_name", "physical_type",
+        "row_group_rows", "null_count", "stats_available",
+        "min_bigint", "max_bigint", "min_double", "max_double",
+        "min_timestamp", "max_timestamp", "min_string", "max_string",
+        "min_is_exact", "max_is_exact",
+    }
+    if (
+        stats_df is None
+        or not isinstance(stats_df, polars.DataFrame)
+        or stats_df.height == 0
+        or not required.issubset(stats_df.columns)
+        or len(set(keys)) != len(keys)
+        or any(not isinstance(key, str) or not key for key in keys)
+    ):
+        return {}
+    try:
+        requested_names = (
+            {
+                str(name).casefold()
+                for name in column_names
+                if isinstance(name, str) and name
+            }
+            if column_names is not None
+            else None
+        )
+        if requested_names == set():
+            return {}
+        key_set = set(keys)
+        scoped = stats_df.filter(polars.col("file_path").is_in(keys))
+        present_files = set(
+            scoped.get_column("file_path").drop_nulls().unique().to_list()
+        )
+        if present_files != key_set:
+            return {}
+
+        available_pairs: Dict[str, Set[int]] = {key: set() for key in keys}
+        for file_path, group_id in scoped.select(
+            ["file_path", "row_group_id"]
+        ).unique().iter_rows():
+            if (
+                file_path not in key_set
+                or not isinstance(group_id, int)
+                or isinstance(group_id, bool)
+                or group_id < 0
+            ):
+                return {}
+            available_pairs[file_path].add(group_id)
+
+        selections = selections or {}
+        expected_pairs: Set[Tuple[str, int]] = set()
+        for key in keys:
+            selection = selections.get(key)
+            if selection is None:
+                group_ids = available_pairs[key]
+            elif isinstance(selection, RowGroupSelection):
+                group_ids = set(selection.selected_ids)
+                if not group_ids.issubset(available_pairs[key]):
+                    return {}
+            else:
+                return {}
+            expected_pairs.update((key, group_id) for group_id in group_ids)
+        if not expected_pairs:
+            return {}
+
+        minima: Dict[str, int] = {}
+        maxima: Dict[str, int] = {}
+        has_null: Dict[str, bool] = defaultdict(bool)
+        seen: Dict[str, Set[Tuple[str, int]]] = defaultdict(set)
+        spellings: Dict[str, Set[str]] = defaultdict(set)
+        invalid: Set[str] = set()
+        columns = [
+            "file_path", "row_group_id", "column_name", "physical_type",
+            "row_group_rows", "null_count", "stats_available",
+            "min_bigint", "max_bigint", "min_double", "max_double",
+            "min_timestamp", "max_timestamp", "min_string", "max_string",
+            "min_is_exact", "max_is_exact",
+        ]
+        candidate_stats = scoped
+        if requested_names is not None:
+            candidate_stats = candidate_stats.filter(
+                polars.col("column_name")
+                .str.to_lowercase()
+                .is_in(sorted(requested_names))
+            )
+        for row in candidate_stats.select(columns).iter_rows(named=True):
+            pair = (row["file_path"], row["row_group_id"])
+            if pair not in expected_pairs:
+                continue
+            raw_name = row["column_name"]
+            if not isinstance(raw_name, str) or not raw_name:
+                continue
+            name = raw_name.casefold()
+            spellings[name].add(raw_name)
+            if pair in seen[name]:
+                invalid.add(name)
+                continue
+            seen[name].add(pair)
+
+            rows = row["row_group_rows"]
+            nulls = row["null_count"]
+            if (
+                not isinstance(rows, int)
+                or isinstance(rows, bool)
+                or rows < 0
+                or not isinstance(nulls, int)
+                or isinstance(nulls, bool)
+                or nulls < 0
+                or nulls > rows
+                or str(row["physical_type"] or "").upper()
+                not in {"INT32", "INT64"}
+            ):
+                invalid.add(name)
+                continue
+            if nulls:
+                has_null[name] = True
+
+            minimum = row["min_bigint"]
+            maximum = row["max_bigint"]
+            other_lane = any(
+                row[lane] is not None
+                for lane in (
+                    "min_double", "max_double", "min_timestamp",
+                    "max_timestamp", "min_string", "max_string",
+                )
+            )
+            non_null_rows = rows - nulls
+            if non_null_rows == 0:
+                if (
+                    bool(row["stats_available"])
+                    or minimum is not None
+                    or maximum is not None
+                    or other_lane
+                ):
+                    invalid.add(name)
+                continue
+            if (
+                row["stats_available"] is not True
+                or row["min_is_exact"] is not True
+                or row["max_is_exact"] is not True
+                or other_lane
+                or not isinstance(minimum, int)
+                or isinstance(minimum, bool)
+                or not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+                or minimum > maximum
+            ):
+                invalid.add(name)
+                continue
+            minima[name] = min(minima.get(name, minimum), minimum)
+            maxima[name] = max(maxima.get(name, maximum), maximum)
+
+        result: Dict[str, IntegerDomainBound] = {}
+        for name, pairs in seen.items():
+            if (
+                name in invalid
+                or pairs != expected_pairs
+                or len(spellings[name]) != 1
+            ):
+                continue
+            minimum = minima.get(name)
+            maximum = maxima.get(name)
+            if (minimum is None) != (maximum is None):
+                continue
+            result[name] = IntegerDomainBound(
+                minimum=minimum,
+                maximum=maximum,
+                has_null=bool(has_null[name]),
+            )
+        return result
+    except Exception:
+        return {}
 
 
 def prune_overlapping_files_by_stats(
@@ -3744,6 +4443,38 @@ def select_row_groups_by_predicates(
 #     read is served from memory with no storage round-trip at all.
 # ===========================================================================
 
+
+def _cache_metadata_estimated_bytes(metadata: Any) -> int:
+    """Conservative admission size for immutable validation metadata."""
+    if metadata is None:
+        return 0
+    validation = getattr(metadata, "validation", None)
+    if validation is not None:
+        seals = getattr(validation, "resource_seals", None) or {}
+        complete = getattr(validation, "complete_resource_rows", None) or {}
+        # Dict/object/key overhead varies by interpreter. These intentionally
+        # high constants keep the configured cap conservative without walking
+        # object graphs or materialising reprs on the query hot path.
+        return (
+            256
+            + sum(512 + len(str(key).encode("utf-8")) for key in seals)
+            + sum(128 + len(str(key).encode("utf-8")) for key in complete)
+        )
+    if isinstance(metadata, tuple):
+        total = 128
+        for value in metadata:
+            if isinstance(value, (set, frozenset)):
+                total += sum(
+                    96 + len(str(item).encode("utf-8")) for item in value
+                )
+            elif isinstance(value, str):
+                total += 64 + len(value.encode("utf-8"))
+            else:
+                total += 64
+        return total
+    return 1024
+
+
 class _PathKeyedFrameCache:
     """Process-wide LRU of each table's latest artifact frame (one per table).
 
@@ -3843,15 +4574,16 @@ class _PathKeyedFrameCache:
             if byte_cap is not None:
                 return
             frame_bytes = 0
+        entry_bytes = frame_bytes + _cache_metadata_estimated_bytes(metadata)
         key = self._key(path)
         with self._lock:
             old = self._entries.pop(key, None)
             if old is not None:
                 self._bytes -= old[2]
-            if byte_cap is not None and frame_bytes > byte_cap:
+            if byte_cap is not None and entry_bytes > byte_cap:
                 return
-            self._entries[key] = (path, df, frame_bytes, metadata)
-            self._bytes += frame_bytes
+            self._entries[key] = (path, df, entry_bytes, metadata)
+            self._bytes += entry_bytes
             self._entries.move_to_end(key)
             self._trim_locked(cap, byte_cap)
 
@@ -3875,6 +4607,15 @@ def _stats_cache_cap() -> int:
     return int(settings.SUPERTABLE_STATS_CACHE_MAX_TABLES)
 
 
+def _stats_cache_byte_cap() -> int:
+    configured = getattr(settings, "SUPERTABLE_STATS_CACHE_MAX_BYTES", None)
+    if not isinstance(configured, (int, str)) or isinstance(configured, bool):
+        configured = os.environ.get(
+            "SUPERTABLE_STATS_CACHE_MAX_BYTES", str(256 * 1024 * 1024)
+        )
+    return int(configured)
+
+
 def _tombstone_cache_cap() -> int:
     return int(settings.SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES)
 
@@ -3888,16 +4629,47 @@ def _tombstone_cache_byte_cap() -> int:
     return int(configured)
 
 
-_STATS_CACHE = _PathKeyedFrameCache(_stats_cache_cap)
+_STATS_CACHE = _PathKeyedFrameCache(_stats_cache_cap, _stats_cache_byte_cap)
 _TOMBSTONE_CACHE = _PathKeyedFrameCache(
     _tombstone_cache_cap, _tombstone_cache_byte_cap
 )
+
+
+@dataclass(frozen=True)
+class _StatsCacheMetadata:
+    """Validation work cached beside one immutable stats-frame version."""
+
+    validation: _StatsFrameValidation
+
+
+def _stats_validation_for_frame(
+        stats_df: polars.DataFrame,
+        *,
+        stats_path: Optional[str] = None,
+) -> _StatsFrameValidation:
+    """Compute digest/group indexes once per immutable cached stats frame."""
+    cache_key = stats_cache_identity(stats_path) if stats_path else None
+    cache_entry = _STATS_CACHE.get_entry(cache_key) if cache_key else None
+    if cache_entry is not None:
+        cached_frame, metadata = cache_entry
+        if cached_frame is stats_df and isinstance(metadata, _StatsCacheMetadata):
+            return metadata.validation
+
+    calculated = _validate_stats_frame_once(stats_df)
+    # Only attach metadata when this exact frame is already an admitted entry.
+    # Historical allow_cache=False reads must not evict the current version.
+    if cache_entry is not None and cache_entry[0] is stats_df:
+        _STATS_CACHE.put(
+            cache_key, stats_df, _StatsCacheMetadata(calculated),
+        )
+    return calculated
 
 
 def load_stats(
         stats_path: Optional[str],
         *,
         allow_cache: bool = True,
+        cache_identity: Optional[str] = None,
         profiler: Optional[Profiler] = None,
 ) -> Optional[polars.DataFrame]:
     """Load a table's stats parquet, serving the latest version from memory.
@@ -3910,7 +4682,8 @@ def load_stats(
     if not stats_path:
         return None
     p = profiler or get_null_profiler()
-    cached = _STATS_CACHE.get(stats_path)
+    identity = cache_identity or stats_cache_identity(stats_path)
+    cached = _STATS_CACHE.get(identity)
     if cached is not None:
         p.add("stats_cache_hit", 1)
         return cached
@@ -3928,23 +4701,31 @@ def load_stats(
             )
             return None
     if df is not None and allow_cache:
-        _STATS_CACHE.put(stats_path, df)
+        _STATS_CACHE.put(identity, df)
     return df
 
 
-def cache_stats(stats_path: Optional[str], df: Optional[polars.DataFrame]) -> None:
+def cache_stats(
+        stats_path: Optional[str],
+        df: Optional[polars.DataFrame],
+        *,
+        cache_identity: Optional[str] = None,
+) -> None:
     """Seed the cache with a freshly built latest-version stats frame.
 
     Called by writers right after :func:`build_stats_file` so the very next
     read (this process's next overwrite/delete or query) needs no storage read.
     """
     if stats_path and df is not None:
-        _STATS_CACHE.put(stats_path, df)
+        identity = cache_identity or stats_cache_identity(stats_path)
+        _STATS_CACHE.put(identity, df)
 
 
 def load_tombstone(
         tombstone_path: Optional[str],
         *,
+        cache_identity: Optional[str] = None,
+        loader: Optional[Callable[[], Optional[polars.DataFrame]]] = None,
         allow_cache: bool = True,
         required: bool = False,
         expected_rows: Optional[int] = None,
@@ -3953,6 +4734,12 @@ def load_tombstone(
         profiler: Optional[Profiler] = None,
 ) -> Optional[polars.DataFrame]:
     """Load a table's deletion-vector parquet, serving the latest from memory.
+
+    ``cache_identity`` may provide a stable, authorization-scoped raw object
+    identity when ``tombstone_path`` is a rotating presigned URL. It controls
+    only the cache key; misses are still read from ``tombstone_path``.
+    ``loader`` lets an engine use its bounded storage-SDK read on a miss while
+    retaining the same sealed cache and validation path.
 
     Symmetric to :func:`load_stats`.  *allow_cache* must be ``True`` only when
     *tombstone_path* is the table's CURRENT (latest) deletion-vector version —
@@ -3967,12 +4754,13 @@ def load_tombstone(
     """
     if not tombstone_path:
         return None
+    identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
     p = profiler or get_null_profiler()
-    cached_entry = _TOMBSTONE_CACHE.get_entry(tombstone_path)
+    cached_entry = _TOMBSTONE_CACHE.get_entry(identity)
     if cached_entry is not None:
         p.add("tombstone_cache_hit", 1)
         cached, metadata = cached_entry
-        source = f"cached deletion-vector {tombstone_path}"
+        source = f"cached deletion-vector {identity}"
         if not (
             isinstance(metadata, tuple)
             and len(metadata) == 3
@@ -3993,7 +4781,7 @@ def load_tombstone(
             metadata = _tombstone_cache_seal(
                 cached, known_digest=expected_digest, source=source,
             )
-            _TOMBSTONE_CACHE.put(tombstone_path, cached, metadata)
+            _TOMBSTONE_CACHE.put(identity, cached, metadata)
         _validate_cached_tombstone_seal(
             metadata,
             expected_rows=expected_rows,
@@ -4003,7 +4791,11 @@ def load_tombstone(
         )
         return cached
     p.add("tombstone_cache_miss", 1)
-    df = _read_parquet_safe(tombstone_path, profiler=p, required=required)
+    df = (
+        loader()
+        if loader is not None
+        else _read_parquet_safe(tombstone_path, profiler=p, required=required)
+    )
     if df is not None:
         df = validate_tombstone_frame(
             df,
@@ -4018,7 +4810,7 @@ def load_tombstone(
             known_digest=expected_digest,
             source=f"deletion-vector cache entry {tombstone_path}",
         )
-        _TOMBSTONE_CACHE.put(tombstone_path, df, seal)
+        _TOMBSTONE_CACHE.put(identity, df, seal)
     return df
 
 
@@ -4026,6 +4818,7 @@ def cache_tombstone(
         tombstone_path: Optional[str],
         df: Optional[polars.DataFrame],
         *,
+        cache_identity: Optional[str] = None,
         expected_rows: Optional[int] = None,
         expected_digest: Optional[str] = None,
         assume_valid: bool = False,
@@ -4072,13 +4865,19 @@ def cache_tombstone(
         seal = _tombstone_cache_seal(
             validated, known_digest=checked_digest, source=source,
         )
-        _TOMBSTONE_CACHE.put(tombstone_path, validated, seal)
+        identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
+        _TOMBSTONE_CACHE.put(identity, validated, seal)
 
 
-def evict_tombstone(tombstone_path: Optional[str]) -> None:
+def evict_tombstone(
+        tombstone_path: Optional[str],
+        *,
+        cache_identity: Optional[str] = None,
+) -> None:
     """Remove a superseded/currently-drained deletion-vector cache entry."""
     if tombstone_path:
-        _TOMBSTONE_CACHE.discard(tombstone_path)
+        identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
+        _TOMBSTONE_CACHE.discard(identity)
 
 
 def compact_tombstones(

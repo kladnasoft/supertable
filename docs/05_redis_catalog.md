@@ -168,7 +168,7 @@ All query-engine state is unified under one org-level `system:engine:` namespace
 |---------|------|---------|
 | `supertable:{org}:system:engine:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
 | `supertable:{org}:system:engine:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
-| `supertable:{org}:system:engine:duckdb` | STRING (JSON) | DuckDB Lite/Pro runtime config + shared auto-pick thresholds (memory, threads, thresholds) |
+| `supertable:{org}:system:engine:duckdb` | STRING (JSON) | DuckDB/Pro runtime config + shared auto-pick thresholds (memory, threads, thresholds) |
 
 ### Schema Keys
 
@@ -394,14 +394,14 @@ On initialization, the catalog:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `set_engine_config` | `(org, sup, config) -> bool` | Stores engine runtime configuration. Only whitelisted fields are persisted. |
-| `get_engine_config` | `(org, sup) -> Optional[Dict]` | Retrieves engine runtime configuration. |
+| `set_engine_config` | `(org, config) -> bool` | Stores the organization-wide DuckDB runtime configuration. Only whitelisted fields are persisted. |
+| `get_engine_config` | `(org) -> Optional[Dict]` | Retrieves engine runtime configuration. |
 
 **Whitelisted engine config fields** (defined in `ENGINE_CONFIG_FIELDS`):
 
 | Field | Environment Variable Fallback |
 |-------|-------------------------------|
-| `engine_lite_max_bytes` | `SUPERTABLE_ENGINE_LITE_MAX_BYTES` |
+| `engine_island_min_bytes` | `SUPERTABLE_ENGINE_ISLAND_MIN_BYTES` |
 | `engine_spark_min_bytes` | `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` |
 | `engine_freshness_sec` | `SUPERTABLE_ENGINE_FRESHNESS_SEC` |
 | `duckdb_memory_limit` | `SUPERTABLE_DUCKDB_MEMORY_LIMIT` |

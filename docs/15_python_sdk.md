@@ -164,7 +164,7 @@ print(f"timings: {dr.timer.timings}")
 print(f"plan_stats: {dr.plan_stats.stats}")
 ```
 
-Engine values: `engine.AUTO`, `engine.DUCKDB_LITE`, `engine.DUCKDB_PRO`,
+Engine values: `engine.AUTO`, `engine.DUCKDB`, `engine.ISLANDDB`,
 `engine.SPARK_SQL`.
 
 ### MetaReader

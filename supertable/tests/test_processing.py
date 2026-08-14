@@ -361,6 +361,31 @@ class TestWriteParquetAndCollectResources:
         assert "data.parquet" in res["file"]
         assert "stats" not in res
 
+    @patch(f"{_MOD}.generate_filename", return_value="binary.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_binary_resource_records_exact_maximum_value_width(
+        self, mock_gs, mock_gen,
+    ):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        storage = MagicMock()
+        storage.exists.return_value = True
+        mock_gs.return_value = storage
+        payload = pl.Series(
+            "payload", [None, b"", b"\x80", b"x" * 257], dtype=pl.Binary,
+        )
+        resources: list = []
+
+        write_parquet_and_collect_resources(
+            write_df=pl.DataFrame({"id": [1, 2, 3, 4], "payload": payload}),
+            overwrite_columns=["id"],
+            data_dir="/data",
+            new_resources=resources,
+            compression_level=1,
+        )
+
+        assert resources[0]["column_max_value_bytes"] == {"payload": 257}
+
     @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
     @patch(f"{_MOD}._get_storage")
     def test_creates_dir_if_missing(self, mock_gs, mock_gen):

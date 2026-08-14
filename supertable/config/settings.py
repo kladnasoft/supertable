@@ -198,20 +198,24 @@ class Settings:
     SUPERTABLE_DEBUG_TIMINGS: bool = False          # SUPERTABLE_DEBUG_TIMINGS
 
     # ── Engine Routing / Executor ────────────────────────────────────
-    SUPERTABLE_ENGINE_LITE_MAX_BYTES: int = 100 * 1024 * 1024    # SUPERTABLE_ENGINE_LITE_MAX_BYTES (100 MB)
+    SUPERTABLE_ENGINE_ISLAND_MIN_BYTES: int = 100 * 1024 * 1024    # SUPERTABLE_ENGINE_ISLAND_MIN_BYTES (100 MB)
     SUPERTABLE_ENGINE_SPARK_MIN_BYTES: int = 0  # fallback only; 0 = active fleet's min_bytes drives Spark routing
     SUPERTABLE_ENGINE_FRESHNESS_SEC: int = 300     # SUPERTABLE_ENGINE_FRESHNESS_SEC
     SUPERTABLE_DEFAULT_ENGINE: str = "AUTO"        # SUPERTABLE_DEFAULT_ENGINE
 
     # ── IslandDB / shared local Parquet cache ──────────────────────
-    # IslandDB remains explicit-only by default while deployment benchmarks
-    # establish AUTO break-even points. Its complete-object cache is also
+    # IslandDB is an AUTO candidate behind conservative capability/resource
+    # gates. Its complete-object cache is also
     # consulted (hit-only) by DuckDB so both engines can reuse immutable local
     # Parquet files; selective remote Island scans use the range cache below.
     SUPERTABLE_ISLAND_CACHE_ENABLED: bool = True       # SUPERTABLE_ISLAND_CACHE_ENABLED
     SUPERTABLE_ISLAND_CACHE_DIR: str = ""              # SUPERTABLE_ISLAND_CACHE_DIR
     SUPERTABLE_ISLAND_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_CACHE_MAX_BYTES
-    SUPERTABLE_ISLAND_CACHE_TTL_SEC: int = 24 * 60 * 60  # SUPERTABLE_ISLAND_CACHE_TTL_SEC
+    # Published Parquet objects are immutable/version-addressed.  Capacity and
+    # integrity, rather than age, rotate the local object cache by default.
+    # Operators may still opt into an idle TTL with an explicitly positive
+    # value; zero means no time-based expiry.
+    SUPERTABLE_ISLAND_CACHE_TTL_SEC: int = 0  # SUPERTABLE_ISLAND_CACHE_TTL_SEC
     SUPERTABLE_ISLAND_CACHE_WORKERS: int = 4            # SUPERTABLE_ISLAND_CACHE_WORKERS
     SUPERTABLE_ISLAND_AUTO_ENABLED: bool = True         # SUPERTABLE_ISLAND_AUTO_ENABLED
     # Persistent exact-range cache used by IslandDB's seekable Arrow Parquet
@@ -221,17 +225,26 @@ class Settings:
     SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED: bool = True   # SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
     SUPERTABLE_ISLAND_RANGE_CACHE_DIR: str = ""          # SUPERTABLE_ISLAND_RANGE_CACHE_DIR
     SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES
-    SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC: int = 24 * 60 * 60  # SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC
+    # Immutable, version-sealed ranges rotate on capacity/corruption by default.
+    # A positive value explicitly restores idle-TTL eviction.
+    SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC: int = 0  # SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC
 
-    # Container-aware native execution budgets.  Zero means auto-detect from
-    # cgroup-v2 and CPU affinity.  These are hard planning limits: IslandDB
-    # routes an unsupported/oversized plan away instead of risking OOM.
+    # Container-aware native execution admission budgets. Zero means
+    # auto-detect from cgroup-v2 and CPU affinity. Result collection and spill
+    # quotas are hard; Polars/Arrow scan pools are process-global, so decoded
+    # scan-memory estimates are conservative routing/admission guards rather
+    # than an in-process per-query allocator cap.
     SUPERTABLE_ISLAND_MEMORY_FRACTION: float = 0.60       # SUPERTABLE_ISLAND_MEMORY_FRACTION
     SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION: float = 0.80  # SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION
     SUPERTABLE_ISLAND_MAX_MEMORY_BYTES: int = 0           # SUPERTABLE_ISLAND_MAX_MEMORY_BYTES
     SUPERTABLE_ISLAND_MAX_RESULT_BYTES: int = 512 * 1024 * 1024  # SUPERTABLE_ISLAND_MAX_RESULT_BYTES
     SUPERTABLE_ISLAND_CPU_MAX: int = 0                    # SUPERTABLE_ISLAND_CPU_MAX
     SUPERTABLE_ISLAND_IO_WORKERS_MAX: int = 16            # SUPERTABLE_ISLAND_IO_WORKERS_MAX
+    # Hard wall-clock bound for one admitted IslandDB execution.  The bound is
+    # checked cooperatively at Arrow/native batch boundaries, including the
+    # eager spill preparation that happens before a result stream is returned.
+    # A non-positive value explicitly disables the deadline.
+    SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC: float = 300.0     # SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC
     SUPERTABLE_ISLAND_SPILL_ENABLED: bool = True          # SUPERTABLE_ISLAND_SPILL_ENABLED
     SUPERTABLE_ISLAND_SPILL_DIR: str = ""                 # SUPERTABLE_ISLAND_SPILL_DIR
     SUPERTABLE_ISLAND_SPILL_MAX_BYTES: int = 64 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_SPILL_MAX_BYTES
@@ -350,6 +363,9 @@ class Settings:
     # in-process stats cache (one DataFrame per table; older versions are
     # always read fresh and never cached).  0 disables caching.
     SUPERTABLE_STATS_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_STATS_CACHE_MAX_TABLES
+    # Independent hard memory ceiling for both cached frames and their small
+    # validation indexes.  Table-count alone cannot bound a wide/long manifest.
+    SUPERTABLE_STATS_CACHE_MAX_BYTES: int = 256 * 1024 * 1024  # SUPERTABLE_STATS_CACHE_MAX_BYTES
 
     # Max number of tables whose *latest* tombstone (deletion-vector) artifact is
     # held in the in-process tombstone cache (one DataFrame per table; older
@@ -366,7 +382,7 @@ class Settings:
     # Projection-aware read sizing: when True the estimator charges a query only
     # the on-disk (compressed) bytes of the columns it selects — via per-column
     # ``compressed_bytes`` in the stats artifact, falling back to a type-width
-    # ratio of the whole file. Drives AUTO engine routing (lite/pro/spark). Set
+    # ratio of the whole file. Drives AUTO engine routing (DuckDB/IslandDB/spark). Set
     # False to fall back to whole-file sizing (every query charged all columns).
     SUPERTABLE_READ_PROJECTION_SIZING_ENABLED: bool = True
 
@@ -529,7 +545,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),
 
         # ── Engine Routing ───────────────────────────────────────────
-        SUPERTABLE_ENGINE_LITE_MAX_BYTES=_env_int("SUPERTABLE_ENGINE_LITE_MAX_BYTES", 100 * 1024 * 1024),
+        SUPERTABLE_ENGINE_ISLAND_MIN_BYTES=_env_int("SUPERTABLE_ENGINE_ISLAND_MIN_BYTES", 100 * 1024 * 1024),
         SUPERTABLE_ENGINE_SPARK_MIN_BYTES=_env_int("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", 0),
         SUPERTABLE_ENGINE_FRESHNESS_SEC=_env_int("SUPERTABLE_ENGINE_FRESHNESS_SEC", 300),
         SUPERTABLE_DEFAULT_ENGINE=_env_str("SUPERTABLE_DEFAULT_ENGINE", "AUTO"),
@@ -541,7 +557,7 @@ def _build_settings() -> Settings:
             "SUPERTABLE_ISLAND_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
         ),
         SUPERTABLE_ISLAND_CACHE_TTL_SEC=_env_int(
-            "SUPERTABLE_ISLAND_CACHE_TTL_SEC", 24 * 60 * 60,
+            "SUPERTABLE_ISLAND_CACHE_TTL_SEC", 0,
         ),
         SUPERTABLE_ISLAND_CACHE_WORKERS=_env_int(
             "SUPERTABLE_ISLAND_CACHE_WORKERS", 4,
@@ -559,7 +575,7 @@ def _build_settings() -> Settings:
             "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
         ),
         SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC=_env_int(
-            "SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC", 24 * 60 * 60,
+            "SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC", 0,
         ),
         SUPERTABLE_ISLAND_MEMORY_FRACTION=_env_float(
             "SUPERTABLE_ISLAND_MEMORY_FRACTION", 0.60,
@@ -578,6 +594,9 @@ def _build_settings() -> Settings:
         ),
         SUPERTABLE_ISLAND_IO_WORKERS_MAX=_env_int(
             "SUPERTABLE_ISLAND_IO_WORKERS_MAX", 16,
+        ),
+        SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC=_env_float(
+            "SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC", 300.0,
         ),
         SUPERTABLE_ISLAND_SPILL_ENABLED=_env_bool(
             "SUPERTABLE_ISLAND_SPILL_ENABLED", True,
@@ -704,6 +723,9 @@ def _build_settings() -> Settings:
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_STATS_CACHE_MAX_BYTES=_env_int(
+            "SUPERTABLE_STATS_CACHE_MAX_BYTES", 256 * 1024 * 1024
+        ),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES=_env_int(
             "SUPERTABLE_TOMBSTONE_CACHE_MAX_BYTES", 256 * 1024 * 1024

@@ -295,6 +295,7 @@ class SimpleTable:
             ROWID_COL,
             TOMBSTONE_FILE_COL,
             load_tombstone,
+            tombstone_cache_identity,
         )
 
         snapshot, _path = self.get_simple_table_snapshot()
@@ -311,6 +312,11 @@ class SimpleTable:
         if tombstone_path:
             tomb_df = load_tombstone(
                 tombstone_path,
+                cache_identity=tombstone_cache_identity(
+                    tombstone_path,
+                    organization=self.super_table.organization,
+                    storage=self.storage,
+                ),
                 allow_cache=False,
                 required=True,
                 expected_rows=snapshot.get("tombstone_rows"),

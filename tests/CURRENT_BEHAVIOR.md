@@ -10,7 +10,7 @@
 > migration.
 
 The read path builds a stack of per-query DuckDB views and executes the user SQL
-on top of them. Chain order (`supertable/engine/duckdb_lite.py:160-247`):
+on top of them. Chain order (`supertable/engine/duckdb.py:160-247`):
 
 ```
 reflection (parquet scan) → RBAC → tombstone → dedup → user query
@@ -51,7 +51,7 @@ absent from one file reads as `NULL` there.
 
 ### 3. View / SQL generated for reads
 Per-query, uniquely-suffixed views are created then dropped in a `finally`
-(`supertable/engine/duckdb_lite.py`). The two semantically important ones:
+(`supertable/engine/duckdb.py`). The two semantically important ones:
 
 - **Tombstone** (`engine_common.py:1124-1190`):
   ```sql
@@ -152,8 +152,8 @@ Partially, and asymmetrically:
   than erroring — sealed as-is (`schema_incompatible_types`: `10`→`'10'`).
 
 ### 14. DuckDB vs Spark execution differences
-Both engines exist. DuckDB (`supertable/engine/duckdb_lite.py`,
-`duckdb_pro.py`) is the **default and the oracle that sealed the goldens**. Spark
+Both engines exist. DuckDB (`supertable/engine/duckdb.py`,
+`duckdb_engine.py`) is the **default and the oracle that sealed the goldens**. Spark
 (`supertable/engine/spark_thrift.py`) builds the *same logical* view chain
 (reflection → RBAC → tombstone → dedup) but with engine-specific syntax and
 caveats:

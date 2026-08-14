@@ -101,6 +101,143 @@ class RowGroupSelection:
             raise ValueError("footer_sha256 must be a lowercase SHA-256 digest")
 
 
+@dataclass(frozen=True)
+class ResourceStatsSeal:
+    """Snapshot-pinned identity for one resource's footer-statistics rows.
+
+    ``footer_sha256`` binds the rows to the exact Parquet footer from which they
+    were extracted. ``stats_rows`` prevents truncation/extension, while
+    ``stats_digest`` seals the canonical ``STATS_SCHEMA`` row stream.  All three
+    values are required before statistics may prove a resource absent.  Legacy
+    resources simply have no seal and therefore scan conservatively.
+    """
+
+    footer_sha256: str
+    stats_rows: int
+    stats_digest: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("footer_sha256", self.footer_sha256),
+            ("stats_digest", self.stats_digest),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(ch not in "0123456789abcdef" for ch in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if (
+            not isinstance(self.stats_rows, int)
+            or isinstance(self.stats_rows, bool)
+            or self.stats_rows < 0
+        ):
+            raise ValueError("stats_rows must be a non-negative integer")
+
+
+@dataclass(frozen=True)
+class ResourceObjectSeal:
+    """Snapshot-pinned identity for one immutable storage object.
+
+    ``size`` is a bounds check, not an identity by itself.  At least one
+    provider identity attribute must also be present so a range reader can
+    address and validate the exact object observed immediately after upload.
+    Legacy resources have no seal and retain the normal storage ``stat`` path.
+    """
+
+    size: int
+    version: str = ""
+    etag: str = ""
+    last_modified_ns: int = 0
+    checksum_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.size, int)
+            or isinstance(self.size, bool)
+            or self.size < 0
+        ):
+            raise ValueError("size must be a non-negative integer")
+        if (
+            not isinstance(self.last_modified_ns, int)
+            or isinstance(self.last_modified_ns, bool)
+            or self.last_modified_ns < 0
+        ):
+            raise ValueError("last_modified_ns must be a non-negative integer")
+        for name, value in (("version", self.version), ("etag", self.etag)):
+            if (
+                not isinstance(value, str)
+                or len(value) > 1024
+                or "\x00" in value
+            ):
+                raise ValueError(f"{name} must be a bounded string")
+        checksum = self.checksum_sha256
+        if not isinstance(checksum, str) or (
+            checksum
+            and (
+                len(checksum) != 64
+                or any(ch not in "0123456789abcdef" for ch in checksum)
+            )
+        ):
+            raise ValueError(
+                "checksum_sha256 must be an empty string or lowercase SHA-256"
+            )
+        if not (
+            self.version
+            or self.etag
+            or self.last_modified_ns
+            or self.checksum_sha256
+        ):
+            raise ValueError("an object identity beyond size is required")
+
+
+@dataclass(frozen=True)
+class IntegerDomainBound:
+    """Complete integer domain bound for one snapshot/query selection.
+
+    The estimator creates this only from every selected row group's
+    snapshot-sealed footer row.  ``minimum``/``maximum`` therefore bound every
+    non-NULL value that can reach execution, while ``has_null`` accounts for
+    SQL's one additional NULL grouping key.  Both extrema are ``None`` only
+    for an empty/all-NULL selection.
+
+    This is deliberately a narrow resource-planning proof, not an NDV
+    estimate: holes in the integer range are retained, so
+    :attr:`cardinality_upper_bound` can overstate but never understate the
+    number of GROUP BY keys.
+    """
+
+    minimum: Optional[int]
+    maximum: Optional[int]
+    has_null: bool = False
+
+    def __post_init__(self) -> None:
+        minimum = self.minimum
+        maximum = self.maximum
+        if (minimum is None) != (maximum is None):
+            raise ValueError("integer domain extrema must both be present or absent")
+        if minimum is not None:
+            if (
+                not isinstance(minimum, int)
+                or isinstance(minimum, bool)
+                or not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+                or minimum > maximum
+            ):
+                raise ValueError("integer domain extrema must be ordered integers")
+        if not isinstance(self.has_null, bool):
+            raise ValueError("integer domain has_null must be boolean")
+
+    @property
+    def cardinality_upper_bound(self) -> int:
+        non_null = (
+            0
+            if self.minimum is None
+            else int(self.maximum) - int(self.minimum) + 1
+        )
+        return non_null + int(self.has_null)
+
+
 @dataclass
 class TableDefinition:
     super_name: str
@@ -162,6 +299,30 @@ class SuperSnapshot:
     # Used for bounded result/join/response-LIMIT planning.
     candidate_rows: int = 0
     candidate_rows_complete: bool = False
+    # Stable raw resource key -> independently snapshot-pinned statistics seal.
+    # Absence is the explicit legacy/fail-open representation: the file remains
+    # readable, but no min/max row may be used to exclude it or one of its row
+    # groups from the scan.
+    resource_stats_seals: Dict[str, ResourceStatsSeal] = field(default_factory=dict)
+    # Stable raw resource key -> exact provider identity observed immediately
+    # after the unique immutable object was uploaded.  IslandDB may pass this
+    # directly to its conditional range reader and avoid one remote HEAD per
+    # file/query. Missing/malformed/ambiguous entries fail open to the existing
+    # stat path.
+    resource_object_seals: Dict[str, ResourceObjectSeal] = field(default_factory=dict)
+    # Exact maximum logical value width for selected variable-width columns,
+    # keyed by their canonical schema spelling.  This is optional because old
+    # snapshots did not persist the write-time measurement.  IslandDB may use a
+    # bound only for resource admission; absence or malformed values route a
+    # variable-width native reduction away rather than inventing a small value.
+    # The bound must describe every immutable resource represented by this
+    # SuperSnapshot (the maximum across them), not merely the current survivor.
+    column_max_value_bytes: Dict[str, int] = field(default_factory=dict)
+    # Canonical column name -> complete selected-row-group integer domain.
+    # These optional resource-planning proofs are derived only after every
+    # contributing stats row has passed its snapshot footer/count/digest seal.
+    # Absence is conservative and preserves the general spill plan.
+    integer_domain_bounds: Dict[str, IntegerDomainBound] = field(default_factory=dict)
 
 
 @dataclass

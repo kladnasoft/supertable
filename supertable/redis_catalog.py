@@ -2321,7 +2321,7 @@ return 1
     # Canonical field names and their env-var counterparts.  Used by the
     # resolver in engine_common to fall back to os.getenv when a field
     # is absent from Redis.
-    # Per-engine DuckDB runtime pragmas (separate sections for "lite" / "pro").
+    # Runtime pragmas for the sole DuckDB engine.
     DUCKDB_CONFIG_FIELDS = (
         "duckdb_memory_limit",
         "duckdb_io_multiplier",
@@ -2329,32 +2329,24 @@ return 1
         "duckdb_http_timeout",
         "duckdb_external_cache_size",
     )
-    DUCKDB_ENGINES = ("lite", "pro")
-
     def set_engine_config(
             self,
             org: str,
-            engine: str,
             config: Dict[str, Any],
     ) -> bool:
-        """Store DuckDB runtime configuration for one engine ("lite" / "pro").
+        """Store the organization-wide DuckDB runtime configuration.
 
         Org-level system scope: one engine document per organization, applied
         globally across all supertables (not per-supertable).
 
-        Only the requested engine's section is replaced; the other engine's
-        section and the shared auto-pick thresholds are preserved.  Within the
-        section it is a full replace (last-write-wins) — omitting a field clears
-        its Redis override so it falls back to env / default at read time.
+        The DuckDB section is fully replaced (last-write-wins); shared AUTO
+        thresholds and policy are preserved.
 
         Only recognised DuckDB fields (see DUCKDB_CONFIG_FIELDS) are persisted —
         unknown keys are silently dropped to prevent injection of arbitrary
         settings.
         """
         if not org:
-            return False
-        engine = (engine or "").strip().lower()
-        if engine not in self.DUCKDB_ENGINES:
             return False
         try:
             from supertable.engine.engine_config import normalize_memory_size
@@ -2381,7 +2373,7 @@ return 1
                     section["duckdb_external_cache_size"] = normalized_cache
                 else:
                     section.pop("duckdb_external_cache_size")
-            doc[engine] = section
+            doc["duckdb"] = section
             doc["modified_ms"] = _now_ms()
             self.r.set(
                 RK.engine_duckdb(org),

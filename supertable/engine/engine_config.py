@@ -11,23 +11,21 @@ connection reset.
 Two kinds of settings live in that document:
 
   * **Shared auto-pick thresholds** (one value, used by the router):
-    ``engine_lite_max_bytes``, ``engine_spark_min_bytes``,
+    ``engine_island_min_bytes``, ``engine_spark_min_bytes``,
     ``engine_freshness_sec``.  These describe the *boundaries* between engines
     so they cannot be per-engine.
-  * **Per-engine DuckDB runtime pragmas** (separate values for Lite and Pro):
+  * **DuckDB runtime pragmas**:
     ``duckdb_memory_limit``, ``duckdb_io_multiplier``, ``duckdb_threads``,
     ``duckdb_http_timeout``, ``duckdb_external_cache_size``.  Each DuckDB engine
-    carries its own copy under a ``"lite"`` / ``"pro"`` section, so tuning Lite
-    never changes Pro and vice-versa.
+    are stored under the single ``"duckdb"`` section.
 
 Stored document shape::
 
     {
-      "engine_lite_max_bytes": "104857600",
+      "engine_island_min_bytes": "104857600",
       "engine_spark_min_bytes": "10737418240",
       "engine_freshness_sec":   "300",
-      "lite": {"duckdb_memory_limit": "1GB", ...},
-      "pro":  {"duckdb_memory_limit": "8GB", ...},
+      "duckdb": {"duckdb_memory_limit": "1GB", ...},
       "modified_ms": 1750000000000
     }
 
@@ -35,18 +33,17 @@ Resolution precedence, per field::
 
     Redis (org system config)  →  environment variable  →  built-in default
 
-The environment variable is a single global fallback shared by both engines;
-per-engine differentiation therefore only happens once a value is stored in
-Redis (via the UI).
+The environment variable is the global fallback until a value is stored in
+Redis via the UI.
 
 Entry points (all share that precedence so engine and UI never disagree):
 
-  * :func:`resolve_engine_configs`           → ``{"lite": cfg, "pro": cfg}`` in a
+  * :func:`resolve_engine_configs`           → ``{"duckdb": cfg}`` in a
                                                 single Redis read; used by the
                                                 executor.
   * :func:`resolve_engine_config`            → typed :class:`EngineRuntimeConfig`
                                                 for one engine (convenience).
-  * :func:`resolve_engine_config_provenance` → ``{shared, lite, pro,
+  * :func:`resolve_engine_config_provenance` → ``{shared, duckdb,
                                                 modified_ms}`` per-field
                                                 ``{value, source, env_var,
                                                 default}`` for the API / UI.
@@ -109,12 +106,12 @@ def normalize_memory_size(value: Any, default: str = "1GB", *, bare_unit: str = 
 
 # Shared auto-pick thresholds: key → (env var, built-in default as string).
 _SHARED_SPEC: Dict[str, Tuple[str, str]] = {
-    "engine_lite_max_bytes":  ("SUPERTABLE_ENGINE_LITE_MAX_BYTES",  str(100 * 1024 * 1024)),
+    "engine_island_min_bytes":  ("SUPERTABLE_ENGINE_ISLAND_MIN_BYTES",  str(100 * 1024 * 1024)),
     "engine_spark_min_bytes": ("SUPERTABLE_ENGINE_SPARK_MIN_BYTES", str(0)),
     "engine_freshness_sec":   ("SUPERTABLE_ENGINE_FRESHNESS_SEC",   "300"),
 }
 
-# Per-engine DuckDB runtime pragmas: key → (env var, built-in default as string).
+# DuckDB runtime pragmas: key → (env var, built-in default as string).
 # Defaults mirror the settings dataclass defaults in supertable/config/settings.py.
 _DUCKDB_SPEC: Dict[str, Tuple[str, str]] = {
     "duckdb_memory_limit":        ("SUPERTABLE_DUCKDB_MEMORY_LIMIT",        "1GB"),
@@ -123,9 +120,6 @@ _DUCKDB_SPEC: Dict[str, Tuple[str, str]] = {
     "duckdb_http_timeout":        ("SUPERTABLE_DUCKDB_HTTP_TIMEOUT",        ""),
     "duckdb_external_cache_size": ("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "5GB"),
 }
-
-# The two DuckDB engines that each carry their own runtime section.
-DUCKDB_ENGINES: Tuple[str, ...] = ("lite", "pro")
 
 # Public whitelists (for callers / catalog / tests).
 SHARED_CONFIG_FIELDS: Tuple[str, ...] = tuple(_SHARED_SPEC.keys())
@@ -207,14 +201,10 @@ def match_auto_routing_policy(
 
 @dataclass(frozen=True)
 class EngineRuntimeConfig:
-    """Effective, typed config for one DuckDB engine resolution.
-
-    Carries the shared auto-pick thresholds (identical across engines) plus the
-    DuckDB session pragmas for the engine it was resolved for.
-    """
+    """Effective, typed config for the DuckDB executor."""
 
     # auto-pick thresholds (shared)
-    engine_lite_max_bytes: int
+    engine_island_min_bytes: int
     engine_spark_min_bytes: int
     engine_freshness_sec: int
 
@@ -243,9 +233,7 @@ def _redis_cfg(org: str, catalog: Optional[Any]) -> Dict[str, Any]:
 def _effective(stored: Dict[str, Any], key: str, spec: Dict[str, Tuple[str, str]]) -> Tuple[str, str]:
     """Return ``(value, source)`` for one field. source ∈ redis|env|default.
 
-    ``stored`` is the dict the value is looked up in directly: the top-level
-    document for shared fields, or the ``lite`` / ``pro`` sub-section for
-    per-engine fields.
+    ``stored`` is the dict the value is looked up in directly.
     """
     env_var, default = spec[key]
     redis_val = stored.get(key) if isinstance(stored, dict) else None
@@ -271,9 +259,12 @@ def _to_float(s: Any, fallback: float) -> float:
         return fallback
 
 
-def _build_runtime(redis_cfg: Dict[str, Any], engine: str) -> EngineRuntimeConfig:
-    """Build the typed config for ``engine`` ("lite"/"pro") from a stored doc."""
-    section = redis_cfg.get(engine) if isinstance(redis_cfg.get(engine), dict) else {}
+def _build_runtime(redis_cfg: Dict[str, Any]) -> EngineRuntimeConfig:
+    """Build the typed DuckDB config from the stored document."""
+    section = (
+        redis_cfg.get("duckdb")
+        if isinstance(redis_cfg.get("duckdb"), dict) else {}
+    )
 
     sv = {k: _effective(redis_cfg, k, _SHARED_SPEC)[0] for k in _SHARED_SPEC}
     dv = {k: _effective(section, k, _DUCKDB_SPEC)[0] for k in _DUCKDB_SPEC}
@@ -282,7 +273,7 @@ def _build_runtime(redis_cfg: Dict[str, Any], engine: str) -> EngineRuntimeConfi
     http = _to_int(dv["duckdb_http_timeout"], 0) if dv["duckdb_http_timeout"] else 0
 
     return EngineRuntimeConfig(
-        engine_lite_max_bytes=_to_int(sv["engine_lite_max_bytes"], 100 * 1024 * 1024),
+        engine_island_min_bytes=_to_int(sv["engine_island_min_bytes"], 100 * 1024 * 1024),
         engine_spark_min_bytes=_to_int(sv["engine_spark_min_bytes"], 0),
         engine_freshness_sec=_to_int(sv["engine_freshness_sec"], 300),
         duckdb_memory_limit=normalize_memory_size(dv["duckdb_memory_limit"], default="1GB"),
@@ -294,13 +285,8 @@ def _build_runtime(redis_cfg: Dict[str, Any], engine: str) -> EngineRuntimeConfi
 
 
 def resolve_engine_configs(org: str, catalog: Optional[Any] = None) -> Dict[str, EngineRuntimeConfig]:
-    """Resolve both DuckDB engines in a single Redis read.
-
-    Returns ``{"lite": EngineRuntimeConfig, "pro": EngineRuntimeConfig}``.  The
-    shared thresholds are identical in both; only the DuckDB pragmas differ.
-    """
-    cfg = _redis_cfg(org, catalog)
-    return {e: _build_runtime(cfg, e) for e in DUCKDB_ENGINES}
+    """Compatibility-shaped resolver containing the sole DuckDB config."""
+    return {"duckdb": _build_runtime(_redis_cfg(org, catalog))}
 
 
 def resolve_auto_routing_policy(
@@ -319,7 +305,7 @@ def resolve_engine_bundle(
 ) -> Tuple[Dict[str, EngineRuntimeConfig], Tuple[AutoRoutingRule, ...]]:
     """Resolve runtime configs and manual AUTO policy with one Redis GET."""
     cfg = _redis_cfg(org, catalog)
-    configs = {e: _build_runtime(cfg, e) for e in DUCKDB_ENGINES}
+    configs = {"duckdb": _build_runtime(cfg)}
     try:
         policy = normalize_auto_routing_policy(cfg.get("auto_policy"))
     except ValueError:
@@ -327,15 +313,14 @@ def resolve_engine_bundle(
     return configs, policy
 
 
-def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "lite") -> EngineRuntimeConfig:
-    """Resolve effective config for a single ``engine`` (Redis → env → default).
+def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "duckdb") -> EngineRuntimeConfig:
+    """Resolve effective DuckDB config (Redis → env → default).
 
     ``catalog`` is an optional ``RedisCatalog``.  When it is None or Redis is
     unreachable the resolver falls back to environment variables and built-in
     defaults, which keeps the engine usable without Redis (e.g. in unit tests).
     """
-    engine = engine if engine in DUCKDB_ENGINES else "lite"
-    return _build_runtime(_redis_cfg(org, catalog), engine)
+    return _build_runtime(_redis_cfg(org, catalog))
 
 
 def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) -> Dict[str, Any]:
@@ -345,8 +330,7 @@ def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) ->
 
         {
           "shared": {field: {value, source, env_var, default}, ...},
-          "lite":   {field: {value, source, env_var, default}, ...},
-          "pro":    {field: {value, source, env_var, default}, ...},
+          "duckdb": {field: {value, source, env_var, default}, ...},
           "modified_ms": <int|None>,
         }
 
@@ -362,9 +346,8 @@ def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) ->
         return out
 
     result: Dict[str, Any] = {"shared": _block(cfg, _SHARED_SPEC)}
-    for engine in DUCKDB_ENGINES:
-        section = cfg.get(engine) if isinstance(cfg.get(engine), dict) else {}
-        result[engine] = _block(section, _DUCKDB_SPEC)
+    section = cfg.get("duckdb") if isinstance(cfg.get("duckdb"), dict) else {}
+    result["duckdb"] = _block(section, _DUCKDB_SPEC)
     result["modified_ms"] = cfg.get("modified_ms")
     try:
         result["auto_policy"] = [

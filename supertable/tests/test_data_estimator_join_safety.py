@@ -7,13 +7,18 @@ apply a table's candidate files.
 """
 from __future__ import annotations
 
+import hashlib
 import polars
 
 from supertable.data_classes import JoinEdge, PredInterval
 from supertable.engine import data_estimator as de_mod
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.join_pruner import JoinPrunePlan
-from supertable.processing import STATS_SCHEMA, prune_files_by_predicates
+from supertable.processing import (
+    STATS_SCHEMA,
+    prune_files_by_predicates,
+    stats_resource_seals,
+)
 from supertable.tests.test_data_estimator_join_pruning import (
     SUPER,
     _flat_stats,
@@ -112,6 +117,7 @@ def test_same_height_stats_substitution_cannot_hide_a_row_group():
         row = {column: None for column in STATS_SCHEMA}
         row.update({
             "file_path": file_path,
+            "footer_sha256": hashlib.sha256(file_path.encode()).hexdigest(),
             "row_group_id": row_group_id,
             "column_name": "k",
             "physical_type": "INT64",
@@ -138,6 +144,7 @@ def test_same_height_stats_substitution_cannot_hide_a_row_group():
     safe = DataEstimator._stats_for_complete_files(
         corrupt,
         {"f.parquet": 2, "g.parquet": 1, "h.parquet": 1},
+        stats_resource_seals(corrupt.filter(polars.col("file_path") == "h.parquet")),
     )
     assert safe is not None
     assert set(safe["file_path"].to_list()) == {"h.parquet"}

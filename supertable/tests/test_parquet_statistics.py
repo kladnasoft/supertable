@@ -62,26 +62,28 @@ class TestParquetStatisticsAlwaysWritten:
                 assert col.statistics is not None
                 assert col.statistics.has_min_max
 
-    @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
-    @patch(f"{_MOD}._get_storage")
-    @patch(f"{_MOD}.pq.write_table")
-    def test_write_statistics_flag_cannot_be_disabled(self, mock_write_table, mock_gs, mock_gen):
+    def test_write_statistics_flag_cannot_be_disabled(self):
         """Guard: the explicit write_statistics=True kwarg must be passed to
         pq.write_table.  Fails loudly if someone flips or drops it."""
         from supertable.processing import write_parquet_and_collect_resources
 
-        mock_stor = MagicMock()
-        mock_stor.exists.return_value = True
-        mock_stor.size.return_value = 1234
-        mock_gs.return_value = mock_stor
+        with (
+            patch(f"{_MOD}.generate_filename", return_value="data.parquet"),
+            patch(f"{_MOD}._get_storage") as mock_gs,
+            patch(f"{_MOD}.pq.write_table", wraps=pq.write_table) as mock_write_table,
+        ):
+            mock_stor = MagicMock()
+            mock_stor.exists.return_value = True
+            mock_stor.size.return_value = 1234
+            mock_gs.return_value = mock_stor
 
-        write_parquet_and_collect_resources(
-            write_df=_df(id=[1, 2], val=["a", "b"]),
-            overwrite_columns=["id"],
-            data_dir="/data",
-            new_resources=[],
-            compression_level=10,
-        )
+            write_parquet_and_collect_resources(
+                write_df=_df(id=[1, 2], val=["a", "b"]),
+                overwrite_columns=["id"],
+                data_dir="/data",
+                new_resources=[],
+                compression_level=10,
+            )
 
         assert mock_write_table.called
         assert mock_write_table.call_args.kwargs.get("write_statistics") is True

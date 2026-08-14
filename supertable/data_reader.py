@@ -245,7 +245,11 @@ class DataReader:
         frame with the stats schema columns is returned (success, not error).
         """
         from supertable.data_classes import TableDefinition
-        from supertable.processing import load_stats, STATS_SCHEMA
+        from supertable.processing import (
+            load_stats,
+            stats_cache_identity,
+            STATS_SCHEMA,
+        )
 
         super_name = command.super_name
         simple_name = command.simple_name
@@ -276,7 +280,18 @@ class DataReader:
 
         try:
             stats_file = self._resolve_latest_stats_file(super_name, simple_name)
-            stats_df = load_stats(stats_file, allow_cache=True) if stats_file else None
+            stats_df = (
+                load_stats(
+                    stats_file,
+                    allow_cache=True,
+                    cache_identity=stats_cache_identity(
+                        stats_file,
+                        organization=self.organization,
+                        storage=self.storage,
+                    ),
+                )
+                if stats_file else None
+            )
         except Exception as e:
             logger.error(self._lp(f"[show-stats] failed to load stats: {e}"))
             return pd.DataFrame(), Status.ERROR, str(e)
@@ -553,13 +568,13 @@ class DataReader:
                 message = "No parquet files found"
                 return pd.DataFrame(), status, message
 
-            # 2) EXECUTE.  EXPLAIN is pinned to DuckDB-lite so the plan is
+            # 2) EXECUTE.  EXPLAIN is pinned to DuckDB so the plan is
             # produced cheaply and uniformly (no Pro materialisation / Spark
             # round trip) and prefixed onto the final rewritten query.
             exec_engine = engine
             if command.explain:
                 from supertable.engine.engine_enum import Engine as _EngineEnum
-                exec_engine = _EngineEnum.DUCKDB_LITE
+                exec_engine = _EngineEnum.DUCKDB
             result_df, engine_used = executor.execute(
                 engine=exec_engine,
                 reflection=reflection,

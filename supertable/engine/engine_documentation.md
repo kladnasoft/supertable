@@ -17,7 +17,7 @@ query_sql() / DataReader.execute()
   ├─ DataEstimator         Resolve snapshots from Redis, collect files, validate columns
   │    └─ Returns Reflection (files, bytes, freshness_ms, schema)
   ├─ Wire pinned rbac_views + tombstone_views onto Reflection
-  ├─ Executor._auto_pick   Choose engine (Lite / Pro / bounded IslandDB / Spark)
+  ├─ Executor._auto_pick   Choose engine (DuckDB / IslandDB / bounded IslandDB / Spark)
   └─ Engine.execute
        ├─ Create reflection views (parquet_scan)
        ├─ Create tombstone view    (soft-delete anti-join)
@@ -28,17 +28,12 @@ query_sql() / DataReader.execute()
 
 ## Engines
 
-### DuckDB Lite (`duckdb_lite.py`)
-Scoped lightweight DuckDB executor with request-private views and cursors. It
-reuses its connection/cache only within the same organization and storage
-authorization identity. Best for small datasets or actively changing versions.
-
-### DuckDB Pro (`duckdb_pro.py`)
-Persistent scoped executor. Keeps a long-lived connection with version-based
-view caching and DuckDB's in-memory HTTP metadata/block cache. Old views are
-ref-counted and dropped when stale and unreferenced. Released DuckDB versions
-do not expose a safely bounded reusable on-disk Parquet object cache; the
-application-owned shared cache below provides that layer.
+### DuckDB (`duckdb_engine.py`)
+Scoped DuckDB executor with request-private views and cursors. It reuses its
+connection and caches only within the same organization and storage
+authorization identity. Released DuckDB versions do not expose a safely
+bounded reusable on-disk Parquet object cache; the application-owned shared
+cache below provides that layer.
 
 ### IslandDB (`islanddb.py`)
 SuperTable's specialised Parquet executor. It consumes the estimator's exact
@@ -57,9 +52,20 @@ anti-joins. RBAC filters, unproved string collation/coercion behavior, typed
 empty snapshots, and unsupported SQL stay on DuckDB/Spark.
 
 Decoded input, result, and operator-state estimates are planned against cgroup
-CPU/memory limits. Large supported GROUP BY / ORDER BY shapes use query-private
-hard-quota spill files; memory-heavy joins and unsupported spill shapes route to
-DuckDB or Spark. A public Arrow batch stream avoids materialising large results.
+CPU/memory limits. Because Polars and Arrow use process-global worker pools,
+IslandDB reserves the pool's full CPU width at admission; decoded scan-memory
+figures are conservative routing guards, not a per-query allocator ceiling.
+Result collection and query-private spill do have hard byte quotas. Large
+supported GROUP BY / ORDER BY shapes spill; memory-heavy joins and unsupported
+spill shapes route to DuckDB or Spark. A public Arrow batch stream avoids
+materialising large results.
+For sealed local full-scan ORDER BY plans whose first key has a complete integer
+domain, IslandDB range-partitions each bounded scan block with one stable native
+scatter, writes each row once, and sorts independent ranges with aggregate-
+memory-admitted Arrow C++ workers. Skew, incomplete bounds, unsupported key
+types, or insufficient descriptor headroom retain the conservative bounded
+fallback. Range-writer buffers are globally charged, and public FixedSizeBinary
+payloads are exposed as Arrow Binary without copying their value buffers.
 The engine-level streaming entry point is `Executor.execute_stream(...)`; it
 returns an `ArrowBatchStream` (also exported from `supertable.engine`) whose
 context lifetime owns cache leases, resource reservations, cancellation, and
@@ -79,38 +85,29 @@ source file. Projection/predicate pushdown reduces decoded/query bytes, not the
 first full-object cache fill.
 
 ### Spark Thrift (`spark_thrift.py`)
-Connects to a remote Spark Thrift Server via PyHive. Registers parquet files as temp views (batched unions for multi-file tables), applies timestamp CAST wrappers for DuckDB-written nanos columns, transpiles SQL from DuckDB dialect to Spark dialect. Per-statement timeout via `_execute_with_stmt_timeout`. Best for datasets exceeding single-node DuckDB capacity (10+ GB).
+Connects to a remote Spark Thrift Server via PyHive. Registers parquet files as temp views (batched unions for multi-file tables), applies timestamp CAST wrappers for DuckDB-written nanos columns, transpiles SQL from DuckDB dialect to Spark dialect. Per-statement timeout via `_execute_with_stmt_timeout`. Best for work that exceeds the safely admitted single-node plan.
 
 ## Engine Auto-Selection
 
-`Executor._auto_pick()` chooses based on **data size** and **data freshness** (age of most recent snapshot):
+`Executor._auto_pick()` first applies SQL capability, immutable-identity,
+resource, result, tombstone, and Spark-fleet availability gates. It then
+compares deterministic costs using the sealed post-pruning scan estimate,
+decoded bytes, file/row-group fanout, query shape, freshness, spill work, and
+compatible scoped observations. Incomplete evidence routes conservatively to
+DuckDB. Spark is considered only when an active registered cluster accepts the
+job's byte window. Redis `auto_policy` intervals can force a preferred engine
+for an estimated-scan range but cannot bypass any safety gate.
 
-```
-                        Data freshness
-                   FRESH (<5 min)       STABLE (≥5 min)
-              ┌─────────────────────┬─────────────────────┐
-  Small       │       LITE          │       LITE          │
-  (≤100 MB)   │  cheap anyway       │  cheap anyway       │
-              ├─────────────────────┼─────────────────────┤
-  Medium      │       LITE          │       PRO           │
-  (100MB–10GB)│  cache would churn  │  cache pays off     │
-              ├─────────────────────┼─────────────────────┤
-  Large       │       SPARK *       │       SPARK *       │
-  (≥10 GB)    │  too big for DuckDB │  too big for DuckDB │
-              └─────────────────────┴─────────────────────┘
+Freshness is derived from `Reflection.freshness_ms` — the max
+`last_updated_ms` across all snapshots involved in the query. Unknown
+freshness (0) is treated as stable.
 
-* Spark only when an active registered cluster accepts the job; otherwise the
-  single-node route remains Lite/Pro.
-```
-
-Freshness is derived from `Reflection.freshness_ms` — the max `last_updated_ms` across all snapshots involved in the query. Unknown freshness (0) is treated as stable.
-
-IslandDB is disabled in AUTO by default. With
-`SUPERTABLE_ISLAND_AUTO_ENABLED=true`, it may replace Pro only for a supported,
+IslandDB is enabled in AUTO by default. It may replace DuckDB only for a supported,
 stable query whose decoded working set and operator/result state fit a bounded
 native or spill plan. A cold remote query remains eligible because the sealed
 range reader does not require a whole-object fill. Unsupported, incomplete, or
-over-budget queries stay on DuckDB; Spark retains the fleet-first lane.
+over-budget queries stay on DuckDB; Spark retains the fleet-first lane. Set
+`SUPERTABLE_ISLAND_AUTO_ENABLED=false` to disable the IslandDB AUTO candidate.
 
 ## View Chain
 
@@ -155,8 +152,8 @@ and exact snapshot resource membership
 ### Engine Selection
 | Variable | Default | Description |
 |---|---|---|
-| `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | `104857600` (100 MB) | Upper bound for Lite in AUTO mode |
-| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | `10737418240` (10 GB) | Lower bound for Spark in AUTO mode |
+| `SUPERTABLE_ENGINE_ISLAND_MIN_BYTES` | `104857600` (100 MB) | Upper bound for DuckDB in AUTO mode |
+| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | `0` | Fallback only; an active Spark cluster's `min_bytes` normally drives fleet routing |
 | `SUPERTABLE_ENGINE_FRESHNESS_SEC` | `300` (5 min) | Age threshold separating fresh vs stable data |
 
 ### IslandDB / Shared Cache
@@ -165,19 +162,20 @@ and exact snapshot resource membership
 | `SUPERTABLE_ISLAND_CACHE_ENABLED` | `true` | Enable shared-cache lookup and explicit IslandDB localization |
 | `SUPERTABLE_ISLAND_CACHE_DIR` | DuckDB cache root / app home | Application-owned Parquet cache root |
 | `SUPERTABLE_ISLAND_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | Hard admission/eviction byte cap |
-| `SUPERTABLE_ISLAND_CACHE_TTL_SEC` | `86400` | Idle entry TTL |
+| `SUPERTABLE_ISLAND_CACHE_TTL_SEC` | `0` | Idle entry TTL; `0` keeps immutable objects until capacity pressure/corruption |
 | `SUPERTABLE_ISLAND_CACHE_WORKERS` | `4` | Concurrent bounded downloads per query |
-| `SUPERTABLE_ISLAND_AUTO_ENABLED` | `false` | Allow supported, resource-bounded queries to use IslandDB in AUTO |
+| `SUPERTABLE_ISLAND_AUTO_ENABLED` | `true` | Allow supported, resource-admitted queries to use IslandDB in AUTO |
 | `SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED` | `true` | Cache sealed Parquet footer/column byte ranges instead of cold whole objects |
 | `SUPERTABLE_ISLAND_RANGE_CACHE_DIR` | Island cache sibling | Persistent range-cache root |
 | `SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES` | `20 GiB` | Hard range-cache capacity |
-| `SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC` | `86400` | Idle range TTL |
+| `SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC` | `0` | Idle range TTL; `0` keeps immutable ranges until capacity/corruption rotation |
 | `SUPERTABLE_ISLAND_MEMORY_FRACTION` | `0.60` | Per-query fraction of cgroup-available memory |
 | `SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION` | `0.80` | Aggregate native-query reservation ceiling |
 | `SUPERTABLE_ISLAND_MAX_MEMORY_BYTES` | `0` (auto) | Optional absolute native memory ceiling |
 | `SUPERTABLE_ISLAND_MAX_RESULT_BYTES` | `512 MiB` | Materialized result cap; larger results require Arrow streaming |
 | `SUPERTABLE_ISLAND_CPU_MAX` | `0` (auto) | Optional cap below cpuset/cpu.max capacity |
 | `SUPERTABLE_ISLAND_IO_WORKERS_MAX` | `16` | Adaptive remote range-read concurrency cap |
+| `SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC` | `300` | Cooperative wall-clock deadline checked at native batch boundaries; non-positive disables it |
 | `SUPERTABLE_ISLAND_SPILL_ENABLED` | `true` | Enable the sealed external sort/group spill subset |
 | `SUPERTABLE_ISLAND_SPILL_DIR` | `$SUPERTABLE_HOME/island_spill` | Query-private spill root |
 | `SUPERTABLE_ISLAND_SPILL_MAX_BYTES` | `64 GiB` | Hard per-query spill quota |
@@ -186,7 +184,7 @@ and exact snapshot resource membership
 ### DuckDB Configuration
 | Variable | Default | Description |
 |---|---|---|
-| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | `1GB` | DuckDB memory cap (both Lite and Pro) |
+| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | `1GB` | DuckDB memory cap (both DuckDB and IslandDB) |
 | `SUPERTABLE_DUCKDB_THREADS` | auto-derived | Explicit thread count override |
 | `SUPERTABLE_DUCKDB_IO_MULTIPLIER` | `3` | CPU × multiplier for IO threads (auto mode) |
 | `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` | DuckDB default (30s) | HTTP timeout in seconds |
@@ -222,11 +220,11 @@ and exact snapshot resource membership
 ```
 supertable/engine/
 ├── __init__.py              Package exports (Engine, Executor, PlanStats, DataEstimator)
-├── engine_enum.py           Engine enum (AUTO, DUCKDB_LITE, DUCKDB_PRO, ISLANDDB, SPARK_SQL) + dialect
+├── engine_enum.py           Engine enum (AUTO, DUCKDB, ISLANDDB, ISLANDDB, SPARK_SQL) + dialect
 ├── engine_common.py         Shared: S3 config, httpfs, view creation (reflection/RBAC/dedup/tombstone), query rewriting, connection init, augment_rbac_columns
 ├── executor.py              Engine router + auto-pick logic
-├── duckdb_lite.py           Ephemeral DuckDB executor (fire-and-forget)
-├── duckdb_pro.py            Persistent DuckDB executor (singleton, view cache, ref-counting)
+├── duckdb.py           Ephemeral DuckDB executor (fire-and-forget)
+├── duckdb_engine.py            Persistent DuckDB executor (singleton, view cache, ref-counting)
 ├── islanddb.py              Conservative native lazy-Parquet executor
 ├── file_cache.py            Shared atomic local Parquet object cache
 ├── range_cache.py           Conditional persistent Parquet byte-range cache

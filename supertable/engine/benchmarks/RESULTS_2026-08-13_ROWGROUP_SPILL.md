@@ -1,6 +1,6 @@
 # IslandDB row-group / spill implementation benchmark — 2026-08-13
 
-The production benchmark runner compared explicit `DUCKDB_LITE` with explicit
+The production benchmark runner compared explicit `DUCKDB` with explicit
 native `ISLANDDB`. DuckDB was the oracle and exact columns, pandas dtypes, row
 order, and values matched before every timed series.
 

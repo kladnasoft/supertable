@@ -243,7 +243,7 @@ def _install_reader_fakes(monkeypatch, reflection, *, resolver):
     monkeypatch.setattr(reader_module, "DataEstimator", lambda *a, **k: estimator)
 
     executor = MagicMock()
-    executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb_lite")
+    executor.execute.return_value = (pd.DataFrame({"id": [1]}), "duckdb")
     monkeypatch.setattr(reader_module, "Executor", lambda *a, **k: executor)
     monkeypatch.setattr(reader_module, "get_storage", lambda: MagicMock())
     monkeypatch.setattr(reader_module, "restrict_read_access", lambda **k: {})
@@ -285,7 +285,7 @@ def test_reader_uses_coherent_pinned_pointer_without_second_leaf_lookup(monkeypa
 
     result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.OK
     assert message is None
@@ -321,7 +321,7 @@ def test_reader_fails_closed_when_pinned_tombstone_resolution_fails(monkeypatch)
     )
     result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.ERROR
     assert result.empty
@@ -352,7 +352,7 @@ def test_object_store_bare_key_fallback_is_not_accepted_as_resolved(monkeypatch)
 
     result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.ERROR
     assert result.empty
@@ -373,7 +373,7 @@ def test_snapshot_without_tombstone_remains_backward_compatible(monkeypatch):
 
     _result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.OK
     assert message is None
@@ -398,12 +398,12 @@ def test_reader_executes_authoritative_zero_resource_reflection(monkeypatch):
         monkeypatch, reflection, resolver=lambda key: key,
     )
     executor.execute.return_value = (
-        pd.DataFrame({"id": pd.Series(dtype="int64")}), "duckdb_lite",
+        pd.DataFrame({"id": pd.Series(dtype="int64")}), "duckdb",
     )
 
     result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.OK
     assert message is None
@@ -429,7 +429,7 @@ def test_reader_rejects_pinned_pointer_with_zero_rows(monkeypatch):
 
     result, status, message = reader_module.DataReader(
         "s", "org", "SELECT * FROM t"
-    ).execute("admin", engine=Engine.DUCKDB_LITE)
+    ).execute("admin", engine=Engine.DUCKDB)
 
     assert status is reader_module.Status.ERROR
     assert result.empty

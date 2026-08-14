@@ -405,8 +405,8 @@ def share_index(org: str) -> str:
 #
 # All query-engine state lives under one ``system:engine:`` namespace: the
 # Spark Thrift cluster registry, the Spark Plug runtime registry, and the
-# DuckDB (Lite/Pro) runtime config document. Grouping them keeps every engine
-# knob the UI exposes under a single, discoverable path.
+# DuckDB runtime configuration and AUTO policy. Grouping these with the Spark
+# registries keeps every engine knob under one discoverable namespace.
 
 def engine_thrifts(org: str) -> str:
     """Spark Thrift cluster registry (HASH)."""
@@ -613,7 +613,7 @@ def pipe_pattern(org: str, sup: str, staging_name: str) -> str:
 # --- DuckDB engine config -------------------------------------------------- #
 
 def engine_duckdb(org: str) -> str:
-    """DuckDB (Lite/Pro) runtime config (STRING). Org-level system scope (global, not per-supertable).
+    """DuckDB (DuckDB/IslandDB) runtime config (STRING). Org-level system scope (global, not per-supertable).
 
     One document holds both engines' DuckDB pragmas plus the shared auto-pick
     thresholds; see :mod:`supertable.engine.engine_config`.
@@ -914,7 +914,7 @@ def parse_monitor_partition_key(key: str) -> Optional[Tuple[str, str, str]]:
 # --- AUTO routing observations -------------------------------------------- #
 
 _ROUTING_ENGINES: FrozenSet[str] = frozenset(
-    {"duckdb_lite", "duckdb_pro", "islanddb", "spark_sql"}
+    {"duckdb", "islanddb", "spark_sql"}
 )
 _WORKLOAD_SIGNATURE_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16,64}$")
 

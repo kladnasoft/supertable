@@ -466,7 +466,7 @@ def pro_table_name(
         simple_version: int,
         file_signature: str = "",
 ) -> str:
-    """Generate a deterministic Pro view name for an exact snapshot.
+    """Generate a deterministic IslandDB view name for an exact snapshot.
 
     A catalog version alone is insufficient: fail-open snapshot recovery and
     mocked/legacy catalogs can return a different file list at the same
@@ -1051,16 +1051,27 @@ def create_reflection_view_with_presign_retry(
 def rewrite_query_with_hashed_tables(
         original_sql: str,
         alias_to_table: Dict[str, str],
+        *,
+        parsed_expression: Optional[exp.Expression] = None,
 ) -> str:
-    """Replace table references in SQL with hashed physical table names."""
+    """Replace table references in SQL with hashed physical table names.
+
+    Callers that already hold the exact parsed expression may pass it to avoid
+    reparsing the same immutable SQL.  The expression is always copied before
+    rewriting, so the parser's canonical AST remains immutable and reusable by
+    capability analysis, routing, and other engines.
+    """
     if not alias_to_table:
         return original_sql
 
-    try:
-        parsed = sqlglot.parse_one(original_sql)
-    except Exception as e:
-        logger.warning(f"[duckdb] Failed to parse SQL for rewrite; using original. Error: {e}")
-        return original_sql
+    if isinstance(parsed_expression, exp.Expression):
+        parsed = parsed_expression.copy()
+    else:
+        try:
+            parsed = sqlglot.parse_one(original_sql)
+        except Exception as e:
+            logger.warning(f"[duckdb] Failed to parse SQL for rewrite; using original. Error: {e}")
+            return original_sql
 
     for table in parsed.find_all(exp.Table):
         alias_expr = table.args.get("alias")
@@ -1317,7 +1328,7 @@ def reset_pooled_duckdb_connections() -> None:
 def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     """Re-apply the session-settable DuckDB pragmas from a live engine config.
 
-    DuckDB Lite/Pro reuse a persistent connection, so settings applied once at
+    DuckDB/IslandDB reuse a persistent connection, so settings applied once at
     ``init_connection`` time would otherwise freeze for the connection's life.
     Calling this immediately before each query makes the org's engine config
     (memory limit, thread count, HTTP timeout, external file cache) take effect
@@ -1427,7 +1438,7 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
       * the external file cache is in a memory-safe state.
 
     ``cfg`` is an ``EngineRuntimeConfig`` (or None to use init defaults); the
-    connection is configured exactly like a live Lite/Pro query via
+    connection is configured exactly like a live DuckDB/IslandDB query via
     ``init_connection`` + ``apply_runtime_pragmas``.  Returns a JSON-serialisable
     report and never raises.
     """

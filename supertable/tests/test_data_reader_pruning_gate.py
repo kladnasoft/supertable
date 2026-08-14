@@ -27,7 +27,7 @@ def test_auto_and_spark_drop_timezone_dependent_timestamp_constraints():
 
     # Explicit DuckDB compares the same naïve footer/literal representation.
     assert reader_mod._engine_safe_predicate_constraints(
-        constraints, reader_mod.engine.DUCKDB_LITE,
+        constraints, reader_mod.engine.DUCKDB,
     ) is constraints
 
     # AUTO can route to Spark after estimation; both modes keep the exact
@@ -49,7 +49,7 @@ def test_auto_and_spark_join_pruning_uses_only_common_exact_lane():
         reader_mod.engine.SPARK_SQL,
     ) == {"numeric"}
     assert reader_mod._engine_safe_join_pruning_lanes(
-        reader_mod.engine.DUCKDB_LITE,
+        reader_mod.engine.DUCKDB,
     ) == {"numeric", "date", "timestamp", "timestamptz"}
 
 
@@ -143,13 +143,13 @@ def test_disabled_pruning_skips_predicate_and_join_analysis(monkeypatch):
 
     expected = pd.DataFrame({"id": [1]})
     executor = MagicMock(name="executor")
-    executor.execute.return_value = (expected, "duckdb_lite")
+    executor.execute.return_value = (expected, "duckdb")
     executor_cls = MagicMock(return_value=executor)
     monkeypatch.setattr(reader_mod, "Executor", executor_cls)
 
     result, status, message = reader_mod.DataReader(
         "s", "o", "SELECT 1",
-    ).execute("admin", engine=reader_mod.engine.DUCKDB_LITE)
+    ).execute("admin", engine=reader_mod.engine.DUCKDB)
 
     pd.testing.assert_frame_equal(result, expected)
     assert status is reader_mod.Status.OK

@@ -94,10 +94,10 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | int | `104857600` (100 MB) | Max data size for DuckDB Lite |
-| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | int | `10737418240` (10 GB) | Min data size for Spark routing |
+| `SUPERTABLE_ENGINE_ISLAND_MIN_BYTES` | int | `104857600` (100 MiB) | IslandDB crossover hint for AUTO cost routing |
+| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | int | `0` | Spark fallback floor; active fleet `min_bytes` normally wins |
 | `SUPERTABLE_ENGINE_FRESHNESS_SEC` | int | `300` (5 min) | Freshness threshold for engine selection |
-| `SUPERTABLE_DEFAULT_ENGINE` | str | `AUTO` | Engine override: `AUTO`, `LITE`, `PRO`, `SPARK` |
+| `SUPERTABLE_DEFAULT_ENGINE` | str | `AUTO` | Engine override: `AUTO`, `DUCKDB`, `ISLANDDB`, `SPARK_SQL` |
 
 ### Spark Engine
 

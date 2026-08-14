@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
+import stat
 import threading
 import time
 import uuid
@@ -28,9 +30,11 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
+import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pads
 import pyarrow.fs as pafs
 import pyarrow.parquet as papq
@@ -40,7 +44,12 @@ from sqlglot import exp
 from supertable.config.defaults import logger
 from supertable.config.homedir import get_app_home
 from supertable.config.settings import settings
-from supertable.data_classes import Reflection, SuperSnapshot
+from supertable.data_classes import (
+    IntegerDomainBound,
+    Reflection,
+    ResourceObjectSeal,
+    SuperSnapshot,
+)
 from supertable.engine.engine_common import (
     ROWID_COL,
     SOURCE_FILE_COL,
@@ -49,8 +58,8 @@ from supertable.engine.engine_common import (
 )
 from supertable.processing import (
     TOMBSTONE_FILE_COL,
+    load_tombstone,
     parquet_footer_sha256,
-    validate_tombstone_frame,
 )
 from supertable.engine.island_resources import (
     ArrowBatchStream,
@@ -66,14 +75,23 @@ from supertable.engine.island_resources import (
 from supertable.engine.island_spill import (
     AggregateSpec,
     IslandSpillError,
+    SpillDeadlineExceeded,
     SpillSession,
     external_group_aggregate,
     external_sort,
 )
+from supertable.storage.storage_interface import ObjectMetadata
+
+
+_monotonic = time.monotonic
 
 
 class IslandUnsupportedError(RuntimeError):
     """The query is outside IslandDB's proven-equivalent native subset."""
+
+
+class IslandExecutionTimeout(IslandUnsupportedError, TimeoutError):
+    """IslandDB exceeded its cooperative wall-clock execution deadline."""
 
 
 class IslandIntegrityError(RuntimeError):
@@ -88,6 +106,22 @@ class IslandCapability:
     def require(self) -> None:
         if not self.supported:
             raise IslandUnsupportedError("; ".join(self.reasons))
+
+
+@dataclass(frozen=True)
+class IslandPreparedQuery:
+    """Pure, reusable validation and resource decision for one query.
+
+    Executor prepares this before any optional cache localization.  Localizing
+    immutable objects changes only physical paths, so the capability and byte
+    budgets remain valid for the execution reflection.  Keeping this object
+    explicit prevents the materialized facade from repeating the same semantic
+    walk and resource plan inside ``execute_stream``.
+    """
+
+    capability: IslandCapability
+    resource_plan: QueryResourcePlan
+    streaming_result: bool
 
 
 @dataclass
@@ -218,13 +252,271 @@ class _IslandTelemetry:
         }
 
 
+class _QueryRangeMetrics:
+    """Concurrency-safe counters owned by exactly one IslandDB query."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: Dict[str, int] = {}
+
+    def merge(self, metrics: object) -> None:
+        try:
+            values = metrics.as_dict()
+        except Exception:
+            return
+        with self._lock:
+            for name, value in values.items():
+                self._values[str(name)] = (
+                    self._values.get(str(name), 0) + max(0, int(value))
+                )
+
+    def as_dict(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._values)
+
+
 _GOVERNOR_LOCK = threading.Lock()
 _GOVERNORS: Dict[Tuple[object, ...], ResourceGovernor] = {}
+# Polars and Arrow pools are process-global, while governors are deliberately
+# policy/spill-root scoped.  One cross-policy slot prevents two otherwise
+# independent governors from concurrently admitting scans that can each use
+# the complete native pool.
+_ISLAND_EXECUTION_SLOT = threading.BoundedSemaphore(1)
 _ARROW_POOL_LOCK = threading.Lock()
+_RANGE_CACHE_REGISTRY_LOCK = threading.Lock()
+_RANGE_CACHE_REGISTRY: "OrderedDict[Tuple[object, ...], object]" = OrderedDict()
+_RANGE_CACHE_REGISTRY_MAX_ENTRIES = 16
 _ROWID_PROOF_LOCK = threading.Lock()
-_ROWID_PROOFS: "OrderedDict[Tuple[object, ...], float]" = OrderedDict()
+_ROWID_PROOFS: "OrderedDict[Tuple[object, ...], bool]" = OrderedDict()
 _ROWID_PROOF_MAX_ENTRIES = 4096
-_ROWID_PROOF_TTL_SEC = 24 * 60 * 60
+
+# Local Parquet objects are immutable once published, but constructing a native
+# scan currently reopens every footer merely to re-prove the same physical
+# schema.  Cache only the validated *description* of a scan -- paths, identities,
+# schema and filesystem seals -- never decoded pages, frames, or query results.
+# Both limits are hard process bounds and deliberately module-local so changing
+# the public settings/Redis schema is not required for this optimization.
+_LOCAL_SCAN_PLAN_MAX_ENTRIES = 64
+_LOCAL_SCAN_PLAN_MAX_BYTES = 64 * 1024 * 1024
+_LOCAL_SCAN_PLAN_LOCK = threading.Lock()
+
+# On small, narrow local scans Polars' automatic strategy can choose a
+# pre-filtered row-group pipeline whose mask/worker state costs more than the
+# compressed pages themselves.  Column-parallel decoding avoids that transient
+# state for a bounded middle-width projection.  Keep the gate deliberately
+# narrow: broader scans and very narrow/wide projections retain Polars' adaptive
+# strategy, where row-group parallelism can be materially faster.
+_LOCAL_COLUMN_PARALLEL_MAX_SCAN_BYTES = 32 * 1024 * 1024
+_LOCAL_COLUMN_PARALLEL_MIN_COLUMNS = 4
+_LOCAL_COLUMN_PARALLEL_MAX_COLUMNS = 8
+
+
+@dataclass(frozen=True)
+class _LocalFileSeal:
+    source_path: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class _LocalScanPlan:
+    local_paths: Tuple[str, ...]
+    local_to_resource: Tuple[Tuple[str, str], ...]
+    physical_schema: pa.Schema
+    file_seals: Tuple[_LocalFileSeal, ...]
+    weight_bytes: int
+
+
+@dataclass
+class _LocalScanPlanBuild:
+    completed: threading.Event = field(default_factory=threading.Event)
+
+
+_LOCAL_SCAN_PLANS: "OrderedDict[str, _LocalScanPlan]" = OrderedDict()
+_LOCAL_SCAN_PLAN_BUILDS: Dict[str, _LocalScanPlanBuild] = {}
+_LOCAL_SCAN_PLAN_BYTES = 0
+
+
+def _trim_local_scan_plans_locked() -> None:
+    """Enforce both cache bounds while ``_LOCAL_SCAN_PLAN_LOCK`` is held."""
+    global _LOCAL_SCAN_PLAN_BYTES
+    max_entries = max(0, int(_LOCAL_SCAN_PLAN_MAX_ENTRIES))
+    max_bytes = max(0, int(_LOCAL_SCAN_PLAN_MAX_BYTES))
+    while _LOCAL_SCAN_PLANS and (
+        len(_LOCAL_SCAN_PLANS) > max_entries
+        or _LOCAL_SCAN_PLAN_BYTES > max_bytes
+    ):
+        _key, plan = _LOCAL_SCAN_PLANS.popitem(last=False)
+        _LOCAL_SCAN_PLAN_BYTES = max(
+            0, _LOCAL_SCAN_PLAN_BYTES - int(plan.weight_bytes),
+        )
+
+
+def _clear_local_scan_plan_cache() -> None:
+    """Test/connection-reset hook; active builders remain safe and bounded."""
+    global _LOCAL_SCAN_PLAN_BYTES
+    with _LOCAL_SCAN_PLAN_LOCK:
+        _LOCAL_SCAN_PLANS.clear()
+        _LOCAL_SCAN_PLAN_BYTES = 0
+
+
+def _clear_range_cache_registry() -> None:
+    """Test hook for the bounded process-local RangeCache registry."""
+    with _RANGE_CACHE_REGISTRY_LOCK:
+        _RANGE_CACHE_REGISTRY.clear()
+
+
+def _local_file_seal(source_path: str) -> Optional[_LocalFileSeal]:
+    """Return a cheap mutation seal for one local path, or ``None`` on change."""
+    try:
+        info = os.stat(source_path, follow_symlinks=True)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return _LocalFileSeal(
+        source_path=source_path,
+        device=int(info.st_dev),
+        inode=int(info.st_ino),
+        size=int(info.st_size),
+        mtime_ns=int(info.st_mtime_ns),
+        ctime_ns=int(info.st_ctime_ns),
+    )
+
+
+def _local_scan_plan_is_current(plan: _LocalScanPlan) -> bool:
+    """Detect a broken immutability contract without reopening any footer."""
+    for expected in plan.file_seals:
+        current = _local_file_seal(expected.source_path)
+        if current != expected:
+            return False
+    return True
+
+
+def _local_object_metadata(seal: _LocalFileSeal) -> ObjectMetadata:
+    """Translate one validated filesystem seal without another syscall."""
+    return ObjectMetadata(
+        size=int(seal.size),
+        version=f"{seal.device}:{seal.inode}:{seal.ctime_ns}",
+        last_modified_ns=int(seal.mtime_ns),
+    )
+
+
+def _snapshot_expected_object_metadata(
+    snapshot: SuperSnapshot,
+) -> Dict[str, ObjectMetadata]:
+    """Convert only exact, survivor-bound snapshot object seals.
+
+    This is deliberately defensive even though DataEstimator already parses
+    the catalog: tests and integrations may construct ``SuperSnapshot``
+    directly. A foreign key, malformed type, or size disagreement is ignored so
+    RangeCache performs its normal provider stat instead.
+    """
+    keys = list(getattr(snapshot, "resource_keys", None) or [])
+    sizes = list(getattr(snapshot, "resource_sizes", None) or [])
+    seals = getattr(snapshot, "resource_object_seals", None)
+    if not isinstance(seals, dict):
+        return {}
+    declared_sizes = (
+        dict(zip(keys, sizes)) if sizes and len(sizes) == len(keys) else {}
+    )
+    expected: Dict[str, ObjectMetadata] = {}
+    for key in keys:
+        seal = seals.get(key)
+        if not isinstance(seal, ResourceObjectSeal):
+            continue
+        declared = declared_sizes.get(key)
+        if declared is not None and (
+            not isinstance(declared, int)
+            or isinstance(declared, bool)
+            or declared <= 0
+            or seal.size != declared
+        ):
+            continue
+        metadata = ObjectMetadata(
+            size=seal.size,
+            version=seal.version,
+            etag=seal.etag,
+            last_modified_ns=seal.last_modified_ns,
+            checksum_sha256=seal.checksum_sha256,
+        )
+        if metadata.identity_token():
+            expected[str(key)] = metadata
+    return expected
+
+
+def _get_or_reserve_local_scan_plan(
+    key: Optional[str],
+) -> Tuple[Optional[_LocalScanPlan], Optional[_LocalScanPlanBuild]]:
+    """Return a current hit or reserve one single-flight cold validation."""
+    if not key:
+        return None, None
+    while True:
+        wait_for: Optional[_LocalScanPlanBuild] = None
+        with _LOCAL_SCAN_PLAN_LOCK:
+            _trim_local_scan_plans_locked()
+            plan = _LOCAL_SCAN_PLANS.get(key)
+            if plan is not None:
+                _LOCAL_SCAN_PLANS.move_to_end(key)
+            else:
+                wait_for = _LOCAL_SCAN_PLAN_BUILDS.get(key)
+                if wait_for is None:
+                    build = _LocalScanPlanBuild()
+                    _LOCAL_SCAN_PLAN_BUILDS[key] = build
+                    return None, build
+        if plan is not None:
+            # Thousands of stat calls are still two orders of magnitude cheaper
+            # than reopening/converting thousands of Parquet schemas, and catch
+            # deletion, replacement, symlink retargeting and same-size rewrites.
+            if _local_scan_plan_is_current(plan):
+                return plan, None
+            with _LOCAL_SCAN_PLAN_LOCK:
+                current = _LOCAL_SCAN_PLANS.get(key)
+                if current is plan:
+                    global _LOCAL_SCAN_PLAN_BYTES
+                    _LOCAL_SCAN_PLANS.pop(key, None)
+                    _LOCAL_SCAN_PLAN_BYTES = max(
+                        0, _LOCAL_SCAN_PLAN_BYTES - int(plan.weight_bytes),
+                    )
+            continue
+        # A different query is validating the same immutable reflection. Avoid
+        # duplicate footer storms, then retry the cache under the lock. A failed
+        # builder publishes nothing, so one waiter safely becomes the next owner.
+        assert wait_for is not None
+        wait_for.completed.wait()
+
+
+def _finish_local_scan_plan_build(
+    key: Optional[str],
+    build: Optional[_LocalScanPlanBuild],
+    plan: Optional[_LocalScanPlan],
+) -> None:
+    """Publish a fully validated plan atomically and wake all waiters."""
+    if not key or build is None:
+        return
+    global _LOCAL_SCAN_PLAN_BYTES
+    with _LOCAL_SCAN_PLAN_LOCK:
+        owner = _LOCAL_SCAN_PLAN_BUILDS.get(key)
+        if owner is build:
+            if (
+                plan is not None
+                and _LOCAL_SCAN_PLAN_MAX_ENTRIES > 0
+                and _LOCAL_SCAN_PLAN_MAX_BYTES > 0
+                and plan.weight_bytes <= _LOCAL_SCAN_PLAN_MAX_BYTES
+            ):
+                old = _LOCAL_SCAN_PLANS.pop(key, None)
+                if old is not None:
+                    _LOCAL_SCAN_PLAN_BYTES = max(
+                        0, _LOCAL_SCAN_PLAN_BYTES - int(old.weight_bytes),
+                    )
+                _LOCAL_SCAN_PLANS[key] = plan
+                _LOCAL_SCAN_PLAN_BYTES += int(plan.weight_bytes)
+                _trim_local_scan_plans_locked()
+            _LOCAL_SCAN_PLAN_BUILDS.pop(key, None)
+            build.completed.set()
 
 
 class _IslandFileSystemHandler(pafs.FileSystemHandler):
@@ -266,7 +558,9 @@ class _IslandFileSystemHandler(pafs.FileSystemHandler):
         if cache is None:
             raise FileNotFoundError(str(path))
         reader = cache.open(
-            str(entry["raw_key"]), expected=entry.get("metadata"),
+            str(entry["raw_key"]),
+            expected=entry.get("metadata"),
+            metrics_sink=entry.get("metrics_sink"),
         )
         return pa.PythonFile(reader, mode="r")
 
@@ -310,6 +604,10 @@ _NUMERIC_TYPE_NAMES = frozenset({
 _OUTPUT_SAFE_TYPE_NAMES = _NUMERIC_TYPE_NAMES | frozenset({
     "bool", "boolean", "string", "utf8",
 })
+_BINARY_EXTREMA_TYPE_NAME = "binary"
+_DATETIME_US_EXTREMA_TYPE_NAME = (
+    "datetime(time_unit='us', time_zone=none)"
+)
 
 
 def _local_path(path: str) -> str:
@@ -353,6 +651,35 @@ def _is_output_safe_type(type_name: object) -> bool:
     return _normalized_type(type_name) in _OUTPUT_SAFE_TYPE_NAMES
 
 
+def _is_stream_output_safe_type(type_name: object) -> bool:
+    """Return whether one raw column has an exact public Arrow contract.
+
+    Binary and timezone-free microsecond timestamps are deliberately absent
+    from ``_is_output_safe_type`` because DuckDB ``fetchdf`` and Polars pandas
+    conversion expose different Python/pandas representations.  A one-shot
+    Arrow stream has no such conversion: both values have an exact physical
+    representation which the spill result normalises below.  This helper is
+    intentionally *only* consulted for direct projected output; predicates,
+    grouping, ordering, joins, and the materialised facade retain their
+    narrower differential gates.
+    """
+    return bool(
+        _is_output_safe_type(type_name)
+        or _is_binary_extrema_type(type_name)
+        or _is_datetime_us_extrema_type(type_name)
+    )
+
+
+def _is_binary_extrema_type(type_name: object) -> bool:
+    """Return whether bytewise extrema parity is certified for this type."""
+    return _normalized_type(type_name) == _BINARY_EXTREMA_TYPE_NAME
+
+
+def _is_datetime_us_extrema_type(type_name: object) -> bool:
+    """Accept only the exact timezone-free microsecond timestamp contract."""
+    return _normalized_type(type_name) == _DATETIME_US_EXTREMA_TYPE_NAME
+
+
 def _canonical_physical_type(type_name: object) -> str:
     """Canonicalise only type spellings known to describe one physical type."""
     normalized = _normalized_type(type_name)
@@ -363,6 +690,95 @@ def _canonical_physical_type(type_name: object) -> str:
         "boolean": "bool", "utf8": "string",
     }
     return aliases.get(normalized, normalized)
+
+
+def _fixed_size_binary_to_binary(
+    column: pa.Array,
+    *,
+    offsets_cache: Optional[Dict[Tuple[int, int], pa.Buffer]] = None,
+) -> pa.BinaryArray:
+    """Expose bounded fixed-width bytes as Arrow Binary without copying data.
+
+    Arrow Binary needs an int32 offset for every value, while
+    FixedSizeBinary stores only one contiguous value buffer.  Output batches
+    are already bounded by the query resource plan, so a small offsets buffer
+    is sufficient; the potentially large value buffer is sliced and retained
+    zero-copy.  A per-batch cache lets equal-width projected columns share the
+    same immutable offsets buffer.
+    """
+    if not isinstance(column, pa.Array) or not pa.types.is_fixed_size_binary(
+        column.type
+    ):
+        raise TypeError("expected a FixedSizeBinary Arrow array")
+
+    length = len(column)
+    byte_width = int(column.type.byte_width)
+    value_bytes = length * byte_width
+    int32_max = int(np.iinfo(np.int32).max)
+    if length > int32_max or value_bytes > int32_max:
+        raise OverflowError(
+            "fixed-size binary output exceeds Arrow Binary's int32 bounds"
+        )
+
+    cache_key = (length, byte_width)
+    offsets_buffer = (
+        offsets_cache.get(cache_key) if offsets_cache is not None else None
+    )
+    expected_offsets_bytes = (length + 1) * np.dtype(np.int32).itemsize
+    if offsets_buffer is None:
+        offsets = np.arange(length + 1, dtype=np.int32)
+        if byte_width != 1:
+            offsets *= byte_width
+        offsets.setflags(write=False)
+        offsets_buffer = pa.py_buffer(offsets)
+        if offsets_cache is not None:
+            offsets_cache[cache_key] = offsets_buffer
+    elif offsets_buffer.size != expected_offsets_bytes:
+        # The cache is query-private and populated only above.  Keep this
+        # assertion at the consumption boundary so future refactors cannot
+        # silently construct an invalid public Arrow array.
+        raise AssertionError("cached fixed-binary offsets have invalid size")
+
+    validity_source, data_source = column.buffers()
+    data_start = int(column.offset) * byte_width
+    data_end = data_start + value_bytes
+    if data_source is None:
+        if value_bytes:
+            raise ValueError("fixed-size binary array has no value buffer")
+        data_buffer = pa.py_buffer(b"")
+    else:
+        if data_start < 0 or data_end > data_source.size:
+            raise ValueError("fixed-size binary value buffer is truncated")
+        data_buffer = data_source.slice(data_start, value_bytes)
+
+    null_count = int(column.null_count)
+    validity_buffer = None
+    if null_count:
+        if validity_source is None:
+            raise ValueError("fixed-size binary null bitmap is missing")
+        # Array.from_buffers below has offset zero.  Reuse a byte-aligned
+        # source bitmap when possible; otherwise Arrow's native is_valid
+        # kernel cheaply rebases only the one-bit-per-row validity data.
+        bit_offset = int(column.offset)
+        bitmap_bytes = (length + 7) // 8
+        if bit_offset % 8 == 0:
+            bitmap_start = bit_offset // 8
+            if bitmap_start + bitmap_bytes > validity_source.size:
+                raise ValueError("fixed-size binary null bitmap is truncated")
+            validity_buffer = validity_source.slice(
+                bitmap_start, bitmap_bytes,
+            )
+        else:
+            validity_buffer = column.is_valid().buffers()[1]
+            if validity_buffer is None or validity_buffer.size < bitmap_bytes:
+                raise ValueError("could not rebase fixed-size binary validity")
+
+    return pa.Array.from_buffers(
+        pa.binary(),
+        length,
+        [validity_buffer, offsets_buffer, data_buffer],
+        null_count=null_count,
+    )
 
 
 class IslandDB:
@@ -393,14 +809,29 @@ class IslandDB:
                 f"{id(storage)}"
             ).encode("utf-8")
         self._proof_namespace = hashlib.sha256(encoded_namespace).hexdigest()
+        # Cache identities must include organization *and* authorization scope;
+        # raw object keys alone can collide across buckets or principals. Reuse
+        # FileCache's hardened namespace calculation without touching disk.
+        try:
+            from supertable.engine.file_cache import FileCache
+            cache_identity = FileCache(
+                storage, self.organization, max_bytes=0, workers=1,
+            )
+            self._artifact_cache_namespace = (
+                f"{cache_identity._organization_hash}:"
+                f"{cache_identity._storage_hash}"
+            )
+        except Exception:
+            self._artifact_cache_namespace = hashlib.sha256(
+                f"{self.organization}\0{self._proof_namespace}\0{id(storage)}".encode()
+            ).hexdigest()
         self.range_cache = range_cache
         self.last_profile = IslandProfile()
         self._resources = self._detect_resources()
         self._policy = self._resource_policy()
-        # Arrow owns a process-global CPU/I/O pool. Bound it to the container's
-        # cgroup/affinity capacity once; individual plans then reserve a subset
-        # as an admission weight while fragmented scans can use every available
-        # core when the planner decides the work is large enough.
+        # Arrow owns process-global CPU/I/O pools. Bound them to the container's
+        # cgroup/affinity capacity; plans account for their full possible widths
+        # and the process slot serializes scans across differing policies.
         with _ARROW_POOL_LOCK:
             pa.set_cpu_count(max(1, self._resources.cpu_count))
             pa.set_io_thread_count(max(
@@ -441,7 +872,6 @@ class IslandDB:
                 # part of the stable sharing key.  Never retain the first
                 # process sample as the governor's capacity indefinitely.
                 self._governor.refresh_resources(self._resources)
-        self._query_range_start: Optional[object] = None
 
     @staticmethod
     def _detect_resources() -> ContainerResources:
@@ -505,18 +935,67 @@ class IslandDB:
                 self.range_cache = False
                 return None
             from supertable.engine.range_cache import RangeCache
-            self.range_cache = RangeCache(
+            configured_root = (
+                settings.SUPERTABLE_ISLAND_RANGE_CACHE_DIR
+                or settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+                or os.path.join(get_app_home(), "duckdb_cache")
+            )
+            resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(
+                str(configured_root),
+            )))
+            registry_key = (
+                self.organization,
+                self._artifact_cache_namespace,
+                resolved_root,
+                max(0, int(settings.SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES)),
+                max(0.0, float(settings.SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC)),
+                True,  # RangeCache.allow_cache_bypass
+            )
+            with _RANGE_CACHE_REGISTRY_LOCK:
+                shared = _RANGE_CACHE_REGISTRY.get(registry_key)
+                if shared is not None:
+                    _RANGE_CACHE_REGISTRY.move_to_end(registry_key)
+                    self.range_cache = shared
+                    return shared
+            candidate = RangeCache(
                 self.storage,
                 self.organization,
                 root=(settings.SUPERTABLE_ISLAND_RANGE_CACHE_DIR or None),
                 max_bytes=settings.SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES,
                 ttl=settings.SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC,
             )
+            with _RANGE_CACHE_REGISTRY_LOCK:
+                shared = _RANGE_CACHE_REGISTRY.get(registry_key)
+                if shared is None:
+                    shared = candidate
+                    _RANGE_CACHE_REGISTRY[registry_key] = shared
+                    while (
+                        len(_RANGE_CACHE_REGISTRY)
+                        > max(0, int(_RANGE_CACHE_REGISTRY_MAX_ENTRIES))
+                    ):
+                        _RANGE_CACHE_REGISTRY.popitem(last=False)
+                else:
+                    _RANGE_CACHE_REGISTRY.move_to_end(registry_key)
+                self.range_cache = shared
         return self.range_cache
 
     # ------------------------------------------------------------------
     # Capability boundary
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _query_root(parser) -> exp.Expression:
+        """Return SQLParser's canonical AST without mutating it.
+
+        ``SQLParser`` has already parsed and security-checked the query before
+        engine selection.  Reusing that tree removes several complete sqlglot
+        parses from every IslandDB query.  Lightweight/custom parser objects
+        retain the old parse fallback.
+        """
+        parsed = getattr(parser, "_parsed", None)
+        if isinstance(parsed, exp.Expression):
+            return parsed
+        return sqlglot.parse_one(parser.original_query, read="duckdb")
 
     @staticmethod
     def _snapshots(reflection: Reflection) -> Dict[Tuple[str, str], SuperSnapshot]:
@@ -571,6 +1050,59 @@ class IslandDB:
         return required
 
     @staticmethod
+    def _local_scan_parallel_strategy(
+        reflection: Reflection,
+        required_columns: Optional[set[str]],
+    ) -> str:
+        """Choose a memory-lean scan strategy only inside a measured safe gate.
+
+        This is a performance hint, never a pruning or correctness decision.
+        An incomplete byte estimate, a star projection, or a shape outside the
+        benchmark-backed middle-width window therefore leaves Polars on
+        ``auto``.  The strategy is applied only by the local native scanner;
+        remote Arrow fragments keep their exact sealed row-group ranges.
+        """
+        # A deletion vector adds source-identity/rowid columns, an eager DV
+        # frame, a validation pass and an anti-join hash table.  The narrow
+        # column-parallel benchmark gate did not cover that materially different
+        # pipeline, so it must not override Polars' adaptive strategy.  Treat a
+        # malformed optional mapping conservatively too; correctness validation
+        # later still decides whether execution may proceed.
+        try:
+            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+            if not isinstance(tombstone_views, dict) or any(
+                getattr(tombstone, "tombstone_path", None)
+                for tombstone in tombstone_views.values()
+            ):
+                return "auto"
+        except Exception:
+            return "auto"
+        if required_columns is None:
+            return "auto"
+        scan_bytes = max(
+            0,
+            int(
+                getattr(reflection, "row_group_scan_bytes", 0)
+                or getattr(reflection, "reflection_bytes", 0)
+                or 0
+            ),
+        )
+        if not bool(
+            getattr(reflection, "row_group_scan_bytes_complete", False)
+        ):
+            return "auto"
+        if not 0 < scan_bytes <= _LOCAL_COLUMN_PARALLEL_MAX_SCAN_BYTES:
+            return "auto"
+        column_count = len(required_columns)
+        if not (
+            _LOCAL_COLUMN_PARALLEL_MIN_COLUMNS
+            <= column_count
+            <= _LOCAL_COLUMN_PARALLEL_MAX_COLUMNS
+        ):
+            return "auto"
+        return "columns"
+
+    @staticmethod
     def _resolve_column_type(
         column: exp.Column,
         aliases: Dict[str, SuperSnapshot],
@@ -598,6 +1130,144 @@ class IslandDB:
                     matches.append(str(value))
                     break
         return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _resolve_column_snapshot(
+        column: exp.Column,
+        aliases: Dict[str, SuperSnapshot],
+    ) -> Optional[SuperSnapshot]:
+        """Resolve one already-validated column to exactly one snapshot."""
+        wanted = column.name.casefold()
+        if column.table:
+            snapshot = aliases.get(column.table.casefold())
+            if snapshot is None:
+                return None
+            matches = [
+                name for name in (snapshot.column_types or {})
+                if str(name).casefold() == wanted
+            ]
+            return snapshot if len(matches) == 1 else None
+
+        matches: List[SuperSnapshot] = []
+        seen: set[int] = set()
+        for snapshot in aliases.values():
+            if id(snapshot) in seen:
+                continue
+            seen.add(id(snapshot))
+            names = [
+                name for name in (snapshot.column_types or {})
+                if str(name).casefold() == wanted
+            ]
+            if len(names) == 1:
+                matches.append(snapshot)
+        return matches[0] if len(matches) == 1 else None
+
+    @classmethod
+    def _sealed_integer_column_domain(
+        cls,
+        column: exp.Column,
+        aliases: Dict[str, SuperSnapshot],
+    ) -> Optional[IntegerDomainBound]:
+        """Resolve one direct integer column to complete sealed extrema.
+
+        The estimator publishes these bounds only after validating every
+        selected row group's snapshot-pinned statistics.  Consumers still use
+        them solely for conservative resource/partition planning: missing or
+        ambiguous evidence disables the optimization, and execution never
+        prunes rows from this metadata.
+        """
+        if _numeric_family(cls._resolve_column_type(column, aliases)) != "integer":
+            return None
+        snapshot = cls._resolve_column_snapshot(column, aliases)
+        if snapshot is None or not bool(
+            getattr(snapshot, "candidate_rows_complete", False)
+        ):
+            return None
+        try:
+            domains = getattr(snapshot, "integer_domain_bounds", None)
+            if not isinstance(domains, dict):
+                return None
+            matches = [
+                bound for name, bound in domains.items()
+                if isinstance(name, str)
+                and name.casefold() == column.name.casefold()
+            ]
+            if len(matches) != 1 or not isinstance(matches[0], IntegerDomainBound):
+                return None
+            return matches[0]
+        except Exception:
+            return None
+
+    @classmethod
+    def _sealed_integer_group_cardinality(
+        cls,
+        root: exp.Select,
+        aliases: Dict[str, SuperSnapshot],
+    ) -> Optional[int]:
+        """Return a complete upper bound for one direct integer GROUP key.
+
+        Multi-key/expression groups and every missing or malformed proof retain
+        the general external plan.  The bound is capped by the exact selected
+        physical row count; tombstones/RBAC/WHERE can only reduce it.
+        """
+        group = root.args.get("group")
+        if not isinstance(group, exp.Group) or len(group.expressions) != 1:
+            return None
+        column = group.expressions[0]
+        if not isinstance(column, exp.Column):
+            return None
+        bound = cls._sealed_integer_column_domain(column, aliases)
+        if bound is None:
+            return None
+        snapshot = cls._resolve_column_snapshot(column, aliases)
+        if snapshot is None:
+            return None
+        try:
+            rows = getattr(snapshot, "candidate_rows", None)
+            if (
+                not isinstance(rows, int)
+                or isinstance(rows, bool)
+                or rows < 0
+            ):
+                return None
+            cardinality = bound.cardinality_upper_bound
+            if cardinality < 0:
+                return None
+            return min(cardinality, rows)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _binary_value_bound(
+        column: exp.Column,
+        aliases: Dict[str, SuperSnapshot],
+    ) -> Optional[int]:
+        """Return one exact, snapshot-wide Binary value-width seal.
+
+        Bounds are admission metadata, not semantic authority. Missing,
+        differently-cased, Boolean, negative, or duplicate keys are unknown and
+        therefore make the resource estimate incomplete.
+        """
+        snapshot = IslandDB._resolve_column_snapshot(column, aliases)
+        if snapshot is None:
+            return None
+        raw = getattr(snapshot, "column_max_value_bytes", None)
+        if not isinstance(raw, dict):
+            return None
+        matches = [
+            (name, value) for name, value in raw.items()
+            if str(name).casefold() == column.name.casefold()
+        ]
+        if len(matches) != 1 or str(matches[0][0]) != column.name:
+            return None
+        value = matches[0][1]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            return None
+        return int(value)
 
     @staticmethod
     def _column_spelling_is_exact(
@@ -638,7 +1308,13 @@ class IslandDB:
             )
         return len(matches) == 1 and matches[0] == column.name
 
-    def can_execute(self, reflection: Reflection, parser) -> IslandCapability:
+    def can_execute(
+        self,
+        reflection: Reflection,
+        parser,
+        *,
+        streaming_result: bool = False,
+    ) -> IslandCapability:
         reasons: List[str] = []
         if getattr(reflection, "rbac_views", None):
             reasons.append("RBAC views are not yet native in IslandDB")
@@ -646,7 +1322,7 @@ class IslandDB:
             reasons.append("typed empty snapshots use DuckDB until native type parity is complete")
 
         try:
-            root = sqlglot.parse_one(parser.original_query, read="duckdb")
+            root = self._query_root(parser)
         except Exception as exc:
             return IslandCapability(False, (f"SQL parse failed: {exc}",))
         if not isinstance(root, exp.Select):
@@ -849,10 +1525,20 @@ class IslandDB:
                 type_name = self._resolve_column_type(core, aliases)
                 if type_name is None:
                     reasons.append(f"cannot prove type of projected column {core.sql()}")
-                elif not _is_output_safe_type(type_name):
+                elif not (
+                    _is_output_safe_type(type_name)
+                    or (
+                        streaming_result
+                        and _is_stream_output_safe_type(type_name)
+                    )
+                ):
                     reasons.append(
                         f"projected column {core.sql()} type {type_name} "
-                        "has unproven pandas parity"
+                        + (
+                            "has unproven Arrow-stream parity"
+                            if streaming_result
+                            else "has unproven pandas parity"
+                        )
                     )
 
         semantic_roots: List[exp.Expression] = []
@@ -864,9 +1550,11 @@ class IslandDB:
             on = join.args.get("on")
             if isinstance(on, exp.Expression):
                 semantic_roots.append(on)
-        semantic_roots.extend(
-            list(root.find_all(exp.Sum, exp.Avg, exp.Min, exp.Max))
-        )
+        # MIN/MAX have one additional, tightly fenced semantic lane below:
+        # direct Binary values use unsigned lexicographic byte order and exact
+        # Datetime(us, no timezone) values use integer microsecond order.  Keep
+        # every other operator on the numeric-only path here.
+        semantic_roots.extend(list(root.find_all(exp.Sum, exp.Avg)))
 
         dangerous_columns: List[exp.Column] = []
         for node in semantic_roots:
@@ -984,6 +1672,8 @@ class IslandDB:
         aggregates = tuple(root.find_all(exp.Count, exp.Sum, exp.Min, exp.Max))
         if root.args.get("group") is not None and not aggregates:
             reasons.append("GROUP BY without an aggregate uses DuckDB's distinct path")
+        has_grouped_reduction = root.args.get("group") is not None
+        has_joined_reduction = next(root.find_all(exp.Join), None) is not None
         for aggregate in aggregates:
             argument = aggregate.this
             is_count_star = isinstance(aggregate, exp.Count) and isinstance(
@@ -1003,8 +1693,36 @@ class IslandDB:
                 if type_name is not None and _numeric_family(type_name) == "float":
                     reasons.append("floating SUM reduction parity is not yet proven")
             elif isinstance(aggregate, (exp.Min, exp.Max)):
-                if type_name is not None and _numeric_family(type_name) == "float":
+                family = _numeric_family(type_name)
+                if family == "float":
                     reasons.append("floating MIN/MAX NaN semantics are not native")
+                elif family == "integer":
+                    pass
+                elif _is_binary_extrema_type(type_name):
+                    # DuckDB BLOB and Arrow/Polars Binary both order unsigned
+                    # bytes lexicographically, with the shorter value first when
+                    # one is a prefix.  Certify only the scalar direct-column
+                    # reduction: grouping/join spill and Binary predicates keep
+                    # their existing fail-closed contract.
+                    if has_grouped_reduction or has_joined_reduction:
+                        reasons.append(
+                            "Binary MIN/MAX is native only as a scalar "
+                            "direct-column reduction"
+                        )
+                elif _is_datetime_us_extrema_type(type_name):
+                    # Both engines reduce this exact physical family as signed
+                    # integer microseconds and ignore NULL. Other units/zones
+                    # remain outside the certified contract.
+                    if has_grouped_reduction or has_joined_reduction:
+                        reasons.append(
+                            "Datetime(us) MIN/MAX is native only as a scalar "
+                            "direct-column reduction"
+                        )
+                elif type_name is not None:
+                    reasons.append(
+                        f"{aggregate.key.upper()} over {type_name} has "
+                        "unproven DuckDB semantics"
+                    )
 
         # Native joins are deliberately in-memory only for now.  The resource
         # planner routes a decoded hash table that exceeds its budget to
@@ -1015,13 +1733,35 @@ class IslandDB:
 
     @staticmethod
     def _query_shape(parser) -> Tuple[exp.Select, bool, bool, bool]:
-        root = sqlglot.parse_one(parser.original_query, read="duckdb")
+        root = IslandDB._query_root(parser)
         if not isinstance(root, exp.Select):
             raise IslandUnsupportedError("only one top-level SELECT is native")
         has_join = next(root.find_all(exp.Join), None) is not None
         has_group = root.args.get("group") is not None
         has_sort = root.args.get("order") is not None
         return root, has_join, has_group, has_sort
+
+    def prepare_execution(
+        self,
+        reflection: Reflection,
+        parser,
+        *,
+        streaming_result: bool,
+    ) -> IslandPreparedQuery:
+        """Validate semantics and produce the one authoritative resource plan."""
+        capability = self.can_execute(
+            reflection,
+            parser,
+            streaming_result=streaming_result,
+        )
+        capability.require()
+        return IslandPreparedQuery(
+            capability=capability,
+            resource_plan=self.resource_plan(
+                reflection, parser, streaming_result=streaming_result,
+            ),
+            streaming_result=bool(streaming_result),
+        )
 
     @staticmethod
     def _selected_row_group_count(reflection: Reflection) -> int:
@@ -1072,6 +1812,7 @@ class IslandDB:
         native spill subset proves a tighter bound.
         """
         root, has_join, has_group, has_sort = self._query_shape(parser)
+        aliases = self._table_maps(parser, reflection)
         decoded = max(0, int(getattr(reflection, "decoded_bytes", 0) or 0))
         selected_decoded = decoded
         selected_decoded_complete = bool(
@@ -1122,11 +1863,53 @@ class IslandDB:
             max(0, int(getattr(snapshot, "candidate_rows", 0) or 0))
             for snapshot in reflection.supers
         )
+        scalar_aggregates = tuple(
+            root.find_all(exp.Count, exp.Sum, exp.Min, exp.Max)
+        )
+        group_cardinality_bound = (
+            self._sealed_integer_group_cardinality(root, aliases)
+            if has_group and not has_join
+            else None
+        )
+        bounded_group_operator = group_cardinality_bound is not None
+        group_expression = root.args.get("group")
+        group_key_count = (
+            len(group_expression.expressions)
+            if isinstance(group_expression, exp.Group)
+            else 0
+        )
+        # Conservative fixed numeric compact-state charge. The 512-byte base
+        # covers hash-table/control/allocator slack; every direct key and every
+        # accumulator gets another 128 bytes. Duplicate aggregate aliases are
+        # intentionally counted as independent state.
+        group_state_bytes_per_key = (
+            512
+            + 128 * max(1, group_key_count)
+            + 128 * max(1, len(scalar_aggregates))
+        )
         scalar_aggregate = bool(root.expressions) and all(
             next(expression.find_all(exp.Count, exp.Sum, exp.Min, exp.Max), None)
             is not None
             for expression in root.expressions
         ) and not has_group
+        binary_extrema_bounds: List[int] = []
+        for aggregate in scalar_aggregates:
+            argument = aggregate.this
+            if (
+                isinstance(aggregate, (exp.Min, exp.Max))
+                and isinstance(argument, exp.Column)
+                and _is_binary_extrema_type(
+                    self._resolve_column_type(argument, aliases)
+                )
+            ):
+                bound = self._binary_value_bound(argument, aliases)
+                if bound is None:
+                    # Decoded scan bytes do not bound one dictionary-expanded
+                    # variable-width value. Semantic parity remains certified,
+                    # but execution needs the snapshot's exact write-time bound.
+                    complete = False
+                else:
+                    binary_extrema_bounds.append(bound)
         # A join needs build/probe hash state; ordering needs runs/merge state;
         # grouped aggregation needs a key-state table.  Spill integration below
         # supports only the sealed direct-column GROUP/ORDER subset; joins route.
@@ -1135,14 +1918,48 @@ class IslandDB:
             # overhead beyond decoded buffers. Unknown output cardinality never
             # becomes a small result estimate below.
             state = decoded * 4
+        elif has_group:
+            if bounded_group_operator:
+                # Native partial aggregation retains one compact entry per
+                # possible key, never the wide decoded input.  This deliberately
+                # overcharges C++ hash/allocator state: 512 bytes/key plus 128
+                # bytes for every accumulator. It is still orders of magnitude
+                # below the old 10-GiB input-sized plan for a sealed 1,024-key
+                # domain, while a high-cardinality id domain remains external.
+                state = (
+                    int(group_cardinality_bound)
+                    * group_state_bytes_per_key
+                )
+            else:
+                # Preserve the historical ORDER+GROUP fallback exactly when no
+                # complete domain proof exists. Unknown cardinality must never
+                # be reinterpreted as a small hash table.
+                state = (
+                    decoded if has_sort else max(decoded * 2, compressed)
+                )
+                if candidate_rows_complete:
+                    # Without a sealed NDV the only safe group-count bound is
+                    # one key per selected row. Narrow input with hundreds of
+                    # aggregate aliases can otherwise create vastly more state
+                    # than decoded bytes and exhaust spill quota mid-query.
+                    state = max(
+                        state,
+                        candidate_rows * group_state_bytes_per_key,
+                    )
         elif has_sort:
             state = decoded
-        elif has_group:
-            state = max(decoded * 2, compressed)
         elif scalar_aggregate:
             # COUNT/SUM/MIN/MAX reduce incrementally. Scan buffers are budgeted
-            # separately; the aggregate itself has O(1) state.
-            state = 4096 * max(1, len(root.expressions))
+            # separately; every aggregate has O(1) state. Count the aggregate
+            # nodes rather than only output expressions because one aliased
+            # expression may contain several independent reductions.
+            state = 4096 * max(1, len(scalar_aggregates))
+            # Polars can maintain one global-extremum accumulator per native
+            # worker before merging. Charge the exact maximum value plus Python/
+            # Arrow scalar overhead for every Binary reduction and worker.
+            state += max(1, int(self._resources.cpu_count)) * sum(
+                bound + 128 for bound in binary_extrema_bounds
+            )
         else:
             # A projection/filter stream has no blocking operator state. Its
             # source and result batches are governed by scan/result budgets;
@@ -1157,7 +1974,14 @@ class IslandDB:
         # no reduction can return the decoded input; grouped/sorted results may
         # do the same, while scalar aggregates are tiny.
         if scalar_aggregate:
-            result_bytes = 4096
+            # Result width still grows with the number of projected aggregate
+            # expressions.  A fixed scalar charge can under-admit generated
+            # "aggregate every column" queries by orders of magnitude even
+            # though their operator state remains bounded while scanning.
+            result_bytes = 4096 * max(1, len(root.expressions))
+            result_bytes += sum(
+                bound + 128 for bound in binary_extrema_bounds
+            )
             estimated_result_rows = 1
         else:
             projected_fields = 0
@@ -1197,11 +2021,22 @@ class IslandDB:
                     worst_rows *= rows
                 result_bytes = worst_rows * projected_fields * 24
                 estimated_result_rows = worst_rows
+            elif bounded_group_operator:
+                result_bytes = int(group_cardinality_bound) * projected_fields * 24
+                estimated_result_rows = int(group_cardinality_bound)
             else:
                 result_bytes = candidate_rows * projected_fields * 24
                 estimated_result_rows = candidate_rows
             if not candidate_rows_complete:
                 complete = False
+
+        if has_group and has_sort:
+            # ORDER BY consumes the grouped output, not the wide source. Charge
+            # its full conservative result bound for both sealed and unknown
+            # group cardinalities. The external operator remains mandatory for
+            # the low-NDV case because the normal Polars lazy GROUP can
+            # transiently retain decoded batches.
+            state += result_bytes
 
         # A sealed deletion vector is eager metadata and anti-join hash state.
         # Bound it from its exact row count and the longest permitted resource
@@ -1247,6 +2082,10 @@ class IslandDB:
             has_group_by=has_group,
             has_join=has_join,
             estimates_complete=complete,
+            requires_bounded_group_operator=bounded_group_operator,
+            group_state_bytes_per_key=(
+                group_state_bytes_per_key if bounded_group_operator else 0
+            ),
         )
         return self._planner.plan(estimate, streaming_result=streaming_result)
 
@@ -1291,6 +2130,30 @@ class IslandDB:
                             "supertable.engine.data_estimator",
                             fromlist=["DataEstimator"],
                         ).DataEstimator._decoded_fixed_width(str(field.type))
+                        if width is None and str(field.type).casefold() == "binary":
+                            bounds = getattr(
+                                snapshot, "column_max_value_bytes", None,
+                            )
+                            matches = (
+                                [
+                                    (name, value)
+                                    for name, value in bounds.items()
+                                    if str(name).casefold()
+                                    == field.name.casefold()
+                                ]
+                                if isinstance(bounds, dict) else []
+                            )
+                            if (
+                                len(matches) == 1
+                                and str(matches[0][0]) == field.name
+                                and isinstance(matches[0][1], int)
+                                and not isinstance(matches[0][1], bool)
+                                and matches[0][1] >= 0
+                            ):
+                                # Arrow Binary has one 32-bit offset per value;
+                                # the caller's extra byte covers validity and
+                                # alignment slack.
+                                width = int(matches[0][1]) + 4
                         if width is None:
                             return None
                         selected_indexes.append(field_index)
@@ -1407,6 +2270,202 @@ class IslandDB:
         # couples execution to an estimator artifact.
         return None if len(ids) == actual_count else ids
 
+    def _local_scan_plan_key(self, snapshot: SuperSnapshot) -> Optional[str]:
+        """Digest every pinned input that can change a local physical relation.
+
+        Modern reflections carry exact positive sizes. Legacy reflections do
+        not provide a stable physical identity and deliberately retain cold
+        validation on every query rather than caching a path-only assertion.
+        """
+        try:
+            sizes = tuple(getattr(snapshot, "resource_sizes", None) or ())
+            if (
+                len(sizes) != len(snapshot.files)
+                or any(
+                    not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size <= 0
+                    for size in sizes
+                )
+            ):
+                return None
+
+            digest = hashlib.sha256(b"supertable-island-local-plan-v2\0")
+
+            def add(value: object) -> None:
+                encoded_value = str(value).encode(
+                    "utf-8", errors="surrogatepass",
+                )
+                digest.update(len(encoded_value).to_bytes(8, "big"))
+                digest.update(encoded_value)
+
+            def section(name: str, count: int) -> None:
+                # Field order is fixed by this version. Length framing plus an
+                # explicit section/count makes the stream collision-free
+                # without hashing dynamic label strings for every file.
+                add(name)
+                add(count)
+
+            section("identity", 6)
+            add(self.organization)
+            add(self._artifact_cache_namespace)
+            add(snapshot.super_name)
+            add(snapshot.simple_name)
+            add(snapshot.simple_version)
+            add(getattr(snapshot, "snapshot_path", None))
+
+            # Order is semantically significant: include_file_paths is mapped
+            # positionally to the exact canonical resource identity.
+            section("files", len(snapshot.files))
+            for path, resource_key, size in zip(
+                snapshot.files, snapshot.resource_keys, sizes,
+            ):
+                # Relative paths acquire meaning from the process working
+                # directory. Include their syscall-free absolute form so a
+                # later chdir cannot reuse a descriptor for the old target.
+                add(self._local_source_path(path))
+                add(resource_key)
+                add(size)
+
+            snapshot_keys = getattr(snapshot, "snapshot_resource_keys", None)
+            if snapshot_keys is None:
+                section("snapshot_resources_none", 0)
+            else:
+                section("snapshot_resources", len(snapshot_keys))
+                for resource_key in snapshot_keys:
+                    add(resource_key)
+
+            column_types = snapshot.column_types or {}
+            section("column_types", len(column_types))
+            for name, type_name in column_types.items():
+                add(name)
+                add(type_name)
+            columns = sorted(str(value) for value in (snapshot.columns or ()))
+            section("column_set", len(columns))
+            for name in columns:
+                add(name)
+
+            # Row-group selections and statistics seals are query-planning
+            # inputs, not part of this descriptor. The local scanner deliberately
+            # reads their safe superset and the LazyFrame retains each query's
+            # independent predicate. If exact local subsets are introduced,
+            # bump the key format before adding that subset to the descriptor.
+            return digest.hexdigest()
+        except Exception:
+            # Key construction is an optimization boundary. Malformed metadata
+            # must take the existing cold validator, which will either widen the
+            # optional hint or raise its normal integrity error.
+            return None
+
+    @staticmethod
+    def _local_source_path(path: object) -> str:
+        """Return an absolute, symlink-preserving path for cheap hit sealing."""
+        raw = str(path or "")
+        if raw.startswith("file://"):
+            parsed = urlparse(raw)
+            if parsed.netloc not in ("", "localhost"):
+                raise IslandUnsupportedError(
+                    f"IslandDB cannot scan non-local file URL {raw!r}"
+                )
+            raw = unquote(parsed.path)
+        if "://" in raw:
+            raise IslandUnsupportedError(
+                "IslandDB requires a localised Reflection; remote path remained"
+            )
+        return raw if os.path.isabs(raw) else os.path.abspath(raw)
+
+    @staticmethod
+    def _local_scan_plan_weight(
+        local_paths: Iterable[str],
+        local_to_resource: Dict[str, str],
+        physical_schema: pa.Schema,
+        file_seals: Iterable[_LocalFileSeal],
+    ) -> int:
+        """Conservative retained-memory charge for one descriptor-only plan."""
+        path_bytes = sum(
+            len(str(path).encode("utf-8", errors="surrogatepass")) + 96
+            for path in local_paths
+        )
+        mapping_bytes = sum(
+            len(str(path).encode("utf-8", errors="surrogatepass"))
+            + len(str(key).encode("utf-8", errors="surrogatepass"))
+            + 128
+            for path, key in local_to_resource.items()
+        )
+        seal_bytes = sum(
+            len(seal.source_path.encode("utf-8", errors="surrogatepass")) + 128
+            for seal in file_seals
+        )
+        try:
+            schema_bytes = int(physical_schema.serialize().size)
+        except Exception:
+            schema_bytes = 4096
+        return max(1, 512 + path_bytes + mapping_bytes + seal_bytes + schema_bytes)
+
+    @staticmethod
+    def _local_relation_from_plan(
+        plan: _LocalScanPlan,
+        object_metadata_out: Optional[Dict[str, object]] = None,
+        expected_object_metadata: Optional[Dict[str, object]] = None,
+        parallel_strategy: str = "auto",
+    ) -> pl.LazyFrame:
+        """Create a query-private lazy node from a shared immutable descriptor."""
+        if object_metadata_out is not None or expected_object_metadata:
+            if len(plan.local_to_resource) != len(plan.file_seals):
+                raise IslandIntegrityError(
+                    "cached local scan plan has non-bijective object seals"
+                )
+            actual_metadata = {
+                resource_key: _local_object_metadata(seal)
+                for (_local_path_value, resource_key), seal in zip(
+                    plan.local_to_resource, plan.file_seals,
+                )
+            }
+            for resource_key, expected in (
+                expected_object_metadata or {}
+            ).items():
+                actual = actual_metadata.get(str(resource_key))
+                expected_identity = getattr(expected, "identity_token", None)
+                actual_identity = getattr(actual, "identity_token", None)
+                try:
+                    expected_token = (
+                        expected_identity()
+                        if callable(expected_identity) else None
+                    )
+                    actual_token = (
+                        actual_identity() if callable(actual_identity) else None
+                    )
+                except Exception:
+                    expected_token = actual_token = None
+                if (
+                    not isinstance(expected_token, str)
+                    or not expected_token
+                    or expected_token != actual_token
+                ):
+                    raise IslandIntegrityError(
+                        f"local object identity for {resource_key!r} changed"
+                    )
+            if object_metadata_out is not None:
+                object_metadata_out.update(actual_metadata)
+        return (
+            pl.scan_parquet(
+                list(plan.local_paths),
+                schema=pl.Schema(plan.physical_schema),
+                include_file_paths=SOURCE_FILE_COL,
+                hive_partitioning=False,
+                use_statistics=True,
+                parallel=parallel_strategy,
+                missing_columns="insert",
+                extra_columns="raise",
+            )
+            .with_columns(
+                pl.col(SOURCE_FILE_COL).replace_strict(
+                    dict(plan.local_to_resource),
+                    return_dtype=pl.String,
+                )
+            )
+        )
+
     def _base_relation(
         self,
         snapshot: SuperSnapshot,
@@ -1415,6 +2474,80 @@ class IslandDB:
         batch_rows: int = 65_536,
         object_metadata_out: Optional[Dict[str, object]] = None,
         expected_object_metadata: Optional[Dict[str, object]] = None,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        parallel_strategy: str = "auto",
+    ) -> pl.LazyFrame:
+        """Return a physical relation, reusing only fully validated local plans."""
+        if not (
+            len(snapshot.files) == len(snapshot.resource_keys)
+            and len(snapshot.files) > 0
+        ):
+            raise IslandIntegrityError(
+                f"{snapshot.super_name}.{snapshot.simple_name} has a non-bijective "
+                "file/resource mapping"
+            )
+        if len(set(snapshot.resource_keys)) != len(snapshot.resource_keys):
+            raise IslandIntegrityError(
+                f"{snapshot.super_name}.{snapshot.simple_name} has duplicate "
+                "canonical resource keys"
+            )
+        has_remote = any(
+            "://" in str(path or "")
+            and not str(path or "").startswith("file://")
+            for path in snapshot.files
+        )
+        if has_remote and expected_object_metadata is None:
+            expected_object_metadata = _snapshot_expected_object_metadata(snapshot)
+        plan_key = None if has_remote else self._local_scan_plan_key(snapshot)
+        cached, build = _get_or_reserve_local_scan_plan(plan_key)
+        if cached is not None:
+            return self._local_relation_from_plan(
+                cached,
+                object_metadata_out=object_metadata_out,
+                expected_object_metadata=expected_object_metadata,
+                parallel_strategy=parallel_strategy,
+            )
+
+        built_plan: List[_LocalScanPlan] = []
+        try:
+            relation = self._base_relation_uncached(
+                snapshot,
+                row_group_hints=row_group_hints,
+                batch_rows=batch_rows,
+                object_metadata_out=object_metadata_out,
+                expected_object_metadata=expected_object_metadata,
+                range_metrics_out=range_metrics_out,
+                parallel_strategy=parallel_strategy,
+                local_plan_out=built_plan,
+            )
+        except BaseException:
+            _finish_local_scan_plan_build(plan_key, build, None)
+            raise
+        if (
+            plan_key is not None
+            and built_plan
+            and self._local_scan_plan_key(snapshot) != plan_key
+        ):
+            _finish_local_scan_plan_build(plan_key, build, None)
+            raise IslandIntegrityError(
+                "snapshot metadata changed during local scan planning"
+            )
+        _finish_local_scan_plan_build(
+            plan_key, build, built_plan[0] if built_plan else None,
+        )
+        return relation
+
+    def _base_relation_uncached(
+        self,
+        snapshot: SuperSnapshot,
+        *,
+        row_group_hints: bool = True,
+        batch_rows: int = 65_536,
+        object_metadata_out: Optional[Dict[str, object]] = None,
+        expected_object_metadata: Optional[Dict[str, object]] = None,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
+        parallel_strategy: str = "auto",
+        local_plan_out: Optional[List[_LocalScanPlan]] = None,
     ) -> pl.LazyFrame:
         if not (
             len(snapshot.files) == len(snapshot.resource_keys)
@@ -1442,10 +2575,12 @@ class IslandDB:
             if has_remote else pafs.LocalFileSystem()
         )
         common_schema: Optional[Dict[str, Tuple[str, pl.DataType]]] = None
+        common_arrow_types: Dict[str, Tuple[str, pa.DataType]] = {}
         ordered_fields: List[pa.Field] = []
         seen_fields: set[str] = set()
         local_paths: List[str] = []
         local_to_resource: Dict[str, str] = {}
+        local_validation_seals: List[_LocalFileSeal] = []
         pinned_schema: Dict[str, Tuple[str, str]] = {}
         for name, type_name in (snapshot.column_types or {}).items():
             folded = str(name).casefold()
@@ -1495,9 +2630,22 @@ class IslandDB:
                     "cache": cache,
                     "metadata": metadata,
                     "size": file_size,
+                    "metrics_sink": (
+                        range_metrics_out.merge
+                        if range_metrics_out is not None else None
+                    ),
                 }
             else:
                 local = _local_path(path)
+                validation_seal = None
+                if not has_remote:
+                    validation_seal = _local_file_seal(
+                        self._local_source_path(path),
+                    )
+                    if validation_seal is None:
+                        raise IslandIntegrityError(
+                            "a local Parquet file changed before scan validation"
+                        )
                 prior_key = resolved_to_key.setdefault(local, str(resource_key))
                 if prior_key != str(resource_key):
                     raise IslandIntegrityError(
@@ -1511,6 +2659,8 @@ class IslandDB:
                     )
                 local_paths.append(local)
                 local_to_resource[local] = str(resource_key)
+                if validation_seal is not None:
+                    local_validation_seals.append(validation_seal)
                 if has_remote:
                     file_entries[virtual_path] = {
                         "local": local,
@@ -1528,6 +2678,32 @@ class IslandDB:
                     seen_fields.add(field.name)
             physical_schema = pl.Schema(physical_arrow_schema)
             self._reserved_schema_guard(physical_schema, source=resource_key)
+            current_arrow_types = {
+                str(field.name).casefold(): (str(field.name), field.type)
+                for field in physical_arrow_schema
+                if str(field.name).casefold() not in {
+                    ROWID_COL.casefold(), TIMESTAMP_COL.casefold(),
+                }
+            }
+            incompatible_arrow = sorted(
+                name for name in set(common_arrow_types).intersection(
+                    current_arrow_types,
+                )
+                if (
+                    common_arrow_types[name][0]
+                    != current_arrow_types[name][0]
+                    or not common_arrow_types[name][1].equals(
+                        current_arrow_types[name][1]
+                    )
+                )
+            )
+            if incompatible_arrow:
+                raise IslandUnsupportedError(
+                    "IslandDB native physical schema evolution requires identical "
+                    "physical Arrow names and types for shared columns: "
+                    + ", ".join(incompatible_arrow)
+                )
+            common_arrow_types.update(current_arrow_types)
             comparable_schema = {
                 str(name).casefold(): (str(name), dtype)
                 for name, dtype in physical_schema.items()
@@ -1627,23 +2803,30 @@ class IslandDB:
             # performance hint: scanning its safe superset preserves results.
             # Remote objects still require exact fragments below so range I/O
             # never expands from selected chunks to whole objects.
-            physical_schema = pl.Schema(pa.schema(ordered_fields[:-1]))
-            return (
-                pl.scan_parquet(
+            physical_arrow_schema = pa.schema(ordered_fields[:-1])
+            plan = _LocalScanPlan(
+                local_paths=tuple(local_paths),
+                local_to_resource=tuple(local_to_resource.items()),
+                physical_schema=physical_arrow_schema,
+                file_seals=tuple(local_validation_seals),
+                weight_bytes=self._local_scan_plan_weight(
                     local_paths,
-                    schema=physical_schema,
-                    include_file_paths=SOURCE_FILE_COL,
-                    hive_partitioning=False,
-                    use_statistics=True,
-                    missing_columns="insert",
-                    extra_columns="raise",
+                    local_to_resource,
+                    physical_arrow_schema,
+                    local_validation_seals,
+                ),
+            )
+            if not _local_scan_plan_is_current(plan):
+                raise IslandIntegrityError(
+                    "a validated local Parquet file changed during scan planning"
                 )
-                .with_columns(
-                    pl.col(SOURCE_FILE_COL).replace_strict(
-                        local_to_resource,
-                        return_dtype=pl.String,
-                    )
-                )
+            if local_plan_out is not None:
+                local_plan_out.append(plan)
+            return self._local_relation_from_plan(
+                plan,
+                object_metadata_out=object_metadata_out,
+                expected_object_metadata=expected_object_metadata,
+                parallel_strategy=parallel_strategy,
             )
         dataset = pads.FileSystemDataset(
             fragments,
@@ -1662,25 +2845,44 @@ class IslandDB:
         cache_key = str(getattr(tomb_def, "cache_key", "") or "")
         if not path:
             raise IslandIntegrityError("active deletion-vector definition has no path")
-        if "://" not in path and os.path.isfile(path):
-            frame = pl.read_parquet(path, hive_partitioning=False)
-        elif self.storage is not None and cache_key:
-            # DVs are bounded correctness metadata (normally <= threshold), so
-            # the storage SDK path is acceptable here.  Data Parquet files never
-            # take this whole-object fallback.
-            frame = pl.from_arrow(self.storage.read_parquet(cache_key))
-        else:
-            raise IslandIntegrityError("required deletion vector cannot be read safely")
         allowed = getattr(tomb_def, "snapshot_resource_keys", None)
         if allowed is None:
             allowed = getattr(tomb_def, "resource_keys", ())
-        return validate_tombstone_frame(
-            frame,
+        # The digest is snapshot-pinned and content-derived. Include it (plus
+        # expected cardinality) so two independently constructed snapshots that
+        # reuse the same raw key can never alias inside a long-lived process.
+        digest = str(getattr(tomb_def, "tombstone_digest", "") or "")
+        rows = getattr(tomb_def, "expected_rows", None)
+        identity_source = cache_key or os.path.realpath(path)
+        cache_identity = (
+            f"islanddb-dv-v1:{self._artifact_cache_namespace}:{identity_source}:"
+            f"{rows}:{digest}"
+        )
+        if "://" not in path and os.path.isfile(path):
+            read_path = path
+            loader = lambda: pl.read_parquet(
+                read_path, hive_partitioning=False,
+            )
+        elif self.storage is not None and cache_key:
+            # DVs are bounded correctness metadata. Use the storage SDK only on
+            # a scoped cache miss; rotating presigned URLs never enter identity.
+            read_path = path
+            loader = lambda: pl.from_arrow(self.storage.read_parquet(cache_key))
+        else:
+            raise IslandIntegrityError("required deletion vector cannot be read safely")
+        frame = load_tombstone(
+            read_path,
+            cache_identity=cache_identity,
+            loader=loader,
+            allow_cache=True,
+            required=True,
             expected_rows=getattr(tomb_def, "expected_rows", None),
             expected_digest=getattr(tomb_def, "tombstone_digest", None),
             allowed_files=set(allowed),
-            source=f"IslandDB deletion-vector {cache_key or path}",
         )
+        if frame is None:  # required=True should make this unreachable.
+            raise IslandIntegrityError("required deletion vector was unavailable")
+        return frame
 
     def _source_rowid_proof_key(
         self,
@@ -1688,7 +2890,7 @@ class IslandDB:
         metadata: object,
         rowids: Iterable[int],
     ) -> Optional[Tuple[object, ...]]:
-        """Return a cache key only for a conditionally readable remote object."""
+        """Key a proof only for a stable, immutable source-object identity."""
         identity = getattr(metadata, "identity_token", None)
         try:
             token = identity() if callable(identity) else None
@@ -1717,13 +2919,8 @@ class IslandDB:
     def _source_rowid_proof_hit(key: Optional[Tuple[object, ...]]) -> bool:
         if key is None:
             return False
-        now = time.monotonic()
         with _ROWID_PROOF_LOCK:
-            completed = _ROWID_PROOFS.get(key)
-            if completed is None:
-                return False
-            if now - completed > _ROWID_PROOF_TTL_SEC:
-                _ROWID_PROOFS.pop(key, None)
+            if key not in _ROWID_PROOFS:
                 return False
             _ROWID_PROOFS.move_to_end(key)
             return True
@@ -1732,12 +2929,14 @@ class IslandDB:
     def _store_source_rowid_proofs(
         keys: Iterable[Optional[Tuple[object, ...]]],
     ) -> None:
-        now = time.monotonic()
         with _ROWID_PROOF_LOCK:
             for key in keys:
                 if key is None:
                     continue
-                _ROWID_PROOFS[key] = now
+                # The key is bound to immutable object identity and the exact
+                # DV rowid set. Capacity pressure, not wall-clock age, is the
+                # only valid reason to discard a completed integrity proof.
+                _ROWID_PROOFS[key] = True
                 _ROWID_PROOFS.move_to_end(key)
             while len(_ROWID_PROOFS) > _ROWID_PROOF_MAX_ENTRIES:
                 _ROWID_PROOFS.popitem(last=False)
@@ -1748,6 +2947,7 @@ class IslandDB:
         deletion_vector: pl.DataFrame,
         *,
         object_metadata: Optional[Dict[str, object]] = None,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
     ) -> None:
         targets = deletion_vector.filter(
             pl.col(TOMBSTONE_FILE_COL).is_in(snapshot.resource_keys)
@@ -1811,6 +3011,7 @@ class IslandDB:
                 for key, metadata in (object_metadata or {}).items()
                 if key in missed_keys
             },
+            range_metrics_out=range_metrics_out,
         )
         schema = scan.collect_schema()
         if ROWID_COL not in schema or schema[ROWID_COL] != pl.Int64:
@@ -1854,6 +3055,7 @@ class IslandDB:
         *,
         object_metadata: Optional[Dict[str, object]] = None,
         query_proofs: Optional[set[Tuple[object, ...]]] = None,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
     ) -> pl.LazyFrame:
         if tomb_def is not None and getattr(tomb_def, "tombstone_path", None):
             dv = self._load_tombstone(tomb_def)
@@ -1868,6 +3070,7 @@ class IslandDB:
                     snapshot,
                     dv,
                     object_metadata=object_metadata,
+                    range_metrics_out=range_metrics_out,
                 )
                 if query_proofs is not None:
                     query_proofs.add(query_marker)
@@ -1914,14 +3117,19 @@ class IslandDB:
         sql: str,
         parser,
         reflection: Reflection,
-    ) -> Tuple[str, exp.Select]:
+    ) -> Tuple[str, exp.Select, exp.Select]:
         """Bridge documented aggregate edge semantics before Polars parses SQL.
 
         Polars returns integer zero for ``SUM`` over an empty/all-NULL input;
         SQL and DuckDB require NULL.  Rewriting each native SUM to a guarded
         aggregate preserves row-group/projection pushdown and the exact result.
         """
-        root = sqlglot.parse_one(sql, read="duckdb")
+        parsed = self._query_root(parser) if sql == parser.original_query else None
+        root = (
+            parsed.copy()
+            if isinstance(parsed, exp.Expression)
+            else sqlglot.parse_one(sql, read="duckdb")
+        )
         if not isinstance(root, exp.Select):  # already fenced by can_execute
             raise IslandUnsupportedError("only one top-level SELECT is native")
         original = root.copy()
@@ -1955,7 +3163,7 @@ class IslandDB:
                 default=widened,
             )
             aggregate.replace(guarded)
-        return root.sql(dialect="duckdb"), original
+        return root.sql(dialect="duckdb"), original, root
 
     @staticmethod
     def _to_duckdb_pandas(result: pl.DataFrame) -> pd.DataFrame:
@@ -1968,6 +3176,20 @@ class IslandDB:
         }
         for name, dtype in result.schema.items():
             series = result.get_column(name)
+            if dtype == pl.Binary:
+                # DuckDB fetchdf represents BLOB values as bytearray and NULL as
+                # pandas.NA.  Polars emits bytes/None. Normalize the materialized
+                # compatibility facade while leaving the public Arrow stream's
+                # canonical Binary buffers untouched.
+                frame[name] = pd.Series(
+                    [
+                        pd.NA if value is None else bytearray(value)
+                        for value in series.to_list()
+                    ],
+                    index=frame.index,
+                    dtype=object,
+                )
+                continue
             if series.null_count() == 0:
                 continue
             pandas_dtype = nullable_integer.get(dtype)
@@ -2004,12 +3226,16 @@ class IslandDB:
         *,
         sql_override: Optional[str] = None,
         batch_rows: int = 65_536,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
     ) -> Tuple[pl.LazyFrame, exp.Select, str, str]:
         snapshots = self._snapshots(reflection)
         table_defs = parser.get_table_tuples()
         context = pl.SQLContext(eager=False)
         alias_to_physical: Dict[str, str] = {}
         query_rowid_proofs: set[Tuple[object, ...]] = set()
+        required_columns = self._required_columns_by_snapshot(
+            parser, reflection,
+        )
         tombstone_views = {
             str(alias).casefold(): tombstone
             for alias, tombstone in (
@@ -2030,6 +3256,10 @@ class IslandDB:
                 snapshot,
                 batch_rows=batch_rows,
                 object_metadata_out=object_metadata,
+                range_metrics_out=range_metrics_out,
+                parallel_strategy=self._local_scan_parallel_strategy(
+                    reflection, required_columns.get(id(snapshot)),
+                ),
             )
             tomb_def = tombstone_views.get(str(td.alias).casefold())
             relation = self._apply_tombstone(
@@ -2038,15 +3268,20 @@ class IslandDB:
                 tomb_def,
                 object_metadata=object_metadata,
                 query_proofs=query_rowid_proofs,
+                range_metrics_out=range_metrics_out,
             )
             context.register(physical, relation)
             alias_to_physical[td.alias] = physical
 
         timer_capture("CREATING_REFLECTION")
-        native_sql, original_root = self._rewrite_native_aggregates(
+        native_sql, original_root, native_root = self._rewrite_native_aggregates(
             sql_override or parser.original_query, parser, reflection,
         )
-        query = rewrite_query_with_hashed_tables(native_sql, alias_to_physical)
+        query = rewrite_query_with_hashed_tables(
+            native_sql,
+            alias_to_physical,
+            parsed_expression=native_root,
+        )
         parser.executing_query = query
         lazy_result = context.execute(query, eager=False)
         if not isinstance(lazy_result, pl.LazyFrame):
@@ -2087,6 +3322,34 @@ class IslandDB:
         *,
         batch_rows: int,
     ) -> Tuple[pa.Schema, Iterable[pa.RecordBatch]]:
+        logical_schema = lazy_result.collect_schema()
+
+        def canonical_schema(schema: pa.Schema) -> pa.Schema:
+            fields = [
+                pa.field(
+                    field.name,
+                    pa.binary()
+                    if logical_schema.get(field.name) == pl.Binary
+                    else field.type,
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+                for field in schema
+            ]
+            return pa.schema(fields, metadata=schema.metadata)
+
+        def canonical_arrow(frame: pl.DataFrame) -> pa.Table:
+            table = frame.to_arrow()
+            # Polars' Binary C-data export currently uses large_binary even
+            # when the Parquet/DuckDB BLOB contract is 32-bit Arrow binary.
+            # Query batches are resource-bounded well below 2 GiB, so the safe
+            # offset narrowing is exact and makes the public Arrow stream match
+            # DuckDB as well as the materialized pandas facade.
+            target = canonical_schema(table.schema)
+            return table if target.equals(table.schema) else table.cast(
+                target, safe=True,
+            )
+
         frames = lazy_result.collect_batches(
             chunk_size=max(1, int(batch_rows)),
             maintain_order=True,
@@ -2101,19 +3364,19 @@ class IslandDB:
         # its first physical batch; for an empty stream the logical schema is
         # the only schema available and no batch can violate it.
         schema = (
-            first_frame.to_arrow().schema
+            canonical_arrow(first_frame).schema
             if first_frame is not None
-            else lazy_result.collect_schema().to_arrow()
+            else canonical_schema(logical_schema.to_arrow())
         )
 
         def produce() -> Iterable[pa.RecordBatch]:
             try:
                 if first_frame is not None:
-                    yield from first_frame.to_arrow().to_batches(
+                    yield from canonical_arrow(first_frame).to_batches(
                         max_chunksize=max(1, int(batch_rows)),
                     )
                 for frame in frames:
-                    yield from frame.to_arrow().to_batches(
+                    yield from canonical_arrow(frame).to_batches(
                         max_chunksize=max(1, int(batch_rows)),
                     )
             finally:
@@ -2123,6 +3386,169 @@ class IslandDB:
 
         return schema, produce()
 
+    @staticmethod
+    def _row_group_hints_are_full_scan(snapshot: SuperSnapshot) -> bool:
+        """Prove that optional local row-group hints do not select a subset.
+
+        The direct Arrow projection below deliberately has no SQL predicate
+        compiler. A partial estimator hint normally accompanies a predicate,
+        but treating the hint itself as the predicate would be a correctness
+        bug. Admit only absent hints or the canonical complete sequence and
+        leave every partial/malformed shape on the existing Polars path.
+        """
+        selections = getattr(snapshot, "row_group_selections", None)
+        if not selections:
+            return True
+        try:
+            if not isinstance(selections, dict):
+                return False
+            resource_keys = set(str(key) for key in snapshot.resource_keys)
+            if any(str(key) not in resource_keys for key in selections):
+                return False
+            for selection in selections.values():
+                expected = selection.expected_row_group_count
+                selected = selection.selected_ids
+                if (
+                    not isinstance(expected, int)
+                    or isinstance(expected, bool)
+                    or expected <= 0
+                    or not isinstance(selected, tuple)
+                    # Check the already-retained tuple in-place. Constructing
+                    # range(expected) as another tuple would let malformed
+                    # optional metadata request an unbounded allocation.
+                    or len(selected) != expected
+                    or any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value != index
+                        for index, value in enumerate(selected)
+                    )
+                ):
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def _direct_local_projection_batches(
+        self,
+        reflection: Reflection,
+        parser,
+        root: exp.Select,
+        *,
+        column_names: Iterable[str],
+        batch_rows: int,
+    ) -> Optional[Tuple[pa.Schema, Iterable[pa.RecordBatch], str]]:
+        """Return a sealed Arrow Dataset projection for one simple local scan.
+
+        This is intentionally a narrow physical fast path, not another SQL
+        implementation. GROUP/aggregate/order semantics remain in the bounded
+        spill operators. Arrow replaces only the redundant Parquet -> Polars
+        -> Arrow conversion for an unfiltered, unmodified single-table
+        projection. Any uncertainty preserves the general native Polars path.
+        """
+        if (
+            getattr(reflection, "rbac_views", None)
+            or getattr(reflection, "tombstone_views", None)
+            or len(parser.get_table_tuples()) != 1
+        ):
+            return None
+
+        # A plain aggregate query has values only in these four Select slots.
+        # Reject LIMIT too, even when capability checking proved it redundant:
+        # this physical layer must never silently implement SQL semantics.
+        allowed_args = {"expressions", "from", "from_", "group", "order"}
+        if any(
+            value is not None and name not in allowed_args
+            for name, value in root.args.items()
+        ):
+            return None
+        from_clause = root.args.get("from") or root.args.get("from_")
+        if (
+            not isinstance(from_clause, exp.From)
+            or not isinstance(from_clause.this, exp.Table)
+            or sum(isinstance(node, exp.Select) for node in root.walk()) != 1
+        ):
+            return None
+
+        definition = parser.get_table_tuples()[0]
+        snapshot = self._snapshots(reflection).get((
+            definition.super_name.casefold(),
+            definition.simple_name.casefold(),
+        ))
+        if snapshot is None or not self._row_group_hints_are_full_scan(snapshot):
+            return None
+        if any(
+            "://" in str(path or "")
+            and not str(path or "").startswith("file://")
+            for path in snapshot.files
+        ):
+            # Remote fragments carry range-reader identities and exact sealed
+            # row-group subsets. They continue through _base_relation.
+            return None
+
+        names = tuple(str(name) for name in column_names)
+        if not names or len(set(names)) != len(names):
+            return None
+
+        # Build or hit the same descriptor cache as the Polars relation. This
+        # performs the existing resource-size, physical-schema, pinned-schema,
+        # path/resource bijection, and filesystem identity checks before Arrow
+        # can open a data page. The LazyFrame returned here is never collected.
+        plan_key = self._local_scan_plan_key(snapshot)
+        if plan_key is None:
+            return None
+        self._base_relation(snapshot, batch_rows=batch_rows)
+        with _LOCAL_SCAN_PLAN_LOCK:
+            scan_plan = _LOCAL_SCAN_PLANS.get(plan_key)
+            if scan_plan is not None:
+                _LOCAL_SCAN_PLANS.move_to_end(plan_key)
+        if (
+            scan_plan is None
+            or self._local_scan_plan_key(snapshot) != plan_key
+            or not _local_scan_plan_is_current(scan_plan)
+        ):
+            return None
+
+        field_indexes = [
+            scan_plan.physical_schema.get_field_index(name) for name in names
+        ]
+        if any(index < 0 for index in field_indexes):
+            # The validator should already reject a pinned-but-absent column.
+            # Fall back rather than let a fast-path assumption weaken that
+            # established error boundary.
+            return None
+        projection_schema = pa.schema([
+            scan_plan.physical_schema.field(index) for index in field_indexes
+        ])
+        dataset = pads.FileSystemDataset.from_paths(
+            list(scan_plan.local_paths),
+            schema=scan_plan.physical_schema,
+            format=pads.ParquetFileFormat(),
+            filesystem=pafs.LocalFileSystem(),
+        )
+        scanner = pads.Scanner.from_dataset(
+            dataset,
+            columns=list(names),
+            batch_size=max(1, int(batch_rows)),
+            # Two batches/fragments overlap local I/O and decoding without the
+            # multi-gigabyte read-ahead observed at Arrow's broad defaults on a
+            # wide scan inside a 4 GiB cgroup.
+            batch_readahead=2,
+            fragment_readahead=2,
+            use_threads=True,
+        )
+        if not scanner.projected_schema.equals(projection_schema):
+            # Equality includes field order and physical Arrow types. Do not
+            # cast a mismatch; the established path has richer evolution
+            # handling and remains the safe fallback.
+            return None
+        optimized_plan = (
+            f"Parquet SCAN [{len(scan_plan.local_paths)} sealed local sources]\n"
+            f"PROJECT {len(names)}/{len(scan_plan.physical_schema)} COLUMNS\n"
+            "ARROW NATIVE DIRECT PROJECTION"
+        )
+        return projection_schema, scanner.to_batches(), optimized_plan
+
     def _prepare_spilled_stream(
         self,
         reflection: Reflection,
@@ -2131,6 +3557,7 @@ class IslandDB:
         log_prefix: str,
         plan: QueryResourcePlan,
         session: SpillSession,
+        range_metrics_out: Optional[_QueryRangeMetrics] = None,
     ) -> Tuple[ArrowBatchStream, str, str]:
         """Compile the sealed direct-column GROUP/ORDER subset to spill ops."""
         root = sqlglot.parse_one(parser.original_query, read="duckdb")
@@ -2149,6 +3576,7 @@ class IslandDB:
         pre_root.set("order", None)
         aggregate_specs: List[AggregateSpec] = []
         group_names: List[str] = []
+        direct_projection_names: Optional[List[str]] = None
 
         if isinstance(group, exp.Group):
             group_columns = list(group.expressions)
@@ -2190,15 +3618,10 @@ class IslandDB:
                         exp.Count: "count", exp.Sum: "sum",
                         exp.Min: "min", exp.Max: "max",
                     }[type(core)]
-                    output_type = (
-                        pa.decimal128(38, 0)
-                        if isinstance(core, exp.Sum) else None
-                    )
                     aggregate_specs.append(AggregateSpec(
                         output_name,
                         function,
                         argument.name,
-                        output_type,
                     ))
                 else:
                     raise IslandUnsupportedError(
@@ -2210,24 +3633,68 @@ class IslandDB:
                 )
             pre_root.set("expressions", list(pre_columns.values()))
             pre_root.set("group", None)
+            direct_projection_names = list(pre_columns)
         elif next(root.find_all(exp.Count, exp.Sum, exp.Min, exp.Max), None):
             raise IslandUnsupportedError(
                 "global aggregate state is bounded in memory and is not a spill shape"
             )
+        else:
+            # A sealed ORDER-only scan can bypass the redundant
+            # Parquet -> Polars -> Arrow conversion too, but only when the
+            # projection is a literal list of unaliased physical columns.
+            # Computed/aliased/star projections retain the SQL engine path;
+            # this scanner is not a second expression implementation.
+            projected_columns: List[str] = []
+            for selected in root.expressions:
+                if (
+                    not isinstance(selected, exp.Column)
+                    or selected.is_star
+                    or selected.alias_or_name != selected.name
+                ):
+                    break
+                projected_columns.append(selected.name)
+            else:
+                if projected_columns and len(set(projected_columns)) == len(
+                    projected_columns
+                ):
+                    direct_projection_names = projected_columns
 
         pre_sql = pre_root.sql(dialect="duckdb")
-        lazy_input, _, _, input_plan = self._prepare_lazy_query(
-            reflection,
-            parser,
-            timer_capture,
-            log_prefix,
-            sql_override=pre_sql,
-            batch_rows=plan.batch_rows,
+        direct_input = (
+            self._direct_local_projection_batches(
+                reflection,
+                parser,
+                root,
+                column_names=direct_projection_names,
+                batch_rows=plan.batch_rows,
+            )
+            if direct_projection_names is not None else None
         )
-        input_schema, input_batches = self._lazy_batches(
-            lazy_input, batch_rows=plan.batch_rows,
-        )
+        direct_raw_projection = direct_input is not None and not group_names
+        if direct_input is not None:
+            input_schema, input_batches, input_plan = direct_input
+            parser.executing_query = pre_sql
+            timer_capture("CREATING_REFLECTION")
+            logger.debug(
+                "%s[islanddb] executing direct Arrow projection: %s",
+                log_prefix,
+                pre_sql,
+            )
+        else:
+            lazy_input, _, _, input_plan = self._prepare_lazy_query(
+                reflection,
+                parser,
+                timer_capture,
+                log_prefix,
+                sql_override=pre_sql,
+                batch_rows=plan.batch_rows,
+                range_metrics_out=range_metrics_out,
+            )
+            input_schema, input_batches = self._lazy_batches(
+                lazy_input, batch_rows=plan.batch_rows,
+            )
         stream: ArrowBatchStream
+        used_native_range_sort = False
         if group_names:
             stream = external_group_aggregate(
                 input_batches,
@@ -2243,6 +3710,7 @@ class IslandDB:
 
         if isinstance(order, exp.Order):
             sort_keys: List[Tuple[str, str]] = []
+            first_sort_column: Optional[exp.Column] = None
             for ordered in order.expressions:
                 target = ordered.this if isinstance(ordered, exp.Ordered) else ordered
                 if not isinstance(target, exp.Column):
@@ -2255,12 +3723,48 @@ class IslandDB:
                     raise IslandUnsupportedError(
                         f"spill ORDER BY key {target.name!r} is not projected"
                     )
+                if first_sort_column is None:
+                    first_sort_column = target
                 direction = (
                     "descending"
                     if isinstance(ordered, exp.Ordered) and ordered.args.get("desc")
                     else "ascending"
                 )
                 sort_keys.append((target.name, direction))
+            first_key_range: Optional[IntegerDomainBound] = None
+            input_size_hint_bytes: Optional[int] = None
+            input_rows_hint: Optional[int] = None
+            if direct_raw_projection and first_sort_column is not None:
+                aliases = self._table_maps(parser, reflection)
+                domain = self._sealed_integer_column_domain(
+                    first_sort_column, aliases,
+                )
+                first_index = stream.schema.get_field_index(
+                    first_sort_column.name,
+                )
+                if (
+                    domain is not None
+                    and domain.minimum is not None
+                    and first_index >= 0
+                    and pa.types.is_integer(stream.schema.field(first_index).type)
+                    and bool(getattr(reflection, "decoded_bytes_complete", False))
+                    and all(
+                        bool(getattr(snapshot, "candidate_rows_complete", False))
+                        for snapshot in reflection.supers
+                    )
+                ):
+                    decoded_hint = int(
+                        max(0, getattr(reflection, "decoded_bytes", 0) or 0)
+                    )
+                    row_hint = sum(
+                        int(max(0, getattr(snapshot, "candidate_rows", 0) or 0))
+                        for snapshot in reflection.supers
+                    )
+                    if decoded_hint > 0:
+                        first_key_range = domain
+                        input_size_hint_bytes = decoded_hint
+                        input_rows_hint = row_hint
+                        used_native_range_sort = True
             try:
                 stream = external_sort(
                     stream,
@@ -2270,6 +3774,10 @@ class IslandDB:
                     memory_budget_bytes=plan.operator_memory_bytes,
                     output_batch_rows=max(1, plan.batch_rows),
                     null_placement="at_end",
+                    first_key_range=first_key_range,
+                    input_size_hint_bytes=input_size_hint_bytes,
+                    input_rows_hint=input_rows_hint,
+                    parallelism=max(1, int(plan.cpu_workers)),
                 )
             except BaseException:
                 stream.close()
@@ -2305,7 +3813,72 @@ class IslandDB:
                 reorder_batches(),
                 cancel_event=source_stream.cancel_event,
             )
-        return stream, parser.original_query, input_plan + "\nEXTERNAL SPILL"
+        if direct_raw_projection and any(
+            pa.types.is_fixed_size_binary(field.type)
+            or pa.types.is_large_binary(field.type)
+            for field in stream.schema
+        ):
+            # DuckDB exposes Parquet FIXED_LEN_BYTE_ARRAY logical BLOB columns
+            # as Arrow Binary. Keep the fixed-width representation internally
+            # while sorting (it gives exact constant row-width accounting),
+            # then normalise only bounded output batches at the public stream
+            # boundary. Values and ordering are unchanged.
+            source_stream = stream
+            output_schema = pa.schema([
+                pa.field(
+                    field.name,
+                    pa.binary()
+                    if (
+                        pa.types.is_fixed_size_binary(field.type)
+                        or pa.types.is_large_binary(field.type)
+                    )
+                    else field.type,
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+                for field in source_stream.schema
+            ], metadata=source_stream.schema.metadata)
+
+            def canonical_raw_batches():
+                try:
+                    for batch in source_stream:
+                        offsets_cache: Dict[
+                            Tuple[int, int], pa.Buffer
+                        ] = {}
+                        arrays = []
+                        for column in batch.columns:
+                            if pa.types.is_fixed_size_binary(column.type):
+                                arrays.append(_fixed_size_binary_to_binary(
+                                    column,
+                                    offsets_cache=offsets_cache,
+                                ))
+                            elif pa.types.is_large_binary(column.type):
+                                # Safe narrowing remains delegated to Arrow:
+                                # unlike fixed-width input, arbitrary offsets
+                                # cannot be reconstructed without proving each
+                                # value boundary fits the int32 Binary domain.
+                                arrays.append(pc.cast(
+                                    column, pa.binary(), safe=True,
+                                ))
+                            else:
+                                arrays.append(column)
+                        yield pa.RecordBatch.from_arrays(
+                            arrays,
+                            schema=output_schema,
+                        )
+                finally:
+                    source_stream.close()
+
+            stream = ArrowBatchStream(
+                output_schema,
+                canonical_raw_batches(),
+                close_callback=source_stream.close,
+                cancel_event=source_stream.cancel_event,
+            )
+        spill_plan = input_plan + "\nEXTERNAL SPILL"
+        if used_native_range_sort:
+            spill_plan += "\nARROW NATIVE RANGE PARTITION SORT"
+        return stream, parser.original_query, spill_plan
 
     def execute_stream(
         self,
@@ -2317,6 +3890,7 @@ class IslandDB:
         engine_config=None,
         cache_metrics=None,
         _defer_reservation_release: bool = False,
+        _prepared: Optional[IslandPreparedQuery] = None,
     ) -> ArrowBatchStream:
         """Execute natively and yield bounded Arrow batches.
 
@@ -2324,22 +3898,91 @@ class IslandDB:
         one-shot stream is exhausted or explicitly closed.  This is the safe
         interface for a result larger than the configured collection budget.
         """
-        self.can_execute(reflection, parser).require()
-        plan = self.resource_plan(reflection, parser, streaming_result=True)
+        prepared = _prepared or self.prepare_execution(
+            reflection, parser, streaming_result=True,
+        )
+        prepared.capability.require()
+        plan = prepared.resource_plan
         if plan.advice in {ExecutionAdvice.ROUTE_DUCKDB, ExecutionAdvice.ROUTE_SPARK}:
             raise IslandUnsupportedError(
                 f"bounded IslandDB plan routes to {plan.advice.value}: {plan.reason}"
             )
         query_id = uuid.uuid4().hex
-        reservation = self._governor.reserve(
-            plan,
-            query_id=query_id,
-            timeout=float(max(1, settings.DEFAULT_TIMEOUT_SEC)),
-        )
+        admission_timeout = float(max(1, settings.DEFAULT_TIMEOUT_SEC))
+        if not _ISLAND_EXECUTION_SLOT.acquire(timeout=admission_timeout):
+            raise IslandUnsupportedError(
+                "timed out waiting for the process-global IslandDB scan slot"
+            )
+        if not _ARROW_POOL_LOCK.acquire(timeout=admission_timeout):
+            _ISLAND_EXECUTION_SLOT.release()
+            raise IslandUnsupportedError(
+                "timed out stabilizing the process-global Arrow worker pools"
+            )
+        slot_lock = threading.Lock()
+        slot_held = True
+
+        def release_execution_slot() -> None:
+            nonlocal slot_held
+            with slot_lock:
+                if slot_held:
+                    slot_held = False
+                    try:
+                        _ARROW_POOL_LOCK.release()
+                    finally:
+                        _ISLAND_EXECUTION_SLOT.release()
+
+        try:
+            reservation = self._governor.reserve(
+                plan,
+                query_id=query_id,
+                timeout=admission_timeout,
+            )
+        except BaseException:
+            release_execution_slot()
+            raise
         started = time.perf_counter()
+        configured_timeout = float(
+            settings.SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC
+        )
+        if not math.isfinite(configured_timeout):
+            # NaN/inf are configuration errors, not an opt-out.  Falling back
+            # to the documented bound keeps a malformed environment variable
+            # from silently disabling the production safety deadline.
+            configured_timeout = 300.0
+        execution_timeout = (
+            configured_timeout
+            if configured_timeout > 0
+            else None
+        )
+        deadline_monotonic = (
+            _monotonic() + execution_timeout
+            if execution_timeout is not None else None
+        )
+        query_cancel_event = threading.Event()
+
+        def check_execution_deadline() -> None:
+            if (
+                deadline_monotonic is not None
+                and _monotonic() >= deadline_monotonic
+            ):
+                # The event is shared by every nested Arrow/spill stream.  The
+                # active caller performs ordinary stack unwinding; no worker
+                # thread or native iterator is closed asynchronously.
+                query_cancel_event.set()
+                raise IslandExecutionTimeout(
+                    f"IslandDB query {query_id!r} timed out after "
+                    f"{execution_timeout:g} seconds"
+                )
+
+        def execution_timeout_from(exc: BaseException) -> IslandExecutionTimeout:
+            return IslandExecutionTimeout(
+                f"IslandDB query {query_id!r} timed out after "
+                f"{execution_timeout:g} seconds"
+            )
+
         telemetry = _IslandTelemetry()
         range_cache = None
-        range_start = None
+        query_range_metrics = _QueryRangeMetrics()
         session: Optional[SpillSession] = None
         inner_stream: Optional[ArrowBatchStream] = None
         try:
@@ -2347,7 +3990,7 @@ class IslandDB:
             # it inside the reservation/telemetry cleanup boundary so a bad
             # deployment cannot leak a governor slot or sampler thread.
             range_cache = self._get_range_cache()
-            range_start = range_cache.metrics() if range_cache is not None else None
+            check_execution_deadline()
             timer_capture("CONNECTING")
             if plan.advice == ExecutionAdvice.ISLAND_SPILL:
                 if not settings.SUPERTABLE_ISLAND_SPILL_ENABLED:
@@ -2357,6 +4000,9 @@ class IslandDB:
                     budget_bytes=plan.spill_budget_bytes,
                     min_free_bytes=self._policy.min_spill_free_bytes,
                     query_id=query_id,
+                    cancel_event=query_cancel_event,
+                    deadline_monotonic=deadline_monotonic,
+                    monotonic=_monotonic,
                 )
                 session.__enter__()
                 inner_stream, query, optimized_plan = self._prepare_spilled_stream(
@@ -2366,7 +4012,9 @@ class IslandDB:
                     log_prefix,
                     plan,
                     session,
+                    range_metrics_out=query_range_metrics,
                 )
+                check_execution_deadline()
                 schema, batches = inner_stream.schema, inner_stream
             else:
                 lazy_result, _, query, optimized_plan = self._prepare_lazy_query(
@@ -2375,7 +4023,9 @@ class IslandDB:
                     timer_capture,
                     log_prefix,
                     batch_rows=plan.batch_rows,
+                    range_metrics_out=query_range_metrics,
                 )
+                check_execution_deadline()
                 schema, batches = self._lazy_batches(
                     lazy_result, batch_rows=plan.batch_rows,
                 )
@@ -2388,6 +4038,9 @@ class IslandDB:
                     session.close()
             finally:
                 reservation.release()
+                release_execution_slot()
+            if isinstance(exc, SpillDeadlineExceeded):
+                raise execution_timeout_from(exc) from exc
             raise IslandUnsupportedError(
                 f"bounded spill could not be honored: {exc}"
             ) from exc
@@ -2400,6 +4053,7 @@ class IslandDB:
                     session.close()
             finally:
                 reservation.release()
+                release_execution_slot()
             raise
 
         result_rows = 0
@@ -2407,21 +4061,36 @@ class IslandDB:
 
         def measured_batches():
             nonlocal result_rows, result_bytes
-            for batch in batches:
-                result_rows += int(batch.num_rows)
-                result_bytes += int(batch.nbytes)
-                yield batch
+            batch_iterator = iter(batches)
+            try:
+                while True:
+                    check_execution_deadline()
+                    try:
+                        batch = next(batch_iterator)
+                    except StopIteration:
+                        break
+                    except SpillDeadlineExceeded as exc:
+                        raise execution_timeout_from(exc) from exc
+                    # Native calls are cooperative rather than force-killed.
+                    # Check immediately after each call so a batch completed
+                    # after the deadline is never exposed to the client.
+                    check_execution_deadline()
+                    result_rows += int(batch.num_rows)
+                    result_bytes += int(batch.nbytes)
+                    yield batch
+            finally:
+                close_batches = getattr(batch_iterator, "close", None)
+                if callable(close_batches):
+                    close_batches()
 
-        def finish() -> None:
-            range_metrics: Dict[str, object] = {}
-            if range_cache is not None and range_start is not None:
-                current = range_cache.metrics()
-                range_metrics = {
-                    f"range_{name}": max(
-                        0, int(value) - int(getattr(range_start, name, 0)),
-                    )
-                    for name, value in current.as_dict().items()
-                }
+        def finish_profile() -> None:
+            # Per-reader sinks isolate this query even when the process-wide
+            # RangeCache serves concurrent queries. A cumulative before/after
+            # delta would incorrectly charge neighboring reads.
+            range_metrics = {
+                f"range_{name}": int(value)
+                for name, value in query_range_metrics.as_dict().items()
+            }
             combined_cache = (
                 cache_metrics.as_dict()
                 if cache_metrics is not None else {}
@@ -2494,23 +4163,38 @@ class IslandDB:
                 spill_bytes=spill_peak,
                 spill_bytes_measured=session is not None,
             )
+            self._write_profile(query_manager.query_plan_path, self.last_profile)
+
+        def finish() -> None:
             try:
-                self._write_profile(query_manager.query_plan_path, self.last_profile)
-                if session is not None:
-                    session.close()
+                finish_profile()
             finally:
-                if not _defer_reservation_release:
-                    reservation.release()
+                try:
+                    # Profile persistence is diagnostic and must never pin a
+                    # query-private spill directory when it fails.
+                    if session is not None:
+                        session.close()
+                finally:
+                    if not _defer_reservation_release:
+                        reservation.release()
+                        release_execution_slot()
 
         stream = ArrowBatchStream(
             schema,
             measured_batches(),
             close_callback=finish,
+            cancel_event=query_cancel_event,
         )
         if _defer_reservation_release:
             # Private handoff used only by the pandas facade so Arrow -> Polars
             # -> pandas conversion remains inside the same governor reservation.
-            stream._island_release_reservation = reservation.release
+            def release_deferred_resources() -> None:
+                try:
+                    reservation.release()
+                finally:
+                    release_execution_slot()
+
+            stream._island_release_reservation = release_deferred_resources
         return stream
 
     def execute(
@@ -2522,8 +4206,13 @@ class IslandDB:
         log_prefix: str = "",
         engine_config=None,
         cache_metrics=None,
+        _prepared: Optional[IslandPreparedQuery] = None,
     ) -> pd.DataFrame:
-        plan = self.resource_plan(reflection, parser, streaming_result=False)
+        prepared = _prepared or self.prepare_execution(
+            reflection, parser, streaming_result=False,
+        )
+        prepared.capability.require()
+        plan = prepared.resource_plan
         if plan.advice == ExecutionAdvice.STREAM_RESULT:
             raise ResultMemoryLimitExceeded(
                 f"{plan.reason}; call IslandDB.execute_stream()"
@@ -2537,13 +4226,14 @@ class IslandDB:
             engine_config=engine_config,
             cache_metrics=cache_metrics,
             _defer_reservation_release=True,
+            _prepared=prepared,
         )
         release = getattr(stream, "_island_release_reservation", lambda: None)
         try:
             with stream:
                 table = stream.collect_table(max_bytes=plan.result_memory_bytes)
             result = pl.from_arrow(table)
-            root = sqlglot.parse_one(parser.original_query, read="duckdb")
+            root = self._query_root(parser)
             if isinstance(root, exp.Select):
                 result = self._normalize_aggregate_dtypes(result, root)
             return self._to_duckdb_pandas(result)
@@ -2552,6 +4242,7 @@ class IslandDB:
 
 
 __all__ = [
-    "IslandDB", "IslandCapability", "IslandProfile",
-    "IslandUnsupportedError", "IslandIntegrityError", "ArrowBatchStream",
+    "IslandDB", "IslandCapability", "IslandPreparedQuery", "IslandProfile",
+    "IslandUnsupportedError", "IslandExecutionTimeout", "IslandIntegrityError",
+    "ArrowBatchStream",
 ]

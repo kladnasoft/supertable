@@ -1,4 +1,4 @@
-"""Parity-first DuckDB Lite versus IslandDB benchmark runner.
+"""Parity-first DuckDB versus IslandDB benchmark runner.
 
 Each engine series executes in a fresh Python process.  Process startup is not
 timed: the first production Executor call is the cold engine/application-cache
@@ -29,13 +29,133 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from .corpus import build_workloads, normalize_workloads, plan_workload
+from .corpus import (
+    GIB,
+    build_workloads,
+    normalize_workloads,
+    plan_workload,
+    repeated_manifest_paths,
+)
 
 
 RESULT_FORMAT_VERSION = 1
-ENGINE_DUCKDB = "duckdb_lite"
+ENGINE_DUCKDB = "duckdb"
 ENGINE_ISLAND = "islanddb"
 ENGINE_NAMES = (ENGINE_DUCKDB, ENGINE_ISLAND)
+# The spill workload has only 1,024 generated groups (roughly 256 KiB for the
+# normal 30-column corpus), while IslandDB's safe generic result estimator must
+# assume one output row per input row.  Keep the benchmark escape hatch bounded
+# independently of that conservative estimate.
+ISLAND_STREAM_RESULT_MAX_BYTES = 64 * 1024**2
+
+
+def _duckdb_memory_limit_text(limit_bytes: int) -> str:
+    """Return an exact DuckDB-valid size without falling back to bare GB."""
+    if limit_bytes <= 0:
+        raise ValueError("memory limit must be positive")
+    units = ((GIB, "GiB"), (1024**2, "MiB"), (1024, "KiB"))
+    for divisor, suffix in units:
+        if limit_bytes % divisor == 0:
+            return f"{limit_bytes // divisor}{suffix}"
+    # DuckDB accepts fractional GiB values. Seventeen significant digits are
+    # sufficient to round-trip the integer-byte ratio used by this harness.
+    return f"{limit_bytes / GIB:.17g}GiB"
+
+
+def _cgroup_v2_memory_telemetry(
+    *,
+    proc_cgroup: str | Path = "/proc/self/cgroup",
+    cgroup_root: str | Path = "/sys/fs/cgroup",
+) -> dict[str, Any]:
+    """Read this process' cgroup-v2 memory counters without escaping its mount."""
+    telemetry: dict[str, Any] = {"available": False}
+    try:
+        proc_text = Path(proc_cgroup).read_text(encoding="utf-8")
+    except OSError as exc:
+        telemetry["reason"] = f"proc_cgroup_unavailable:{type(exc).__name__}"
+        return telemetry
+
+    relative: str | None = None
+    for line in proc_text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            relative = parts[2].lstrip("/")
+            break
+    if relative is None:
+        telemetry["reason"] = "cgroup_v2_entry_missing"
+        return telemetry
+
+    try:
+        root = Path(cgroup_root).resolve(strict=True)
+        current = (root / relative).resolve(strict=True)
+        current.relative_to(root)
+    except (OSError, ValueError) as exc:
+        telemetry["reason"] = f"cgroup_path_invalid:{type(exc).__name__}"
+        return telemetry
+
+    def safe_counter(name: str) -> Path:
+        candidate = (current / name).resolve(strict=True)
+        candidate.relative_to(current)
+        return candidate
+
+    def read_scalar(name: str) -> tuple[int | None, str | None]:
+        try:
+            raw = safe_counter(name).read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return None, None
+        if raw == "max":
+            return None, raw
+        try:
+            return max(0, int(raw)), raw
+        except ValueError:
+            return None, raw[:128]
+
+    def read_events(name: str) -> dict[str, int] | None:
+        try:
+            raw = safe_counter(name).read_text(encoding="utf-8")[:65_536]
+        except (OSError, ValueError):
+            return None
+        values: dict[str, int] = {}
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                values[parts[0]] = max(0, int(parts[1]))
+            except ValueError:
+                continue
+        return values
+
+    def read_text(name: str, limit: int = 65_536) -> str | None:
+        try:
+            return safe_counter(name).read_text(encoding="utf-8")[:limit]
+        except (OSError, ValueError):
+            return None
+
+    normalized_relative = current.relative_to(root)
+    normalized_path = "/" if str(normalized_relative) == "." else f"/{normalized_relative}"
+    telemetry.update({
+        "available": True,
+        "path": normalized_path,
+        "semantics": "cumulative counters for the containing cgroup",
+    })
+    for prefix, filename in (
+        ("memory_current", "memory.current"),
+        ("memory_peak", "memory.peak"),
+        ("memory_max", "memory.max"),
+        ("swap_current", "memory.swap.current"),
+        ("swap_peak", "memory.swap.peak"),
+        ("swap_max", "memory.swap.max"),
+    ):
+        parsed, raw = read_scalar(filename)
+        telemetry[f"{prefix}_bytes"] = parsed
+        if raw is not None and parsed is None:
+            telemetry[f"{prefix}_raw"] = raw
+    telemetry["memory_events"] = read_events("memory.events")
+    telemetry["memory_stat"] = read_events("memory.stat")
+    telemetry["memory_pressure"] = read_text("memory.pressure")
+    telemetry["io_stat"] = read_text("io.stat")
+    return telemetry
 
 
 class BenchmarkUnavailableError(RuntimeError):
@@ -135,7 +255,7 @@ def _resolve_engine(engine_name: str):
     from supertable.engine.engine_enum import Engine
 
     if engine_name == ENGINE_DUCKDB:
-        return Engine.DUCKDB_LITE
+        return Engine.DUCKDB
     if engine_name == ENGINE_ISLAND:
         # ISLANDDB / islanddb is the public contract.  The second spelling is a
         # short compatibility bridge for development branches and can be
@@ -160,7 +280,7 @@ def islanddb_available() -> bool:
 
 def _build_reflection(plan: Mapping[str, Any]):
     from supertable.data_classes import (
-        Reflection, RowGroupSelection, SuperSnapshot,
+        IntegerDomainBound, Reflection, RowGroupSelection, SuperSnapshot,
     )
 
     files = [str(path) for path in plan["files"]]
@@ -187,6 +307,22 @@ def _build_reflection(plan: Mapping[str, Any]):
         },
         candidate_rows=int(plan.get("candidate_rows") or 0),
         candidate_rows_complete=True,
+        column_max_value_bytes={
+            str(column): int(plan["payload_width"])
+            for column in plan["required_columns"]
+            if str(column).startswith("payload_")
+        },
+        integer_domain_bounds={
+            str(column).casefold(): IntegerDomainBound(
+                minimum=values.get("minimum"),
+                maximum=values.get("maximum"),
+                has_null=values.get("has_null", False),
+            )
+            for column, values in (
+                plan.get("integer_domain_bounds") or {}
+            ).items()
+            if isinstance(values, Mapping)
+        },
     )
     return Reflection(
         storage_type="LocalBenchmarkCorpus",
@@ -197,14 +333,12 @@ def _build_reflection(plan: Mapping[str, Any]):
         source_bytes=int(plan["candidate_source_bytes"]),
         row_group_scan_bytes=int(plan.get("eligible_pushdown_bytes") or 0),
         row_group_scan_bytes_complete=True,
-        # Benchmark manifests do not yet persist exact uncompressed chunks.
-        # Use a conservative 8x upper planning estimate and label it complete
-        # for the generated fixed-width/high-entropy corpus only.
-        decoded_bytes=max(
-            int(plan.get("eligible_pushdown_bytes") or 0) * 8,
-            int(plan.get("estimated_reflection_bytes") or 0),
-        ),
-        decoded_bytes_complete=True,
+        # The generator writes only non-null fixed-width Arrow fields. The
+        # corpus planner derives an exact selected-row value-buffer width from
+        # that sealed schema; this complete estimate is benchmark-only and must
+        # not be generalized to arbitrary Parquet Binary/String columns.
+        decoded_bytes=int(plan["estimated_decoded_bytes"]),
+        decoded_bytes_complete=bool(plan["decoded_estimate_complete"]),
     )
 
 
@@ -319,6 +453,78 @@ def _rss_bytes() -> int | None:
         return None
 
 
+def _proc_io_counters(path: str | Path = "/proc/self/io") -> dict[str, int] | None:
+    """Read Linux process-I/O counters; return ``None`` when unavailable."""
+    try:
+        raw = Path(path).read_text(encoding="ascii")
+    except OSError:
+        return None
+    counters: dict[str, int] = {}
+    for line in raw.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        try:
+            counters[key.strip()] = max(0, int(value.strip()))
+        except ValueError:
+            continue
+    return counters or None
+
+
+def _counter_delta(
+    before: Mapping[str, int] | None,
+    after: Mapping[str, int] | None,
+) -> dict[str, int] | None:
+    if before is None or after is None:
+        return None
+    return {
+        key: max(0, int(after[key]) - int(before[key]))
+        for key in sorted(before.keys() & after.keys())
+    }
+
+
+def _validate_cold_physical_read(
+    *,
+    engine_name: str,
+    plan: Mapping[str, Any],
+    cold_advice: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    minimum_fraction: float,
+) -> dict[str, Any]:
+    """Fail rather than label a metadata/page-cache hit as a full cold scan."""
+    if minimum_fraction <= 0 or minimum_fraction > 1:
+        raise ValueError("minimum cold-read fraction must be in (0, 1]")
+    if cold_advice.get("supported") is not True or int(cold_advice.get("errors", 0)):
+        raise BenchmarkUnavailableError(
+            "verified cold physical reads require successful POSIX_FADV_DONTNEED "
+            "for every source file"
+        )
+    # Repeated source paths create a larger logical scan without a second copy
+    # on disk. The kernel can satisfy repeats two..N from page cache inside one
+    # query, so verified block I/O is bounded against unique backing chunks.
+    expected = int(
+        plan.get("unique_estimated_pushdown_bytes")
+        or plan.get("estimated_pushdown_bytes")
+        or 0
+    )
+    observed = int((sample.get("process_io_delta") or {}).get("read_bytes") or 0)
+    fraction = observed / expected if expected > 0 else 0.0
+    verification = {
+        "expected_projected_bytes": expected,
+        "observed_process_read_bytes": observed,
+        "observed_fraction": fraction,
+        "minimum_fraction": minimum_fraction,
+        "passed": fraction >= minimum_fraction,
+    }
+    if not verification["passed"]:
+        raise BenchmarkWorkerError(
+            f"{engine_name} cold full scan read only {observed:,} physical bytes "
+            f"for {expected:,} projected bytes ({fraction:.3%}); refusing to "
+            "report a full-source cold benchmark"
+        )
+    return verification
+
+
 class _PeakRSS:
     def __init__(self, interval_s: float = 0.002):
         self.interval_s = interval_s
@@ -424,20 +630,43 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
     arrow_pool = pa.default_memory_pool()
     arrow_before = int(arrow_pool.bytes_allocated())
 
+    process_io_before = _proc_io_counters()
     cpu_start = time.process_time()
     wall_start = time.perf_counter()
+    island_streaming_result = bool(plan.get("island_streaming_result")) and (
+        str(engine.value) == ENGINE_ISLAND
+    )
     with _PeakRSS() as rss:
-        frame, used = executor.execute(
-            engine=engine,
-            reflection=reflection,
-            parser=parser,
-            query_manager=query_manager,
-            timer=timer,
-            plan_stats=plan_stats,
-            log_prefix="[islanddb.benchmark] ",
-        )
+        if island_streaming_result:
+            stream, used = executor.execute_stream(
+                engine=engine,
+                reflection=reflection,
+                parser=parser,
+                query_manager=query_manager,
+                timer=timer,
+                plan_stats=plan_stats,
+                log_prefix="[islanddb.benchmark] ",
+            )
+            with stream:
+                table = stream.collect_table(
+                    max_bytes=ISLAND_STREAM_RESULT_MAX_BYTES,
+                )
+            frame = table.to_pandas()
+            result_mode = "arrow_stream"
+        else:
+            frame, used = executor.execute(
+                engine=engine,
+                reflection=reflection,
+                parser=parser,
+                query_manager=query_manager,
+                timer=timer,
+                plan_stats=plan_stats,
+                log_prefix="[islanddb.benchmark] ",
+            )
+            result_mode = "pandas"
     wall_seconds = time.perf_counter() - wall_start
     cpu_seconds = time.process_time() - cpu_start
+    process_io_after = _proc_io_counters()
     arrow_after = int(arrow_pool.bytes_allocated())
     arrow_peak = int(arrow_pool.max_memory())
     cache_after = _tree_footprint(cache_root)
@@ -458,11 +687,15 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
     return {
         "sample_index": sample_index,
         "engine": str(used),
+        "result_mode": result_mode,
         "wall_seconds": wall_seconds,
         "cpu_seconds": cpu_seconds,
         "rss_baseline_bytes": rss.baseline,
         "rss_peak_bytes": rss.peak,
         "rss_peak_delta_bytes": rss.delta,
+        "process_io_before": process_io_before,
+        "process_io_after": process_io_after,
+        "process_io_delta": _counter_delta(process_io_before, process_io_after),
         "arrow_bytes_before": arrow_before,
         "arrow_bytes_after": arrow_after,
         "arrow_peak_bytes_process": arrow_peak,
@@ -482,6 +715,8 @@ def run_engine_series_in_process(request: Mapping[str, Any]) -> dict[str, Any]:
     from supertable.engine.executor import Executor
     from supertable.storage.local_storage import LocalStorage
 
+    cgroup_before = _cgroup_v2_memory_telemetry()
+
     engine_name = str(request["engine"])
     engine = _resolve_engine(engine_name)
     plan = dict(request["plan"])
@@ -491,6 +726,25 @@ def run_engine_series_in_process(request: Mapping[str, Any]) -> dict[str, Any]:
     cold_mode = str(request.get("cold_mode", "process"))
     if cold_mode not in ("process", "fadvise"):
         raise ValueError("cold_mode must be process or fadvise")
+    configured_memory_limit = request.get("memory_limit_bytes")
+    if configured_memory_limit is not None:
+        configured_memory_limit = int(configured_memory_limit)
+        if configured_memory_limit <= 0:
+            raise ValueError("memory_limit_bytes must be positive")
+    configured_threads = request.get("threads")
+    if configured_threads is not None:
+        configured_threads = int(configured_threads)
+        if configured_threads <= 0:
+            raise ValueError("threads must be positive")
+    minimum_cold_read_fraction = request.get("minimum_cold_read_fraction")
+    if minimum_cold_read_fraction is not None:
+        minimum_cold_read_fraction = float(minimum_cold_read_fraction)
+        if minimum_cold_read_fraction <= 0 or minimum_cold_read_fraction > 1:
+            raise ValueError("minimum_cold_read_fraction must be in (0, 1]")
+        if cold_mode != "fadvise":
+            raise ValueError(
+                "minimum_cold_read_fraction requires cold_mode='fadvise'"
+            )
 
     cold_advice: dict[str, Any]
     if cold_mode == "fadvise":
@@ -514,17 +768,118 @@ def run_engine_series_in_process(request: Mapping[str, Any]) -> dict[str, Any]:
         sample["temperature"] = "cold" if index == 0 else "warm"
         samples.append(sample)
 
+    duckdb_connection = getattr(executor.duckdb_exec, "_con", None)
+    if bool(request.get("disable_caches", False)) and duckdb_connection is not None:
+        # Empty cannot override EngineConfig's historical non-empty default via
+        # environment resolution. Assert the benchmark contract directly after
+        # every production query has re-applied its live runtime settings.
+        duckdb_connection.execute("SET enable_external_file_cache=false")
+
     first_digest = samples[0]["result_digest"]
     if any(sample["result_digest"] != first_digest for sample in samples[1:]):
         raise RuntimeError(
             f"{engine_name} returned inconsistent results across cold/warm repeats"
         )
+    cold_read_verification = None
+    if minimum_cold_read_fraction is not None:
+        cold_read_verification = _validate_cold_physical_read(
+            engine_name=engine_name,
+            plan=plan,
+            cold_advice=cold_advice,
+            sample=samples[0],
+            minimum_fraction=minimum_cold_read_fraction,
+        )
+    # Record the actual parallelism used by the production executors.  A
+    # benchmark that silently pins one engine to a different worker count is
+    # not reproducible and can reverse the result for narrow scans.
+    import polars as pl
+
+    cgroup_after = _cgroup_v2_memory_telemetry()
+    cgroup_event_delta = _counter_delta(
+        cgroup_before.get("memory_events"),
+        cgroup_after.get("memory_events"),
+    )
+    if cgroup_event_delta and (
+        cgroup_event_delta.get("oom", 0)
+        or cgroup_event_delta.get("oom_kill", 0)
+        or cgroup_event_delta.get("oom_group_kill", 0)
+    ):
+        raise BenchmarkWorkerError(
+            f"{engine_name} triggered cgroup OOM events: {cgroup_event_delta}"
+        )
+
+    execution_context: dict[str, Any] = {
+        "logical_cpu_count": os.cpu_count(),
+        "polars_thread_pool_size": int(pl.thread_pool_size()),
+        "configured_memory_limit_bytes": configured_memory_limit,
+        "configured_threads": configured_threads,
+        "caches_disabled": bool(request.get("disable_caches", False)),
+        "duckdb_memory_limit_env": os.environ.get(
+            "SUPERTABLE_DUCKDB_MEMORY_LIMIT", ""
+        ),
+        "duckdb_http_metadata_cache_env": os.environ.get(
+            "SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE", ""
+        ),
+        "island_max_memory_bytes_env": os.environ.get(
+            "SUPERTABLE_ISLAND_MAX_MEMORY_BYTES", ""
+        ),
+        "duckdb_threads_override": os.environ.get(
+            "SUPERTABLE_DUCKDB_THREADS", ""
+        ),
+        "cgroup_v2": cgroup_after,
+        "cgroup_v2_before": cgroup_before,
+        "cgroup_memory_event_delta": cgroup_event_delta,
+    }
+    if duckdb_connection is not None:
+        try:
+            execution_context["duckdb_threads"] = int(
+                duckdb_connection.execute(
+                    "SELECT current_setting('threads')"
+                ).fetchone()[0]
+            )
+        except Exception:
+            execution_context["duckdb_threads"] = None
+        try:
+            execution_context["duckdb_memory_limit"] = str(
+                duckdb_connection.execute(
+                    "SELECT current_setting('memory_limit')"
+                ).fetchone()[0]
+            )
+        except Exception:
+            execution_context["duckdb_memory_limit"] = None
+        for setting in ("enable_external_file_cache", "temp_directory"):
+            try:
+                execution_context[f"duckdb_{setting}"] = _json_value(
+                    duckdb_connection.execute(
+                        f"SELECT current_setting('{setting}')"
+                    ).fetchone()[0]
+                )
+            except Exception:
+                execution_context[f"duckdb_{setting}"] = None
+    island_executor = getattr(executor, "island_exec", None)
+    island_resources = getattr(island_executor, "_resources", None)
+    island_policy = getattr(island_executor, "_policy", None)
+    execution_context["island_memory_limit_bytes"] = getattr(
+        island_resources, "memory_limit_bytes", None
+    )
+    execution_context["island_memory_available_bytes"] = getattr(
+        island_resources, "memory_available_bytes", None
+    )
+    execution_context["island_query_memory_fraction"] = getattr(
+        island_policy, "query_memory_fraction", None
+    )
+    execution_context["island_global_memory_fraction"] = getattr(
+        island_policy, "global_memory_fraction", None
+    )
+
     return {
         "engine": engine_name,
         "engine_value": str(engine.value),
+        "execution_context": execution_context,
         "cold_definition": "fresh worker process and fresh engine connection",
         "os_cache_state": os_cache_state,
         "cold_advice": cold_advice,
+        "cold_physical_read_verification": cold_read_verification,
         "result": samples[0]["result"],
         "result_digest": first_digest,
         "samples": samples,
@@ -562,6 +917,16 @@ def run_isolated_worker(
     timeout_seconds: float = 3600,
 ) -> dict[str, Any]:
     """Run one engine series with env configuration fixed before imports."""
+    configured_memory_limit = request.get("memory_limit_bytes")
+    if configured_memory_limit is not None:
+        configured_memory_limit = int(configured_memory_limit)
+        if configured_memory_limit <= 0:
+            raise ValueError("memory_limit_bytes must be positive")
+    configured_threads = request.get("threads")
+    if configured_threads is not None:
+        configured_threads = int(configured_threads)
+        if configured_threads <= 0:
+            raise ValueError("threads must be positive")
     control_root = Path(tempfile.mkdtemp(prefix="islanddb-benchmark-control-"))
     request_path = control_root / "request.json"
     response_path = control_root / "response.json"
@@ -581,7 +946,31 @@ def run_isolated_worker(
     environment["SUPERTABLE_ISLAND_RANGE_CACHE_DIR"] = str(
         cache_path / "ranges"
     )
-    environment.setdefault("SUPERTABLE_DUCKDB_THREADS", "1")
+    if configured_memory_limit is not None:
+        environment["SUPERTABLE_DUCKDB_MEMORY_LIMIT"] = (
+            _duckdb_memory_limit_text(configured_memory_limit)
+        )
+        environment["SUPERTABLE_ISLAND_MAX_MEMORY_BYTES"] = str(
+            configured_memory_limit
+        )
+        # The CLI value is already the benchmark's conservative internal
+        # workspace (normally 6GiB inside an 8GiB cgroup), so do not apply the
+        # production 60%/80% admission fractions a second time.
+        environment["SUPERTABLE_ISLAND_MEMORY_FRACTION"] = "1.0"
+        environment["SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION"] = "1.0"
+    if configured_threads is not None:
+        environment["SUPERTABLE_DUCKDB_THREADS"] = str(configured_threads)
+        environment["SUPERTABLE_ISLAND_CPU_MAX"] = str(configured_threads)
+        environment["SUPERTABLE_ISLAND_IO_WORKERS_MAX"] = str(configured_threads)
+        environment["POLARS_MAX_THREADS"] = str(configured_threads)
+    if bool(request.get("disable_caches", False)):
+        # EngineConfig treats an empty env value as absent and restores its 5GB
+        # default. "0" normalizes to the explicit disabled representation and
+        # apply_runtime_pragmas turns the cache off before user SQL executes.
+        environment["SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE"] = "0"
+        environment["SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE"] = "false"
+        environment["SUPERTABLE_ISLAND_CACHE_ENABLED"] = "false"
+        environment["SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED"] = "false"
     existing_pythonpath = environment.get("PYTHONPATH", "")
     environment["PYTHONPATH"] = (
         str(repo_root)
@@ -688,12 +1077,30 @@ class ComparisonConfig:
     )
     cold_mode: str = "process"
     timeout_seconds: float = 3600
+    memory_limit_bytes: int | None = None
+    minimum_cold_read_fraction: float | None = None
+    source_repeat: int = 1
+    threads: int | None = None
+    disable_caches: bool = False
 
     def __post_init__(self) -> None:
         if self.warm_repeats <= 0:
             raise ValueError("warm_repeats must be positive")
         if self.cold_mode not in ("process", "fadvise"):
             raise ValueError("cold_mode must be process or fadvise")
+        if self.memory_limit_bytes is not None and self.memory_limit_bytes <= 0:
+            raise ValueError("memory_limit_bytes must be positive")
+        if self.minimum_cold_read_fraction is not None:
+            if not 0 < self.minimum_cold_read_fraction <= 1:
+                raise ValueError("minimum_cold_read_fraction must be in (0, 1]")
+            if self.cold_mode != "fadvise":
+                raise ValueError(
+                    "minimum_cold_read_fraction requires cold_mode='fadvise'"
+                )
+        if self.source_repeat <= 0:
+            raise ValueError("source_repeat must be positive")
+        if self.threads is not None and self.threads <= 0:
+            raise ValueError("threads must be positive")
 
 
 def compare_manifest(
@@ -709,8 +1116,26 @@ def compare_manifest(
     The two parity workers always finish and compare before either timing
     worker is launched for that workload.
     """
+    prepared_repeat = int(manifest.get("source_repeat") or 1)
+    prepared_mode = str(manifest.get("source_repeat_mode") or "none")
+    if prepared_mode == "none" and config.source_repeat > 1:
+        with repeated_manifest_paths(manifest, config.source_repeat) as repeated:
+            return compare_manifest(
+                repeated,
+                cache_root=cache_root,
+                home_root=home_root,
+                config=config,
+                worker_runner=worker_runner,
+            )
+    if prepared_repeat != config.source_repeat:
+        raise ValueError(
+            "execution manifest source_repeat does not match comparison config"
+        )
     selected_names = normalize_workloads(config.workloads)
-    workloads = build_workloads(int(manifest["total_rows"]))
+    workloads = build_workloads(
+        int(manifest["total_rows"]),
+        payload_columns=int(manifest["spec"].get("payload_columns", 8)),
+    )
     tier = str(manifest["spec"]["tier"])
     cache_base = Path(cache_root).expanduser().resolve()
     home_base = Path(home_root).expanduser().resolve()
@@ -719,6 +1144,14 @@ def compare_manifest(
 
     for workload_index, name in enumerate(selected_names):
         plan = plan_workload(manifest, workloads[name])
+        if name in {"full_scan", "spill_group"} and float(
+            plan["projected_source_fraction"]
+        ) < 0.95:
+            raise BenchmarkUnavailableError(
+                f"{name} selected-column chunks cover less than 95% of the "
+                "physical corpus; increase payload columns/width before claiming "
+                "a full-source benchmark"
+            )
         label = f"{tier}/{name}"
         parity_results: dict[str, Any] = {}
         for engine_name in ENGINE_NAMES:
@@ -728,6 +1161,9 @@ def compare_manifest(
                 "plan": plan,
                 "warm_repeats": 0,
                 "cold_mode": "process",
+                "memory_limit_bytes": config.memory_limit_bytes,
+                "threads": config.threads,
+                "disable_caches": config.disable_caches,
             }
             parity_results[engine_name] = worker_runner(
                 request,
@@ -754,6 +1190,10 @@ def compare_manifest(
                 "plan": plan,
                 "warm_repeats": config.warm_repeats,
                 "cold_mode": config.cold_mode,
+                "memory_limit_bytes": config.memory_limit_bytes,
+                "minimum_cold_read_fraction": config.minimum_cold_read_fraction,
+                "threads": config.threads,
+                "disable_caches": config.disable_caches,
             }
             result = worker_runner(
                 request,
@@ -784,15 +1224,26 @@ def compare_manifest(
                     key: plan[key]
                     for key in (
                         "source_bytes",
+                        "unique_source_bytes",
+                        "source_repeat",
+                        "source_repeat_mode",
                         "candidate_source_bytes",
                         "estimated_reflection_bytes",
                         "estimated_pushdown_bytes",
+                        "unique_estimated_reflection_bytes",
+                        "unique_estimated_pushdown_bytes",
+                        "estimated_decoded_bytes",
+                        "decoded_row_width",
+                        "decoded_estimate_complete",
+                        "projected_source_fraction",
                         "files_before_prune",
+                        "unique_files_before_prune",
                         "files_after_prune",
                         "files_pruned",
                         "row_groups_after_file_prune",
                         "row_groups_pushdown_eligible",
                         "required_columns",
+                        "island_streaming_result",
                     )
                 },
                 "parity": {
@@ -812,7 +1263,11 @@ def compare_manifest(
         "tier": tier,
         "target_source_bytes": int(manifest["target_source_bytes"]),
         "actual_source_bytes": int(manifest["actual_source_bytes"]),
+        "logical_source_bytes": int(manifest["actual_source_bytes"])
+        * config.source_repeat,
+        "source_repeat": config.source_repeat,
         "total_rows": int(manifest["total_rows"]),
+        "logical_total_rows": int(manifest["total_rows"]) * config.source_repeat,
         "file_count": len(manifest.get("files") or []),
         "run_id": run_id,
         "workloads": records,
@@ -850,7 +1305,7 @@ def build_artifact(
     return {
         "format_version": RESULT_FORMAT_VERSION,
         "generated_unix_ms": int(time.time() * 1000),
-        "benchmark": "duckdb_lite_vs_islanddb",
+        "benchmark": "duckdb_vs_islanddb",
         "oracle": ENGINE_DUCKDB,
         "parity_is_blocking": True,
         "performance_thresholds_are_blocking": False,

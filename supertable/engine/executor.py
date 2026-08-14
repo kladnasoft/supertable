@@ -17,8 +17,7 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 
 from supertable.engine.engine_enum import Engine
-from supertable.engine.duckdb_lite import DuckDBLite
-from supertable.engine.duckdb_pro import DuckDBPro
+from supertable.engine.duckdb_engine import DuckDB
 from supertable.engine.engine_config import (
     AutoRoutingRule,
     EngineRuntimeConfig,
@@ -41,20 +40,35 @@ from supertable.engine.island_resources import (
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
+from supertable.storage.storage_interface import StorageInterface
 
 
-# Module-level singleton for the pro executor so the persistent
-# connection survives across Executor instances (which are per-request).
-_pro_singleton: Optional[DuckDBPro] = None
-_pro_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDBPro]" = (
+_duckdb_singleton: Optional[DuckDB] = None
+_duckdb_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDB]" = (
     weakref.WeakValueDictionary()
 )
-_pro_lock = __import__("threading").Lock()
-_lite_singleton: Optional[DuckDBLite] = None
-_lite_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDBLite]" = (
-    weakref.WeakValueDictionary()
-)
-_lite_lock = __import__("threading").Lock()
+_duckdb_lock = __import__("threading").Lock()
+
+
+def _storage_supports_bounded_ranges(storage: Optional[object]) -> bool:
+    """Return whether a backend advertises a real bounded-range method.
+
+    The base StorageInterface method deliberately raises NotImplementedError.
+    Treating its mere presence as range support can make AUTO select IslandDB
+    and fail only after Arrow starts opening fragments. Custom duck-typed
+    adapters remain supported when they provide a callable implementation.
+    This is an availability check only; conditional identity mismatches during
+    an actual read remain fail-closed and must never trigger AUTO fallback.
+    """
+    if storage is None:
+        return False
+    method = getattr(storage, "read_range", None)
+    if not callable(method):
+        return False
+    return not (
+        isinstance(storage, StorageInterface)
+        and type(storage).read_range is StorageInterface.read_range
+    )
 
 
 def _fingerprint(values) -> str:
@@ -143,38 +157,20 @@ def _storage_identity(storage: Optional[object]) -> tuple:
     return tuple(parts)
 
 
-def _get_pro(
+def _get_duckdb(
         storage: Optional[object] = None, organization: str = "",
-) -> DuckDBPro:
-    global _pro_singleton
+) -> DuckDB:
+    global _duckdb_singleton
     key = (str(organization or ""), _storage_identity(storage))
-    with _pro_lock:
-        # Keep the historical reset hook used by tests/operators: assigning
-        # _pro_singleton=None clears every scoped singleton on the next access.
-        if _pro_singleton is None and _pro_singletons:
-            _pro_singletons.clear()
-        pro = _pro_singletons.get(key)
-        if pro is None:
-            pro = DuckDBPro(storage=storage)
-            _pro_singletons[key] = pro
-        _pro_singleton = pro
-        return pro
-
-
-def _get_lite(
-        storage: Optional[object] = None, organization: str = "",
-) -> DuckDBLite:
-    global _lite_singleton
-    key = (str(organization or ""), _storage_identity(storage))
-    with _lite_lock:
-        if _lite_singleton is None and _lite_singletons:
-            _lite_singletons.clear()
-        lite = _lite_singletons.get(key)
-        if lite is None:
-            lite = DuckDBLite(storage=storage)
-            _lite_singletons[key] = lite
-        _lite_singleton = lite
-        return lite
+    with _duckdb_lock:
+        if _duckdb_singleton is None and _duckdb_singletons:
+            _duckdb_singletons.clear()
+        engine = _duckdb_singletons.get(key)
+        if engine is None:
+            engine = DuckDB(storage=storage)
+            _duckdb_singletons[key] = engine
+        _duckdb_singleton = engine
+        return engine
 
 
 class Executor:
@@ -193,7 +189,7 @@ class Executor:
     ):
         self.storage = storage
         self.organization = organization
-        self.lite_exec = _get_lite(storage=storage, organization=organization)
+        self.duckdb_exec = _get_duckdb(storage=storage, organization=organization)
         self.spark_exec = None
         self.island_exec = IslandDB(
             storage=storage, organization=organization,
@@ -353,6 +349,12 @@ class Executor:
 
         native = None
         island_plan = None
+        routing_storage = getattr(self, "storage", None)
+        island_range_available = bool(
+            not settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
+            or routing_storage is None
+            or _storage_supports_bounded_ranges(routing_storage)
+        )
         # Production AUTO only routes to Spark for the same conservative SQL
         # semantics that passed IslandDB's DuckDB differential capability gate.
         # This is a correctness fence around cross-dialect transpilation; an
@@ -364,7 +366,11 @@ class Executor:
             and getattr(self, "island_exec", None) is not None
         ):
             try:
-                native = self.island_exec.can_execute(reflection, parser)
+                native = self.island_exec.can_execute(
+                    reflection,
+                    parser,
+                    streaming_result=streaming_result,
+                )
                 native_supported = (
                     getattr(native, "supported", False) is True
                 )
@@ -372,7 +378,7 @@ class Executor:
                 policy_enables_island = any(
                     rule.engine is Engine.ISLANDDB for rule in routing_policy
                 )
-                if native_supported and (
+                if native_supported and island_range_available and (
                     settings.SUPERTABLE_ISLAND_AUTO_ENABLED
                     or policy_enables_island
                 ):
@@ -546,6 +552,7 @@ class Executor:
             island_supported=bool(
                 native is not None
                 and getattr(native, "supported", False) is True
+                and island_range_available
             ),
             spark_available=spark_available,
             spark_semantics_supported=spark_semantics_supported,
@@ -580,7 +587,7 @@ class Executor:
                 ),
             }
         decision = AdaptiveEngineRouter(
-            lite_max_bytes=cfg.engine_lite_max_bytes,
+            island_min_bytes=cfg.engine_island_min_bytes,
         ).decide(
             features,
             availability,
@@ -625,20 +632,17 @@ class Executor:
         explain_options: str = "",
     ) -> Tuple[pd.DataFrame, str]:
         # Resolve engine config live (Redis → env → default) for this query so
-        # UI changes take effect immediately without restart or cache.  Lite and
-        # Pro carry independent DuckDB pragmas; the shared auto-pick thresholds
-        # are identical in both, so either may drive the routing decision.
+        # UI changes take effect immediately without restart or cache.
         cfgs, routing_policy = resolve_engine_bundle(
             self.organization, self._get_catalog()
         )
-        lite_cfg = cfgs["lite"]
-        pro_cfg = cfgs["pro"]
+        duckdb_cfg = cfgs["duckdb"]
 
         chosen = (
             engine if engine != Engine.AUTO
             else self._auto_pick(
                 reflection,
-                lite_cfg,
+                duckdb_cfg,
                 parser=parser,
                 plan_stats=plan_stats,
                 routing_policy=routing_policy,
@@ -654,11 +658,14 @@ class Executor:
         })
         attempt_stage = "primary"
 
+        island_prepared = None
         if chosen == Engine.ISLANDDB:
             # Capability analysis is pure and must run before a potentially
             # multi-gigabyte cache fill. Explicit unsupported queries fail
             # visibly without downloading anything.
-            self.island_exec.can_execute(reflection, parser).require()
+            island_prepared = self.island_exec.prepare_execution(
+                reflection, parser, streaming_result=False,
+            )
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
@@ -668,6 +675,7 @@ class Executor:
             chosen == Engine.ISLANDDB
             and settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
             and self.storage is not None
+            and _storage_supports_bounded_ranges(self.storage)
         )
         if (
             chosen == Engine.ISLANDDB
@@ -685,13 +693,20 @@ class Executor:
             and engine != Engine.AUTO
             and not island_uses_ranges
         )
-        # Spark workers cannot see a coordinator-local path.  DuckDB consumes
-        # existing hits without forcing a cold whole-object download; explicit
-        # IslandDB populates the cache and holds eviction leases through fetch.
+        # Spark workers cannot see a coordinator-local path. DuckDB and
+        # IslandDB both consume already-complete objects without forcing a cold
+        # whole-object download. A selective/range Island query remains
+        # hit-only here: misses stay remote and are served by the sealed range
+        # cache, while complete hits are leased and exposed as ordinary local
+        # files. This prevents the two immutable cache tiers from needlessly
+        # downloading the same object twice.
         cache_is_useful = (
             cache is not None
             and chosen != Engine.SPARK_SQL
-            and not island_uses_ranges
+            # A LocalStorage reflection is already composed of ordinary local
+            # files. Range mode gains no lease or locality from cloning it and
+            # should not report a fictitious whole-object-cache hit.
+            and (not island_uses_ranges or not cache.source_is_local)
             and (
                 chosen == Engine.ISLANDDB
                 or not cache.source_is_local
@@ -726,8 +741,8 @@ class Executor:
             ):
                 # Coverage was warm during routing but the leases are acquired
                 # only here. If concurrent eviction won the race, retain AUTO's
-                # no-download guarantee and use Pro on original/remaining paths.
-                chosen = Engine.DUCKDB_PRO
+                # no-download guarantee and use DuckDB on original paths.
+                chosen = Engine.DUCKDB
                 execution_reflection = reflection
                 attempt_stage = "auto_fallback_cache"
 
@@ -738,30 +753,18 @@ class Executor:
                 },
             })
 
-            if chosen == Engine.DUCKDB_LITE:
-                df = self.lite_exec.execute(
+            if chosen == Engine.DUCKDB:
+                df = self.duckdb_exec.execute(
                     reflection=execution_reflection,
                     parser=parser,
                     query_manager=query_manager,
                     timer_capture=timer_capture,
                     log_prefix=log_prefix,
-                    engine_config=lite_cfg,
+                    engine_config=duckdb_cfg,
                     explain=explain,
                     explain_options=explain_options,
                 )
-                used = "duckdb_lite"
-
-            elif chosen == Engine.DUCKDB_PRO:
-                pro = _get_pro(storage=self.storage, organization=self.organization)
-                df = pro.execute(
-                    reflection=execution_reflection,
-                    parser=parser,
-                    query_manager=query_manager,
-                    timer_capture=timer_capture,
-                    log_prefix=log_prefix,
-                    engine_config=pro_cfg,
-                )
-                used = "duckdb_pro"
+                used = "duckdb"
 
             elif chosen == Engine.ISLANDDB:
                 if (
@@ -780,8 +783,9 @@ class Executor:
                         query_manager=query_manager,
                         timer_capture=timer_capture,
                         log_prefix=log_prefix,
-                        engine_config=lite_cfg,
+                        engine_config=duckdb_cfg,
                         cache_metrics=cache_metrics,
+                        _prepared=island_prepared,
                     )
                     used = "islanddb"
                     profile = self.island_exec.last_profile
@@ -805,26 +809,24 @@ class Executor:
                     # (for example mixed per-file types) rejected the native
                     # plan before user SQL execution. AUTO safely retains the
                     # already-localized files and runs the DuckDB oracle.
-                    pro = _get_pro(
-                        storage=self.storage,
-                        organization=self.organization,
-                    )
                     plan_stats.add_stat({
                         "ENGINE_ATTEMPT": {
-                            "engine": Engine.DUCKDB_PRO.value,
+                            "engine": Engine.DUCKDB.value,
                             "stage": "auto_fallback",
                             "reason_code": type(exc).__name__,
                         },
                     })
-                    df = pro.execute(
+                    df = self.duckdb_exec.execute(
                         reflection=execution_reflection,
                         parser=parser,
                         query_manager=query_manager,
                         timer_capture=timer_capture,
                         log_prefix=log_prefix,
-                        engine_config=pro_cfg,
+                        engine_config=duckdb_cfg,
+                        explain=explain,
+                        explain_options=explain_options,
                     )
-                    used = "duckdb_pro"
+                    used = "duckdb"
 
             elif chosen == Engine.SPARK_SQL:
                 if self.spark_exec is None:
@@ -881,7 +883,7 @@ class Executor:
             if engine != Engine.AUTO
             else self._auto_pick(
                 reflection,
-                cfgs["lite"],
+                cfgs["duckdb"],
                 parser=parser,
                 streaming_result=True,
                 plan_stats=plan_stats,
@@ -892,7 +894,9 @@ class Executor:
             raise IslandUnsupportedError(
                 f"streaming Arrow results require IslandDB; router selected {chosen.value}"
             )
-        self.island_exec.can_execute(reflection, parser).require()
+        island_prepared = self.island_exec.prepare_execution(
+            reflection, parser, streaming_result=True,
+        )
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
@@ -906,10 +910,20 @@ class Executor:
         island_uses_ranges = bool(
             settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
             and self.storage is not None
+            and _storage_supports_bounded_ranges(self.storage)
         )
-        cache_is_useful = bool(cache is not None and not island_uses_ranges)
+        # Match the materialized facade: range mode must never cold-populate a
+        # complete object, but it should consume an already-complete immutable
+        # hit under a lease for the entire stream lifetime.  Otherwise the same
+        # object can be cached twice (whole-object and ranges) and streaming
+        # behaves differently from execute().
+        cache_is_useful = bool(
+            cache is not None
+            and (not island_uses_ranges or not cache.source_is_local)
+        )
         if (
             cache_is_useful
+            and not island_uses_ranges
             and not cache.source_is_local
             and not cache.can_populate_all(reflection)
         ):
@@ -918,7 +932,11 @@ class Executor:
                 "within the configured shared-cache byte cap"
             )
         cache_context = (
-            cache.localized(reflection, populate=True)
+            cache.localized(
+                reflection,
+                populate=not island_uses_ranges,
+                tolerate_corrupt_hits=island_uses_ranges,
+            )
             if cache_is_useful
             else nullcontext((reflection, None))
         )
@@ -929,6 +947,7 @@ class Executor:
             if (
                 cache_metrics is not None
                 and cache_metrics.coverage_ratio != 1.0
+                and not island_uses_ranges
             ):
                 raise RuntimeError(
                     "IslandDB streaming requires complete cache localization"
@@ -941,8 +960,9 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
-                engine_config=cfgs["lite"],
+                engine_config=cfgs["duckdb"],
                 cache_metrics=cache_metrics,
+                _prepared=island_prepared,
             )
         except BaseException as exc:
             if entered:

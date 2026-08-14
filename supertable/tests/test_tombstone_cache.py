@@ -20,7 +20,12 @@ import polars as pl
 import pytest
 
 from supertable import processing
-from supertable.processing import load_tombstone, cache_tombstone, _TOMBSTONE_CACHE
+from supertable.processing import (
+    load_tombstone,
+    cache_tombstone,
+    tombstone_cache_identity,
+    _TOMBSTONE_CACHE,
+)
 
 _MOD = "supertable.processing"
 
@@ -208,3 +213,102 @@ class TestTombstoneCacheBounds:
                 load_tombstone("t/tombstone/v1.parquet")
                 load_tombstone("t/tombstone/v1.parquet")
                 assert mock_read.call_count == 2  # never cached
+def test_explicit_cache_identity_reuses_frame_across_rotating_read_paths(monkeypatch):
+    frame = _dv(1)
+    calls = []
+
+    def loader():
+        calls.append(1)
+        return frame
+
+    first = load_tombstone(
+        "https://signed-one.invalid/dv",
+        cache_identity="org:storage:raw/dv:digest",
+        loader=loader,
+    )
+    second = load_tombstone(
+        "https://signed-two.invalid/dv",
+        cache_identity="org:storage:raw/dv:digest",
+        loader=lambda: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+
+    assert first is second
+    assert calls == [1]
+
+
+def test_tombstone_cache_identity_isolates_organization_and_auth_scope():
+    class ScopedStorage:
+        def __init__(self, access_key: str):
+            self._aws_access_key_id = access_key
+
+        @staticmethod
+        def cache_namespace():
+            return {"provider": "test", "bucket": "shared"}
+
+        @staticmethod
+        def is_local_storage():
+            return False
+
+    path = "same/table/tombstone/v1.parquet"
+    storage_a = ScopedStorage("principal-a")
+    storage_b = ScopedStorage("principal-b")
+    key_a = tombstone_cache_identity(
+        path, organization="org-a", storage=storage_a,
+    )
+    assert key_a == tombstone_cache_identity(
+        path, organization="org-a", storage=storage_a,
+    )
+    assert key_a != tombstone_cache_identity(
+        path, organization="org-b", storage=storage_a,
+    )
+    assert key_a != tombstone_cache_identity(
+        path, organization="org-a", storage=storage_b,
+    )
+
+
+def test_same_raw_tombstone_key_cannot_alias_across_auth_scopes():
+    class ScopedStorage:
+        def __init__(self, access_key: str):
+            self._aws_access_key_id = access_key
+
+        @staticmethod
+        def cache_namespace():
+            return {"provider": "test", "bucket": "shared"}
+
+        @staticmethod
+        def is_local_storage():
+            return False
+
+    path = "same/table/tombstone/v1.parquet"
+    identity_a = tombstone_cache_identity(
+        path, organization="org", storage=ScopedStorage("principal-a"),
+    )
+    identity_b = tombstone_cache_identity(
+        path, organization="org", storage=ScopedStorage("principal-b"),
+    )
+    frame_a, frame_b = _dv(1), _dv(2)
+    cache_tombstone(path, frame_a, cache_identity=identity_a)
+    calls = []
+
+    def load_b():
+        calls.append(1)
+        return frame_b
+
+    first_b = load_tombstone(
+        path, cache_identity=identity_b, loader=load_b,
+    )
+    second_b = load_tombstone(
+        path,
+        cache_identity=identity_b,
+        loader=lambda: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+    still_a = load_tombstone(
+        path,
+        cache_identity=identity_a,
+        loader=lambda: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+
+    assert first_b is frame_b
+    assert second_b is frame_b
+    assert still_a is frame_a
+    assert calls == [1]

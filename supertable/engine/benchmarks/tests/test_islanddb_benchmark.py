@@ -10,13 +10,22 @@ from supertable.engine.benchmarks.corpus import (
     CorpusSpec,
     build_workloads,
     normalize_tiers,
+    normalize_workloads,
     plan_workload,
     prepare_corpus,
+    repeated_manifest_paths,
 )
 from supertable.engine.benchmarks.islanddb import build_parser, selected_tiers
 from supertable.engine.benchmarks.runner import (
     BenchmarkParityError,
+    BenchmarkWorkerError,
     ComparisonConfig,
+    _cgroup_v2_memory_telemetry,
+    _counter_delta,
+    _duckdb_memory_limit_text,
+    _execute_one,
+    _proc_io_counters,
+    _validate_cold_physical_read,
     assert_exact_parity,
     canonical_frame,
     compare_manifest,
@@ -49,11 +58,12 @@ def _file_digest(path: Path) -> str:
 
 
 def test_tier_aliases_and_large_opt_in():
-    assert normalize_tiers(["KB,64MiB", "1GB", "10gib"]) == [
+    assert normalize_tiers(["KB,64MiB", "1GB", "10gib", "50GB"]) == [
         "kb",
         "mb",
         "1gib",
         "10gib",
+        "50gib",
     ]
 
     parser = build_parser()
@@ -61,8 +71,256 @@ def test_tier_aliases_and_large_opt_in():
     with pytest.raises(ValueError, match="opt-in"):
         selected_tiers(args)
 
-    args = parser.parse_args(["--1gb", "--10gb", "--allow-large"])
-    assert selected_tiers(args) == ["1gib", "10gib"]
+    args = parser.parse_args(["--1gb", "--10gb", "--50gb", "--allow-large"])
+    assert selected_tiers(args) == ["1gib", "10gib", "50gib"]
+
+
+def test_full_scan_projects_every_public_column(tiny_manifest):
+    workload = build_workloads(
+        tiny_manifest["total_rows"], payload_columns=2,
+    )["full_scan"]
+    plan = plan_workload(tiny_manifest, workload)
+
+    assert plan["required_columns"] == [
+        "id", "event_ts", "metric", "dimension", "payload_00", "payload_01",
+    ]
+    assert plan["files_after_prune"] == plan["files_before_prune"]
+    assert plan["row_groups_pushdown_eligible"] == plan["row_groups_after_file_prune"]
+    assert plan["estimated_pushdown_bytes"] == plan["estimated_reflection_bytes"]
+    assert plan["projected_source_fraction"] >= 0.5
+    assert plan["decoded_row_width"] == 8 + 8 + 8 + 4 + 2 * 16
+    assert plan["estimated_decoded_bytes"] == (
+        plan["candidate_rows"] * plan["decoded_row_width"]
+    )
+    assert plan["decoded_estimate_complete"] is True
+    assert all(
+        f"MAX({column})" in plan["sql"] for column in plan["required_columns"]
+    )
+    assert "COUNT(*) AS row_count" in plan["sql"]
+
+
+def test_spill_group_projects_all_columns_and_requests_island_streaming(
+    tiny_manifest,
+):
+    workload = build_workloads(
+        tiny_manifest["total_rows"], payload_columns=2,
+    )["spill_group"]
+    plan = plan_workload(tiny_manifest, workload)
+
+    assert normalize_workloads(["spill_group"]) == ["spill_group"]
+    assert plan["required_columns"] == [
+        "id", "event_ts", "metric", "dimension", "payload_00", "payload_01",
+    ]
+    assert plan["files_after_prune"] == plan["files_before_prune"]
+    assert plan["estimated_pushdown_bytes"] == plan["estimated_reflection_bytes"]
+    assert plan["island_streaming_result"] is True
+    assert plan["sql"].startswith("SELECT dimension, COUNT(id) AS id_count")
+    assert "COUNT(event_ts) AS event_ts_count" in plan["sql"]
+    assert "COUNT(metric) AS metric_count" in plan["sql"]
+    assert "COUNT(payload_00) AS payload_00_count" in plan["sql"]
+    assert "COUNT(payload_01) AS payload_01_count" in plan["sql"]
+    assert "COUNT(dimension)" not in plan["sql"]
+    assert plan["sql"].endswith(
+        "FROM events GROUP BY dimension ORDER BY dimension"
+    )
+
+
+def test_spill_group_dispatches_only_island_through_bounded_stream(
+    tiny_manifest,
+):
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    from supertable.engine.engine_enum import Engine
+
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(
+            tiny_manifest["total_rows"], payload_columns=2,
+        )["spill_group"],
+    )
+
+    class FakeStream:
+        def __init__(self):
+            self.max_bytes = None
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.closed = True
+
+        def collect_table(self, *, max_bytes):
+            self.max_bytes = max_bytes
+            return pa.table({"dimension": pa.array([0], type=pa.int32())})
+
+    class FakeExecutor:
+        def __init__(self):
+            self.stream = FakeStream()
+            self.streaming_calls = 0
+            self.materialized_calls = 0
+
+        def execute_stream(self, **kwargs):
+            self.streaming_calls += 1
+            return self.stream, "islanddb"
+
+        def execute(self, **kwargs):
+            self.materialized_calls += 1
+            return pd.DataFrame({"dimension": pd.Series([0], dtype="int32")}), "duckdb"
+
+    island_executor = FakeExecutor()
+    island = _execute_one(island_executor, Engine.ISLANDDB, plan, 0)
+    assert island_executor.streaming_calls == 1
+    assert island_executor.materialized_calls == 0
+    assert island_executor.stream.closed is True
+    assert 0 < island_executor.stream.max_bytes <= 64 * 1024**2
+    assert island["result_mode"] == "arrow_stream"
+
+    duck_executor = FakeExecutor()
+    duck = _execute_one(duck_executor, Engine.DUCKDB, plan, 0)
+    assert duck_executor.streaming_calls == 0
+    assert duck_executor.materialized_calls == 1
+    assert duck["result_mode"] == "pandas"
+
+
+def test_source_repeat_is_explicit_and_preserves_unique_backing_metrics(tiny_manifest):
+    workload = build_workloads(
+        tiny_manifest["total_rows"], payload_columns=2,
+    )["full_scan"]
+    once = plan_workload(tiny_manifest, workload)
+    with repeated_manifest_paths(tiny_manifest, 5) as repeated_manifest:
+        repeated_paths = [
+            str(entry["path"]) for entry in repeated_manifest["files"]
+        ]
+        assert len(set(repeated_paths)) == len(repeated_paths)
+        repeated = plan_workload(repeated_manifest, workload)
+        original = Path(tiny_manifest["manifest_path"]).parent / str(
+            tiny_manifest["files"][0]["path"]
+        )
+        alias = Path(repeated_manifest["files"][len(tiny_manifest["files"])]["path"])
+        assert original.stat().st_ino == alias.stat().st_ino
+        alias_root = alias.parent.parent
+
+    assert repeated["source_repeat"] == 5
+    assert repeated["unique_source_bytes"] == once["source_bytes"]
+    assert repeated["source_bytes"] == once["source_bytes"] * 5
+    assert repeated["unique_estimated_pushdown_bytes"] == once[
+        "estimated_pushdown_bytes"
+    ]
+    assert repeated["estimated_pushdown_bytes"] == once[
+        "estimated_pushdown_bytes"
+    ] * 5
+    assert repeated["files_before_prune"] == once["files_before_prune"] * 5
+    assert repeated["unique_files_before_prune"] == once["files_before_prune"]
+    assert repeated["candidate_rows"] == once["candidate_rows"] * 5
+    assert repeated["source_repeat_mode"] == "distinct_hardlink_aliases"
+    assert not alias_root.exists()
+
+    with pytest.raises(ValueError, match="source_repeat"):
+        with repeated_manifest_paths(tiny_manifest, 0):
+            pass
+
+
+def test_memory_limit_rendering_is_duckdb_valid_and_exact_for_8gib():
+    assert _duckdb_memory_limit_text(8 * 1024**3) == "8GiB"
+    assert _duckdb_memory_limit_text(768 * 1024**2) == "768MiB"
+    with pytest.raises(ValueError, match="positive"):
+        _duckdb_memory_limit_text(0)
+
+    with pytest.raises(ValueError, match="source_repeat"):
+        ComparisonConfig(source_repeat=0)
+
+
+def test_cgroup_v2_memory_telemetry_reads_own_contained_counters(tmp_path):
+    root = tmp_path / "cgroup"
+    current = root / "bench.scope"
+    current.mkdir(parents=True)
+    proc = tmp_path / "self.cgroup"
+    proc.write_text("0::/bench.scope\n", encoding="utf-8")
+    values = {
+        "memory.current": "1234\n",
+        "memory.peak": "5678\n",
+        "memory.max": "max\n",
+        "memory.swap.current": "12\n",
+        "memory.swap.peak": "34\n",
+        "memory.swap.max": "0\n",
+        "memory.events": "low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\n",
+        "memory.stat": "anon 100\nfile 200\n",
+        "memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        "io.stat": "8:0 rbytes=10 wbytes=20 rios=1 wios=2\n",
+    }
+    for name, value in values.items():
+        (current / name).write_text(value, encoding="utf-8")
+
+    telemetry = _cgroup_v2_memory_telemetry(
+        proc_cgroup=proc, cgroup_root=root,
+    )
+
+    assert telemetry["available"] is True
+    assert telemetry["path"] == "/bench.scope"
+    assert telemetry["memory_current_bytes"] == 1234
+    assert telemetry["memory_peak_bytes"] == 5678
+    assert telemetry["memory_max_bytes"] is None
+    assert telemetry["memory_max_raw"] == "max"
+    assert telemetry["swap_max_bytes"] == 0
+    assert telemetry["memory_events"]["oom_kill"] == 5
+    assert telemetry["memory_stat"] == {"anon": 100, "file": 200}
+    assert telemetry["memory_pressure"].startswith("some ")
+    assert telemetry["io_stat"].startswith("8:0 ")
+
+
+def test_cgroup_v2_memory_telemetry_rejects_path_escape(tmp_path):
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (tmp_path / "outside").mkdir()
+    proc = tmp_path / "self.cgroup"
+    proc.write_text("0::/../outside\n", encoding="utf-8")
+
+    telemetry = _cgroup_v2_memory_telemetry(
+        proc_cgroup=proc, cgroup_root=root,
+    )
+
+    assert telemetry["available"] is False
+    assert telemetry["reason"].startswith("cgroup_path_invalid:")
+
+
+def test_process_io_counters_and_non_negative_delta(tmp_path):
+    counters = tmp_path / "io"
+    counters.write_text(
+        "rchar: 10\nwchar: 20\nread_bytes: 30\ninvalid: x\n",
+        encoding="ascii",
+    )
+    assert _proc_io_counters(counters) == {
+        "rchar": 10, "wchar": 20, "read_bytes": 30,
+    }
+    assert _counter_delta(
+        {"rchar": 10, "read_bytes": 40},
+        {"rchar": 25, "read_bytes": 30},
+    ) == {"rchar": 15, "read_bytes": 0}
+
+
+def test_physical_read_gate_uses_unique_backing_for_repeated_sources():
+    verification = _validate_cold_physical_read(
+        engine_name="duckdb",
+        plan={
+            "estimated_pushdown_bytes": 500,
+            "unique_estimated_pushdown_bytes": 100,
+        },
+        cold_advice={"supported": True, "errors": 0},
+        sample={"process_io_delta": {"read_bytes": 99}},
+        minimum_fraction=0.99,
+    )
+    assert verification["passed"] is True
+    assert verification["expected_projected_bytes"] == 100
+
+    with pytest.raises(BenchmarkWorkerError, match="refusing"):
+        _validate_cold_physical_read(
+            engine_name="islanddb",
+            plan={"unique_estimated_pushdown_bytes": 100},
+            cold_advice={"supported": True, "errors": 0},
+            sample={"process_io_delta": {"read_bytes": 98}},
+            minimum_fraction=0.99,
+        )
 
 
 def test_corpus_is_byte_deterministic_and_reusable(tmp_path):
@@ -135,7 +393,7 @@ def test_compare_stops_before_timing_on_parity_failure(tiny_manifest, tmp_path):
 
     def fake_worker(request, **kwargs):
         calls.append((request["purpose"], request["engine"]))
-        value = 1 if request["engine"] == "duckdb_lite" else 2
+        value = 1 if request["engine"] == "duckdb" else 2
         canonical = {"columns": ["value"], "dtypes": ["int64"], "rows": [[value]]}
         return {
             "result": canonical,
@@ -151,7 +409,7 @@ def test_compare_stops_before_timing_on_parity_failure(tiny_manifest, tmp_path):
             config=ComparisonConfig(warm_repeats=1, workloads=("point",)),
             worker_runner=fake_worker,
         )
-    assert calls == [("parity", "duckdb_lite"), ("parity", "islanddb")]
+    assert calls == [("parity", "duckdb"), ("parity", "islanddb")]
 
 
 def test_explicit_duckdb_production_worker_reports_cold_and_warm(tiny_manifest, tmp_path):
@@ -161,17 +419,41 @@ def test_explicit_duckdb_production_worker_reports_cold_and_warm(tiny_manifest, 
     result = run_isolated_worker(
         {
             "purpose": "smoke",
-            "engine": "duckdb_lite",
+            "engine": "duckdb",
             "plan": plan,
             "warm_repeats": 1,
             "cold_mode": "process",
+            "memory_limit_bytes": 256 * 1024**2,
+            "threads": 2,
+            "disable_caches": True,
         },
         cache_dir=tmp_path / "cache",
         home_dir=tmp_path / "home",
         timeout_seconds=120,
     )
 
-    assert result["engine_value"] == "duckdb_lite"
+    assert result["engine_value"] == "duckdb"
+    assert result["execution_context"]["duckdb_threads"] == 2
+    assert result["execution_context"]["polars_thread_pool_size"] == 2
+    assert result["execution_context"]["configured_threads"] == 2
+    assert result["execution_context"]["caches_disabled"] is True
+    assert result["execution_context"]["duckdb_http_metadata_cache_env"] == "false"
+    assert result["execution_context"]["duckdb_enable_external_file_cache"] is False
+    assert result["execution_context"]["duckdb_temp_directory"]
+    assert result["execution_context"]["configured_memory_limit_bytes"] == 256 * 1024**2
+    assert result["execution_context"]["duckdb_memory_limit_env"] == "256MiB"
+    assert result["execution_context"]["island_max_memory_bytes_env"] == str(
+        256 * 1024**2
+    )
+    assert "256" in result["execution_context"]["duckdb_memory_limit"]
+    assert result["execution_context"]["island_memory_limit_bytes"] <= 256 * 1024**2
+    assert result["execution_context"]["island_query_memory_fraction"] == 1.0
+    assert result["execution_context"]["island_global_memory_fraction"] == 1.0
+    assert "available" in result["execution_context"]["cgroup_v2"]
+    event_delta = result["execution_context"]["cgroup_memory_event_delta"] or {}
+    assert event_delta.get("oom", 0) == 0
+    assert event_delta.get("oom_kill", 0) == 0
+    assert result["execution_context"]["polars_thread_pool_size"] >= 1
     assert [sample["temperature"] for sample in result["samples"]] == ["cold", "warm"]
     assert all(sample["result_digest"] == result["result_digest"] for sample in result["samples"])
     assert result["samples"][0]["wall_seconds"] > 0
@@ -198,7 +480,79 @@ def test_explicit_islanddb_matches_duckdb_in_production_workers(tiny_manifest, t
             timeout_seconds=120,
         )
 
-    duck = run("duckdb_lite")
+    duck = run("duckdb")
     island = run("islanddb")
     assert assert_exact_parity(duck, island, label="production-smoke") == duck["result_digest"]
     assert island["samples"][0]["engine"] == "islanddb"
+
+
+@pytest.mark.skipif(not islanddb_available(), reason="Engine.ISLANDDB is not implemented")
+def test_full_scan_matches_in_production_workers(tiny_manifest, tmp_path):
+    workload = build_workloads(
+        tiny_manifest["total_rows"], payload_columns=2,
+    )["full_scan"]
+
+    def run(engine: str):
+        return run_isolated_worker(
+            {
+                "purpose": "full-scan-smoke-parity",
+                "engine": engine,
+                "plan": plan,
+                "warm_repeats": 0,
+                "cold_mode": "process",
+                "memory_limit_bytes": 256 * 1024**2,
+            },
+            cache_dir=tmp_path / "shared-cache",
+            home_dir=tmp_path / "home" / engine,
+            timeout_seconds=120,
+        )
+
+    with repeated_manifest_paths(tiny_manifest, 2) as repeated_manifest:
+        plan = plan_workload(repeated_manifest, workload)
+        duck = run("duckdb")
+        island = run("islanddb")
+    assert assert_exact_parity(duck, island, label="full-scan-smoke") == duck[
+        "result_digest"
+    ]
+    assert len(duck["result"]["rows"]) == 1
+    assert len(duck["result"]["rows"][0]) == 7
+    assert duck["result"]["rows"][0][0] == tiny_manifest["total_rows"] * 2
+
+
+@pytest.mark.skipif(not islanddb_available(), reason="Engine.ISLANDDB is not implemented")
+def test_spill_group_streaming_matches_duckdb_in_production_workers(
+    tiny_manifest, tmp_path,
+):
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(
+            tiny_manifest["total_rows"], payload_columns=2,
+        )["spill_group"],
+    )
+
+    def run(engine: str):
+        return run_isolated_worker(
+            {
+                "purpose": "spill-group-smoke-parity",
+                "engine": engine,
+                "plan": plan,
+                "warm_repeats": 0,
+                "cold_mode": "process",
+                "memory_limit_bytes": 256 * 1024**2,
+                "threads": 2,
+            },
+            cache_dir=tmp_path / "shared-cache",
+            home_dir=tmp_path / "home" / engine,
+            timeout_seconds=120,
+        )
+
+    duck = run("duckdb")
+    island = run("islanddb")
+
+    assert assert_exact_parity(duck, island, label="spill-group-smoke") == duck[
+        "result_digest"
+    ]
+    assert duck["samples"][0]["result_mode"] == "pandas"
+    assert island["samples"][0]["result_mode"] == "arrow_stream"
+    assert 0 < len(island["result"]["rows"]) <= 1_024
+    assert island["samples"][0]["plan_stats"]["RESULT_MODE"] == "arrow_stream"

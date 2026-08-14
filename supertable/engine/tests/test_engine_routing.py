@@ -37,7 +37,7 @@ GIB = 1024 ** 3
 
 def _cfg(spark_min_bytes: int) -> EngineRuntimeConfig:
     return EngineRuntimeConfig(
-        engine_lite_max_bytes=100 * 1024 * 1024,
+        engine_island_min_bytes=100 * 1024 * 1024,
         engine_spark_min_bytes=spark_min_bytes,
         engine_freshness_sec=300,
         duckdb_memory_limit="1GB",
@@ -62,7 +62,7 @@ class _RaisingCatalog:
 
 
 def _executor(catalog) -> Executor:
-    # Bypass __init__ (which builds a DuckDBLite); we only exercise routing.
+    # Bypass __init__ (which builds a DuckDB); we only exercise routing.
     e = Executor.__new__(Executor)
     e._catalog = catalog
     e.organization = "kladna-soft"
@@ -146,17 +146,17 @@ def test_auto_stays_on_duckdb_below_fleet_min():
 
 
 def test_auto_never_spark_without_active_cluster_even_when_huge():
-    # No active cluster: a 500 GiB job still stays on DuckDB (Pro for stable data).
+    # No active cluster: a 500 GiB job still stays on DuckDB (DuckDB for stable data).
     cat = _Catalog([])
     chosen = _executor(cat)._auto_pick(_reflection(500 * GIB), _cfg(10 * GIB))
-    assert chosen == Engine.DUCKDB_PRO
+    assert chosen == Engine.DUCKDB
 
 
 def test_auto_unknown_source_size_never_routes_spark_or_island(monkeypatch):
     cat = _Catalog([_active(1)])
     executor = _executor(cat)
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
     )
     reflection = _reflection(0)
     reflection.source_bytes_complete = False
@@ -168,7 +168,7 @@ def test_auto_unknown_source_size_never_routes_spark_or_island(monkeypatch):
 
     chosen = executor._auto_pick(reflection, _cfg(0), parser=object())
 
-    assert chosen is Engine.DUCKDB_PRO
+    assert chosen is Engine.DUCKDB
 
 
 def _bounded_island_plan():
@@ -183,7 +183,7 @@ def test_auto_routes_supported_bounded_query_to_islanddb(monkeypatch):
     """Decoded working-set bounds, not whole-file warmth, admit IslandDB."""
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
     )
     enabled = dataclasses.replace(
@@ -199,12 +199,36 @@ def test_auto_routes_supported_bounded_query_to_islanddb(monkeypatch):
     assert chosen is Engine.ISLANDDB
 
 
+def test_auto_rejects_island_when_storage_has_no_bounded_range_reader(
+    monkeypatch,
+):
+    """An enabled range cache is not proof that a backend can feed Arrow."""
+    executor = _executor(_Catalog([]))
+    executor.storage = object()
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
+        resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
+    )
+    enabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+        SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+    )
+    monkeypatch.setattr(executor_module, "settings", enabled)
+
+    chosen = executor._auto_pick(
+        _reflection(512 * 1024 * 1024), _cfg(10 * GIB), parser=object(),
+    )
+
+    assert chosen is Engine.DUCKDB
+
+
 def test_redis_policy_selects_island_by_effective_scan_even_when_auto_flag_off(
     monkeypatch,
 ):
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
     )
     disabled = dataclasses.replace(
@@ -240,7 +264,7 @@ def test_auto_uses_range_native_query_without_whole_file_warmth(monkeypatch):
     """Cold Island scans are eligible because only sealed ranges are fetched."""
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
     )
     enabled = dataclasses.replace(
@@ -260,7 +284,7 @@ def test_auto_uses_trusted_row_group_size_before_spark_threshold(monkeypatch):
     """A huge table with one tiny candidate row group is not a huge job."""
     executor = _executor(_Catalog([_active(1 * GIB)]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: _bounded_island_plan(),
     )
     reflection = _reflection(10 * GIB)
@@ -284,7 +308,7 @@ def test_auto_materialized_result_fails_before_fetch_when_streaming_is_required(
 ):
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
             advice=ExecutionAdvice.STREAM_RESULT,
             cpu_workers=2,
@@ -318,7 +342,7 @@ def test_auto_routes_decoded_heavy_small_object_to_spark(monkeypatch):
     """Compressed bytes cannot override a native decoded/operator warning."""
     executor = _executor(_Catalog([_active(1)]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
             advice=ExecutionAdvice.ROUTE_SPARK,
             cpu_workers=1,
@@ -350,7 +374,7 @@ def test_auto_never_demotes_native_memory_warning_to_lite_without_spark(
 ):
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: SimpleNamespace(supported=True),
+        can_execute=lambda reflection, parser, streaming_result=False: SimpleNamespace(supported=True),
         resource_plan=lambda reflection, parser, streaming_result: SimpleNamespace(
             advice=advice,
             cpu_workers=1,
@@ -367,7 +391,7 @@ def test_auto_never_demotes_native_memory_warning_to_lite_without_spark(
         _reflection(32 * 1024 * 1024), _cfg(0), parser=object(),
     )
 
-    assert chosen is Engine.DUCKDB_PRO
+    assert chosen is Engine.DUCKDB
 
 
 def test_auto_does_not_route_spark_when_job_fits_no_cluster_window():
@@ -378,13 +402,13 @@ def test_auto_does_not_route_spark_when_job_fits_no_cluster_window():
 
     chosen = _executor(catalog)._auto_pick(_reflection(3 * GIB), _cfg(0))
 
-    assert chosen is Engine.DUCKDB_PRO
+    assert chosen is Engine.DUCKDB
 
 
 def test_auto_capability_or_cache_probe_error_falls_back_to_pro(monkeypatch):
     executor = _executor(_Catalog([]))
     executor.island_exec = SimpleNamespace(
-        can_execute=lambda reflection, parser: (_ for _ in ()).throw(
+        can_execute=lambda reflection, parser, streaming_result=False: (_ for _ in ()).throw(
             RuntimeError("optional probe failed")
         ),
     )
@@ -399,7 +423,7 @@ def test_auto_capability_or_cache_probe_error_falls_back_to_pro(monkeypatch):
         _reflection(512 * 1024 * 1024), _cfg(10 * GIB), parser=object(),
     )
 
-    assert chosen is Engine.DUCKDB_PRO
+    assert chosen is Engine.DUCKDB
 
 
 # --------------------------------------------------------------------------- #

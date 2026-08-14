@@ -132,7 +132,7 @@ script index.
 
 - **Versioned tables** with snapshot isolation, upsert (`overwrite_columns`),
   soft deletes (`delete_only=True`), schema evolution, and staleness filtering
-- **DuckDB query engine** — embedded, zero-copy reads from object storage
+- **DuckDB and IslandDB query engines** — embedded reads with adaptive selection
 - **Spark SQL via Thrift** — for queries exceeding DuckDB memory limits
 - **RBAC** — role types (superadmin, admin, writer, reader, meta) with
   row-level and column-level security enforced through view chains
@@ -163,7 +163,7 @@ See [docs/00_index.md](docs/00_index.md) for the full table of contents.
 | 06 | [Data Writer](docs/06_data_writer.md) | Write pipeline, locking, dedup, tombstones |
 | 07 | [Ingestion & Pipes](docs/07_ingestion.md) | Staging areas, automated ingestion pipes |
 | 08 | [Distributed Locking](docs/08_locking.md) | Redis locks, file locks, deadlock prevention |
-| 09 | [Query Engine](docs/09_query_engine.md) | DuckDB Lite/Pro, Spark SQL, auto selection |
+| 09 | [Query Engine](docs/09_query_engine.md) | DuckDB, IslandDB, Spark SQL, auto selection |
 | 10 | [Data Reader](docs/10_data_reader.md) | Read facade, snapshot history, view chain |
 | 11 | [RBAC & Access Control](docs/11_rbac.md) | Roles, users, row/column security |
 | 12 | [Audit Logging](docs/12_audit.md) | SHA-256 hash chain, DORA/SOC 2, SIEM |

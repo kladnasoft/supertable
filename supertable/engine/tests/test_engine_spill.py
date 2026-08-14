@@ -4,7 +4,7 @@ and actually spill to the configured temp directory?
 
 These tests replicate the exact runtime sequence the executor drives:
 
-    con = duckdb.connect()                      # in-memory, like Lite/Pro
+    con = duckdb.connect()                      # in-memory, like Lite/DuckDB
     init_connection(con, temp_dir=<abs path>)   # pragmas at connect time
     apply_runtime_pragmas(con, engine_config)   # live per-query config
 
@@ -26,7 +26,7 @@ from supertable.engine.engine_config import EngineRuntimeConfig
 
 def _cfg(mem, threads=None, cache=""):
     return EngineRuntimeConfig(
-        engine_lite_max_bytes=100 * 1024 * 1024,
+        engine_island_min_bytes=100 * 1024 * 1024,
         engine_spark_min_bytes=10 * 1024 * 1024 * 1024,
         engine_freshness_sec=300,
         duckdb_memory_limit=mem,
@@ -54,7 +54,7 @@ class TestConfigAdopted:
     def test_resolved_memory_limit_lands_on_connection(self, tmp_path):
         con = duckdb.connect()
         init_connection(con, temp_dir=str(tmp_path))           # init default
-        apply_runtime_pragmas(con, _cfg("8GB", threads=8))     # Pro cfg
+        apply_runtime_pragmas(con, _cfg("8GB", threads=8))     # DuckDB cfg
         mem = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
         # 8 GB decimal == 7.45 GiB; assert it tracks the cfg, not 80%-of-RAM.
         assert 7.0e9 <= _human_to_bytes(mem) <= 8.1e9, mem

@@ -47,6 +47,7 @@ from supertable.processing import (
     STATS_SCHEMA,
     _stats_rows_for_metadata,
     _STATS_CACHE,
+    stats_resource_seals,
 )
 import sys
 
@@ -91,15 +92,26 @@ def orders_on_disk(tmp_path):
     for p in files:
         rows.extend(_stats_rows_for_metadata(p, pq.read_metadata(p)))
     stats_path = str(tmp_path / "orders_stats.parquet")
-    pl.DataFrame(rows, schema=STATS_SCHEMA).write_parquet(stats_path)
+    stats_frame = pl.DataFrame(rows, schema=STATS_SCHEMA)
+    stats_frame.write_parquet(stats_path)
+    resource_seals = stats_resource_seals(stats_frame)
+    assert resource_seals is not None
 
     payload = {
         "snapshot_version": 7,
         "schema": [{"name": "id", "type": "BIGINT"},
                    {"name": "val", "type": "VARCHAR"}],
         "stats_file": stats_path,
+        "stats_rows": stats_frame.height,
         "resources": [
-            {"file": p, "file_size": os.path.getsize(p), "rows": 100}
+            {
+                "file": p,
+                "file_size": os.path.getsize(p),
+                "rows": 100,
+                "footer_sha256": resource_seals[p].footer_sha256,
+                "stats_rows": resource_seals[p].stats_rows,
+                "stats_digest": resource_seals[p].stats_digest,
+            }
             for p in files
         ],
         "tombstone": None,
@@ -142,6 +154,7 @@ def _wired(orders_on_disk, *, pruning: bool):
 
     with patch.object(data_estimator_mod, "RedisCatalog", return_value=est_cat), \
          patch.object(super_table_mod, "RedisCatalog", return_value=super_cat), \
+         patch.object(super_table_mod, "get_storage", return_value=local), \
          patch.object(data_estimator_mod, "settings", test_settings):
         processing._storage = local  # load_stats reads the on-disk stats parquet
         try:
@@ -314,12 +327,12 @@ class TestReadPruningObservability:
 
 
 # ---------------------------------------------------------------------------
-# EXPLAIN SQL contract — the prefix duckdb_lite builds is valid DuckDB and
+# EXPLAIN SQL contract — the prefix duckdb builds is valid DuckDB and
 # returns a plan (not rows) over the real reflection-style view.
 # ---------------------------------------------------------------------------
 
 def _explain_prefixed(query: str, explain_options: str = "") -> str:
-    # Mirrors supertable/engine/duckdb_lite.py: the exact prefix construction
+    # Mirrors supertable/engine/duckdb.py: the exact prefix construction
     # applied to the final rewritten query when explain=True.
     _opts = (explain_options or "").strip()
     return f"EXPLAIN {(_opts + ' ') if _opts else ''}{query}"

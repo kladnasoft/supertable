@@ -105,6 +105,7 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "SUPERTABLE_ISLAND_MAX_RESULT_BYTES",
         "SUPERTABLE_ISLAND_CPU_MAX",
         "SUPERTABLE_ISLAND_IO_WORKERS_MAX",
+        "SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC",
         "SUPERTABLE_ISLAND_SPILL_ENABLED",
         "SUPERTABLE_ISLAND_SPILL_DIR",
         "SUPERTABLE_ISLAND_SPILL_MAX_BYTES",
@@ -267,10 +268,13 @@ class TestSettingsDataclass:
         assert s.SUPERTABLE_QUERY_OBSERVATION_MAX_SIGNATURES == 4096
         assert s.SUPERTABLE_ISLAND_CACHE_ENABLED is True
         assert s.SUPERTABLE_ISLAND_CACHE_MAX_BYTES == 20 * 1024 * 1024 * 1024
+        assert s.SUPERTABLE_ISLAND_CACHE_TTL_SEC == 0
         assert s.SUPERTABLE_ISLAND_AUTO_ENABLED is True
         assert s.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED is True
+        assert s.SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC == 0
         assert s.SUPERTABLE_ISLAND_MEMORY_FRACTION == 0.60
         assert s.SUPERTABLE_ISLAND_MAX_RESULT_BYTES == 512 * 1024 * 1024
+        assert s.SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC == 300.0
         assert s.SUPERTABLE_ISLAND_SPILL_ENABLED is True
         assert s.MAX_MEMORY_CHUNK_SIZE == 16 * 1024 * 1024
         assert s.MAX_OVERLAPPING_FILES == 100
@@ -278,6 +282,15 @@ class TestSettingsDataclass:
         assert s.TOMBSTONE_COMPACTION_WORKERS == 2
         assert s.DEFAULT_TIMEOUT_SEC == 60
         assert s.DEFAULT_LOCK_DURATION_SEC == 30
+
+    def test_island_query_timeout_environment_override(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC", "12.5")
+
+        built = _build_settings()
+
+        assert built.SUPERTABLE_ISLAND_QUERY_TIMEOUT_SEC == 12.5
 
     def test_query_observation_environment_overrides(
         self, fresh_env: pytest.MonkeyPatch,

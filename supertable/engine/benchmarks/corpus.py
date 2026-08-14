@@ -5,9 +5,9 @@ small numeric subset while several fixed-width, high-entropy payload columns
 make the original Parquet footprint substantial.  This makes projection and
 row-group pushdown visible without constructing a large result in Python.
 
-Generation is streaming and bounded by one Arrow batch.  The 1 GiB and 10 GiB
-tiers are therefore feasible on modest machines, but the CLI requires an
-explicit large-data opt-in before preparing either tier.
+Generation is streaming and bounded by one Arrow batch.  GiB-scale tiers are
+therefore feasible without materializing the corpus in memory, but the CLI
+requires an explicit large-data opt-in before preparing any of them.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import os
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -39,6 +40,7 @@ TIER_TARGET_BYTES: dict[str, int] = {
     "mb": 64 * MIB,
     "1gib": GIB,
     "10gib": 10 * GIB,
+    "50gib": 50 * GIB,
 }
 
 _TIER_ALIASES = {
@@ -57,6 +59,9 @@ _TIER_ALIASES = {
     "10gb": "10gib",
     "10g": "10gib",
     "10gib": "10gib",
+    "50gb": "50gib",
+    "50g": "50gib",
+    "50gib": "50gib",
 }
 
 PUBLIC_COLUMN_TYPES: dict[str, str] = {
@@ -230,7 +235,7 @@ def _record_batch(spec: CorpusSpec, start_id: int, rows: int, rng):
     import pyarrow as pa
 
     ids = np.arange(start_id, start_id + rows, dtype=np.int64)
-    # Values stay bounded, avoiding aggregate overflow even in the 10 GiB tier.
+    # Values stay bounded, avoiding aggregate overflow even in the 50 GiB tier.
     metric = ((ids * np.int64(48_271) + np.int64(17)) % np.int64(1_000_003))
     dimension = (ids % np.int64(1_024)).astype(np.int32)
     base_us = np.int64(1_700_000_000_000_000)
@@ -321,6 +326,64 @@ def load_manifest(path_or_directory: str | Path) -> dict[str, Any]:
         manifest = json.load(handle)
     manifest["manifest_path"] = str(path.resolve())
     return manifest
+
+
+@contextmanager
+def repeated_manifest_paths(
+    manifest: Mapping[str, Any], source_repeat: int,
+):
+    """Yield an execution manifest with distinct hard-link aliases per repeat.
+
+    Production engines reject duplicate canonical paths/resource keys because
+    they make deletion-vector identity ambiguous. Benchmark repetition keeps
+    that invariant: repeats two..N are unique directory entries pointing to the
+    same immutable inode. They consume no second payload copy and are removed
+    after all isolated workers finish.
+    """
+    if source_repeat <= 0:
+        raise ValueError("source_repeat must be positive")
+    if source_repeat == 1:
+        yield dict(manifest)
+        return
+
+    manifest_path = Path(str(manifest["manifest_path"])).resolve()
+    base = manifest_path.parent
+    unique_entries = list(manifest.get("files") or [])
+    if not unique_entries:
+        raise ValueError("cannot repeat an empty benchmark manifest")
+    alias_root = Path(tempfile.mkdtemp(prefix=".logical-repeat-", dir=base))
+    repeated_entries = [dict(entry) for entry in unique_entries]
+    try:
+        for repeat_index in range(1, source_repeat):
+            repeat_root = alias_root / f"repeat-{repeat_index:04d}"
+            repeat_root.mkdir()
+            for file_index, entry in enumerate(unique_entries):
+                source = (base / str(entry["path"])).resolve(strict=True)
+                alias = repeat_root / f"{file_index:05d}-{source.name}"
+                os.link(source, alias)
+                source_stat = source.stat()
+                alias_stat = alias.stat()
+                if (
+                    source_stat.st_dev != alias_stat.st_dev
+                    or source_stat.st_ino != alias_stat.st_ino
+                    or source_stat.st_size != alias_stat.st_size
+                ):
+                    raise RuntimeError("source-repeat hard-link identity proof failed")
+                repeated = dict(entry)
+                repeated["path"] = str(alias)
+                repeated_entries.append(repeated)
+
+        execution_manifest = dict(manifest)
+        execution_manifest["files"] = repeated_entries
+        execution_manifest["source_repeat"] = source_repeat
+        execution_manifest["source_repeat_mode"] = "distinct_hardlink_aliases"
+        execution_manifest["unique_file_count"] = len(unique_entries)
+        execution_manifest["unique_source_bytes"] = int(
+            manifest["actual_source_bytes"]
+        )
+        yield execution_manifest
+    finally:
+        shutil.rmtree(alias_root, ignore_errors=True)
 
 
 def validate_manifest(
@@ -498,6 +561,10 @@ class Workload:
     upper_id: int | None
     required_columns: tuple[str, ...]
     file_pruning: bool = True
+    # The stress harness consumes the grouped result through the bounded Arrow
+    # API even though the generated dimension's sealed domain is small enough
+    # to collect. This keeps benchmark result handling independent of pandas.
+    island_streaming_result: bool = False
 
 
 WORKLOAD_NAMES = (
@@ -507,12 +574,20 @@ WORKLOAD_NAMES = (
     "range_1pct_5cols",
     "range_10pct",
     "projection",
+    "full_scan",
+    "spill_group",
 )
 
 
-def build_workloads(total_rows: int) -> dict[str, Workload]:
+def build_workloads(
+    total_rows: int,
+    *,
+    payload_columns: int = 8,
+) -> dict[str, Workload]:
     if total_rows <= 0:
         raise ValueError("total_rows must be positive")
+    if payload_columns <= 0:
+        raise ValueError("payload_columns must be positive")
 
     def aggregate(name: str, lower: int, upper: int) -> Workload:
         return Workload(
@@ -531,6 +606,18 @@ def build_workloads(total_rows: int) -> dict[str, Workload]:
     ten_pct = max(1, total_rows // 10)
     one_start = max(0, (total_rows - one_pct) // 2)
     ten_start = max(0, (total_rows - ten_pct) // 2)
+    full_scan_columns = tuple(PUBLIC_COLUMN_TYPES) + tuple(
+        f"payload_{idx:02d}" for idx in range(payload_columns)
+    )
+    full_scan_aggregates = ", ".join(
+        f"MAX({column}) AS {column}_max" for column in full_scan_columns
+    )
+    full_scan_aggregates = f"COUNT(*) AS row_count, {full_scan_aggregates}"
+    spill_group_aggregates = ", ".join(
+        f"COUNT({column}) AS {column}_count"
+        for column in full_scan_columns
+        if column != "dimension"
+    )
     return {
         # Keep physical files for this workload so both native engines prove
         # the empty result through Parquet row-group statistics.  Removing all
@@ -575,6 +662,35 @@ def build_workloads(total_rows: int) -> dict[str, Workload]:
             lower_id=None,
             upper_id=None,
             required_columns=("metric",),
+        ),
+        # A direct MAX reduction consumes values from every public column in
+        # both engines. COUNT is intentionally not used: DuckDB can answer it
+        # from Parquet null-count metadata without reading value pages. MAX has
+        # constant state per column, so the corpus may still be much larger than
+        # RAM without manufacturing a large result.
+        "full_scan": Workload(
+            name="full_scan",
+            sql=f"SELECT {full_scan_aggregates} FROM {TABLE_NAME}",
+            lower_id=None,
+            upper_id=None,
+            required_columns=full_scan_columns,
+        ),
+        # This deliberately drives IslandDB's sealed external GROUP BY + ORDER
+        # path while keeping the final result bounded to the generated 1,024
+        # dimension values.  COUNT over every other public field makes the
+        # physical projection cover all public columns.  Engines remain free
+        # to exploit valid Parquet metadata, so physical read counters—not the
+        # projection alone—are authoritative for bytes actually transferred.
+        "spill_group": Workload(
+            name="spill_group",
+            sql=(
+                f"SELECT dimension, {spill_group_aggregates} "
+                f"FROM {TABLE_NAME} GROUP BY dimension ORDER BY dimension"
+            ),
+            lower_id=None,
+            upper_id=None,
+            required_columns=full_scan_columns,
+            island_streaming_result=True,
         ),
     }
 
@@ -638,8 +754,34 @@ def _column_chunk_bytes(metadata, names: set[str], only_matching_groups, id_inde
     return total
 
 
+def _generated_decoded_row_width(
+    manifest: Mapping[str, Any], required_columns: Sequence[str],
+) -> int:
+    """Exact value-buffer width for this harness' non-null generated schema."""
+    schema = dict(manifest.get("schema") or {})
+    payload_width = int(manifest["spec"]["payload_width"])
+    widths = {
+        "Int64": 8,
+        "Int32": 4,
+        "Datetime(time_unit='us', time_zone=None)": 8,
+        "Binary": payload_width,
+    }
+    total = 0
+    for column in required_columns:
+        type_name = schema.get(column)
+        width = widths.get(str(type_name))
+        if width is None:
+            raise RuntimeError(
+                f"benchmark generated schema has no exact decoded width for "
+                f"{column!r}: {type_name!r}"
+            )
+        total += width
+    return total
+
+
 def plan_workload(
-    manifest: Mapping[str, Any], workload: Workload
+    manifest: Mapping[str, Any],
+    workload: Workload,
 ) -> dict[str, Any]:
     """Build one executor input and two explicit scan-size estimates.
 
@@ -654,6 +796,12 @@ def plan_workload(
     manifest_path = Path(str(manifest["manifest_path"]))
     base = manifest_path.parent
     original_files = list(manifest.get("files") or [])
+    source_repeat = int(manifest.get("source_repeat") or 1)
+    if source_repeat <= 0 or len(original_files) % source_repeat:
+        raise ValueError("execution manifest has invalid source-repeat metadata")
+    unique_file_count = int(
+        manifest.get("unique_file_count") or len(original_files) // source_repeat
+    )
     retained = [
         entry
         for entry in original_files
@@ -723,27 +871,74 @@ def plan_workload(
             ).hexdigest(),
         }
 
+    unique_source_bytes = int(
+        manifest.get("unique_source_bytes") or manifest["actual_source_bytes"]
+    )
+    source_bytes = unique_source_bytes * source_repeat
+    unique_estimated_reflection = estimated_reflection // source_repeat
+    unique_estimated_pushdown = estimated_pushdown // source_repeat
+    projected_source_fraction = (
+        estimated_pushdown / source_bytes if source_bytes > 0 else 0.0
+    )
+    decoded_row_width = _generated_decoded_row_width(
+        manifest, workload.required_columns,
+    )
+    estimated_decoded_bytes = candidate_rows * decoded_row_width
     return {
         "name": workload.name,
         "sql": workload.sql,
         "required_columns": list(workload.required_columns),
+        "island_streaming_result": bool(workload.island_streaming_result),
+        "payload_width": int(manifest["spec"]["payload_width"]),
         "lower_id": workload.lower_id,
         "upper_id": workload.upper_id,
         "original_files": original_paths,
         "files": resolved_files,
         "resource_keys": resolved_files,
-        "source_bytes": int(manifest["actual_source_bytes"]),
+        "source_bytes": source_bytes,
+        "unique_source_bytes": unique_source_bytes,
+        "source_repeat": source_repeat,
         "candidate_source_bytes": sum(int(entry["bytes"]) for entry in retained),
         "estimated_reflection_bytes": int(estimated_reflection),
         "estimated_pushdown_bytes": int(estimated_pushdown),
+        "unique_estimated_reflection_bytes": int(unique_estimated_reflection),
+        "unique_estimated_pushdown_bytes": int(unique_estimated_pushdown),
+        "estimated_decoded_bytes": int(estimated_decoded_bytes),
+        "decoded_row_width": int(decoded_row_width),
+        "decoded_estimate_complete": True,
+        "projected_source_fraction": projected_source_fraction,
         "eligible_pushdown_bytes": int(estimated_pushdown),
         "row_group_selections": row_group_selections,
         "files_before_prune": len(original_files),
+        "unique_files_before_prune": unique_file_count,
+        "source_repeat_mode": str(
+            manifest.get("source_repeat_mode") or "none"
+        ),
         "files_after_prune": len(retained),
         "files_pruned": len(original_files) - len(retained),
         "row_groups_after_file_prune": int(row_groups_total),
         "row_groups_pushdown_eligible": int(row_groups_eligible),
         "candidate_rows": int(candidate_rows),
+        # Benchmark-only generator proof. Every immutable row has contiguous
+        # id, metric=(id*48271+17)%1000003, and dimension=id%1024. These
+        # corpus-wide extrema remain conservative for every selected subset.
+        "integer_domain_bounds": {
+            "id": {
+                "minimum": 0,
+                "maximum": int(manifest["total_rows"]) - 1,
+                "has_null": False,
+            },
+            "metric": {
+                "minimum": 0,
+                "maximum": 1_000_002,
+                "has_null": False,
+            },
+            "dimension": {
+                "minimum": 0,
+                "maximum": min(1_023, int(manifest["total_rows"]) - 1),
+                "has_null": False,
+            },
+        },
         "schema": dict(manifest["schema"]),
         "super_name": str(manifest.get("super_name") or SUPER_NAME),
         "table": str(manifest.get("table") or TABLE_NAME),

@@ -43,6 +43,12 @@ def test_parse_cpuset_is_strict_and_deduplicates():
         parse_cpuset("2-1")
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+def test_resource_policy_rejects_non_finite_or_boolean_amplification(value):
+    with pytest.raises(ValueError):
+        ResourcePolicy(spill_amplification=value)
+
+
 def test_detect_intersects_affinity_cpuset_quota_and_memory(tmp_path):
     cg = tmp_path / "cg"
     proc = tmp_path / "proc"
@@ -113,7 +119,32 @@ def test_large_fragmented_scan_can_use_all_four_container_cpus(tmp_path):
     assert 0 < plan.batch_rows
 
 
-def test_tiny_query_uses_one_cpu_and_one_io_worker(tmp_path):
+def test_fifty_gib_incremental_aggregate_needs_no_input_sized_spill(tmp_path):
+    resources = _resources(cpus=8, memory=8 * GIB)
+    plan = ResourcePlanner(resources, spill_root=tmp_path).plan(
+        QueryResourceEstimate(
+            compressed_scan_bytes=50 * GIB,
+            decoded_scan_bytes=50 * GIB,
+            result_bytes=31 * 4096,
+            operator_state_bytes=31 * 4096,
+            selected_files=405,
+            selected_row_groups=7695,
+            estimated_rows=32_000_000,
+            estimated_result_rows=1,
+            selected_decoded_bytes=50 * GIB,
+            selected_decoded_bytes_complete=True,
+            spillable=False,
+        )
+    )
+
+    assert plan.advice is ExecutionAdvice.ISLAND_IN_MEMORY
+    assert plan.memory_budget_bytes == int(8 * GIB * 0.60)
+    assert plan.spill_budget_bytes == 0
+    assert plan.estimated_spill_bytes == 0
+    assert 0 < plan.batch_bytes <= plan.scan_memory_bytes
+
+
+def test_tiny_query_accounts_for_process_global_worker_pools(tmp_path):
     plan = ResourcePlanner(_resources(), spill_root=tmp_path).plan(
         QueryResourceEstimate(
             compressed_scan_bytes=32 * 1024,
@@ -123,7 +154,9 @@ def test_tiny_query_uses_one_cpu_and_one_io_worker(tmp_path):
             selected_row_groups=1,
         )
     )
-    assert (plan.cpu_workers, plan.io_workers) == (1, 1)
+    # Polars/Arrow pools are process-global and cannot be narrowed per query.
+    # Planning therefore accounts for their full possible widths even here.
+    assert (plan.cpu_workers, plan.io_workers) == (4, 8)
 
 
 def test_tight_operator_memory_produces_explicit_spill_budget(tmp_path):
@@ -152,6 +185,67 @@ def test_tight_operator_memory_produces_explicit_spill_budget(tmp_path):
     assert plan.advice == ExecutionAdvice.ISLAND_SPILL
     assert plan.estimated_spill_bytes > 0
     assert plan.spill_budget_bytes == plan.estimated_spill_bytes
+
+
+def test_compact_group_state_keeps_bounded_operator_without_input_sized_spill(
+    tmp_path,
+):
+    planner = ResourcePlanner(
+        _resources(memory=4 * GIB),
+        spill_root=tmp_path,
+        disk_usage=lambda _: DiskUsage(10 * GIB, 0, 10 * GIB),
+    )
+    compact_state = 8 * MIB
+    grouped_result = MIB
+    plan = planner.plan(QueryResourceEstimate(
+        compressed_scan_bytes=10 * GIB,
+        decoded_scan_bytes=10 * GIB,
+        result_bytes=grouped_result,
+        operator_state_bytes=compact_state,
+        selected_files=81,
+        selected_row_groups=1_521,
+        estimated_rows=6_413_677,
+        estimated_result_rows=1_024,
+        spillable=True,
+        has_sort=True,
+        has_group_by=True,
+        requires_bounded_group_operator=True,
+        group_state_bytes_per_key=8 * 1024,
+    ))
+
+    assert plan.advice is ExecutionAdvice.ISLAND_SPILL
+    assert plan.estimated_spill_bytes == int(compact_state * 2.25)
+    assert plan.estimated_spill_bytes < 32 * MIB
+    assert plan.spill_budget_bytes == plan.estimated_spill_bytes
+    assert "sealed group cardinality" in plan.reason
+
+
+def test_sealed_domain_above_retained_target_budgets_partial_occurrences(tmp_path):
+    planner = ResourcePlanner(
+        _resources(memory=GIB),
+        spill_root=tmp_path,
+        disk_usage=lambda _: DiskUsage(10 * GIB, 0, 10 * GIB),
+    )
+    per_key = 1024
+    selected_rows = 1_000_000
+    plan = planner.plan(QueryResourceEstimate(
+        compressed_scan_bytes=64 * MIB,
+        decoded_scan_bytes=128 * MIB,
+        result_bytes=16 * MIB,
+        # Fits operator admission (~307 MiB) but exceeds its retained hash
+        # target (~76 MiB), so one-domain compact budgeting is unsafe.
+        operator_state_bytes=200 * MIB,
+        estimated_rows=selected_rows,
+        estimated_result_rows=200_000,
+        spillable=True,
+        has_group_by=True,
+        requires_bounded_group_operator=True,
+        group_state_bytes_per_key=per_key,
+    ))
+
+    worst_partials = selected_rows * per_key
+    assert plan.advice is ExecutionAdvice.ISLAND_SPILL
+    assert plan.estimated_spill_bytes == int(worst_partials * 2.25)
 
 
 def test_disk_exhaustion_routes_away_instead_of_starting(tmp_path):
@@ -241,7 +335,7 @@ def test_streamed_proof_work_does_not_collapse_selected_scan_batch_rows(tmp_path
     assert plan.batch_rows > 1
 
 
-def test_governor_weighted_reservations_and_release(tmp_path):
+def test_governor_serializes_process_global_scan_pools(tmp_path):
     policy = ResourcePolicy(
         query_memory_fraction=0.40,
         global_memory_fraction=0.80,
@@ -259,17 +353,15 @@ def test_governor_weighted_reservations_and_release(tmp_path):
             selected_row_groups=2,
         )
     )
-    assert plan.cpu_workers == 2
+    assert plan.cpu_workers == 4
     governor = ResourceGovernor(resources, spill_root=tmp_path, policy=policy)
     first = governor.reserve(plan, query_id="one")
-    second = governor.reserve(plan, query_id="two")
     assert governor.snapshot()["cpu_reserved"] == 4
     with pytest.raises(ResourceReservationTimeout):
-        governor.reserve(plan, query_id="three", timeout=0)
+        governor.reserve(plan, query_id="two", timeout=0)
     first.release()
-    with governor.reserve(plan, query_id="three", timeout=0):
-        assert governor.snapshot()["active_queries"] == 2
-    second.release()
+    with governor.reserve(plan, query_id="two", timeout=0):
+        assert governor.snapshot()["active_queries"] == 1
     assert governor.snapshot()["active_queries"] == 0
 
 
@@ -583,7 +675,7 @@ def test_query_plan_never_exceeds_global_governor_memory_capacity(tmp_path):
         assert governor.snapshot()["active_queries"] == 1
 
 
-def test_parallel_scan_batches_never_exceed_scan_workspace(tmp_path):
+def test_planned_delivery_batches_fit_conservative_scan_workspace(tmp_path):
     resources = _resources(cpus=32, memory=128 * MIB)
     policy = ResourcePolicy(
         query_memory_fraction=1.0,
@@ -610,4 +702,7 @@ def test_parallel_scan_batches_never_exceed_scan_workspace(tmp_path):
 
     assert plan.runs_on_island
     assert plan.batch_bytes >= 1
+    # This bounds planned delivered batches against every possible native pool
+    # slot. It is conservative admission arithmetic, not a claim that the
+    # Polars allocator exposes a hard per-query scan-memory ceiling.
     assert plan.batch_bytes * (plan.cpu_workers + plan.io_workers) <= plan.scan_memory_bytes

@@ -214,8 +214,7 @@ class RoutingFeatures:
 class RoutingAvailability:
     """Runtime availability after external fleet and capability probes."""
 
-    lite_available: bool = True
-    pro_available: bool = True
+    duckdb_available: bool = True
     island_enabled: bool = False
     island_supported: bool = False
     spark_available: bool = False
@@ -305,7 +304,7 @@ class AdaptiveEngineRouter:
     # Aggregate throughput baselines.  They intentionally describe relative
     # break-even points rather than machine-specific peak bandwidth.
     _MODEL = {
-        Engine.DUCKDB_LITE: {
+        Engine.DUCKDB: {
             "startup_us": 8_000,
             "scan_bps": int(1.8 * GIB),
             "decode_bps": int(2.5 * GIB),
@@ -313,15 +312,6 @@ class AdaptiveEngineRouter:
             "row_group_us": 40,
             "operator_bps": int(1.2 * GIB),
             "result_bps": int(2.0 * GIB),
-        },
-        Engine.DUCKDB_PRO: {
-            "startup_us": 18_000,
-            "scan_bps": int(2.2 * GIB),
-            "decode_bps": int(3.0 * GIB),
-            "file_us": 600,
-            "row_group_us": 30,
-            "operator_bps": int(2.0 * GIB),
-            "result_bps": int(2.8 * GIB),
         },
         Engine.ISLANDDB: {
             "startup_us": 30_000,
@@ -333,7 +323,7 @@ class AdaptiveEngineRouter:
             "result_bps": int(5.0 * GIB),
         },
         Engine.SPARK_SQL: {
-            "startup_us": 700_000,
+            "startup_us": 1_500_000,
             "scan_bps": int(8.0 * GIB),
             "decode_bps": int(12.0 * GIB),
             "file_us": 300,
@@ -345,14 +335,13 @@ class AdaptiveEngineRouter:
 
     # Prefer the mature local engines for an exact cost tie.
     _TIE_PRIORITY = {
-        Engine.DUCKDB_LITE: 0,
-        Engine.DUCKDB_PRO: 1,
-        Engine.ISLANDDB: 2,
-        Engine.SPARK_SQL: 3,
+        Engine.DUCKDB: 0,
+        Engine.ISLANDDB: 1,
+        Engine.SPARK_SQL: 2,
     }
 
-    def __init__(self, *, lite_max_bytes: int):
-        self.lite_max_bytes = _non_negative(lite_max_bytes)
+    def __init__(self, *, island_min_bytes: int):
+        self.island_min_bytes = _non_negative(island_min_bytes)
 
     @staticmethod
     def _normal_work_bytes(features: RoutingFeatures) -> Tuple[int, int]:
@@ -405,9 +394,7 @@ class AdaptiveEngineRouter:
             ) // features.island_cpu_workers
 
         if (
-            engine in {
-                Engine.DUCKDB_LITE, Engine.DUCKDB_PRO, Engine.SPARK_SQL,
-            }
+            engine in {Engine.DUCKDB, Engine.SPARK_SQL}
             and features.row_group_bytes_complete
             and features.reflection_bytes > scan > 0
         ):
@@ -423,22 +410,18 @@ class AdaptiveEngineRouter:
                 250_000, magnitude_gap * 8_000,
             )
 
-        if engine == Engine.DUCKDB_PRO and scan <= self.lite_max_bytes:
-            components["small_query_contention"] = 25_000
-        elif engine == Engine.ISLANDDB and scan <= self.lite_max_bytes:
+        if engine == Engine.ISLANDDB and scan <= self.island_min_bytes:
             # The benchmarked native crossover is around the Lite boundary;
             # Arrow/Polars setup is not worthwhile for a tiny materialization.
             components["small_query_launch"] = 35_000
 
         if features.data_is_fresh:
             base = sum(components.values())
-            if engine == Engine.DUCKDB_PRO:
-                components["fresh_cache_churn"] = max(75_000, base // 4)
-            elif engine == Engine.ISLANDDB:
+            if engine == Engine.ISLANDDB:
                 components["fresh_metadata_churn"] = max(300_000, base // 2)
 
         if features.has_active_tombstone:
-            if engine in {Engine.DUCKDB_LITE, Engine.DUCKDB_PRO}:
+            if engine == Engine.DUCKDB:
                 components["tombstone_anti_join"] = features.total_files * 700
             elif engine == Engine.ISLANDDB:
                 components["tombstone_anti_join"] = features.total_files * 80
@@ -497,10 +480,8 @@ class AdaptiveEngineRouter:
             engine: [] for engine in self._MODEL
         }
 
-        if not availability.lite_available:
-            rejections[Engine.DUCKDB_LITE].append("DuckDB Lite unavailable")
-        if not availability.pro_available:
-            rejections[Engine.DUCKDB_PRO].append("DuckDB Pro unavailable")
+        if not availability.duckdb_available:
+            rejections[Engine.DUCKDB].append("DuckDB unavailable")
 
         if (
             not availability.island_enabled
@@ -539,11 +520,7 @@ class AdaptiveEngineRouter:
         # race.  Preserve a small/fresh Lite escape hatch, otherwise select the
         # persistent external-memory DuckDB engine.
         if not features.source_bytes_complete:
-            preferred = (
-                Engine.DUCKDB_LITE
-                if features.data_is_fresh and availability.lite_available
-                else Engine.DUCKDB_PRO
-            )
+            preferred = Engine.DUCKDB
             forced_reason = "source byte estimate incomplete; conservative DuckDB route"
             for engine in self._MODEL:
                 if engine != preferred:
@@ -553,7 +530,7 @@ class AdaptiveEngineRouter:
         # than compressed size.  Treat its route-away advice as a hard safety
         # constraint so a compressed object cannot be demoted to Lite.
         elif features.island_advice in {"route_duckdb", "stream_result"}:
-            preferred = Engine.DUCKDB_PRO
+            preferred = Engine.DUCKDB
             forced_reason = (
                 f"IslandDB resource planner requires {features.island_advice}"
             )
@@ -564,12 +541,12 @@ class AdaptiveEngineRouter:
             preferred = (
                 Engine.SPARK_SQL
                 if not rejections[Engine.SPARK_SQL]
-                else Engine.DUCKDB_PRO
+                else Engine.DUCKDB
             )
             forced_reason = (
                 "decoded/operator state requires distributed execution"
                 if preferred == Engine.SPARK_SQL
-                else "distributed route unavailable; use external-memory DuckDB Pro"
+                else "distributed route unavailable; use DuckDB"
             )
             for engine in self._MODEL:
                 if engine != preferred:
@@ -592,8 +569,8 @@ class AdaptiveEngineRouter:
             features.has_active_tombstone
             and rejections[Engine.ISLANDDB]
         ):
-            preferred = Engine.DUCKDB_PRO
-            forced_reason = "active tombstone requires persistent DuckDB Pro"
+            preferred = Engine.DUCKDB
+            forced_reason = "active tombstone requires DuckDB"
             for engine in self._MODEL:
                 if engine != preferred:
                     rejections[engine].append("excluded by tombstone execution policy")
@@ -601,14 +578,14 @@ class AdaptiveEngineRouter:
         # The configured Lite ceiling is inclusive at its exact boundary.
         # Below it, normal cost/history adaptation remains active.
         elif (
-            features.reflection_bytes == self.lite_max_bytes
-            and availability.lite_available
+            features.reflection_bytes == self.island_min_bytes
+            and availability.duckdb_available
         ):
-            preferred = Engine.DUCKDB_LITE
-            forced_reason = "scan fits inclusive DuckDB Lite ceiling"
+            preferred = Engine.DUCKDB
+            forced_reason = "scan fits inclusive DuckDB ceiling"
             for engine in self._MODEL:
                 if engine != preferred:
-                    rejections[engine].append("excluded by DuckDB Lite ceiling")
+                    rejections[engine].append("excluded by DuckDB ceiling")
 
         candidates = []
         work_bytes = sum(self._normal_work_bytes(features))
@@ -641,7 +618,7 @@ class AdaptiveEngineRouter:
 
         eligible = [candidate for candidate in candidates if candidate.eligible]
         if not eligible:
-            # Executor construction guarantees DuckDB Lite, but keep this pure
+            # Executor construction guarantees DuckDB, but keep this pure
             # policy total and deterministic for malformed integrations.
             raise RuntimeError("AUTO routing has no eligible execution engine")
         selected = min(

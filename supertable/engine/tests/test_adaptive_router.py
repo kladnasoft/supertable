@@ -40,16 +40,16 @@ def _availability(**changes) -> RoutingAvailability:
 
 
 def test_small_query_prefers_lite_after_cost_race():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(4 * MIB), _availability(),
     )
 
-    assert decision.engine is Engine.DUCKDB_LITE
+    assert decision.engine is Engine.DUCKDB
     assert "lowest predicted latency" in decision.reason
 
 
 def test_stable_medium_projection_prefers_bounded_island():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(
             512 * MIB,
             decoded_bytes=256 * MIB,
@@ -64,7 +64,7 @@ def test_stable_medium_projection_prefers_bounded_island():
 
 
 def test_fresh_medium_query_avoids_cache_churn_and_prefers_lite():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(
             512 * MIB,
             data_is_fresh=True,
@@ -74,11 +74,11 @@ def test_fresh_medium_query_avoids_cache_churn_and_prefers_lite():
         _availability(island_enabled=True, island_supported=True),
     )
 
-    assert decision.engine is Engine.DUCKDB_LITE
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_spark_startup_cost_keeps_near_floor_query_on_pro():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(1 * GIB),
         _availability(
             spark_available=True,
@@ -87,11 +87,11 @@ def test_spark_startup_cost_keeps_near_floor_query_on_pro():
         ),
     )
 
-    assert decision.engine is Engine.DUCKDB_PRO
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_large_query_amortizes_spark_startup():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(2 * GIB),
         _availability(
             spark_available=True,
@@ -104,7 +104,7 @@ def test_large_query_amortizes_spark_startup():
 
 
 def test_tombstone_hard_gate_excludes_spark():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(20 * GIB, has_active_tombstone=True),
         _availability(
             spark_available=True,
@@ -130,7 +130,7 @@ def test_spark_semantic_gate_cannot_be_overridden_by_low_cost_history():
             feature_signature=features.feature_signature(),
         ),
     }
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         features,
         _availability(
             spark_available=True,
@@ -147,7 +147,7 @@ def test_spark_semantic_gate_cannot_be_overridden_by_low_cost_history():
 
 
 def test_incomplete_estimate_uses_conservative_pro_without_cost_guess():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(1, source_bytes_complete=False),
         _availability(
             island_enabled=True,
@@ -157,21 +157,21 @@ def test_incomplete_estimate_uses_conservative_pro_without_cost_guess():
         ),
     )
 
-    assert decision.engine is Engine.DUCKDB_PRO
+    assert decision.engine is Engine.DUCKDB
     assert "incomplete" in decision.reason
 
 
 def test_incomplete_fresh_estimate_retains_lite_escape_hatch():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(1, source_bytes_complete=False, data_is_fresh=True),
         _availability(),
     )
 
-    assert decision.engine is Engine.DUCKDB_LITE
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_native_route_spark_is_hard_operator_memory_gate():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(32 * MIB, island_advice="route_spark"),
         _availability(
             island_enabled=True,
@@ -187,21 +187,21 @@ def test_native_route_spark_is_hard_operator_memory_gate():
 
 
 def test_native_route_spark_falls_back_to_pro_when_fleet_is_unavailable():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(32 * MIB, island_advice="route_spark"),
         _availability(island_enabled=True, island_supported=True),
     )
 
-    assert decision.engine is Engine.DUCKDB_PRO
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_native_stream_warning_never_demotes_to_lite():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(1 * MIB, island_advice="stream_result"),
         _availability(island_enabled=True, island_supported=True),
     )
 
-    assert decision.engine is Engine.DUCKDB_PRO
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_history_is_bounded_and_cannot_override_safety_gate():
@@ -215,7 +215,7 @@ def test_history_is_bounded_and_cannot_override_safety_gate():
             feature_signature=features.feature_signature(),
         ),
     }
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         features,
         _availability(spark_available=True, spark_min_scan_bytes=1),
         history=history,
@@ -227,16 +227,16 @@ def test_history_is_bounded_and_cannot_override_safety_gate():
 
 
 def test_successful_history_can_adapt_performance_choice():
-    baseline = AdaptiveEngineRouter(lite_max_bytes=100 * MIB)
+    baseline = AdaptiveEngineRouter(island_min_bytes=100 * MIB)
     features = _features(64 * MIB)
     availability = _availability()
-    assert baseline.decide(features, availability).engine is Engine.DUCKDB_LITE
+    assert baseline.decide(features, availability).engine is Engine.DUCKDB
 
     decision = baseline.decide(
         features,
         availability,
         history={
-            Engine.DUCKDB_PRO: EngineHistory(
+            Engine.DUCKDB: EngineHistory(
                 sample_count=100,
                 success_count=100,
                 ewma_duration_us=1_000,
@@ -246,21 +246,21 @@ def test_successful_history_can_adapt_performance_choice():
         },
     )
 
-    assert decision.engine is Engine.DUCKDB_PRO
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_decision_payload_is_json_safe_and_contains_all_candidates():
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(4 * MIB), _availability(),
     )
     payload = decision.as_plan_stat()["AUTO_ROUTING"]
 
     assert payload["policy_version"] == "adaptive-v1"
     assert len(payload["feature_signature"]) == 16
-    assert payload["selected_engine"] == "duckdb_lite"
+    assert payload["selected_engine"] == "duckdb"
     assert payload["features"]["effective_scan_bytes"] == 4 * MIB
     assert {item["engine"] for item in payload["candidates"]} == {
-        "duckdb_lite", "duckdb_pro", "islanddb", "spark_sql",
+        "duckdb", "duckdb", "islanddb", "spark_sql",
     }
 
 
@@ -290,11 +290,11 @@ def test_query_shape_features_capture_blocking_operators_and_limit():
 
 def test_history_from_different_feature_bucket_is_ignored():
     features = _features(64 * MIB)
-    decision = AdaptiveEngineRouter(lite_max_bytes=100 * MIB).decide(
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         features,
         _availability(),
         history={
-            Engine.DUCKDB_PRO: EngineHistory(
+            Engine.DUCKDB: EngineHistory(
                 sample_count=100,
                 success_count=100,
                 ewma_duration_us=1,
@@ -304,7 +304,7 @@ def test_history_from_different_feature_bucket_is_ignored():
         },
     )
 
-    assert decision.engine is Engine.DUCKDB_LITE
+    assert decision.engine is Engine.DUCKDB
 
 
 def test_history_signature_isolates_deletion_freshness_and_worker_capacity():
@@ -346,7 +346,7 @@ def test_history_signature_isolates_deletion_freshness_and_worker_capacity():
 
 
 def test_constrained_island_cpu_is_visible_in_candidate_cost():
-    router = AdaptiveEngineRouter(lite_max_bytes=100 * MIB)
+    router = AdaptiveEngineRouter(island_min_bytes=100 * MIB)
     availability = _availability(island_enabled=True, island_supported=True)
     four = router.decide(
         _features(
