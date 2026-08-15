@@ -31,7 +31,11 @@ from supertable.engine.adaptive_router import (
     RoutingFeatures,
     analyze_query_shape,
 )
-from supertable.engine.islanddb import IslandDB, IslandUnsupportedError
+from supertable.engine.islanddb import (
+    IslandCapability,
+    IslandDB,
+    IslandUnsupportedError,
+)
 from supertable.engine.island_resources import (
     ArrowBatchStream,
     IslandResourceError,
@@ -245,6 +249,52 @@ class Executor:
                 telemetry_error,
             )
 
+    @staticmethod
+    def _publish_engine_capability(
+        plan_stats: Optional[PlanStats],
+        capability: object,
+        *,
+        analysis_error: Optional[BaseException] = None,
+    ) -> None:
+        """Publish IslandDB's whole-query semantic certification.
+
+        AUTO is allowed to select IslandDB only when ``can_execute`` certifies
+        the complete SQL statement.  Recording that decision lets system
+        callers such as data-quality checks distinguish native execution from
+        a correctness-preserving DuckDB route.  This is observability only;
+        serialization failure must never affect execution.
+        """
+        if plan_stats is None:
+            return
+        try:
+            supported = bool(
+                analysis_error is None
+                and getattr(capability, "supported", False) is True
+            )
+            reasons = [
+                str(reason)
+                for reason in (getattr(capability, "reasons", ()) or ())
+                if str(reason)
+            ]
+            if analysis_error is not None:
+                # Arbitrary exception text can contain a presigned URL.  The
+                # type explains a fail-closed route without leaking it. Normal
+                # unsupported SQL retains its exact, data-free reasons above.
+                reasons = [
+                    "IslandDB capability analysis failed: "
+                    f"{type(analysis_error).__name__}"
+                ]
+            plan_stats.add_stat({
+                "ENGINE_CAPABILITY": {
+                    "engine": Engine.ISLANDDB.value,
+                    "supported": supported,
+                    "scope": "complete_query_static_semantics",
+                    "reasons": reasons,
+                },
+            })
+        except Exception:
+            return
+
     def _get_file_cache(self):
         """Return the org/storage-scoped shared Parquet cache, lazily.
 
@@ -414,6 +464,7 @@ class Executor:
                     parser,
                     streaming_result=streaming_result,
                 )
+                self._publish_engine_capability(plan_stats, native)
                 native_supported = (
                     getattr(native, "supported", False) is True
                 )
@@ -431,6 +482,10 @@ class Executor:
                         streaming_result=streaming_result,
                     )
             except Exception as exc:
+                if native is None:
+                    self._publish_engine_capability(
+                        plan_stats, None, analysis_error=exc,
+                    )
                 logger.debug(
                     "[engine.auto] IslandDB resource probe skipped: %s", exc,
                 )
@@ -706,8 +761,17 @@ class Executor:
             # Capability analysis is pure and must run before a potentially
             # multi-gigabyte cache fill. Explicit unsupported queries fail
             # visibly without downloading anything.
-            island_prepared = self.island_exec.prepare_execution(
-                reflection, parser, streaming_result=False,
+            try:
+                island_prepared = self.island_exec.prepare_execution(
+                    reflection, parser, streaming_result=False,
+                )
+            except IslandUnsupportedError as exc:
+                self._publish_engine_capability(
+                    plan_stats, IslandCapability(False, (str(exc),)),
+                )
+                raise
+            self._publish_engine_capability(
+                plan_stats, island_prepared.capability,
             )
 
         def timer_capture(evt: str):
@@ -930,8 +994,17 @@ class Executor:
             raise IslandUnsupportedError(
                 f"streaming Arrow results require IslandDB; router selected {chosen.value}"
             )
-        island_prepared = self.island_exec.prepare_execution(
-            reflection, parser, streaming_result=True,
+        try:
+            island_prepared = self.island_exec.prepare_execution(
+                reflection, parser, streaming_result=True,
+            )
+        except IslandUnsupportedError as exc:
+            self._publish_engine_capability(
+                plan_stats, IslandCapability(False, (str(exc),)),
+            )
+            raise
+        self._publish_engine_capability(
+            plan_stats, island_prepared.capability,
         )
 
         def timer_capture(evt: str):

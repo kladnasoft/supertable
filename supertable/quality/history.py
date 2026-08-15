@@ -38,6 +38,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from supertable.quality.serialization import (
+    DEFAULT_MAX_TOTAL_BYTES,
+    normalize_json_value,
+)
+
 logger = logging.getLogger(__name__)
 
 # Simple-table name where dq history rows land.
@@ -66,6 +71,10 @@ def build_history_row(
 
     This is a pure function — no I/O, no side effects.
     """
+    # History can also be invoked directly, outside the scheduler's Redis
+    # publication path.  Apply the same strict conversion here so ndarray
+    # LIST<STRUCT> values never degrade into implementation-specific strings.
+    latest = normalize_json_value(latest)
     anomalies = latest.get("anomalies", [])
     parsed = latest.get("parsed", {})
     rule_results = latest.get("rule_results", [])
@@ -87,7 +96,7 @@ def build_history_row(
             col_stats[col_name]["min"] = col_data.get("min")
             col_stats[col_name]["max"] = col_data.get("max")
 
-    return {
+    row = {
         "dq_id": str(uuid.uuid4()),
         "checked_at": latest.get("checked_at", _now_iso()),
         "table_name": table_name,
@@ -100,11 +109,25 @@ def build_history_row(
         "warnings": latest.get("warnings", 0),
         "critical_count": latest.get("critical", 0),
         "anomaly_count": len(anomalies),
-        "anomalies_json": json.dumps(anomalies, default=str),
-        "column_stats_json": json.dumps(col_stats, default=str),
-        "rule_results_json": json.dumps(rule_results, default=str),
+        "anomalies_json": json.dumps(
+            anomalies, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+        ),
+        "column_stats_json": json.dumps(
+            col_stats, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+        ),
+        "rule_results_json": json.dumps(
+            rule_results, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+        ),
         "execution_ms": execution_ms,
     }
+    # The three *_json fields are generated container encodings rather than
+    # raw source scalars, so they may legitimately exceed the 64 KiB source
+    # scalar cap.  They still share the strict 16 MiB final-row budget, which
+    # bounds both the Polars history write and Redis fallback payload.
+    return normalize_json_value(
+        row,
+        max_scalar_bytes=DEFAULT_MAX_TOTAL_BYTES,
+    )
 
 
 def write_history(
@@ -230,7 +253,18 @@ def write_history_via_sql(
         key = _dq_key(org, sup, "history")
 
         # Push to head of list (newest first), cap at 1000 entries
-        r.lpush(key, json.dumps(row, default=str))
+        r.lpush(
+            key,
+            json.dumps(
+                normalize_json_value(
+                    row,
+                    max_scalar_bytes=DEFAULT_MAX_TOTAL_BYTES,
+                ),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
         r.ltrim(key, 0, 999)
 
         logger.debug(f"[dq-history] Wrote history row to Redis fallback: {table_name}")

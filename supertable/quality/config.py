@@ -20,6 +20,7 @@ The prefix is centralised in ``supertable.redis_keys.quality_prefix``.
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 import logging
@@ -28,7 +29,16 @@ from typing import Any, Dict, List, Optional
 
 import redis
 
+from supertable.quality.serialization import normalize_json_value
+
 logger = logging.getLogger(__name__)
+
+
+class DQConfigReadError(RuntimeError):
+    """Persisted DQ state could not be read with execution-safe certainty."""
+
+
+_MISSING = object()
 
 
 def _now_iso() -> str:
@@ -78,6 +88,56 @@ BUILTIN_CHECKS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _default_global_config() -> Dict[str, Any]:
+    return {
+        "checks": {
+            check_id: {
+                "enabled": definition["enabled"],
+                "threshold": definition["threshold"],
+            }
+            for check_id, definition in BUILTIN_CHECKS.items()
+        },
+    }
+
+
+def _merge_known_checks(
+    base: Dict[str, Dict[str, Any]],
+    overrides: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Merge only supported built-ins and only object-shaped overrides."""
+
+    merged = deepcopy(base)
+    if not isinstance(overrides, dict):
+        return merged
+    for check_id, override in overrides.items():
+        if check_id not in BUILTIN_CHECKS or not isinstance(override, dict):
+            continue
+        merged.setdefault(check_id, {}).update(deepcopy(override))
+    return merged
+
+
+def _incremental_scope_requested(config: Dict[str, Any]) -> bool:
+    """Return whether a config requests the unsupported row-level cursor."""
+
+    return config.get("scope") == "incremental"
+
+
+def _without_incremental_scope(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail legacy incremental configuration closed to a complete scan.
+
+    A timestamp alone is not a lossless cursor: ``>`` drops rows sharing or
+    arriving behind the watermark while ``>=`` processes boundary rows more
+    than once.  Until a stable composite cursor exists, persisted legacy
+    configuration must never activate that execution path.
+    """
+
+    sanitized = deepcopy(config)
+    if _incremental_scope_requested(sanitized):
+        sanitized["scope"] = "full"
+        sanitized.pop("incremental_column", None)
+    return sanitized
+
+
 class DQConfig:
     """
     CRUD operations for Data Quality configuration stored in Redis.
@@ -93,28 +153,147 @@ class DQConfig:
     def _key(self, *parts: str) -> str:
         return _dq_key(self.org, self.sup, *parts)
 
+    def _read_json(
+        self,
+        key: str,
+        *,
+        expected_type,
+        missing: Any = _MISSING,
+        label: str,
+    ):
+        """Read one persisted document without conflating absence and failure."""
+
+        try:
+            raw = self.r.get(key)
+        except Exception as exc:
+            logger.error("[dq-config] %s backend read error: %s", label, exc)
+            raise DQConfigReadError(f"could not read {label}") from exc
+        if raw is None:
+            if missing is _MISSING:
+                raise DQConfigReadError(f"required {label} is missing")
+            return deepcopy(missing)
+        try:
+            document = json.loads(raw)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            logger.error("[dq-config] %s contains malformed JSON", label)
+            raise DQConfigReadError(f"persisted {label} is malformed") from exc
+        if not isinstance(document, expected_type):
+            expected_name = getattr(expected_type, "__name__", str(expected_type))
+            logger.error(
+                "[dq-config] %s has wrong shape (expected %s)",
+                label,
+                expected_name,
+            )
+            raise DQConfigReadError(f"persisted {label} has the wrong shape")
+        return document
+
+    @staticmethod
+    def _validate_config_document(document: Dict[str, Any], label: str) -> None:
+        if "checks" not in document:
+            return
+        checks = document["checks"]
+        if not isinstance(checks, dict):
+            raise DQConfigReadError(f"persisted {label} checks have the wrong shape")
+        for check_id, override in checks.items():
+            definition = BUILTIN_CHECKS.get(check_id)
+            if definition is None:
+                continue
+            if not isinstance(override, dict):
+                raise DQConfigReadError(
+                    f"persisted {label} has malformed override for {check_id}"
+                )
+            if "enabled" in override and not isinstance(override["enabled"], bool):
+                raise DQConfigReadError(
+                    f"persisted {label} has non-boolean enabled for {check_id}"
+                )
+            if "threshold" not in override:
+                continue
+            threshold = override["threshold"]
+            if definition["threshold"] is None:
+                if threshold is not None:
+                    raise DQConfigReadError(
+                        f"persisted {label} requires a null threshold for {check_id}"
+                    )
+                continue
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))
+                or threshold < 0
+            ):
+                raise DQConfigReadError(
+                    f"persisted {label} has an invalid threshold for {check_id}"
+                )
+
+    @staticmethod
+    def _validate_schedule_document(document: Dict[str, Any], label: str) -> None:
+        boolean_fields = {
+            "enabled",
+            "post_ingest",
+            "post_ingest_quick",
+            "post_ingest_deep",
+            "post_ingest_custom",
+            "deep_enabled",
+            "custom_enabled",
+        }
+        for field_name in boolean_fields.intersection(document):
+            if not isinstance(document[field_name], bool):
+                raise DQConfigReadError(
+                    f"persisted {label} has non-boolean {field_name}"
+                )
+        if "cooldown_seconds" in document:
+            cooldown = document["cooldown_seconds"]
+            if (
+                isinstance(cooldown, bool)
+                or not isinstance(cooldown, int)
+                or cooldown < 0
+            ):
+                raise DQConfigReadError(
+                    f"persisted {label} has an invalid cooldown_seconds"
+                )
+        for field_name in ("quick_cron", "deep_cron", "custom_cron"):
+            if field_name in document and (
+                not isinstance(document[field_name], str)
+                or not document[field_name].strip()
+            ):
+                raise DQConfigReadError(
+                    f"persisted {label} has an invalid {field_name}"
+                )
+
     # ── Global config ─────────────────────────────────────────────────
 
     def get_global_config(self) -> Dict[str, Any]:
         """Return global check config.  Falls back to BUILTIN_CHECKS defaults."""
-        try:
-            raw = self.r.get(self._key("config", "__global__"))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_global_config error: {e}")
-        # Return defaults
-        return {
-            "checks": {cid: {"enabled": c["enabled"], "threshold": c["threshold"]}
-                        for cid, c in BUILTIN_CHECKS.items()},
-        }
+        defaults = _default_global_config()
+        stored = self._read_json(
+            self._key("config", "__global__"),
+            expected_type=dict,
+            missing={},
+            label="global quality config",
+        )
+        self._validate_config_document(stored, "global quality config")
+        merged = deepcopy(defaults)
+        for key, value in stored.items():
+            if key != "checks":
+                merged[key] = deepcopy(value)
+        merged["checks"] = _merge_known_checks(
+            defaults["checks"], stored.get("checks")
+        )
+        return _without_incremental_scope(merged)
 
     def set_global_config(self, config: Dict[str, Any], updated_by: str = "") -> bool:
         try:
-            config["updated_by"] = updated_by
-            config["updated_at"] = _now_iso()
-            self.r.set(self._key("config", "__global__"), json.dumps(config, default=str))
-            return True
+            if not isinstance(config, dict) or _incremental_scope_requested(config):
+                return False
+            self._validate_config_document(config, "global quality config")
+            stored = deepcopy(config)
+            stored["updated_by"] = updated_by
+            stored["updated_at"] = _now_iso()
+            persisted = self.r.set(
+                self._key("config", "__global__"),
+                json.dumps(stored, default=str),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_global_config error: {e}")
             return False
@@ -122,20 +301,33 @@ class DQConfig:
     # ── Per-table config ──────────────────────────────────────────────
 
     def get_table_config(self, table: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("config", table))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_table_config error: {e}")
-        return None
+        stored = self._read_json(
+            self._key("config", table),
+            expected_type=dict,
+            missing=None,
+            label=f"quality config for table {table!r}",
+        )
+        if stored is not None:
+            self._validate_config_document(stored, f"quality config for table {table!r}")
+            stored = _without_incremental_scope(stored)
+        return stored
 
     def set_table_config(self, table: str, config: Dict[str, Any], updated_by: str = "") -> bool:
         try:
-            config["updated_by"] = updated_by
-            config["updated_at"] = _now_iso()
-            self.r.set(self._key("config", table), json.dumps(config, default=str))
-            return True
+            if not isinstance(config, dict) or _incremental_scope_requested(config):
+                return False
+            self._validate_config_document(
+                config,
+                f"quality config for table {table!r}",
+            )
+            stored = deepcopy(config)
+            stored["updated_by"] = updated_by
+            stored["updated_at"] = _now_iso()
+            persisted = self.r.set(
+                self._key("config", table),
+                json.dumps(stored, default=str),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_table_config error: {e}")
             return False
@@ -156,77 +348,366 @@ class DQConfig:
             return g
         merged = deepcopy(g)
         # Merge check overrides
-        for cid, overrides in (t.get("checks") or {}).items():
-            if cid in merged.get("checks", {}):
-                merged["checks"][cid].update(overrides)
-            else:
-                merged["checks"][cid] = overrides
+        merged["checks"] = _merge_known_checks(merged.get("checks", {}), t.get("checks"))
         # Merge top-level fields
         for field in ("scope", "incremental_column"):
             if field in t:
                 merged[field] = t[field]
-        return merged
+        # A lone timestamp cursor cannot cover equal or late-arriving rows
+        # exactly.  Degrade every legacy incremental config to a complete
+        # profile until a stable composite public cursor is supported.
+        return _without_incremental_scope(merged)
 
     # ── Custom rules ──────────────────────────────────────────────────
+
+    def _validate_rule_inventory_document(
+        self,
+        rule_id: str,
+        document: Dict[str, Any],
+    ) -> None:
+        """Fail closed on corrupt indexed rule documents.
+
+        Disabled, recognisable legacy rules remain listable so an operator can
+        repair or delete them.  Enabled rules must pass the complete
+        schema-independent validator; the scheduler repeats validation with
+        the actual public schema before execution.
+        """
+
+        from supertable.quality.checker import (
+            quality_table_fqn,
+            validate_custom_rule,
+            validate_quality_table_name,
+        )
+
+        if document.get("rule_id") != rule_id:
+            raise DQConfigReadError(
+                f"quality rule {rule_id!r} document identity does not match its index"
+            )
+        enabled = document.get("enabled")
+        if not isinstance(enabled, bool):
+            raise DQConfigReadError(
+                f"quality rule {rule_id!r} has non-boolean enabled"
+            )
+        rule_type = document.get("rule_type")
+        known_types = {
+            "column_min", "column_max", "null_rate_max", "row_count_min",
+            "distinct_in", "custom_sql",
+        }
+        if rule_type not in known_types:
+            raise DQConfigReadError(
+                f"quality rule {rule_id!r} has unknown rule_type"
+            )
+        table_validation = validate_quality_table_name(
+            document.get("table_name"),
+            super_name=self.sup,
+            allow_wildcard=rule_type != "custom_sql",
+        )
+        if not table_validation.valid:
+            raise DQConfigReadError(
+                f"quality rule {rule_id!r} has invalid table scope "
+                f"({table_validation.code})"
+            )
+
+        required_fields = {
+            "column_min": ("column_name", "threshold"),
+            "column_max": ("column_name", "threshold"),
+            "null_rate_max": ("column_name", "threshold"),
+            "row_count_min": ("threshold",),
+            "distinct_in": ("column_name", "expected_values"),
+            "custom_sql": ("sql",),
+        }
+        if any(field not in document for field in required_fields[rule_type]):
+            raise DQConfigReadError(
+                f"quality rule {rule_id!r} is missing required fields"
+            )
+
+        if enabled:
+            table_fqn = (
+                None
+                if document["table_name"] == "*"
+                else quality_table_fqn(self.sup, document["table_name"])
+            )
+            validation = validate_custom_rule(document, table_fqn=table_fqn)
+            if not validation.valid:
+                raise DQConfigReadError(
+                    f"quality rule {rule_id!r} is invalid "
+                    f"({validation.code}): {validation.message}"
+                )
 
     def list_rules(self) -> List[Dict[str, Any]]:
         try:
             index_key = self._key("rules", "index")
             rule_ids = self.r.smembers(index_key) or set()
-            rules = []
-            for rid_raw in rule_ids:
-                rid = rid_raw if isinstance(rid_raw, str) else rid_raw.decode("utf-8")
-                raw = self.r.get(self._key("rules", "doc", rid))
-                if raw:
-                    rules.append(json.loads(raw))
-            return sorted(rules, key=lambda x: x.get("created_at", ""))
-        except Exception as e:
-            logger.error(f"[dq-config] list_rules error: {e}")
-            return []
+        except Exception as exc:
+            logger.error("[dq-config] list_rules index read error: %s", exc)
+            raise DQConfigReadError("could not read quality rule index") from exc
+        if not isinstance(rule_ids, (set, frozenset, list, tuple)):
+            raise DQConfigReadError("quality rule index has the wrong shape")
+
+        rules = []
+        for rid_raw in rule_ids:
+            try:
+                rid = (
+                    rid_raw
+                    if isinstance(rid_raw, str)
+                    else rid_raw.decode("utf-8")
+                )
+            except (AttributeError, UnicodeError) as exc:
+                raise DQConfigReadError("quality rule index contains an invalid id") from exc
+            document = self._read_json(
+                self._key("rules", "doc", rid),
+                expected_type=dict,
+                label=f"quality rule {rid!r}",
+            )
+            self._validate_rule_inventory_document(rid, document)
+            rules.append(document)
+        return sorted(rules, key=lambda x: str(x.get("created_at", "")))
 
     def get_rule(self, rule_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("rules", "doc", rule_id))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_rule error: {e}")
-        return None
+        return self._read_json(
+            self._key("rules", "doc", rule_id),
+            expected_type=dict,
+            missing=None,
+            label=f"quality rule {rule_id!r}",
+        )
 
     def create_rule(self, rule: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
-        rule_id = rule.get("rule_id") or f"rule_{uuid.uuid4().hex[:8]}"
-        rule["rule_id"] = rule_id
-        rule.setdefault("enabled", True)
-        rule.setdefault("severity", "warning")
-        rule["created_by"] = created_by
-        rule["created_at"] = _now_iso()
+        if not isinstance(rule, dict):
+            raise ValueError("quality rule must be an object")
+        candidate = deepcopy(rule)
+        rule_id = candidate.get("rule_id") or f"rule_{uuid.uuid4().hex[:8]}"
+        candidate["rule_id"] = rule_id
+        candidate.setdefault("enabled", True)
+        candidate.setdefault("severity", "warning")
+        if not isinstance(candidate.get("enabled"), bool):
+            raise ValueError("quality rule enabled must be a boolean")
+        from supertable.quality.checker import (
+            quality_table_fqn,
+            validate_custom_rule,
+            validate_quality_table_name,
+        )
+        table_validation = validate_quality_table_name(
+            candidate.get("table_name"),
+            super_name=self.sup,
+            allow_wildcard=candidate.get("rule_type") != "custom_sql",
+        )
+        if not table_validation.valid:
+            raise ValueError(
+                f"invalid quality rule ({table_validation.code}): "
+                f"{table_validation.message}"
+            )
+        table_fqn = (
+            None
+            if candidate["table_name"] == "*"
+            else quality_table_fqn(self.sup, candidate["table_name"])
+        )
+        validation = validate_custom_rule(
+            candidate,
+            table_fqn=table_fqn,
+        )
+        if not validation.valid:
+            raise ValueError(f"invalid quality rule ({validation.code}): {validation.message}")
+        candidate["created_by"] = created_by
+        candidate["created_at"] = _now_iso()
+        document_key = self._key("rules", "doc", rule_id)
+        index_key = self._key("rules", "index")
+        payload = json.dumps(candidate, default=str)
+        pipe = None
         try:
-            self.r.set(self._key("rules", "doc", rule_id), json.dumps(rule, default=str))
-            self.r.sadd(self._key("rules", "index"), rule_id)
+            # WATCH prevents a caller-supplied ID from turning create into an
+            # undocumented upsert. Watching both authorities also treats an
+            # indexed-but-missing legacy document as occupied instead of
+            # silently repairing/overwriting uncertain state.
+            pipe = self.r.pipeline()
+            while True:
+                try:
+                    pipe.watch(document_key, index_key)
+                    if pipe.exists(document_key) or pipe.sismember(index_key, rule_id):
+                        raise ValueError(
+                            f"quality rule {rule_id!r} already exists"
+                        )
+                    pipe.multi()
+                    pipe.set(document_key, payload)
+                    pipe.sadd(index_key, rule_id)
+                    results = pipe.execute()
+                    break
+                except redis.WatchError:
+                    # Re-read both watched authorities. A competing creator
+                    # will be reported as a duplicate on the next iteration.
+                    continue
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"[dq-config] create_rule error: {e}")
-        return rule
+            raise RuntimeError(
+                f"could not persist quality rule {rule_id!r}"
+            ) from e
+        finally:
+            if pipe is not None:
+                try:
+                    pipe.reset()
+                except Exception:
+                    pass
+        if (
+            not isinstance(results, (list, tuple))
+            or len(results) != 2
+            or not results[0]
+            or isinstance(results[1], bool)
+            or not isinstance(results[1], int)
+            or results[1] != 1
+        ):
+            logger.error(
+                "[dq-config] create_rule returned invalid transaction result: %r",
+                results,
+            )
+            raise RuntimeError(f"could not persist quality rule {rule_id!r}")
+        return candidate
 
     def update_rule(self, rule_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        existing = self.get_rule(rule_id)
-        if not existing:
-            return None
-        existing.update(updates)
-        existing["updated_at"] = _now_iso()
+        if not isinstance(updates, dict):
+            raise ValueError("quality rule updates must be an object")
+        requested_updates = deepcopy(updates)
+        document_key = self._key("rules", "doc", rule_id)
+        index_key = self._key("rules", "index")
+        pipe = None
         try:
-            self.r.set(self._key("rules", "doc", rule_id), json.dumps(existing, default=str))
+            pipe = self.r.pipeline()
+            while True:
+                try:
+                    # Both the document and discoverability index are
+                    # authorities. A delete or repair racing this update must
+                    # invalidate EXEC so SET can never recreate an orphan.
+                    pipe.watch(document_key, index_key)
+                    raw = pipe.get(document_key)
+                    indexed = bool(pipe.sismember(index_key, rule_id))
+                    if raw is None:
+                        if indexed:
+                            raise DQConfigReadError(
+                                f"indexed quality rule {rule_id!r} is missing"
+                            )
+                        return None
+                    if not indexed:
+                        raise DQConfigReadError(
+                            f"quality rule {rule_id!r} is not indexed"
+                        )
+                    try:
+                        existing = json.loads(raw)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise DQConfigReadError(
+                            f"persisted quality rule {rule_id!r} is malformed"
+                        ) from exc
+                    if not isinstance(existing, dict):
+                        raise DQConfigReadError(
+                            f"persisted quality rule {rule_id!r} has the wrong shape"
+                        )
+
+                    candidate = deepcopy(existing)
+                    candidate.update(deepcopy(requested_updates))
+                    # The Redis document/index identity is immutable.
+                    candidate["rule_id"] = rule_id
+                    candidate.setdefault("severity", "warning")
+                    if not isinstance(candidate.get("enabled"), bool):
+                        raise ValueError("quality rule enabled must be a boolean")
+                    from supertable.quality.checker import (
+                        quality_table_fqn,
+                        validate_custom_rule,
+                        validate_quality_table_name,
+                    )
+                    # Always permit an invalid legacy document to be disabled.
+                    # Enabling or otherwise updating an active rule requires
+                    # full validation.
+                    if candidate["enabled"]:
+                        table_validation = validate_quality_table_name(
+                            candidate.get("table_name"),
+                            super_name=self.sup,
+                            allow_wildcard=candidate.get("rule_type") != "custom_sql",
+                        )
+                        if not table_validation.valid:
+                            raise ValueError(
+                                f"invalid quality rule ({table_validation.code}): "
+                                f"{table_validation.message}"
+                            )
+                        table_fqn = (
+                            None
+                            if candidate["table_name"] == "*"
+                            else quality_table_fqn(self.sup, candidate["table_name"])
+                        )
+                        validation = validate_custom_rule(
+                            candidate,
+                            table_fqn=table_fqn,
+                        )
+                        if not validation.valid:
+                            raise ValueError(
+                                f"invalid quality rule ({validation.code}): "
+                                f"{validation.message}"
+                            )
+                    candidate["updated_at"] = _now_iso()
+                    pipe.multi()
+                    pipe.set(
+                        document_key,
+                        json.dumps(candidate, default=str),
+                    )
+                    results = pipe.execute()
+                    break
+                except redis.WatchError:
+                    # Re-read both authorities. A completed concurrent delete
+                    # becomes a normal absent result on the next iteration.
+                    continue
+        except (DQConfigReadError, ValueError):
+            raise
         except Exception as e:
             logger.error(f"[dq-config] update_rule error: {e}")
-        return existing
+            raise RuntimeError(
+                f"could not persist quality rule {rule_id!r} update"
+            ) from e
+        finally:
+            if pipe is not None:
+                try:
+                    pipe.reset()
+                except Exception:
+                    pass
+        if (
+            not isinstance(results, (list, tuple))
+            or len(results) != 1
+            or not results[0]
+        ):
+            logger.error(
+                "[dq-config] update_rule transaction did not acknowledge "
+                "persistence for %s: %r",
+                rule_id,
+                results,
+            )
+            raise RuntimeError(
+                f"could not persist quality rule {rule_id!r} update"
+            )
+        return candidate
 
     def delete_rule(self, rule_id: str) -> bool:
+        pipe = None
         try:
-            self.r.delete(self._key("rules", "doc", rule_id))
-            self.r.srem(self._key("rules", "index"), rule_id)
-            return True
+            pipe = self.r.pipeline(transaction=True)
+            pipe.delete(self._key("rules", "doc", rule_id))
+            pipe.srem(self._key("rules", "index"), rule_id)
+            results = pipe.execute()
         except Exception as e:
             logger.error(f"[dq-config] delete_rule error: {e}")
             return False
+        finally:
+            if pipe is not None:
+                try:
+                    pipe.reset()
+                except Exception:
+                    pass
+        return bool(
+            isinstance(results, (list, tuple))
+            and len(results) == 2
+            and all(
+                isinstance(result, int)
+                and not isinstance(result, bool)
+                and result >= 0
+                for result in results
+            )
+        )
 
     def list_rules_for_table(self, table: str) -> List[Dict[str, Any]]:
         all_rules = self.list_rules()
@@ -236,13 +717,7 @@ class DQConfig:
     # ── Schedule config ───────────────────────────────────────────────
 
     def get_schedule(self) -> Dict[str, Any]:
-        try:
-            raw = self.r.get(self._key("schedule"))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_schedule error: {e}")
-        return {
+        defaults = {
             "quick_cron": "0 */4 * * *",
             "deep_cron": "0 2 * * *",
             "custom_cron": "0 */6 * * *",
@@ -252,30 +727,59 @@ class DQConfig:
             "post_ingest_deep": False,
             "enabled": True,
         }
+        stored = self._read_json(
+            self._key("schedule"),
+            expected_type=dict,
+            missing={},
+            label="global quality schedule",
+        )
+        self._validate_schedule_document(stored, "global quality schedule")
+        defaults.update(stored)
+        return defaults
 
     def set_schedule(self, schedule: Dict[str, Any]) -> bool:
         try:
+            if not isinstance(schedule, dict):
+                return False
+            self._validate_schedule_document(schedule, "global quality schedule")
             schedule["updated_at"] = _now_iso()
-            self.r.set(self._key("schedule"), json.dumps(schedule, default=str))
-            return True
+            persisted = self.r.set(
+                self._key("schedule"),
+                json.dumps(schedule, default=str),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_schedule error: {e}")
             return False
 
     def get_table_schedule(self, table: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("schedule", table))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_table_schedule error: {e}")
-        return None
+        stored = self._read_json(
+            self._key("schedule", table),
+            expected_type=dict,
+            missing=None,
+            label=f"quality schedule for table {table!r}",
+        )
+        if stored is not None:
+            self._validate_schedule_document(
+                stored,
+                f"quality schedule for table {table!r}",
+            )
+        return stored
 
     def set_table_schedule(self, table: str, schedule: Dict[str, Any]) -> bool:
         try:
+            if not isinstance(schedule, dict):
+                return False
+            self._validate_schedule_document(
+                schedule,
+                f"quality schedule for table {table!r}",
+            )
             schedule["updated_at"] = _now_iso()
-            self.r.set(self._key("schedule", table), json.dumps(schedule, default=str))
-            return True
+            persisted = self.r.set(
+                self._key("schedule", table),
+                json.dumps(schedule, default=str),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_table_schedule error: {e}")
             return False
@@ -318,52 +822,73 @@ class DQConfig:
     # ── Latest results (fast UI cache) ────────────────────────────────
 
     def get_latest(self, table: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("latest", table))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_latest error: {e}")
-        return None
+        return self._read_json(
+            self._key("latest", table),
+            expected_type=dict,
+            missing=None,
+            label=f"latest quality result for table {table!r}",
+        )
 
     def set_latest(self, table: str, result: Dict[str, Any]) -> bool:
         try:
-            self.r.set(self._key("latest", table), json.dumps(result, default=str))
-            return True
+            persisted = self.r.set(
+                self._key("latest", table),
+                json.dumps(
+                    normalize_json_value(result),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_latest error: {e}")
             return False
 
     def get_latest_column(self, table: str, column: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("latest", table, column))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_latest_column error: {e}")
-        return None
+        return self._read_json(
+            self._key("latest", table, column),
+            expected_type=dict,
+            missing=None,
+            label=f"latest quality result for {table!r}.{column!r}",
+        )
 
     def set_latest_column(self, table: str, column: str, result: Dict[str, Any]) -> bool:
         try:
-            self.r.set(self._key("latest", table, column), json.dumps(result, default=str))
-            return True
+            persisted = self.r.set(
+                self._key("latest", table, column),
+                json.dumps(
+                    normalize_json_value(result),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_latest_column error: {e}")
             return False
 
     def get_anomalies(self, table: str) -> List[Dict[str, Any]]:
-        try:
-            raw = self.r.get(self._key("anomalies", table))
-            if raw:
-                return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_anomalies error: {e}")
-        return []
+        return self._read_json(
+            self._key("anomalies", table),
+            expected_type=list,
+            missing=[],
+            label=f"quality anomalies for table {table!r}",
+        )
 
     def set_anomalies(self, table: str, anomalies: List[Dict[str, Any]]) -> bool:
         try:
-            self.r.set(self._key("anomalies", table), json.dumps(anomalies, default=str))
-            return True
+            persisted = self.r.set(
+                self._key("anomalies", table),
+                json.dumps(
+                    normalize_json_value(anomalies),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            return bool(persisted)
         except Exception as e:
             logger.error(f"[dq-config] set_anomalies error: {e}")
             return False
