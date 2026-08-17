@@ -185,6 +185,7 @@ def test_compaction_outputs_carry_exact_resource_seals(tmp_path, monkeypatch):
             compression_level=1,
         )
 
+    footer_cache = {}
     considered, rows, new_resources, sunset = compact_resources(
         {"resources": source_resources},
         compacted_dir,
@@ -192,13 +193,27 @@ def test_compaction_outputs_carry_exact_resource_seals(tmp_path, monkeypatch):
         table_config={"max_memory_chunk_size": 1024 * 1024},
         small_only=False,
         required_reads=True,
+        footer_md_out=footer_cache,
     )
 
     assert considered == 2
     assert rows == 4
     assert sunset == {resource["file"] for resource in source_resources}
     assert new_resources
-    stats = extract_stats_rows([resource["file"] for resource in new_resources])
+    # Compaction already parsed the exact uploaded footer.  Metadata extraction
+    # must reuse it rather than downloading each complete output again.
+    assert set(footer_cache) == {resource["file"] for resource in new_resources}
+    monkeypatch.setattr(
+        processing,
+        "_read_footer_metadata",
+        lambda _path, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh compaction footer was reread from storage")
+        ),
+    )
+    stats = extract_stats_rows(
+        [resource["file"] for resource in new_resources],
+        footer_md_cache=footer_cache,
+    )
     observed = stats_resource_seals(stats)
     assert observed is not None
     assert {

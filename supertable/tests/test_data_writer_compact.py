@@ -36,6 +36,7 @@ _P_REDIS_CAT     = f"{_MOD}.RedisCatalog"
 _P_COMPACT_RES   = f"{_MOD}.compact_resources"
 _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
 _P_READ_PARQUET  = f"{_MOD}._read_parquet_safe"
+_P_BUILD_STATS   = f"{_MOD}.build_stats_file"
 _P_MIRROR        = f"{_MOD}.MirrorFormats"
 _P_MON_WRITER    = f"{_MOD}.MonitoringWriter"
 _P_AUDIT         = f"{_MOD}._audit_emit"
@@ -107,6 +108,20 @@ def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
 def _stub_settings():
     """Build a fake ``settings`` object for patching."""
     return MagicMock()
+
+
+@pytest.fixture(autouse=True)
+def _stub_compaction_stats_io():
+    """Keep this orchestration suite isolated from footer/stat storage I/O.
+
+    Exact footer caching and statistics persistence are exercised by their
+    dedicated processing tests; these tests use synthetic resource paths.
+    """
+    with (
+        patch(f"{_MOD}.extract_stats_rows", return_value=pl.DataFrame()),
+        patch(_P_BUILD_STATS, return_value=(None, None)),
+    ):
+        yield
 
 
 def _build_writer():
@@ -349,7 +364,12 @@ class TestTombstoneGating:
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
     @patch(_P_MIRROR)
-    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(
+        _P_COMPACT_RES,
+        return_value=(
+            0, 0, [], set(), _dv_frame(1),
+        ),
+    )
     @patch(_P_COMPACT_TOMB)
     @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
@@ -359,7 +379,7 @@ class TestTombstoneGating:
         self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """force_tombstones=True + a non-empty DV → compact_tombstones runs."""
+        """force_tombstones=True + a non-empty DV uses the fused drain."""
         dw = _build_writer()
         snap = _snapshot(
             [_resource("a"), _resource("b")],
@@ -367,17 +387,23 @@ class TestTombstoneGating:
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(1)  # 1 tombstoned row
-        mock_compact_tomb.return_value = (1, [{"file": "rebuilt.parquet", "file_size": 100, "columns": []}], {"a"})
         dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=True)
 
-        mock_compact_tomb.assert_called_once()
+        mock_compact_tomb.assert_not_called()
+        assert mock_compact_res.call_args.kwargs["tombstone_df"].height == 1
+        assert mock_compact_res.call_args.kwargs["return_residual"] is True
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
     @patch(_P_MIRROR)
-    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(
+        _P_COMPACT_RES,
+        return_value=(
+            0, 0, [], set(), _dv_frame(2),
+        ),
+    )
     @patch(_P_COMPACT_TOMB)
     @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
@@ -396,17 +422,22 @@ class TestTombstoneGating:
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(2)  # 2 tombstoned rows
-        mock_compact_tomb.return_value = (2, [{"file": "rebuilt", "file_size": 1, "columns": []}], {"a"})
         dw._get_table_config = MagicMock(return_value={})
 
         dw.compact("admin", "tbl", force_tombstones=False)
 
-        mock_compact_tomb.assert_called_once()
+        mock_compact_tomb.assert_not_called()
+        assert mock_compact_res.call_args.kwargs["tombstone_df"].height == 2
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
     @patch(_P_MIRROR)
-    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(
+        _P_COMPACT_RES,
+        return_value=(
+            0, 0, [], set(), _dv_frame(3),
+        ),
+    )
     @patch(_P_COMPACT_TOMB)
     @patch(_P_READ_PARQUET)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
@@ -425,13 +456,13 @@ class TestTombstoneGating:
         )
         MockSimple.return_value = _mk_simple_mock(snap)
         mock_read_pq.return_value = _dv_frame(3)
-        mock_compact_tomb.return_value = (3, [{"file": "rebuilt", "file_size": 1, "columns": []}], {"a"})
         # A huge per-table threshold must NOT suppress compact()'s drain.
         dw._get_table_config = MagicMock(return_value={"max_tombstone_rows": 1_000_000})
 
         dw.compact("admin", "tbl", force_tombstones=False)
 
-        mock_compact_tomb.assert_called_once()
+        mock_compact_tomb.assert_not_called()
+        assert mock_compact_res.call_args.kwargs["tombstone_df"].height == 3
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -788,14 +819,19 @@ class TestMonitoring:
 # 8. Schema preservation through update() — regression
 # ===========================================================================
 #
-# compact() hands a model_df to simple_table.update(); update() derives
-# the new snapshot's ``schema`` field from that frame's Polars dtypes.
-# If the frame is empty / wrong-typed, the snapshot metadata gets
-# corrupted (even though the Parquet files on disk are correct).
-# These tests pin the resolution chain in ``_build_compact_model_df``.
+# compact() is a physical rewrite. Passing a model frame to update() would
+# republish physical legacy columns or lose columns held by untouched files.
+# These tests pin the ``model_df=None`` preservation boundary.
 
 
 class TestSchemaPreservation:
+
+    def test_footer_cache_contains_stats_only(self):
+        """Physical compaction metadata must not override logical schema."""
+        from supertable.processing import _FooterStatsCacheEntry
+
+        entry = _FooterStatsCacheEntry(metadata=object(), rows=[])
+        assert not hasattr(entry, "polars_schema")
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -805,13 +841,11 @@ class TestSchemaPreservation:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_model_df_built_from_new_parquet_when_storage_succeeds(
+    def test_explicit_compaction_preserves_schema_without_body_read(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """Happy path: model_df mirrors the schema of the first new
-        compacted parquet file. simple_table.update receives a frame
-        whose dtypes are the real post-compaction dtypes."""
+        """A physical rewrite must not replace last-write schema metadata."""
         dw = _build_writer()
 
         # Storage.read_parquet returns a real Arrow table with mixed dtypes
@@ -837,19 +871,9 @@ class TestSchemaPreservation:
 
         dw.compact("admin", "tbl")
 
-        # update() received a non-empty schema frame with the real dtypes
         args, kwargs = mock_simple.update.call_args
-        model_df = args[2]   # (new_resources, sunset, model_df, ...)
-        assert model_df.width == 4, (
-            f"model_df should have 4 columns, got {model_df.width} — "
-            "schema would be corrupted"
-        )
-        assert set(model_df.columns) == {"id", "name", "amount", "ok"}
-        # Dtypes match the source parquet, not Utf8
-        dtype_map = dict(zip(model_df.columns, model_df.dtypes))
-        assert dtype_map["id"] == pl.Int64
-        assert dtype_map["amount"] == pl.Float64
-        assert dtype_map["ok"] == pl.Boolean
+        assert args[2] is None
+        dw.super_table.storage.read_parquet.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -859,13 +883,11 @@ class TestSchemaPreservation:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_fallback_to_prior_snapshot_schema_when_storage_read_fails(
+    def test_explicit_compaction_preserves_prior_schema_when_storage_unavailable(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """Storage read fails → reconstruct from last_simple_table["schema"]
-        (Spark-style entries). Compaction preserves schema by definition
-        so the pre-compaction schema is correct."""
+        """Schema preservation needs no output read or reconstruction."""
         dw = _build_writer()
 
         # Storage.read_parquet raises — exercise the fallback
@@ -893,15 +915,8 @@ class TestSchemaPreservation:
         dw.compact("admin", "tbl")
 
         args, kwargs = mock_simple.update.call_args
-        model_df = args[2]
-        assert model_df.width == 3, (
-            "fallback should have reconstructed all 3 columns from snapshot schema"
-        )
-        assert set(model_df.columns) == {"id", "amount", "flag"}
-        dtype_map = dict(zip(model_df.columns, model_df.dtypes))
-        assert dtype_map["id"] == pl.Int64       # "long" → Int64
-        assert dtype_map["amount"] == pl.Float64  # "double" → Float64
-        assert dtype_map["flag"] == pl.Boolean    # "boolean" → Boolean
+        assert args[2] is None
+        dw.super_table.storage.read_parquet.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -911,13 +926,11 @@ class TestSchemaPreservation:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_empty_frame_when_no_schema_anywhere(
+    def test_explicit_compaction_preserves_missing_schema(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """Pathological case: storage read fails AND snapshot has no
-        schema field. Falls back to an empty frame — the snapshot's
-        existing schema (None/missing) is left as-is."""
+        """A missing prior schema stays missing instead of being guessed."""
         dw = _build_writer()
         dw.super_table.storage.read_parquet.side_effect = RuntimeError("nope")
 
@@ -938,11 +951,8 @@ class TestSchemaPreservation:
         dw.compact("admin", "tbl")
 
         args, kwargs = mock_simple.update.call_args
-        model_df = args[2]
-        # Empty frame is acceptable here — it would leave the schema
-        # blank in the new snapshot, which is no worse than the
-        # pre-fix behaviour (silent corruption).
-        assert isinstance(model_df, pl.DataFrame)
+        assert args[2] is None
+        dw.super_table.storage.read_parquet.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -952,15 +962,11 @@ class TestSchemaPreservation:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_multi_chunk_schemas_union_correctly(
+    def test_explicit_compaction_does_not_derive_schema_from_output_chunks(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """Regression: compact_resources may produce multiple chunks
-        with different schemas (when files have schema evolution).
-        ``_build_compact_model_df`` must read ALL new files and union
-        their schemas — not just the first — otherwise the snapshot's
-        schema field is missing columns that appear in later chunks."""
+        """Independent physical chunk schemas cannot redefine the table."""
         dw = _build_writer()
 
         import pyarrow as pa
@@ -996,26 +1002,8 @@ class TestSchemaPreservation:
         dw.compact("admin", "tbl")
 
         args, kwargs = mock_simple.update.call_args
-        model_df = args[2]
-        # CRITICAL: model_df must have the UNION of both chunks' schemas
-        assert model_df.width == 3, (
-            f"model_df must union schemas from all chunks; got width={model_df.width}"
-        )
-        assert set(model_df.columns) == {"id", "name", "email"}, (
-            f"missing columns: expected {{id, name, email}}, got {set(model_df.columns)}"
-        )
-
-    def test_spark_to_polars_type_map_covers_common_types(self):
-        """The conversion map must cover the dtypes that
-        ``_schema_list_from_polars_df`` in ``simple_table`` emits, so
-        a round-trip (Polars → snapshot → fallback model_df) is lossless."""
-        from supertable.data_writer import DataWriter
-        m = DataWriter._SPARK_TYPE_TO_POLARS
-        # Every common dtype must map to a Polars attribute that exists.
-        for spark, pl_name in m.items():
-            assert hasattr(pl, pl_name), (
-                f"{spark!r} → {pl_name!r} but polars.{pl_name} does not exist"
-            )
+        assert args[2] is None
+        dw.super_table.storage.read_parquet.assert_not_called()
 
 
 # ===========================================================================
@@ -1024,14 +1012,7 @@ class TestSchemaPreservation:
 
 
 class TestTwoPhaseAggregation:
-    """Regression for the duplicate-file bug.
-
-    A file produced by Phase A (compact_tombstones) can be picked up
-    as a small-file candidate by Phase B (compact_resources) and
-    sunset there. If we leave it in ``all_new_resources``, the final
-    snapshot lists it AND the file is on the GC queue → 30 min later
-    GC deletes a file the snapshot still references.
-    """
+    """The fused replacement publishes only final resources, exactly once."""
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -1065,20 +1046,15 @@ class TestTwoPhaseAggregation:
         MockSimple.return_value = mock_simple
         mock_read_pq.return_value = _dv_frame(1, "A")  # DV has rows → drains
 
-        # Phase A: tombstone compaction rewrites A → F
-        F_resource = {
-            "file": "F", "file_size": 1_500_000,
-            "rows": 50, "columns": 1, "stats": None,
-        }
-        mock_compact_tomb.return_value = (1, [F_resource], {"A"})
-
-        # Phase B: compact_resources sees B, C, F (all small) and merges
-        # them into G. F is in the sunset set — that's the bug-trigger.
+        # The fused pass consumes A's tombstone and packs A/B/C directly into
+        # final G. There is no intermediate F to accidentally publish/sunset.
         G_resource = {
             "file": "G", "file_size": 3_500_000,
             "rows": 150, "columns": 1, "stats": None,
         }
-        mock_compact_res.return_value = (3, 150, [G_resource], {"B", "C", "F"})
+        mock_compact_res.return_value = (
+            3, 150, [G_resource], {"A", "B", "C"}, _dv_frame(0),
+        )
 
         dw._get_table_config = MagicMock(return_value={})
 
@@ -1090,14 +1066,13 @@ class TestTwoPhaseAggregation:
         sunset_passed = args[1]
 
         new_files = {r["file"] for r in new_resources_passed}
-        # CRITICAL: F must NOT appear in new_resources because it's
-        # also sunset. Only G should be there.
+        # Only the final output is published; no intermediate can leak in.
         assert new_files == {"G"}, (
             f"new_resources must exclude files in sunset; got new={new_files}, "
             f"sunset={sunset_passed}"
         )
-        # Sunset is the union of both phases
-        assert sunset_passed == {"A", "B", "C", "F"}
+        assert sunset_passed == {"A", "B", "C"}
+        mock_compact_tomb.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -1112,16 +1087,7 @@ class TestTwoPhaseAggregation:
         self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
-        """The benign case: tombstone-output F is large (or otherwise not picked
-        up by Phase B). F must survive in the final snapshot exactly once.
-
-        F is spliced into the in-memory baseline right after Phase A, so ``update``
-        carries it forward via ``(baseline - sunset)``.  It must therefore NOT be
-        re-passed as ``new_resources`` — doing so listed the same file twice in the
-        new snapshot (a real defect; see
-        tests/characterization/test_compaction_duplicate_resource_entry.py).  So
-        ``update`` receives only Phase B's brand-new file G, while F survives
-        through the baseline."""
+        """Multiple final fused outputs are each passed to update once."""
         dw = _build_writer()
 
         import pyarrow as pa
@@ -1142,15 +1108,15 @@ class TestTwoPhaseAggregation:
             "file": "F", "file_size": 20_000_000,  # large
             "rows": 50, "columns": 1, "stats": None,
         }
-        mock_compact_tomb.return_value = (1, [F_resource], {"A"})
-
-        # Phase B only sees B (small) and rewrites it → G. F is too
-        # large for the small-file gate.
+        # A's survivor is large enough for its own final F; clean small B
+        # becomes final G. Both are outputs of the one fused pass.
         G_resource = {
             "file": "G", "file_size": 500_000,
             "rows": 50, "columns": 1, "stats": None,
         }
-        mock_compact_res.return_value = (1, 50, [G_resource], {"B"})
+        mock_compact_res.return_value = (
+            2, 100, [F_resource, G_resource], {"A", "B"}, _dv_frame(0),
+        )
 
         dw._get_table_config = MagicMock(return_value={})
 
@@ -1161,22 +1127,15 @@ class TestTwoPhaseAggregation:
         sunset_passed = args[1]
         new_files_list = [r["file"] for r in new_resources_passed]
 
-        # F (Phase-A output) is already in the baseline ``update`` merges
-        # against, so it must NOT be re-passed as new_resources — only Phase
-        # B's brand-new G is. Re-passing F is the duplicate-entry defect.
-        assert set(new_files_list) == {"G"}, (
-            f"update must receive only Phase B's net-new file; got new={new_files_list}"
+        assert set(new_files_list) == {"F", "G"}, (
+            f"update must receive each fused final file once; got {new_files_list}"
         )
         assert sunset_passed == {"A", "B"}, f"unexpected sunset={sunset_passed}"
 
-        # F survives via the baseline: Phase A spliced it into the in-memory
-        # snapshot ([B, F]) before Phase B ran, so ``update`` carries it forward
-        # through ``(baseline - sunset)``.
+        # The baseline contains no transient output; final F/G are introduced
+        # only through new_resources.
         baseline_files = [r["file"] for r in kwargs["last_snapshot"]["resources"]]
-        assert "F" in baseline_files, (
-            f"Phase-A output F must be carried by the update baseline; "
-            f"baseline={baseline_files}"
-        )
+        assert "F" not in baseline_files and "G" not in baseline_files
 
         # Effective snapshot = (baseline - sunset) + new_resources — F and G
         # each listed exactly once (a re-passed F would surface here as a dup).
@@ -1184,6 +1143,7 @@ class TestTwoPhaseAggregation:
         assert sorted(effective) == ["F", "G"], (
             f"new snapshot must list F and G exactly once each; got {effective}"
         )
+        mock_compact_tomb.assert_not_called()
 
 
 # ===========================================================================
@@ -1220,8 +1180,9 @@ class TestResultShape:
         mock_read_pq.return_value = _dv_frame(1)  # 1 tombstoned row
 
         new_res = [{"file": "c.parquet", "file_size": 5000, "columns": [{"name": "id"}]}]
-        mock_compact_res.return_value = (3, 300, new_res, {"a", "b", "c"})
-        mock_compact_tomb.return_value = (1, [], {"a"})  # 1 tombstoned row, no new files
+        mock_compact_res.return_value = (
+            3, 300, new_res, {"a", "b", "c"}, _dv_frame(0),
+        )
         dw._get_table_config = MagicMock(return_value={})
 
         result = dw.compact("admin", "tbl", force_tombstones=True)
@@ -1231,9 +1192,10 @@ class TestResultShape:
             "role_name", "table_name", "compression_level",
             "force_tombstones", "small_only",
             "files_before", "files_after", "files_compacted",
-            "tombstone_rows_removed", "tombstone_files_rewritten",
+            "tombstone_rows_removed", "tombstone_files_consumed",
+            "tombstone_files_rewritten", "tombstone_files_fully_dead",
             "new_resources", "sunset_files", "total_rows_written",
-            "duration", "lineage",
+            "duration", "lineage", "counts",
         }
         missing = expected_keys - set(result.keys())
         assert not missing, f"result missing keys: {missing}"
@@ -1242,5 +1204,8 @@ class TestResultShape:
         assert result["files_after"] == 1
         assert result["files_compacted"] == 3
         assert result["tombstone_rows_removed"] == 1
+        assert result["tombstone_files_consumed"] == 1
+        assert result["tombstone_files_rewritten"] == 0
+        assert result["tombstone_files_fully_dead"] == 1
         assert result["sunset_files"] >= 3   # parquet sunsets + tombstone sunsets
         assert result["duration"] > 0

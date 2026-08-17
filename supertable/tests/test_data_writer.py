@@ -2099,7 +2099,7 @@ class TestWriteAutoCompaction:
     @patch(_PATCH_POLARS_FROM_ARROW)
     @patch(_PATCH_REDIS_CATALOG)
     @patch(_PATCH_SUPER_TABLE)
-    def test_carried_forward_vector_drains_before_merge(
+    def test_carried_forward_vector_is_loaded_before_fused_compaction(
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_resolve, mock_process,
@@ -2107,12 +2107,13 @@ class TestWriteAutoCompaction:
         mock_build_stats, mock_load_tombstone, mock_compact_tomb,
         mock_compact_res,
     ):
-        """The ordering invariant: when a live deletion-vector is carried
-        forward (build_tombstone_file returns a path but no fresh frame) and
-        the gate trips, Phase A must LOAD and drain that vector (compact_
-        tombstones) BEFORE Phase B merges small files (compact_resources).
-        Merging first could sunset a file the vector still references and
-        permanently orphan its dead rows."""
+        """A carried-forward deletion vector must feed the fused compactor.
+
+        The vector is loaded before any source can be sunset, and the fused
+        operation must return the residual explicitly.  Falling back to the
+        old two-phase drain/merge sequence would reintroduce the redundant
+        survivor write and reread this path is intended to eliminate.
+        """
         mock_st = MagicMock(super_name="s", organization="o")
         MockST.return_value = mock_st
         MockCat.return_value = _mk_compaction_catalog()
@@ -2142,8 +2143,7 @@ class TestWriteAutoCompaction:
         mock_process.side_effect = lambda **kw: kw["new_resources"].append(
             {"file": "new.parquet", "file_size": 80 * 1024, "rows": 1}
         )
-        # Phase A loads the live vector off its pointer to drain it.
-        mock_load_tombstone.return_value = _tombstone_df([
+        carried_dv = _tombstone_df([
             ("small_0.parquet", rowid) for rowid in range(1, 51)
         ])
         mock_extract_stats.return_value = MagicMock()
@@ -2152,19 +2152,24 @@ class TestWriteAutoCompaction:
 
         order: List[str] = []
 
-        def _drain(**kw):
-            order.append("tomb")
-            return (50, [{"file": "survivor.parquet",
-                          "file_size": 70 * 1024, "rows": 50}],
-                    {"small_0.parquet"})
-        mock_compact_tomb.side_effect = _drain
+        def _load(*args, **kwargs):
+            order.append("load")
+            return carried_dv
+        mock_load_tombstone.side_effect = _load
 
-        def _merge(**kw):
-            order.append("res")
-            return (10, 5_000, [{"file": "merged.parquet",
-                                 "file_size": 4_000_000, "rows": 5_000}],
-                    set())
-        mock_compact_res.side_effect = _merge
+        def _fused(**kw):
+            order.append("fused")
+            assert kw["return_residual"] is True
+            assert kw["tombstone_df"].equals(carried_dv)
+            return (
+                10,
+                5_000,
+                [{"file": "merged.parquet", "file_size": 4_000_000,
+                  "rows": 5_000}],
+                {"small_0.parquet"},
+                carried_dv.head(0),
+            )
+        mock_compact_res.side_effect = _fused
 
         from supertable.data_writer import DataWriter
         dw = DataWriter("s", "o")
@@ -2174,7 +2179,8 @@ class TestWriteAutoCompaction:
         # The carried-forward vector was read off its pointer to drain it.
         mock_load_tombstone.assert_called_once()
         assert mock_load_tombstone.call_args[0][0] == "/d/tombstone/dv.parquet"
-        # Both phases ran, drain strictly before merge.
-        mock_compact_tomb.assert_called_once()
+        # The old intermediate-survivor phase is gone: the loaded vector is
+        # consumed by one fused source pass with an explicit residual result.
+        mock_compact_tomb.assert_not_called()
         mock_compact_res.assert_called_once()
-        assert order == ["tomb", "res"]
+        assert order == ["load", "fused"]

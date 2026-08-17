@@ -62,15 +62,22 @@ class TestParquetStatisticsAlwaysWritten:
                 assert col.statistics is not None
                 assert col.statistics.has_min_max
 
-    def test_write_statistics_flag_cannot_be_disabled(self):
-        """Guard: the explicit write_statistics=True kwarg must be passed to
-        pq.write_table.  Fails loudly if someone flips or drops it."""
+    def test_both_codec_paths_enable_full_statistics(self):
+        """Guard both the fast native codec and the PyArrow fallback flags."""
         from supertable.processing import write_parquet_and_collect_resources
+
+        native_calls = []
+        original_native_write = pl.DataFrame.write_parquet
+
+        def native_write(frame, *args, **kwargs):
+            native_calls.append(dict(kwargs))
+            return original_native_write(frame, *args, **kwargs)
 
         with (
             patch(f"{_MOD}.generate_filename", return_value="data.parquet"),
             patch(f"{_MOD}._get_storage") as mock_gs,
             patch(f"{_MOD}.pq.write_table", wraps=pq.write_table) as mock_write_table,
+            patch.object(pl.DataFrame, "write_parquet", native_write),
         ):
             mock_stor = MagicMock()
             mock_stor.exists.return_value = True
@@ -84,7 +91,23 @@ class TestParquetStatisticsAlwaysWritten:
                 new_resources=[],
                 compression_level=10,
             )
+            # A >64-byte top-level string is deliberately stats-sensitive and
+            # must exercise the established PyArrow compatibility writer.
+            write_parquet_and_collect_resources(
+                write_df=_df(id=[1], val=["x" * 65]),
+                overwrite_columns=["id"],
+                data_dir="/data",
+                new_resources=[],
+                compression_level=10,
+            )
 
+        assert native_calls
+        assert native_calls[0].get("statistics") == {
+            "min": True,
+            "max": True,
+            "null_count": True,
+            "distinct_count": False,
+        }
         assert mock_write_table.called
         assert mock_write_table.call_args.kwargs.get("write_statistics") is True
 

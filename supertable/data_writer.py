@@ -42,6 +42,7 @@ from supertable.processing import (
     compact_resources,
     compact_tombstones,
     should_compact_small_files,
+    _resolve_unified_dtype,
     _max_tombstone_rows,
     _read_parquet_safe,
     validate_tombstone_frame,
@@ -447,7 +448,9 @@ class DataWriter:
             role_name: RBAC role performing the configuration.
             simple_name: Name of the SimpleTable to configure.
             max_memory_chunk_size: Override MAX_MEMORY_CHUNK_SIZE (bytes) for
-                this table.  None leaves the existing value unchanged.
+                this table. The legacy name denotes the compressed source-byte
+                packing/output target; it is not a hard decoded-RAM limit.
+                None leaves the existing value unchanged.
             max_overlapping_files: Override MAX_OVERLAPPING_FILES for this
                 table.  None leaves the existing value unchanged.
             max_tombstone_rows: Maximum number of rows in the deletion-vector
@@ -551,6 +554,7 @@ class DataWriter:
 
     def _build_compact_model_df(
         self, new_resources: list, last_snapshot: dict,
+        footer_md_cache: dict | None = None,
     ) -> "DataFrame":
         """Build a zero-row Polars DataFrame whose schema mirrors the
         post-compaction file schema.
@@ -587,6 +591,19 @@ class DataWriter:
                 first_path = r.get("file") if isinstance(r, dict) else None
                 if not first_path:
                     continue
+                cached_entry = (footer_md_cache or {}).get(first_path)
+                cached_schema = getattr(cached_entry, "polars_schema", ())
+                if cached_schema:
+                    sample = polars.DataFrame(schema=dict(cached_schema))
+                    success_count += 1
+                    for col, dtype in sample.schema.items():
+                        if col not in union_schema:
+                            union_schema[col] = dtype
+                        else:
+                            union_schema[col] = _resolve_unified_dtype({
+                                union_schema[col], dtype,
+                            })
+                    continue
                 try:
                     arrow_tbl = self.super_table.storage.read_parquet(first_path)
                     sample = polars.from_arrow(arrow_tbl).limit(0)
@@ -599,9 +616,15 @@ class DataWriter:
                 for col, dtype in zip(sample.columns, sample.dtypes):
                     if col not in union_schema:
                         union_schema[col] = dtype
-                    # else: keep first-seen dtype (compaction-time dtypes
-                    # are already resolved by concat_with_union, so they
-                    # should be consistent across new files).
+                    else:
+                        # Multiple target-sized outputs are independently
+                        # packed and can legitimately carry different physical
+                        # dtypes after schema evolution. Mirror the exact
+                        # lossless widening rule used by concat_with_union;
+                        # first-file-wins would silently narrow metadata.
+                        union_schema[col] = _resolve_unified_dtype({
+                            union_schema[col], dtype,
+                        })
             if success_count > 0 and union_schema:
                 return polars.DataFrame(schema=union_schema)
             # If we got AT LEAST one successful read but the resulting
@@ -1243,9 +1266,13 @@ class DataWriter:
                 _tomb_files_written = 0
                 _tomb_files_total = 0
                 _comp_considered = 0
+                _comp_small_consumed = 0
+                _comp_large_tombstone_consumed = 0
                 _comp_files_written = 0
                 _comp_rows = 0
                 residual_tombstone_files: set[str] = set()
+                compaction_ran = False
+                fused_compaction_ran = False
 
                 # Phase A — drain the deletion-vector when either trigger fires
                 # and a vector is actually live (freshly built this write OR
@@ -1285,22 +1312,92 @@ class DataWriter:
                             )
                         )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
-                        removed, tomb_new, tomb_sunset, residual_dv = (
-                            self._unpack_tombstone_compaction(compact_tombstones(
-                                snapshot=last_simple_table,
+                        # When both physical phases are due, consume them in one
+                        # source pass.  Partial-DV survivors flow directly into
+                        # final ~chunk-sized outputs instead of being uploaded,
+                        # downloaded, and encoded again by Phase B.  A mirror
+                        # keeps the established targeted drain because its
+                        # fail-closed residual handling happens before any
+                        # unrelated small-file work.
+                        if compaction_gate and not enabled_mirrors:
+                            _small_consumed0 = profiler.counts.get(
+                                "compact_small_files_consumed", 0,
+                            )
+                            _large_tombstone_consumed0 = profiler.counts.get(
+                                "compact_large_tombstone_files_consumed", 0,
+                            )
+                            (
+                                considered,
+                                fused_rows,
+                                fused_new,
+                                fused_sunset,
+                                residual_dv,
+                            ) = compact_resources(
+                                snapshot={"resources": post_write_resources},
                                 tombstone_df=dv_to_drain,
+                                return_residual=True,
                                 data_dir=simple_table.data_dir,
                                 compression_level=compression_level,
                                 table_config=table_config,
+                                small_only=True,
                                 profiler=profiler,
-                                return_residual=True,
-                            ))
-                        )
-                        new_resources.extend(tomb_new)
-                        sunset_files |= tomb_sunset
-                        if residual_dv.height > 0:
+                                footer_md_out=footer_md_cache,
+                            )
                             residual_tombstone_files = (
                                 self._tombstone_referenced_files(residual_dv)
+                                if residual_dv.height else set()
+                            )
+                            all_tombstone_files = (
+                                self._tombstone_referenced_files(dv_to_drain)
+                            )
+                            tomb_sunset = (
+                                all_tombstone_files
+                                - residual_tombstone_files
+                            )
+                            tomb_new = []
+                            removed = dv_to_drain.height - residual_dv.height
+
+                            sunset_files |= fused_sunset
+                            new_resources = [
+                                resource
+                                for resource in (new_resources + fused_new)
+                                if resource.get("file") not in sunset_files
+                            ]
+                            _comp_considered = considered
+                            _comp_small_consumed = (
+                                profiler.counts.get(
+                                    "compact_small_files_consumed", 0,
+                                ) - _small_consumed0
+                            )
+                            _comp_large_tombstone_consumed = (
+                                profiler.counts.get(
+                                    "compact_large_tombstone_files_consumed", 0,
+                                ) - _large_tombstone_consumed0
+                            )
+                            _comp_files_written = len(fused_new)
+                            _comp_rows = fused_rows
+                            fused_compaction_ran = True
+                            compaction_ran = bool(fused_new or fused_sunset)
+                        else:
+                            removed, tomb_new, tomb_sunset, residual_dv = (
+                                self._unpack_tombstone_compaction(
+                                    compact_tombstones(
+                                        snapshot=last_simple_table,
+                                        tombstone_df=dv_to_drain,
+                                        data_dir=simple_table.data_dir,
+                                        compression_level=compression_level,
+                                        table_config=table_config,
+                                        profiler=profiler,
+                                        return_residual=True,
+                                        footer_md_out=footer_md_cache,
+                                    )
+                                )
+                            )
+                            new_resources.extend(tomb_new)
+                            sunset_files |= tomb_sunset
+                        if residual_dv.height > 0:
+                            residual_tombstone_files = self._tombstone_referenced_files(
+                                residual_dv
                             )
                             if tomb_new or tomb_sunset or tombstone_path is None:
                                 # Some groups were physically consumed. Publish a
@@ -1338,8 +1435,9 @@ class DataWriter:
                             profiler.counts.get("tombstone_files_total", 0)
                         )
                         logger.info(lp(
+                            f"{'fused ' if fused_compaction_ran else ''}"
                             f"tombstone compaction removed {removed} rows "
-                            f"from {len(tomb_sunset)} files"
+                            f"from {len(tomb_sunset)} file(s)"
                         ))
 
                 # 5. Pin the (carried-forward / new / cleared) tombstone pointer
@@ -1405,8 +1503,7 @@ class DataWriter:
                 # was drained above, so every surviving file is safe to sunset.
                 # Result folds into the SAME snapshot commit below (new_resources
                 # / sunset_files feed build_stats and simple_table.update).
-                compaction_ran = False
-                if compaction_gate:
+                if compaction_gate and not fused_compaction_ran:
                     live_resources = [
                         r for r in (last_simple_table.get("resources") or [])
                         if r.get("file") not in sunset_files
@@ -1424,9 +1521,12 @@ class DataWriter:
                         table_config=table_config,
                         small_only=True,
                         profiler=profiler,
+                        footer_md_out=footer_md_cache,
                     )
                     if comp_new or comp_sunset:
                         _comp_considered = considered
+                        _comp_small_consumed = considered
+                        _comp_large_tombstone_consumed = 0
                         _comp_files_written = len(comp_new)
                         _comp_rows = comp_rows
                         sunset_files |= comp_sunset
@@ -1468,15 +1568,30 @@ class DataWriter:
                     _cio_bw = profiler.counts.get("bytes_written", 0) - _cio_bw0
                     _cio_fr = profiler.counts.get("files_read", 0) - _cio_fr0
                     _cio_br = profiler.counts.get("bytes_read", 0) - _cio_br0
+                    if _comp_large_tombstone_consumed:
+                        _file_phase = (
+                            "fused file phase consumed "
+                            f"{_comp_small_consumed} small file(s) and "
+                            f"{_comp_large_tombstone_consumed} "
+                            "tombstone-referenced large file(s) -> "
+                            f"{_comp_files_written} file(s) "
+                            f"({_comp_rows} row(s)); unrelated large files "
+                            "left untouched"
+                        )
+                    else:
+                        _file_phase = (
+                            "small-file phase merged "
+                            f"{_comp_small_consumed} small file(s) -> "
+                            f"{_comp_files_written} file(s) "
+                            f"({_comp_rows} row(s)); large files left untouched"
+                        )
                     logger.info(lp(
                         "compaction during write "
                         f"[trigger={'+'.join(_triggers) or 'none'}]: "
                         f"tombstone phase removed {_tomb_removed} row(s) from "
                         f"{_tomb_files_touched}/{_tomb_files_total} deletion-vector file(s), "
                         f"wrote {_tomb_files_written} file(s); "
-                        f"small-file phase merged {_comp_considered} small file(s) -> "
-                        f"{_comp_files_written} file(s) ({_comp_rows} row(s)); "
-                        f"large files left untouched; live files {_live_before} -> {_final_live}; "
+                        f"{_file_phase}; live files {_live_before} -> {_final_live}; "
                         f"compaction io: read {_cio_fr} file(s)/{_cio_br / 1048576:.1f} MiB, "
                         f"wrote {_cio_files} file(s)/{_cio_bw / 1048576:.1f} MiB"
                     ))
@@ -1564,17 +1679,11 @@ class DataWriter:
                 # shape even though all parquet files still have full schema.
                 # See docs/03_data_model.md "Schema Field Semantics".
                 #
-                # When auto-compaction merged files this write, derive the
-                # schema from the compacted output instead: a merged file may
-                # union in columns from older files that the incoming frame
-                # lacks (schema-evolving tables), so `dataframe` would narrow
-                # the metadata even though the Parquet is wider.
-                if compaction_ran:
-                    schema_model_df = self._build_compact_model_df(
-                        new_resources, last_simple_table
-                    )
-                else:
-                    schema_model_df = None if delete_only else dataframe
+                # Physical compaction may retain legacy-only columns in Parquet,
+                # but it must not change the logical last-write-wins contract.
+                # The current incoming frame remains authoritative on every
+                # non-delete write; delete-only preserves the prior metadata.
+                schema_model_df = None if delete_only else dataframe
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
                     new_resources, sunset_files, schema_model_df,
                     last_snapshot=last_simple_table,
@@ -1848,19 +1957,18 @@ class DataWriter:
           2. Read the current snapshot via the leaf pointer. The simple
              table must already exist — compaction is **not** a
              bootstrap.
-          3. If a deletion-vector exists, run ``compact_tombstones``
-             unconditionally — physically removing tombstoned rows from
-             the affected parquet files and clearing the vector. This
-             must happen before step 4 so the small-file step never
-             rewrites a file the vector still references (which would
-             resurrect dead rows onto disk and orphan the vector). The
-             lazy ``max_tombstone_rows`` threshold gates only ``write``;
+          3. If a deletion-vector exists, drain it and merge eligible small
+             files in one fused ``compact_resources`` pass, so survivors are
+             never encoded and reread as intermediates. Mirror publication
+             retains the established targeted drain before the small-file pass.
+             The lazy ``max_tombstone_rows`` threshold gates only ``write``;
              ``compact()`` is explicit maintenance and always drains.
-          4. Run ``compact_resources`` to merge small parquet files in
-             memory-bounded chunks. When ``small_only=True`` (default),
+          4. ``compact_resources`` packs files toward the configured compressed
+             byte target. When ``small_only=True`` (default),
              only files strictly smaller than ``max_memory_chunk_size``
              qualify — large files are left untouched. ``small_only=False``
-             rewrites every resource regardless of size.
+             rewrites every resource regardless of size. This target is not a
+             hard bound on decoded RAM; each source is currently decoded whole.
           5. Commit the new snapshot via ``simple_table.update``,
              leaf-CAS, ``bump_root``, optional mirroring, and the same
              monitoring + audit pipeline as ``write``.
@@ -1884,8 +1992,9 @@ class DataWriter:
                 regardless of this flag (the vector must be consumed
                 before small-file compaction to stay consistent).
             small_only: only consider files smaller than
-                ``max_memory_chunk_size`` for compaction. Set to False
-                to rewrite every file (e.g. for a full-table re-encode).
+                the compressed-byte target ``max_memory_chunk_size`` for
+                compaction. Set to False to rewrite every file (e.g. for a
+                full-table re-encode).
             compression_level: zstd compression level for new parquets.
             lineage: optional provenance dict — same conventions as
                 ``write``. If omitted a minimal compaction lineage is
@@ -1915,6 +2024,7 @@ class DataWriter:
         t0 = time.time()
         t_last = t0
         timings: dict = {}
+        compaction_profiler = Profiler()
 
         def mark(stage: str):
             nonlocal t_last
@@ -1940,7 +2050,9 @@ class DataWriter:
             "files_after": 0,
             "files_compacted": 0,
             "tombstone_rows_removed": 0,
+            "tombstone_files_consumed": 0,
             "tombstone_files_rewritten": 0,
+            "tombstone_files_fully_dead": 0,
             "new_resources": 0,
             "sunset_files": 0,
             "total_rows_written": 0,
@@ -2006,6 +2118,7 @@ class DataWriter:
             prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
             prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             table_config = self._get_table_config(simple_name)
+            footer_md_cache = {}
             files_before = len(last_simple_table.get("resources") or [])
             result["files_before"] = files_before
             mark("snapshot")
@@ -2056,23 +2169,63 @@ class DataWriter:
                 schema={TOMBSTONE_FILE_COL: polars.Utf8, ROWID_COL: polars.Int64}
             )
             residual_tombstone_files: set[str] = set()
+            fused_maintenance = False
+            considered = 0
+            small_total_rows = 0
+            small_new_resources: list = []
+            small_sunset: set = set()
 
             should_run_tombstones = tombstone_rows > 0
             if should_run_tombstones:
-                (
-                    tomb_compacted_rows,
-                    tomb_new_resources,
-                    tomb_sunset,
-                    residual_dv,
-                ) = self._unpack_tombstone_compaction(compact_tombstones(
+                if not enabled_mirrors:
+                    (
+                        considered,
+                        small_total_rows,
+                        small_new_resources,
+                        small_sunset,
+                        residual_dv,
+                    ) = compact_resources(
                         snapshot=last_simple_table,
                         tombstone_df=tombstone_df,
+                        return_residual=True,
                         data_dir=simple_table.data_dir,
                         compression_level=compression_level,
                         table_config=table_config,
-                        return_residual=True,
+                        small_only=small_only,
+                        required_reads=False,
+                        profiler=compaction_profiler,
+                        footer_md_out=footer_md_cache,
                     )
-                )
+                    residual_tombstone_files = (
+                        self._tombstone_referenced_files(residual_dv)
+                        if residual_dv.height else set()
+                    )
+                    tomb_sunset = (
+                        self._tombstone_referenced_files(tombstone_df)
+                        - residual_tombstone_files
+                    )
+                    tomb_compacted_rows = (
+                        tombstone_df.height - residual_dv.height
+                    )
+                    fused_maintenance = True
+                else:
+                    (
+                        tomb_compacted_rows,
+                        tomb_new_resources,
+                        tomb_sunset,
+                        residual_dv,
+                    ) = self._unpack_tombstone_compaction(
+                        compact_tombstones(
+                            snapshot=last_simple_table,
+                            tombstone_df=tombstone_df,
+                            data_dir=simple_table.data_dir,
+                            compression_level=compression_level,
+                            table_config=table_config,
+                            profiler=compaction_profiler,
+                            return_residual=True,
+                            footer_md_out=footer_md_cache,
+                        )
+                    )
                 if residual_dv.height:
                     residual_tombstone_files = (
                         self._tombstone_referenced_files(residual_dv)
@@ -2108,12 +2261,29 @@ class DataWriter:
                 last_simple_table["resources"] = survivors
 
             result["tombstone_rows_removed"] = tomb_compacted_rows
-            result["tombstone_files_rewritten"] = len(tomb_sunset)
+            result["tombstone_files_consumed"] = len(tomb_sunset)
+            result["tombstone_files_rewritten"] = min(
+                len(tomb_sunset),
+                int(
+                    compaction_profiler.counts.get(
+                        "tombstone_files_with_survivors", 0,
+                    )
+                ),
+            )
+            result["tombstone_files_fully_dead"] = max(
+                0,
+                len(tomb_sunset) - result["tombstone_files_rewritten"],
+            )
             mark("tombstone_compact")
 
             # --- Phase B: small-file compaction ------------------------------
-            considered, small_total_rows, small_new_resources, small_sunset = (
-                compact_resources(
+            if not fused_maintenance:
+                (
+                    considered,
+                    small_total_rows,
+                    small_new_resources,
+                    small_sunset,
+                ) = compact_resources(
                     snapshot={
                         "resources": [
                             r for r in (last_simple_table.get("resources") or [])
@@ -2124,8 +2294,9 @@ class DataWriter:
                     compression_level=compression_level,
                     table_config=table_config,
                     small_only=small_only,
+                    profiler=compaction_profiler,
+                    footer_md_out=footer_md_cache,
                 )
-            )
             mark("small_file_compact")
 
             # --- Aggregate the two phases ------------------------------------
@@ -2175,6 +2346,7 @@ class DataWriter:
                 result["files_after"] = files_before
                 result["duration"] = round(time.time() - t0, 6)
                 result["timings"] = {k: round(v, 6) for k, v in timings.items()}
+                result["counts"] = compaction_profiler.emit_counts()
                 stats_payload = dict(result)
                 logger.info(lp(
                     f"compact: nothing to do (files_before={files_before})"
@@ -2214,7 +2386,9 @@ class DataWriter:
                     r.get("file") for r in all_new_resources
                     if isinstance(r, dict) and r.get("file")
                 ]
-                new_stats_rows = extract_stats_rows(new_data_files)
+                new_stats_rows = extract_stats_rows(
+                    new_data_files, footer_md_cache=footer_md_cache,
+                )
                 stats_path, combined_stats_df = build_stats_file(
                     stats_dir=stats_dir,
                     prev_stats_path=last_simple_table.get("stats_file"),
@@ -2248,30 +2422,12 @@ class DataWriter:
                     )
                 mark("build_stats")
 
-                # Derive the post-compaction schema for ``simple_table.update``.
-                # update() builds the new snapshot's ``schema`` field from
-                # the model_df's Polars dtypes, so we MUST hand it a frame
-                # whose dtypes match the actual compacted data — otherwise
-                # the snapshot's schema metadata gets corrupted (e.g. every
-                # column reported as Utf8) and downstream consumers
-                # (MetaReader, mirroring, query estimation) see a broken
-                # schema even though the Parquet files on disk are intact.
-                #
-                # Strategy: read the schema (no data — n_rows=0) of the
-                # first freshly-written compacted file. By construction
-                # every compacted file in this call has the same union
-                # schema (``concat_with_union`` enforces this in
-                # ``compact_resources``), so any of them is representative.
-                #
-                # Fallback chain on read failure:
-                #   1. Reconstruct from the previous snapshot's ``schema``
-                #      field — compaction preserves logical schema, so the
-                #      pre-compaction schema is the right answer.
-                #   2. Empty frame — last resort, only on a pre-compaction
-                #      schema that's already empty / missing.
-                model_df = self._build_compact_model_df(
-                    all_new_resources, last_simple_table,
-                )
+                # Explicit compaction is a physical rewrite, not a logical
+                # schema update. Preserve the last-upload schema byte-for-byte;
+                # deriving it from only the rewritten subset can resurrect a
+                # legacy column or drop one held by an untouched large/residual
+                # file. ``None`` is SimpleTable.update's preservation contract.
+                model_df = None
 
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
                     update_new_resources,
@@ -2374,6 +2530,7 @@ class DataWriter:
                 result["files_after"] = len(new_resources_list)
                 result["duration"] = round(time.time() - t0, 6)
                 result["timings"] = {k: round(v, 6) for k, v in timings.items()}
+                result["counts"] = compaction_profiler.emit_counts()
                 stats_payload = dict(result)
 
                 logger.info(lp(

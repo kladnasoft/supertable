@@ -281,6 +281,47 @@ def test_tombstone_files_drain_with_bounded_parallel_workers(monkeypatch):
     assert len(thread_ids) == 2
 
 
+def test_parallel_tombstone_writes_publish_footer_cache_in_parent(monkeypatch):
+    """Worker-local footer maps are merged without concurrent shared writes."""
+    barrier = threading.Barrier(2, timeout=5)
+
+    def read(path, **_kwargs):
+        barrier.wait()
+        base = 1 if path == "a.parquet" else 3
+        return pl.DataFrame({
+            "__rowid__": pl.Series([base, base + 1], dtype=pl.Int64),
+            "value": ["dead", "live"],
+        })
+
+    def write(**kwargs):
+        path = f"new-{kwargs['write_df'].get_column('__rowid__')[0]}.parquet"
+        kwargs["new_resources"].append({"file": path, "rows": 1})
+        kwargs["footer_md_out"][path] = f"footer-{path}"
+
+    monkeypatch.setattr(processing, "_read_parquet_safe", read)
+    monkeypatch.setattr(processing, "write_parquet_and_collect_resources", write)
+    cache = {}
+
+    removed, resources, sunset, residual = processing.compact_tombstones(
+        snapshot={"resources": [
+            {"file": "a.parquet", "rows": 2},
+            {"file": "b.parquet", "rows": 2},
+        ]},
+        tombstone_df=_dv([("a.parquet", 1), ("b.parquet", 3)]),
+        data_dir="data",
+        compression_level=1,
+        table_config={"tombstone_compaction_workers": 2},
+        return_residual=True,
+        footer_md_out=cache,
+    )
+
+    assert removed == 2
+    assert len(resources) == 2
+    assert sunset == {"a.parquet", "b.parquet"}
+    assert residual.height == 0
+    assert set(cache) == {resource["file"] for resource in resources}
+
+
 def test_randomized_threshold_drain_matches_logical_delete_model(monkeypatch):
     """Every consumed DV entry removes exactly its physical row, never more."""
     rng = random.Random(20260812)

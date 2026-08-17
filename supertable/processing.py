@@ -149,6 +149,122 @@ _NUMERIC_INTS = {
 _NUMERIC_FLOATS = {polars.Float32, polars.Float64}
 
 
+def _native_polars_parquet_eligibility(
+        write_df: polars.DataFrame,
+) -> Tuple[bool, Optional[str]]:
+    """Return whether the native Polars Parquet codec is stats-compatible.
+
+    Polars' Rust writer is substantially faster than the PyArrow writer, but a
+    few footer-statistics behaviours differ in ways that can weaken or change
+    the row-group bounds consumed by SuperTable.  Keep those frames on the
+    established PyArrow path:
+
+      * float columns containing NaN (Polars omits their min/max),
+      * top-level strings wider than 64 UTF-8 bytes (Polars truncates bounds),
+      * categorical/enum columns, whose dictionary/statistics representation is
+        deliberately left to the compatibility writer for now,
+      * nested list/array/struct columns, until the same checks can be proven
+        recursively for every Parquet leaf.
+
+    The check itself fails closed.  A new/third-party dtype or expression error
+    therefore costs performance for that file, never statistics correctness.
+    The optional reason is a fixed token suitable for a telemetry counter.
+    """
+    checks: List[polars.Expr] = []
+    check_kinds: List[str] = []
+
+    try:
+        for index, (name, dtype) in enumerate(write_df.schema.items()):
+            base_type = dtype.base_type()
+            if base_type == polars.Categorical:
+                return False, "categorical"
+            if base_type == polars.Enum:
+                return False, "enum"
+            if base_type in (polars.List, polars.Array, polars.Struct):
+                return False, "nested"
+            if dtype in _NUMERIC_FLOATS:
+                checks.append(
+                    polars.col(name)
+                    .is_nan()
+                    .any()
+                    .fill_null(False)
+                    .alias(f"__supertable_codec_check_{index}")
+                )
+                check_kinds.append("nan")
+            elif dtype == polars.String:
+                checks.append(
+                    polars.col(name)
+                    .str.len_bytes()
+                    .max()
+                    .fill_null(0)
+                    .alias(f"__supertable_codec_check_{index}")
+                )
+                check_kinds.append("long_string")
+
+        if checks:
+            observed = write_df.select(checks).row(0)
+            for kind, value in zip(check_kinds, observed):
+                if kind == "nan" and bool(value):
+                    return False, kind
+                if kind == "long_string" and int(value or 0) > 64:
+                    return False, kind
+    except Exception:
+        return False, "stats_check_error"
+    return True, None
+
+
+def _encode_parquet_polars(
+        write_df: polars.DataFrame,
+        compression_level: int,
+) -> bytes:
+    """Encode with Polars' native Rust writer using the table invariants."""
+    buf = io.BytesIO()
+    write_df.write_parquet(
+        buf,
+        compression="zstd",
+        compression_level=int(compression_level),
+        # Match PyArrow's established min/max/null-count contract without the
+        # extra distinct-count pass performed by ``statistics="full"``.
+        statistics={
+            "min": True,
+            "max": True,
+            "null_count": True,
+            "distinct_count": False,
+        },
+        row_group_size=_PARQUET_ROW_GROUP_SIZE,
+    )
+    return buf.getvalue()
+
+
+def _encode_parquet_pyarrow(
+        arrow_tbl: pa.Table,
+        compression_level: int,
+) -> bytes:
+    """Encode with the compatibility PyArrow writer using existing settings."""
+    buf = io.BytesIO()
+    pq.write_table(
+        arrow_tbl,
+        buf,
+        compression="zstd",
+        compression_level=int(compression_level),
+        use_dictionary=True,
+        write_statistics=True,
+        row_group_size=_PARQUET_ROW_GROUP_SIZE,
+    )
+    return buf.getvalue()
+
+
+def _record_parquet_codec(
+        profiler: Profiler,
+        codec: str,
+        fallback_reason: Optional[str] = None,
+) -> None:
+    """Record the selected encoder and, for PyArrow, its fixed gate reason."""
+    profiler.add(f"parquet_codec_{codec}", 1)
+    if codec == "pyarrow" and fallback_reason:
+        profiler.add(f"parquet_codec_pyarrow_{fallback_reason}", 1)
+
+
 def _resolve_unified_dtype(dtypes: Set[polars.DataType]) -> polars.DataType:
     if not dtypes:
         return polars.Utf8
@@ -286,9 +402,8 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
       - If no frames are given, an empty zero-column frame is returned.
 
     Note on memory: this materialises every input frame in memory at once.
-    For memory-bounded streaming compaction, callers should still iterate
-    with chunked flushes via :func:`concat_with_union` — this helper is for
-    callers that already have all frames in memory.
+    Chunked callers reduce simultaneous frame retention but are not a hard
+    bound while each Parquet source is still decoded whole.
     """
     if not frames:
         return polars.DataFrame()
@@ -511,6 +626,503 @@ def find_overlapping_files(  # keep name/signature for compatibility
 # Public API: standalone compaction (no incoming data)
 # =========================
 
+def _validate_compaction_source_rowids(
+        frame: polars.DataFrame,
+        file_path: str,
+        *,
+        required: bool,
+) -> Optional[polars.Series]:
+    """Validate a source rowid lane before it can be repacked.
+
+    Rowid-less legacy files remain supported for ordinary compaction.  A file
+    named by a deletion vector, however, must carry the exact canonical lane;
+    otherwise the vector cannot be consumed safely.
+    """
+    folded = [
+        column for column in frame.columns
+        if str(column).casefold() == ROWID_COL.casefold()
+    ]
+    if not folded:
+        if required:
+            raise ValueError(
+                f"Cannot drain deletion-vector: {file_path!r} lacks "
+                f"{ROWID_COL!r}"
+            )
+        return None
+    if folded != [ROWID_COL]:
+        raise ValueError(
+            f"Compaction encountered an ambiguous reserved rowid column in "
+            f"{file_path!r}"
+        )
+    rowids = frame.get_column(ROWID_COL)
+    if rowids.dtype != polars.Int64:
+        raise ValueError(
+            f"Compaction requires canonical {ROWID_COL} Int64 in {file_path!r}"
+        )
+    if rowids.null_count() > 0:
+        raise ValueError(
+            f"Compaction cannot consume NULL rowids in {file_path!r}"
+        )
+    minimum = rowids.min()
+    if minimum is None or minimum <= 0:
+        raise ValueError(
+            f"Compaction requires positive rowids in {file_path!r}"
+        )
+    if rowids.n_unique() != frame.height:
+        raise ValueError(
+            f"Compaction found duplicate rowids in {file_path!r}"
+        )
+    return rowids
+
+
+def _prove_safe_compacted_rowids(frame: polars.DataFrame) -> None:
+    """Prove that one final output cannot make a future DV over-delete."""
+    _validate_compaction_source_rowids(
+        frame, "compaction output", required=False,
+    )
+
+
+def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
+    """Best-effort removal of only objects minted by one compaction attempt.
+
+    This helper is called while preserving an earlier mutation failure, so no
+    storage lookup, malformed resource entry, delete, or diagnostic logging
+    failure may escape and replace that original error.
+    """
+    try:
+        storage = _get_storage()
+    except BaseException as cleanup_error:
+        try:
+            logging.warning(
+                "[compaction] could not resolve storage for output cleanup: %s",
+                cleanup_error,
+            )
+        except BaseException:
+            pass
+        return
+    seen: Set[str] = set()
+    for resource in resources:
+        try:
+            generated = (
+                resource.get("file") if isinstance(resource, dict) else None
+            )
+        except BaseException:
+            continue
+        if not isinstance(generated, str) or not generated or generated in seen:
+            continue
+        seen.add(generated)
+        _cleanup_unpublished_parquet_path(storage, generated)
+
+
+def _compact_resources_with_tombstones(
+        *,
+        snapshot: dict,
+        tombstone_df: polars.DataFrame,
+        data_dir: str,
+        compression_level: int,
+        table_config: Optional[dict],
+        small_only: bool,
+        required_reads: bool,
+        profiler: Profiler,
+        footer_md_out: Optional[Dict],
+) -> Tuple[int, int, List[Dict], Set[str], polars.DataFrame]:
+    """Fuse DV draining and small-file packing into one physical pass.
+
+    A vector-referenced source is decoded at most once and its survivors are
+    fed directly into the final target-sized packer.  No per-source successor
+    is uploaded and then downloaded by a second phase.  Tombstone identity is
+    all-or-nothing per source: an unprovable group keeps both its original file
+    and the complete group in the residual vector.
+
+    The byte target is a proportional estimate based on immutable source file
+    sizes.  It controls output packing, not the decoded-memory footprint; a
+    single highly-compressed or skewed row can still exceed the target.
+    """
+    p = profiler
+    tombstone_df = validate_tombstone_frame(
+        tombstone_df, source="deletion-vector passed to fused compaction",
+    )
+    resources = snapshot.get("resources") or []
+
+    by_path: Dict[str, Dict] = {}
+    ordered_resources: List[Dict] = []
+    for resource in resources:
+        path = resource.get("file") if isinstance(resource, dict) else None
+        if not path:
+            continue
+        if path in by_path:
+            raise ValueError(
+                f"Compaction snapshot contains duplicate resource path {path!r}"
+            )
+        by_path[path] = resource
+        ordered_resources.append(resource)
+
+    grouped_raw = tombstone_df.partition_by(
+        TOMBSTONE_FILE_COL, as_dict=True, maintain_order=False,
+    )
+    grouped: Dict[str, polars.DataFrame] = {}
+    for key, group in grouped_raw.items():
+        path = key[0] if isinstance(key, tuple) else key
+        grouped[str(path)] = group
+    p.add("tombstone_files_total", len(grouped))
+    p.add("compact_fused", 1)
+
+    residual_parts: List[polars.DataFrame] = [
+        group for path, group in grouped.items() if path not in by_path
+    ]
+    max_bytes, _max_files = _resolve_limits(table_config)
+    max_bytes = max(1, int(max_bytes))
+
+    candidates: List[Tuple[Dict, bool]] = []
+    small_candidate_paths: Set[str] = set()
+    large_tombstone_candidate_paths: Set[str] = set()
+    for resource in ordered_resources:
+        path = str(resource["file"])
+        file_size = max(0, int(resource.get("file_size") or 0))
+        has_tombstones = path in grouped
+        if has_tombstones or not small_only or file_size < max_bytes:
+            candidates.append((resource, has_tombstones))
+            if file_size < max_bytes:
+                small_candidate_paths.add(path)
+            elif has_tombstones:
+                # A DV-referenced source is mandatory even when it is larger
+                # than the small-file target. Keep it out of the small-file
+                # telemetry lane so operators can distinguish the two costs.
+                large_tombstone_candidate_paths.add(path)
+    p.add("compact_candidates_total", len(candidates))
+    p.add("compact_small_candidates", len(small_candidate_paths))
+    p.add(
+        "compact_large_tombstone_candidates",
+        len(large_tombstone_candidate_paths),
+    )
+
+    new_resources: List[Dict] = []
+    sunset_files: Set[str] = set()
+    total_rows = 0
+    removed_rows = 0
+    local_footer_cache: Dict = {}
+    chunk_parts: List[polars.DataFrame] = []
+    chunk_estimated_bytes = 0
+    packing_limit = max_bytes
+    observed_expansion = 1.0
+    packing_calibrated = False
+
+    cfg = table_config or {}
+    try:
+        configured_workers = int(
+            cfg.get("tombstone_compaction_workers")
+            or getattr(default, "TOMBSTONE_COMPACTION_WORKERS", 2)
+        )
+    except (TypeError, ValueError):
+        configured_workers = 2
+    # Keep one core available for the coordinator's read/union/anti-join work.
+    # On the supported 4-CPU envelope, three PyArrow encoders were both faster
+    # and lower-RSS than four; larger pools only add allocator contention.
+    encode_workers = max(1, min(configured_workers, 3))
+    executor = (
+        ThreadPoolExecutor(max_workers=encode_workers)
+        if encode_workers > 1 else None
+    )
+    pending_writes: List[Any] = []
+    p.add("compact_encode_worker_capacity", encode_workers if executor else 1)
+    encode_state_lock = threading.Lock()
+    active_encodes = 0
+    max_active_encodes = 0
+    encode_calls = 0
+
+    def _write_final_chunk(
+            merged: polars.DataFrame,
+            estimated: int,
+    ) -> Tuple[List[Dict], Dict, Profiler, int, int]:
+        """Encode one independent final chunk with worker-local telemetry."""
+        nonlocal active_encodes, max_active_encodes, encode_calls
+        with encode_state_lock:
+            active_encodes += 1
+            encode_calls += 1
+            max_active_encodes = max(max_active_encodes, active_encodes)
+        sub = Profiler()
+        resources: List[Dict] = []
+        footer_cache: Dict = {}
+        try:
+            write_parquet_and_collect_resources(
+                write_df=merged,
+                overwrite_columns=[],
+                data_dir=data_dir,
+                new_resources=resources,
+                compression_level=compression_level,
+                profiler=sub,
+                footer_md_out=footer_cache,
+            )
+            return resources, footer_cache, sub, merged.height, int(estimated)
+        finally:
+            with encode_state_lock:
+                active_encodes -= 1
+
+    def _accept_write(result: Tuple[List[Dict], Dict, Profiler, int, int]) -> None:
+        nonlocal total_rows, packing_limit, observed_expansion
+        resources, footer_cache, sub, rows, estimated = result
+        p.merge(sub)
+        new_resources.extend(resources)
+        local_footer_cache.update(footer_cache)
+        total_rows += rows
+        p.add("compact_estimated_output_bytes", estimated)
+        actual_total = sum(
+            max(0, int(resource.get("file_size") or 0))
+            for resource in resources
+        )
+        if estimated > 0 and actual_total > 0:
+            expansion = actual_total / estimated
+            if expansion > observed_expansion:
+                observed_expansion = expansion
+                # The source-byte estimate can understate a unioned output
+                # because missing columns and new row-group boundaries add
+                # encoded overhead.  Calibrate from actual uploaded bytes; a
+                # 1% guard absorbs integer row slicing without chronically
+                # underfilling schema-stable files.
+                packing_limit = max(
+                    1,
+                    int(max_bytes / (observed_expansion * 1.01)),
+                )
+                p.add("compact_packing_calibrations", 1)
+        for resource in resources:
+            actual = max(0, int(resource.get("file_size") or 0))
+            if actual > max_bytes:
+                p.add("compact_output_oversize_bytes", actual - max_bytes)
+                p.add("compact_output_oversize_files", 1)
+
+    def _harvest_one() -> None:
+        future = pending_writes.pop(0)
+        _accept_write(future.result())
+
+    def _harvest_all() -> None:
+        while pending_writes:
+            _harvest_one()
+
+    def _flush_chunk() -> None:
+        nonlocal chunk_parts, chunk_estimated_bytes, packing_calibrated
+        if not chunk_parts:
+            return
+        with p.span("compact.concat"):
+            merged = concat_many_with_union(chunk_parts)
+        chunk_parts = []
+        estimated = chunk_estimated_bytes
+        chunk_estimated_bytes = 0
+        if merged.height == 0:
+            return
+        _prove_safe_compacted_rowids(merged)
+        # The first output is an intentional synchronous calibration sample.
+        # Subsequent PyArrow-compatible chunks use bounded outer parallelism;
+        # native Polars chunks already use the global Rust worker pool and stay
+        # synchronous to avoid oversubscription.
+        native_eligible, _reason = _native_polars_parquet_eligibility(merged)
+        if not packing_calibrated:
+            _accept_write(_write_final_chunk(merged, estimated))
+            packing_calibrated = True
+        elif executor is not None and not native_eligible:
+            if len(pending_writes) >= encode_workers:
+                _harvest_one()
+            pending_writes.append(
+                executor.submit(_write_final_chunk, merged, estimated)
+            )
+        else:
+            # Do not overlap a native/global-pool encode with queued PyArrow
+            # work. This keeps the CPU and memory cap deterministic.
+            _harvest_all()
+            _accept_write(_write_final_chunk(merged, estimated))
+
+    def _pack(frame: polars.DataFrame, estimated_bytes: int) -> None:
+        """Slice one decoded source into proportional target-sized pieces."""
+        nonlocal chunk_estimated_bytes
+        if frame.height == 0:
+            return
+        remaining_offset = 0
+        remaining_rows = frame.height
+        remaining_estimate = max(1, int(estimated_bytes))
+        while remaining_rows > 0:
+            capacity = packing_limit - chunk_estimated_bytes
+            if capacity <= 0:
+                _flush_chunk()
+                capacity = packing_limit
+
+            if remaining_estimate <= capacity:
+                take_rows = remaining_rows
+                take_estimate = remaining_estimate
+            else:
+                take_rows = (remaining_rows * capacity) // remaining_estimate
+                if take_rows <= 0:
+                    if chunk_parts:
+                        _flush_chunk()
+                        continue
+                    # One physical row is the indivisible lower bound.
+                    take_rows = 1
+                take_rows = min(remaining_rows, max(1, take_rows))
+                take_estimate = max(
+                    1,
+                    (remaining_estimate * take_rows) // remaining_rows,
+                )
+
+            chunk_parts.append(frame.slice(remaining_offset, take_rows))
+            chunk_estimated_bytes += take_estimate
+            remaining_offset += take_rows
+            remaining_rows -= take_rows
+            remaining_estimate = max(
+                0, remaining_estimate - take_estimate,
+            )
+            if chunk_estimated_bytes >= packing_limit:
+                _flush_chunk()
+
+    try:
+        for resource, has_tombstones in candidates:
+            file_path = str(resource["file"])
+            file_size = max(0, int(resource.get("file_size") or 0))
+            file_tombstones = grouped.get(file_path)
+
+            # Exact fully-dead shortcut: the row-count seal only admits the
+            # projection lane; identity equality is still proved from rowids.
+            if has_tombstones and file_tombstones is not None:
+                try:
+                    declared_rows = int(resource.get("rows"))
+                except (TypeError, ValueError):
+                    declared_rows = -1
+                if declared_rows == file_tombstones.height:
+                    projected = _read_parquet_safe(
+                        file_path,
+                        profiler=p,
+                        file_size=file_size,
+                        columns=[ROWID_COL],
+                        required=True,
+                    )
+                    _validate_compaction_source_rowids(
+                        projected, file_path, required=True,
+                    )
+                    physical = projected.select(ROWID_COL)
+                    dead_ids = file_tombstones.select(ROWID_COL)
+                    if (
+                        physical.join(dead_ids, on=ROWID_COL, how="anti").height == 0
+                        and dead_ids.join(
+                            physical, on=ROWID_COL, how="anti"
+                        ).height == 0
+                    ):
+                        sunset_files.add(file_path)
+                        removed_rows += file_tombstones.height
+                        p.add("tombstone_fully_dead_fast_path", 1)
+                        p.add("tombstone_files_touched", 1)
+                        continue
+                    residual_parts.append(file_tombstones)
+                    p.add("tombstone_groups_residual", 1)
+                    continue
+
+            existing_df = _read_parquet_safe(
+                file_path,
+                profiler=p,
+                file_size=file_size,
+                # A current snapshot file named by the DV is mandatory.  Clean
+                # maintenance candidates preserve the legacy best-effort read.
+                required=bool(has_tombstones or required_reads),
+            )
+            if existing_df is None:
+                continue
+
+            _validate_compaction_source_rowids(
+                existing_df, file_path, required=has_tombstones,
+            )
+            original_rows = existing_df.height
+            kept_df = existing_df
+            if has_tombstones and file_tombstones is not None:
+                dead_ids = file_tombstones.select(ROWID_COL)
+                unmatched = dead_ids.join(
+                    existing_df.select(ROWID_COL), on=ROWID_COL, how="anti",
+                )
+                if unmatched.height > 0:
+                    # This path is blacklisted from the ordinary small pack: a
+                    # residual must keep naming its original live resource.
+                    residual_parts.append(file_tombstones)
+                    p.add("tombstone_groups_residual", 1)
+                    continue
+                with p.span("tombstone.anti_join"):
+                    kept_df = existing_df.join(
+                        dead_ids, on=ROWID_COL, how="anti",
+                    )
+                removed = original_rows - kept_df.height
+                if removed != file_tombstones.height:
+                    raise RuntimeError(
+                        f"Deletion-vector cardinality proof failed for "
+                        f"{file_path!r}"
+                    )
+                removed_rows += removed
+                p.add("tombstone_files_touched", 1)
+                if kept_df.height:
+                    p.add("tombstone_files_with_survivors", 1)
+                    p.add("compact_intermediate_files_eliminated", 1)
+
+            sunset_files.add(file_path)
+            if kept_df.height == 0:
+                continue
+            if file_size > 0 and original_rows > 0:
+                estimated = max(
+                    1,
+                    (file_size * kept_df.height + original_rows - 1)
+                    // original_rows,
+                )
+            else:
+                estimated = max(1, int(kept_df.estimated_size()))
+            _pack(kept_df, estimated)
+
+        _flush_chunk()
+        _harvest_all()
+    except BaseException:
+        # A queued worker may already have uploaded a successful final chunk.
+        # Join every worker and collect its resource identity so cleanup cannot
+        # miss an unpublished object. Preserve the original exception.
+        while pending_writes:
+            future = pending_writes.pop(0)
+            try:
+                _accept_write(future.result())
+            except BaseException:
+                pass
+        _cleanup_compaction_outputs(new_resources)
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        # Report observed concurrency separately from configured capacity.
+        # Native Polars encodes are intentionally synchronous, so an all-native
+        # run correctly reports one worker even when a larger pool was allowed.
+        p.add("compact_encode_calls", encode_calls)
+        p.add("compact_encode_workers", max_active_encodes)
+
+    residual = (
+        polars.concat(residual_parts, how="vertical")
+        if residual_parts else _empty_tombstone_df()
+    )
+    residual = validate_tombstone_frame(
+        residual, source="residual deletion-vector after fused compaction",
+    )
+    if removed_rows != tombstone_df.height - residual.height:
+        _cleanup_compaction_outputs(new_resources)
+        raise RuntimeError("Fused compaction tombstone accounting mismatch")
+    try:
+        p.add("compact_files_consumed_total", len(sunset_files))
+        p.add(
+            "compact_small_files_consumed",
+            len(sunset_files.intersection(small_candidate_paths)),
+        )
+        p.add(
+            "compact_large_tombstone_files_consumed",
+            len(sunset_files.intersection(large_tombstone_candidate_paths)),
+        )
+        if footer_md_out is not None:
+            footer_md_out.update(local_footer_cache)
+    except BaseException:
+        # Telemetry/cache publication is still pre-snapshot work. If a custom
+        # profiler or mapping rejects it, none of this invocation's encoded
+        # outputs may be left behind as unreferenced objects.
+        _cleanup_compaction_outputs(new_resources)
+        raise
+    return (
+        len(sunset_files), total_rows, new_resources, sunset_files, residual,
+    )
+
 def compact_resources(
         snapshot: dict,
         data_dir: str,
@@ -521,12 +1133,16 @@ def compact_resources(
         dead_rowids_by_file: Optional[Dict[str, Set[int]]] = None,
         required_reads: bool = False,
         profiler: Optional[Profiler] = None,
-) -> Tuple[int, int, List[Dict], Set[str]]:
+        footer_md_out: Optional[Dict] = None,
+        tombstone_df: Optional[polars.DataFrame] = None,
+        return_residual: bool = False,
+) -> Tuple:
     """Compact small parquet files in a snapshot's resources list.
 
-    Reads files and rewrites them in memory-bounded chunks, **without
-    needing any incoming data**. Used by ``DataWriter.compact()`` and
-    ``SimpleTable.export_to()``.
+    Reads files and rewrites them into target-sized chunks, **without needing
+    incoming data**. Used by ``DataWriter.compact()`` and
+    ``SimpleTable.export_to()``. The target is based on compressed source
+    bytes; it is not a hard decoded-memory limit.
 
     Args:
         snapshot: the current snapshot dict (read by the caller — must
@@ -561,9 +1177,16 @@ def compact_resources(
             ``files_written``/``bytes_written`` counters and ``io.*`` spans, so
             the auto-compaction I/O is attributable per write (the write path
             passes the live profiler; ``None`` -> no instrumentation).
+        tombstone_df: optional canonical deletion vector. When supplied, DV
+            draining and small-file packing are fused so each original source
+            is decoded once and only final outputs are encoded. It cannot be
+            combined with the legacy ``dead_rowids`` inputs.
+        return_residual: required with ``tombstone_df``. Adds the exact
+            unconsumed deletion vector as the fifth return value.
 
     Returns:
-        A 4-tuple ``(considered, total_rows, new_resources, sunset_files)``:
+        Ordinarily a 4-tuple
+        ``(considered, total_rows, new_resources, sunset_files)``:
 
           - ``considered`` — number of files that qualified for compaction
             (i.e. that would be sunset if at least one new file was written).
@@ -576,16 +1199,19 @@ def compact_resources(
             ``simple_table.update`` so the resource list is correctly
             replaced.
 
+        Fused DV mode returns the same four values plus ``residual_dv``. A
+        vector group is consumed only after its complete rowid identity is
+        proved; otherwise its original source remains live and its full group
+        remains in that residual.
+
     Value-preservation properties enforced here:
 
       - Each source file is read **exactly once** via
         ``_read_parquet_safe`` (which returns ``None`` for races where
         another writer already sunset the file).
       - The merge is a row-preserving ``concat_with_union`` — no
-        deduplication, no row drops. Tombstone-driven row removal is a
-        **separate** pre-step performed by ``compact_tombstones`` in
-        the caller (so this function only sees the post-tombstone
-        survivors when ``DataWriter.compact()`` invokes it).
+        deduplication or implicit row drops. In fused mode only rowids proved
+        by the canonical deletion vector are anti-joined before packing.
       - All columns from every source file are preserved: missing
         columns in any input are filled with ``null`` via
         ``concat_with_union``, never silently dropped.
@@ -595,6 +1221,26 @@ def compact_resources(
         is left in the snapshot — the next compaction retries it.
     """
     p = profiler or get_null_profiler()
+    if tombstone_df is not None:
+        if not return_residual:
+            raise ValueError(
+                "Fused tombstone compaction requires return_residual=True"
+            )
+        if dead_rowids is not None or dead_rowids_by_file is not None:
+            raise ValueError(
+                "tombstone_df cannot be combined with legacy dead_rowids inputs"
+            )
+        return _compact_resources_with_tombstones(
+            snapshot=snapshot,
+            tombstone_df=tombstone_df,
+            data_dir=data_dir,
+            compression_level=compression_level,
+            table_config=table_config,
+            small_only=small_only,
+            required_reads=required_reads,
+            profiler=p,
+            footer_md_out=footer_md_out,
+        )
     resources = snapshot.get("resources") or []
     if not resources:
         return 0, 0, [], set()
@@ -722,6 +1368,7 @@ def compact_resources(
                     new_resources=new_resources,
                     compression_level=compression_level,
                     profiler=p,
+                    footer_md_out=footer_md_out,
                 )
                 chunk_df = None
                 chunk_size_bytes = 0
@@ -737,27 +1384,29 @@ def compact_resources(
                 new_resources=new_resources,
                 compression_level=compression_level,
                 profiler=p,
+                footer_md_out=footer_md_out,
             )
-    except Exception:
-        if required_reads and new_resources:
-            # A logical materialisation must be all-or-nothing from the caller's
-            # perspective. Delete only keys minted by this invocation; never
-            # enumerate or touch pre-existing target contents.
-            delete = getattr(_get_storage(), "delete", None)
-            if callable(delete):
-                for resource in new_resources:
-                    generated = resource.get("file") if isinstance(resource, dict) else None
-                    if not generated:
-                        continue
-                    try:
-                        delete(generated)
-                    except Exception as cleanup_error:
-                        logging.warning(
-                            f"[materialize] failed to clean orphan {generated}: "
-                            f"{cleanup_error}"
-                        )
+    except BaseException:
+        # No successful output from a failed invocation can be referenced by a
+        # snapshot. Roll back every exact path collected by this call for both
+        # strict materialisation and best-effort maintenance compaction; source
+        # and pre-existing target objects never enter ``new_resources``.
+        _cleanup_compaction_outputs(new_resources)
         raise
 
+    try:
+        p.add("compact_files_consumed_total", len(sunset_files))
+        p.add(
+            "compact_small_files_consumed",
+            len(
+                sunset_files.intersection(
+                    {path for path, size in candidates if size < max_mem}
+                )
+            ),
+        )
+    except BaseException:
+        _cleanup_compaction_outputs(new_resources)
+        raise
     return len(sunset_files), total_rows, new_resources, sunset_files
 
 
@@ -828,10 +1477,68 @@ def write_parquet_and_collect_resources(
         _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
 
 
+def _cleanup_unpublished_parquet_path(storage: object, path: str) -> None:
+    """Best-effort release of one exact path after upload may have started.
+
+    A remote PUT can persist an object and then lose its acknowledgement.  The
+    UUID path is therefore considered potentially live as soon as it is handed
+    to the pinned backend instance.  Cleanup must use that same instance (a
+    storage factory may rotate clients) and must never replace the publication
+    error that caused this rollback attempt.
+    """
+    try:
+        delete = getattr(storage, "delete", None)
+        if callable(delete):
+            delete(path)
+    except BaseException as cleanup_error:
+        try:
+            logging.warning(
+                "[write] failed to clean unpublished parquet %s: %s",
+                path,
+                cleanup_error,
+            )
+        except BaseException:
+            # Logging is diagnostic only. Even a hostile exception formatter
+            # must not obscure the original upload/publication failure.
+            pass
+
+
 def _write_single_parquet_file(
         write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
+):
+    """Write and publish one resource, cleaning any released orphan on error."""
+    publication_state: Dict[str, Any] = {}
+    try:
+        return _write_single_parquet_file_attempt(
+            write_df,
+            overwrite_columns,
+            target_dir,
+            new_resources,
+            compression_level,
+            profiler=profiler,
+            footer_md_out=footer_md_out,
+            publication_state=publication_state,
+        )
+    except BaseException:
+        if (
+            publication_state.get("released") is True
+            and publication_state.get("published") is not True
+        ):
+            storage = publication_state.get("storage")
+            path = publication_state.get("path")
+            if storage is not None and isinstance(path, str):
+                _cleanup_unpublished_parquet_path(storage, path)
+        raise
+
+
+def _write_single_parquet_file_attempt(
+        write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
+        profiler: Optional[Profiler] = None,
+        footer_md_out: Optional[Dict] = None,
+        *,
+        publication_state: Dict[str, Any],
 ):
     """Write a single Parquet file into *target_dir* and append a resource entry.
 
@@ -847,6 +1554,8 @@ def _write_single_parquet_file(
     # work, this is a correctness boundary: upload and metadata must describe
     # the same backend instance if a custom storage factory rotates clients.
     storage = _get_storage()
+    state = publication_state
+    state["storage"] = storage
 
     # Ensure the target directory exists.  makedirs is idempotent on local
     # storage and a no-op on object storage; calling it directly avoids a
@@ -859,6 +1568,7 @@ def _write_single_parquet_file(
 
     new_parquet_file = generate_filename("data", "parquet")
     new_parquet_path = os.path.join(target_dir, new_parquet_file)
+    state["path"] = new_parquet_path
 
     # Sort before writing so each row group covers a tight min/max range.
     # DuckDB uses these zonemaps to skip entire row groups during filtered scans.
@@ -878,30 +1588,50 @@ def _write_single_parquet_file(
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
 
-    # Write to the active storage backend.  Encoding and upload are deliberately
-    # separate: a failed object-store PUT must abort the mutation, never fall back
-    # to writing the bare object key on the writer's local filesystem.
-    with p.span("write.to_arrow"):
-        arrow_tbl: pa.Table = write_df.to_arrow()
-    with p.span("write.parquet_encode"):
-        buf = io.BytesIO()
-        pq.write_table(
-            arrow_tbl,
-            buf,
-            compression="zstd",
-            compression_level=int(compression_level),
-            use_dictionary=True,
-            write_statistics=True,
-            row_group_size=_PARQUET_ROW_GROUP_SIZE,
-        )
-        data = buf.getvalue()
-
     write_bytes = getattr(storage, "write_bytes", None)
     write_parquet = getattr(storage, "write_parquet", None)
+
+    # Write to the active storage backend. Encoding and upload are deliberately
+    # separate: a failed object-store PUT must abort the mutation, never fall
+    # back to writing the bare object key on the writer's local filesystem.
+    # Native Polars is only selected when the exact encoded bytes can be PUT.
+    # Compatibility backends receive the same Arrow table as before and may
+    # apply their own encoding in ``write_parquet``.
+    arrow_tbl: Optional[pa.Table] = None
+    data: Optional[bytes] = None
+    fallback_reason: Optional[str] = "backend"
+    native_eligible = False
+    if callable(write_bytes):
+        with p.span("write.parquet_codec_check"):
+            native_eligible, fallback_reason = (
+                _native_polars_parquet_eligibility(write_df)
+            )
+    if native_eligible:
+        try:
+            with p.span("write.parquet_encode"):
+                data = _encode_parquet_polars(write_df, compression_level)
+            _record_parquet_codec(p, "polars")
+        except Exception as exc:
+            # No bytes have been uploaded yet. Falling back here is atomic and
+            # preserves support for a dtype newly rejected by Polars' writer.
+            fallback_reason = "encode_error"
+            p.add("parquet_codec_polars_encode_error", 1)
+            logging.warning(
+                "[write] native Polars parquet encode failed; using PyArrow: %s",
+                exc,
+            )
+    if data is None:
+        with p.span("write.to_arrow"):
+            arrow_tbl = write_df.to_arrow()
+        with p.span("write.parquet_encode"):
+            data = _encode_parquet_pyarrow(arrow_tbl, compression_level)
+        _record_parquet_codec(p, "pyarrow", fallback_reason)
+
     footer_md = None
     object_seal = None
     if callable(write_bytes):
         with p.span("write.upload_bytes"):
+            state["released"] = True
             write_bytes(new_parquet_path, data)
         # These are the exact bytes submitted to the backend, so size does not
         # require another lookup. A remote metadata observation below exists
@@ -927,7 +1657,10 @@ def _write_single_parquet_file(
                 f"{new_parquet_path!r}"
             ) from exc
     elif callable(write_parquet):
+        if arrow_tbl is None:  # pragma: no cover - guarded by codec selection
+            raise RuntimeError("Compatibility parquet backend requires Arrow")
         with p.span("write.upload_parquet"):
+            state["released"] = True
             write_parquet(arrow_tbl, new_parquet_path)
         # This compatibility branch may re-encode the Arrow table, so only the
         # backend can report the resulting object size.  Do not silently record
@@ -963,24 +1696,41 @@ def _write_single_parquet_file(
         "columns": columns,
     }
     binary_value_bounds: Dict[str, int] = {}
-    for name, column in zip(arrow_tbl.schema.names, arrow_tbl.columns):
-        if not (
-            pa.types.is_binary(column.type)
-            or pa.types.is_large_binary(column.type)
-            or pa.types.is_fixed_size_binary(column.type)
-        ):
-            continue
-        try:
-            lengths = pc.binary_length(column)
-            maximum = pc.max(lengths).as_py()
-        except Exception as exc:
-            # This seal is an execution-memory boundary. A writer capable of
-            # publishing Binary data must not silently omit or guess it after
-            # accepting the new snapshot format.
-            raise RuntimeError(
-                f"Could not compute Binary value-width seal for {name!r}"
-            ) from exc
-        binary_value_bounds[str(name)] = max(0, int(maximum or 0))
+    if arrow_tbl is not None:
+        # Preserve the established Arrow calculation on compatibility writes.
+        binary_columns = (
+            (name, column)
+            for name, column in zip(arrow_tbl.schema.names, arrow_tbl.columns)
+            if (
+                pa.types.is_binary(column.type)
+                or pa.types.is_large_binary(column.type)
+                or pa.types.is_fixed_size_binary(column.type)
+            )
+        )
+        for name, column in binary_columns:
+            try:
+                lengths = pc.binary_length(column)
+                maximum = pc.max(lengths).as_py()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not compute Binary value-width seal for {name!r}"
+                ) from exc
+            binary_value_bounds[str(name)] = max(0, int(maximum or 0))
+    else:
+        # Do not materialise a full Arrow table solely for this seal on the fast
+        # path. Polars reports the same byte width (not character count).
+        for name, dtype in write_df.schema.items():
+            if dtype != polars.Binary:
+                continue
+            try:
+                maximum = write_df.get_column(name).bin.size().max()
+            except Exception as exc:
+                # This seal is an execution-memory boundary. A writer capable
+                # of publishing Binary data must never omit or guess it.
+                raise RuntimeError(
+                    f"Could not compute Binary value-width seal for {name!r}"
+                ) from exc
+            binary_value_bounds[str(name)] = max(0, int(maximum or 0))
     if binary_value_bounds:
         resource["column_max_value_bytes"] = binary_value_bounds
     if object_seal is not None:
@@ -1003,13 +1753,15 @@ def _write_single_parquet_file(
         })
         if footer_md_out is not None:
             # Reuse both products of the one footer traversal in the subsequent
-            # combined stats-artifact build. This also covers compatibility
-            # backends whose exact footer was read back after re-encoding.
+            # combined stats-artifact build. Logical schema publication is
+            # independent of physical compaction, so no output body/schema
+            # reread is required here.
             footer_md_out[new_parquet_path] = _FooterStatsCacheEntry(
                 metadata=footer_md,
                 rows=exact_stats_rows,
             )
     new_resources.append(resource)
+    state["published"] = True
 
 
 # =========================
@@ -1420,24 +2172,38 @@ def _write_df_parquet(
     no column statistics or Hive partitioning. Returns the file size in bytes.
     """
     p = profiler or get_null_profiler()
-    data = None
-    wrote_exact_bytes = False
-    with p.span("tombstone.encode"):
-        arrow_tbl = write_df.to_arrow()
-        buf = io.BytesIO()
-        pq.write_table(
-            arrow_tbl, buf,
-            compression="zstd",
-            compression_level=int(compression_level),
-            use_dictionary=True,
-            write_statistics=True,
-            row_group_size=_PARQUET_ROW_GROUP_SIZE,
-        )
-        data = buf.getvalue()
-
     storage = _get_storage()
     write_bytes = getattr(storage, "write_bytes", None)
     write_parquet = getattr(storage, "write_parquet", None)
+
+    data: Optional[bytes] = None
+    arrow_tbl: Optional[pa.Table] = None
+    wrote_exact_bytes = False
+    fallback_reason: Optional[str] = "backend"
+    native_eligible = False
+    if callable(write_bytes):
+        with p.span("write.parquet_codec_check"):
+            native_eligible, fallback_reason = (
+                _native_polars_parquet_eligibility(write_df)
+            )
+    with p.span("tombstone.encode"):
+        if native_eligible:
+            try:
+                data = _encode_parquet_polars(write_df, compression_level)
+                _record_parquet_codec(p, "polars")
+            except Exception as exc:
+                fallback_reason = "encode_error"
+                p.add("parquet_codec_polars_encode_error", 1)
+                logging.warning(
+                    "[write] native Polars parquet encode failed; using "
+                    "PyArrow: %s",
+                    exc,
+                )
+        if data is None:
+            arrow_tbl = write_df.to_arrow()
+            data = _encode_parquet_pyarrow(arrow_tbl, compression_level)
+            _record_parquet_codec(p, "pyarrow", fallback_reason)
+
     if callable(write_bytes):
         # Upload failures are authoritative.  Never reinterpret a failed remote
         # PUT as a local relative-path write: that can publish a snapshot whose
@@ -1445,6 +2211,8 @@ def _write_df_parquet(
         write_bytes(path, data)
         wrote_exact_bytes = True
     elif callable(write_parquet):
+        if arrow_tbl is None:  # pragma: no cover - guarded by codec selection
+            raise RuntimeError("Compatibility parquet backend requires Arrow")
         write_parquet(arrow_tbl, path)
     else:
         raise RuntimeError("Configured storage provides no parquet write method")
@@ -4888,6 +5656,7 @@ def compact_tombstones(
         table_config: Optional[dict] = None,
         profiler: Optional[Profiler] = None,
         return_residual: bool = False,
+        footer_md_out: Optional[Dict] = None,
 ) -> Tuple:
     """Physically drop tombstoned rows from the data files that hold them.
 
@@ -4962,12 +5731,13 @@ def compact_tombstones(
     def _drain_group(item):
         group_key, file_tombstones = item
         file_path = group_key[0] if isinstance(group_key, tuple) else group_key
+        local_footer_md = {}
         resource = by_path.get(file_path)
         if not resource:
             # Do not discard a ghost entry: without its referenced physical file
             # we cannot prove that the deletion was consumed.  Keeping the whole
             # group residual is the only conservative action available here.
-            return 0, [], None, file_tombstones, Profiler()
+            return 0, [], None, file_tombstones, local_footer_md, Profiler()
         sub = Profiler()
         file_size = int(resource.get("file_size") or 0)
         dead_ids = file_tombstones.select(ROWID_COL)
@@ -4997,10 +5767,10 @@ def compact_tombstones(
             ):
                 sub.add("tombstone_fully_dead_fast_path", 1)
                 sub.add("tombstone_files_touched", 1)
-                return projected.height, [], file_path, None, sub
+                return projected.height, [], file_path, None, local_footer_md, sub
             # Count agreed but identities did not: metadata/DV corruption. Do
             # not rewrite or discard any part of this group.
-            return 0, [], None, file_tombstones, sub
+            return 0, [], None, file_tombstones, local_footer_md, sub
 
         # required=True: this is the only physical drain.  A transient backend
         # error or NotFound must abort with the prior snapshot + vector intact;
@@ -5010,7 +5780,7 @@ def compact_tombstones(
             file_path, profiler=sub, file_size=file_size, required=True
         )
         if existing_df is None:  # defensive; required=True normally raises
-            return 0, [], None, file_tombstones, sub
+            return 0, [], None, file_tombstones, local_footer_md, sub
         _validate_physical(existing_df, file_path)
         # A partial match cannot be safely rewritten while retaining only the
         # unmatched entries: doing so would move survivors to a new file while
@@ -5020,17 +5790,18 @@ def compact_tombstones(
             existing_df.select(ROWID_COL), on=ROWID_COL, how="anti"
         )
         if unmatched.height > 0:
-            return 0, [], None, file_tombstones, sub
+            return 0, [], None, file_tombstones, local_footer_md, sub
         with sub.span("tombstone.anti_join"):
             kept_df = existing_df.join(dead_ids, on=ROWID_COL, how="anti")
         difference = existing_df.height - kept_df.height
         if difference == 0:
-            return 0, [], None, file_tombstones, sub
+            return 0, [], None, file_tombstones, local_footer_md, sub
 
         local_resources = []
         sub.add("tombstone_files_touched", 1)
 
         if kept_df.height > 0:
+            sub.add("tombstone_files_with_survivors", 1)
             with sub.span("tombstone.write_kept"):
                 write_parquet_and_collect_resources(
                     write_df=kept_df,
@@ -5039,8 +5810,9 @@ def compact_tombstones(
                     new_resources=local_resources,
                     compression_level=compression_level,
                     profiler=sub,
+                    footer_md_out=local_footer_md,
                 )
-        return difference, local_resources, file_path, None, sub
+        return difference, local_resources, file_path, None, local_footer_md, sub
 
     items = list(grouped.items())
     cfg = table_config or {}
@@ -5056,31 +5828,98 @@ def compact_tombstones(
     # operator match object-store bandwidth without turning a threshold drain
     # into an unbounded memory fan-out.
     workers = max(1, min(configured_workers, 8, len(items)))
+    collected_footer_md: Dict = {}
+    first_failure: Optional[BaseException] = None
+    first_traceback = None
+
+    def _remember_failure(error: BaseException) -> None:
+        nonlocal first_failure, first_traceback
+        if first_failure is None:
+            first_failure = error
+            first_traceback = error.__traceback__
+
+    def _accept_result(result) -> None:
+        nonlocal removed
+        (
+            difference,
+            local_resources,
+            sunset,
+            residual_part,
+            local_footer_md,
+            sub,
+        ) = result
+        # Track minted paths before telemetry/cache merging. If either of those
+        # later operations fails, every successful worker upload is still known
+        # to the rollback path.
+        new_resources.extend(local_resources)
+        p.merge(sub)
+        if local_footer_md:
+            collected_footer_md.update(local_footer_md)
+        removed += difference
+        if sunset:
+            sunset_files.add(sunset)
+        if residual_part is not None:
+            residual_parts.append(residual_part)
+
     if workers == 1:
-        results = map(_drain_group, items)
+        for item in items:
+            try:
+                result = _drain_group(item)
+                _accept_result(result)
+            except BaseException as error:
+                _remember_failure(error)
+                break
     else:
         executor = ThreadPoolExecutor(max_workers=workers)
-        results = executor.map(_drain_group, items)
-    try:
-        for difference, local_resources, sunset, residual_part, sub in results:
-            p.merge(sub)
-            removed += difference
-            new_resources.extend(local_resources)
-            if sunset:
-                sunset_files.add(sunset)
-            if residual_part is not None:
-                residual_parts.append(residual_part)
-    finally:
-        if workers > 1:
-            executor.shutdown(wait=True, cancel_futures=True)
+        futures = []
+        try:
+            for item in items:
+                try:
+                    futures.append(executor.submit(_drain_group, item))
+                except BaseException as error:
+                    _remember_failure(error)
+                    break
+            # Consume every submitted future even after an earlier ordered
+            # result fails. A later worker may already have uploaded a valid
+            # successor; dropping its result here would make that object
+            # invisible to invocation rollback.
+            for future in futures:
+                try:
+                    result = future.result()
+                except BaseException as error:
+                    _remember_failure(error)
+                    continue
+                try:
+                    _accept_result(result)
+                except BaseException as error:
+                    _remember_failure(error)
+        finally:
+            try:
+                executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as error:
+                _remember_failure(error)
 
-    residual = (
-        polars.concat(residual_parts, how="vertical")
-        if residual_parts else _empty_tombstone_df()
-    )
-    residual = validate_tombstone_frame(
-        residual, source="residual deletion-vector after compaction"
-    )
+    if first_failure is not None:
+        _cleanup_compaction_outputs(new_resources)
+        raise first_failure.with_traceback(first_traceback)
+
+    try:
+        residual = (
+            polars.concat(residual_parts, how="vertical")
+            if residual_parts else _empty_tombstone_df()
+        )
+        residual = validate_tombstone_frame(
+            residual, source="residual deletion-vector after compaction"
+        )
+    except BaseException:
+        _cleanup_compaction_outputs(new_resources)
+        raise
+    if footer_md_out is not None and collected_footer_md:
+        try:
+            footer_md_out.update(collected_footer_md)
+        except BaseException:
+            _cleanup_compaction_outputs(new_resources)
+            raise
     if return_residual:
         return removed, new_resources, sunset_files, residual
     return removed, new_resources, sunset_files

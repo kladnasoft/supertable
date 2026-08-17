@@ -1,10 +1,22 @@
 # route: supertable.utils.helper
 import hashlib
 import secrets
-import pandas as pd
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
+
+
+class _SchemaFrame(Protocol):
+    """Minimal frame surface used by :func:`collect_schema`.
+
+    The write path passes a Polars DataFrame here.  Keeping this helper typed
+    against the two attributes it actually consumes avoids importing pandas in
+    the write/compaction module graph merely for an annotation.
+    """
+
+    columns: Any
+
+    def __getitem__(self, key: str) -> Any: ...
 
 
 def dict_keys_to_lowercase(dict_to_change: Dict[str, Any]) -> Dict[str, Any]:
@@ -15,9 +27,12 @@ def dict_keys_to_lowercase(dict_to_change: Dict[str, Any]) -> Dict[str, Any]:
     return {key.lower(): value for key, value in dict_to_change.items()}
 
 
-def collect_schema(model_df: pd.DataFrame) -> Dict[str, str]:
+def collect_schema(model_df: _SchemaFrame) -> Dict[str, str]:
     """
-    Collects the schema (column names and dtypes) of a Pandas DataFrame.
+    Collect the schema of a dataframe-like object.
+
+    Both Polars and pandas expose the small ``columns`` / ``column.dtype``
+    protocol used here; no dataframe implementation needs to be imported.
     Returns a dictionary mapping column name -> dtype as string.
     """
     return {col: str(model_df[col].dtype) for col in model_df.columns}
