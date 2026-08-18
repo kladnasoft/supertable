@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import time
@@ -8,6 +9,7 @@ import fakeredis
 import pandas as pd
 import pytest
 
+from supertable import redis_keys as RK
 from supertable.quality import scheduler
 
 
@@ -100,9 +102,39 @@ class SelectiveReadFaultRedis:
         return self.inner.smembers(key)
 
 
+class RejectFirstAtomicSuccessCommitRedis:
+    """Fail before the scheduler's all-or-nothing success script executes."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.rejected = False
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def eval(self, script, *args):
+        if "atomic quality success document publication" in script and not self.rejected:
+            self.rejected = True
+            raise ConnectionError("injected success-commit failure")
+        return self.inner.eval(script, *args)
+
+
 @pytest.fixture
 def redis_client():
-    return fakeredis.FakeStrictRedis(decode_responses=True)
+    client = fakeredis.FakeStrictRedis(decode_responses=True)
+    client.set(
+        RK.meta_root(ORG, SUPER),
+        json.dumps({"version": 0, "ts": 1}),
+    )
+    client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        json.dumps({
+            "version": 0,
+            "ts": 1,
+            "path": f"{ORG}/{SUPER}/{TABLE}/snapshot.json",
+        }),
+    )
+    return client
 
 
 @pytest.fixture
@@ -143,6 +175,129 @@ def test_notify_ingest_keeps_scalar_marker_and_independent_mode_generations(
         redis_client.ttl(scheduler._pending_key(ORG, SUPER, TABLE, mode)) == -1
         for mode in scheduler.QUALITY_MODES
     )
+
+
+def test_notify_ingest_does_not_repopulate_after_completed_deletion_cleanup(
+    redis_client,
+):
+    from supertable.quality.config import DQConfig
+
+    config = DQConfig(redis_client, ORG, SUPER)
+    assert config.set_schedule({
+        "enabled": True,
+        "post_ingest": True,
+        "post_ingest_quick": True,
+        "post_ingest_custom": False,
+        "post_ingest_deep": False,
+    })
+
+    class DeleteAfterScheduleRead:
+        def __init__(self, inner):
+            self.inner = inner
+            self.deleted = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def eval(self, script, *args):
+            if "atomically resolve one exact ingest generation" in script:
+                self.deleted = True
+                quality_keys = self.inner.keys(
+                    RK.quality_prefix(ORG, SUPER) + "*"
+                )
+                if quality_keys:
+                    self.inner.delete(*quality_keys)
+                self.inner.delete(
+                    RK.meta_leaf(ORG, SUPER, TABLE),
+                    RK.meta_root(ORG, SUPER),
+                )
+            return self.inner.eval(script, *args)
+
+    raced = DeleteAfterScheduleRead(redis_client)
+    scheduler.notify_ingest(raced, ORG, SUPER, TABLE)
+
+    assert raced.deleted
+    assert not redis_client.keys(RK.quality_prefix(ORG, SUPER) + "pending*")
+
+
+def test_notify_ingest_retains_generation_after_stale_disabled_schedule_read(
+    redis_client,
+):
+    from supertable.quality.config import DQConfig
+
+    config = DQConfig(redis_client, ORG, SUPER)
+    assert config.set_schedule({"enabled": False})
+    schedule_key = config._key("schedule")
+
+    class EnableAfterDisabledRead:
+        def __init__(self, inner):
+            self.inner = inner
+            self.enabled = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def get(self, key):
+            value = self.inner.get(key)
+            if key == schedule_key and not self.enabled:
+                self.enabled = True
+                assert config.set_schedule({
+                    "enabled": True,
+                    "post_ingest": True,
+                    "post_ingest_quick": True,
+                    "post_ingest_custom": False,
+                    "post_ingest_deep": False,
+                })
+            return value
+
+    raced = EnableAfterDisabledRead(redis_client)
+    scheduler.notify_ingest(raced, ORG, SUPER, TABLE)
+
+    unresolved_key = scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+    generation = redis_client.get(unresolved_key)
+    assert raced.enabled
+    assert generation is not None
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE, "quick")
+    ) is None
+
+    admission = scheduler._snapshot_pending_lifecycle_admission(
+        redis_client, ORG, SUPER, TABLE,
+    )
+    assert admission is not None
+    scheduler._resolve_unresolved_pending(
+        redis_client, ORG, SUPER, TABLE, ("quick",), admission,
+    )
+    assert redis_client.get(unresolved_key) is None
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE, "quick")
+    ) == generation
+
+
+@pytest.mark.parametrize(
+    ("root_payload", "leaf_payload"),
+    [
+        ('{"version":"0","ts":1}', '{"version":0,"ts":1,"path":"x"}'),
+        ('{"version":0,"ts":1}', '{"version":0,"ts":1,"path":""}'),
+        (
+            '{"version":9007199254740992,"ts":1}',
+            '{"version":0,"ts":1,"path":"x"}',
+        ),
+    ],
+)
+def test_notify_ingest_rejects_malformed_catalog_identity(
+    redis_client,
+    root_payload,
+    leaf_payload,
+):
+    redis_client.set(RK.meta_root(ORG, SUPER), root_payload)
+    redis_client.set(RK.meta_leaf(ORG, SUPER, TABLE), leaf_payload)
+
+    scheduler.notify_ingest(redis_client, ORG, SUPER, TABLE)
+
+    assert redis_client.get(
+        scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+    ) is None
 
 
 def test_pending_generation_compare_delete_never_loses_new_ingest(redis_client):
@@ -462,6 +617,335 @@ def test_deep_baseline_is_skipped_not_passed_and_preserves_quick_mode(
     assert deep["skipped"] == 2
     assert deep["not_applicable"] == 1
     assert dqc.latest["configured_checks"] == 3
+
+
+def test_failed_quick_history_does_not_advance_retry_comparison_baseline(
+    redis_client,
+    fake_meta,
+    monkeypatch,
+):
+    previous_column = {
+        "column_name": "amount",
+        "column_type": "BIGINT",
+        "category": "numeric",
+        "total": 100,
+        "present": 100,
+        "null_count": 0,
+        "null_rate": 0.0,
+        "distinct": 100,
+        "uniqueness": 100.0,
+        "min": 1,
+        "max": 100,
+        "moments_certified": True,
+        "avg": 50.5,
+        "stddev": 10.0,
+        "zero_rate": 0.0,
+        "negative_rate": 0.0,
+    }
+    previous_latest = {
+        "checked_at": "previous",
+        "check_type": "quick",
+        "row_count": 100,
+        "parsed": {
+            "total": 100,
+            "columns": {
+                "amount": previous_column,
+                "label": {
+                    "column_name": "label",
+                    "column_type": "VARCHAR",
+                    "category": "string",
+                    "total": 100,
+                    "present": 100,
+                    "null_count": 0,
+                    "null_rate": 0.0,
+                    "distinct": 100,
+                    "uniqueness": 100.0,
+                },
+            },
+        },
+        "schema": [["amount", "BIGINT"], ["label", "VARCHAR"]],
+    }
+    dqc = MemoryDQConfig(
+        checks={"T1": {"enabled": True, "threshold": 30}},
+        latest=deepcopy(previous_latest),
+        columns={"amount": deepcopy(previous_column)},
+    )
+    frame = pd.DataFrame([{
+        "__total": 200,
+        "__present_amount": 200,
+        "__distinct_amount": 200,
+        "__min_amount": 1.0,
+        "__max_amount": 200.0,
+        "__avg_amount": 100.5,
+        "__stddev_amount": 20.0,
+        "__zero_amount": 0,
+        "__neg_amount": 0,
+        "__present_label": 200,
+        "__distinct_label": 200,
+    }])
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_quality_statement",
+        lambda *_a, **_k: FakeExecution(frame),
+    )
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: False)
+
+    failed = scheduler._run_quick_check(
+        redis_client, ORG, SUPER, TABLE, dqc,
+    )
+
+    assert failed.state == "failed"
+    assert dqc.latest == previous_latest
+    assert dqc.columns["amount"] == previous_column
+
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: True)
+    retried = scheduler._run_quick_check(
+        redis_client, ORG, SUPER, TABLE, dqc,
+    )
+
+    assert retried.successful
+    t1 = next(item for item in retried.details if item["check_id"] == "T1")
+    assert t1["status"] in {"warning", "critical"}
+    assert dqc.latest["parsed"]["total"] == 200
+
+
+def test_failed_deep_history_does_not_advance_retry_comparison_baseline(
+    redis_client,
+    fake_meta,
+    monkeypatch,
+):
+    previous_deep = {
+        "total_rows": 100,
+        "non_nulls": 100,
+        "distinct_vals": 100,
+        "moments_certified": True,
+        "p25_value": 0.0,
+        "p75_value": 10.0,
+    }
+    previous_latest = {
+        "checked_at": "previous",
+        "check_type": "quick",
+        "parsed": {"total": 100, "columns": {}},
+        "schema": [["amount", "BIGINT"], ["label", "VARCHAR"]],
+    }
+    previous_columns = {"amount": {"deep": deepcopy(previous_deep)}}
+    dqc = MemoryDQConfig(
+        checks={"D5": {"enabled": True, "threshold": 30}},
+        latest=deepcopy(previous_latest),
+        columns=deepcopy(previous_columns),
+    )
+    frame = pd.DataFrame([{
+        "total_rows": 100,
+        "non_nulls": 100,
+        "distinct_vals": 100,
+        "moments_certified": True,
+        "p25_value": 0.0,
+        "p75_value": 20.0,
+    }])
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_quality_statement",
+        lambda *_a, **_k: FakeExecution(frame),
+    )
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: False)
+
+    failed = scheduler._run_deep_check(
+        redis_client, ORG, SUPER, TABLE, dqc,
+    )
+
+    assert failed.state == "failed"
+    assert dqc.latest == previous_latest
+    assert dqc.columns == previous_columns
+
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: True)
+    retried = scheduler._run_deep_check(
+        redis_client, ORG, SUPER, TABLE, dqc,
+    )
+
+    assert retried.successful
+    d5 = next(
+        item for item in retried.details
+        if item["check_id"] == "D5" and item["column"] == "amount"
+    )
+    assert d5["status"] in {"warning", "critical"}
+    assert dqc.columns["amount"]["deep"]["p75_value"] == 20.0
+
+
+def test_failed_atomic_quick_commit_does_not_self_baseline_retry(
+    redis_client,
+    fake_meta,
+    monkeypatch,
+):
+    from supertable.quality.config import DQConfig
+
+    previous_column = {
+        "column_name": "amount",
+        "column_type": "BIGINT",
+        "category": "numeric",
+        "total": 100,
+        "present": 100,
+        "null_count": 0,
+        "null_rate": 0.0,
+        "distinct": 100,
+        "uniqueness": 100.0,
+        "min": 1,
+        "max": 100,
+        "moments_certified": True,
+        "avg": 50.5,
+        "stddev": 10.0,
+        "zero_rate": 0.0,
+        "negative_rate": 0.0,
+    }
+    previous_latest = {
+        "checked_at": "previous",
+        "check_type": "quick",
+        "row_count": 100,
+        "parsed": {
+            "total": 100,
+            "columns": {
+                "amount": previous_column,
+                "label": {
+                    "column_name": "label",
+                    "column_type": "VARCHAR",
+                    "category": "string",
+                    "total": 100,
+                    "present": 100,
+                    "null_count": 0,
+                    "null_rate": 0.0,
+                    "distinct": 100,
+                    "uniqueness": 100.0,
+                },
+            },
+        },
+        "schema": [["amount", "BIGINT"], ["label", "VARCHAR"]],
+    }
+    healthy = DQConfig(redis_client, ORG, SUPER)
+    assert healthy.set_latest(TABLE, previous_latest)
+    assert healthy.set_latest_column(TABLE, "amount", previous_column)
+    assert healthy.set_table_config(
+        TABLE, {"checks": {"T1": {"enabled": True, "threshold": 30}}},
+    )
+    frame = pd.DataFrame([{
+        "__total": 200,
+        "__present_amount": 200,
+        "__distinct_amount": 200,
+        "__min_amount": 1.0,
+        "__max_amount": 200.0,
+        "__avg_amount": 100.5,
+        "__stddev_amount": 20.0,
+        "__zero_amount": 0,
+        "__neg_amount": 0,
+        "__present_label": 200,
+        "__distinct_label": 200,
+    }])
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_quality_statement",
+        lambda *_args, **_kwargs: FakeExecution(frame),
+    )
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: True)
+
+    fault = RejectFirstAtomicSuccessCommitRedis(redis_client)
+    rejected = scheduler._try_run_check(
+        fault,
+        ORG,
+        SUPER,
+        TABLE,
+        "quick",
+        DQConfig(fault, ORG, SUPER),
+        0,
+    )
+
+    assert rejected.state == "failed"
+    assert fault.rejected
+    assert healthy.get_latest(TABLE)["parsed"]["total"] == 100
+    assert healthy.get_latest_column(TABLE, "amount")["max"] == 100
+    assert not redis_client.exists(
+        scheduler._cooldown_key(ORG, SUPER, TABLE, "quick")
+    )
+
+    retried = scheduler._try_run_check(
+        redis_client, ORG, SUPER, TABLE, "quick", healthy, 0,
+    )
+    assert retried.successful
+    t1 = next(item for item in retried.details if item["check_id"] == "T1")
+    assert t1["status"] in {"warning", "critical"}
+    assert healthy.get_latest(TABLE)["parsed"]["total"] == 200
+
+
+def test_failed_atomic_deep_commit_does_not_self_baseline_retry(
+    redis_client,
+    fake_meta,
+    monkeypatch,
+):
+    from supertable.quality.config import DQConfig
+
+    previous_deep = {
+        "total_rows": 100,
+        "non_nulls": 100,
+        "distinct_vals": 100,
+        "moments_certified": True,
+        "p25_value": 0.0,
+        "p75_value": 10.0,
+    }
+    previous_latest = {
+        "checked_at": "previous",
+        "check_type": "quick",
+        "parsed": {"total": 100, "columns": {}},
+        "schema": [["amount", "BIGINT"], ["label", "VARCHAR"]],
+    }
+    healthy = DQConfig(redis_client, ORG, SUPER)
+    assert healthy.set_latest(TABLE, previous_latest)
+    assert healthy.set_latest_column(TABLE, "amount", {"deep": previous_deep})
+    assert healthy.set_table_config(
+        TABLE, {"checks": {"D5": {"enabled": True, "threshold": 30}}},
+    )
+    frame = pd.DataFrame([{
+        "total_rows": 100,
+        "non_nulls": 100,
+        "distinct_vals": 100,
+        "moments_certified": True,
+        "p25_value": 0.0,
+        "p75_value": 20.0,
+    }])
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_quality_statement",
+        lambda *_args, **_kwargs: FakeExecution(frame),
+    )
+    monkeypatch.setattr(scheduler, "_write_mode_history", lambda *_a, **_k: True)
+
+    fault = RejectFirstAtomicSuccessCommitRedis(redis_client)
+    rejected = scheduler._try_run_check(
+        fault,
+        ORG,
+        SUPER,
+        TABLE,
+        "deep",
+        DQConfig(fault, ORG, SUPER),
+        0,
+    )
+
+    assert rejected.state == "failed"
+    assert fault.rejected
+    assert (
+        healthy.get_latest_column(TABLE, "amount")["deep"]["p75_value"]
+        == 10.0
+    )
+
+    retried = scheduler._try_run_check(
+        redis_client, ORG, SUPER, TABLE, "deep", healthy, 0,
+    )
+    assert retried.successful
+    d5 = next(
+        item for item in retried.details
+        if item["check_id"] == "D5" and item["column"] == "amount"
+    )
+    assert d5["status"] in {"warning", "critical"}
+    assert (
+        healthy.get_latest_column(TABLE, "amount")["deep"]["p75_value"]
+        == 20.0
+    )
 
 
 def test_mode_publication_preserves_other_modes_and_counter_invariant():
@@ -906,9 +1390,18 @@ def test_legacy_pending_migration_is_persistent_and_never_drops_a_conflict(
     custom_key = scheduler._pending_key(ORG, SUPER, TABLE, "custom")
     redis_client.set(scalar_key, "legacy", ex=600)
     redis_client.set(quick_key, "newer")
+    lifecycle_admission = scheduler._snapshot_pending_lifecycle_admission(
+        redis_client, ORG, SUPER, TABLE,
+    )
+    assert lifecycle_admission is not None
 
     scheduler._migrate_legacy_pending(
-        redis_client, ORG, SUPER, TABLE, ("quick", "custom"),
+        redis_client,
+        ORG,
+        SUPER,
+        TABLE,
+        ("quick", "custom"),
+        lifecycle_admission,
     )
 
     assert redis_client.get(scalar_key) == "legacy"
@@ -918,11 +1411,75 @@ def test_legacy_pending_migration_is_persistent_and_never_drops_a_conflict(
 
     assert scheduler._consume_pending_generation(redis_client, quick_key, "newer")
     scheduler._migrate_legacy_pending(
-        redis_client, ORG, SUPER, TABLE, ("quick", "custom"),
+        redis_client,
+        ORG,
+        SUPER,
+        TABLE,
+        ("quick", "custom"),
+        lifecycle_admission,
     )
     assert redis_client.get(scalar_key) is None
     assert redis_client.get(quick_key) == "legacy"
     assert redis_client.ttl(quick_key) == -1
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "script_marker"),
+    [
+        ("unresolved", "atomically resolve deferred ingest work"),
+        ("legacy", "atomically migrate one legacy pending generation"),
+    ],
+)
+def test_pending_transform_cannot_repopulate_after_deletion_cleanup(
+    redis_client,
+    source_kind,
+    script_marker,
+):
+    admission = scheduler._snapshot_pending_lifecycle_admission(
+        redis_client, ORG, SUPER, TABLE,
+    )
+    assert admission is not None
+    source_key = (
+        scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+        if source_kind == "unresolved"
+        else scheduler._pending_key(ORG, SUPER, TABLE)
+    )
+    redis_client.set(source_key, "generation")
+
+    class DeleteBeforeTransformCAS:
+        def __init__(self, inner):
+            self.inner = inner
+            self.deleted = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def eval(self, script, *args):
+            if script_marker in script:
+                self.deleted = True
+                quality_keys = self.inner.keys(
+                    RK.quality_prefix(ORG, SUPER) + "*"
+                )
+                if quality_keys:
+                    self.inner.delete(*quality_keys)
+                self.inner.delete(
+                    RK.meta_leaf(ORG, SUPER, TABLE),
+                    RK.meta_root(ORG, SUPER),
+                )
+            return self.inner.eval(script, *args)
+
+    raced = DeleteBeforeTransformCAS(redis_client)
+    if source_kind == "unresolved":
+        scheduler._resolve_unresolved_pending(
+            raced, ORG, SUPER, TABLE, ("quick",), admission,
+        )
+    else:
+        scheduler._migrate_legacy_pending(
+            raced, ORG, SUPER, TABLE, ("quick",), admission,
+        )
+
+    assert raced.deleted
+    assert not redis_client.keys(RK.quality_prefix(ORG, SUPER) + "pending*")
 
 
 def test_failed_attempt_is_visible_without_destroying_last_success_and_clears(
@@ -1103,6 +1660,10 @@ def test_scheduler_reaches_empty_mode_cleanup_after_last_checks_are_removed(
     redis_client,
     monkeypatch,
 ):
+    redis_client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        '{"version":1,"ts":1,"path":"snapshot.json"}',
+    )
     class ScheduledConfig(MemoryDQConfig):
         def get_schedule(self):
             return {
@@ -1449,13 +2010,207 @@ def test_transient_schedule_read_during_ingest_preserves_unresolved_generation(
         scheduler._pending_key(ORG, SUPER, TABLE, "quick")
     ) is None
 
+    lifecycle_admission = scheduler._snapshot_pending_lifecycle_admission(
+        redis_client, ORG, SUPER, TABLE,
+    )
+    assert lifecycle_admission is not None
     scheduler._resolve_unresolved_pending(
-        redis_client, ORG, SUPER, TABLE, ("quick",),
+        redis_client,
+        ORG,
+        SUPER,
+        TABLE,
+        ("quick",),
+        lifecycle_admission,
     )
     assert redis_client.get(unresolved_key) is None
     assert redis_client.get(
         scheduler._pending_key(ORG, SUPER, TABLE, "quick")
     ) == generation
+
+
+def test_disabled_ticks_retain_one_unresolved_generation_until_enabled(
+    redis_client,
+    monkeypatch,
+):
+    redis_client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        '{"version":1,"ts":1,"path":"snapshot.json"}',
+    )
+    unresolved_key = scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+    redis_client.set(unresolved_key, "generation-1")
+
+    class MutableScheduleConfig(MemoryDQConfig):
+        table_schedule = {"enabled": False}
+
+        def get_table_schedule(self, _table):
+            return dict(self.table_schedule)
+
+    dqc = MutableScheduleConfig()
+    attempts = []
+    monkeypatch.setattr(
+        scheduler,
+        "_try_run_check",
+        lambda _r, _o, _s, _t, mode, _d, _c, **kwargs: (
+            attempts.append((mode, kwargs.get("pending_generation")))
+            or scheduler._skipped(mode, "test")
+        ),
+    )
+
+    def run_table_job():
+        scheduler._process_table_job(
+            redis_client,
+            ORG,
+            SUPER,
+            TABLE,
+            dqc,
+            {"enabled": True, "post_ingest": True},
+            0,
+            "0 0 1 1 *",
+            "0 0 1 1 *",
+            "0 0 1 1 *",
+            time.time(),
+            {},
+            {},
+            {},
+            time.monotonic() + 30,
+            None,
+        )
+
+    run_table_job()
+    run_table_job()
+
+    assert redis_client.get(unresolved_key) == "generation-1"
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE)
+    ) is None
+    assert attempts == []
+    for mode in scheduler.QUALITY_MODES:
+        assert redis_client.get(
+            scheduler._pending_key(ORG, SUPER, TABLE, mode)
+        ) is None
+        assert redis_client.get(
+            scheduler._retry_key(ORG, SUPER, TABLE, mode)
+        ) is None
+        assert redis_client.get(
+            scheduler._cooldown_key(ORG, SUPER, TABLE, mode)
+        ) is None
+        assert redis_client.get(
+            scheduler._cron_state_key(ORG, SUPER, TABLE, mode)
+        ) is None
+    assert redis_client.get(
+        scheduler._running_key(ORG, SUPER, TABLE)
+    ) is None
+
+    # The unresolved marker is overwrite-only while disabled, so a newer
+    # ingest remains one bounded key and is the generation later resolved.
+    redis_client.set(unresolved_key, "generation-2")
+    dqc.table_schedule = {
+        "enabled": True,
+        "post_ingest": True,
+        "post_ingest_quick": True,
+        "post_ingest_custom": False,
+        "post_ingest_deep": False,
+    }
+    run_table_job()
+
+    assert redis_client.get(unresolved_key) is None
+    # The compatibility scalar is consumed after migration; authoritative
+    # per-mode work remains persistent.
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE)
+    ) is None
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE, "quick")
+    ) == "generation-2"
+    assert attempts == [("quick", "generation-2")]
+
+
+def test_stale_disabled_schedule_cannot_consume_concurrent_enabled_ingest(
+    redis_client,
+    monkeypatch,
+):
+    from supertable.quality.config import DQConfig
+
+    redis_client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        '{"version":1,"ts":1,"path":"snapshot.json"}',
+    )
+    healthy = DQConfig(redis_client, ORG, SUPER)
+    assert healthy.set_table_schedule(TABLE, {"enabled": False})
+    table_schedule_key = healthy._key("schedule", TABLE)
+    unresolved_key = scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+
+    class EnableAndIngestAfterRead:
+        def __init__(self, inner):
+            self.inner = inner
+            self.injected = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def get(self, key):
+            value = self.inner.get(key)
+            if key == table_schedule_key and not self.injected:
+                self.injected = True
+                assert healthy.set_table_schedule(TABLE, {
+                    "enabled": True,
+                    "post_ingest": True,
+                    "post_ingest_quick": True,
+                    "post_ingest_custom": False,
+                    "post_ingest_deep": False,
+                })
+                self.inner.set(unresolved_key, "concurrent-generation")
+            return value
+
+    raced_redis = EnableAndIngestAfterRead(redis_client)
+    dqc = DQConfig(raced_redis, ORG, SUPER)
+    attempts = []
+    monkeypatch.setattr(
+        scheduler,
+        "_try_run_check",
+        lambda _r, _o, _s, _t, mode, _d, _c, **kwargs: (
+            attempts.append((mode, kwargs.get("pending_generation")))
+            or scheduler._skipped(mode, "test")
+        ),
+    )
+
+    def run_table_job():
+        scheduler._process_table_job(
+            raced_redis,
+            ORG,
+            SUPER,
+            TABLE,
+            dqc,
+            {"enabled": True, "post_ingest": True},
+            0,
+            "0 0 1 1 *",
+            "0 0 1 1 *",
+            "0 0 1 1 *",
+            time.time(),
+            {},
+            {},
+            {},
+            time.monotonic() + 30,
+            None,
+        )
+
+    # This worker read disabled before the enable+ingest, and therefore must
+    # leave the concurrently-created generation unresolved.
+    run_table_job()
+    assert raced_redis.injected
+    assert redis_client.get(unresolved_key) == "concurrent-generation"
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE, "quick")
+    ) is None
+    assert attempts == []
+
+    # The next tick observes enabled and resolves exactly that generation.
+    run_table_job()
+    assert redis_client.get(unresolved_key) is None
+    assert redis_client.get(
+        scheduler._pending_key(ORG, SUPER, TABLE, "quick")
+    ) == "concurrent-generation"
+    assert attempts == [("quick", "concurrent-generation")]
 
 
 def test_latest_read_uncertainty_preserves_prior_modes_and_only_sets_retry(
@@ -1508,7 +2263,7 @@ def test_latest_read_uncertainty_preserves_prior_modes_and_only_sets_retry(
     )
 
 
-def test_success_merge_read_uncertainty_preserves_result_and_denies_cooldown(
+def test_deferred_success_bundle_needs_no_post_result_merge_read(
     redis_client,
     fake_meta,
     monkeypatch,
@@ -1550,14 +2305,16 @@ def test_success_merge_read_uncertainty_preserves_result_and_denies_cooldown(
         redis_client, ORG, SUPER, TABLE, "quick", dqc, 30,
     )
 
-    assert outcome.state == "failed"
-    assert latest_reads >= 4
+    assert outcome.state == "success"
+    assert latest_reads == 2
     latest = original_get_latest(TABLE)
     assert latest["mode_results"]["quick"]["checked_at"]
-    assert latest["mode_attempts"]["quick"]["state"] == "failed"
-    assert "success-merge GET failure" in latest["last_attempt_error"]
-    assert redis_client.exists(scheduler._retry_key(ORG, SUPER, TABLE, "quick"))
+    assert latest["mode_attempts"]["quick"]["state"] == "success"
+    assert "last_attempt_error" not in latest
     assert not redis_client.exists(
+        scheduler._retry_key(ORG, SUPER, TABLE, "quick")
+    )
+    assert redis_client.exists(
         scheduler._cooldown_key(ORG, SUPER, TABLE, "quick")
     )
 
@@ -1612,6 +2369,10 @@ def test_tick_schedule_read_failure_records_retries_and_no_cooldowns(
     from supertable.quality.config import DQConfig
 
     healthy = DQConfig(redis_client, ORG, SUPER)
+    redis_client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        '{"version":1,"ts":1,"path":"snapshot.json"}',
+    )
     schedule_key = healthy._key("schedule")
     fault = SelectiveReadFaultRedis(redis_client, get_key=schedule_key)
     monkeypatch.setattr(
@@ -1681,6 +2442,11 @@ def test_tick_schedule_failures_are_isolated_between_pairs_and_tables(
             return {"enabled": False}
 
     table_config = TableConfig()
+    for table_name in ("bad-table", "good-table"):
+        redis_client.set(
+            RK.meta_leaf(ORG, SUPER, table_name),
+            '{"version":1,"ts":1,"path":"snapshot.json"}',
+        )
     monkeypatch.setattr(
         "supertable.quality.config.DQConfig",
         lambda *_args, **_kwargs: table_config,

@@ -691,7 +691,9 @@ def _query() -> List[Scenario]:
         rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
         primary_keys=["id"],
         sql="SELECT id, __timestamp__ FROM t ORDER BY id", ordered=True,
-        expect_error=ErrorExpectation("RuntimeError", "__timestamp__", "execution"),
+        expect_error=ErrorExpectation(
+            "RuntimeError", "DuckDB query execution failed", "execution"
+        ),
     ))
 
     out.append(_single(
@@ -953,7 +955,9 @@ def _errors() -> List[Scenario]:
         columns=_C_IDVAL, rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
         primary_keys=["id"],
         sql="SELECT id, val FROM t",
-        expect_error=ErrorExpectation("RuntimeError", "No files found", "execution"),
+        expect_error=ErrorExpectation(
+            "RuntimeError", "DuckDB managed query setup failed", "execution"
+        ),
         corrupt_inputs=_delete_first_parquet,
     ))
 
@@ -963,7 +967,9 @@ def _errors() -> List[Scenario]:
         columns=_C_IDVAL, rows=[{"id": 1, "val": "a", TS: ts(seconds=0)}],
         primary_keys=["id"],
         sql="SELECT id, val FROM t",
-        expect_error=ErrorExpectation("RuntimeError", "No magic bytes", "execution"),
+        expect_error=ErrorExpectation(
+            "RuntimeError", "DuckDB managed query setup failed", "execution"
+        ),
         corrupt_inputs=_scramble_first_parquet,
     ))
 

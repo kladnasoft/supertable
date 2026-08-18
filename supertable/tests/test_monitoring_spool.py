@@ -243,6 +243,33 @@ def test_stream_monitoring_finalizes_on_exhaustion_with_measured_rows_bytes():
     )]
 
 
+def test_stream_monitoring_records_close_failure_as_error():
+    from supertable.data_reader import _MonitoredResultStream, Status
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            raise RuntimeError("backend close failed")
+
+    outcomes = []
+    stream = _MonitoredResultStream(
+        Inner(), lambda status, message, rows, size: outcomes.append(
+            (status, message, rows, size)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="backend close failed"):
+        next(stream)
+
+    assert outcomes == [(
+        Status.ERROR.value, "backend close failed", 0, 0,
+    )]
+
+
 def test_stream_monitoring_backpressure_closes_and_surfaces_completed_outcome():
     from supertable.data_reader import _MonitoredResultStream
 
@@ -291,3 +318,116 @@ def test_stream_monitoring_backpressure_closes_and_surfaces_completed_outcome():
         second.cancel()
     assert second_inner.cancelled is True
     assert second_inner.closed is True
+
+
+def test_stream_terminal_callers_wait_for_one_completed_monitor_outcome():
+    import threading
+
+    from supertable.data_reader import _MonitoredResultStream
+
+    second_close_entered = threading.Event()
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def __init__(self):
+            self.closed = False
+            self._close_count = 0
+            self._lock = threading.Lock()
+
+        def close(self):
+            self.closed = True
+            with self._lock:
+                self._close_count += 1
+                if self._close_count == 2:
+                    second_close_entered.set()
+
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    callback_calls = []
+    terminal_errors = []
+    monitoring_error = RuntimeError("monitoring finalization failed")
+
+    def finalize(*outcome):
+        callback_calls.append(outcome)
+        callback_started.set()
+        assert release_callback.wait(2)
+        raise monitoring_error
+
+    stream = _MonitoredResultStream(Inner(), finalize)
+
+    def close_stream():
+        try:
+            stream.close()
+        except BaseException as exc:
+            terminal_errors.append(exc)
+
+    first = threading.Thread(target=close_stream)
+    first.start()
+    assert callback_started.wait(2)
+    second = threading.Thread(target=close_stream)
+    second.start()
+    assert second_close_entered.wait(2)
+    second.join(0.05)
+
+    # The losing terminal path must not report completion before the one
+    # durable monitoring callback has itself completed.
+    assert second.is_alive()
+    release_callback.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(callback_calls) == 1
+    assert terminal_errors == [monitoring_error, monitoring_error]
+
+
+def test_stream_concurrent_batch_accounting_is_atomic_before_exhaustion():
+    import threading
+
+    from supertable.data_reader import _MonitoredResultStream, Status
+
+    batches = [
+        pa.record_batch({"id": [1, 2]}),
+        pa.record_batch({"id": [3, 4, 5]}),
+    ]
+
+    class Inner:
+        schema = batches[0].schema
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._barrier = threading.Barrier(2)
+            self._index = 0
+            self.closed = False
+
+        def __next__(self):
+            with self._lock:
+                if self._index >= len(batches):
+                    raise StopIteration
+                batch = batches[self._index]
+                self._index += 1
+            self._barrier.wait()
+            return batch
+
+        def close(self):
+            self.closed = True
+
+    outcomes = []
+    stream = _MonitoredResultStream(Inner(), lambda *args: outcomes.append(args))
+    observed = []
+    workers = [threading.Thread(target=lambda: observed.append(next(stream))) for _ in batches]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(2)
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    assert len(observed) == 2
+    assert outcomes == [(
+        Status.OK.value,
+        None,
+        sum(batch.num_rows for batch in batches),
+        sum(batch.nbytes for batch in batches),
+    )]

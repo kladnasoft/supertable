@@ -1,5 +1,5 @@
 {
   "category": "RuntimeError",
-  "message_substring": "No magic bytes",
+  "message_substring": "DuckDB managed query setup failed",
   "phase": "execution"
 }

@@ -28,6 +28,7 @@ from supertable.engine.engine_common import (
     rewrite_query_with_hashed_tables,
     redact_url_credentials,
     snapshot_spark_type,
+    validate_rbac_binding_stability,
 )
 
 from urllib.parse import urlparse, unquote
@@ -1338,6 +1339,7 @@ def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
         parsed_expression=None,
+        default_super_name: Optional[str] = None,
 ) -> str:
     """Rewrite table references and transpile SQL to Spark dialect.
 
@@ -1356,6 +1358,7 @@ def _spark_rewrite_query(
         original_sql,
         alias_to_table,
         parsed_expression=parsed_expression,
+        default_super_name=default_super_name,
     )
 
     try:
@@ -1678,6 +1681,10 @@ class SparkThriftExecutor:
             )
         caller_parser = parser
         parser = _revalidate_spark_parser(parser, reflection)
+        validate_rbac_binding_stability(
+            parser,
+            getattr(reflection, "rbac_views", None) or {},
+        )
 
         query_timeout = _spark_timeout_seconds()
         stmt_timeout = _spark_statement_timeout_seconds()
@@ -1947,10 +1954,11 @@ class SparkThriftExecutor:
                 parser.original_query,
                 query_alias_to_name,
                 parsed_expression=getattr(parser, "_parsed", None),
+                default_super_name=parser.default_super_name,
             )
             parser.executing_query = executing_query
             if caller_parser is not parser:
-                caller_parser.executing_query = executing_query
+                setattr(caller_parser, "executing_query", executing_query)
 
             logger.debug(
                 f"{log_prefix}[spark.thrift] protected user query prepared"

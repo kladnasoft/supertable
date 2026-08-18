@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import re
+from typing import Any
 
 import polars
 from polars import DataFrame
@@ -242,6 +243,7 @@ class DataWriter:
             simple_name: str,
             count: int,
             profiler: Profiler,
+            lock_token: str,
             require_floor: bool = False,
     ) -> tuple[int, int | None]:
         """Reserve a block above the durable floor and return start/new floor."""
@@ -265,10 +267,9 @@ class DataWriter:
                 snapshot, profiler=profiler
             )
         else:
-            try:
-                floor = int(raw_floor)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Snapshot has an invalid rowid_high_watermark") from exc
+            if type(raw_floor) is not int:
+                raise ValueError("Snapshot has an invalid rowid_high_watermark")
+            floor = raw_floor
             if floor < 0:
                 raise ValueError("Snapshot has a negative rowid_high_watermark")
 
@@ -281,6 +282,7 @@ class DataWriter:
             simple_name,
             count,
             floor,
+            lock_token=lock_token,
         )
         start, new_high = int(start), int(new_high)
         if start <= floor or new_high != start + count - 1:
@@ -354,12 +356,13 @@ class DataWriter:
                     lock_token=lock_token,
                     now_ms=now_ms,
                 )
-            commit_kwargs = {
+            commit_kwargs: dict[str, Any] = {
                 "expected_version": expected_version,
                 "expected_path": expected_path,
                 "lock_token": lock_token,
                 "commit_id": commit_id,
                 "now_ms": now_ms,
+                "expected_mirrors": mirror_formats,
             }
             if mirror_formats:
                 commit_kwargs["mirror_publication"] = True
@@ -447,9 +450,9 @@ class DataWriter:
         """Set per-table limit overrides.
 
         This is a one-time (or infrequent) operation.  The configuration is
-        persisted in Redis and cached locally so subsequent ``write()`` /
-        ``compact()`` calls pick up the overrides without an extra Redis
-        round-trip.
+        persisted in Redis.  A local copy is retained for observability, but
+        operational reads refresh from Redis so changes made by another
+        process are not hidden by a stale process-local cache.
 
         Args:
             role_name: RBAC role performing the configuration.
@@ -478,57 +481,48 @@ class DataWriter:
             table_name=simple_name,
         )
 
-        # Only fetch existing Redis config when a limit override is being set,
-        # preserving the cache-population guarantee for callers that omit them.
-        if (
-            max_memory_chunk_size is not None
-            or max_decoded_compaction_bytes is not None
-            or max_overlapping_files is not None
-            or max_tombstone_rows is not None
-            or tombstone_compaction_workers is not None
-        ):
-            existing = self.catalog.get_table_config(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
-            ) or {}
-        else:
-            existing = self._table_config_cache.get(simple_name) or {}
-        config = dict(existing)
+        updates: dict[str, int] = {}
         if max_memory_chunk_size is not None:
-            if max_memory_chunk_size <= 0:
+            if (
+                type(max_memory_chunk_size) is not int
+                or max_memory_chunk_size <= 0
+            ):
                 raise ValueError("max_memory_chunk_size must be a positive integer")
-            config["max_memory_chunk_size"] = int(max_memory_chunk_size)
+            updates["max_memory_chunk_size"] = max_memory_chunk_size
         if max_decoded_compaction_bytes is not None:
             if (
-                isinstance(max_decoded_compaction_bytes, bool)
-                or not isinstance(max_decoded_compaction_bytes, int)
+                type(max_decoded_compaction_bytes) is not int
                 or max_decoded_compaction_bytes <= 0
             ):
                 raise ValueError(
                     "max_decoded_compaction_bytes must be a positive integer"
                 )
-            config["max_decoded_compaction_bytes"] = (
+            updates["max_decoded_compaction_bytes"] = (
                 max_decoded_compaction_bytes
             )
         if max_overlapping_files is not None:
-            if max_overlapping_files <= 0:
+            if (
+                type(max_overlapping_files) is not int
+                or max_overlapping_files <= 0
+            ):
                 raise ValueError("max_overlapping_files must be a positive integer")
-            config["max_overlapping_files"] = int(max_overlapping_files)
+            updates["max_overlapping_files"] = max_overlapping_files
         if max_tombstone_rows is not None:
-            if max_tombstone_rows <= 0:
+            if (
+                type(max_tombstone_rows) is not int
+                or max_tombstone_rows <= 0
+            ):
                 raise ValueError("max_tombstone_rows must be a positive integer")
-            config["max_tombstone_rows"] = int(max_tombstone_rows)
+            updates["max_tombstone_rows"] = max_tombstone_rows
         if tombstone_compaction_workers is not None:
             if (
-                isinstance(tombstone_compaction_workers, bool)
-                or not isinstance(tombstone_compaction_workers, int)
+                type(tombstone_compaction_workers) is not int
                 or not 1 <= tombstone_compaction_workers <= 8
             ):
                 raise ValueError(
                     "tombstone_compaction_workers must be an integer from 1 to 8"
                 )
-            config["tombstone_compaction_workers"] = tombstone_compaction_workers
+            updates["tombstone_compaction_workers"] = tombstone_compaction_workers
 
         token = self.catalog.acquire_simple_lock(
             self.super_table.organization,
@@ -542,6 +536,17 @@ class DataWriter:
                 f"Could not acquire configuration lock for {simple_name!r}"
             )
         try:
+            # Read-modify-write under the same per-table lease used by every
+            # writer.  Reading before the lease lets two disjoint partial
+            # updates both derive from the same stale document and silently
+            # lose whichever acknowledged update commits first.
+            existing = self.catalog.get_table_config(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            ) or {}
+            config = dict(existing)
+            config.update(updates)
             self.catalog.set_table_config(
                 self.super_table.organization,
                 self.super_table.super_name,
@@ -549,6 +554,10 @@ class DataWriter:
                 config,
                 lock_token=token,
             )
+            # Publish before releasing the lease.  Otherwise an older caller
+            # can resume after a newer caller and overwrite this process cache
+            # with a stale document even though Redis contains the merge.
+            self._table_config_cache[simple_name] = dict(config)
         finally:
             self.catalog.release_simple_lock(
                 self.super_table.organization,
@@ -557,19 +566,16 @@ class DataWriter:
                 token,
             )
 
-        # Update local cache so the next write() sees it immediately
-        self._table_config_cache[simple_name] = config
-
     def _get_table_config(self, simple_name: str) -> dict:
-        """Return table config from local cache, falling back to Redis once."""
-        if simple_name not in self._table_config_cache:
-            config = self.catalog.get_table_config(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
-            )
-            self._table_config_cache[simple_name] = config or {}
-        return self._table_config_cache[simple_name]
+        """Return the authoritative table config and refresh the local copy."""
+        config = self.catalog.get_table_config(
+            self.super_table.organization,
+            self.super_table.super_name,
+            simple_name,
+        )
+        refreshed = dict(config or {})
+        self._table_config_cache[simple_name] = refreshed
+        return dict(refreshed)
 
     # ── Schema derivation for ``compact()`` ─────────────────────────────
     #
@@ -804,7 +810,6 @@ class DataWriter:
             # silently corrupt partitioning and dedup.  ``newer_than`` is the
             # supported, explicit mechanism for caller-controlled conflict
             # resolution.
-            table_config = self._get_table_config(simple_name)
             if not delete_only:
                 dataframe = dataframe.with_columns(
                     polars.lit(datetime.now(timezone.utc)).alias("__timestamp__")
@@ -830,6 +835,26 @@ class DataWriter:
                     lock_token=token,
                 )
 
+            # Pin the create-vs-update authorization decision at the table
+            # lease boundary.  A concurrent creator can publish the leaf after
+            # our optimistic preflight but before this writer acquires the
+            # lease; CREATE permission must never authorize mutation of that
+            # newly-existing table.  Conversely, a table that existed at
+            # preflight is deliberately not recreated if it disappeared while
+            # we waited (``create_if_missing`` remains false below).
+            locked_target_exists = self.catalog.leaf_exists(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
+            if not target_existed and locked_target_exists:
+                check_write_access(**access_args)
+
+            # Configuration updates use this same lease.  Refresh only after
+            # acquiring it so a write cannot read an old configuration, pause,
+            # then resume after a newer configuration has been acknowledged.
+            table_config = self._get_table_config(simple_name)
+
             # --- Read last snapshot (via leaf pointer) ------------------------
             # A target that existed at authorization time must not be
             # implicitly recreated if another actor deletes it before we take
@@ -837,7 +862,7 @@ class DataWriter:
             simple_table = SimpleTable(
                 self.super_table,
                 simple_name,
-                create_if_missing=not target_existed,
+                create_if_missing=not locked_target_exists,
             )
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             # A current deletion-vector is immutable correctness metadata.  Do
@@ -865,6 +890,7 @@ class DataWriter:
                 simple_name=simple_name,
                 count=reserve_count,
                 profiler=profiler,
+                lock_token=token,
                 require_floor=not delete_all,
             )
             if rowid_high_watermark is not None:

@@ -48,40 +48,35 @@
       "supertable/data_classes.py:236: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]"
     ],
     "supertable/data_reader.py": [
-      "supertable/data_reader.py:1032: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
-      "supertable/data_reader.py:1034: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
-      "supertable/data_reader.py:701: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"dict[tuple[str, str], Iterable[str]] | None\"  [arg-type]",
-      "supertable/data_reader.py:701: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"list[TableDefinition]\"  [arg-type]",
-      "supertable/data_reader.py:701: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"str\"  [arg-type]",
-      "supertable/data_reader.py:734: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:737: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
-      "supertable/data_reader.py:738: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:742: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
-      "supertable/data_reader.py:745: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
-      "supertable/data_reader.py:799: error: Need type annotation for \"resolved_tombstones\" (hint: \"resolved_tombstones: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_reader.py:999: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]"
+      "supertable/data_reader.py:1130: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
+      "supertable/data_reader.py:1163: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
+      "supertable/data_reader.py:1165: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
+      "supertable/data_reader.py:831: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"dict[tuple[str, str], Iterable[str]] | None\"  [arg-type]",
+      "supertable/data_reader.py:831: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"list[TableDefinition]\"  [arg-type]",
+      "supertable/data_reader.py:831: error: Argument 1 to \"restrict_read_access\" has incompatible type \"**dict[str, Sequence[object]]\"; expected \"str\"  [arg-type]",
+      "supertable/data_reader.py:865: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:868: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
+      "supertable/data_reader.py:869: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:873: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
+      "supertable/data_reader.py:876: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
+      "supertable/data_reader.py:930: error: Need type annotation for \"resolved_tombstones\" (hint: \"resolved_tombstones: dict[<type>, <type>] = ...\")  [var-annotated]"
     ],
     "supertable/data_writer.py": [
-      "supertable/data_writer.py:1082: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:1155: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:135: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
-      "supertable/data_writer.py:1694: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:1700: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
-      "supertable/data_writer.py:1726: error: Argument 1 to \"stats_cache_identity\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/data_writer.py:2007: error: Incompatible types in assignment (expression has type \"MirrorPublicationError\", variable has type \"MonitoringPostCommitError\")  [assignment]",
-      "supertable/data_writer.py:2212: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:2299: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
-      "supertable/data_writer.py:2481: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:2509: error: Argument 1 to \"stats_cache_identity\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/data_writer.py:2708: error: Incompatible types in assignment (expression has type \"MirrorPublicationError\", variable has type \"MonitoringPostCommitError\")  [assignment]",
-      "supertable/data_writer.py:2721: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]",
-      "supertable/data_writer.py:373: error: Argument 6 to \"commit_snapshot\" of \"RedisCatalog\" has incompatible type \"**dict[str, object]\"; expected \"bool\"  [arg-type]",
-      "supertable/data_writer.py:373: error: Argument 6 to \"commit_snapshot\" of \"RedisCatalog\" has incompatible type \"**dict[str, object]\"; expected \"int | None\"  [arg-type]",
-      "supertable/data_writer.py:373: error: Argument 6 to \"commit_snapshot\" of \"RedisCatalog\" has incompatible type \"**dict[str, object]\"; expected \"int\"  [arg-type]",
-      "supertable/data_writer.py:373: error: Argument 6 to \"commit_snapshot\" of \"RedisCatalog\" has incompatible type \"**dict[str, object]\"; expected \"str | None\"  [arg-type]",
-      "supertable/data_writer.py:373: error: Argument 6 to \"commit_snapshot\" of \"RedisCatalog\" has incompatible type \"**dict[str, object]\"; expected \"str\"  [arg-type]",
-      "supertable/data_writer.py:932: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
-      "supertable/data_writer.py:937: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]"
+      "supertable/data_writer.py:1108: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:1181: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:136: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
+      "supertable/data_writer.py:1720: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:1726: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
+      "supertable/data_writer.py:1752: error: Argument 1 to \"stats_cache_identity\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/data_writer.py:2033: error: Incompatible types in assignment (expression has type \"MirrorPublicationError\", variable has type \"MonitoringPostCommitError\")  [assignment]",
+      "supertable/data_writer.py:2238: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:2325: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
+      "supertable/data_writer.py:2507: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:2535: error: Argument 1 to \"stats_cache_identity\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/data_writer.py:2734: error: Incompatible types in assignment (expression has type \"MirrorPublicationError\", variable has type \"MonitoringPostCommitError\")  [assignment]",
+      "supertable/data_writer.py:2747: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]",
+      "supertable/data_writer.py:958: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
+      "supertable/data_writer.py:963: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]"
     ],
     "supertable/demo/medcenter/export_accounting.py": [
       "supertable/demo/medcenter/export_accounting.py:178: error: Argument \"key\" to \"max\" has incompatible type overloaded function; expected \"Callable[[int], SupportsDunderLT[Any] | SupportsDunderGT[Any]]\"  [arg-type]"
@@ -170,60 +165,60 @@
       "supertable/engine/adaptive_router.py:31: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]"
     ],
     "supertable/engine/data_estimator.py": [
-      "supertable/engine/data_estimator.py:1582: error: Incompatible types in assignment (expression has type \"list[str] | None\", variable has type \"list[str]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1650: error: Invalid index type \"object\" for \"dict[tuple[str, str], list[dict[str, object]]]\"; expected type \"tuple[str, str]\"  [index]",
-      "supertable/engine/data_estimator.py:1673: error: No overload variant of \"list\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/data_estimator.py:1745: error: Incompatible types in assignment (expression has type \"object\", variable has type \"str\")  [assignment]",
+      "supertable/engine/data_estimator.py:1583: error: Incompatible types in assignment (expression has type \"list[str] | None\", variable has type \"list[str]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1651: error: Invalid index type \"object\" for \"dict[tuple[str, str], list[dict[str, object]]]\"; expected type \"tuple[str, str]\"  [index]",
+      "supertable/engine/data_estimator.py:1674: error: No overload variant of \"list\" matches argument type \"object\"  [call-overload]",
       "supertable/engine/data_estimator.py:1746: error: Incompatible types in assignment (expression has type \"object\", variable has type \"str\")  [assignment]",
-      "supertable/engine/data_estimator.py:1747: error: Incompatible types in assignment (expression has type \"object\", variable has type \"list[str]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1748: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, int]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1749: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, int | None]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1750: error: Incompatible types in assignment (expression has type \"object\", variable has type \"set[str]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1751: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, str]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1752: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, dict[str, int] | None]\")  [assignment]",
-      "supertable/engine/data_estimator.py:1753: error: Incompatible types in assignment (expression has type \"object\", variable has type \"set[str] | None\")  [assignment]",
-      "supertable/engine/data_estimator.py:1754: error: Incompatible types in assignment (expression has type \"object\", variable has type \"bool\")  [assignment]",
-      "supertable/engine/data_estimator.py:1759: error: Value of type \"dict[str, int] | None\" is not indexable  [index]",
-      "supertable/engine/data_estimator.py:1767: error: Unsupported right operand type for in (\"dict[str, int] | None\")  [operator]",
-      "supertable/engine/data_estimator.py:1773: error: \"object\" has no attribute \"items\"  [attr-defined]",
-      "supertable/engine/data_estimator.py:1807: error: Argument 2 to \"_projected_bytes_index\" of \"DataEstimator\" has incompatible type \"set[str] | None\"; expected \"set[str]\"  [arg-type]",
-      "supertable/engine/data_estimator.py:1810: error: Unsupported operand types for < (\"int\" and \"object\")  [operator]",
-      "supertable/engine/data_estimator.py:1830: error: Argument 1 to \"_projection_widths\" of \"DataEstimator\" has incompatible type \"set[str] | None\"; expected \"set[str]\"  [arg-type]",
-      "supertable/engine/data_estimator.py:1922: error: Unsupported operand types for <= (\"int\" and \"None\")  [operator]",
-      "supertable/engine/data_estimator.py:1927: error: Generator has incompatible item type \"int | None\"; expected \"bool\"  [misc]",
-      "supertable/engine/data_estimator.py:1932: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
-      "supertable/engine/data_estimator.py:1947: error: Unsupported operand types for <= (\"int\" and \"None\")  [operator]",
-      "supertable/engine/data_estimator.py:1963: error: Generator has incompatible item type \"int | None\"; expected \"bool\"  [misc]",
-      "supertable/engine/data_estimator.py:2007: error: Argument 1 to \"len\" has incompatible type \"object\"; expected \"Sized\"  [arg-type]",
-      "supertable/engine/data_estimator.py:2008: error: Value of type \"object\" is not indexable  [index]",
-      "supertable/engine/data_estimator.py:2017: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
-      "supertable/engine/data_estimator.py:2028: error: Argument \"simple_version\" to \"SuperSnapshot\" has incompatible type \"object\"; expected \"int\"  [arg-type]",
-      "supertable/engine/data_estimator.py:2034: error: No overload variant of \"list\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/data_estimator.py:2053: error: \"object\" has no attribute \"get\"  [attr-defined]",
-      "supertable/engine/data_estimator.py:2059: error: \"object\" has no attribute \"get\"  [attr-defined]",
-      "supertable/engine/data_estimator.py:441: error: Argument 3 to \"prune_files_by_predicates\" has incompatible type \"Any | None\"; expected \"list[dict[str, PredInterval]]\"  [arg-type]"
+      "supertable/engine/data_estimator.py:1747: error: Incompatible types in assignment (expression has type \"object\", variable has type \"str\")  [assignment]",
+      "supertable/engine/data_estimator.py:1748: error: Incompatible types in assignment (expression has type \"object\", variable has type \"list[str]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1749: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, int]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1750: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, int | None]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1751: error: Incompatible types in assignment (expression has type \"object\", variable has type \"set[str]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1752: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, str]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1753: error: Incompatible types in assignment (expression has type \"object\", variable has type \"dict[str, dict[str, int] | None]\")  [assignment]",
+      "supertable/engine/data_estimator.py:1754: error: Incompatible types in assignment (expression has type \"object\", variable has type \"set[str] | None\")  [assignment]",
+      "supertable/engine/data_estimator.py:1755: error: Incompatible types in assignment (expression has type \"object\", variable has type \"bool\")  [assignment]",
+      "supertable/engine/data_estimator.py:1760: error: Value of type \"dict[str, int] | None\" is not indexable  [index]",
+      "supertable/engine/data_estimator.py:1768: error: Unsupported right operand type for in (\"dict[str, int] | None\")  [operator]",
+      "supertable/engine/data_estimator.py:1774: error: \"object\" has no attribute \"items\"  [attr-defined]",
+      "supertable/engine/data_estimator.py:1808: error: Argument 2 to \"_projected_bytes_index\" of \"DataEstimator\" has incompatible type \"set[str] | None\"; expected \"set[str]\"  [arg-type]",
+      "supertable/engine/data_estimator.py:1811: error: Unsupported operand types for < (\"int\" and \"object\")  [operator]",
+      "supertable/engine/data_estimator.py:1831: error: Argument 1 to \"_projection_widths\" of \"DataEstimator\" has incompatible type \"set[str] | None\"; expected \"set[str]\"  [arg-type]",
+      "supertable/engine/data_estimator.py:1923: error: Unsupported operand types for <= (\"int\" and \"None\")  [operator]",
+      "supertable/engine/data_estimator.py:1928: error: Generator has incompatible item type \"int | None\"; expected \"bool\"  [misc]",
+      "supertable/engine/data_estimator.py:1933: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+      "supertable/engine/data_estimator.py:1948: error: Unsupported operand types for <= (\"int\" and \"None\")  [operator]",
+      "supertable/engine/data_estimator.py:1964: error: Generator has incompatible item type \"int | None\"; expected \"bool\"  [misc]",
+      "supertable/engine/data_estimator.py:2008: error: Argument 1 to \"len\" has incompatible type \"object\"; expected \"Sized\"  [arg-type]",
+      "supertable/engine/data_estimator.py:2009: error: Value of type \"object\" is not indexable  [index]",
+      "supertable/engine/data_estimator.py:2018: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+      "supertable/engine/data_estimator.py:2029: error: Argument \"simple_version\" to \"SuperSnapshot\" has incompatible type \"object\"; expected \"int\"  [arg-type]",
+      "supertable/engine/data_estimator.py:2035: error: No overload variant of \"list\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/data_estimator.py:2054: error: \"object\" has no attribute \"get\"  [attr-defined]",
+      "supertable/engine/data_estimator.py:2060: error: \"object\" has no attribute \"get\"  [attr-defined]",
+      "supertable/engine/data_estimator.py:442: error: Argument 3 to \"prune_files_by_predicates\" has incompatible type \"Any | None\"; expected \"list[dict[str, PredInterval]]\"  [arg-type]"
     ],
     "supertable/engine/duckdb_engine.py": [
-      "supertable/engine/duckdb_engine.py:276: error: Argument 3 to \"getattr\" has incompatible type \"str\"; expected \"bool\"  [arg-type]",
-      "supertable/engine/duckdb_engine.py:437: error: Argument 1 to \"append\" of \"list\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/engine/duckdb_engine.py:469: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
+      "supertable/engine/duckdb_engine.py:593: error: Argument 3 to \"getattr\" has incompatible type \"str\"; expected \"bool\"  [arg-type]",
+      "supertable/engine/duckdb_engine.py:796: error: Argument 1 to \"append\" of \"list\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/engine/duckdb_engine.py:829: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
     ],
     "supertable/engine/engine_common.py": [
-      "supertable/engine/engine_common.py:1817: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:1818: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:1819: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2165: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2169: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2172: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2178: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2188: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]"
+      "supertable/engine/engine_common.py:2489: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2490: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2491: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2837: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2841: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2844: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2850: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2860: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]"
     ],
     "supertable/engine/engine_config.py": [
       "supertable/engine/engine_config.py:321: error: Argument 1 to \"_effective\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]",
-      "supertable/engine/engine_config.py:401: error: Argument 1 to \"_block\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]"
+      "supertable/engine/engine_config.py:403: error: Argument 1 to \"_block\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]"
     ],
     "supertable/engine/executor.py": [
-      "supertable/engine/executor.py:1159: error: Argument 9 to \"execute_stream\" of \"IslandDB\" has incompatible type \"**dict[str, int]\"; expected \"bool\"  [arg-type]",
+      "supertable/engine/executor.py:1163: error: Argument 9 to \"execute_stream\" of \"IslandDB\" has incompatible type \"**dict[str, int]\"; expected \"bool\"  [arg-type]",
       "supertable/engine/executor.py:127: error: Argument 1 to \"append\" of \"list\" has incompatible type \"tuple[str, str | int | float | None]\"; expected \"str\"  [arg-type]",
       "supertable/engine/executor.py:133: error: Argument 1 to \"append\" of \"list\" has incompatible type \"tuple[str, str]\"; expected \"str\"  [arg-type]",
       "supertable/engine/executor.py:155: error: Argument 1 to \"append\" of \"list\" has incompatible type \"tuple[str, str]\"; expected \"str\"  [arg-type]",
@@ -233,9 +228,8 @@
       "supertable/engine/executor.py:327: error: Incompatible types in assignment (expression has type \"FileCache\", variable has type \"None\")  [assignment]",
       "supertable/engine/executor.py:337: error: Incompatible types in assignment (expression has type \"bool\", variable has type \"None\")  [assignment]",
       "supertable/engine/executor.py:350: error: Incompatible types in assignment (expression has type \"RedisCatalog\", variable has type \"None\")  [assignment]",
-      "supertable/engine/executor.py:352: error: Incompatible types in assignment (expression has type \"bool\", variable has type \"None\")  [assignment]",
-      "supertable/engine/executor.py:950: error: Incompatible types in assignment (expression has type \"SparkThriftExecutor\", variable has type \"None\")  [assignment]",
-      "supertable/engine/executor.py:954: error: \"None\" has no attribute \"execute\"  [attr-defined]"
+      "supertable/engine/executor.py:954: error: Incompatible types in assignment (expression has type \"SparkThriftExecutor\", variable has type \"None\")  [assignment]",
+      "supertable/engine/executor.py:958: error: \"None\" has no attribute \"execute\"  [attr-defined]"
     ],
     "supertable/engine/file_cache.py": [
       "supertable/engine/file_cache.py:571: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]"
@@ -252,41 +246,39 @@
     ],
     "supertable/engine/islanddb.py": [
       "supertable/engine/islanddb.py:1089: error: \"object\" has no attribute \"cache_namespace\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1340: error: Item \"None\" of \"set[str] | None\" has no attribute \"update\"  [union-attr]",
-      "supertable/engine/islanddb.py:1412: error: Name \"matches\" already defined on line 1406  [no-redef]",
-      "supertable/engine/islanddb.py:1442: error: Name \"matches\" already defined on line 1436  [no-redef]",
-      "supertable/engine/islanddb.py:1453: error: Argument 1 to \"append\" of \"list\" has incompatible type \"SuperSnapshot\"; expected \"str\"  [arg-type]",
-      "supertable/engine/islanddb.py:1454: error: Incompatible return value type (got \"str | None\", expected \"SuperSnapshot | None\")  [return-value]",
-      "supertable/engine/islanddb.py:1589: error: Name \"matches\" already defined on line 1583  [no-redef]",
-      "supertable/engine/islanddb.py:2221: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:2298: error: Incompatible types in assignment (expression has type \"SuperSnapshot | None\", variable has type \"SuperSnapshot\")  [assignment]",
-      "supertable/engine/islanddb.py:2316: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:2317: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:2337: error: Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")  [assignment]",
-      "supertable/engine/islanddb.py:2799: error: Incompatible types in assignment (expression has type \"dict[str, ObjectMetadata]\", variable has type \"dict[str, object] | None\")  [assignment]",
-      "supertable/engine/islanddb.py:3197: error: Item \"None\" of \"object | None\" has no attribute \"read_parquet\"  [union-attr]",
-      "supertable/engine/islanddb.py:3208: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
+      "supertable/engine/islanddb.py:1394: error: Item \"None\" of \"set[str] | None\" has no attribute \"update\"  [union-attr]",
+      "supertable/engine/islanddb.py:1466: error: Name \"matches\" already defined on line 1460  [no-redef]",
+      "supertable/engine/islanddb.py:1496: error: Name \"matches\" already defined on line 1490  [no-redef]",
+      "supertable/engine/islanddb.py:1507: error: Argument 1 to \"append\" of \"list\" has incompatible type \"SuperSnapshot\"; expected \"str\"  [arg-type]",
+      "supertable/engine/islanddb.py:1508: error: Incompatible return value type (got \"str | None\", expected \"SuperSnapshot | None\")  [return-value]",
+      "supertable/engine/islanddb.py:1726: error: Name \"matches\" already defined on line 1720  [no-redef]",
+      "supertable/engine/islanddb.py:2342: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:2436: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:2437: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:2919: error: Incompatible types in assignment (expression has type \"dict[str, ObjectMetadata]\", variable has type \"dict[str, object] | None\")  [assignment]",
+      "supertable/engine/islanddb.py:3317: error: Item \"None\" of \"object | None\" has no attribute \"read_parquet\"  [union-attr]",
+      "supertable/engine/islanddb.py:3328: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
       "supertable/engine/islanddb.py:414: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
       "supertable/engine/islanddb.py:418: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
       "supertable/engine/islanddb.py:424: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:4317: error: Item \"None\" of \"ResourceGovernor | None\" has no attribute \"reserve\"  [union-attr]",
-      "supertable/engine/islanddb.py:4516: error: Incompatible types in assignment (expression has type \"Iterable[Any]\", variable has type \"ArrowBatchStream\")  [assignment]",
-      "supertable/engine/islanddb.py:4727: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4729: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4733: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4738: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4741: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]",
-      "supertable/engine/islanddb.py:4758: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4785: error: Argument \"rss_baseline_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:4786: error: Argument \"rss_peak_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:4787: error: Argument \"rss_final_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:4788: error: Argument \"rss_peak_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:4791: error: Argument \"rss_retained_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:4796: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4806: error: No overload variant of \"dict\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:4916: error: \"ArrowBatchStream\" has no attribute \"_island_release_reservation\"  [attr-defined]",
-      "supertable/engine/islanddb.py:4917: error: \"ArrowBatchStream\" has no attribute \"_island_finish_profile\"  [attr-defined]",
-      "supertable/engine/islanddb.py:4918: error: \"ArrowBatchStream\" has no attribute \"_island_execution_metrics\"  [attr-defined]",
+      "supertable/engine/islanddb.py:4438: error: Item \"None\" of \"ResourceGovernor | None\" has no attribute \"reserve\"  [union-attr]",
+      "supertable/engine/islanddb.py:4637: error: Incompatible types in assignment (expression has type \"Iterable[Any]\", variable has type \"ArrowBatchStream\")  [assignment]",
+      "supertable/engine/islanddb.py:4848: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4850: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4854: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4859: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4862: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]",
+      "supertable/engine/islanddb.py:4879: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4906: error: Argument \"rss_baseline_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:4907: error: Argument \"rss_peak_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:4908: error: Argument \"rss_final_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:4909: error: Argument \"rss_peak_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:4912: error: Argument \"rss_retained_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:4917: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:4927: error: No overload variant of \"dict\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:5037: error: \"ArrowBatchStream\" has no attribute \"_island_release_reservation\"  [attr-defined]",
+      "supertable/engine/islanddb.py:5038: error: \"ArrowBatchStream\" has no attribute \"_island_finish_profile\"  [attr-defined]",
+      "supertable/engine/islanddb.py:5039: error: \"ArrowBatchStream\" has no attribute \"_island_execution_metrics\"  [attr-defined]",
       "supertable/engine/islanddb.py:553: error: \"object\" has no attribute \"as_dict\"  [attr-defined]",
       "supertable/engine/islanddb.py:833: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
       "supertable/engine/islanddb.py:851: error: \"object\" has no attribute \"open\"  [attr-defined]"
@@ -323,12 +315,12 @@
       "supertable/engine/query_observations.py:768: error: Argument \"result_complete\" to \"NormalizedQueryProfile\" has incompatible type \"object\"; expected \"bool | None\"  [arg-type]"
     ],
     "supertable/engine/spark_thrift.py": [
-      "supertable/engine/spark_thrift.py:1245: error: \"object\" has no attribute \"cursor\"  [attr-defined]",
-      "supertable/engine/spark_thrift.py:1375: error: Argument 2 to \"_parquet_timestamp_units\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/engine/spark_thrift.py:1453: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]",
-      "supertable/engine/spark_thrift.py:1476: error: Need type annotation for \"current_lines\" (hint: \"current_lines: list[<type>] = ...\")  [var-annotated]",
-      "supertable/engine/spark_thrift.py:1573: error: \"object\" has no attribute \"close\"  [attr-defined]",
-      "supertable/engine/spark_thrift.py:339: error: List comprehension has incompatible type List[tuple[str, str, None]]; expected List[tuple[str, str, str]]  [misc]"
+      "supertable/engine/spark_thrift.py:1732: error: \"object\" has no attribute \"cursor\"  [attr-defined]",
+      "supertable/engine/spark_thrift.py:1878: error: Argument 2 to \"_parquet_timestamp_units\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/engine/spark_thrift.py:1959: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]",
+      "supertable/engine/spark_thrift.py:1986: error: Need type annotation for \"current_lines\" (hint: \"current_lines: list[<type>] = ...\")  [var-annotated]",
+      "supertable/engine/spark_thrift.py:2095: error: \"object\" has no attribute \"close\"  [attr-defined]",
+      "supertable/engine/spark_thrift.py:723: error: List comprehension has incompatible type List[tuple[str, str, None]]; expected List[tuple[str, str, str]]  [misc]"
     ],
     "supertable/logging.py": [
       "supertable/logging.py:292: error: Incompatible types in assignment (expression has type \"JSONFormatter\", variable has type \"TextFormatter\")  [assignment]"
@@ -341,12 +333,12 @@
       "supertable/mirroring/mirror_delta.py:732: error: Need type annotation for \"metadata\"  [var-annotated]"
     ],
     "supertable/mirroring/mirror_formats.py": [
-      "supertable/mirroring/mirror_formats.py:351: error: Item \"None\" of \"dict[str, Any] | None\" has no attribute \"get\"  [union-attr]",
-      "supertable/mirroring/mirror_formats.py:354: error: Incompatible return value type (got \"dict[str, Any] | None\", expected \"dict[str, Any]\")  [return-value]",
-      "supertable/mirroring/mirror_formats.py:356: error: Item \"None\" of \"dict[str, Any] | None\" has no attribute \"get\"  [union-attr]",
-      "supertable/mirroring/mirror_formats.py:422: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]",
-      "supertable/mirroring/mirror_formats.py:423: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]",
-      "supertable/mirroring/mirror_formats.py:433: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]"
+      "supertable/mirroring/mirror_formats.py:354: error: Item \"None\" of \"dict[str, Any] | None\" has no attribute \"get\"  [union-attr]",
+      "supertable/mirroring/mirror_formats.py:357: error: Incompatible return value type (got \"dict[str, Any] | None\", expected \"dict[str, Any]\")  [return-value]",
+      "supertable/mirroring/mirror_formats.py:359: error: Item \"None\" of \"dict[str, Any] | None\" has no attribute \"get\"  [union-attr]",
+      "supertable/mirroring/mirror_formats.py:425: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]",
+      "supertable/mirroring/mirror_formats.py:426: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]",
+      "supertable/mirroring/mirror_formats.py:437: error: Item \"None\" of \"dict[Any, Any] | None\" has no attribute \"get\"  [union-attr]"
     ],
     "supertable/mirroring/mirror_iceberg.py": [
       "supertable/mirroring/mirror_iceberg.py:1059: error: Name \"write_iceberg_table\" already defined on line 47  [no-redef]",
@@ -462,19 +454,16 @@
       "supertable/quality/checker.py:1716: error: Incompatible types in assignment (expression has type \"float\", variable has type \"int\")  [assignment]",
       "supertable/quality/checker.py:808: error: Argument 1 to \"abs\" has incompatible type \"Literal['n', 'N', 'F'] | int\"; expected \"SupportsAbs[int]\"  [arg-type]"
     ],
-    "supertable/quality/execution.py": [
-      "supertable/quality/execution.py:114: error: Incompatible types in assignment (expression has type \"Any | None\", variable has type \"DataReader\")  [assignment]"
-    ],
     "supertable/quality/scheduler.py": [
-      "supertable/quality/scheduler.py:2090: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/quality/scheduler.py:3059: error: Name \"base_updates\" already defined on line 2911  [no-redef]",
-      "supertable/quality/scheduler.py:3307: error: Name \"base_updates\" already defined on line 3165  [no-redef]",
-      "supertable/quality/scheduler.py:987: error: Too many arguments for \"_process_table_job\"  [call-arg]"
+      "supertable/quality/scheduler.py:1213: error: Too many arguments for \"_process_table_job\"  [call-arg]",
+      "supertable/quality/scheduler.py:2744: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/quality/scheduler.py:3858: error: Name \"base_updates\" already defined on line 3675  [no-redef]",
+      "supertable/quality/scheduler.py:4162: error: Name \"base_updates\" already defined on line 3989  [no-redef]"
     ],
     "supertable/rbac/access_control.py": [
       "supertable/rbac/access_control.py:182: error: Incompatible return value type (got \"dict[Any, Any] | None\", expected \"dict[Any, Any]\")  [return-value]",
-      "supertable/rbac/access_control.py:410: error: Incompatible types in assignment (expression has type \"RoleAccessContext | None\", variable has type \"RoleAccessContext\")  [assignment]",
-      "supertable/rbac/access_control.py:505: error: Incompatible types in assignment (expression has type \"dict[Any, Any] | None\", variable has type \"dict[Any, Any]\")  [assignment]"
+      "supertable/rbac/access_control.py:413: error: Incompatible types in assignment (expression has type \"RoleAccessContext | None\", variable has type \"RoleAccessContext\")  [assignment]",
+      "supertable/rbac/access_control.py:508: error: Incompatible types in assignment (expression has type \"dict[Any, Any] | None\", variable has type \"dict[Any, Any]\")  [assignment]"
     ],
     "supertable/rbac/role_manager.py": [
       "supertable/rbac/role_manager.py:161: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
@@ -485,23 +474,23 @@
       "supertable/rbac/user_manager.py:234: error: Incompatible return value type (got \"str | None\", expected \"str\")  [return-value]"
     ],
     "supertable/recovery/redis_rebuild.py": [
-      "supertable/recovery/redis_rebuild.py:377: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[Any]\"  [arg-type]"
+      "supertable/recovery/redis_rebuild.py:386: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[Any]\"  [arg-type]"
     ],
     "supertable/redis_catalog.py": [
       "supertable/redis_catalog.py:21: error: Name \"RedisConnector\" already defined (possibly by an import)  [no-redef]",
       "supertable/redis_catalog.py:21: error: Name \"RedisOptions\" already defined (possibly by an import)  [no-redef]",
-      "supertable/redis_catalog.py:5310: error: Unsupported right operand type for in (\"object\")  [operator]",
-      "supertable/redis_catalog.py:5768: error: Incompatible types in assignment (expression has type \"dict[str, Any] | None\", variable has type \"dict[str, Any]\")  [assignment]",
-      "supertable/redis_catalog.py:624: error: Argument \"role\" to \"RowColumnSecurity\" has incompatible type \"str | Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/redis_catalog.py:7615: error: Assignment to variable \"error\" outside except: block  [misc]",
-      "supertable/redis_catalog.py:7624: error: Trying to read deleted variable \"error\"  [misc]",
-      "supertable/redis_catalog.py:7625: error: Trying to read deleted variable \"error\"  [misc]",
-      "supertable/redis_catalog.py:7664: error: Assignment to variable \"error\" outside except: block  [misc]",
-      "supertable/redis_catalog.py:7679: error: Trying to read deleted variable \"error\"  [misc]",
-      "supertable/redis_catalog.py:7680: error: Trying to read deleted variable \"error\"  [misc]",
-      "supertable/redis_catalog.py:7753: error: Assignment to variable \"error\" outside except: block  [misc]",
-      "supertable/redis_catalog.py:7771: error: Trying to read deleted variable \"error\"  [misc]",
-      "supertable/redis_catalog.py:7772: error: Trying to read deleted variable \"error\"  [misc]"
+      "supertable/redis_catalog.py:6873: error: Unsupported right operand type for in (\"object\")  [operator]",
+      "supertable/redis_catalog.py:7331: error: Incompatible types in assignment (expression has type \"dict[str, Any] | None\", variable has type \"dict[str, Any]\")  [assignment]",
+      "supertable/redis_catalog.py:827: error: Argument \"role\" to \"RowColumnSecurity\" has incompatible type \"str | Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/redis_catalog.py:9178: error: Assignment to variable \"error\" outside except: block  [misc]",
+      "supertable/redis_catalog.py:9187: error: Trying to read deleted variable \"error\"  [misc]",
+      "supertable/redis_catalog.py:9188: error: Trying to read deleted variable \"error\"  [misc]",
+      "supertable/redis_catalog.py:9227: error: Assignment to variable \"error\" outside except: block  [misc]",
+      "supertable/redis_catalog.py:9242: error: Trying to read deleted variable \"error\"  [misc]",
+      "supertable/redis_catalog.py:9243: error: Trying to read deleted variable \"error\"  [misc]",
+      "supertable/redis_catalog.py:9316: error: Assignment to variable \"error\" outside except: block  [misc]",
+      "supertable/redis_catalog.py:9334: error: Trying to read deleted variable \"error\"  [misc]",
+      "supertable/redis_catalog.py:9335: error: Trying to read deleted variable \"error\"  [misc]"
     ],
     "supertable/redis_connector.py": [
       "supertable/redis_connector.py:410: error: Dict entry 0 has incompatible type \"str\": \"str\"; expected \"str\": \"bool\"  [dict-item]",
@@ -511,62 +500,52 @@
       "supertable/redis_infra.py:303: error: Unused \"type: ignore\" comment  [unused-ignore]"
     ],
     "supertable/simple_table.py": [
-      "supertable/simple_table.py:566: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
-      "supertable/simple_table.py:573: error: Need type annotation for \"dead_rowids_by_file\" (hint: \"dead_rowids_by_file: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/simple_table.py:650: error: Incompatible types in assignment (expression has type \"list[dict[str, Any]]\", variable has type \"dict[str, str]\")  [assignment]"
+      "supertable/simple_table.py:571: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
+      "supertable/simple_table.py:578: error: Need type annotation for \"dead_rowids_by_file\" (hint: \"dead_rowids_by_file: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/simple_table.py:655: error: Incompatible types in assignment (expression has type \"list[dict[str, Any]]\", variable has type \"dict[str, str]\")  [assignment]"
     ],
     "supertable/staging_area.py": [
-      "supertable/staging_area.py:142: error: Incompatible types in assignment (expression has type \"None\", variable has type \"str\")  [assignment]",
-      "supertable/staging_area.py:143: error: Incompatible types in assignment (expression has type \"None\", variable has type \"str\")  [assignment]",
-      "supertable/staging_area.py:207: error: Need type annotation for \"data\"  [var-annotated]",
-      "supertable/staging_area.py:208: error: List comprehension has incompatible type List[Any | None]; expected List[str]  [misc]",
-      "supertable/staging_area.py:254: error: Argument 3 to \"acquire_stage_lock\" of \"RedisCatalog\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/staging_area.py:267: error: Argument 3 to \"release_stage_lock\" of \"RedisCatalog\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/staging_area.py:299: error: Argument 2 to \"write_json\" of \"StorageInterface\" has incompatible type \"list[Never]\"; expected \"dict[str, Any]\"  [arg-type]",
-      "supertable/staging_area.py:322: error: Need type annotation for \"current_index\"  [var-annotated]",
-      "supertable/staging_area.py:323: error: Item \"dict[str, Any]\" of \"dict[str, Any] | list[Any]\" has no attribute \"append\"  [union-attr]",
-      "supertable/staging_area.py:329: error: Argument 2 to \"write_json\" of \"StorageInterface\" has incompatible type \"dict[str, Any] | list[Any]\"; expected \"dict[str, Any]\"  [arg-type]",
-      "supertable/staging_area.py:358: error: Need type annotation for \"data\"  [var-annotated]",
-      "supertable/staging_area.py:359: error: List comprehension has incompatible type List[Any | None]; expected List[str]  [misc]"
+      "supertable/staging_area.py:149: error: Incompatible types in assignment (expression has type \"None\", variable has type \"str\")  [assignment]",
+      "supertable/staging_area.py:150: error: Incompatible types in assignment (expression has type \"None\", variable has type \"str\")  [assignment]"
     ],
     "supertable/storage/azure_storage.py": [
-      "supertable/storage/azure_storage.py:485: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
+      "supertable/storage/azure_storage.py:486: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/local_storage.py": [
-      "supertable/storage/local_storage.py:357: error: Need type annotation for \"directory_structure\" (hint: \"directory_structure: dict[<type>, <type>] = ...\")  [var-annotated]"
+      "supertable/storage/local_storage.py:481: error: Need type annotation for \"directory_structure\" (hint: \"directory_structure: dict[<type>, <type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/minio_storage.py": [
-      "supertable/storage/minio_storage.py:462: error: Need type annotation for \"prior_errors\" (hint: \"prior_errors: list[<type>] = ...\")  [var-annotated]"
+      "supertable/storage/minio_storage.py:463: error: Need type annotation for \"prior_errors\" (hint: \"prior_errors: list[<type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/storage_factory.py": [
       "supertable/storage/storage_factory.py:26: error: Module has no attribute \"util\"  [attr-defined]"
     ],
     "supertable/super_pipe.py": [
-      "supertable/super_pipe.py:59: error: Incompatible default for parameter \"overwrite_columns\" (default has type \"None\", parameter has type \"list[str]\")  [assignment]"
+      "supertable/super_pipe.py:168: error: Incompatible default for parameter \"overwrite_columns\" (default has type \"None\", parameter has type \"list[str]\")  [assignment]"
     ],
     "supertable/utils/snapshot.py": [
-      "supertable/utils/snapshot.py:77: error: Unsupported operand types for < (\"int\" and \"None\")  [operator]"
+      "supertable/utils/snapshot.py:156: error: Unsupported operand types for < (\"int\" and \"None\")  [operator]"
     ],
     "supertable/utils/sql_parser.py": [
-      "supertable/utils/sql_parser.py:1008: error: \"object\" has no attribute \"sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:1017: error: \"object\" has no attribute \"sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:1026: error: \"object\" has no attribute \"sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:1136: error: \"object\" has no attribute \"sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:1148: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:1251: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:165: error: \"object\" has no attribute \"strip\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:514: error: \"object\" has no attribute \"selected_sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:639: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:641: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:643: error: \"object\" has no attribute \"selected_sources\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:666: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:701: error: \"object\" has no attribute \"expression\"  [attr-defined]",
-      "supertable/utils/sql_parser.py:93: error: Unsupported operand type for unary - (\"object\")  [operator]",
-      "supertable/utils/sql_parser.py:965: error: Value of type \"tuple[str, object] | None\" is not indexable  [index]",
-      "supertable/utils/sql_parser.py:973: error: Value of type \"tuple[str, object] | None\" is not indexable  [index]",
-      "supertable/utils/sql_parser.py:974: error: Value of type variable \"SupportsRichComparisonT\" of \"max\" cannot be \"object | Any\"  [type-var]",
-      "supertable/utils/sql_parser.py:974: error: Value of type variable \"SupportsRichComparisonT\" of \"min\" cannot be \"object | Any\"  [type-var]",
-      "supertable/utils/sql_parser.py:998: error: \"object\" has no attribute \"expression\"  [attr-defined]"
+      "supertable/utils/sql_parser.py:1035: error: \"object\" has no attribute \"selected_sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1198: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1200: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1202: error: \"object\" has no attribute \"selected_sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1226: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1264: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1739: error: Value of type \"tuple[str, object] | None\" is not indexable  [index]",
+      "supertable/utils/sql_parser.py:1747: error: Value of type \"tuple[str, object] | None\" is not indexable  [index]",
+      "supertable/utils/sql_parser.py:1748: error: Value of type variable \"SupportsRichComparisonT\" of \"max\" cannot be \"object | Any\"  [type-var]",
+      "supertable/utils/sql_parser.py:1748: error: Value of type variable \"SupportsRichComparisonT\" of \"min\" cannot be \"object | Any\"  [type-var]",
+      "supertable/utils/sql_parser.py:1772: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1782: error: \"object\" has no attribute \"sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1791: error: \"object\" has no attribute \"sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1800: error: \"object\" has no attribute \"sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1910: error: \"object\" has no attribute \"sources\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:1922: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:2025: error: \"object\" has no attribute \"expression\"  [attr-defined]",
+      "supertable/utils/sql_parser.py:595: error: Unsupported operand type for unary - (\"object\")  [operator]",
+      "supertable/utils/sql_parser.py:667: error: \"object\" has no attribute \"strip\"  [attr-defined]"
     ],
     "supertable/utils/timer.py": [
       "supertable/utils/timer.py:38: error: Incompatible default for parameter \"show_timing\" (default has type \"None\", parameter has type \"bool\")  [assignment]",
@@ -598,22 +577,12 @@
     "supertable/redis_infra.py": [
       "supertable/redis_infra.py:303:from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore",
       "supertable/redis_infra.py:306:from redis_catalog import RedisCatalog as _RC  # type: ignore"
-    ],
-    "supertable/staging_area.py": [
-      "supertable/staging_area.py:127:self.staging_name, label=\"staging_name\",  # type: ignore[arg-type]",
-      "supertable/staging_area.py:280:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:292:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:338:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:399:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:406:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:443:self.staging_name,  # type: ignore[arg-type]",
-      "supertable/staging_area.py:456:self.staging_name,  # type: ignore[arg-type]"
     ]
   },
-  "known_error_count": 443,
-  "known_suppression_count": 20,
+  "known_error_count": 424,
+  "known_suppression_count": 12,
   "mypy_version": "2.3.0",
-  "production_file_count": 150,
+  "production_file_count": 151,
   "schema": 1,
   "target": "supertable"
 }

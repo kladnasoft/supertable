@@ -4,14 +4,12 @@ Comprehensive test suite for supertable/meta_reader.py
 Covers:
   1. _super_meta_cache_ttl_s — env var parsing
   2. _prune_dict — key removal
-  3. _get_redis_items — Redis SCAN loop, bytes/str keys, exceptions
-  4. _try_parse_leaf_meta — None, bytes, str, empty, invalid JSON, valid JSON
-  5. _leaf_to_snapshot_like — all nesting paths (direct, payload, payload.snapshot,
-     data, snapshot), non-dict input
-  6. _schema_to_dict — dict, list [{name,type}], list [single-key], non-list/dict
-  7. MetaReader.__init__ — wiring
-  8. MetaReader._get_all_tables — scan loop, dedup, bytes keys, exception
-  9. MetaReader.get_tables — RBAC filtering
+  3. _get_redis_items — Redis SCAN loop, bytes/str keys, strict failures
+  4. _try_parse_leaf_meta — strict absent/bytes/str/JSON handling
+  5. _schema_to_dict — dict, list [{name,type}], list [single-key], non-list/dict
+  6. MetaReader.__init__ — wiring
+  7. MetaReader._get_all_tables — scan loop, dedup, strict failures
+  8. MetaReader.get_tables — RBAC filtering and strict backend failures
  10. MetaReader.get_table_schema — single table (Redis hit, fallback),
      super-level aggregation, RBAC denial
  11. MetaReader.collect_simple_table_schema — RBAC, FileNotFoundError, happy path
@@ -107,24 +105,38 @@ def _scan_two_batches(batch1: list, batch2: list):
 
 
 def _wire_catalog_scan(catalog, *keys, raise_exc: Exception | None = None):
-    """Wire up ``catalog.scan_leaf_keys`` (the new entry point used by
-    MetaReader) to return the supplied keys, or raise ``raise_exc``.
+    """Wire up lifecycle-pinned ``catalog.scan_leaf_items`` for MetaReader.
 
-    MetaReader iterates this generator-like result in ``_get_all_tables``,
-    so we set both ``side_effect`` (for exceptions) and ``return_value``.
+    Most call sites retain readable full-key fixtures; translate those to the
+    validated item shape returned by RedisCatalog. Non-key objects pass through
+    so corruption tests can exercise the MetaReader boundary directly.
     """
+    def to_item(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if isinstance(value, str) and "meta:leaf:doc:" in value:
+            return {"simple": value.rsplit("meta:leaf:doc:", 1)[-1]}
+        return value
+
     if raise_exc is not None:
-        catalog.scan_leaf_keys.side_effect = raise_exc
+        catalog.scan_leaf_items.side_effect = raise_exc
         return
-    catalog.scan_leaf_keys.side_effect = None
-    catalog.scan_leaf_keys.return_value = iter(list(keys))
+    catalog.scan_leaf_items.side_effect = None
+    catalog.scan_leaf_items.return_value = iter([to_item(key) for key in keys])
 
 
 def _wire_catalog_scan_factory(catalog, key_provider):
-    """Have ``scan_leaf_keys`` invoke ``key_provider()`` each call (used
+    """Have ``scan_leaf_items`` invoke ``key_provider()`` each call (used
     by tests that need fresh iterators across multiple ``_get_all_tables``
     invocations)."""
-    catalog.scan_leaf_keys.side_effect = lambda *a, **kw: iter(list(key_provider()))
+    catalog.scan_leaf_items.side_effect = lambda *a, **kw: iter(
+        {
+            "simple": (
+                key.decode("utf-8") if isinstance(key, bytes) else key
+            ).rsplit("meta:leaf:doc:", 1)[-1]
+        }
+        for key in key_provider()
+    )
 
 
 def _snap(schema=None, resources=None, last_updated_ms=0):
@@ -133,6 +145,32 @@ def _snap(schema=None, resources=None, last_updated_ms=0):
         "schema": schema or {},
         "resources": resources or [],
         "last_updated_ms": last_updated_ms,
+    }
+
+
+def _complete_leaf(
+    resources,
+    *,
+    schema=None,
+    tombstone_rows=0,
+    last_updated_ms=0,
+):
+    """Build a Redis leaf whose payload is safe for the metadata fast path."""
+    has_tombstone = tombstone_rows > 0
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": schema or {},
+        "resources": resources,
+        "last_updated_ms": last_updated_ms,
+        "tombstone": "dv.parquet" if has_tombstone else None,
+        "tombstone_rows": tombstone_rows,
+        "tombstone_digest": "0" * 64 if has_tombstone else None,
+        "_row_filter": None,
+    }
+    return {
+        "version": 1,
+        "path": "snapshots/v1.json",
+        "payload": snapshot,
     }
 
 
@@ -259,13 +297,24 @@ class TestGetRedisItems:
         assert len(result) == 2
 
     @patch(_P_REDIS_CAT)
-    def test_redis_exception_returns_empty(self, MockCat):
+    def test_redis_exception_propagates(self, MockCat):
         from supertable.meta_reader import _get_redis_items
         mock_cat = MagicMock()
         mock_cat.r.scan.side_effect = ConnectionError("down")
         MockCat.return_value = mock_cat
 
-        assert _get_redis_items("pattern") == []
+        with pytest.raises(ConnectionError, match="down"):
+            _get_redis_items("pattern")
+
+    @patch(_P_REDIS_CAT)
+    def test_invalid_key_type_is_corruption(self, MockCat):
+        from supertable.meta_reader import _get_redis_items
+        mock_cat = MagicMock()
+        mock_cat.r.scan.return_value = (0, [123])
+        MockCat.return_value = mock_cat
+
+        with pytest.raises(RuntimeError, match="invalid key type"):
+            _get_redis_items("pattern")
 
     @patch(_P_REDIS_CAT)
     def test_empty_scan(self, MockCat):
@@ -304,20 +353,33 @@ class TestTryParseLeafMeta:
 
     def test_empty_string(self):
         from supertable.meta_reader import _try_parse_leaf_meta
-        assert _try_parse_leaf_meta("") is None
+        with pytest.raises(RuntimeError, match="empty"):
+            _try_parse_leaf_meta("")
 
     def test_whitespace_only(self):
         from supertable.meta_reader import _try_parse_leaf_meta
-        assert _try_parse_leaf_meta("   ") is None
+        with pytest.raises(RuntimeError, match="empty"):
+            _try_parse_leaf_meta("   ")
 
     def test_invalid_json(self):
         from supertable.meta_reader import _try_parse_leaf_meta
-        assert _try_parse_leaf_meta("{not json}") is None
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            _try_parse_leaf_meta("{not json}")
 
     def test_non_string_non_bytes(self):
         from supertable.meta_reader import _try_parse_leaf_meta
-        # int gets str()-converted → "123" → valid JSON number → returns 123
-        assert _try_parse_leaf_meta(123) == 123
+        with pytest.raises(RuntimeError, match="invalid type"):
+            _try_parse_leaf_meta(123)
+
+    def test_json_scalar_is_corruption(self):
+        from supertable.meta_reader import _try_parse_leaf_meta
+        with pytest.raises(RuntimeError, match="not a JSON object"):
+            _try_parse_leaf_meta("123")
+
+    def test_invalid_utf8_is_corruption(self):
+        from supertable.meta_reader import _try_parse_leaf_meta
+        with pytest.raises(UnicodeDecodeError):
+            _try_parse_leaf_meta(b"\xff")
 
     def test_bytes_with_whitespace(self):
         from supertable.meta_reader import _try_parse_leaf_meta
@@ -326,69 +388,7 @@ class TestTryParseLeafMeta:
 
 
 # ===========================================================================
-# 5. _leaf_to_snapshot_like
-# ===========================================================================
-
-class TestLeafToSnapshotLike:
-
-    def test_non_dict_returns_none(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        assert _leaf_to_snapshot_like("string") is None
-        assert _leaf_to_snapshot_like(42) is None
-        assert _leaf_to_snapshot_like(None) is None
-
-    def test_direct_resources_key(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        meta = {"resources": [{"file": "f1"}]}
-        assert _leaf_to_snapshot_like(meta) is meta
-
-    def test_payload_with_resources(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        payload = {"resources": [{"file": "f1"}]}
-        meta = {"payload": payload}
-        assert _leaf_to_snapshot_like(meta) is payload
-
-    def test_payload_snapshot_with_resources(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        snap = {"resources": [{"file": "f1"}]}
-        meta = {"payload": {"snapshot": snap}}
-        assert _leaf_to_snapshot_like(meta) is snap
-
-    def test_data_with_resources(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        data = {"resources": [{"file": "f1"}]}
-        meta = {"data": data}
-        assert _leaf_to_snapshot_like(meta) is data
-
-    def test_snapshot_with_resources(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        snap = {"resources": [{"file": "f1"}]}
-        meta = {"snapshot": snap}
-        assert _leaf_to_snapshot_like(meta) is snap
-
-    def test_no_resources_returns_none(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        assert _leaf_to_snapshot_like({"other": "stuff"}) is None
-
-    def test_resources_not_list_returns_none(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        assert _leaf_to_snapshot_like({"resources": "not_a_list"}) is None
-
-    def test_empty_resources_list(self):
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        meta = {"resources": []}
-        assert _leaf_to_snapshot_like(meta) is meta
-
-    def test_priority_direct_over_payload(self):
-        """Direct resources takes priority over payload.resources."""
-        from supertable.meta_reader import _leaf_to_snapshot_like
-        meta = {"resources": [{"file": "direct"}], "payload": {"resources": [{"file": "nested"}]}}
-        result = _leaf_to_snapshot_like(meta)
-        assert result is meta
-
-
-# ===========================================================================
-# 6. _schema_to_dict
+# 5. _schema_to_dict
 # ===========================================================================
 
 class TestSchemaToDict:
@@ -507,8 +507,8 @@ class TestGetAllTables:
         assert reader._get_all_tables() == ["events"]
 
     def test_multi_batch_scan(self):
-        # The catalog now exposes a single iterator (scan_leaf_keys) — the
-        # multi-batch detail is encapsulated. We just supply both keys.
+        # The catalog exposes one pinned item iterator; page boundaries are
+        # encapsulated. We just supply both leaves.
         reader = _make_reader()
         _wire_catalog_scan(
             reader.catalog,
@@ -518,25 +518,54 @@ class TestGetAllTables:
         result = reader._get_all_tables()
         assert set(result) == {"t1", "t2"}
 
-    def test_redis_exception_returns_empty(self):
+    def test_catalog_exception_propagates(self):
         reader = _make_reader()
         _wire_catalog_scan(reader.catalog, raise_exc=ConnectionError("down"))
-        assert reader._get_all_tables() == []
+        with pytest.raises(ConnectionError, match="down"):
+            reader._get_all_tables()
 
     def test_empty_scan(self):
         reader = _make_reader()
         _wire_catalog_scan(reader.catalog)  # no keys
         assert reader._get_all_tables() == []
 
-    def test_empty_table_name_skipped(self):
+    def test_empty_table_name_is_corruption(self):
         reader = _make_reader()
-        # Key ending with ":" produces empty table name
         _wire_catalog_scan(
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:",
-            "supertable:org:lakes:sup:meta:leaf:doc:valid",
         )
-        assert reader._get_all_tables() == ["valid"]
+        with pytest.raises(RuntimeError, match="invalid table name"):
+            reader._get_all_tables()
+
+    @pytest.mark.parametrize(
+        "bad_item",
+        [
+            123,
+            None,
+            {},
+            {"simple": ""},
+            {"simple": 123},
+        ],
+    )
+    def test_corrupt_scan_item_propagates(self, bad_item):
+        reader = _make_reader()
+        reader.catalog.scan_leaf_items.return_value = iter([bad_item])
+        with pytest.raises(RuntimeError, match="invalid"):
+            reader._get_all_tables()
+
+    def test_table_deletion_state_propagates(self):
+        reader = _make_reader()
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        reader.catalog.check_deletion_intent_absent.side_effect = RuntimeError(
+            "durable deletion intent",
+        )
+
+        with pytest.raises(RuntimeError, match="deletion intent"):
+            reader._get_all_tables()
 
 
 # ===========================================================================
@@ -593,6 +622,18 @@ class TestGetTables:
         assert reader.get_tables("admin") == []
         mock_check.assert_not_called()
 
+    @patch(_P_CHECK_META)
+    def test_authorization_backend_failure_propagates(self, mock_check):
+        reader = _make_reader()
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+        )
+        mock_check.side_effect = TimeoutError("RBAC unavailable")
+
+        with pytest.raises(TimeoutError, match="RBAC unavailable"):
+            reader.get_tables("viewer")
+
 
 # ===========================================================================
 # 10. MetaReader.get_table_schema
@@ -612,10 +653,13 @@ class TestGetTableSchema:
     def test_single_table_redis_hit(self, mock_check, MockST):
         """Schema read from Redis leaf — no SimpleTable fallback."""
         reader = _make_reader()
-        leaf_data = json.dumps({
-            "resources": [{"file": "f1"}],
-            "schema": [{"name": "id", "type": "int"}, {"name": "val", "type": "str"}],
-        })
+        leaf_data = json.dumps(_complete_leaf(
+            [{"file": "f1"}],
+            schema=[
+                {"name": "id", "type": "int"},
+                {"name": "val", "type": "str"},
+            ],
+        ))
         reader.catalog.r.get.return_value = leaf_data.encode()
 
         result = reader.get_table_schema("events", "admin")
@@ -657,15 +701,19 @@ class TestGetTableSchema:
     def test_super_level_aggregates_schemas(self, mock_check, MockST):
         """table_name == super_name → aggregate schemas across all tables."""
         reader = _make_reader("sup", "org")
-        # _get_all_tables now goes through catalog.scan_leaf_keys
+        # _get_all_tables now goes through catalog.scan_leaf_items
         _wire_catalog_scan(
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:t1",
             "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
         # mget returns leaf data for both
-        leaf1 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}]})
-        leaf2 = json.dumps({"resources": [], "schema": [{"name": "val", "type": "str"}]})
+        leaf1 = json.dumps(_complete_leaf(
+            [], schema=[{"name": "id", "type": "int"}],
+        ))
+        leaf2 = json.dumps(_complete_leaf(
+            [], schema=[{"name": "val", "type": "str"}],
+        ))
         reader.catalog.r.mget.return_value = [leaf1.encode(), leaf2.encode()]
 
         result = reader.get_table_schema("sup", "admin")
@@ -681,8 +729,16 @@ class TestGetTableSchema:
             "supertable:org:lakes:sup:meta:leaf:doc:t1",
             "supertable:org:lakes:sup:meta:leaf:doc:t2",
         )
-        leaf1 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}]})
-        leaf2 = json.dumps({"resources": [], "schema": [{"name": "id", "type": "int"}, {"name": "x", "type": "str"}]})
+        leaf1 = json.dumps(_complete_leaf(
+            [], schema=[{"name": "id", "type": "int"}],
+        ))
+        leaf2 = json.dumps(_complete_leaf(
+            [],
+            schema=[
+                {"name": "id", "type": "int"},
+                {"name": "x", "type": "str"},
+            ],
+        ))
         reader.catalog.r.mget.return_value = [leaf1.encode(), leaf2.encode()]
 
         result = reader.get_table_schema("sup", "admin")
@@ -690,8 +746,8 @@ class TestGetTableSchema:
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
-    def test_super_level_mget_exception_falls_back_to_snapshot(self, mock_check, MockST):
-        """A metadata-cache outage falls back to the authoritative snapshot."""
+    def test_super_level_mget_exception_propagates(self, mock_check, MockST):
+        """A metadata-cache outage is not misreported as missing metadata."""
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
@@ -699,24 +755,47 @@ class TestGetTableSchema:
         )
         reader.catalog.r.mget.side_effect = ConnectionError("down")
 
-        mock_st_inst = MagicMock()
-        mock_st_inst.get_simple_table_snapshot.return_value = (
-            {"schema": {"col": "float"}, "resources": []},
-            "/p",
-        )
-        MockST.return_value = mock_st_inst
+        with pytest.raises(ConnectionError, match="down"):
+            reader.get_table_schema("sup", "admin")
+        MockST.assert_not_called()
 
-        result = reader.get_table_schema("sup", "admin")
-        assert result == [{"col": "float"}]
-        MockST.assert_called_once()
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_super_level_incomplete_mget_is_corruption(self, mock_check, MockST):
+        reader = _make_reader("sup", "org")
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
+        )
+        reader.catalog.r.mget.return_value = [None]
+
+        with pytest.raises(RuntimeError, match="incomplete"):
+            reader.get_table_schema("sup", "admin")
+        MockST.assert_not_called()
+
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_corrupt_leaf_propagates_without_storage_fallback(
+        self, mock_check, MockST,
+    ):
+        reader = _make_reader()
+        reader.catalog.r.get.return_value = b"{not-json}"
+
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            reader.get_table_schema("events", "admin")
+        MockST.assert_not_called()
 
     @patch(_P_CHECK_META)
     def test_schema_result_is_sorted(self, mock_check):
         reader = _make_reader()
-        leaf_data = json.dumps({
-            "resources": [],
-            "schema": [{"name": "z_col", "type": "str"}, {"name": "a_col", "type": "int"}],
-        })
+        leaf_data = json.dumps(_complete_leaf(
+            [],
+            schema=[
+                {"name": "z_col", "type": "str"},
+                {"name": "a_col", "type": "int"},
+            ],
+        ))
         reader.catalog.r.get.return_value = leaf_data.encode()
 
         result = reader.get_table_schema("events", "admin")
@@ -900,10 +979,10 @@ class TestGetSuperMeta:
             "supertable:org:lakes:sup:meta:leaf:doc:events",
         )
 
-        leaf = json.dumps({
-            "resources": [{"file": "f1", "rows": 100, "file_size": 5000}],
-            "last_updated_ms": 1234,
-        })
+        leaf = json.dumps(_complete_leaf(
+            [{"file": "f1", "rows": 100, "file_size": 5000}],
+            last_updated_ms=1234,
+        ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
         result = reader.get_super_meta("admin")
@@ -949,8 +1028,8 @@ class TestGetSuperMeta:
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_CHECK_META)
-    def test_mget_exception_degrades_gracefully(self, mock_check, mock_ttl):
-        """mget raises → falls back to SimpleTable per table."""
+    def test_mget_exception_propagates(self, mock_check, mock_ttl):
+        """A Redis outage must not be reported as empty/partial metadata."""
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
         _wire_catalog_scan(
@@ -960,12 +1039,42 @@ class TestGetSuperMeta:
         reader.catalog.r.mget.side_effect = ConnectionError("down")
 
         with patch(_P_SIMPLE_TABLE) as MockST:
-            MockST.return_value.get_simple_table_snapshot.return_value = (
-                {"resources": [{"file": "f", "rows": 10, "file_size": 100}], "last_updated_ms": 0},
-                "/p",
-            )
-            result = reader.get_super_meta("admin")
-            assert result["super"]["rows"] == 10
+            with pytest.raises(ConnectionError, match="down"):
+                reader.get_super_meta("admin")
+            MockST.assert_not_called()
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_CHECK_META)
+    def test_incomplete_mget_is_corruption(self, mock_check, mock_ttl):
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
+        )
+        reader.catalog.r.mget.return_value = [None]
+
+        with patch(_P_SIMPLE_TABLE) as MockST:
+            with pytest.raises(RuntimeError, match="incomplete"):
+                reader.get_super_meta("admin")
+            MockST.assert_not_called()
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_CHECK_META)
+    def test_corrupt_leaf_propagates(self, mock_check, mock_ttl):
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+        )
+        reader.catalog.r.mget.return_value = [b"not-json"]
+
+        with patch(_P_SIMPLE_TABLE) as MockST:
+            with pytest.raises(RuntimeError, match="not valid JSON"):
+                reader.get_super_meta("admin")
+            MockST.assert_not_called()
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_CHECK_META)
@@ -979,9 +1088,9 @@ class TestGetSuperMeta:
             "supertable:org:lakes:sup:meta:leaf:doc:good",
         )
         # First leaf → None (will fallback), second → valid
-        reader.catalog.r.mget.return_value = [None, json.dumps({
-            "resources": [{"file": "f", "rows": 5, "file_size": 50}],
-        }).encode()]
+        reader.catalog.r.mget.return_value = [None, json.dumps(_complete_leaf(
+            [{"file": "f", "rows": 5, "file_size": 50}],
+        )).encode()]
 
         with patch(_P_SIMPLE_TABLE) as MockST:
             MockST.return_value.get_simple_table_snapshot.side_effect = FileNotFoundError()
@@ -1024,12 +1133,12 @@ class TestGetSuperMeta:
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:t1",
         )
-        leaf = json.dumps({
-            "resources": [
+        leaf = json.dumps(_complete_leaf(
+            [
                 {"file": "f1", "rows": 100, "file_size": 1000},
                 {"file": "f2", "rows": 200, "file_size": 2000},
             ],
-        })
+        ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
         result = reader.get_super_meta("admin")
@@ -1048,10 +1157,10 @@ class TestGetSuperMeta:
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:events",
         )
-        leaf = json.dumps({
-            "resources": [{"file": "f1", "rows": 100, "file_size": 5000}],
-            "tombstone_rows": 30,
-        })
+        leaf = json.dumps(_complete_leaf(
+            [{"file": "f1", "rows": 100, "file_size": 5000}],
+            tombstone_rows=30,
+        ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
         result = reader.get_super_meta("admin")
@@ -1072,10 +1181,10 @@ class TestGetSuperMeta:
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:events",
         )
-        leaf = json.dumps({
-            "resources": [{"file": "f1", "rows": 20, "file_size": 5000}],
-            "tombstone_rows": 50,
-        })
+        leaf = json.dumps(_complete_leaf(
+            [{"file": "f1", "rows": 20, "file_size": 5000}],
+            tombstone_rows=50,
+        ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
         result = reader.get_super_meta("admin")
@@ -1096,9 +1205,9 @@ class TestGetSuperMeta:
             result1 = reader.get_super_meta("admin")
 
         # Reset to prove it's not called again
-        reader.catalog.scan_leaf_keys.reset_mock()
-        reader.catalog.scan_leaf_keys.side_effect = None
-        reader.catalog.scan_leaf_keys.return_value = iter(["should_not_appear"])
+        reader.catalog.scan_leaf_items.reset_mock()
+        reader.catalog.scan_leaf_items.side_effect = None
+        reader.catalog.scan_leaf_items.return_value = iter([])
 
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
             result2 = reader.get_super_meta("admin")
@@ -1108,7 +1217,7 @@ class TestGetSuperMeta:
         # Aggregate visibility is re-evaluated before serving the cached
         # payload so a role that lost its final visible child cannot retain
         # access until the metadata TTL expires.
-        reader.catalog.scan_leaf_keys.assert_called_once_with(
+        reader.catalog.scan_leaf_items.assert_called_once_with(
             "org", "sup", count=1000,
         )
 
@@ -1133,7 +1242,9 @@ class TestGetSuperMeta:
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:new_table",
         )
-        leaf = json.dumps({"resources": [{"file": "f", "rows": 99, "file_size": 1}]})
+        leaf = json.dumps(_complete_leaf(
+            [{"file": "f", "rows": 99, "file_size": 1}],
+        ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
@@ -1150,8 +1261,11 @@ class TestGetSuperMeta:
 class TestListSupers:
 
     @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
     @patch(f"{_MOD}._get_redis_items")
-    def test_extracts_and_sorts_super_names(self, mock_items, mock_check):
+    def test_extracts_and_sorts_super_names(
+        self, mock_items, MockCat, mock_check,
+    ):
         # list_supers now requires a role_name and applies RBAC filtering.
         # Stub check_meta_access to allow everything so we can verify the
         # parsing/sorting behaviour.
@@ -1163,28 +1277,88 @@ class TestListSupers:
             RK.meta_root("org", "mid"),
         ]
 
-        def items(pattern):
-            if pattern == RK.meta_root_pattern_for_org("org"):
-                return roots
-            super_name = pattern.split(":lakes:", 1)[1].split(":", 1)[0]
-            return [RK.meta_leaf("org", super_name, "visible")]
-
-        mock_items.side_effect = items
+        mock_items.return_value = roots
+        catalog = MagicMock()
+        catalog.get_root.side_effect = lambda _org, sup: {
+            "version": 1,
+            "ts": 1,
+            "simple": sup,
+        }
+        catalog.scan_leaf_items.side_effect = lambda _org, _sup, count: iter(
+            [{"simple": "visible"}],
+        )
+        MockCat.return_value = catalog
         mock_check.return_value = None
         result = list_supers("org", role_name="superadmin")
         assert result == ["alpha", "mid", "zeta"]
         assert mock_items.call_args_list[0].args == (
             RK.meta_root_pattern_for_org("org"),
         )
-        assert mock_items.call_count == 4
+        assert mock_items.call_count == 1
+        assert catalog.get_root.call_count == 3
+        assert catalog.scan_leaf_items.call_count == 3
 
     @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
     @patch(f"{_MOD}._get_redis_items")
-    def test_empty_returns_empty(self, mock_items, mock_check):
+    def test_empty_returns_empty(self, mock_items, MockCat, mock_check):
         from supertable.meta_reader import list_supers
         mock_items.return_value = []
         mock_check.return_value = None
         assert list_supers("org", role_name="superadmin") == []
+        MockCat.return_value.get_root.assert_not_called()
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    @patch(f"{_MOD}._get_redis_items")
+    def test_corrupt_root_document_propagates(
+        self, mock_items, MockCat, mock_check,
+    ):
+        from supertable.meta_reader import list_supers
+        from supertable import redis_keys as RK
+
+        mock_items.return_value = [RK.meta_root("org", "broken")]
+        MockCat.return_value.get_root.side_effect = RuntimeError(
+            "Corrupt Redis root JSON",
+        )
+        with pytest.raises(RuntimeError, match="Corrupt Redis root JSON"):
+            list_supers("org", role_name="admin")
+        mock_check.assert_not_called()
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    @patch(f"{_MOD}._get_redis_items")
+    def test_namespace_deletion_state_propagates(
+        self, mock_items, MockCat, mock_check,
+    ):
+        from supertable.meta_reader import list_supers
+        from supertable import redis_keys as RK
+
+        mock_items.return_value = [RK.meta_root("org", "deleting")]
+        catalog = MockCat.return_value
+        catalog.get_root.return_value = {"version": 1, "ts": 1}
+        catalog.scan_leaf_items.side_effect = RuntimeError(
+            "durable deletion intent",
+        )
+        with pytest.raises(RuntimeError, match="deletion intent"):
+            list_supers("org", role_name="admin")
+        mock_check.assert_not_called()
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    @patch(f"{_MOD}._get_redis_items")
+    def test_malformed_root_scan_key_propagates(
+        self, mock_items, MockCat, mock_check,
+    ):
+        from supertable.meta_reader import list_supers
+
+        mock_items.return_value = [
+            "supertable:org:lakes:sup:meta:root:unexpected",
+        ]
+        with pytest.raises(RuntimeError, match="invalid catalog key"):
+            list_supers("org", role_name="admin")
+        MockCat.return_value.get_root.assert_not_called()
+        mock_check.assert_not_called()
 
 
 # ===========================================================================
@@ -1194,23 +1368,68 @@ class TestListSupers:
 class TestListTables:
 
     @patch(f"{_MOD}.check_meta_access")
-    @patch(f"{_MOD}._get_redis_items")
-    def test_extracts_and_sorts_table_names(self, mock_items, mock_check):
+    @patch(_P_REDIS_CAT)
+    def test_extracts_and_sorts_table_names(self, MockCat, mock_check):
         from supertable.meta_reader import list_tables
-        mock_items.return_value = [
-            "supertable:org:lakes:sup:meta:leaf:doc:users",
-            "supertable:org:lakes:sup:meta:leaf:doc:events",
-            "supertable:org:lakes:sup:meta:leaf:doc:logs",
-        ]
+        MockCat.return_value.scan_leaf_items.return_value = iter([
+            {"simple": "users"},
+            {"simple": "events"},
+            {"simple": "logs"},
+        ])
         mock_check.return_value = None
         result = list_tables("org", "sup", role_name="superadmin")
         assert result == ["events", "logs", "users"]
-        mock_items.assert_called_once_with("supertable:org:lakes:sup:meta:leaf:doc:*")
+        MockCat.return_value.scan_leaf_items.assert_called_once_with(
+            "org", "sup", count=1000,
+        )
 
     @patch(f"{_MOD}.check_meta_access")
-    @patch(f"{_MOD}._get_redis_items")
-    def test_empty_returns_empty(self, mock_items, mock_check):
+    @patch(_P_REDIS_CAT)
+    def test_replica_uses_catalog_resolution(self, MockCat, mock_check):
         from supertable.meta_reader import list_tables
-        mock_items.return_value = []
+
+        # RedisCatalog owns replica resolution and lifecycle pinning. The
+        # module-level API must enumerate through it, never raw-scan target
+        # keys (which are intentionally absent for a replica).
+        MockCat.return_value.scan_leaf_items.return_value = iter([
+            {"simple": "source_table"},
+        ])
+        mock_check.return_value = None
+        assert list_tables("org", "replica", "reader") == ["source_table"]
+        MockCat.return_value.scan_leaf_items.assert_called_once_with(
+            "org", "replica", count=1000,
+        )
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    def test_empty_returns_empty(self, MockCat, mock_check):
+        from supertable.meta_reader import list_tables
+        MockCat.return_value.scan_leaf_items.return_value = iter([])
         mock_check.return_value = None
         assert list_tables("org", "sup", role_name="superadmin") == []
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    def test_leaf_corruption_propagates(self, MockCat, mock_check):
+        from supertable.meta_reader import list_tables
+
+        MockCat.return_value.scan_leaf_items.side_effect = RuntimeError(
+            "Malformed catalog leaf",
+        )
+        with pytest.raises(RuntimeError, match="Malformed catalog leaf"):
+            list_tables("org", "sup", role_name="admin")
+        mock_check.assert_not_called()
+
+    @patch(f"{_MOD}.check_meta_access")
+    @patch(_P_REDIS_CAT)
+    def test_leaf_deletion_state_propagates(self, MockCat, mock_check):
+        from supertable.meta_reader import list_tables
+
+        catalog = MockCat.return_value
+        catalog.scan_leaf_items.return_value = iter([{"simple": "gone"}])
+        catalog.check_deletion_intent_absent.side_effect = RuntimeError(
+            "durable deletion intent",
+        )
+        with pytest.raises(RuntimeError, match="deletion intent"):
+            list_tables("org", "sup", role_name="admin")
+        mock_check.assert_not_called()

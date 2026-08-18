@@ -109,6 +109,7 @@ def test_disabled_post_ingest_skips(hermetic_fakeredis):
     """``post_ingest: False`` in the schedule means no pending flag is set."""
     fake = hermetic_fakeredis
     table = "sales"
+    SuperTable(SUPER, ORG)
     DQConfig(fake, ORG, SUPER).set_schedule({"post_ingest": False, "enabled": True})
     notify_ingest(fake, ORG, SUPER, table)
     assert fake.get(_pending_key(ORG, SUPER, table)) is None
@@ -118,6 +119,7 @@ def test_disabled_quality_skips(hermetic_fakeredis):
     """Quality fully disabled (``enabled: False``) means no pending flag."""
     fake = hermetic_fakeredis
     table = "sales"
+    SuperTable(SUPER, ORG)
     DQConfig(fake, ORG, SUPER).set_schedule({"post_ingest": True, "enabled": False})
     notify_ingest(fake, ORG, SUPER, table)
     assert fake.get(_pending_key(ORG, SUPER, table)) is None

@@ -318,6 +318,7 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
             "path": "a/_snapshot.json",
             "payload": {
                 "snapshot_version": 3,
+                "_row_filter": None,
                 "schema": {"k": "BIGINT"},
                 "stats_file": "a/_stats.parquet",
                 "resources": [
@@ -335,6 +336,7 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
             "path": "b/_snapshot.json",
             "payload": {
                 "snapshot_version": 3,
+                "_row_filter": None,
                 "schema": {"k": "BIGINT"},
                 "stats_file": "b/_stats.parquet",
                 "resources": [

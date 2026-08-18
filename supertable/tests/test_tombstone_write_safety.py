@@ -660,8 +660,11 @@ def test_writer_rejects_casefolded_reserved_columns(column):
 
 def test_snapshot_rowid_reservation_honors_durable_floor():
     class Catalog:
-        def reserve_rowids_at_least(self, org, sup, simple, count, floor):
+        def reserve_rowids_at_least(
+                self, org, sup, simple, count, floor, *, lock_token,
+        ):
             assert (org, sup, simple, count, floor) == ("o", "s", "t", 2, 10)
+            assert lock_token == "token"
             return 11, 12
 
     writer = DataWriter.__new__(DataWriter)
@@ -672,7 +675,28 @@ def test_snapshot_rowid_reservation_honors_durable_floor():
         simple_name="t",
         count=2,
         profiler=Profiler(),
+        lock_token="token",
     ) == (11, 12)
+
+
+@pytest.mark.parametrize("invalid_floor", [True, 10.5, "10"])
+def test_snapshot_rowid_reservation_rejects_noninteger_floor(invalid_floor):
+    class Catalog:
+        def reserve_rowids_at_least(self, *_args, **_kwargs):
+            pytest.fail("invalid floor reached the catalog allocator")
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="o", super_name="s")
+    writer.catalog = Catalog()
+
+    with pytest.raises(ValueError, match="invalid rowid_high_watermark"):
+        writer._reserve_snapshot_rowids(
+            snapshot={"rowid_high_watermark": invalid_floor},
+            simple_name="t",
+            count=1,
+            profiler=Profiler(),
+            lock_token="token",
+        )
 
 
 def test_legacy_rowid_reservation_without_atomic_floor_is_rejected():
@@ -689,6 +713,7 @@ def test_legacy_rowid_reservation_without_atomic_floor_is_rejected():
             simple_name="t",
             count=2,
             profiler=Profiler(),
+            lock_token="token",
         )
 
 
@@ -706,6 +731,7 @@ def test_legacy_rowid_reservation_is_rejected_even_if_return_is_above_floor():
             simple_name="t",
             count=1,
             profiler=Profiler(),
+            lock_token="token",
         )
 
 
@@ -723,6 +749,7 @@ def test_legacy_delete_only_does_not_scan_to_derive_rowid_floor(monkeypatch):
         simple_name="t",
         count=0,
         profiler=Profiler(),
+        lock_token="token",
     ) == (0, None)
 
 
@@ -741,6 +768,7 @@ def test_legacy_targeted_delete_derives_and_carries_rowid_floor(monkeypatch):
         simple_name="t",
         count=0,
         profiler=Profiler(),
+        lock_token="token",
         require_floor=True,
     ) == (0, 91)
     assert len(calls) == 1

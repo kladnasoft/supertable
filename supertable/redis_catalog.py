@@ -26,10 +26,205 @@ from supertable.utils.spark_security import (
     spark_storage_credential_keys,
     validate_spark_storage_config,
 )
+from supertable.utils.snapshot import snapshot_cache_payload
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+_ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
+_REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
+
+
+def _lua_safe_integer(
+        value: Any, *, field: str, minimum: int = 0,
+) -> int:
+    """Return an integer that Redis Lua can compare without precision loss."""
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise ValueError(
+            f"{field} must be an integer from {minimum} through "
+            f"{_REDIS_LUA_MAX_SAFE_INTEGER}"
+        )
+    return value
+
+
+def _publication_timestamp(now_ms: Optional[int]) -> int:
+    return _lua_safe_integer(
+        _now_ms() if now_ms is None else now_ms,
+        field="publication timestamp",
+    )
+
+
+# Every mutation script that consumes ``meta:root`` prepends this helper.  A
+# Python authorization preflight is not a write fence: root flags can change
+# before the final Redis publication.  ``root_document_state`` therefore
+# validates the full persisted lifecycle contract and returns 0 for a valid
+# but non-writable root at the same atomic boundary as the mutation.
+_LUA_ROOT_DOCUMENT_GUARD = r"""
+local ROOT_MAX_SAFE_INTEGER = 9007199254740991
+
+local function root_safe_segment(value)
+  if type(value) ~= 'string'
+      or string.len(value) < 1
+      or string.len(value) > 64 then return false end
+  if string.match(value, '^[a-z0-9][a-z0-9_-]*$') then return true end
+  if string.match(value, '^__[a-z0-9][a-z0-9_-]*__$') then return true end
+  return false
+end
+
+local function root_valid_string_array(value)
+  if value == cjson.null then return true end
+  if type(value) ~= 'table' then return false end
+  local encoded_ok, encoded = pcall(cjson.encode, value)
+  if not encoded_ok or string.sub(encoded, 1, 1) ~= '[' then return false end
+  local count = 0
+  local seen = {}
+  for key, item in pairs(value) do
+    if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+        or not root_safe_segment(item) or seen[item] then return false end
+    seen[item] = true
+    count = count + 1
+  end
+  for index = 1, count do
+    if value[index] == nil then return false end
+  end
+  return true
+end
+
+local function root_document_state(root, target_super)
+  if type(root) ~= 'table'
+      or type(root['version']) ~= 'number'
+      or root['version'] < 0
+      or root['version'] > ROOT_MAX_SAFE_INTEGER
+      or root['version'] ~= math.floor(root['version'])
+      or type(root['ts']) ~= 'number'
+      or root['ts'] < 0
+      or root['ts'] > ROOT_MAX_SAFE_INTEGER
+      or root['ts'] ~= math.floor(root['ts']) then return -1 end
+  if root['read_only'] ~= nil
+      and type(root['read_only']) ~= 'boolean' then return -1 end
+  local clone_type = root['clone_type']
+  if clone_type ~= nil and clone_type ~= cjson.null
+      and clone_type ~= 'readonly' and clone_type ~= 'replica' then return -1 end
+  local source = root['cloned_from']
+  if source ~= nil and source ~= cjson.null then
+    if not root_safe_segment(source)
+        or (target_super ~= nil and target_super ~= ''
+            and source == target_super) then return -1 end
+  end
+  local clone_ts = root['clone_ts']
+  if clone_ts ~= nil and clone_ts ~= cjson.null
+      and (type(clone_ts) ~= 'number' or clone_ts < 0
+          or clone_ts > ROOT_MAX_SAFE_INTEGER
+          or clone_ts ~= math.floor(clone_ts)) then return -1 end
+  if root['replica_tables'] ~= nil
+      and not root_valid_string_array(root['replica_tables']) then return -1 end
+  local commit_id = root['commit_id']
+  if commit_id ~= nil and commit_id ~= cjson.null
+      and (type(commit_id) ~= 'string' or string.len(commit_id) < 1) then
+    return -1
+  end
+  if (clone_type ~= nil and clone_type ~= cjson.null)
+      or (source ~= nil and source ~= cjson.null) then
+    if root['read_only'] ~= true
+        or source == nil or source == cjson.null then return -1 end
+  end
+  if root['read_only'] == true
+      or (clone_type ~= nil and clone_type ~= cjson.null)
+      or (source ~= nil and source ~= cjson.null) then return 0 end
+  return 1
+end
+"""
+
+
+def _validate_root_document(
+        document: Any, *, org: str, sup: str,
+) -> Dict[str, Any]:
+    """Validate security- and lifecycle-relevant root fields fail closed."""
+    if (
+        not isinstance(document, dict)
+        or type(document.get("version")) is not int
+        or document["version"] < 0
+        or document["version"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or type(document.get("ts")) is not int
+        or document["ts"] < 0
+        or document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise ValueError("invalid root identity fields")
+    if "read_only" in document and type(document["read_only"]) is not bool:
+        raise ValueError("invalid root read_only flag")
+
+    clone_type = document.get("clone_type")
+    if clone_type is not None and clone_type not in _ROOT_CLONE_TYPES:
+        raise ValueError("invalid root clone_type")
+
+    source = document.get("cloned_from")
+    if source is not None:
+        if not isinstance(source, str) or not source or source == sup:
+            raise ValueError("invalid root clone source")
+        try:
+            RK.meta_root(org, source)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid root clone source") from exc
+
+    clone_ts = document.get("clone_ts")
+    if clone_ts is not None and (
+        type(clone_ts) is not int
+        or clone_ts < 0
+        or clone_ts > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise ValueError("invalid root clone timestamp")
+
+    commit_id = document.get("commit_id")
+    if commit_id is not None and (
+        not isinstance(commit_id, str) or not commit_id
+    ):
+        raise ValueError("invalid root commit identity")
+
+    replica_tables = document.get("replica_tables")
+    if replica_tables is not None:
+        if not isinstance(replica_tables, list):
+            raise ValueError("invalid root replica table allowlist")
+        seen: set[str] = set()
+        for table in replica_tables:
+            if not isinstance(table, str) or not table or table in seen:
+                raise ValueError("invalid root replica table allowlist")
+            try:
+                RK.meta_leaf(org, source or sup, table)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid root replica table allowlist") from exc
+            seen.add(table)
+
+    # ``cloned_from`` predates the explicit clone_type marker.  It has always
+    # represented a clone boundary, so legacy roots carrying it must be just as
+    # immutable as newer readonly/replica roots.
+    if clone_type in _ROOT_CLONE_TYPES or source is not None:
+        if document.get("read_only") is not True or source is None:
+            raise ValueError("clone roots must be read-only and source-bound")
+    return document
+
+
+def _validate_leaf_document(document: Any) -> Dict[str, Any]:
+    """Validate the live leaf identity contract without normalizing values."""
+    if not isinstance(document, dict):
+        raise ValueError("leaf is not a JSON object")
+    if (
+        type(document.get("version")) is not int
+        or document["version"] < 0
+        or document["version"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or type(document.get("ts")) is not int
+        or document["ts"] < 0
+        or document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or not isinstance(document.get("path"), str)
+        or not document["path"]
+    ):
+        raise ValueError("leaf has invalid version/ts/path")
+    return document
 
 
 class RbacAuditAttemptError(RuntimeError):
@@ -77,6 +272,10 @@ class RbacIntegrityError(RuntimeError):
 
 class DeletionIntentConflictError(RuntimeError):
     """A durable delete intent fences ordinary creation or mutation."""
+
+
+class ReadOnlyCatalogError(PermissionError):
+    """The atomic catalog boundary observed a non-writable root."""
 
 
 _RBAC_ATTEMPT_IDENTITIES = {
@@ -669,18 +868,32 @@ class RedisCatalog:
     _RBAC_CASCADE_MANIFEST_USER_LIMIT = 10_000
     _RBAC_ATTEMPT_CONDITION_LIMIT = 16
     _RBAC_ATTEMPT_CONDITION_BYTES_LIMIT = 16_384
+    _QUALITY_MODES = ("quick", "deep", "custom")
+    _QUALITY_DYNAMIC_SCAN_COUNT = 256
+    _QUALITY_DYNAMIC_KEY_LIMIT = 100_000
+    _QUALITY_DYNAMIC_SCAN_CALL_LIMIT = 100_000
+    _STAGE_LOCK_SCAN_COUNT = 256
+    _STAGE_LOCK_DRAIN_LIMIT = 10_000
+    _STAGE_LOCK_SCAN_CALL_LIMIT = 100_000
+    _LEAF_LOCK_SCAN_COUNT = 256
+    _LEAF_LOCK_DRAIN_LIMIT = 10_000
+    _LEAF_LOCK_SCAN_CALL_LIMIT = 100_000
 
     # ------------- Lua sources -------------
-    _LUA_LEAF_CAS_SET = """
+    _LUA_LEAF_CAS_SET = _LUA_ROOT_DOCUMENT_GUARD + """
 local key = KEYS[1]
 local namespace_lock = KEYS[2]
 local table_names = KEYS[3]
 local namespace_delete = KEYS[4]
 local simple_delete = KEYS[5]
+local root_key = KEYS[6]
 local new_path = ARGV[1]
 local now_ms = tonumber(ARGV[2])
 local namespace_token = ARGV[3]
 local simple_name = ARGV[4]
+
+if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms) then return -8 end
 
 local namespace_holder = redis.call('GET', namespace_lock)
 if namespace_holder and namespace_holder ~= namespace_token then
@@ -688,6 +901,15 @@ if namespace_holder and namespace_holder ~= namespace_token then
 end
 if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
 if redis.call('EXISTS', simple_delete) == 1 then return -4 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -5 end
+if root_type ~= 'string' then return -6 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -6 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -6 end
+if root_state == 0 then return -7 end
 local cur = redis.call('GET', key)
 if cur then
   return -1
@@ -703,17 +925,21 @@ redis.call('SADD', table_names, simple_name)
 return 0
 """
 
-    _LUA_LEAF_PAYLOAD_CAS_SET = """
+    _LUA_LEAF_PAYLOAD_CAS_SET = _LUA_ROOT_DOCUMENT_GUARD + """
 local key = KEYS[1]
 local namespace_lock = KEYS[2]
 local table_names = KEYS[3]
 local namespace_delete = KEYS[4]
 local simple_delete = KEYS[5]
+local root_key = KEYS[6]
 local payload_json = ARGV[1]
 local new_path = ARGV[2]
 local now_ms = tonumber(ARGV[3])
 local namespace_token = ARGV[4]
 local simple_name = ARGV[5]
+
+if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms) then return -8 end
 
 local namespace_holder = redis.call('GET', namespace_lock)
 if namespace_holder and namespace_holder ~= namespace_token then
@@ -721,6 +947,15 @@ if namespace_holder and namespace_holder ~= namespace_token then
 end
 if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
 if redis.call('EXISTS', simple_delete) == 1 then return -4 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -5 end
+if root_type ~= 'string' then return -6 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -6 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -6 end
+if root_state == 0 then return -7 end
 local cur = redis.call('GET', key)
 if cur then
   return -1
@@ -743,7 +978,38 @@ redis.call('SADD', table_names, simple_name)
 return 0
 """
 
-    _LUA_DELETE_SIMPLE_TABLE = """
+    _LUA_GET_REPLICA_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
+local target_root_key = KEYS[1]
+local target_intent = KEYS[2]
+local source_root_key = KEYS[3]
+local source_intent = KEYS[4]
+local source_leaf_key = KEYS[5]
+local expected_target_raw = ARGV[1]
+local target_super = ARGV[2]
+local source_super = ARGV[3]
+
+if redis.call('GET', target_root_key) ~= expected_target_raw then return {-1} end
+if redis.call('EXISTS', target_intent) == 1 then return {-2} end
+if redis.call('EXISTS', source_intent) == 1 then return {-3} end
+local target_ok, target = pcall(cjson.decode, expected_target_raw)
+if not target_ok or root_document_state(target, target_super) == -1 then
+  return {-4}
+end
+if target['clone_type'] ~= 'replica'
+    or target['cloned_from'] ~= source_super then return {-1} end
+local source_raw = redis.call('GET', source_root_key)
+if not source_raw then return {-5} end
+local source_ok, source = pcall(cjson.decode, source_raw)
+if not source_ok or root_document_state(source, source_super) == -1 then
+  return {-6}
+end
+if source['clone_type'] == 'replica' then return {-6} end
+local leaf_raw = redis.call('GET', source_leaf_key)
+if not leaf_raw then return {0} end
+return {1, leaf_raw}
+"""
+
+    _LUA_DELETE_SIMPLE_TABLE = _LUA_ROOT_DOCUMENT_GUARD + """
 local leaf = KEYS[1]
 local leaf_lock = KEYS[2]
 local table_names = KEYS[3]
@@ -784,23 +1050,39 @@ end
 local names_type = redis.call('TYPE', table_names)
 if type(names_type) == 'table' then names_type = names_type['ok'] end
 if names_type ~= 'none' and names_type ~= 'set' then return -2 end
+local deletion_index_type = redis.call('TYPE', simple_delete_index)
+if type(deletion_index_type) == 'table' then
+  deletion_index_type = deletion_index_type['ok']
+end
+if deletion_index_type ~= 'none' and deletion_index_type ~= 'set' then
+  return -8
+end
 
-local root_raw = redis.call('GET', root)
+-- Recovery can finish after a parent cleanup has already removed the root.
+-- When the root is still present, however, validate and recheck writability at
+-- this exact finalization boundary before mutating it.
 local root_doc = nil
+local root_raw = redis.call('GET', root)
 if root_raw then
-  local ok, decoded = pcall(cjson.decode, root_raw)
-  if not ok or type(decoded) ~= 'table'
-      or type(decoded['version']) ~= 'number' then
-    return -3
-  end
-  root_doc = decoded
+  local root_ok
+  root_ok, root_doc = pcall(cjson.decode, root_raw)
+  if not root_ok then return -3 end
+  local root_state = root_document_state(root_doc, nil)
+  if root_state == -1 then return -3 end
+  if root_state == 0 then return -9 end
 end
 
 local removed = redis.call(
   'DEL', leaf, schema, rowid, table_config, mirror_publication
 )
+-- Remaining keys are the finite mutable quality state owned by this table.
+-- Delivered history and the shared durable history outbox are immutable audit
+-- records, not recreation inputs, and intentionally survive table deletion.
+for index = 13, #KEYS do
+  removed = removed + redis.call('DEL', KEYS[index])
+end
 removed = removed + redis.call('SREM', table_names, simple_name)
-if removed > 0 and root_doc then
+if removed > 0 and root_doc ~= nil then
   root_doc['version'] = root_doc['version'] + 1
   root_doc['ts'] = now_ms
   redis.call('SET', root, cjson.encode(root_doc))
@@ -812,87 +1094,363 @@ redis.call('SADD', simple_delete_index, simple_name)
 return removed + 1
 """
 
+    _LUA_DELETE_SIMPLE_QUALITY_KEYS = """
+local namespace_lock = KEYS[1]
+local leaf_lock = KEYS[2]
+local namespace_intent = KEYS[3]
+local simple_intent = KEYS[4]
+local namespace_token = ARGV[1]
+local leaf_token = ARGV[2]
+local expected_intent_id = ARGV[3]
+local expected_prefix = ARGV[4]
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then return -1 end
+if leaf_token == ''
+    or redis.call('GET', leaf_lock) ~= leaf_token then return -1 end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+local raw = redis.call('GET', simple_intent)
+if not raw then return -2 end
+local intent_ok, intent = pcall(cjson.decode, raw)
+if not intent_ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['namespace_lock_token'] or '') ~= namespace_token
+    or tostring(intent['leaf_lock_token'] or '') ~= leaf_token
+    or (tostring(intent['status'] or '') ~= 'deleting'
+        and tostring(intent['status'] or '') ~= 'deleted') then return -2 end
+local removed = 0
+for index = 5, #KEYS do
+  if string.sub(KEYS[index], 1, string.len(expected_prefix))
+      ~= expected_prefix then return -4 end
+  removed = removed + redis.call('DEL', KEYS[index])
+end
+return removed
+"""
+
     _LUA_ROOT_ENSURE = """
+local ROOT_MAX_SAFE_INTEGER = 9007199254740991
 local root_key = KEYS[1]
 local namespace_lock = KEYS[2]
 local namespace_delete = KEYS[3]
 local initial_json = ARGV[1]
 local namespace_token = ARGV[2]
+local initial_ok, initial = pcall(cjson.decode, initial_json)
+if not initial_ok or type(initial) ~= 'table' then return -3 end
+if type(initial['version']) ~= 'number'
+    or initial['version'] < 0
+    or initial['version'] > ROOT_MAX_SAFE_INTEGER
+    or initial['version'] ~= math.floor(initial['version'])
+    or type(initial['ts']) ~= 'number'
+    or initial['ts'] < 0
+    or initial['ts'] > ROOT_MAX_SAFE_INTEGER
+    or initial['ts'] ~= math.floor(initial['ts']) then return -3 end
 local namespace_holder = redis.call('GET', namespace_lock)
 if namespace_holder and namespace_holder ~= namespace_token then
   return -1
 end
 if redis.call('EXISTS', namespace_delete) == 1 then return -2 end
-if redis.call('EXISTS', root_key) == 1 then
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type ~= 'none' and root_type ~= 'string' then return -3 end
+if root_type == 'string' then
+  local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+  if not root_ok or type(root) ~= 'table' then return -3 end
+  if type(root['version']) ~= 'number'
+      or root['version'] < 0
+      or root['version'] > ROOT_MAX_SAFE_INTEGER
+      or root['version'] ~= math.floor(root['version'])
+      or type(root['ts']) ~= 'number'
+      or root['ts'] < 0
+      or root['ts'] > ROOT_MAX_SAFE_INTEGER
+      or root['ts'] ~= math.floor(root['ts']) then return -3 end
   return 0
 end
 redis.call('SET', root_key, initial_json)
 return 1
 """
 
-    _LUA_UPDATE_ROOT_FLAGS = """
+    _LUA_UPDATE_ROOT_FLAGS = _LUA_ROOT_DOCUMENT_GUARD + """
 local root_key = KEYS[1]
 local namespace_intent = KEYS[2]
+local simple_intent_index = KEYS[3]
+local stage_intent_index = KEYS[4]
 local flags_json = ARGV[1]
 local now_ms = tonumber(ARGV[2])
+local target_super = ARGV[3]
+local expected_root_raw = ARGV[4]
+
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local simple_index_type = redis.call('TYPE', simple_intent_index)
+if type(simple_index_type) == 'table' then simple_index_type = simple_index_type['ok'] end
+local stage_index_type = redis.call('TYPE', stage_intent_index)
+if type(stage_index_type) == 'table' then stage_index_type = stage_index_type['ok'] end
+if simple_index_type ~= 'none' and simple_index_type ~= 'set' then return -3 end
+if stage_index_type ~= 'none' and stage_index_type ~= 'set' then return -3 end
+if redis.call('SCARD', simple_intent_index) ~= 0
+    or redis.call('SCARD', stage_intent_index) ~= 0 then return -6 end
 local flags_ok, flags = pcall(cjson.decode, flags_json)
 if not flags_ok or type(flags) ~= 'table' then return -2 end
-local root = {version=0, ts=now_ms}
-local raw = redis.call('GET', root_key)
-if raw then
-  local root_ok, decoded = pcall(cjson.decode, raw)
-  if not root_ok or type(decoded) ~= 'table' then return -3 end
-  root = decoded
+for key, _ in pairs(flags) do
+  if type(key) ~= 'string' then return -2 end
 end
+if flags['version'] ~= nil or flags['ts'] ~= nil
+    or flags['commit_id'] ~= nil then return -2 end
+local raw = redis.call('GET', root_key)
+if not raw then return -4 end
+local root_ok, root = pcall(cjson.decode, raw)
+if not root_ok or root_document_state(root, target_super) == -1 then return -3 end
+if raw ~= expected_root_raw then return -5 end
 for key, value in pairs(flags) do root[key] = value end
+if root_document_state(root, target_super) == -1 then return -2 end
 redis.call('SET', root_key, cjson.encode(root))
 return 1
 """
 
-    _LUA_SET_MIRRORS = """
+    _LUA_SET_MIRRORS = _LUA_ROOT_DOCUMENT_GUARD + """
 local mirrors_key = KEYS[1]
 local namespace_intent = KEYS[2]
+local root_key = KEYS[3]
 local document_json = ARGV[1]
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -3 end
+if root_type ~= 'string' then return -4 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -4 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -4 end
+if root_state == 0 then return -5 end
 local ok, document = pcall(cjson.decode, document_json)
-if not ok or type(document) ~= 'table' then return -2 end
+if not ok or type(document) ~= 'table'
+    or type(document['formats']) ~= 'table'
+    or type(document['ts']) ~= 'number'
+    or document['ts'] < 0
+    or document['ts'] ~= math.floor(document['ts']) then return -2 end
 redis.call('SET', mirrors_key, document_json)
 return 1
 """
 
-    _LUA_UPSERT_LINKED_SHARE = """
+    _LUA_MUTATE_MIRROR = _LUA_ROOT_DOCUMENT_GUARD + """
+local mirrors_key = KEYS[1]
+local namespace_intent = KEYS[2]
+local root_key = KEYS[3]
+local requested_format = ARGV[1]
+local enable = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -3 end
+if root_type ~= 'string' then return -4 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -4 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -4 end
+if root_state == 0 then return -6 end
+
+local current = {}
+local seen = {}
+local mirrors_type = redis.call('TYPE', mirrors_key)
+if type(mirrors_type) == 'table' then mirrors_type = mirrors_type['ok'] end
+if mirrors_type ~= 'none' and mirrors_type ~= 'string' then return -5 end
+if mirrors_type == 'string' then
+  local config_ok, config = pcall(cjson.decode, redis.call('GET', mirrors_key))
+  if not config_ok or type(config) ~= 'table'
+      or type(config['formats']) ~= 'table'
+      or type(config['ts']) ~= 'number'
+      or config['ts'] < 0
+      or config['ts'] ~= math.floor(config['ts']) then return -5 end
+  local count = 0
+  for key, value in pairs(config['formats']) do
+    if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+        or type(value) ~= 'string' then return -5 end
+    count = count + 1
+    local normalized = string.upper(value)
+    if normalized ~= 'DELTA' and normalized ~= 'ICEBERG'
+        and normalized ~= 'PARQUET' then return -5 end
+    if not seen[normalized] then
+      seen[normalized] = true
+      table.insert(current, normalized)
+    end
+  end
+  if count ~= #config['formats'] then return -5 end
+end
+
+local changed = false
+if enable == '1' then
+  if not seen[requested_format] then
+    table.insert(current, requested_format)
+    changed = true
+  end
+else
+  local retained = {}
+  for _, value in ipairs(current) do
+    if value == requested_format then
+      changed = true
+    else
+      table.insert(retained, value)
+    end
+  end
+  current = retained
+end
+if changed then
+  redis.call('SET', mirrors_key, cjson.encode({formats=current, ts=now_ms}))
+end
+return current
+"""
+
+    _LUA_UPSERT_LINKED_SHARE = _LUA_ROOT_DOCUMENT_GUARD + """
 local document_key = KEYS[1]
 local index_key = KEYS[2]
 local namespace_intent = KEYS[3]
+local root_key = KEYS[4]
 local document_json = ARGV[1]
 local link_id = ARGV[2]
-local add_to_index = ARGV[3]
+local mode = ARGV[3]
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -3 end
+if root_type ~= 'string' then return -4 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -4 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -4 end
+if root_state == 0 then return -7 end
+-- Lua represents JSON arrays and objects as tables.  Python emits canonical
+-- object JSON here, so retain an explicit object-shape check at the atomic
+-- boundary instead of accepting an array as a control-plane document.
+if not string.match(document_json, '^%s*{') then return -2 end
 local ok, document = pcall(cjson.decode, document_json)
 if not ok or type(document) ~= 'table' then return -2 end
-redis.call('SET', document_key, document_json)
-if add_to_index == '1' then redis.call('SADD', index_key, link_id) end
+local document_type = redis.call('TYPE', document_key)
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if document_type ~= 'none' and document_type ~= 'string' then return -5 end
+if index_type ~= 'none' and index_type ~= 'set' then return -5 end
+local indexed = redis.call('SISMEMBER', index_key, link_id)
+if mode == 'create' then
+  if document_type ~= 'none' then return -6 end
+  if indexed == 1 then return -5 end
+  redis.call('SET', document_key, document_json)
+  redis.call('SADD', index_key, link_id)
+elseif mode == 'update' then
+  if document_type == 'none' then
+    if indexed == 1 then return -5 end
+    return 0
+  end
+  if indexed ~= 1 then return -5 end
+  redis.call('SET', document_key, document_json)
+else
+  return -2
+end
 return 1
 """
 
-    _LUA_ROOT_BUMP = """
+    _LUA_MUTATE_SHARE = """
+local document_key = KEYS[1]
+local index_key = KEYS[2]
+local document_json = ARGV[1]
+local share_id = ARGV[2]
+local mode = ARGV[3]
+local document_type = redis.call('TYPE', document_key)
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if document_type ~= 'none' and document_type ~= 'string' then return -2 end
+if index_type ~= 'none' and index_type ~= 'set' then return -2 end
+local indexed = redis.call('SISMEMBER', index_key, share_id)
+
+if mode == 'delete' then
+  if document_type == 'none' then
+    if indexed == 1 then return -2 end
+    return 0
+  end
+  if indexed ~= 1 then return -2 end
+  redis.call('DEL', document_key)
+  redis.call('SREM', index_key, share_id)
+  return 1
+end
+
+if not string.match(document_json, '^%s*{') then return -3 end
+local ok, document = pcall(cjson.decode, document_json)
+if not ok or type(document) ~= 'table' then return -3 end
+if mode == 'create' then
+  if document_type ~= 'none' then return -1 end
+  if indexed == 1 then return -2 end
+  redis.call('SET', document_key, document_json)
+  redis.call('SADD', index_key, share_id)
+  return 1
+end
+if mode == 'update' then
+  if document_type == 'none' then
+    if indexed == 1 then return -2 end
+    return 0
+  end
+  if indexed ~= 1 then return -2 end
+  redis.call('SET', document_key, document_json)
+  return 1
+end
+return -3
+"""
+
+    _LUA_DELETE_LINKED_SHARE = _LUA_ROOT_DOCUMENT_GUARD + """
+local document_key = KEYS[1]
+local index_key = KEYS[2]
+local namespace_intent = KEYS[3]
+local root_key = KEYS[4]
+local link_id = ARGV[1]
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -2 end
+if root_type ~= 'string' then return -3 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -3 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -3 end
+if root_state == 0 then return -5 end
+local document_type = redis.call('TYPE', document_key)
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if document_type ~= 'none' and document_type ~= 'string' then return -4 end
+if index_type ~= 'none' and index_type ~= 'set' then return -4 end
+local indexed = redis.call('SISMEMBER', index_key, link_id)
+if document_type == 'none' then
+  if indexed == 1 then return -4 end
+  return 0
+end
+if indexed ~= 1 then return -4 end
+local removed = redis.call('DEL', document_key)
+redis.call('SREM', index_key, link_id)
+return removed
+"""
+
+    _LUA_ROOT_BUMP = _LUA_ROOT_DOCUMENT_GUARD + """
 local key = KEYS[1]
 local namespace_intent = KEYS[2]
 local now_ms = tonumber(ARGV[1])
 
+if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms) then return -5 end
+
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
 
 local cur = redis.call('GET', key)
-local old_version = -1
-if cur then
-  local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj and obj['version'] then
-    old_version = tonumber(obj['version'])
-  end
-end
+if not cur then return -2 end
+local ok, obj = pcall(cjson.decode, cur)
+if not ok or type(obj) ~= 'table' then return -3 end
+local root_state = root_document_state(obj, nil)
+if root_state == -1 then return -3 end
+if root_state == 0 then return -4 end
+local old_version = obj['version']
+if old_version >= ROOT_MAX_SAFE_INTEGER then return -5 end
 local new_version = old_version + 1
-local new_val = cjson.encode({version=new_version, ts=now_ms})
+obj['version'] = new_version
+obj['ts'] = now_ms
+local new_val = cjson.encode(obj)
 redis.call('SET', key, new_val)
 return new_version
 """
@@ -902,13 +1460,15 @@ return new_version
     # is never silently taken over, because that process may still resume an
     # in-flight object-store prefix delete.  The RECOVER scripts are exposed
     # only through APIs that require an explicit operator acknowledgement.
-    _LUA_BEGIN_SIMPLE_DELETION = """
+    _LUA_BEGIN_SIMPLE_DELETION = _LUA_ROOT_DOCUMENT_GUARD + """
 local intent_key = KEYS[1]
 local intent_index = KEYS[2]
 local namespace_intent = KEYS[3]
 local namespace_lock = KEYS[4]
 local leaf_lock = KEYS[5]
 local leaf = KEYS[6]
+local quality_running = KEYS[7]
+local root_key = KEYS[8]
 local record_json = ARGV[1]
 local intent_id = ARGV[2]
 local namespace_token = ARGV[3]
@@ -923,6 +1483,13 @@ if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
   return -2
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -3 end
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -8 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok then return -9 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -9 end
+if root_state == 0 then return -10 end
 
 local index_type = redis.call('TYPE', intent_index)
 if type(index_type) == 'table' then index_type = index_type['ok'] end
@@ -935,6 +1502,7 @@ if current_raw then
   if tostring(current['intent_id'] or '') == intent_id
       and tostring(current['namespace_lock_token'] or '') == namespace_token
       and tostring(current['leaf_lock_token'] or '') == leaf_token then
+    redis.call('DEL', quality_running)
     redis.call('SADD', intent_index, simple_name)
     return 2
   end
@@ -952,6 +1520,7 @@ if not record_ok or type(record) ~= 'table'
 end
 redis.call('SET', intent_key, record_json)
 redis.call('SADD', intent_index, simple_name)
+redis.call('DEL', quality_running)
 return 1
 """
 
@@ -961,6 +1530,7 @@ local intent_index = KEYS[2]
 local namespace_intent = KEYS[3]
 local namespace_lock = KEYS[4]
 local leaf_lock = KEYS[5]
+local quality_running = KEYS[6]
 local expected_intent_id = ARGV[1]
 local namespace_token = ARGV[2]
 local leaf_token = ARGV[3]
@@ -987,6 +1557,7 @@ current['recovered_at_ms'] = now_ms
 current['recovery_count'] = tonumber(current['recovery_count'] or 0) + 1
 redis.call('SET', intent_key, cjson.encode(current))
 redis.call('SADD', intent_index, simple_name)
+redis.call('DEL', quality_running)
 return 1
 """
 
@@ -1020,16 +1591,20 @@ if tostring(intent['intent_id'] or '') ~= expected_intent_id
     or tostring(intent['status'] or '') ~= 'deleted' then return -4 end
 if redis.call('EXISTS', leaf, schema, rowid, table_config, mirror_publication) ~= 0
     or redis.call('SISMEMBER', table_names, simple_name) ~= 0 then return -6 end
+for index = 12, #KEYS do
+  if redis.call('EXISTS', KEYS[index]) ~= 0 then return -6 end
+end
 redis.call('DEL', intent_key)
 redis.call('SREM', intent_index, simple_name)
 return 1
 """
 
-    _LUA_BEGIN_NAMESPACE_DELETION = """
+    _LUA_BEGIN_NAMESPACE_DELETION = _LUA_ROOT_DOCUMENT_GUARD + """
 local intent_key = KEYS[1]
 local namespace_lock = KEYS[2]
 local simple_intent_index = KEYS[3]
 local stage_intent_index = KEYS[4]
+local root_key = KEYS[5]
 local record_json = ARGV[1]
 local intent_id = ARGV[2]
 local namespace_token = ARGV[3]
@@ -1038,6 +1613,12 @@ if namespace_token == ''
     or redis.call('GET', namespace_lock) ~= namespace_token then
   return -1
 end
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -8 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok then return -9 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -9 end
 local index_type = redis.call('TYPE', simple_intent_index)
 if type(index_type) == 'table' then index_type = index_type['ok'] end
 if index_type ~= 'none' and index_type ~= 'set' then return -5 end
@@ -1129,16 +1710,26 @@ redis.call('DEL', intent_key)
 return 1
 """
 
-    _LUA_ASSERT_TABLE_MUTATION_ALLOWED = """
+    _LUA_ASSERT_TABLE_MUTATION_ALLOWED = _LUA_ROOT_DOCUMENT_GUARD + """
 local leaf_lock = KEYS[1]
 local namespace_intent = KEYS[2]
 local simple_intent = KEYS[3]
+local root_key = KEYS[4]
 local leaf_token = ARGV[1]
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
   return -1
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
 if redis.call('EXISTS', simple_intent) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -4 end
+if root_type ~= 'string' then return -5 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -5 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -5 end
+if root_state == 0 then return -6 end
 return 1
 """
 
@@ -1159,12 +1750,13 @@ end
 return 1
 """
 
-    _LUA_SET_TABLE_CONFIG = """
+    _LUA_SET_TABLE_CONFIG = _LUA_ROOT_DOCUMENT_GUARD + """
 local config_key = KEYS[1]
 local leaf_key = KEYS[2]
 local leaf_lock = KEYS[3]
 local namespace_intent = KEYS[4]
 local simple_intent = KEYS[5]
+local root_key = KEYS[6]
 local config_json = ARGV[1]
 local lock_token = ARGV[2]
 if lock_token == '' or redis.call('GET', leaf_lock) ~= lock_token then
@@ -1173,6 +1765,13 @@ end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
 if redis.call('EXISTS', simple_intent) == 1 then return -3 end
 if redis.call('EXISTS', leaf_key) ~= 1 then return -4 end
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -6 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok then return -7 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -7 end
+if root_state == 0 then return -8 end
 local ok, config = pcall(cjson.decode, config_json)
 if not ok or type(config) ~= 'table' then return -5 end
 redis.call('SET', config_key, config_json)
@@ -1241,11 +1840,12 @@ redis.call('SET', namespace_intent, cjson.encode(intent))
 return 1
 """
 
-    _LUA_BEGIN_STAGE_DELETION = """
+    _LUA_BEGIN_STAGE_DELETION = _LUA_ROOT_DOCUMENT_GUARD + """
 local intent_key = KEYS[1]
 local intent_index = KEYS[2]
 local namespace_intent = KEYS[3]
 local stage_lock = KEYS[4]
+local root_key = KEYS[5]
 local record_json = ARGV[1]
 local intent_id = ARGV[2]
 local lock_token = ARGV[3]
@@ -1254,6 +1854,13 @@ if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -6 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok then return -7 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -7 end
+if root_state == 0 then return -8 end
 local index_type = redis.call('TYPE', intent_index)
 if type(index_type) == 'table' then index_type = index_type['ok'] end
 if index_type ~= 'none' and index_type ~= 'set' then return -5 end
@@ -1333,59 +1940,242 @@ redis.call('SREM', intent_index, stage_name)
 return 1
 """
 
-    _LUA_ASSERT_STAGE_MUTATION_ALLOWED = """
+    _LUA_ASSERT_STAGE_MUTATION_ALLOWED = _LUA_ROOT_DOCUMENT_GUARD + """
 local stage_lock = KEYS[1]
 local namespace_intent = KEYS[2]
 local stage_intent = KEYS[3]
+local root_key = KEYS[4]
 local lock_token = ARGV[1]
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
 if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -4 end
+if root_type ~= 'string' then return -5 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -5 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -5 end
+if root_state == 0 then return -6 end
 return 1
 """
 
-    _LUA_UPSERT_STAGING_META = """
+    _LUA_UPSERT_STAGING_META = _LUA_ROOT_DOCUMENT_GUARD + """
 local meta_key = KEYS[1]
 local index_key = KEYS[2]
 local stage_lock = KEYS[3]
 local namespace_intent = KEYS[4]
 local stage_intent = KEYS[5]
+local root_key = KEYS[6]
 local payload_json = ARGV[1]
 local stage_name = ARGV[2]
 local lock_token = ARGV[3]
+local create_only = ARGV[4]
+local organization = ARGV[5]
+local super_name = ARGV[6]
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
 if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -7 end
+if root_type ~= 'string' then return -8 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -8 end
+local root_state = root_document_state(root, super_name)
+if root_state == -1 then return -8 end
+if root_state == 0 then return -9 end
 local ok, payload = pcall(cjson.decode, payload_json)
 if not ok or type(payload) ~= 'table' then return -4 end
+if type(payload['organization']) ~= 'string'
+    or payload['organization'] ~= organization
+    or type(payload['super_name']) ~= 'string'
+    or payload['super_name'] ~= super_name
+    or type(payload['staging_name']) ~= 'string'
+    or payload['staging_name'] ~= stage_name then return -4 end
+local meta_type = redis.call('TYPE', meta_key)
+if type(meta_type) == 'table' then meta_type = meta_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if meta_type ~= 'none' and meta_type ~= 'string' then return -6 end
+if index_type ~= 'none' and index_type ~= 'set' then return -6 end
+if create_only == '1' and meta_type ~= 'none' then return -5 end
 redis.call('SET', meta_key, payload_json)
 redis.call('SADD', index_key, stage_name)
 return 1
 """
 
-    _LUA_UPSERT_PIPE_META = """
+    _LUA_UPSERT_PIPE_META = _LUA_ROOT_DOCUMENT_GUARD + """
 local pipe_key = KEYS[1]
 local pipe_index = KEYS[2]
 local stage_lock = KEYS[3]
 local namespace_intent = KEYS[4]
 local stage_intent = KEYS[5]
+local stage_meta = KEYS[6]
+local root_key = KEYS[7]
 local payload_json = ARGV[1]
 local pipe_name = ARGV[2]
 local lock_token = ARGV[3]
+local create_only = ARGV[4]
+local organization = ARGV[5]
+local super_name = ARGV[6]
+local stage_name = ARGV[7]
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
 if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local stage_type = redis.call('TYPE', stage_meta)
+if type(stage_type) == 'table' then stage_type = stage_type['ok'] end
+if stage_type == 'none' then return -7 end
+if stage_type ~= 'string' then return -8 end
+local stage_ok, stage = pcall(cjson.decode, redis.call('GET', stage_meta))
+if not stage_ok or type(stage) ~= 'table' then return -8 end
+if type(stage['organization']) ~= 'string'
+    or stage['organization'] ~= organization
+    or type(stage['super_name']) ~= 'string'
+    or stage['super_name'] ~= super_name
+    or type(stage['staging_name']) ~= 'string'
+    or stage['staging_name'] ~= stage_name then return -8 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -9 end
+if root_type ~= 'string' then return -10 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -10 end
+local root_state = root_document_state(root, super_name)
+if root_state == -1 then return -10 end
+if root_state == 0 then return -11 end
 local ok, payload = pcall(cjson.decode, payload_json)
 if not ok or type(payload) ~= 'table' then return -4 end
+if type(payload['organization']) ~= 'string'
+    or payload['organization'] ~= organization
+    or type(payload['super_name']) ~= 'string'
+    or payload['super_name'] ~= super_name
+    or type(payload['staging_name']) ~= 'string'
+    or payload['staging_name'] ~= stage_name
+    or type(payload['pipe_name']) ~= 'string'
+    or payload['pipe_name'] ~= pipe_name then return -4 end
+local pipe_type = redis.call('TYPE', pipe_key)
+if type(pipe_type) == 'table' then pipe_type = pipe_type['ok'] end
+local index_type = redis.call('TYPE', pipe_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if pipe_type ~= 'none' and pipe_type ~= 'string' then return -6 end
+if index_type ~= 'none' and index_type ~= 'set' then return -6 end
+if create_only == '1' and pipe_type ~= 'none' then return -5 end
 redis.call('SET', pipe_key, payload_json)
 redis.call('SADD', pipe_index, pipe_name)
 return 1
+"""
+
+    _LUA_UPSERT_STAGING_FILE_META = _LUA_ROOT_DOCUMENT_GUARD + """
+local meta_key = KEYS[1]
+local stage_lock = KEYS[2]
+local namespace_intent = KEYS[3]
+local stage_intent = KEYS[4]
+local root_key = KEYS[5]
+local payload_json = ARGV[1]
+local file_name = ARGV[2]
+local lock_token = ARGV[3]
+local organization = ARGV[4]
+local super_name = ARGV[5]
+local stage_name = ARGV[6]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -7 end
+if root_type ~= 'string' then return -8 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -8 end
+local root_state = root_document_state(root, super_name)
+if root_state == -1 then return -8 end
+if root_state == 0 then return -9 end
+local meta_type = redis.call('TYPE', meta_key)
+if type(meta_type) == 'table' then meta_type = meta_type['ok'] end
+if meta_type == 'none' then return -6 end
+if meta_type ~= 'string' then return -5 end
+local payload_ok, payload = pcall(cjson.decode, payload_json)
+if not payload_ok or type(payload) ~= 'table' then return -4 end
+if type(payload['file']) ~= 'string'
+    or payload['file'] ~= file_name then return -4 end
+local raw_meta = redis.call('GET', meta_key)
+local meta_ok, meta = pcall(cjson.decode, raw_meta)
+if not meta_ok or type(meta) ~= 'table' then return -5 end
+if type(meta['organization']) ~= 'string'
+    or meta['organization'] ~= organization
+    or type(meta['super_name']) ~= 'string'
+    or meta['super_name'] ~= super_name
+    or type(meta['staging_name']) ~= 'string'
+    or meta['staging_name'] ~= stage_name then return -5 end
+local files = meta['files']
+if files == nil then
+  files = {}
+elseif type(files) ~= 'table' then
+  return -5
+end
+files[file_name] = payload
+meta['files'] = files
+redis.call('SET', meta_key, cjson.encode(meta))
+return 1
+"""
+
+    _LUA_DELETE_PIPE_META = _LUA_ROOT_DOCUMENT_GUARD + """
+local pipe_key = KEYS[1]
+local pipe_index = KEYS[2]
+local stage_lock = KEYS[3]
+local namespace_intent = KEYS[4]
+local stage_intent = KEYS[5]
+local stage_meta = KEYS[6]
+local root_key = KEYS[7]
+local pipe_name = ARGV[1]
+local lock_token = ARGV[2]
+local organization = ARGV[3]
+local super_name = ARGV[4]
+local stage_name = ARGV[5]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local stage_type = redis.call('TYPE', stage_meta)
+if type(stage_type) == 'table' then stage_type = stage_type['ok'] end
+if stage_type == 'none' then return -5 end
+if stage_type ~= 'string' then return -6 end
+local stage_ok, stage = pcall(cjson.decode, redis.call('GET', stage_meta))
+if not stage_ok or type(stage) ~= 'table' then return -6 end
+if type(stage['organization']) ~= 'string'
+    or stage['organization'] ~= organization
+    or type(stage['super_name']) ~= 'string'
+    or stage['super_name'] ~= super_name
+    or type(stage['staging_name']) ~= 'string'
+    or stage['staging_name'] ~= stage_name then return -6 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -7 end
+if root_type ~= 'string' then return -8 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -8 end
+local root_state = root_document_state(root, super_name)
+if root_state == -1 then return -8 end
+if root_state == 0 then return -9 end
+local pipe_type = redis.call('TYPE', pipe_key)
+if type(pipe_type) == 'table' then pipe_type = pipe_type['ok'] end
+local index_type = redis.call('TYPE', pipe_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if pipe_type ~= 'none' and pipe_type ~= 'string' then return -4 end
+if index_type ~= 'none' and index_type ~= 'set' then return -4 end
+local removed = redis.call('DEL', pipe_key)
+redis.call('SREM', pipe_index, pipe_name)
+return removed
 """
 
     # Finalize deletion of one staging namespace after its child keys have been
@@ -1470,7 +2260,8 @@ return removed_meta + removed_index + 1
     #  -8  durable SuperTable deletion intent exists
     #  -9  durable SimpleTable deletion intent exists
     # -10  mirror publication is owned by another publisher
-    _LUA_SNAPSHOT_COMMIT = """
+    # -11  SuperTable root no longer exists
+    _LUA_SNAPSHOT_COMMIT = _LUA_ROOT_DOCUMENT_GUARD + """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
@@ -1491,6 +2282,88 @@ local commit_id = ARGV[7]
 local mirror_required = ARGV[8]
 local simple_name = ARGV[9]
 local schema_json = ARGV[10]
+local expected_mirrors_json = ARGV[11]
+
+if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms)
+    or not expected_version or expected_version < -1
+    or expected_version > ROOT_MAX_SAFE_INTEGER
+    or expected_version ~= math.floor(expected_version) then
+  return {-13, 0, 0}
+end
+
+local early_held_token = redis.call('GET', lock_key)
+if not early_held_token or early_held_token ~= lock_token then
+  return {-2, 0, 0}
+end
+
+-- Mirror configuration changes are part of snapshot publication semantics.
+-- Compare the set observed by the writer at this same atomic boundary so an
+-- acknowledged enable cannot be omitted by a later snapshot commit.
+if not string.match(expected_mirrors_json, '^%s*%[') then
+  return {-15, 0, 0}
+end
+local oke, expected_mirrors = pcall(cjson.decode, expected_mirrors_json)
+if not oke or type(expected_mirrors) ~= 'table' then
+  return {-15, 0, 0}
+end
+local expected_seen = {}
+local expected_count = 0
+for key, value in pairs(expected_mirrors) do
+  if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+      or type(value) ~= 'string' then return {-15, 0, 0} end
+  local normalized = string.upper(value)
+  if normalized ~= 'DELTA' and normalized ~= 'ICEBERG'
+      and normalized ~= 'PARQUET' then return {-15, 0, 0} end
+  if expected_seen[normalized] then return {-15, 0, 0} end
+  expected_seen[normalized] = true
+  expected_count = expected_count + 1
+end
+if expected_count ~= #expected_mirrors then return {-15, 0, 0} end
+
+local configured_seen = {}
+local configured_count = 0
+local mirrors_config_key = KEYS[10]
+local mirrors_config_type = redis.call('TYPE', mirrors_config_key)
+if type(mirrors_config_type) == 'table' then
+  mirrors_config_type = mirrors_config_type['ok']
+end
+if mirrors_config_type ~= 'none' and mirrors_config_type ~= 'string' then
+  return {-15, 0, 0}
+end
+if mirrors_config_type == 'string' then
+  local okc, configured = pcall(
+    cjson.decode, redis.call('GET', mirrors_config_key)
+  )
+  if not okc or type(configured) ~= 'table'
+      or type(configured['formats']) ~= 'table'
+      or type(configured['ts']) ~= 'number'
+      or configured['ts'] < 0
+      or configured['ts'] > ROOT_MAX_SAFE_INTEGER
+      or configured['ts'] ~= math.floor(configured['ts']) then
+    return {-15, 0, 0}
+  end
+  local physical_count = 0
+  for key, value in pairs(configured['formats']) do
+    if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+        or type(value) ~= 'string' then return {-15, 0, 0} end
+    physical_count = physical_count + 1
+    local normalized = string.upper(value)
+    if normalized ~= 'DELTA' and normalized ~= 'ICEBERG'
+        and normalized ~= 'PARQUET' then return {-15, 0, 0} end
+    if configured_seen[normalized] then return {-15, 0, 0} end
+    configured_seen[normalized] = true
+    configured_count = configured_count + 1
+  end
+  if physical_count ~= #configured['formats'] then return {-15, 0, 0} end
+end
+if configured_count ~= expected_count then return {-14, 0, 0} end
+for format, _ in pairs(expected_seen) do
+  if not configured_seen[format] then return {-14, 0, 0} end
+end
+if expected_count > 0 and mirror_required ~= '1' then
+  return {-15, 0, 0}
+end
 
 local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
@@ -1511,20 +2384,38 @@ if names_type ~= 'none' and names_type ~= 'set' then
   return {-3, 0, 0}
 end
 
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-11, 0, 0} end
+if root_type ~= 'string' then return {-3, 0, 0} end
+local raw_root = redis.call('GET', root_key)
+local okr, root = pcall(cjson.decode, raw_root)
+if not okr or type(root) ~= 'table' then return {-3, 0, 0} end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return {-3, 0, 0} end
+if root_state == 0 then return {-12, 0, 0} end
+local root_version = root['version']
+
 local old_version = -1
 local old_path = ''
 local cur = redis.call('GET', leaf_key)
 if cur then
   local ok, obj = pcall(cjson.decode, cur)
-  if not ok or type(obj) ~= 'table' then
+  if not ok or type(obj) ~= 'table'
+      or type(obj['version']) ~= 'number'
+      or obj['version'] < 0
+      or obj['version'] > ROOT_MAX_SAFE_INTEGER
+      or obj['version'] ~= math.floor(obj['version'])
+      or type(obj['ts']) ~= 'number'
+      or obj['ts'] < 0
+      or obj['ts'] > ROOT_MAX_SAFE_INTEGER
+      or obj['ts'] ~= math.floor(obj['ts'])
+      or type(obj['path']) ~= 'string'
+      or obj['path'] == '' then
     return {-3, 0, 0}
   end
-  if obj['version'] ~= nil then
-    old_version = tonumber(obj['version'])
-  end
-  if obj['path'] ~= nil then
-    old_path = tostring(obj['path'])
-  end
+  old_version = obj['version']
+  old_path = obj['path']
 end
 
 if old_version ~= expected_version or old_path ~= expected_path then
@@ -1557,23 +2448,31 @@ if mirror_required == '1' then
   if tostring(parsed_mirror['publication_owner'] or '') ~= lock_token then
     return {-10, 0, 0}
   end
+  if expected_count > 0 then
+    local recorded_mirrors = parsed_mirror['mirrors']
+    if type(recorded_mirrors) ~= 'table' then return {-5, 0, 0} end
+    local recorded_seen = {}
+    local recorded_count = 0
+    for key, value in pairs(recorded_mirrors) do
+      if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+          or type(value) ~= 'string' then return {-5, 0, 0} end
+      local normalized = string.upper(value)
+      if not expected_seen[normalized] or recorded_seen[normalized] then
+        return {-5, 0, 0}
+      end
+      recorded_seen[normalized] = true
+      recorded_count = recorded_count + 1
+    end
+    if recorded_count ~= expected_count
+        or recorded_count ~= #recorded_mirrors then return {-5, 0, 0} end
+  end
   mirror = parsed_mirror
 end
 
-local root = {}
-local root_version = -1
-local raw_root = redis.call('GET', root_key)
-if raw_root then
-  local okr, parsed_root = pcall(cjson.decode, raw_root)
-  if not okr or type(parsed_root) ~= 'table' then
-    return {-3, 0, 0}
-  end
-  root = parsed_root
-  if root['version'] ~= nil then
-    root_version = tonumber(root['version'])
-  end
+if old_version >= ROOT_MAX_SAFE_INTEGER
+    or root_version >= ROOT_MAX_SAFE_INTEGER then
+  return {-13, 0, 0}
 end
-
 local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
 local leaf = {
@@ -1607,11 +2506,12 @@ end
 return {1, new_leaf_version, new_root_version}
 """
 
-    _LUA_MIRROR_PUBLICATION_PREPARE = """
+    _LUA_MIRROR_PUBLICATION_PREPARE = _LUA_ROOT_DOCUMENT_GUARD + """
 local state_key = KEYS[1]
 local lock_key = KEYS[2]
 local namespace_delete = KEYS[3]
 local simple_delete = KEYS[4]
+local root_key = KEYS[5]
 local record_json = ARGV[1]
 local lock_token = ARGV[2]
 local commit_id = ARGV[3]
@@ -1622,6 +2522,13 @@ if not held_token or held_token ~= lock_token then
 end
 if redis.call('EXISTS', namespace_delete) == 1 then return -5 end
 if redis.call('EXISTS', simple_delete) == 1 then return -6 end
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -8 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok then return -9 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -9 end
+if root_state == 0 then return -10 end
 
 local okr, record = pcall(cjson.decode, record_json)
 if not okr or type(record) ~= 'table'
@@ -1790,10 +2697,50 @@ redis.call('SET', state_key, cjson.encode(record))
 return 1
 """
 
-    _LUA_RESERVE_ROWIDS_AT_LEAST = """
+    _LUA_RESERVE_ROWIDS_AT_LEAST = _LUA_ROOT_DOCUMENT_GUARD + """
 local key = KEYS[1]
+local leaf_lock = KEYS[2]
+local leaf = KEYS[3]
+local root = KEYS[4]
+local namespace_intent = KEYS[5]
+local simple_intent = KEYS[6]
 local floor = ARGV[1]
 local count = ARGV[2]
+local lock_token = ARGV[3]
+
+if lock_token == '' or redis.call('GET', leaf_lock) ~= lock_token then
+  return {-1}
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
+if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+
+local root_type = redis.call('TYPE', root)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-4} end
+if root_type ~= 'string' then return {-5} end
+local root_ok, root_doc = pcall(cjson.decode, redis.call('GET', root))
+if not root_ok or type(root_doc) ~= 'table' then return {-5} end
+local root_state = root_document_state(root_doc, nil)
+if root_state == -1 then return {-5} end
+if root_state == 0 then return {-8} end
+
+local leaf_type = redis.call('TYPE', leaf)
+if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
+if leaf_type == 'none' then return {-6} end
+if leaf_type ~= 'string' then return {-7} end
+local leaf_ok, leaf_doc = pcall(cjson.decode, redis.call('GET', leaf))
+if not leaf_ok or type(leaf_doc) ~= 'table'
+    or type(leaf_doc['version']) ~= 'number'
+    or leaf_doc['version'] < 0
+    or leaf_doc['version'] > ROOT_MAX_SAFE_INTEGER
+    or leaf_doc['version'] ~= math.floor(leaf_doc['version'])
+    or type(leaf_doc['ts']) ~= 'number'
+    or leaf_doc['ts'] < 0
+    or leaf_doc['ts'] > ROOT_MAX_SAFE_INTEGER
+    or leaf_doc['ts'] ~= math.floor(leaf_doc['ts'])
+    or type(leaf_doc['path']) ~= 'string'
+    or leaf_doc['path'] == '' then return {-7} end
+
 local cur = redis.call('GET', key) or '0'
 
 -- Lua numbers lose integer precision above 2^53.  Row ids are signed Int64,
@@ -3325,8 +4272,14 @@ return 1
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
+        self._get_replica_leaf = self.r.register_script(
+            self._LUA_GET_REPLICA_LEAF
+        )
         self._delete_simple_table = self.r.register_script(
             self._LUA_DELETE_SIMPLE_TABLE
+        )
+        self._delete_simple_quality_keys = self.r.register_script(
+            self._LUA_DELETE_SIMPLE_QUALITY_KEYS
         )
         self._root_ensure = self.r.register_script(self._LUA_ROOT_ENSURE)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
@@ -3336,8 +4289,15 @@ return 1
         self._set_mirrors_fenced = self.r.register_script(
             self._LUA_SET_MIRRORS
         )
+        self._mutate_mirror_fenced = self.r.register_script(
+            self._LUA_MUTATE_MIRROR
+        )
         self._upsert_linked_share_fenced = self.r.register_script(
             self._LUA_UPSERT_LINKED_SHARE
+        )
+        self._mutate_share = self.r.register_script(self._LUA_MUTATE_SHARE)
+        self._delete_linked_share_fenced = self.r.register_script(
+            self._LUA_DELETE_LINKED_SHARE
         )
         self._begin_simple_deletion = self.r.register_script(
             self._LUA_BEGIN_SIMPLE_DELETION
@@ -3408,6 +4368,12 @@ return 1
         )
         self._upsert_pipe_meta = self.r.register_script(
             self._LUA_UPSERT_PIPE_META
+        )
+        self._upsert_staging_file_meta = self.r.register_script(
+            self._LUA_UPSERT_STAGING_FILE_META
+        )
+        self._delete_pipe_meta = self.r.register_script(
+            self._LUA_DELETE_PIPE_META
         )
 
         # Distributed locking (delegates to supertable.locking.redis_lock)
@@ -3543,6 +4509,7 @@ return 1
                 RK.lock_leaf(org, sup, simple),
                 RK.meta_namespace_deletion_intent(org, sup),
                 RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_root(org, sup),
             ],
             args=[lock_token or ""],
         ) or 0)
@@ -3553,6 +4520,16 @@ return 1
         if result in (-2, -3):
             raise DeletionIntentConflictError(
                 f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if result == -4:
+            raise FileNotFoundError(
+                f"SuperTable does not exist: {org}/{sup}"
+            )
+        if result == -5:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if result == -6:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
             )
         if result != 1:
             raise RuntimeError(f"Invalid mutation fence result: {result}")
@@ -3602,7 +4579,7 @@ return 1
     ) -> Dict[str, Any]:
         """Create a no-TTL SimpleTable delete intent under both live locks."""
         iid = intent_id or secrets.token_hex(16)
-        timestamp = int(now_ms or _now_ms())
+        timestamp = _publication_timestamp(now_ms)
         record = {
             "schema_version": 1,
             "kind": "simple_table",
@@ -3624,6 +4601,8 @@ return 1
                 RK.lock_namespace(org, sup),
                 RK.lock_leaf(org, sup, simple),
                 RK.meta_leaf(org, sup, simple),
+                RK.quality_prefix(org, sup) + f"running:{simple}",
+                RK.meta_root(org, sup),
             ],
             args=[
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
@@ -3652,6 +4631,14 @@ return 1
             raise RuntimeError(f"Cannot delete missing table {org}/{sup}/{simple}")
         if result == -7:
             raise RuntimeError("simple deletion-intent index has wrong Redis type")
+        if result == -8:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result == -9:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if result == -10:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
+            )
         if result not in (1, 2):
             raise RuntimeError(f"Invalid begin_simple_deletion result: {result}")
         return self.get_simple_deletion_intent(org, sup, simple) or record
@@ -3686,6 +4673,7 @@ return 1
                 RK.meta_namespace_deletion_intent(org, sup),
                 RK.lock_namespace(org, sup),
                 RK.lock_leaf(org, sup, simple),
+                RK.quality_prefix(org, sup) + f"running:{simple}",
             ],
             args=[
                 expected_intent_id or "",
@@ -3730,6 +4718,7 @@ return 1
                 "Tombstone clearing requires confirmation that every previous "
                 "mutation owner has stopped"
             )
+        self._assert_simple_quality_column_keys_absent(org, sup, simple)
         result = int(self._clear_simple_deletion(
             keys=[
                 RK.meta_simple_deletion_intent(org, sup, simple),
@@ -3743,6 +4732,7 @@ return 1
                 RK.meta_table_config(org, sup, simple),
                 RK.meta_mirror_publication(org, sup, simple),
                 RK.meta_table_names(org, sup),
+                *self._quality_table_mutable_keys(org, sup, simple),
             ],
             args=[
                 expected_intent_id or "",
@@ -3777,7 +4767,7 @@ return 1
     ) -> Dict[str, Any]:
         """Create a no-TTL whole-SuperTable deletion intent."""
         iid = intent_id or secrets.token_hex(16)
-        timestamp = int(now_ms or _now_ms())
+        timestamp = _publication_timestamp(now_ms)
         record = {
             "schema_version": 1,
             "kind": "super_table",
@@ -3795,6 +4785,7 @@ return 1
                 RK.lock_namespace(org, sup),
                 RK.meta_simple_deletion_intent_index(org, sup),
                 RK.meta_stage_deletion_intent_index(org, sup),
+                RK.meta_root(org, sup),
             ],
             args=[
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
@@ -3823,6 +4814,10 @@ return 1
             raise DeletionIntentConflictError(
                 "A staging deletion must be recovered before deleting its parent"
             )
+        if result == -8:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result == -9:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
         if result not in (1, 2):
             raise RuntimeError(f"Invalid begin_namespace_deletion result: {result}")
         return self.get_namespace_deletion_intent(org, sup) or record
@@ -3919,6 +4914,109 @@ return 1
             )
 
 
+    def scan_stage_lock_names(self, org: str, sup: str) -> List[str]:
+        """Return a bounded, validated snapshot of live stage-lock names.
+
+        Namespace deletion calls this only after its durable parent intent is
+        visible. A full Redis SCAN therefore includes every pre-intent stage
+        writer whose renewable lock remains live, including creators that have
+        not published a staging document/index entry yet.
+        """
+        prefix = RK.lock_stage_prefix(org, sup)
+        pattern = RK.lock_stage_pattern(org, sup)
+        names: set[str] = set()
+        cursor = 0
+        calls = 0
+        try:
+            while True:
+                calls += 1
+                if calls > self._STAGE_LOCK_SCAN_CALL_LIMIT:
+                    raise RuntimeError(
+                        "Stage-lock discovery exceeded its scan-call bound"
+                    )
+                cursor, raw_keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=self._STAGE_LOCK_SCAN_COUNT,
+                )
+                for raw_key in raw_keys:
+                    key = self._redis_key_text(raw_key)
+                    if not key.startswith(prefix):
+                        raise RuntimeError(
+                            "Redis stage-lock scan returned an out-of-scope key"
+                        )
+                    stage_name = key[len(prefix):]
+                    try:
+                        canonical = RK.lock_stage(org, sup, stage_name)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "Redis stage-lock scan returned an invalid stage name"
+                        ) from exc
+                    if canonical != key:
+                        raise RuntimeError(
+                            "Redis stage-lock scan returned a non-canonical key"
+                        )
+                    names.add(stage_name)
+                    if len(names) > self._STAGE_LOCK_DRAIN_LIMIT:
+                        raise RuntimeError(
+                            "Stage-lock discovery exceeded its key bound"
+                        )
+                cursor = int(cursor)
+                if cursor == 0:
+                    return sorted(names)
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] stage-lock SCAN error: {exc}")
+            raise
+
+    def scan_leaf_lock_names(self, org: str, sup: str) -> List[str]:
+        """Return every live table-lock name, including pre-leaf creators."""
+        prefix = RK.lock_leaf_prefix(org, sup)
+        pattern = RK.lock_leaf_pattern(org, sup)
+        names: set[str] = set()
+        cursor = 0
+        calls = 0
+        try:
+            while True:
+                calls += 1
+                if calls > self._LEAF_LOCK_SCAN_CALL_LIMIT:
+                    raise RuntimeError(
+                        "Leaf-lock discovery exceeded its scan-call bound"
+                    )
+                cursor, raw_keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=self._LEAF_LOCK_SCAN_COUNT,
+                )
+                for raw_key in raw_keys:
+                    key = self._redis_key_text(raw_key)
+                    if not key.startswith(prefix):
+                        raise RuntimeError(
+                            "Redis leaf-lock scan returned an out-of-scope key"
+                        )
+                    simple_name = key[len(prefix):]
+                    try:
+                        canonical = RK.lock_leaf(org, sup, simple_name)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "Redis leaf-lock scan returned an invalid table name"
+                        ) from exc
+                    if canonical != key:
+                        raise RuntimeError(
+                            "Redis leaf-lock scan returned a non-canonical key"
+                        )
+                    names.add(simple_name)
+                    if len(names) > self._LEAF_LOCK_DRAIN_LIMIT:
+                        raise RuntimeError(
+                            "Leaf-lock discovery exceeded its key bound"
+                        )
+                cursor = int(cursor)
+                if cursor == 0:
+                    return sorted(names)
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] leaf-lock SCAN error: {exc}")
+            raise
+
+
     def acquire_stage_lock(
             self,
             org: str,
@@ -3954,6 +5052,7 @@ return 1
                 RK.lock_stage(org, sup, stage_name),
                 RK.meta_namespace_deletion_intent(org, sup),
                 RK.meta_stage_deletion_intent(org, sup, stage_name),
+                RK.meta_root(org, sup),
             ],
             args=[lock_token or ""],
         ) or 0)
@@ -3962,6 +5061,16 @@ return 1
         if result in (-2, -3):
             raise DeletionIntentConflictError(
                 f"Durable deletion intent fences staging {org}/{sup}/{stage_name}"
+            )
+        if result == -4:
+            raise FileNotFoundError(
+                f"SuperTable does not exist: {org}/{sup}"
+            )
+        if result == -5:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if result == -6:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
             )
         if result != 1:
             raise RuntimeError(f"Invalid staging mutation fence result: {result}")
@@ -3994,6 +5103,7 @@ return 1
                 RK.meta_stage_deletion_intent_index(org, sup),
                 RK.meta_namespace_deletion_intent(org, sup),
                 RK.lock_stage(org, sup, stage_name),
+                RK.meta_root(org, sup),
             ],
             args=[
                 json.dumps(record, sort_keys=True, separators=(",", ":")),
@@ -4019,6 +5129,14 @@ return 1
             )
         if result == -5:
             raise RuntimeError("stage deletion-intent index has wrong Redis type")
+        if result == -6:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result == -7:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if result == -8:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
+            )
         if result not in (1, 2):
             raise RuntimeError(f"Invalid begin_stage_deletion result: {result}")
         return self.get_stage_deletion_intent(org, sup, stage_name) or record
@@ -4123,7 +5241,7 @@ return 1
         """Initialize meta:root if missing with version=0."""
         key = RK.meta_root(org, sup)
         try:
-            init = {"version": 0, "ts": _now_ms()}
+            init = {"version": 0, "ts": _publication_timestamp(None)}
             # The namespace fence and initialize-only write share one Redis
             # transaction, so recreation cannot slip into a verified delete.
             result = int(self._root_ensure(
@@ -4142,26 +5260,32 @@ return 1
                 raise DeletionIntentConflictError(
                     f"SuperTable has a durable deletion intent: {org}/{sup}"
                 )
+            if result == -3:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result not in (0, 1):
+                raise RuntimeError(f"Invalid root initialization result: {result}")
+            # The Lua boundary validates mandatory identity atomically. This
+            # strict read also rejects malformed optional lifecycle/security
+            # fields on a pre-existing root instead of acknowledging it.
+            self.get_root(org, sup)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] ensure_root failed: {e}")
             raise
 
     def root_exists(self, org: str, sup: str) -> bool:
-        """Check existence of meta:root key."""
-        try:
-            return bool(self.r.exists(RK.meta_root(org, sup)))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] root_exists error: {e}")
-            raise
+        """Check for a structurally valid meta:root document."""
+        return self.get_root(org, sup) is not None
 
     def leaf_exists(self, org: str, sup: str, simple: str) -> bool:
         """Check existence of meta:leaf key for a simple table (replica-aware)."""
         info = self._resolve_replica_info(org, sup)
         if info:
             source, allowed = info
-            if allowed and simple not in allowed:
+            if allowed is not None and simple not in allowed:
                 return False
-            return self._leaf_exists_raw(org, source, simple)
+            return self._get_replica_leaf_atomic(
+                org, sup, simple, info=info,
+            ) is not None
         return self._leaf_exists_raw(org, sup, simple)
 
     def _leaf_exists_raw(self, org: str, sup: str, simple: str) -> bool:
@@ -4177,9 +5301,7 @@ return 1
             if not raw:
                 return None
             root = json.loads(raw)
-            if not isinstance(root, dict):
-                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
-            return root
+            return _validate_root_document(root, org=org, sup=sup)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_root error: {e}")
             raise
@@ -4190,13 +5312,48 @@ return 1
         """Merge *flags* into the existing meta:root JSON document.
 
         Used to set read_only, cloned_from, clone_type, clone_ts without
-        disturbing version/ts.  Creates the root if it does not exist.
+        disturbing version/ts. The root must already exist.
         """
+        if not isinstance(flags, dict):
+            raise TypeError("Root flags must be a JSON object")
+        if {"version", "ts", "commit_id"}.intersection(flags):
+            raise ValueError("Root publication identity fields are immutable")
+        self.check_deletion_intent_absent(org, sup)
         key = RK.meta_root(org, sup)
         try:
+            expected_raw = self.r.get(key)
+            if not expected_raw:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            try:
+                current = _validate_root_document(
+                    json.loads(expected_raw), org=org, sup=sup,
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Corrupt Redis root JSON for {org}/{sup}"
+                ) from exc
+            candidate = dict(current)
+            candidate.update(flags)
+            try:
+                _validate_root_document(candidate, org=org, sup=sup)
+            except ValueError as exc:
+                raise ValueError("Invalid root lifecycle flags") from exc
+
             result = int(self._update_root_flags(
-                keys=[key, RK.meta_namespace_deletion_intent(org, sup)],
-                args=[json.dumps(dict(flags or {})), _now_ms()],
+                keys=[
+                    key,
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_simple_deletion_intent_index(org, sup),
+                    RK.meta_stage_deletion_intent_index(org, sup),
+                ],
+                args=[
+                    json.dumps(flags),
+                    _now_ms(),
+                    sup,
+                    expected_raw,
+                ],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
@@ -4206,6 +5363,18 @@ return 1
                 raise ValueError("Root flags are not valid JSON")
             if result == -3:
                 raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -4:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -5:
+                raise SnapshotCommitConflictError(
+                    f"SuperTable root changed before flags were updated: {org}/{sup}"
+                )
+            if result == -6:
+                raise DeletionIntentConflictError(
+                    f"A child deletion intent fences root flags for {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid root flag update result: {result}")
             return True
@@ -4245,18 +5414,38 @@ return 1
         return clones
 
     def bump_root(self, org: str, sup: str, now_ms: Optional[int] = None) -> int:
+        self.check_deletion_intent_absent(org, sup)
+        if self.get_root(org, sup) is None:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        timestamp = _publication_timestamp(now_ms)
         try:
             result = int(self._root_bump(
                 keys=[
                     RK.meta_root(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
                 ],
-                args=[int(now_ms or _now_ms())],
+                args=[timestamp],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
                     f"Durable deletion intent fences {org}/{sup}"
                 )
+            if result == -2:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -3:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -4:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result == -5:
+                raise RuntimeError(
+                    f"Redis root numeric identity is exhausted or invalid: "
+                    f"{org}/{sup}"
+                )
+            self.get_root(org, sup)
             return result
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] root_bump error: {e}")
@@ -4289,6 +5478,7 @@ return 1
             lock_token: str,
             commit_id: Optional[str] = None,
             mirror_publication: bool = False,
+            expected_mirrors: Optional[Sequence[str]] = None,
             now_ms: Optional[int] = None,
     ) -> tuple[int, int]:
         """Atomically publish one fenced table snapshot and bump its root.
@@ -4307,8 +5497,15 @@ return 1
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
+        timestamp = _publication_timestamp(now_ms)
+        base_version = _lua_safe_integer(
+            expected_version,
+            field="expected snapshot version",
+            minimum=-1,
+        )
         try:
-            payload_json = json.dumps(payload or {})
+            payload = snapshot_cache_payload(payload)
+            payload_json = json.dumps(payload)
         except Exception as exc:
             raise ValueError("snapshot payload is not JSON serializable") from exc
 
@@ -4317,6 +5514,19 @@ return 1
                 "mirror-tracked snapshot publication requires an explicit commit_id"
             )
         cid = commit_id or secrets.token_hex(16)
+        if expected_mirrors is None:
+            expected_mirrors = self.get_mirrors(org, sup)
+        if isinstance(expected_mirrors, (str, bytes)):
+            raise TypeError("expected_mirrors must be a sequence of formats")
+        normalized_mirrors: List[str] = []
+        for value in expected_mirrors:
+            if not isinstance(value, str):
+                raise ValueError("expected_mirrors contains an invalid format")
+            normalized = value.upper()
+            if normalized not in ("DELTA", "ICEBERG", "PARQUET"):
+                raise ValueError("expected_mirrors contains an invalid format")
+            if normalized not in normalized_mirrors:
+                normalized_mirrors.append(normalized)
         try:
             raw = self._snapshot_commit(
                 keys=[
@@ -4329,18 +5539,20 @@ return 1
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_simple_deletion_intent(org, sup, simple),
                     RK.schema(org, sup, simple),
+                    RK.meta_mirrors(org, sup),
                 ],
                 args=[
                     payload_json,
                     path,
-                    int(now_ms or _now_ms()),
-                    int(expected_version),
+                    timestamp,
+                    base_version,
                     expected_path or "",
                     lock_token,
                     cid,
                     "1" if mirror_publication else "0",
                     simple,
                     json.dumps(self._snapshot_schema_document(payload)),
+                    json.dumps(normalized_mirrors),
                 ],
             )
         except redis.RedisError as exc:
@@ -4390,6 +5602,29 @@ return 1
                 f"Mirror publication is owned by another publisher for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
+        if code == -11:
+            raise FileNotFoundError(
+                f"SuperTable does not exist: {org}/{sup}"
+            )
+        if code == -12:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
+            )
+        if code == -13:
+            raise RuntimeError(
+                f"Redis snapshot numeric identity is exhausted or invalid: "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -14:
+            raise SnapshotCommitConflictError(
+                f"Mirror configuration changed before snapshot publication: "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -15:
+            raise RuntimeError(
+                f"Corrupt mirror configuration during snapshot publication: "
+                f"{org}/{sup}/{simple}"
+            )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
     def prepare_mirror_publication(
@@ -4421,7 +5656,7 @@ return 1
                 normalized.append(fmt)
         if not normalized:
             raise ValueError("mirror publication requires at least one format")
-        timestamp = int(now_ms or _now_ms())
+        timestamp = _publication_timestamp(now_ms)
         record: Dict[str, Any] = {
             "schema_version": 2,
             "status": "prepared",
@@ -4445,6 +5680,7 @@ return 1
                 RK.lock_leaf(org, sup, simple),
                 RK.meta_namespace_deletion_intent(org, sup),
                 RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_root(org, sup),
             ],
             args=[json.dumps(record), lock_token, commit_id],
         )
@@ -4472,6 +5708,14 @@ return 1
             raise SnapshotCommitConflictError(
                 f"Mirror publication is owned by another publisher for "
                 f"{org}/{sup}/{simple} commit {commit_id}"
+            )
+        if code == -8:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if code == -9:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if code == -10:
+            raise ReadOnlyCatalogError(
+                f"SuperTable is read-only: {org}/{sup}"
             )
         raise RuntimeError(f"Invalid mirror publication prepare status {code}")
 
@@ -4532,7 +5776,7 @@ return 1
                 commit_id,
                 expected_previous_owner,
                 lock_token,
-                int(now_ms or _now_ms()),
+                _publication_timestamp(now_ms),
                 "1" if confirm_previous_owner_stopped is True else "0",
             ],
         )
@@ -4600,7 +5844,7 @@ return 1
             args=[
                 commit_id,
                 status,
-                int(now_ms or _now_ms()),
+                _publication_timestamp(now_ms),
                 lock_token,
                 failure_stage,
                 error_type,
@@ -4662,6 +5906,62 @@ return 1
 
     # ------------- Replica resolution ------------------------------------
 
+    @staticmethod
+    def _replica_binding_from_root(
+            root: Optional[Mapping[str, Any]], *, org: str, sup: str,
+    ) -> Optional[tuple[str, Optional[frozenset[str]]]]:
+        """Return the canonical one-hop replica binding in a valid root."""
+        if not root or root.get("clone_type") != "replica":
+            return None
+        source = root.get("cloned_from")
+        if not isinstance(source, str) or not source or source == sup:
+            raise RuntimeError(
+                f"Replica {org}/{sup} has an invalid source binding"
+            )
+        try:
+            RK.meta_root(org, source)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Replica {org}/{sup} has an invalid source binding"
+            ) from exc
+
+        tables = root.get("replica_tables")
+        if tables is None:
+            # Historical full replicas use JSON null (or omit the field).
+            allowed: Optional[frozenset[str]] = None
+        elif isinstance(tables, list):
+            normalized: set[str] = set()
+            for table in tables:
+                if not isinstance(table, str) or not table:
+                    raise RuntimeError(
+                        f"Replica {org}/{sup} has an invalid table allowlist"
+                    )
+                try:
+                    RK.meta_leaf(org, source, table)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Replica {org}/{sup} has an invalid table allowlist"
+                    ) from exc
+                normalized.add(table)
+            # An explicit empty list is an empty subset, never an implicit
+            # authorization widening to every table in the source.
+            allowed = frozenset(normalized)
+        else:
+            raise RuntimeError(
+                f"Replica {org}/{sup} has an invalid table allowlist"
+            )
+        return source, allowed
+
+    @staticmethod
+    def _decode_root_snapshot(
+            raw: Any, *, org: str, sup: str,
+    ) -> Dict[str, Any]:
+        try:
+            root = json.loads(raw)
+            return _validate_root_document(root, org=org, sup=sup)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}") from exc
+
     def _resolve_replica_info(self, org: str, sup: str) -> Optional[tuple]:
         """If *sup* is a replica clone, return (source_name, allowed_tables).
 
@@ -4670,13 +5970,50 @@ return 1
         Single get_root() call — avoids redundant Redis reads.
         """
         root = self.get_root(org, sup)
-        if root and root.get("clone_type") == "replica":
-            source = root.get("cloned_from", "")
-            if source and source != sup:
-                tables = root.get("replica_tables")
-                allowed = tables if isinstance(tables, list) and tables else None
-                return (source, allowed)
-        return None
+        try:
+            target_intent = self.r.get(
+                RK.meta_namespace_deletion_intent(org, sup)
+            )
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] replica target lifecycle read error: %s", exc)
+            raise
+        if target_intent:
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent fences {org}/{sup}"
+            )
+
+        binding = self._replica_binding_from_root(root, org=org, sup=sup)
+        if binding is None:
+            return None
+        source, allowed = binding
+
+        # A replica is a live one-hop reference, not permission to consume
+        # orphaned source leaves.  Read the source deletion fence before the
+        # root so this operation linearizes before or after deletion begins.
+        try:
+            source_intent = self.r.get(
+                RK.meta_namespace_deletion_intent(org, source)
+            )
+            source_raw = self.r.get(RK.meta_root(org, source))
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] replica source lifecycle read error: %s", exc)
+            raise
+        if source_intent:
+            raise DeletionIntentConflictError(
+                f"Replica source is fenced for deletion: {org}/{source}"
+            )
+        if not source_raw:
+            raise RuntimeError(
+                f"Replica {org}/{sup} refers to a missing source namespace"
+            )
+        source_root = self._decode_root_snapshot(
+            source_raw, org=org, sup=source,
+        )
+        if source_root.get("clone_type") == "replica":
+            raise RuntimeError(
+                f"Replica {org}/{sup} cannot reference another replica"
+            )
+        return source, allowed
 
     # Keep backward-compatible wrappers for gc.py and other callers
     def _resolve_replica_source(self, org: str, sup: str) -> Optional[str]:
@@ -4689,32 +6026,116 @@ return 1
         info = self._resolve_replica_info(org, sup)
         if info:
             source, allowed = info
-            if allowed and simple not in allowed:
+            if allowed is not None and simple not in allowed:
                 return None
-            return self._get_leaf_raw(org, source, simple)
+            return self._get_replica_leaf_atomic(
+                org, sup, simple, info=info,
+            )
         return self._get_leaf_raw(org, sup, simple)
+
+    def _get_replica_leaf_atomic(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            info: tuple[str, Optional[frozenset[str]]],
+    ) -> Optional[Dict[str, Any]]:
+        """Read one replica leaf at a single target/source lifecycle point."""
+        source, _allowed = info
+        try:
+            target_raw = self.r.get(RK.meta_root(org, sup))
+            if not target_raw:
+                raise RuntimeError(
+                    f"Replica target disappeared while reading {org}/{sup}"
+                )
+            target_root = self._decode_root_snapshot(
+                target_raw, org=org, sup=sup,
+            )
+            if self._replica_binding_from_root(
+                    target_root, org=org, sup=sup,
+            ) != info:
+                raise SnapshotCommitConflictError(
+                    f"Replica binding changed while reading {org}/{sup}"
+                )
+            result = self._get_replica_leaf(
+                keys=[
+                    RK.meta_root(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, source),
+                    RK.meta_namespace_deletion_intent(org, source),
+                    RK.meta_leaf(org, source, simple),
+                ],
+                args=[target_raw, sup, source],
+            )
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] atomic replica leaf read error: %s", exc)
+            raise
+        if not isinstance(result, (list, tuple)) or not result:
+            raise RuntimeError(f"Invalid replica leaf read result: {result!r}")
+        code = int(result[0])
+        if code == 0:
+            return None
+        if code == -1:
+            raise SnapshotCommitConflictError(
+                f"Replica binding changed while reading {org}/{sup}"
+            )
+        if code == -2:
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent fences {org}/{sup}"
+            )
+        if code == -3:
+            raise DeletionIntentConflictError(
+                f"Replica source is fenced for deletion: {org}/{source}"
+            )
+        if code == -4:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if code == -5:
+            raise RuntimeError(
+                f"Replica {org}/{sup} refers to a missing source namespace"
+            )
+        if code == -6:
+            raise RuntimeError(
+                f"Replica {org}/{sup} refers to an invalid source namespace"
+            )
+        if code != 1 or len(result) != 2:
+            raise RuntimeError(f"Invalid replica leaf read result: {result!r}")
+        try:
+            return _validate_leaf_document(json.loads(result[1]))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Corrupt Redis leaf JSON for {org}/{source}/{simple}"
+            ) from exc
 
     def _get_leaf_raw(self, org: str, sup: str, simple: str) -> Optional[Dict]:
         try:
             raw = self.r.get(RK.meta_leaf(org, sup, simple))
-            return json.loads(raw) if raw else None
+            if not raw:
+                return None
+            return _validate_leaf_document(json.loads(raw))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_leaf error: {e}")
-            return None
+            raise
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+            ) from exc
 
     def reserve_rowids(self, org: str, sup: str, simple: str, count: int) -> int:
-        """Atomically reserve ``count`` contiguous ``__rowid__`` values.
+        """Reject the retired, lifecycle-unfenced row-id allocator.
 
-        Uses INCRBY on the per-table rowid counter so the reserved block is
-        unique within the table even across concurrent writers. Returns the
-        first id of the block; the reserved range is
-        ``[start, start + count - 1]``. Ids start at 1. Returns 0 for a
-        non-positive ``count`` (nothing reserved).
+        A caller must pin the immutable snapshot floor and use
+        :meth:`reserve_rowids_at_least`, which also requires the exact live
+        table lease and validates the parent/leaf lifecycle in one Lua command.
+        Retaining the method as an explicit failure gives older integrations a
+        deterministic migration error instead of silently recreating state.
         """
         if count <= 0:
             return 0
-        new_val = int(self.r.incrby(RK.meta_rowid_seq(org, sup, simple), count))
-        return new_val - count + 1
+        raise RuntimeError(
+            "reserve_rowids is retired; use the lock- and floor-fenced "
+            "reserve_rowids_at_least API"
+        )
 
     def reserve_rowids_at_least(
             self,
@@ -4723,34 +6144,73 @@ return 1
             simple: str,
             count: int,
             floor: int,
+            *,
+            lock_token: str,
     ) -> tuple[int, int]:
         """Reserve IDs strictly above a snapshot-persisted high-water mark.
 
         Redis is the fast allocator, while ``floor`` is the durable recovery
-        boundary stored in the immutable table snapshot.  If Redis was flushed
+        boundary stored in the immutable table snapshot. If Redis was flushed
         or restored from an older backup, this atomic max-and-increment prevents
-        reusing identifiers that existing Parquet rows may still carry.
+        reusing identifiers that existing Parquet rows may still carry. The
+        reservation is atomically fenced by the exact live leaf lease, both
+        deletion intents, and valid parent/leaf catalog documents.
         Returns ``(first_reserved, new_high_watermark)``.
         """
+        if type(count) is not int or type(floor) is not int:
+            raise TypeError("rowid count and floor must be integers")
         if count <= 0:
-            safe_floor = max(0, int(floor or 0))
+            safe_floor = max(0, floor)
             return 0, safe_floor
-        safe_floor = max(0, int(floor or 0))
+        safe_floor = max(0, floor)
         int64_max = (1 << 63) - 1
         if safe_floor > int64_max:
             raise OverflowError("rowid high-watermark exceeds signed Int64")
-        if int(count) > int64_max - safe_floor:
+        if count > int64_max - safe_floor:
             raise OverflowError("rowid reservation exceeds signed Int64")
         raw = self._reserve_rowids_at_least(
-            keys=[RK.meta_rowid_seq(org, sup, simple)],
-            args=[str(safe_floor), str(int(count))],
+            keys=[
+                RK.meta_rowid_seq(org, sup, simple),
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_root(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
+            ],
+            args=[str(safe_floor), str(count), lock_token or ""],
         )
+        if isinstance(raw, (list, tuple)) and len(raw) == 1:
+            status = int(raw[0])
+            if status == -1:
+                raise LockLostError("Lost table lock before rowid reservation")
+            if status in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Deletion intent blocks rowid reservation for "
+                    f"{org}/{sup}/{simple}"
+                )
+            if status == -4:
+                raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+            if status == -5:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if status == -6:
+                raise FileNotFoundError(
+                    f"SimpleTable does not exist: {org}/{sup}/{simple}"
+                )
+            if status == -7:
+                raise RuntimeError(
+                    f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+                )
+            if status == -8:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            raise RuntimeError(f"Invalid rowid reservation status: {status}")
         try:
             previous, new_high = [int(v) for v in raw]
             start = previous + 1
         except Exception as exc:
             raise RuntimeError(f"Invalid rowid reservation result: {raw!r}") from exc
-        if new_high > int64_max or new_high != previous + int(count):
+        if new_high > int64_max or new_high != previous + count:
             raise RuntimeError(f"Unsafe rowid reservation result: {raw!r}")
         return start, new_high
 
@@ -4766,6 +6226,7 @@ return 1
             self, org: str, sup: str, simple: str, path: str,
             now_ms: Optional[int] = None, *, namespace_token: str = "",
     ) -> int:
+        timestamp = _publication_timestamp(now_ms)
         try:
             result = int(
                 self._leaf_cas_set(
@@ -4775,10 +6236,11 @@ return 1
                         RK.meta_table_names(org, sup),
                         RK.meta_namespace_deletion_intent(org, sup),
                         RK.meta_simple_deletion_intent(org, sup, simple),
+                        RK.meta_root(org, sup),
                     ],
                     args=[
                         path,
-                        int(now_ms or _now_ms()),
+                        timestamp,
                         namespace_token or "",
                         simple,
                     ],
@@ -4792,6 +6254,18 @@ return 1
                 raise DeletionIntentConflictError(
                     f"Table has a durable deletion intent: {org}/{sup}/{simple}"
                 )
+            if result == -5:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -6:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -7:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result == -8:
+                raise ValueError("Leaf timestamp is outside Redis Lua's exact range")
             if result < 0:
                 raise SnapshotCommitConflictError(
                     f"Cannot initialize existing table {org}/{sup}/{simple}"
@@ -4813,10 +6287,11 @@ return 1
             namespace_token: str = "",
     ) -> int:
         """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
+        timestamp = _publication_timestamp(now_ms)
         try:
-            payload_json = json.dumps(payload or {})
-        except Exception:
-            payload_json = "{}"
+            payload_json = json.dumps(snapshot_cache_payload(payload))
+        except Exception as exc:
+            raise ValueError("snapshot payload is not JSON serializable") from exc
 
         try:
             result = int(
@@ -4827,11 +6302,12 @@ return 1
                         RK.meta_table_names(org, sup),
                         RK.meta_namespace_deletion_intent(org, sup),
                         RK.meta_simple_deletion_intent(org, sup, simple),
+                        RK.meta_root(org, sup),
                     ],
                     args=[
                         payload_json,
                         path,
-                        int(now_ms or _now_ms()),
+                        timestamp,
                         namespace_token or "",
                         simple,
                     ],
@@ -4846,6 +6322,18 @@ return 1
                 raise DeletionIntentConflictError(
                     f"Table has a durable deletion intent: {org}/{sup}/{simple}"
                 )
+            if result == -5:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -6:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -7:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result == -8:
+                raise ValueError("Leaf timestamp is outside Redis Lua's exact range")
             if result < 0:
                 raise SnapshotCommitConflictError(
                     f"Cannot initialize existing table {org}/{sup}/{simple}"
@@ -4866,7 +6354,13 @@ return 1
             obj = json.loads(raw)
             if not isinstance(obj, dict):
                 raise ValueError("Mirror configuration must be a JSON object")
-            formats = obj.get("formats", [])
+            if (
+                type(obj.get("ts")) is not int
+                or obj["ts"] < 0
+                or obj["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+            ):
+                raise ValueError("Mirror configuration timestamp is invalid")
+            formats = obj.get("formats")
             if not isinstance(formats, list):
                 raise ValueError("Mirror configuration formats must be a list")
             seen = set()
@@ -4875,9 +6369,10 @@ return 1
                 fu = str(f).upper()
                 if fu not in ("DELTA", "ICEBERG", "PARQUET"):
                     raise ValueError(f"Unsupported configured mirror format: {f!r}")
-                if fu not in seen:
-                    seen.add(fu)
-                    out.append(fu)
+                if fu in seen:
+                    raise ValueError("Mirror configuration contains duplicates")
+                seen.add(fu)
+                out.append(fu)
             return out
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_mirrors error: {e}")
@@ -4903,11 +6398,15 @@ return 1
                 seen.add(fu)
                 ordered.append(fu)
         try:
-            payload = {"formats": ordered, "ts": int(now_ms or _now_ms())}
+            payload = {
+                "formats": ordered,
+                "ts": _publication_timestamp(now_ms),
+            }
             result = int(self._set_mirrors_fenced(
                 keys=[
                     RK.meta_mirrors(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
                 ],
                 args=[json.dumps(payload)],
             ) or 0)
@@ -4917,6 +6416,16 @@ return 1
                 )
             if result == -2:
                 raise ValueError("Mirror configuration is not valid JSON")
+            if result == -3:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -4:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -5:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid mirror configuration result: {result}")
             return ordered
@@ -4925,23 +6434,63 @@ return 1
             raise
 
     def enable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
-        cur = self.get_mirrors(org, sup)
-        fu = str(fmt).upper()
-        if fu not in ("DELTA", "ICEBERG", "PARQUET"):
-            raise ValueError(f"Unsupported mirror format: {fmt!r}")
-        if fu in cur:
-            return cur
-        return self.set_mirrors(org, sup, cur + [fu])
+        return self._mutate_mirror(org, sup, fmt, enable=True)
 
     def disable_mirror(self, org: str, sup: str, fmt: str) -> List[str]:
-        cur = self.get_mirrors(org, sup)
+        return self._mutate_mirror(org, sup, fmt, enable=False)
+
+    def _mutate_mirror(
+            self,
+            org: str,
+            sup: str,
+            fmt: str,
+            *,
+            enable: bool,
+    ) -> List[str]:
+        """Atomically add or remove one mirror format.
+
+        The Lua boundary validates the namespace root and durable deletion
+        fence before reading or replacing the configuration. Concurrent
+        acknowledged mutations therefore compose without a client-side
+        read/replace race, while stale handles cannot recreate mirror state
+        after namespace deletion.
+        """
         fu = str(fmt).upper()
         if fu not in ("DELTA", "ICEBERG", "PARQUET"):
             raise ValueError(f"Unsupported mirror format: {fmt!r}")
-        nxt = [x for x in cur if x != fu]
-        if nxt == cur:
-            return cur
-        return self.set_mirrors(org, sup, nxt)
+        try:
+            result = self._mutate_mirror_fenced(
+                keys=[
+                    RK.meta_mirrors(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
+                ],
+                args=[fu, "1" if enable else "0", _now_ms()],
+            )
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -3:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -4:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -5:
+                raise ValueError("Persisted mirror configuration is invalid")
+            if result == -6:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"Invalid mirror configuration result: {result!r}"
+                )
+            return [self._decode_member(value) for value in result]
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] mutate_mirror error: {exc}")
+            raise
 
     # ------------- User and Role Management (RBAC, UUID-based) ------------- #
 
@@ -5001,6 +6550,10 @@ return 1
                 for uid in uids:
                     pipe.hgetall(RK.rbac_user_doc(org, sup, uid))
                 results = pipe.execute()
+            if len(results) != len(uids):
+                raise RbacIntegrityError(
+                    "RBAC user listing returned an incomplete document set"
+                )
             for uid, raw in zip(uids, results):
                 if not raw:
                     raise RbacIntegrityError(
@@ -5027,6 +6580,7 @@ return 1
                 users.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_users error: {e}")
+            raise
         return users
 
     def get_roles(self, org: str, sup: str) -> List[Dict[str, Any]]:
@@ -5042,6 +6596,10 @@ return 1
                 for rid in rids:
                     pipe.hgetall(RK.rbac_role_doc(org, sup, rid))
                 results = pipe.execute()
+            if len(results) != len(rids):
+                raise RbacIntegrityError(
+                    "RBAC role listing returned an incomplete document set"
+                )
             for rid, raw in zip(rids, results):
                 if not raw:
                     raise RbacIntegrityError(
@@ -5057,6 +6615,7 @@ return 1
                 roles.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_roles error: {e}")
+            raise
         return roles
 
     def get_role_details(self, org: str, sup: str, role_id: str) -> Optional[Dict[str, Any]]:
@@ -7826,29 +9385,154 @@ return 1
 
     # ------------- Listings via SCAN -------------
 
-    def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        """Yields full Redis keys: supertable:{org}:lakes:{sup}:meta:leaf:doc:* (replica-aware)."""
-        info = self._resolve_replica_info(org, sup)
-        effective_sup = info[0] if info else sup
-        allowed = info[1] if info else None
-
-        pattern = RK.meta_leaf_pattern(org, effective_sup)
+    def _scan_leaf_keys_raw(
+            self,
+            org: str,
+            sup: str,
+            *,
+            allowed: Optional[frozenset[str]],
+            count: int,
+    ) -> Iterator[str]:
+        """Enumerate one physical namespace without resolving it again."""
+        pattern = RK.meta_leaf_pattern(org, sup)
         cursor = 0
         try:
             while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
-                for k in keys:
-                    ks = k if isinstance(k, str) else k.decode('utf-8')
-                    if allowed:
-                        simple = ks.rsplit("meta:leaf:doc:", 1)[-1]
+                cursor, keys = self.r.scan(
+                    cursor=cursor, match=pattern, count=count,
+                )
+                for key in keys:
+                    key_text = (
+                        key if isinstance(key, str) else key.decode("utf-8")
+                    )
+                    if allowed is not None:
+                        simple = key_text.rsplit("meta:leaf:doc:", 1)[-1]
                         if simple not in allowed:
                             continue
-                    yield ks
+                    yield key_text
                 if cursor == 0:
                     break
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] SCAN error: {e}")
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] SCAN error: %s", exc)
             raise
+
+    def _pin_leaf_scan(
+            self,
+            org: str,
+            sup: str,
+            info: Optional[tuple],
+    ) -> Dict[str, Any]:
+        """Atomically pin target and physical-source lifecycle documents."""
+        effective_sup = info[0] if info else sup
+        keys = [
+            RK.meta_root(org, sup),
+            RK.meta_namespace_deletion_intent(org, sup),
+        ]
+        if effective_sup != sup:
+            keys.extend([
+                RK.meta_root(org, effective_sup),
+                RK.meta_namespace_deletion_intent(org, effective_sup),
+            ])
+        try:
+            with self.r.pipeline(transaction=True) as pipe:
+                for key in keys:
+                    pipe.get(key)
+                values = pipe.execute()
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] leaf-scan lifecycle pin error: %s", exc)
+            raise
+        if len(values) != len(keys):
+            raise RuntimeError("Redis returned an incomplete lifecycle pin")
+
+        target_raw, target_intent = values[:2]
+        if target_intent:
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent fences {org}/{sup}"
+            )
+        if not target_raw:
+            raise RuntimeError(
+                f"Missing catalog root while enumerating {org}/{sup}"
+            )
+        target_root = self._decode_root_snapshot(
+            target_raw, org=org, sup=sup,
+        )
+        pinned_binding = self._replica_binding_from_root(
+            target_root, org=org, sup=sup,
+        )
+        if pinned_binding != info:
+            raise SnapshotCommitConflictError(
+                f"Catalog changed while pinning {org}/{sup}"
+            )
+
+        if effective_sup == sup:
+            source_raw = target_raw
+            source_intent = target_intent
+        else:
+            source_raw, source_intent = values[2:]
+            if source_intent:
+                raise DeletionIntentConflictError(
+                    f"Replica source is fenced for deletion: "
+                    f"{org}/{effective_sup}"
+                )
+            if not source_raw:
+                raise RuntimeError(
+                    f"Replica {org}/{sup} refers to a missing source namespace"
+                )
+            source_root = self._decode_root_snapshot(
+                source_raw, org=org, sup=effective_sup,
+            )
+            if source_root.get("clone_type") == "replica":
+                raise RuntimeError(
+                    f"Replica {org}/{sup} cannot reference another replica"
+                )
+
+        return {
+            "keys": tuple(keys),
+            "values": tuple(values),
+            "effective_sup": effective_sup,
+            "allowed": info[1] if info else None,
+            "source_root": source_raw,
+        }
+
+    def _verify_leaf_scan_pin(
+            self, *, org: str, effective_sup: str, pin: Mapping[str, Any],
+    ) -> None:
+        keys = list(pin["keys"])
+        try:
+            with self.r.pipeline(transaction=True) as pipe:
+                for key in keys:
+                    pipe.get(key)
+                values = pipe.execute()
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] leaf-scan lifecycle recheck error: %s", exc)
+            raise
+        if tuple(values) != tuple(pin["values"]):
+            raise SnapshotCommitConflictError(
+                f"Catalog changed while enumerating {org}/{effective_sup}; "
+                "refusing a partial snapshot"
+            )
+
+    def scan_leaf_keys(
+            self,
+            org: str,
+            sup: str,
+            count: int = 1000,
+            *,
+            resolve_replica: bool = True,
+    ) -> Iterator[str]:
+        """Yield full leaf keys, optionally resolving a replica source.
+
+        Namespace deletion passes ``resolve_replica=False``: it must enumerate
+        only children physically owned by the namespace being removed, and
+        recovery must remain able to sweep a stale/corrupt root document.
+        """
+        batch_size = max(1, int(count))
+        info = self._resolve_replica_info(org, sup) if resolve_replica else None
+        effective_sup = info[0] if info else sup
+        allowed = info[1] if info else None
+        yield from self._scan_leaf_keys_raw(
+            org, effective_sup, allowed=allowed, count=batch_size,
+        )
 
     def scan_leaf_items(self, org: str, sup: str, count: int = 1000) -> Iterator[Dict]:
         """Iterate one root-generation-consistent set of leaf documents.
@@ -7858,36 +9542,26 @@ return 1
         mid-enumeration.  Reads must fail/retry instead of silently omitting
         physical tables (and their deletion vectors).
         """
+        batch_size = max(1, int(count))
         info = self._resolve_replica_info(org, sup)
-        effective_sup = info[0] if info else sup
-        root_key = RK.meta_root(org, effective_sup)
-        try:
-            root_before = self.r.get(root_key)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] root generation read error: {e}")
-            raise
-        if not root_before:
-            raise RuntimeError(
-                f"Missing catalog root while enumerating {org}/{effective_sup}"
-            )
+        pin = self._pin_leaf_scan(org, sup, info)
+        effective_sup = str(pin["effective_sup"])
         batch: List[str] = []
-        for key in self.scan_leaf_keys(org, sup, count=count):
+        for key in self._scan_leaf_keys_raw(
+                org,
+                effective_sup,
+                allowed=pin["allowed"],
+                count=batch_size,
+        ):
             batch.append(key)
-            if len(batch) >= count:
+            if len(batch) >= batch_size:
                 yield from self._fetch_batch(batch)
                 batch = []
         if batch:
             yield from self._fetch_batch(batch)
-        try:
-            root_after = self.r.get(root_key)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] root generation recheck error: {e}")
-            raise
-        if root_after != root_before:
-            raise SnapshotCommitConflictError(
-                f"Catalog changed while enumerating {org}/{effective_sup}; "
-                "refusing a partial snapshot"
-            )
+        self._verify_leaf_scan_pin(
+            org=org, effective_sup=effective_sup, pin=pin,
+        )
 
     def _fetch_batch(self, keys: List[str]) -> Iterator[Dict]:
         try:
@@ -7907,23 +9581,197 @@ return 1
                     f"Catalog leaf disappeared during snapshot enumeration: {k}"
                 )
             try:
-                obj = json.loads(raw)
-                if not isinstance(obj, dict):
-                    raise ValueError("leaf is not a JSON object")
+                obj = _validate_leaf_document(json.loads(raw))
                 simple = k.rsplit("meta:leaf:doc:", 1)[-1]
                 item = {
                     "simple": simple,
-                    "version": int(obj.get("version", -1)),
-                    "ts": int(obj.get("ts", 0)),
-                    "path": obj.get("path", ""),
+                    "version": obj["version"],
+                    "ts": obj["ts"],
+                    "path": obj["path"],
                     "payload": obj.get("payload"),
+                    # Linked-share policy overlays have existed beside the
+                    # cached payload as well as inside it. Preserve the raw
+                    # marker (including malformed non-null values) so the read
+                    # boundary can fail closed instead of silently dropping it.
+                    "_row_filter": obj.get("_row_filter"),
                 }
-                if item["version"] < 0 or not isinstance(item["path"], str) \
-                        or not item["path"]:
-                    raise ValueError("leaf has invalid version/path")
                 yield item
             except Exception as exc:
                 raise RuntimeError(f"Malformed catalog leaf {k}") from exc
+
+    @staticmethod
+    def _quality_key(org: str, sup: str, *parts: str) -> str:
+        return RK.quality_prefix(org, sup) + ":".join(parts)
+
+    @classmethod
+    def _quality_table_mutable_keys(
+            cls, org: str, sup: str, simple: str,
+    ) -> List[str]:
+        """Return the finite mutable DQ state owned by one table.
+
+        Column-level ``latest`` documents are dynamic and are removed through
+        a separately bounded, deletion-intent-fenced scan.  Immutable delivered
+        history, the shared durable history outbox, and name-scoped custom-rule
+        policy deliberately survive.
+        """
+        keys = [
+            cls._quality_key(org, sup, "config", simple),
+            cls._quality_key(org, sup, "schedule", simple),
+            cls._quality_key(org, sup, "latest", simple),
+            cls._quality_key(org, sup, "anomalies", simple),
+            cls._quality_key(org, sup, "pending", simple),
+            cls._quality_key(org, sup, "pending_unresolved", simple),
+            cls._quality_key(org, sup, "running", simple),
+            cls._quality_key(org, sup, "cooldown", simple),
+        ]
+        for mode in cls._QUALITY_MODES:
+            keys.extend([
+                cls._quality_key(org, sup, "pending_mode", simple, mode),
+                cls._quality_key(org, sup, "cooldown", simple, mode),
+                cls._quality_key(org, sup, "retry", simple, mode),
+                cls._quality_key(org, sup, "cron_state", simple, mode),
+            ])
+        return keys
+
+    @staticmethod
+    def _redis_key_text(raw: Any) -> str:
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, bytes):
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("Redis returned a non-UTF-8 quality key") from exc
+        raise RuntimeError(
+            f"Redis returned an invalid quality key type: {type(raw).__name__}"
+        )
+
+    def _delete_simple_quality_column_keys(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            lock_token: str,
+            namespace_token: str,
+            intent_id: str,
+    ) -> None:
+        """Restart-safely remove bounded ``latest:{table}:*`` documents."""
+        prefix = self._quality_key(org, sup, "latest", simple) + ":"
+        pattern = prefix + "*"
+        seen: set[str] = set()
+        scan_calls = 0
+
+        # Deleting while SCAN walks Redis can move buckets.  Complete passes
+        # are repeated until one observes no matching keys.  Both discovery
+        # and server round trips have explicit bounds; a failure leaves the
+        # durable tombstone in place so recovery can safely resume.
+        while True:
+            cursor = 0
+            found_this_pass = False
+            while True:
+                scan_calls += 1
+                if scan_calls > self._QUALITY_DYNAMIC_SCAN_CALL_LIMIT:
+                    raise RuntimeError(
+                        "Quality column-key cleanup exceeded its scan-call bound"
+                    )
+                cursor, raw_keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=self._QUALITY_DYNAMIC_SCAN_COUNT,
+                )
+                candidates: List[str] = []
+                for raw_key in raw_keys:
+                    key = self._redis_key_text(raw_key)
+                    if not key.startswith(prefix):
+                        raise RuntimeError(
+                            "Redis quality scan returned a key outside its table prefix"
+                        )
+                    seen.add(key)
+                    if len(seen) > self._QUALITY_DYNAMIC_KEY_LIMIT:
+                        raise RuntimeError(
+                            "Quality column-key cleanup exceeded its key bound"
+                        )
+                    candidates.append(key)
+
+                for offset in range(0, len(candidates), self._QUALITY_DYNAMIC_SCAN_COUNT):
+                    chunk = candidates[
+                        offset:offset + self._QUALITY_DYNAMIC_SCAN_COUNT
+                    ]
+                    result = int(self._delete_simple_quality_keys(
+                        keys=[
+                            RK.lock_namespace(org, sup),
+                            RK.lock_leaf(org, sup, simple),
+                            RK.meta_namespace_deletion_intent(org, sup),
+                            RK.meta_simple_deletion_intent(org, sup, simple),
+                            *chunk,
+                        ],
+                        args=[
+                            namespace_token or "",
+                            lock_token or "",
+                            intent_id or "",
+                            prefix,
+                        ],
+                    ) or 0)
+                    if result == -1:
+                        raise LockLostError(
+                            "Lost lock while cleaning table quality state"
+                        )
+                    if result == -2:
+                        raise DeletionIntentConflictError(
+                            "Deletion intent changed while cleaning table quality state"
+                        )
+                    if result == -3:
+                        raise RuntimeError(
+                            f"Corrupt deletion intent for {org}/{sup}/{simple}"
+                        )
+                    if result == -4:
+                        raise RuntimeError(
+                            "Unsafe quality column key returned by Redis scan"
+                        )
+                    if result < 0:
+                        raise RuntimeError(
+                            f"Invalid quality cleanup result: {result}"
+                        )
+                if candidates:
+                    found_this_pass = True
+                cursor = int(cursor)
+                if cursor == 0:
+                    break
+            if not found_this_pass:
+                return
+
+    def _assert_simple_quality_column_keys_absent(
+            self, org: str, sup: str, simple: str,
+    ) -> None:
+        """Fail closed if dynamic quality state remains before tombstone clear."""
+        prefix = self._quality_key(org, sup, "latest", simple) + ":"
+        pattern = prefix + "*"
+        cursor = 0
+        calls = 0
+        while True:
+            calls += 1
+            if calls > self._QUALITY_DYNAMIC_SCAN_CALL_LIMIT:
+                raise RuntimeError(
+                    "Quality column-key verification exceeded its scan-call bound"
+                )
+            cursor, raw_keys = self.r.scan(
+                cursor=cursor,
+                match=pattern,
+                count=self._QUALITY_DYNAMIC_SCAN_COUNT,
+            )
+            for raw_key in raw_keys:
+                key = self._redis_key_text(raw_key)
+                if not key.startswith(prefix):
+                    raise RuntimeError(
+                        "Redis quality scan returned a key outside its table prefix"
+                    )
+                raise RuntimeError(
+                    "Dynamic table quality state remains after deletion"
+                )
+            cursor = int(cursor)
+            if cursor == 0:
+                return
 
     # ------------- Deletions (dangerous) -------------
 
@@ -7941,8 +9789,10 @@ return 1
 
         Storage must already be empty and the caller must still own the same
         auto-renewed leaf lock used by writers. The table-name index, schema,
-        row-id allocator, runtime config, and mirror-recovery intent are
-        removed with the leaf so delete/recreate cannot inherit stale state.
+        row-id allocator, runtime config, mirror-recovery intent, and mutable
+        quality state are removed with the leaf so delete/recreate cannot
+        inherit stale operational state. Immutable delivered quality history,
+        its durable outbox, and user-authored name-scoped rules survive.
         """
         if not (
             org and sup and simple and lock_token and namespace_token
@@ -7950,6 +9800,14 @@ return 1
         ):
             return False
         try:
+            self._delete_simple_quality_column_keys(
+                org,
+                sup,
+                simple,
+                lock_token=lock_token,
+                namespace_token=namespace_token,
+                intent_id=intent_id,
+            )
             result = int(self._delete_simple_table(
                 keys=[
                     RK.meta_leaf(org, sup, simple),
@@ -7964,6 +9822,7 @@ return 1
                     RK.meta_simple_deletion_intent_index(org, sup),
                     RK.lock_namespace(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
+                    *self._quality_table_mutable_keys(org, sup, simple),
                 ],
                 args=[
                     lock_token,
@@ -8000,11 +9859,22 @@ return 1
                 raise RuntimeError(
                     f"Corrupt deletion intent for {org}/{sup}/{simple}"
                 )
+            if result == -8:
+                raise RuntimeError(
+                    "simple deletion-intent index has wrong Redis type"
+                )
+            if result == -9:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result < 0:
                 raise RuntimeError(
                     f"invalid delete_simple_table result: {result}"
                 )
             return True
+        except LockLostError as e:
+            logger.error(f"[redis-catalog] delete_simple_table error: {e}")
+            return False
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_simple_table error: {e}")
             return False
@@ -8159,50 +10029,122 @@ return 1
     # Data Sharing — provider-side share definitions
     # --------------------------------------------------------------------------- #
 
-    def create_share(self, org: str, share_id: str, share_doc: Dict[str, Any]) -> None:
-        """Store a share definition and add to the org-level index."""
+    @staticmethod
+    def _decode_control_object(raw: Any, *, description: str) -> Dict[str, Any]:
         try:
-            with self.r.pipeline() as p:
-                p.set(RK.share_doc(org, share_id), json.dumps(share_doc))
-                p.sadd(RK.share_index(org), share_id)
-                p.execute()
+            document = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Corrupt {description}") from exc
+        if not isinstance(document, dict):
+            raise RuntimeError(f"Corrupt {description}")
+        return document
+
+    @staticmethod
+    def _decode_index_member(raw: Any, *, description: str) -> str:
+        if isinstance(raw, str):
+            value = raw
+        elif isinstance(raw, bytes):
+            try:
+                value = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(f"Corrupt {description}") from exc
+        else:
+            raise RuntimeError(f"Corrupt {description}")
+        if not value:
+            raise RuntimeError(f"Corrupt {description}")
+        return value
+
+    def create_share(self, org: str, share_id: str, share_doc: Dict[str, Any]) -> None:
+        """Create a share definition and its index entry atomically."""
+        if not isinstance(share_doc, dict):
+            raise TypeError("Share document must be a JSON object")
+        try:
+            result = int(self._mutate_share(
+                keys=[RK.share_doc(org, share_id), RK.share_index(org)],
+                args=[json.dumps(share_doc), share_id, "create"],
+            ) or 0)
+            if result == -1:
+                raise FileExistsError(f"Share already exists: {org}/{share_id}")
+            if result == -2:
+                raise RuntimeError(f"Corrupt share metadata/index for {org}")
+            if result == -3:
+                raise ValueError("Share document is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid share creation result: {result}")
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] create_share error: {e}")
+            raise
+
+    def update_share(
+            self, org: str, share_id: str, share_doc: Dict[str, Any],
+    ) -> bool:
+        """Replace an existing, indexed share without creating an orphan."""
+        if not isinstance(share_doc, dict):
+            raise TypeError("Share document must be a JSON object")
+        try:
+            result = int(self._mutate_share(
+                keys=[RK.share_doc(org, share_id), RK.share_index(org)],
+                args=[json.dumps(share_doc), share_id, "update"],
+            ) or 0)
+            if result == 0:
+                return False
+            if result == -2:
+                raise RuntimeError(f"Corrupt share metadata/index for {org}")
+            if result == -3:
+                raise ValueError("Share document is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid share update result: {result}")
+            return True
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] update_share error: %s", exc)
             raise
 
     def get_share(self, org: str, share_id: str) -> Optional[Dict[str, Any]]:
         try:
             raw = self.r.get(RK.share_doc(org, share_id))
-            return json.loads(raw) if raw else None
+            if raw is None:
+                return None
+            return self._decode_control_object(
+                raw, description=f"share metadata for {org}/{share_id}",
+            )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_share error: {e}")
-            return None
+            raise
 
     def delete_share(self, org: str, share_id: str) -> bool:
         try:
-            with self.r.pipeline() as p:
-                p.delete(RK.share_doc(org, share_id))
-                p.srem(RK.share_index(org), share_id)
-                p.execute()
-            return True
+            result = int(self._mutate_share(
+                keys=[RK.share_doc(org, share_id), RK.share_index(org)],
+                args=["", share_id, "delete"],
+            ) or 0)
+            if result == -2:
+                raise RuntimeError(f"Corrupt share metadata/index for {org}")
+            if result < 0:
+                raise RuntimeError(f"Invalid share deletion result: {result}")
+            return result == 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_share error: {e}")
-            return False
+            raise
 
     def list_shares(self, org: str) -> List[Dict[str, Any]]:
         shares: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(RK.share_index(org))
             for sid_raw in (members or []):
-                sid = sid_raw if isinstance(sid_raw, str) else sid_raw.decode("utf-8")
+                sid = self._decode_index_member(
+                    sid_raw, description=f"share index for {org}",
+                )
                 raw = self.r.get(RK.share_doc(org, sid))
-                if raw:
-                    try:
-                        shares.append(json.loads(raw))
-                    except Exception:
-                        continue
+                if raw is None:
+                    raise RuntimeError(
+                        f"Share index references missing metadata for {org}/{sid}"
+                    )
+                shares.append(self._decode_control_object(
+                    raw, description=f"share metadata for {org}/{sid}",
+                ))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_shares error: {e}")
+            raise
         return shares
 
     # --------------------------------------------------------------------------- #
@@ -8210,14 +10152,17 @@ return 1
     # --------------------------------------------------------------------------- #
 
     def create_linked_share(self, org: str, sup: str, link_id: str, link_doc: Dict[str, Any]) -> None:
+        if not isinstance(link_doc, dict):
+            raise TypeError("Linked-share document must be a JSON object")
         try:
             result = int(self._upsert_linked_share_fenced(
                 keys=[
                     RK.linked_share_doc(org, sup, link_id),
                     RK.linked_share_index(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
                 ],
-                args=[json.dumps(link_doc), link_id, "1"],
+                args=[json.dumps(link_doc), link_id, "create"],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
@@ -8225,6 +10170,24 @@ return 1
                 )
             if result == -2:
                 raise ValueError("Linked-share document is not valid JSON")
+            if result == -3:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -4:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -5:
+                raise RuntimeError(
+                    f"Corrupt linked-share metadata/index for {org}/{sup}"
+                )
+            if result == -6:
+                raise FileExistsError(
+                    f"Linked share already exists: {org}/{sup}/{link_id}"
+                )
+            if result == -7:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(
                     f"Invalid linked-share publication result: {result}"
@@ -8236,20 +10199,30 @@ return 1
     def get_linked_share(self, org: str, sup: str, link_id: str) -> Optional[Dict[str, Any]]:
         try:
             raw = self.r.get(RK.linked_share_doc(org, sup, link_id))
-            return json.loads(raw) if raw else None
+            if raw is None:
+                return None
+            return self._decode_control_object(
+                raw,
+                description=(
+                    f"linked-share metadata for {org}/{sup}/{link_id}"
+                ),
+            )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_linked_share error: {e}")
-            return None
+            raise
 
     def update_linked_share(self, org: str, sup: str, link_id: str, doc: Dict[str, Any]) -> bool:
+        if not isinstance(doc, dict):
+            raise TypeError("Linked-share document must be a JSON object")
         try:
             result = int(self._upsert_linked_share_fenced(
                 keys=[
                     RK.linked_share_doc(org, sup, link_id),
                     RK.linked_share_index(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
                 ],
-                args=[json.dumps(doc), link_id, "0"],
+                args=[json.dumps(doc), link_id, "update"],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
@@ -8257,6 +10230,22 @@ return 1
                 )
             if result == -2:
                 raise ValueError("Linked-share document is not valid JSON")
+            if result == -3:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -4:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -5:
+                raise RuntimeError(
+                    f"Corrupt linked-share metadata/index for {org}/{sup}"
+                )
+            if result == -7:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result == 0:
+                return False
             if result != 1:
                 raise RuntimeError(
                     f"Invalid linked-share publication result: {result}"
@@ -8264,33 +10253,70 @@ return 1
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] update_linked_share error: {e}")
-            return False
+            raise
 
     def delete_linked_share(self, org: str, sup: str, link_id: str) -> bool:
         try:
-            with self.r.pipeline() as p:
-                p.delete(RK.linked_share_doc(org, sup, link_id))
-                p.srem(RK.linked_share_index(org, sup), link_id)
-                p.execute()
-            return True
+            result = int(self._delete_linked_share_fenced(
+                keys=[
+                    RK.linked_share_doc(org, sup, link_id),
+                    RK.linked_share_index(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
+                ],
+                args=[link_id],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -2:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -3:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -4:
+                raise RuntimeError(
+                    f"Corrupt linked-share metadata/index for {org}/{sup}"
+                )
+            if result == -5:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result < 0:
+                raise RuntimeError(
+                    f"Invalid linked-share deletion result: {result}"
+                )
+            return result == 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_linked_share error: {e}")
-            return False
+            raise
 
     def list_linked_shares(self, org: str, sup: str) -> List[Dict[str, Any]]:
         links: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(RK.linked_share_index(org, sup))
             for lid_raw in (members or []):
-                lid = lid_raw if isinstance(lid_raw, str) else lid_raw.decode("utf-8")
+                lid = self._decode_index_member(
+                    lid_raw,
+                    description=f"linked-share index for {org}/{sup}",
+                )
                 raw = self.r.get(RK.linked_share_doc(org, sup, lid))
-                if raw:
-                    try:
-                        links.append(json.loads(raw))
-                    except Exception:
-                        continue
+                if raw is None:
+                    raise RuntimeError(
+                        "Linked-share index references missing metadata for "
+                        f"{org}/{sup}/{lid}"
+                    )
+                links.append(self._decode_control_object(
+                    raw,
+                    description=(
+                        f"linked-share metadata for {org}/{sup}/{lid}"
+                    ),
+                ))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_linked_shares error: {e}")
+            raise
         return links
 
     # --------------------------------------------------------------------------- #
@@ -8305,8 +10331,14 @@ return 1
             meta: Dict[str, Any],
             *,
             lock_token: str,
+            create_only: bool = False,
     ) -> bool:
-        """Upsert staging metadata and ensure it is indexed for listing."""
+        """Publish staging metadata and ensure it is indexed for listing.
+
+        ``create_only`` makes initial stage registration atomic with the lock
+        and deletion-intent checks.  It prevents a caller that observed an
+        absent document from replacing metadata created before publication.
+        """
         if not (org and sup and staging_name):
             return False
         payload = dict(meta or {})
@@ -8323,8 +10355,12 @@ return 1
                     RK.lock_stage(org, sup, staging_name),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_stage_deletion_intent(org, sup, staging_name),
+                    RK.meta_root(org, sup),
                 ],
-                args=[json.dumps(payload), staging_name, lock_token or ""],
+                args=[
+                    json.dumps(payload), staging_name, lock_token or "",
+                    "1" if create_only else "0", org, sup,
+                ],
             ) or 0)
             if result == -1:
                 raise LockLostError("Lost staging lock before metadata publication")
@@ -8335,6 +10371,26 @@ return 1
                 )
             if result == -4:
                 raise ValueError("Staging metadata is not valid JSON")
+            if result == -5:
+                raise FileExistsError(
+                    f"Staging metadata already exists for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -6:
+                raise RuntimeError(
+                    f"Corrupt staging metadata/index for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -7:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -8:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -9:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid staging upsert result: {result}")
             return True
@@ -8350,14 +10406,100 @@ return 1
             raw = self.r.get(RK.staging_doc(org, sup, staging_name))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_staging_meta error: {e}")
-            return None
+            raise
         if not raw:
             return None
         try:
             obj = json.loads(raw)
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            return None
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            raise RuntimeError(
+                f"Corrupt staging metadata for {org}/{sup}/{staging_name}"
+            ) from e
+        if not isinstance(obj, dict):
+            raise RuntimeError(
+                f"Corrupt staging metadata for {org}/{sup}/{staging_name}"
+            )
+        return obj
+
+    def upsert_staging_file_meta(
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            file_name: str,
+            meta: Dict[str, Any],
+            *,
+            lock_token: str,
+    ) -> bool:
+        """Publish one staged file into the lock-fenced stage document.
+
+        The physical parquet object has a unique generated name, so a rejected
+        stale writer leaves only an unreferenced object. The live file index is
+        updated in Redis in the same Lua boundary that verifies lock ownership
+        and both durable deletion intents.
+        """
+        if not (org and sup and staging_name and file_name):
+            raise ValueError(
+                "organization, supertable, staging, and file name are required"
+            )
+        payload = dict(meta or {})
+        payload["file"] = file_name
+        try:
+            result = int(self._upsert_staging_file_meta(
+                keys=[
+                    RK.staging_doc(org, sup, staging_name),
+                    RK.lock_stage(org, sup, staging_name),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_stage_deletion_intent(org, sup, staging_name),
+                    RK.meta_root(org, sup),
+                ],
+                args=[
+                    json.dumps(payload), file_name, lock_token or "",
+                    org, sup, staging_name,
+                ],
+            ) or 0)
+            if result == -1:
+                raise LockLostError(
+                    "Lost staging lock before file-index publication"
+                )
+            if result in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences staging "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -4:
+                raise ValueError("Staging file metadata is not valid JSON")
+            if result == -5:
+                raise RuntimeError(
+                    f"Corrupt staging metadata for {org}/{sup}/{staging_name}"
+                )
+            if result == -6:
+                raise RuntimeError(
+                    f"Cannot index a file for missing staging "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -7:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -8:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -9:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result != 1:
+                raise RuntimeError(
+                    f"Invalid staging file-index result: {result}"
+                )
+            return True
+        except redis.RedisError as exc:
+            logger.error(
+                "[redis-catalog] upsert_staging_file_meta failed for "
+                "%s/%s/%s/%s: %s",
+                org, sup, staging_name, file_name, exc,
+            )
+            raise
 
     def list_stagings(self, org: str, sup: str, *, count: int = 1000) -> List[str]:
         """List staging names from the staging index set."""
@@ -8365,10 +10507,26 @@ return 1
             return []
         try:
             names = self.r.smembers(RK.staging_index(org, sup)) or set()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"Corrupt staging index for {org}/{sup}"
+            ) from exc
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_stagings smembers error: {e}")
-            return []
-        return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
+            raise
+        decoded: set[str] = set()
+        for raw_name in names:
+            name = self._decode_index_member(
+                raw_name, description=f"staging index for {org}/{sup}",
+            )
+            try:
+                RK.staging_doc(org, sup, name)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Corrupt staging index for {org}/{sup}"
+                ) from exc
+            decoded.add(name)
+        return sorted(decoded)
 
     def delete_staging_meta(
             self,
@@ -8524,6 +10682,7 @@ return 1
             meta: Dict[str, Any],
             *,
             lock_token: str,
+            create_only: bool = False,
     ) -> bool:
         """Upsert pipe metadata and ensure it is indexed for listing under a staging."""
         if not (org and sup and staging_name and pipe_name):
@@ -8543,8 +10702,13 @@ return 1
                     RK.lock_stage(org, sup, staging_name),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_stage_deletion_intent(org, sup, staging_name),
+                    RK.staging_doc(org, sup, staging_name),
+                    RK.meta_root(org, sup),
                 ],
-                args=[json.dumps(payload), pipe_name, lock_token or ""],
+                args=[
+                    json.dumps(payload), pipe_name, lock_token or "",
+                    "1" if create_only else "0", org, sup, staging_name,
+                ],
             ) or 0)
             if result == -1:
                 raise LockLostError("Lost staging lock before pipe publication")
@@ -8555,6 +10719,35 @@ return 1
                 )
             if result == -4:
                 raise ValueError("Pipe metadata is not valid JSON")
+            if result == -5:
+                raise FileExistsError(
+                    f"Pipe metadata already exists for "
+                    f"{org}/{sup}/{staging_name}/{pipe_name}"
+                )
+            if result == -6:
+                raise RuntimeError(
+                    f"Corrupt pipe metadata/index for "
+                    f"{org}/{sup}/{staging_name}/{pipe_name}"
+                )
+            if result == -7:
+                raise FileNotFoundError(
+                    f"Staging does not exist: {org}/{sup}/{staging_name}"
+                )
+            if result == -8:
+                raise RuntimeError(
+                    f"Corrupt staging metadata for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -9:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -10:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -11:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid pipe upsert result: {result}")
             return True
@@ -8571,14 +10764,22 @@ return 1
             )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_pipe_meta error: {e}")
-            return None
+            raise
         if not raw:
             return None
         try:
             obj = json.loads(raw)
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            return None
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            raise RuntimeError(
+                f"Corrupt pipe metadata for "
+                f"{org}/{sup}/{staging_name}/{pipe_name}"
+            ) from e
+        if not isinstance(obj, dict):
+            raise RuntimeError(
+                f"Corrupt pipe metadata for "
+                f"{org}/{sup}/{staging_name}/{pipe_name}"
+            )
+        return obj
 
 
     def list_pipe_metas(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> List[Dict[str, Any]]:
@@ -8616,6 +10817,7 @@ return 1
                 return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_pipes smembers error: {e}")
+            raise
 
         # Fallback: scan pipe definition keys.
         pattern = RK.pipe_pattern(org, sup, staging_name)
@@ -8635,23 +10837,74 @@ return 1
                     break
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_pipes scan error: {e}")
+            raise
         return sorted(seen)
 
-    def delete_pipe_meta(self, org: str, sup: str, staging_name: str, pipe_name: str) -> int:
-        """Delete a pipe meta key and remove it from the pipe index set."""
+    def delete_pipe_meta(
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            pipe_name: str,
+            *,
+            lock_token: str,
+    ) -> int:
+        """Atomically delete a pipe while its staging lease still belongs to us."""
         if not (org and sup and staging_name and pipe_name):
             return 0
         try:
-            self.r.srem(RK.pipe_index(org, sup, staging_name), pipe_name)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] delete_pipe_meta srem error: {e}")
-        try:
-            return int(self.r.delete(
-                RK.pipe_doc(org, sup, staging_name, pipe_name)
+            result = int(self._delete_pipe_meta(
+                keys=[
+                    RK.pipe_doc(org, sup, staging_name, pipe_name),
+                    RK.pipe_index(org, sup, staging_name),
+                    RK.lock_stage(org, sup, staging_name),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_stage_deletion_intent(org, sup, staging_name),
+                    RK.staging_doc(org, sup, staging_name),
+                    RK.meta_root(org, sup),
+                ],
+                args=[pipe_name, lock_token or "", org, sup, staging_name],
             ) or 0)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] delete_pipe_meta del error: {e}")
-            return 0
+            if result == -1:
+                raise LockLostError("Lost staging lock before pipe deletion")
+            if result in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences staging "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -4:
+                raise RuntimeError(
+                    f"Corrupt pipe metadata/index for "
+                    f"{org}/{sup}/{staging_name}/{pipe_name}"
+                )
+            if result == -5:
+                raise FileNotFoundError(
+                    f"Staging does not exist: {org}/{sup}/{staging_name}"
+                )
+            if result == -6:
+                raise RuntimeError(
+                    f"Corrupt staging metadata for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -7:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -8:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -9:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
+            if result < 0:
+                raise RuntimeError(f"Invalid pipe deletion result: {result}")
+            return result
+        except redis.RedisError as exc:
+            logger.error(
+                "[redis-catalog] delete_pipe_meta failed for %s/%s/%s/%s: %s",
+                org, sup, staging_name, pipe_name, exc,
+            )
+            raise
 
     # ========================================================================= #
     # Spark Thrift cluster management (org-scoped: supertable:{org}:system:engine:thrifts)
@@ -8846,6 +11099,7 @@ return 1
                     RK.lock_leaf(org, sup, simple),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_simple_deletion_intent(org, sup, simple),
+                    RK.meta_root(org, sup),
                 ],
                 args=[json.dumps(doc, default=str), lock_token or ""],
             ) or 0)
@@ -8859,6 +11113,16 @@ return 1
                 raise RuntimeError(f"Cannot configure missing table {org}/{sup}/{simple}")
             if result == -5:
                 raise ValueError("Table configuration is not valid JSON")
+            if result == -6:
+                raise FileNotFoundError(
+                    f"SuperTable does not exist: {org}/{sup}"
+                )
+            if result == -7:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result == -8:
+                raise ReadOnlyCatalogError(
+                    f"SuperTable is read-only: {org}/{sup}"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid table configuration result: {result}")
             return True
@@ -8880,11 +11144,22 @@ return 1
             return None
         try:
             raw = self.r.get(RK.meta_table_config(org, sup, simple))
-            if raw:
-                return json.loads(raw)
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] get_table_config error: {e}")
-        return None
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] get_table_config error: {exc}")
+            raise
+        if raw is None:
+            return None
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}"
+            )
+        return document
 
     # ========================================================================= #
     # Engine runtime configuration (DuckDB memory, threads, caches, thresholds)
@@ -8901,6 +11176,89 @@ return 1
         "duckdb_http_timeout",
         "duckdb_external_cache_size",
     )
+
+    def _set_engine_document_section(
+            self,
+            org: str,
+            section_name: str,
+            section_value: Any,
+    ) -> bool:
+        """CAS one section of the shared engine document.
+
+        DuckDB pragmas and AUTO routing policy share one Redis document.  A
+        normal GET followed by SET loses acknowledged concurrent changes and,
+        worse, can replace a real document after an ambiguous/failed read.
+        Watching the exact key makes the read and replacement one optimistic
+        transaction. Malformed or unavailable state fails closed and is never
+        interpreted as an empty document.
+        """
+        if section_name not in {"duckdb", "auto_policy"}:
+            raise ValueError("Unsupported engine configuration section")
+        key = RK.engine_duckdb(org)
+        pipe = None
+        try:
+            pipe = self.r.pipeline()
+            for _attempt in range(64):
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if raw is None:
+                        document: Dict[str, Any] = {}
+                    else:
+                        try:
+                            decoded = json.loads(raw)
+                        except (TypeError, ValueError, UnicodeError) as exc:
+                            logger.error(
+                                "[redis-catalog] persisted engine configuration "
+                                "is malformed: %s",
+                                exc,
+                            )
+                            pipe.unwatch()
+                            return False
+                        if not isinstance(decoded, dict):
+                            logger.error(
+                                "[redis-catalog] persisted engine configuration "
+                                "has the wrong shape"
+                            )
+                            pipe.unwatch()
+                            return False
+                        document = dict(decoded)
+
+                    document[section_name] = section_value
+                    document["modified_ms"] = _now_ms()
+                    payload = json.dumps(document, default=str)
+                    pipe.multi()
+                    pipe.set(key, payload)
+                    result = pipe.execute()
+                    if (
+                        not isinstance(result, (list, tuple))
+                        or len(result) != 1
+                        or not result[0]
+                    ):
+                        logger.error(
+                            "[redis-catalog] engine configuration transaction "
+                            "was not acknowledged: %r",
+                            result,
+                        )
+                        return False
+                    return True
+                except redis.WatchError:
+                    continue
+            logger.error(
+                "[redis-catalog] engine configuration changed too frequently "
+                "to update safely"
+            )
+            return False
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] engine configuration update error: {exc}")
+            return False
+        finally:
+            if pipe is not None:
+                try:
+                    pipe.reset()
+                except Exception:
+                    pass
+
     def set_engine_config(
             self,
             org: str,
@@ -8923,7 +11281,6 @@ return 1
         try:
             from supertable.engine.engine_config import normalize_memory_size
 
-            doc = self.get_engine_config(org) or {}
             # Whitelist recognised DuckDB fields only for this engine section.
             section = {
                 k: config[k]
@@ -8945,13 +11302,7 @@ return 1
                     section["duckdb_external_cache_size"] = normalized_cache
                 else:
                     section.pop("duckdb_external_cache_size")
-            doc["duckdb"] = section
-            doc["modified_ms"] = _now_ms()
-            self.r.set(
-                RK.engine_duckdb(org),
-                json.dumps(doc, default=str),
-            )
-            return True
+            return self._set_engine_document_section(org, "duckdb", section)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] set_engine_config error: {e}")
             return False
@@ -8968,11 +11319,22 @@ return 1
             return None
         try:
             raw = self.r.get(RK.engine_duckdb(org))
-            if raw:
-                return json.loads(raw)
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"[redis-catalog] get_engine_config error: {e}")
-        return None
+        except redis.RedisError as exc:
+            logger.error(f"[redis-catalog] get_engine_config error: {exc}")
+            raise
+        if raw is None:
+            return None
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"Corrupt engine configuration for organization {org}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise RuntimeError(
+                f"Corrupt engine configuration for organization {org}"
+            )
+        return document
 
     def set_auto_routing_policy(
             self, org: str, rules: list[Dict[str, Any]],
@@ -8988,11 +11350,11 @@ return 1
 
         normalized = normalize_auto_routing_policy(rules)
         try:
-            doc = self.get_engine_config(org) or {}
-            doc["auto_policy"] = [rule.as_dict() for rule in normalized]
-            doc["modified_ms"] = _now_ms()
-            self.r.set(RK.engine_duckdb(org), json.dumps(doc, default=str))
-            return True
+            return self._set_engine_document_section(
+                org,
+                "auto_policy",
+                [rule.as_dict() for rule in normalized],
+            )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] set_auto_routing_policy error: {e}")
             return False

@@ -217,20 +217,20 @@ class EngineRuntimeConfig:
 
 
 def _redis_cfg(org: str, catalog: Optional[Any]) -> Dict[str, Any]:
-    """Read the stored engine config for ``org`` (best effort).
+    """Read the stored engine config for ``org`` fail closed.
 
-    Returns an empty dict when no catalog is supplied or Redis is unreachable,
-    so the resolver degrades cleanly to env vars + defaults.
+    A genuinely absent document uses env vars and defaults. Backend uncertainty
+    or corrupt control state must propagate instead of silently changing query
+    routing and resource policy.
     """
     if not (org and catalog is not None):
         return {}
-    try:
-        raw = catalog.get_engine_config(org) or {}
-        if not isinstance(raw, dict):
-            return {}
-        return _canonicalize_legacy_24_config(raw)
-    except Exception:
+    raw = catalog.get_engine_config(org)
+    if raw is None:
         return {}
+    if not isinstance(raw, dict):
+        raise RuntimeError("Engine configuration is not a JSON object")
+    return _canonicalize_legacy_24_config(raw)
 
 
 def _canonicalize_legacy_24_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
@@ -367,9 +367,11 @@ def resolve_engine_bundle(
 def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "duckdb") -> EngineRuntimeConfig:
     """Resolve effective DuckDB config (Redis → env → default).
 
-    ``catalog`` is an optional ``RedisCatalog``.  When it is None or Redis is
-    unreachable the resolver falls back to environment variables and built-in
-    defaults, which keeps the engine usable without Redis (e.g. in unit tests).
+    ``catalog`` is optional for standalone/unit-test use.  With no catalog (or
+    with a genuinely absent Redis document), environment variables and built-in
+    defaults apply.  Once a catalog is supplied, backend uncertainty and corrupt
+    control state propagate instead of silently changing routing or resource
+    policy.
     """
     return _build_runtime(_redis_cfg(org, catalog))
 

@@ -521,6 +521,17 @@ CASES.append({
     "expect": {"t": ["created_at"]},
 })
 
+CASES.append({
+    "id": "groupby_004",
+    "desc": "GROUP BY input column that shadows a SELECT alias",
+    "super": "s",
+    "sql": "SELECT y, COUNT(*) AS x FROM t GROUP BY y, x",
+    # x remains a schema ambiguity rather than a literal projected name.  The
+    # shared parser therefore requests the complete source schema so every
+    # backend can let its binder apply physical-column precedence safely.
+    "expect": {"t": []},
+})
+
 
 # ---------------------------------------------------------------------------
 # SECTION 5: JOIN queries
@@ -864,9 +875,9 @@ CASES.append({
         SELECT a, b FROM t
         WHERE b > (SELECT AVG(b) FROM t AS t2 WHERE t2.a = t.a)
     """,
-    # Each SELECT resolves unqualified columns against its sole direct source;
-    # the qualified correlation stays bound to the stated aliases.
-    "expect": {"t": sorted(["a", "b"]), "t2": sorted(["a", "b"])},
+    # Inner unqualified b can bind locally or correlate to outer t depending on
+    # the runtime schemas, so both candidate relations retain full projection.
+    "expect": {"t": [], "t2": []},
 })
 
 CASES.append({
@@ -877,11 +888,11 @@ CASES.append({
         SELECT a, (SELECT MAX(val) FROM scores WHERE scores.ref = t.id) AS max_score
         FROM t ORDER BY max_score DESC
     """,
-    # Each SELECT has one direct source: outer a belongs to t and inner val
-    # belongs to scores. max_score is derived and is not projected from either.
+    # Inner unqualified val may bind to scores or correlate to the outer table;
+    # retain both schemas rather than guessing before the backend binds it.
     "expect": {
-        "t": sorted(["a", "id"]),
-        "scores": sorted(["ref", "val"]),
+        "t": [],
+        "scores": [],
     },
 })
 
@@ -1032,6 +1043,15 @@ CASES.append({
     "expect": {"t1": sorted(["a", "b"]), "t2": sorted(["a", "b"])},
 })
 
+CASES.append({
+    "id": "union_003",
+    "desc": "Case-only aliases in independent UNION branches share one binding",
+    "super": "s",
+    "sql": "SELECT x FROM t AS a UNION ALL SELECT x FROM t AS A",
+    "expect": {"a": ["x"]},
+    "expect_tables": {"a": ("s", "t")},
+})
+
 
 # ---------------------------------------------------------------------------
 # SECTION 14: Schema-qualified tables
@@ -1137,9 +1157,10 @@ CASES.append({
         SELECT EXTRACT(YEAR FROM created_at) AS yr, COUNT(*) AS cnt
         FROM t GROUP BY yr ORDER BY cnt DESC
     """,
-    # DuckDB resolves yr to this Select's derived alias.  It must not become a
-    # Parquet projection; created_at is the alias expression's only leaf.
-    "expect": {"t": ["created_at"]},
+    # The parser has no schema with which to prove that an input ``yr`` is
+    # absent. DuckDB would prefer that physical name over the SELECT alias, so
+    # every backend must retain the full relation until binding.
+    "expect": {"t": []},
 })
 
 CASES.append({
@@ -1208,12 +1229,9 @@ CASES.append({
         GROUP BY cohort_week, active_week
         ORDER BY cohort_week, active_users DESC
     """,
-    # cohort_week and active_week are aliases from expressions -> skip in ORDER BY
-    # active_users is alias from COUNT -> skip in ORDER BY
-    # Physical columns: first_seen (inside DATE_TRUNC), activity_date, user_id
-    "expect": {
-        "user_activity": sorted(["activity_date", "first_seen", "user_id"]),
-    },
+    # Both GROUP names could shadow physical input columns. Keep the complete
+    # source schema so DuckDB/Island/Spark can apply their real binder rules.
+    "expect": {"user_activity": []},
 })
 
 CASES.append({
@@ -1438,9 +1456,10 @@ CASES.append({
         GROUP BY x
         ORDER BY total DESC
     """,
-    # 'total' in WHERE is a physical column reference (WHERE is not alias scope)
-    # 'total' in ORDER BY is alias reference (skipped)
-    "expect": {"t": sorted(["total", "x", "y"])},
+    # DuckDB binds WHERE ``total`` to a physical input when present and falls
+    # back to the SELECT alias otherwise. Preserve the full schema so pruning
+    # cannot decide that binding before the backend sees the input.
+    "expect": {"t": []},
 })
 
 CASES.append({
@@ -1864,11 +1883,10 @@ CASES.append({
         SELECT a, b FROM t
         WHERE a IN (SELECT x FROM u WHERE u.y > 10)
     """,
-    # Outer a/b resolve to t; inner x and qualified y resolve to u. The two
-    # SELECT scopes do not make their unqualified columns mutually ambiguous.
+    # Inner x may bind to u or correlate to t depending on their schemas.
     "expect": {
-        "t": sorted(["a", "b"]),
-        "u": sorted(["x", "y"]),
+        "t": [],
+        "u": [],
     },
 })
 
@@ -2227,11 +2245,11 @@ CASES.append({
         FROM employees GROUP BY dept
         HAVING avg_sal > (SELECT AVG(salary) FROM employees AS e2)
     """,
-    # Both SELECT scopes have one direct source. avg_sal is derived and skipped;
-    # the inner unqualified salary belongs to e2 rather than the outer table.
+    # The inner unqualified salary is schema-dependent between e2 and a
+    # correlated outer input, so both physical candidates remain complete.
     "expect": {
-        "employees": sorted(["dept", "salary"]),
-        "e2": ["salary"],
+        "employees": [],
+        "e2": [],
     },
 })
 
@@ -2264,14 +2282,14 @@ CASES.append({
 
 CASES.append({
     "id": "ambiguous_001",
-    "desc": "Two tables, unqualified columns → ambiguous → ignored",
+    "desc": "Two tables, unqualified columns force conservative projection",
     "super": "s",
     "sql": """
         SELECT a, b FROM t1 JOIN t2 ON t1.id = t2.fk
     """,
-    # a, b are unqualified with two tables → ambiguous → not collected.
-    # Only qualified: t1.id, t2.fk
-    "expect": {"t1": ["id"], "t2": ["fk"]},
+    # a and b can belong to either input. Dropping them while retaining only
+    # qualified join keys can change a valid backend binding.
+    "expect": {"t1": [], "t2": []},
 })
 
 CASES.append({
@@ -2283,7 +2301,7 @@ CASES.append({
         FROM t1 JOIN t2 ON t1.x = t2.y
         JOIN t3 ON t2.y = t3.z
     """,
-    "expect": {"t1": ["x"], "t2": ["y"], "t3": ["z"]},
+    "expect": {"t1": [], "t2": [], "t3": []},
 })
 
 CASES.append({
@@ -2293,8 +2311,9 @@ CASES.append({
     "sql": """
         SELECT t1.id, name FROM t1 JOIN t2 ON t1.fk = t2.id
     """,
-    # 'name' is unqualified → ambiguous → skipped.
-    "expect": {"t1": sorted(["fk", "id"]), "t2": ["id"]},
+    # name is unqualified; retain both inputs so runtime schema resolution is
+    # unchanged by projection.
+    "expect": {"t1": [], "t2": []},
 })
 
 
@@ -2509,9 +2528,9 @@ CASES.append({
         FROM t WHERE total > 0
         GROUP BY category ORDER BY total DESC
     """,
-    # 'total' in WHERE → physical column (WHERE is not alias scope)
-    # 'total' in ORDER BY → alias reference (ORDER BY IS alias scope) → skip
-    "expect": {"t": sorted(["amount", "category", "total"])},
+    # WHERE has schema-dependent physical/alias precedence; ORDER BY prefers
+    # the SELECT alias. The former requires the all-columns sentinel.
+    "expect": {"t": []},
 })
 
 CASES.append({
@@ -2523,9 +2542,8 @@ CASES.append({
         FROM t WHERE cnt > 0
         GROUP BY grp HAVING cnt > 10
     """,
-    # WHERE cnt → physical (not alias scope) → collected
-    # HAVING cnt → alias (alias scope) → skipped
-    "expect": {"t": sorted(["cnt", "grp"])},
+    # WHERE may bind a physical ``cnt`` while HAVING prefers the alias.
+    "expect": {"t": []},
 })
 
 
@@ -2893,8 +2911,9 @@ CASES.append({
         QUALIFY rn <= 10
         ORDER BY rn
     """,
-    # rn is alias → skip in QUALIFY and ORDER BY
-    "expect": {"t": sorted(["id", "val"])},
+    # QUALIFY uses physical ``rn`` when it exists and the window alias when it
+    # does not, so projection cannot safely choose between those bindings.
+    "expect": {"t": []},
 })
 
 
@@ -2936,8 +2955,8 @@ CASES.append({
         SELECT DATE_PART('hour', ts) AS hour_of_day, COUNT(*) AS cnt
         FROM events GROUP BY hour_of_day ORDER BY cnt DESC
     """,
-    # Both clause references are local derived aliases; ts is the only leaf.
-    "expect": {"events": ["ts"]},
+    # ``hour_of_day`` may also be a physical input column.
+    "expect": {"events": []},
 })
 
 CASES.append({
@@ -2948,7 +2967,8 @@ CASES.append({
         SELECT STRFTIME(ts, '%Y-%m') AS month_str, SUM(val) AS total
         FROM t GROUP BY month_str ORDER BY total DESC
     """,
-    "expect": {"t": sorted(["ts", "val"])},
+    # ``month_str`` may also be a physical input column.
+    "expect": {"t": []},
 })
 
 CASES.append({
@@ -2961,8 +2981,8 @@ CASES.append({
         GROUP BY day
         ORDER BY daily_count DESC
     """,
-    # day and daily_count are local derived aliases, never source columns.
-    "expect": {"events": ["created_at"]},
+    # ``day`` may also be a physical input column.
+    "expect": {"events": []},
 })
 
 
@@ -3490,12 +3510,11 @@ CASES.append({
         SELECT a.name, b.amount
         FROM customers a JOIN orders b USING (id)
     """,
-    # USING(id) — 'id' is not a Column node in the same way as ON.
-    # The parser may or may not extract it.
-    # Let's discover the actual behavior.
+    # USING identifiers are not Column nodes, but both physical operands need
+    # the key for execution and RBAC authorization.
     "expect": {
-        "a": ["name"],
-        "b": ["amount"],
+        "a": ["id", "name"],
+        "b": ["amount", "id"],
     },
 })
 
@@ -3508,8 +3527,8 @@ CASES.append({
         FROM t1 a JOIN t2 b USING (key1, key2)
     """,
     "expect": {
-        "a": ["val"],
-        "b": ["val"],
+        "a": ["key1", "key2", "val"],
+        "b": ["key1", "key2", "val"],
     },
 })
 
@@ -3603,10 +3622,9 @@ CASES.append({
         HAVING val > 100
         ORDER BY val DESC
     """,
-    # WHERE val → not alias scope → physical column → collected
-    # HAVING val → alias scope → matches alias 'val' → skipped
-    # ORDER BY val → alias scope → matches alias 'val' → skipped
-    "expect": {"t": sorted(["amount", "grp", "val"])},
+    # WHERE has schema-dependent physical/alias precedence; HAVING and ORDER
+    # BY prefer the SELECT alias. Retain all input columns for the WHERE bind.
+    "expect": {"t": []},
 })
 
 CASES.append({
@@ -3982,10 +4000,11 @@ CASES.append({
         FROM orders o
         WHERE o.order_id IN (SELECT order_id FROM top_orders)
     """,
-    # CTE 'top_orders' is excluded. The two physical orders references merge
-    # their scope-local columns; the derived CTE order_id does not add another.
+    # CTE 'top_orders' is excluded. The unqualified name in the nested
+    # subquery can still be correlated under DuckDB's schema-dependent rules,
+    # so the merged physical source remains full-projection.
     "expect_physical": {
-        "orders": sorted(["amount", "order_id", "status"]),
+        "orders": [],
     },
 })
 
@@ -4442,7 +4461,7 @@ try:
         )
 
         cases = (
-            (build_deep_numeric_sql("lake.facts", "amount", "DOUBLE"), ["amount"]),
+            (build_deep_numeric_sql("lake.facts", "amount", "DOUBLE"), []),
             (build_deep_string_sql("lake.facts", "label"), ["label"]),
         )
         for sql, expected in cases:
@@ -4452,6 +4471,10 @@ try:
                 "duckdb",
                 allow_bounded_collection_aggregates=True,
             ).get_physical_tables()
+            # Numeric quality SQL groups by computed aliases, which requires
+            # the all-columns sentinel because an identically named physical
+            # input would take precedence. The string query groups directly by
+            # its source column and retains its exact projection.
             assert [(table.simple_name, table.columns) for table in physical] == [
                 ("facts", expected)
             ]
@@ -4468,9 +4491,12 @@ try:
             table.simple_name: table.columns
             for table in parser.get_physical_tables()
         }
+        # The scalar subquery can correlate through its nested derived-table
+        # scope. Keep both physical candidates complete while still proving
+        # that q.secret never rebinds to the unrelated outer alias d.
         assert physical == {
-            "inner_table": ["public_value"],
-            "outer_table": ["id"],
+            "inner_table": [],
+            "outer_table": [],
         }
 except ImportError:
     pass  # pytest not installed — standalone runner still works via __main__

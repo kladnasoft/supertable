@@ -453,6 +453,7 @@ class MinioStorage(StorageInterface):
         """Delete and verify a MinIO prefix with bounded retry batches."""
         import itertools
 
+        path = self._require_nonempty_delete_prefix(path)
         physical = self._with_base(path)
         if self._object_exists(physical):
             self.client.remove_object(self.bucket_name, physical)
@@ -547,10 +548,10 @@ class MinioStorage(StorageInterface):
         try:
             buf = io.BytesIO(data)
             proj = None
-            if columns:
+            if columns is not None:
                 proj = self._project_columns(pq.read_schema(buf).names, columns)
                 buf.seek(0)
-            return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
+            return pq.read_table(buf, columns=proj)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
 

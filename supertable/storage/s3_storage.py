@@ -723,6 +723,7 @@ class S3Storage(StorageInterface):
 
     def delete_prefix(self, path: str) -> None:
         """Delete and verify an S3 prefix, retrying partial batch failures."""
+        path = self._require_nonempty_delete_prefix(path)
         physical = self._with_base(path)
         if self._object_exists(physical):
             self._call("delete_object", Bucket=self.bucket_name, Key=physical)
@@ -828,10 +829,10 @@ class S3Storage(StorageInterface):
         try:
             buf = io.BytesIO(data)
             proj = None
-            if columns:
+            if columns is not None:
                 proj = self._project_columns(pq.read_schema(buf).names, columns)
                 buf.seek(0)
-            return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
+            return pq.read_table(buf, columns=proj)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
 

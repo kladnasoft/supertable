@@ -106,17 +106,19 @@ def test_tombstone_threshold_drain_clears_vector_and_stats(caplog):
     simple = f"tomb_drain_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)  # bootstrap super + default superadmin role
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    # Tombstone gate trips at 2 dead rows; keep the small-file gate shut.
-    dw._table_config_cache[simple] = {
-        "max_tombstone_rows": 2,
-        "max_overlapping_files": 100,
-    }
 
     # Two 2-row files.  'a'/'c' will be deleted but co-reside with survivors
     # 'b'/'d', so neither file is eagerly reclaimed — the dead rows stay in the
     # deletion-vector until the threshold drains them.
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["a", "b"]),
              overwrite_columns=[KEY])
+    # Tombstone gate trips at 2 dead rows; keep the small-file gate shut.
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_tombstone_rows=2,
+        max_overlapping_files=100,
+    )
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["c", "d"]),
              overwrite_columns=[KEY])
 
@@ -187,14 +189,16 @@ def test_appends_after_drain_do_not_recompact(caplog):
     simple = f"no_recompact_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {
-        "max_tombstone_rows": 2,
-        "max_overlapping_files": 100,
-    }
 
     # Reach a drained state: build the vector to the threshold, drain inline.
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["a", "b"]),
              overwrite_columns=[KEY])
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_tombstone_rows=2,
+        max_overlapping_files=100,
+    )
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["c", "d"]),
              overwrite_columns=[KEY])
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["a"]),
@@ -228,11 +232,15 @@ def test_small_file_gate_compaction_removes_sunset_file_stats(caplog):
     simple = f"sunset_stats_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {"max_overlapping_files": 2}
 
     # Write #1 — one small file; gate shut (1 < 2).
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["a", "b", "c"]),
              overwrite_columns=[])
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=2,
+    )
     st1, snap1 = _snapshot(simple)
     files_before = _live_files(snap1)  # {file_A}
     assert len(files_before) == 1

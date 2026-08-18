@@ -103,7 +103,7 @@ def test_supported_structured_quality_sql_has_exact_duck_island_parity(
     )
 
 
-def _unsupported_quality_sql() -> list[tuple[str, str]]:
+def _unsupported_quality_sql() -> list[tuple[str, str, bool]]:
     custom_null_rate = build_custom_rule_sql({
         "rule_type": "null_rate_max",
         "column_name": "amount",
@@ -117,17 +117,24 @@ def _unsupported_quality_sql() -> list[tuple[str, str]]:
     assert custom_null_rate is not None
     assert custom_distinct is not None
     return [
-        ("quick", build_quick_sql(FQN, SCHEMA)),
-        ("deep_numeric", build_deep_numeric_sql(FQN, "amount", "BIGINT")),
-        ("deep_string", build_deep_string_sql(FQN, "label")),
-        ("custom_null_rate", custom_null_rate),
-        ("custom_distinct", custom_distinct),
+        ("quick", build_quick_sql(FQN, SCHEMA), False),
+        (
+            "deep_numeric",
+            build_deep_numeric_sql(FQN, "amount", "BIGINT"),
+            True,
+        ),
+        ("deep_string", build_deep_string_sql(FQN, "label"), True),
+        ("custom_null_rate", custom_null_rate, False),
+        ("custom_distinct", custom_distinct, False),
     ]
 
 
-@pytest.mark.parametrize("name,sql", _unsupported_quality_sql())
+@pytest.mark.parametrize(
+    "name,sql,allow_bounded_collection_aggregates",
+    _unsupported_quality_sql(),
+)
 def test_auto_routes_every_uncertified_quality_statement_to_duckdb(
-    quality_table, name, sql,
+    quality_table, name, sql, allow_bounded_collection_aggregates,
 ):
     oracle = execute_quality_sql(
         organization=ORG,
@@ -135,6 +142,9 @@ def test_auto_routes_every_uncertified_quality_statement_to_duckdb(
         sql=sql,
         role_name=ROLE,
         engine=Engine.DUCKDB,
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
     )
     automatic = execute_quality_sql(
         organization=ORG,
@@ -142,6 +152,9 @@ def test_auto_routes_every_uncertified_quality_statement_to_duckdb(
         sql=sql,
         role_name=ROLE,
         engine=Engine.AUTO,
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
     )
 
     assert oracle.ok, f"{name}: {oracle.message}"
@@ -218,6 +231,7 @@ def test_deep_string_output_bounds_huge_values_with_exact_identity(quality_table
         sql=build_deep_string_sql(fqn, "label"),
         role_name=ROLE,
         engine=Engine.AUTO,
+        allow_bounded_collection_aggregates=True,
     )
     assert result.ok, result.message
     assert result.actual_engine == "duckdb"
@@ -282,9 +296,12 @@ def test_auto_keeps_certified_sql_on_duckdb_when_resource_proof_is_incomplete(
     assert_frame_equal(oracle.frame, automatic.frame, check_dtype=False)
 
 
-@pytest.mark.parametrize("name,sql", _unsupported_quality_sql())
+@pytest.mark.parametrize(
+    "name,sql,allow_bounded_collection_aggregates",
+    _unsupported_quality_sql(),
+)
 def test_explicit_island_rejection_remains_visible_and_is_not_called_parity(
-    quality_table, name, sql,
+    quality_table, name, sql, allow_bounded_collection_aggregates,
 ):
     result = execute_quality_sql(
         organization=ORG,
@@ -292,6 +309,9 @@ def test_explicit_island_rejection_remains_visible_and_is_not_called_parity(
         sql=sql,
         role_name=ROLE,
         engine=Engine.ISLANDDB,
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
     )
 
     assert result.ok is False, name

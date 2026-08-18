@@ -93,14 +93,15 @@ def execute_quality_sql(
     """
     requested = _normalise_engine(engine)
     factory = reader_factory or DataReader
+    reader: Optional[DataReader] = None
 
     try:
-        reader_kwargs = dict(
-            super_name=super_name,
-            organization=organization,
-            query=sql,
-            source="quality",
-        )
+        reader_kwargs: Dict[str, Any] = {
+            "super_name": super_name,
+            "organization": organization,
+            "query": sql,
+            "source": "quality",
+        }
         if allow_bounded_collection_aggregates:
             # Narrow internal capability used only by the built-in deep-profile
             # templates. Public/custom quality SQL never receives it.
@@ -117,7 +118,6 @@ def execute_quality_sql(
         frame = pd.DataFrame()
         raw_status = Status.ERROR
         message = str(exc)
-        reader = locals().get("reader")
 
     status = getattr(raw_status, "value", str(raw_status)).casefold()
     ok = raw_status is Status.OK or status == Status.OK.value

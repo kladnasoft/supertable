@@ -376,6 +376,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
         "version": 1,
         "payload": {
             "snapshot_version": 1,
+            # Complete cached snapshots publish policy state explicitly.
+            "_row_filter": None,
             "schema": {"id": "BIGINT", "payload": "Binary"},
             "stats_file": "stats.parquet",
             "stats_rows": 6,

@@ -11,7 +11,10 @@ from supertable.redis_catalog import RedisCatalog
 from supertable.storage.storage_factory import get_storage
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
-from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.utils.snapshot import (
+    complete_snapshot_payload,
+    snapshot_cache_payload,
+)
 from supertable.utils.profiler import Profiler, get_null_profiler
 import json
 from typing import Any, Dict, List, Optional
@@ -234,6 +237,7 @@ class SimpleTable:
                 "rowid_high_watermark": 0,
                 "stats_file": None,
                 "stats_rows": 0,
+                "_row_filter": None,
             }
             self.storage.write_json(new_simple_path, snapshot_data)
 
@@ -497,6 +501,7 @@ class SimpleTable:
         payload = complete_snapshot_payload(
             ptr.get("payload") if isinstance(ptr, dict) else None,
             expected_version=ptr.get("version") if isinstance(ptr, dict) else None,
+            require_policy_marker=True,
         )
         if payload is not None:
             return payload, path
@@ -659,6 +664,13 @@ class SimpleTable:
         # Data lineage — record provenance of this write
         if lineage and isinstance(lineage, dict):
             last_simple_table["lineage"] = lineage
+
+        # Every newly published Redis cache must explicitly seal the linked-
+        # share policy state. Preserve a valid inherited overlay; ordinary
+        # unshared snapshots use JSON null as the canonical unrestricted value.
+        normalized_snapshot = snapshot_cache_payload(last_simple_table)
+        last_simple_table.clear()
+        last_simple_table.update(normalized_snapshot)
 
         # Write new heavy snapshot file
         new_simple_path = os.path.join(self.snapshot_dir, generate_filename(alias=self.identity))

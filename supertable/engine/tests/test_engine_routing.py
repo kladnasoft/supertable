@@ -86,9 +86,26 @@ def _reflection(bytes_total, freshness_ms=0):
 # --------------------------------------------------------------------------- #
 
 def test_no_catalog_uses_policy_fallback():
-    # ``False`` is the executor's "catalog unavailable, do not build" sentinel,
-    # so _get_catalog() returns None without contacting Redis.
+    # A deliberately injected ``False`` keeps this narrow pure-routing helper
+    # independent of Redis. Production config acquisition never creates this
+    # sentinel and propagates catalog construction failures.
     assert _executor(False)._spark_min_bytes(_cfg(10 * GIB)) == 10 * GIB
+
+
+def test_required_catalog_constructor_failure_propagates(monkeypatch):
+    import supertable.redis_catalog as redis_catalog_module
+
+    class BrokenCatalog:
+        def __init__(self):
+            raise ConnectionError("redis unavailable")
+
+    monkeypatch.setattr(redis_catalog_module, "RedisCatalog", BrokenCatalog)
+    executor = _executor(None)
+
+    with pytest.raises(ConnectionError, match="redis unavailable"):
+        executor._get_catalog()
+    # A failure is not cached as an authoritative "no config" result.
+    assert executor._catalog is None
 
 
 def test_empty_fleet_uses_policy_fallback():

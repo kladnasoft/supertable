@@ -339,17 +339,15 @@ class Executor:
         return self._file_cache
 
     def _get_catalog(self):
-        """Lazily create a RedisCatalog for live engine-config reads.
+        """Lazily create the required catalog for live engine-config reads.
 
-        Returns None when Redis is unreachable so config resolution degrades to
-        environment variables and built-in defaults instead of failing a query.
+        Engine and routing policy are security/correctness configuration.  A
+        catalog-construction failure is not evidence that no document exists,
+        so callers must see it instead of silently executing with defaults.
         """
         if self._catalog is None:
-            try:
-                from supertable.redis_catalog import RedisCatalog
-                self._catalog = RedisCatalog()
-            except Exception:
-                self._catalog = False  # sentinel: construction failed, do not retry
+            from supertable.redis_catalog import RedisCatalog
+            self._catalog = RedisCatalog()
         return self._catalog or None
 
     def _active_spark_clusters(self) -> list:
@@ -359,7 +357,13 @@ class Executor:
         makes AUTO stay on DuckDB instead of routing to a fleet that cannot run
         the job.
         """
-        catalog = self._get_catalog()
+        try:
+            catalog = self._get_catalog()
+        except Exception:
+            # Fleet discovery is merely an AUTO availability hint. Required
+            # engine-policy acquisition has already happened at execute(); a
+            # transient discovery failure keeps AUTO off Spark.
+            return []
         if catalog is None:
             return []
         try:

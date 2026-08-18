@@ -144,6 +144,7 @@ def _build_world(n: int = 20):
             "path": f"{table}/_snapshot.json",
             "payload": {
                 "snapshot_version": 3,
+                "_row_filter": None,
                 "schema": cols,
                 "stats_file": stats_file,
                 "stats_rows": stats_frame.height,

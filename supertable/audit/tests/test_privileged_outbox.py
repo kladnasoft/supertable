@@ -1737,7 +1737,7 @@ def test_stream_event_size_is_rejected_before_json_decode(outbox):
         outbox._decode_entry(raw)
 
 
-def test_local_storage_fsyncs_only_the_new_directory_chain(
+def test_local_storage_fsyncs_logical_directory_chain_through_root_on_retry(
     monkeypatch, tmp_path: Path,
 ):
     from supertable.storage.local_storage import LocalStorage
@@ -1750,9 +1750,16 @@ def test_local_storage_fsyncs_only_the_new_directory_chain(
         "_fsync_directory",
         staticmethod(lambda directory: synced.append(os.path.abspath(directory))),
     )
+    # Model an ancestor left visible by a failed publication after this
+    # storage namespace was opened.  A retry must not assume that merely
+    # existing directory entry is durable: it has to anchor the complete
+    # logical path through the configured root before acknowledging success.
     (tmp_path / "existing").mkdir()
     storage.write_bytes_atomic("existing/object", b"one")
-    assert synced == [str(tmp_path / "existing")]
+    assert synced == [
+        str(tmp_path / "existing"),
+        str(tmp_path),
+    ]
 
     synced.clear()
     storage.write_bytes_atomic("new/a/b/object", b"two")

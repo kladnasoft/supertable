@@ -13,8 +13,11 @@ import json
 from unittest.mock import MagicMock
 
 import duckdb
+import fakeredis
 import pytest
+import redis
 
+from supertable import redis_keys as RK
 from supertable.engine.engine_config import (
     match_auto_routing_policy,
     normalize_auto_routing_policy,
@@ -88,6 +91,23 @@ class TestResolverNormalizes:
         con.execute(f"PRAGMA memory_limit='{cfgs['duckdb'].duckdb_memory_limit}';")
         con.close()
 
+    def test_backend_uncertainty_does_not_fall_back_to_defaults(self):
+        class _Catalog:
+            def get_engine_config(self, org):
+                raise redis.TimeoutError("engine policy read timed out")
+
+        with pytest.raises(redis.TimeoutError, match="policy read timed out"):
+            resolve_engine_configs("kladna-soft", _Catalog())
+
+    @pytest.mark.parametrize("raw", ["[]", "null", "not-json"])
+    def test_catalog_rejects_corrupt_engine_document(self, raw):
+        redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+        catalog = RedisCatalog(redis_client=redis_client)
+        redis_client.set(RK.engine_duckdb("acme"), raw)
+
+        with pytest.raises(RuntimeError, match="Corrupt engine configuration"):
+            catalog.get_engine_config("acme")
+
 
 class TestAutoRoutingPolicy:
     def test_half_open_ranges_and_unbounded_tail(self):
@@ -112,16 +132,19 @@ class TestAutoRoutingPolicy:
             normalize_auto_routing_policy(rules)
 
     def test_catalog_persists_canonical_policy_and_preserves_config(self):
-        catalog = RedisCatalog.__new__(RedisCatalog)
-        catalog.r = MagicMock()
-        catalog.get_engine_config = lambda _org: {"duckdb": {"duckdb_threads": "2"}}
+        redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+        catalog = RedisCatalog(redis_client=redis_client)
+        redis_client.set(
+            RK.engine_duckdb("acme"),
+            json.dumps({"duckdb": {"duckdb_threads": "2"}}),
+        )
 
         assert catalog.set_auto_routing_policy("acme", [
             {"min_bytes": 100, "max_bytes": None, "engine": "spark_sql"},
             {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},
         ])
 
-        stored = json.loads(catalog.r.set.call_args.args[1])
+        stored = catalog.get_engine_config("acme")
         assert stored["duckdb"] == {"duckdb_threads": "2"}
         assert stored["auto_policy"] == [
             {"min_bytes": 0, "max_bytes": 100, "engine": "islanddb"},

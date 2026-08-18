@@ -276,7 +276,10 @@ def _check_readonly_guard(super_name: str, organization: str, label: str) -> Non
     # unavailable or corrupt root as writable can modify the wrong physical
     # table or diverge a replica, so lookup ambiguity must fail closed.
     root = RedisCatalog().get_root(organization, super_name)
-    if root and root.get("read_only"):
+    if root and (
+        root.get("read_only") is True
+        or root.get("clone_type") == "replica"
+    ):
         clone_type = root.get("clone_type", "")
         if clone_type == "replica":
             reason = "live replica"

@@ -40,6 +40,7 @@ from supertable.data_reader import _validated_share_row_filter
 from supertable.engine.engine_common import (
     create_rbac_view,
     rewrite_query_with_hashed_tables,
+    validate_rbac_binding_stability,
 )
 from supertable.engine.spark_thrift import _spark_create_rbac_view
 from supertable.rbac.filter_builder import FilterBuilder
@@ -174,6 +175,7 @@ def _execute_secured(query: str, monkeypatch, role_info: dict | None = None):
     """Execute a query through parser -> policy -> real RBAC views."""
 
     parser, views = _restrict(query, monkeypatch, role_info)
+    validate_rbac_binding_stability(parser, views)
     alias_to_view: dict[str, str] = {}
 
     with _duckdb_catalog() as con:
@@ -257,6 +259,24 @@ def test_exclusion_wins_over_explicit_column_inclusion(monkeypatch):
         )
 
 
+def test_using_join_key_is_authorized_even_when_not_projected(monkeypatch):
+    tables = {
+        "card": {
+            "columns": ["*"],
+            "exclude_columns": ["id"],
+            "filters": ["*"],
+        },
+        "ledger": {"columns": ["*"], "filters": ["*"]},
+    }
+    with pytest.raises(PermissionError, match="columns: \\['id'\\]"):
+        _restrict(
+            "SELECT card.label, ledger.label FROM card "
+            "JOIN ledger USING (id)",
+            monkeypatch,
+            _role(tables=tables),
+        )
+
+
 # ---------------------------------------------------------------------------
 # SQL attack matrix
 # ---------------------------------------------------------------------------
@@ -301,13 +321,20 @@ def test_scope_or_star_cannot_bypass_projection_even_if_parser_cannot_enumerate(
         _execute_secured(query, monkeypatch)
 
 
-def test_parser_attributes_unqualified_scalar_subquery_column_to_inner_table():
+def test_parser_marks_scalar_subquery_binding_schema_dependent():
     parser = _parser("SELECT (SELECT cvv FROM card LIMIT 1) FROM ledger")
     physical = {
         td.simple_name.casefold(): {c.casefold() for c in td.columns}
         for td in parser.get_physical_tables()
     }
-    assert "cvv" in physical["card"]
+    # If card lacks cvv the reference may correlate to ledger; both schemas
+    # must remain present and an RBAC policy removing cvv from either candidate
+    # is rejected before that removal can change the binding.
+    assert physical == {"card": set(), "ledger": set()}
+    assert parser.get_binding_ambiguities() == {
+        "card": {"cvv"},
+        "ledger": {"cvv"},
+    }
 
 
 @pytest.mark.parametrize("spelling", ["cvv", "CVV", '"CvV"'])
@@ -1332,20 +1359,24 @@ def test_role_update_cannot_reuse_broader_read_policy(monkeypatch):
 
 def _meta_reader(*, tables: tuple[str, ...] = ("account", "card", "ledger")):
     from supertable.meta_reader import MetaReader
-    from supertable import redis_keys as RK
 
     reader = MetaReader.__new__(MetaReader)
     reader.super_table = SimpleNamespace(super_name=SUPER, organization=ORG)
     reader.catalog = MagicMock()
-    keys = [RK.meta_leaf(ORG, SUPER, name) for name in tables]
-    reader.catalog.scan_leaf_keys.side_effect = lambda *_args, **_kwargs: iter(keys)
+    reader.catalog.scan_leaf_items.side_effect = lambda *_args, **_kwargs: iter(
+        {"simple": name} for name in tables
+    )
     reader.catalog.get_root.return_value = {"version": 7, "ts": 100}
     return reader
 
 
 def _leaf(schema: dict, *, rows: int = 1, columns: list[str] | None = None):
-    return json.dumps(
-        {
+    return json.dumps({
+        "version": 1,
+        "ts": 1,
+        "path": "snapshots/v1.json",
+        "payload": {
+            "snapshot_version": 1,
             "schema": schema,
             "resources": [
                 {
@@ -1358,8 +1389,12 @@ def _leaf(schema: dict, *, rows: int = 1, columns: list[str] | None = None):
                     },
                 }
             ],
-        }
-    ).encode()
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "_row_filter": None,
+        },
+    }).encode()
 
 
 def _set_leaf_payloads(reader, payloads: dict[str, bytes]) -> None:
@@ -1482,7 +1517,9 @@ def test_show_stats_removes_rows_for_excluded_columns(monkeypatch):
     reader.super_name = SUPER
     reader.storage = MagicMock()
     reader._assert_targets_exist = MagicMock()
-    reader._resolve_latest_stats_file = MagicMock(return_value="stats.parquet")
+    reader._resolve_latest_stats_context = MagicMock(
+        return_value=("stats.parquet", False),
+    )
     command = classify_query("SHOW STATS card", SUPER)
 
     with patch("supertable.processing.load_stats", return_value=stats):

@@ -97,6 +97,7 @@ def test_disabled_pruning_skips_predicate_and_join_analysis(monkeypatch):
     parser.original_query = "SELECT 1"
     parser.get_table_tuples.return_value = []
     parser.get_physical_tables.return_value = []
+    parser.get_binding_ambiguities.return_value = {}
     parser.get_predicate_constraints.side_effect = AssertionError(
         "predicate analysis must be skipped",
     )

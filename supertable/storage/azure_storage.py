@@ -438,6 +438,7 @@ class AzureBlobStorage(StorageInterface):
         """Delete and verify an Azure blob prefix with bounded retries."""
         import itertools
 
+        path = self._require_nonempty_delete_prefix(path)
         physical = self._with_base(path)
         if self._blob_exists(physical):
             self.container.delete_blob(physical)
@@ -527,10 +528,10 @@ class AzureBlobStorage(StorageInterface):
         try:
             buf = io.BytesIO(data)
             proj = None
-            if columns:
+            if columns is not None:
                 proj = self._project_columns(pq.read_schema(buf).names, columns)
                 buf.seek(0)
-            return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
+            return pq.read_table(buf, columns=proj)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
 

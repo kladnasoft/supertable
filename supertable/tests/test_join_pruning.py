@@ -476,15 +476,18 @@ def test_join_edges_from_using_two_tables():
     assert edges[0].prune_left and edges[0].prune_right
 
 
-def test_join_edges_using_chain_binds_only_the_first_hop():
-    """Deeper USING hops would need schema knowledge to bind the column to the
-    right left-side table — only the unambiguous first hop is translated."""
+def test_join_edges_using_chain_fails_closed():
+    """Accumulated-left USING bindings require schema-aware resolution."""
     q = ("SELECT a.x FROM webshop.a a JOIN webshop.b b USING (k) "
          "JOIN webshop.c c USING (k)")
-    edges = SQLParser(SUPER, q, "duckdb").get_join_edges()
-    assert _edge_set(edges) == {
-        frozenset({((SUPER, "a"), "k"), ((SUPER, "b"), "k")})
-    }
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"JOIN \.\.\. USING is supported only between two direct table "
+            r"sources"
+        ),
+    ):
+        SQLParser(SUPER, q, "duckdb")
 
 
 def test_join_edges_left_join_using_clears_preserved_side():

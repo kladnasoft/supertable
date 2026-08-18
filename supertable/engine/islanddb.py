@@ -1296,6 +1296,60 @@ class IslandDB:
         }
 
     @staticmethod
+    def _candidate_result_upper_bound(
+        root: exp.Select,
+        parser,
+        reflection: Reflection,
+    ) -> Optional[int]:
+        """Return a sealed row upper bound for the top-level join chain.
+
+        Inner/CROSS joins are bounded by the Cartesian product.  Outer joins
+        additionally retain the rows on their preserved side(s), including
+        when the other input is empty.  Returning ``None`` on any
+        shape/metadata mismatch keeps routing fail-closed.
+        """
+        definitions = list(parser.get_table_tuples())
+        joins = list(root.args.get("joins") or ())
+        if not definitions or len(definitions) != len(joins) + 1:
+            return None
+
+        snapshots = IslandDB._snapshots(reflection)
+        occurrence_rows: List[int] = []
+        for definition in definitions:
+            snapshot = snapshots.get((
+                definition.super_name.casefold(),
+                definition.simple_name.casefold(),
+            ))
+            if snapshot is None or not bool(getattr(
+                snapshot, "candidate_rows_complete", False,
+            )):
+                return None
+            try:
+                occurrence_rows.append(max(
+                    0, int(getattr(snapshot, "candidate_rows", 0) or 0),
+                ))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        upper_bound = occurrence_rows[0]
+        for join, right_rows in zip(joins, occurrence_rows[1:]):
+            side = str(join.args.get("side") or "").upper()
+            if side == "LEFT":
+                upper_bound *= max(1, right_rows)
+            elif side == "RIGHT":
+                upper_bound = max(1, upper_bound) * right_rows
+            elif side == "FULL":
+                # A FULL join may emit the Cartesian matches plus unmatched
+                # rows from either input.  The sum is deliberately loose but
+                # remains a sound resource upper bound for every zero-side case.
+                upper_bound = (
+                    upper_bound * right_rows + upper_bound + right_rows
+                )
+            else:
+                upper_bound *= right_rows
+        return upper_bound
+
+    @staticmethod
     def _table_maps(parser, reflection: Reflection):
         snapshots = IslandDB._snapshots(reflection)
         aliases: Dict[str, SuperSnapshot] = {}
@@ -1542,14 +1596,22 @@ class IslandDB:
         snapshot = IslandDB._resolve_column_snapshot(column, aliases)
         if snapshot is None:
             return None
+        return IslandDB._snapshot_binary_value_bound(snapshot, column.name)
+
+    @staticmethod
+    def _snapshot_binary_value_bound(
+        snapshot: SuperSnapshot,
+        column_name: str,
+    ) -> Optional[int]:
+        """Return the exact-case sealed Binary width on one snapshot."""
         raw = getattr(snapshot, "column_max_value_bytes", None)
         if not isinstance(raw, dict):
             return None
         matches = [
             (name, value) for name, value in raw.items()
-            if str(name).casefold() == column.name.casefold()
+            if str(name).casefold() == column_name.casefold()
         ]
-        if len(matches) != 1 or str(matches[0][0]) != column.name:
+        if len(matches) != 1 or str(matches[0][0]) != column_name:
             return None
         value = matches[0][1]
         if (
@@ -1559,6 +1621,81 @@ class IslandDB:
         ):
             return None
         return int(value)
+
+    @classmethod
+    def _projected_result_row_width(
+        cls,
+        root: exp.Select,
+        aliases: Dict[str, SuperSnapshot],
+        reflection: Reflection,
+        parser,
+    ) -> Optional[int]:
+        """Bound one logical Arrow result row from snapshot-sealed widths.
+
+        The historical 24-byte field charge remains intentionally
+        conservative for the fixed-width native contract.  Arrow Binary is
+        variable-width: its write-time maximum value seal is authoritative,
+        and nine extra bytes cover two int32 offsets plus worst-case validity
+        overhead even for a one-row batch.  Missing or ambiguous Binary seals
+        make admission incomplete rather than falling back to 24 bytes.
+        """
+        system_names = {ROWID_COL.casefold(), TIMESTAMP_COL.casefold()}
+
+        def snapshot_fields(snapshot: SuperSnapshot) -> Optional[int]:
+            total = 0
+            for name, type_name in (snapshot.column_types or {}).items():
+                column_name = str(name)
+                if column_name.casefold() in system_names:
+                    continue
+                if _is_binary_extrema_type(type_name):
+                    bound = cls._snapshot_binary_value_bound(
+                        snapshot, column_name,
+                    )
+                    if bound is None:
+                        return None
+                    total += max(24, bound + 9)
+                else:
+                    total += 24
+            return total
+
+        width = 0
+        for selected in root.expressions:
+            core = selected.this if isinstance(selected, exp.Alias) else selected
+            if isinstance(core, exp.Star):
+                snapshots = cls._snapshots(reflection)
+                # SQL star expands relation occurrences, not unique physical
+                # snapshots. A self-join therefore contributes the same sealed
+                # schema once per alias even though DataEstimator correctly
+                # pins only one immutable SuperSnapshot.
+                for definition in parser.get_table_tuples():
+                    snapshot = snapshots.get((
+                        definition.super_name.casefold(),
+                        definition.simple_name.casefold(),
+                    ))
+                    if snapshot is None:
+                        return None
+                    star_width = snapshot_fields(snapshot)
+                    if star_width is None:
+                        return None
+                    width += star_width
+            elif isinstance(core, exp.Column) and core.is_star:
+                snapshot = aliases.get(core.table.casefold()) if core.table else None
+                if snapshot is None:
+                    return None
+                star_width = snapshot_fields(snapshot)
+                if star_width is None:
+                    return None
+                width += star_width
+            elif isinstance(core, exp.Column) and _is_binary_extrema_type(
+                cls._resolve_column_type(core, aliases)
+            ):
+                bound = cls._binary_value_bound(core, aliases)
+                if bound is None:
+                    return None
+                width += max(24, bound + 9)
+            else:
+                width += 24
+        return max(24, width)
 
     @staticmethod
     def _column_spelling_is_exact(
@@ -1658,26 +1795,10 @@ class IslandDB:
                     and limit_value >= 0
                     and root.args.get("offset") is None
                 ):
-                    snapshots = self._snapshots(reflection)
-                    occurrence_rows: List[int] = []
-                    for definition in parser.get_table_tuples():
-                        snapshot = snapshots.get((
-                            definition.super_name.casefold(),
-                            definition.simple_name.casefold(),
-                        ))
-                        if snapshot is None or not bool(getattr(
-                            snapshot, "candidate_rows_complete", False,
-                        )):
-                            break
-                        occurrence_rows.append(max(
-                            0, int(getattr(snapshot, "candidate_rows", 0) or 0),
-                        ))
-                    else:
-                        upper_bound = 1
-                        for rows in occurrence_rows:
-                            upper_bound *= rows
-                        if not occurrence_rows:
-                            upper_bound = 0
+                    upper_bound = self._candidate_result_upper_bound(
+                        root, parser, reflection,
+                    )
+                    if upper_bound is not None:
                         scalar = bool(root.expressions) and all(
                             next(
                                 selected.find_all(
@@ -2291,32 +2412,31 @@ class IslandDB:
                 else:
                     projected_fields += 1
             projected_fields = max(1, projected_fields)
+            result_row_width = self._projected_result_row_width(
+                root, aliases, reflection, parser,
+            )
+            if result_row_width is None:
+                # A Binary result has no sound width without its immutable
+                # write-time maximum. Keep a diagnostic fallback value, but
+                # route the query away before Island admission/execution.
+                result_row_width = projected_fields * 24
+                complete = False
             if has_join:
-                occurrence_rows: List[int] = []
-                snapshots = self._snapshots(reflection)
-                for definition in parser.get_table_tuples():
-                    snapshot = snapshots.get((
-                        definition.super_name.casefold(),
-                        definition.simple_name.casefold(),
-                    ))
-                    if snapshot is None or not getattr(
-                        snapshot, "candidate_rows_complete", False,
-                    ):
-                        candidate_rows_complete = False
-                        break
-                    occurrence_rows.append(max(
-                        0, int(getattr(snapshot, "candidate_rows", 0) or 0),
-                    ))
-                worst_rows = 1
-                for rows in occurrence_rows:
-                    worst_rows *= rows
-                result_bytes = worst_rows * projected_fields * 24
+                bounded_rows = self._candidate_result_upper_bound(
+                    root, parser, reflection,
+                )
+                if bounded_rows is None:
+                    candidate_rows_complete = False
+                    worst_rows = 0
+                else:
+                    worst_rows = bounded_rows
+                result_bytes = worst_rows * result_row_width
                 estimated_result_rows = worst_rows
             elif bounded_group_operator:
-                result_bytes = int(group_cardinality_bound) * projected_fields * 24
+                result_bytes = int(group_cardinality_bound) * result_row_width
                 estimated_result_rows = int(group_cardinality_bound)
             else:
-                result_bytes = candidate_rows * projected_fields * 24
+                result_bytes = candidate_rows * result_row_width
                 estimated_result_rows = candidate_rows
             if not candidate_rows_complete:
                 complete = False
@@ -3625,6 +3745,7 @@ class IslandDB:
             native_sql,
             alias_to_physical,
             parsed_expression=native_root,
+            default_super_name=parser.default_super_name,
         )
         parser.executing_query = query
         lazy_result = context.execute(query, eager=False)

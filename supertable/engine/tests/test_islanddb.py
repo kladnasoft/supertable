@@ -58,6 +58,23 @@ from supertable.utils.timer import Timer
 from supertable.utils.sql_parser import SQLParser
 
 
+@pytest.fixture(autouse=True)
+def _catalog_without_engine_overrides(monkeypatch):
+    """Public Executor tests use an explicit absent config document."""
+    import supertable.redis_catalog as redis_catalog_module
+
+    class Catalog:
+        @staticmethod
+        def get_engine_config(_organization):
+            return None
+
+        @staticmethod
+        def list_spark_clusters(_organization):
+            return []
+
+    monkeypatch.setattr(redis_catalog_module, "RedisCatalog", Catalog)
+
+
 def _snapshot(name, paths, keys, *, types=None):
     types = types or {
         "id": "Int64", "v": "Int64", "__rowid__": "Int64",
@@ -1574,6 +1591,32 @@ def test_numeric_inner_join_matches_duckdb(tmp_path):
     pd.testing.assert_frame_equal(actual, expected)
 
 
+def test_group_by_physical_column_shadowing_select_alias_matches_duckdb(tmp_path):
+    path = tmp_path / "group-alias-shadow.parquet"
+    pl.DataFrame({
+        "x": [1, 1, 2],
+        "y": [10, 10, 10],
+        "__rowid__": [1, 2, 3],
+        "__timestamp__": [1, 1, 1],
+    }).write_parquet(path)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/group-alias-shadow"],
+        types={
+            "x": "Int64", "y": "Int64", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+    query = (
+        "SELECT y, count(*) AS x FROM s.t "
+        "GROUP BY y, x ORDER BY x"
+    )
+
+    expected = _run_duckdb(tmp_path, reflection, query)
+    actual, _ = _run_island(tmp_path, reflection, query)
+
+    pd.testing.assert_frame_equal(actual, expected)
+
+
 def test_schema_evolution_union_by_name_matches_duckdb(tmp_path):
     first = tmp_path / "evolved-1.parquet"
     second = tmp_path / "evolved-2.parquet"
@@ -2002,6 +2045,184 @@ def test_binary_scalar_plan_charges_exact_value_per_reduction_and_worker(
     assert estimate.estimated_result_rows == 1
 
 
+def test_binary_projection_plan_uses_sealed_width_for_result_and_batch_rows(
+    tmp_path,
+):
+    maximum = 20_000
+    reflection = _binary_reflection(
+        tmp_path, [[b"a" * maximum, b"b" * maximum]],
+    )
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
+    parser = SQLParser("s", "SELECT payload FROM s.t", "duckdb")
+    resources = ContainerResources(
+        cpu_count=2,
+        cpu_capacity=2.0,
+        affinity_cpus=(0, 1),
+        cpuset_cpus=(0, 1),
+        memory_limit_bytes=512 * 1024**2,
+        memory_available_bytes=512 * 1024**2,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+
+    plan = engine.resource_plan(reflection, parser, streaming_result=True)
+    row_width = maximum + 9
+
+    assert plan.advice is ExecutionAdvice.ISLAND_IN_MEMORY
+    assert plan.batch_rows <= plan.batch_bytes // row_width
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(reflection, parser, streaming_result=True)
+    assert estimate.result_bytes == 2 * row_width
+    assert estimate.estimated_result_rows == 2
+    assert estimate.estimates_complete is True
+
+
+def test_binary_join_result_width_sums_each_physical_snapshot_seal(tmp_path):
+    left_path = tmp_path / "binary-join-left.parquet"
+    right_path = tmp_path / "binary-join-right.parquet"
+    left_width = 10_000
+    right_width = 20_000
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+        "payload": pa.array([b"a" * left_width] * 2, type=pa.binary()),
+        "__rowid__": pa.array([1, 2], type=pa.int64()),
+        "__timestamp__": pa.array([1, 1], type=pa.int64()),
+    }), left_path)
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+        "payload": pa.array([b"b" * right_width] * 2, type=pa.binary()),
+        "__rowid__": pa.array([3, 4], type=pa.int64()),
+        "__timestamp__": pa.array([1, 1], type=pa.int64()),
+    }), right_path)
+    column_types = {
+        "id": "Int64", "payload": "Binary",
+        "__rowid__": "Int64", "__timestamp__": "Int64",
+    }
+    left = _snapshot(
+        "left_t", [left_path], ["raw/binary-join-left"], types=column_types,
+    )
+    right = _snapshot(
+        "right_t", [right_path], ["raw/binary-join-right"], types=column_types,
+    )
+    left.column_max_value_bytes = {"payload": left_width}
+    right.column_max_value_bytes = {"payload": right_width}
+    reflection = _reflection(left, right)
+    parser = SQLParser(
+        "s",
+        "SELECT l.payload AS left_payload, r.payload AS right_payload "
+        "FROM s.left_t l JOIN s.right_t r ON l.id = r.id",
+        "duckdb",
+    )
+    assert IslandDB().can_execute(
+        reflection, parser, streaming_result=True,
+    ).supported
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine = IslandDB()
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(reflection, parser, streaming_result=True)
+    row_width = left_width + 9 + right_width + 9
+
+    assert estimate.estimated_result_rows == 4
+    assert estimate.result_bytes == 4 * row_width
+    assert estimate.estimates_complete is True
+
+
+def test_binary_self_join_star_width_counts_occurrences_and_qualified_star(
+    tmp_path,
+):
+    maximum = 4_000
+    reflection = _binary_reflection(
+        tmp_path, [[b"a" * maximum, b"b" * maximum]],
+    )
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine = IslandDB()
+    engine._planner = CapturePlanner()
+    bare = SQLParser(
+        "s", "SELECT * FROM s.t a CROSS JOIN s.t b", "duckdb",
+    )
+    qualified = SQLParser(
+        "s", "SELECT a.* FROM s.t a CROSS JOIN s.t b", "duckdb",
+    )
+
+    bare_estimate = engine.resource_plan(
+        reflection, bare, streaming_result=True,
+    )
+    qualified_estimate = engine.resource_plan(
+        reflection, qualified, streaming_result=True,
+    )
+    one_occurrence_width = 24 + maximum + 9
+
+    assert bare_estimate.estimated_result_rows == 4
+    assert bare_estimate.result_bytes == 4 * 2 * one_occurrence_width
+    assert qualified_estimate.result_bytes == 4 * one_occurrence_width
+
+
+def test_missing_binary_projection_width_routes_instead_of_using_24_bytes(
+    tmp_path,
+):
+    reflection = _binary_reflection(tmp_path, [[b"payload"]])
+    reflection.supers[0].column_max_value_bytes = {}
+    parser = SQLParser("s", "SELECT payload FROM s.t", "duckdb")
+
+    plan = IslandDB().resource_plan(
+        reflection, parser, streaming_result=True,
+    )
+
+    assert plan.advice is ExecutionAdvice.ROUTE_DUCKDB
+    assert "incomplete" in plan.reason
+
+
+def test_wide_binary_result_triggers_stream_admission_from_sealed_width(
+    tmp_path,
+):
+    maximum = 10_000
+    reflection = _binary_reflection(tmp_path, [[b"x" * maximum]])
+    # Model a catalog-sealed large snapshot without constructing a 100-MiB
+    # fixture. The planner consumes this same immutable candidate-row field in
+    # production after DataEstimator validates every selected row group.
+    reflection.supers[0].candidate_rows = 10_000
+    resources = ContainerResources(
+        cpu_count=2,
+        cpu_capacity=2.0,
+        affinity_cpus=(0, 1),
+        cpuset_cpus=(0, 1),
+        memory_limit_bytes=512 * 1024**2,
+        memory_available_bytes=512 * 1024**2,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+    parser = SQLParser("s", "SELECT payload FROM s.t", "duckdb")
+
+    plan = engine.resource_plan(reflection, parser, streaming_result=False)
+
+    assert plan.advice is ExecutionAdvice.STREAM_RESULT
+    assert plan.batch_rows <= plan.batch_bytes // (maximum + 9)
+
+
 def test_island_instances_share_governor_across_live_memory_limit_change(
     tmp_path, monkeypatch,
 ):
@@ -2288,6 +2509,73 @@ def test_response_limit_is_native_when_candidate_count_proves_it_redundant(
     assert capability.supported, capability.reasons
 
 
+def test_left_join_empty_right_preserves_left_cardinality_bound(tmp_path):
+    left_path = tmp_path / "left.parquet"
+    right_path = tmp_path / "right-empty.parquet"
+    schema = {
+        "id": pl.Int64,
+        "v": pl.Int64,
+        "__rowid__": pl.Int64,
+        "__timestamp__": pl.Int64,
+    }
+    pl.DataFrame({
+        "id": [1, 2, 3],
+        "v": [10, 20, 30],
+        "__rowid__": [1, 2, 3],
+        "__timestamp__": [1, 1, 1],
+    }, schema=schema).write_parquet(left_path)
+    pl.DataFrame(schema=schema).write_parquet(right_path)
+    reflection = _reflection(
+        _snapshot("left_t", [left_path], ["raw/left"]),
+        _snapshot("right_t", [right_path], ["raw/right-empty"]),
+    )
+
+    engine = IslandDB()
+    outer_bounds = {
+        "SELECT l.id AS id FROM s.left_t l "
+        "LEFT JOIN s.right_t r ON l.id=r.id": 3,
+        "SELECT l.id AS id FROM s.left_t l "
+        "FULL JOIN s.right_t r ON l.id=r.id": 3,
+        "SELECT l.id AS id FROM s.right_t r "
+        "RIGHT JOIN s.left_t l ON l.id=r.id": 3,
+    }
+    for sql, expected_bound in outer_bounds.items():
+        bound_parser = SQLParser("s", sql, "duckdb")
+        assert engine._candidate_result_upper_bound(
+            engine._query_root(bound_parser), bound_parser, reflection,
+        ) == expected_bound
+
+    truncating = SQLParser(
+        "s",
+        "SELECT l.id AS id FROM s.left_t l "
+        "LEFT JOIN s.right_t r ON l.id=r.id LIMIT 1",
+        "duckdb",
+    )
+    capability = engine.can_execute(reflection, truncating)
+    assert not capability.supported
+    assert "LIMIT/OFFSET" in "; ".join(capability.reasons)
+
+    bounded_sql = (
+        "SELECT l.id AS id FROM s.left_t l "
+        "LEFT JOIN s.right_t r ON l.id=r.id ORDER BY l.id LIMIT 3"
+    )
+    parser = SQLParser("s", bounded_sql, "duckdb")
+    assert engine.can_execute(reflection, parser).supported
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(reflection, parser, streaming_result=False)
+    assert estimate.estimated_result_rows == 3
+    assert estimate.result_bytes == 3 * 24
+
+    expected = _run_duckdb(tmp_path, reflection, bounded_sql)
+    actual, _ = _run_island(tmp_path, reflection, bounded_sql)
+    pd.testing.assert_frame_equal(actual, expected)
+
+
 def test_unproven_projected_pandas_type_is_rejected(tmp_path):
     path = tmp_path / "decimal.parquet"
     frame = pl.DataFrame({
@@ -2310,7 +2598,6 @@ def test_unproven_projected_pandas_type_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("join_sql, reason", [
-    ("SELECT a.id AS aid FROM s.a a NATURAL JOIN s.b b", "NATURAL"),
     ("SELECT a.id AS aid FROM s.a a JOIN s.b b USING(id)", "USING"),
     ("SELECT * FROM s.a a JOIN s.b b ON a.id=b.id", "SELECT *"),
     ("SELECT a.id, b.id FROM s.a a JOIN s.b b ON a.id=b.id", "duplicate output"),
@@ -2336,6 +2623,15 @@ def test_unproven_join_forms_and_output_names_are_rejected(
 
     assert not capability.supported
     assert reason in "; ".join(capability.reasons)
+
+
+def test_natural_join_is_rejected_at_shared_parser_boundary():
+    with pytest.raises(ValueError, match="NATURAL JOIN is not supported"):
+        SQLParser(
+            "s",
+            "SELECT a.id AS aid FROM s.a a NATURAL JOIN s.b b",
+            "duckdb",
+        )
 
 
 @pytest.mark.parametrize("projection", ["*", "a.*, b.*"])

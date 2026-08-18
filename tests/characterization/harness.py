@@ -1,12 +1,14 @@
 """Hermetic test harness for SuperTable characterization tests.
 
 This module deliberately imports **no** ``supertable`` package at module top so
-that :func:`bootstrap_hermetic_env` can run *before* any ``supertable`` import.
-The production ``supertable.config.settings`` module calls
+that :func:`bootstrap_hermetic_env` normally runs *before* any ``supertable``
+import.  The production ``supertable.config.settings`` module calls
 ``load_dotenv(find_dotenv(usecwd=True))`` at import time, which would otherwise
 pull the developer's real ``.env`` (MinIO endpoint, Sentinel Redis, presign,
 ``STORAGE_TYPE=MINIO``) into the test process.  We neutralise python-dotenv and
-pin a fully explicit, local, hermetic environment instead.
+pin a fully explicit, local, hermetic environment instead.  A defensive refresh
+also covers whole-repository pytest collection, where a sibling test tree can
+import the frozen settings singleton before pytest reaches ``tests/conftest.py``.
 
 The other job of this module is to swap the single Redis client factory
 (``supertable.redis_connector.create_redis_client``) for a process-local
@@ -35,10 +37,87 @@ FIXED_NOW_MS = 1_700_000_000_000  # 2023-11-14T22:13:20Z, arbitrary but frozen
 _ENV_BOOTSTRAPPED = False
 
 
+def _refresh_loaded_supertable_configuration() -> None:
+    """Rebuild an already-imported settings singleton from the pinned env.
+
+    ``Settings`` is deliberately frozen for production.  During a whole-tree
+    pytest collection, however, tests under ``supertable/`` may import it before
+    pytest reaches the characterization conftest.  Merely changing
+    ``os.environ`` then leaves every ``from ...settings import settings`` binding
+    pointed at the developer's deployment configuration.  Refresh those exact
+    object bindings here, in the test harness only, and preserve the identity of
+    the legacy mutable ``default`` object imported by older modules.
+    """
+    settings_module = sys.modules.get("supertable.config.settings")
+    if settings_module is None:
+        return
+
+    old_settings = getattr(settings_module, "settings", None)
+    settings_type = getattr(settings_module, "Settings", None)
+    build_settings = getattr(settings_module, "_build_settings", None)
+    if (
+        not isinstance(settings_type, type)
+        or not isinstance(old_settings, settings_type)
+        or not callable(build_settings)
+    ):
+        raise RuntimeError("loaded supertable settings module has an invalid shape")
+
+    fresh_settings = build_settings()
+    settings_module.settings = fresh_settings
+
+    # Production modules import the singleton under several aliases
+    # (``settings``, ``_settings``, ``_cfg``).  Identity-based replacement is
+    # intentionally narrower than matching attribute names or values.
+    for module_name, module in tuple(sys.modules.items()):
+        if module is None or not (
+            module_name == "supertable" or module_name.startswith("supertable.")
+        ):
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict):
+            continue
+        for attribute, value in tuple(namespace.items()):
+            if value is old_settings:
+                namespace[attribute] = fresh_settings
+
+    defaults_module = sys.modules.get("supertable.config.defaults")
+    if defaults_module is not None:
+        legacy_default = getattr(defaults_module, "default", None)
+        update_default = getattr(legacy_default, "update_default", None)
+        if callable(update_default):
+            update_default(
+                MAX_MEMORY_CHUNK_SIZE=fresh_settings.MAX_MEMORY_CHUNK_SIZE,
+                MAX_OVERLAPPING_FILES=fresh_settings.MAX_OVERLAPPING_FILES,
+                MAX_TOMBSTONE_ROWS=fresh_settings.MAX_TOMBSTONE_ROWS,
+                TOMBSTONE_COMPACTION_WORKERS=fresh_settings.TOMBSTONE_COMPACTION_WORKERS,
+                DEFAULT_TIMEOUT_SEC=fresh_settings.DEFAULT_TIMEOUT_SEC,
+                DEFAULT_LOCK_DURATION_SEC=fresh_settings.DEFAULT_LOCK_DURATION_SEC,
+                LOG_LEVEL=fresh_settings.SUPERTABLE_LOG_LEVEL,
+                IS_SHOW_TIMING=fresh_settings.IS_SHOW_TIMING,
+                STORAGE_TYPE=fresh_settings.STORAGE_TYPE,
+            )
+
+    # ``homedir`` caches the resolved path separately from Settings.  It can be
+    # populated by an eager sibling import, so invalidate that cache as well.
+    homedir_module = sys.modules.get("supertable.config.homedir")
+    if homedir_module is not None:
+        homedir_module.settings = fresh_settings
+        homedir_module._resolved_home = None
+
+    # Processing lazily caches a storage instance.  Collection should not
+    # create one, but clearing it prevents a side-effectful sibling import from
+    # retaining an external client after the hermetic settings refresh.
+    processing_module = sys.modules.get("supertable.processing")
+    if processing_module is not None:
+        processing_module._storage = None
+
+
 def bootstrap_hermetic_env(home: Optional[str] = None) -> str:
-    """Pin a hermetic environment.  MUST run before importing ``supertable``.
+    """Pin a hermetic environment before normal ``supertable`` use.
 
     Idempotent: the first call wins (so a test-session temp home is stable).
+    If whole-tree collection imported ``supertable`` first, refresh its frozen
+    configuration bindings after pinning the environment.
     Returns the resolved ``SUPERTABLE_HOME``.
     """
     global _ENV_BOOTSTRAPPED
@@ -75,19 +154,35 @@ def bootstrap_hermetic_env(home: Optional[str] = None) -> str:
         "STORAGE_TYPE": "LOCAL",
         "STORAGE_ENDPOINT_URL": "",        # avoid S3 endpoint detection path
         "STORAGE_BUCKET": "supertable",
+        "STORAGE_REGION": "us-east-1",
+        "STORAGE_ACCESS_KEY": "",
+        "STORAGE_SECRET_KEY": "",
+        "STORAGE_SESSION_TOKEN": "",
+        "STORAGE_FORCE_PATH_STYLE": "true",
+        "STORAGE_USE_SSL": "false",
         "SUPERTABLE_DUCKDB_PRESIGNED": "0",  # LocalStorage has no presign()
+        "SUPERTABLE_DUCKDB_USE_HTTPFS": "0",
+        "SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD": "0",
+        "SUPERTABLE_REDIS_URL": "",
         "SUPERTABLE_REDIS_SENTINEL": "false",
         "SUPERTABLE_REDIS_SENTINELS": "",
         "SUPERTABLE_REDIS_HOST": "localhost",
+        "SUPERTABLE_REDIS_PORT": "6379",
         "SUPERTABLE_REDIS_DB": "0",
+        "SUPERTABLE_REDIS_PASSWORD": "",
+        "SUPERTABLE_REDIS_USERNAME": "",
+        "SUPERTABLE_REDIS_SSL": "false",
         "SUPERTABLE_ORGANIZATION": "",
         "SUPERTABLE_MONITORING_ENABLED": "false",  # no background dequeue threads
+        "SUPERTABLE_MONITOR_SPOOL_MAX_BYTES": str(256 * 1024 * 1024),
+        "SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS": "100000",
         "SUPERTABLE_LOG_LEVEL": "WARNING",
         "LOCKING_BACKEND": "redis",
     }
     for k, v in hermetic.items():
         os.environ[k] = v
 
+    _refresh_loaded_supertable_configuration()
     _ENV_BOOTSTRAPPED = True
     return home
 

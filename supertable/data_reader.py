@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Callable, Optional, Tuple, Any, List, Dict
@@ -22,13 +23,20 @@ from supertable.storage.storage_interface import StorageInterface
 from supertable.utils.timer import Timer
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
+from supertable.utils.snapshot import (
+    collect_share_row_filters,
+    complete_snapshot_payload,
+)
 from supertable.plan_extender import extend_execution_plan
 from supertable.monitoring_writer import (
     MonitoringDurabilityError,
     MonitoringPostExecutionError,
 )
 from supertable.engine.plan_stats import PlanStats
-from supertable.engine.engine_common import redact_url_credentials
+from supertable.engine.engine_common import (
+    redact_url_credentials,
+    validate_rbac_binding_stability,
+)
 from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 
 from supertable.engine.data_estimator import DataEstimator
@@ -82,25 +90,72 @@ class _MonitoredResultStream:
         self._inner = inner
         self._finalize_callback = finalize
         self.schema = inner.schema
+        self._finalize_condition = threading.Condition()
         self._rows = 0
         self._bytes = 0
         self._finalized = False
+        self._finalize_complete = False
+        self._finalizing_thread: Optional[int] = None
         self._finalize_error: BaseException | None = None
 
     def __iter__(self):
         return self
 
     def _finish(self, status: str, message: Optional[str]) -> None:
-        if self._finalized:
-            if self._finalize_error is not None:
-                raise self._finalize_error
-            return
-        self._finalized = True
+        owner = threading.get_ident()
+        with self._finalize_condition:
+            if self._finalized:
+                # A concurrent terminal path must observe completion of the
+                # one callback that won.  Callback re-entry on its own thread
+                # returns immediately instead of deadlocking.
+                while (
+                    not self._finalize_complete
+                    and self._finalizing_thread != owner
+                ):
+                    self._finalize_condition.wait()
+                if self._finalize_error is not None:
+                    raise self._finalize_error
+                return
+            self._finalized = True
+            self._finalizing_thread = owner
+            rows = self._rows
+            size = self._bytes
+
         try:
-            self._finalize_callback(status, message, self._rows, self._bytes)
+            self._finalize_callback(status, message, rows, size)
         except BaseException as exc:
-            self._finalize_error = exc
+            with self._finalize_condition:
+                self._finalize_error = exc
+                self._finalize_complete = True
+                self._finalizing_thread = None
+                self._finalize_condition.notify_all()
             raise
+        else:
+            with self._finalize_condition:
+                self._finalize_complete = True
+                self._finalizing_thread = None
+                self._finalize_condition.notify_all()
+
+    def _record_batch(self, batch: Any) -> None:
+        with self._finalize_condition:
+            while (
+                self._finalized
+                and not self._finalize_complete
+                and self._finalizing_thread != threading.get_ident()
+            ):
+                self._finalize_condition.wait()
+            if self._finalized:
+                if self._finalize_error is not None:
+                    raise self._finalize_error
+                raise RuntimeError(
+                    "Result stream finalized while producing an Arrow batch"
+                )
+            self._rows += max(0, int(getattr(batch, "num_rows", 0)))
+            self._bytes += max(0, int(getattr(batch, "nbytes", 0)))
+
+    def _is_finalized(self) -> bool:
+        with self._finalize_condition:
+            return self._finalized
 
     def __next__(self):
         try:
@@ -110,8 +165,14 @@ class _MonitoredResultStream:
             try:
                 if callable(close):
                     close()
-            finally:
-                self._finish(Status.OK.value, None)
+            except BaseException as exc:
+                try:
+                    self._finish(Status.ERROR.value, str(exc))
+                except BaseException as monitoring_exc:
+                    setattr(monitoring_exc, "stream_error", exc)
+                    raise monitoring_exc from exc
+                raise
+            self._finish(Status.OK.value, None)
             raise
         except BaseException as exc:
             try:
@@ -120,8 +181,7 @@ class _MonitoredResultStream:
                 setattr(monitoring_exc, "stream_error", exc)
                 raise monitoring_exc from exc
             raise
-        self._rows += max(0, int(getattr(batch, "num_rows", 0)))
-        self._bytes += max(0, int(getattr(batch, "nbytes", 0)))
+        self._record_batch(batch)
         return batch
 
     def cancel(self) -> None:
@@ -142,23 +202,20 @@ class _MonitoredResultStream:
             if callable(close):
                 close()
         finally:
-            if not self._finalized:
-                self._finish(
-                    Status.ERROR.value,
-                    "result stream closed before exhaustion",
-                )
-            elif self._finalize_error is not None:
-                raise self._finalize_error
+            self._finish(
+                Status.ERROR.value,
+                "result stream closed before exhaustion",
+            )
 
     @property
     def closed(self) -> bool:
-        return bool(getattr(self._inner, "closed", self._finalized))
+        return bool(getattr(self._inner, "closed", self._is_finalized()))
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc is not None and not self._finalized:
+        if exc is not None and not self._is_finalized():
             try:
                 self.cancel()
             except Exception:
@@ -169,7 +226,7 @@ class _MonitoredResultStream:
 
     def __del__(self):
         try:
-            if not self._finalized:
+            if not self._is_finalized():
                 self.cancel()
         except Exception:
             pass
@@ -465,30 +522,61 @@ class DataReader:
             resolved[key] = tuple(children)
         return resolved
 
-    def _resolve_latest_stats_file(
+    def _resolve_latest_stats_context(
         self, super_name: str, simple_name: str,
-    ) -> Optional[str]:
-        """Return the ``stats_file`` pointer of the table's latest snapshot.
+    ) -> Tuple[Optional[str], bool]:
+        """Return the latest stats pointer and whether a share filter exists.
 
         Prefers the leaf payload (already in Redis); falls back to reading the
-        snapshot JSON from storage. ``None`` when the table has no stats artifact
-        yet (never written, or written before stats existed).
+        snapshot JSON from storage.  The filter marker is read from the same
+        pinned leaf/snapshot context as the pointer so ``SHOW STATS`` cannot
+        authorize one version and then expose another version's raw artifact.
+
+        A malformed non-null ``_row_filter`` is treated as present.  Corrupt
+        authorization metadata must disable raw statistics rather than silently
+        widening access.
         """
+        def has_row_filter(document: object) -> bool:
+            try:
+                return bool(collect_share_row_filters(document))
+            except RuntimeError:
+                # SHOW STATS needs only the deny/allow decision.  Preserve its
+                # generic denial path while treating corrupt authorization
+                # metadata exactly like a present restriction.
+                return True
+
         catalog = RedisCatalog()
         leaf = catalog.get_leaf(self.organization, super_name, simple_name)
         if not isinstance(leaf, dict):
-            return None
+            return None, False
         payload = leaf.get("payload")
-        if isinstance(payload, dict) and payload.get("stats_file"):
-            return payload["stats_file"]
+        filtered = has_row_filter(leaf) or has_row_filter(payload)
+        complete_payload = complete_snapshot_payload(
+            payload,
+            expected_version=leaf.get("version"),
+            require_policy_marker=True,
+        )
+        if complete_payload is not None:
+            return (
+                complete_payload.get("stats_file"),
+                filtered or has_row_filter(complete_payload),
+            )
         path = leaf.get("path")
         if not path:
-            return None
+            return None, filtered
         from supertable.super_table import SuperTable
         snapshot = SuperTable(
             super_name, self.organization, create_if_missing=False,
         ).read_simple_table_snapshot(path)
-        return snapshot.get("stats_file") if isinstance(snapshot, dict) else None
+        if not isinstance(snapshot, dict):
+            return None, filtered
+        return snapshot.get("stats_file"), filtered or has_row_filter(snapshot)
+
+    def _resolve_latest_stats_file(
+        self, super_name: str, simple_name: str,
+    ) -> Optional[str]:
+        """Compatibility wrapper returning only the latest stats pointer."""
+        return self._resolve_latest_stats_context(super_name, simple_name)[0]
 
     def _execute_show_stats(
         self, command, role_name: str,
@@ -533,8 +621,51 @@ class DataReader:
             physical_tables=[td],
         )
 
+        matching_views = [
+            view
+            for alias, view in (views.items() if isinstance(views, dict) else ())
+            if str(alias).casefold() == simple_name.casefold()
+        ]
+        if len(matching_views) > 1:
+            # Case-colliding policy aliases are ambiguous.  Never guess which
+            # effective predicate governs a raw metadata artifact.
+            raise PermissionError(
+                "SHOW STATS is unavailable under the effective access policy"
+            )
+        view_def = matching_views[0] if matching_views else None
+        if view_def is not None and bool(
+            str(getattr(view_def, "where_clause", "") or "").strip()
+        ):
+            # Persisted row-group statistics describe the complete physical
+            # snapshot and cannot be soundly filtered by a row predicate.
+            raise PermissionError(
+                "SHOW STATS is unavailable under the effective access policy"
+            )
+
         try:
-            stats_file = self._resolve_latest_stats_file(super_name, simple_name)
+            stats_file, share_row_filtered = self._resolve_latest_stats_context(
+                super_name, simple_name,
+            )
+        except Exception as e:
+            # Resolving the linked-share overlay may require the immutable
+            # snapshot document.  Backend failures can contain its physical
+            # key or a presigned URL, so retain details only in trusted logs.
+            # More importantly, an unreadable overlay cannot prove that raw
+            # full-table statistics are safe for this caller.
+            logger.error(self._lp(f"[show-stats] policy resolution failed: {e}"))
+            raise PermissionError(
+                "SHOW STATS is unavailable under the effective access policy"
+            ) from None
+
+        if share_row_filtered:
+            # Linked-share predicates live in the atomic leaf/snapshot
+            # metadata, not in role RBAC.  Deny before loading the artifact
+            # so neither physical paths nor full-snapshot counts can escape.
+            raise PermissionError(
+                "SHOW STATS is unavailable under the effective access policy"
+            )
+
+        try:
             stats_df = (
                 load_stats(
                     stats_file,
@@ -553,7 +684,6 @@ class DataReader:
 
         if stats_df is None:
             return pd.DataFrame(columns=list(STATS_SCHEMA.keys())), Status.OK, None
-        view_def = views.get(simple_name) if isinstance(views, dict) else None
         allowed = ["*"] if view_def is None else list(view_def.allowed_columns)
         excluded = {
             "__rowid__",
@@ -699,6 +829,7 @@ class DataReader:
         if aggregate_children:
             rbac_kwargs["aggregate_children"] = aggregate_children
         rbac_views = restrict_read_access(**rbac_kwargs)
+        validate_rbac_binding_stability(parser, rbac_views)
 
         try:
             observation_store = None
@@ -1076,6 +1207,110 @@ class DataReader:
             _stream_batch_rows=max_batch_rows,
         )
 
+def _constant_limit_value(expression: exp.Expression) -> int:
+    """Evaluate a deliberately small, exact integer LIMIT grammar.
+
+    DuckDB evaluates constant LIMIT expressions before scanning.  Replacing an
+    expression we cannot prove would risk widening a valid small bound or
+    hiding an overflow/binder error.  This evaluator therefore accepts only
+    integer literals, parentheses, signed integer casts, unary negation, and
+    overflow-checked ``+``, ``-`` and ``*``.
+    """
+    signed_cast_bits = {
+        exp.DataType.Type.TINYINT: 8,
+        exp.DataType.Type.SMALLINT: 16,
+        exp.DataType.Type.MEDIUMINT: 32,
+        exp.DataType.Type.INT: 32,
+        exp.DataType.Type.BIGINT: 64,
+        exp.DataType.Type.INT128: 128,
+    }
+
+    def checked(value: int, bits: int) -> Tuple[int, int]:
+        lower = -(1 << (bits - 1))
+        upper = (1 << (bits - 1)) - 1
+        if value < lower or value > upper:
+            raise ValueError("LIMIT constant expression overflows its integer type")
+        return value, bits
+
+    def evaluate(node: exp.Expression) -> Tuple[int, int]:
+        while isinstance(node, exp.Paren):
+            node = node.this
+
+        if isinstance(node, exp.Literal) and not node.is_string:
+            raw = str(node.this)
+            if not raw.isdigit():
+                raise ValueError(
+                    "LIMIT row count must be a supported integer constant"
+                )
+            value = int(raw)
+            if value <= (1 << 31) - 1:
+                return value, 32
+            if value <= (1 << 63) - 1:
+                return value, 64
+            if value <= (1 << 127) - 1:
+                return value, 128
+            raise ValueError("LIMIT integer literal is outside DuckDB's exact range")
+
+        if isinstance(node, exp.Cast):
+            target = node.args.get("to")
+            target_type = target.this if isinstance(target, exp.DataType) else None
+            bits = signed_cast_bits.get(target_type)
+            if bits is None:
+                raise ValueError(
+                    "LIMIT casts must target a supported signed integer type"
+                )
+            value, _ = evaluate(node.this)
+            return checked(value, bits)
+
+        if isinstance(node, exp.Neg):
+            value, bits = evaluate(node.this)
+            return checked(-value, bits)
+
+        if isinstance(node, (exp.Add, exp.Sub, exp.Mul)):
+            left, left_bits = evaluate(node.this)
+            right, right_bits = evaluate(node.expression)
+            bits = max(left_bits, right_bits)
+            if isinstance(node, exp.Add):
+                value = left + right
+            elif isinstance(node, exp.Sub):
+                value = left - right
+            else:
+                value = left * right
+            return checked(value, bits)
+
+        raise ValueError("LIMIT row count must be a supported integer constant")
+
+    value, _ = evaluate(expression)
+    if value < 0:
+        raise ValueError("LIMIT row count must be non-negative")
+    if value > (1 << 63) - 1:
+        # DuckDB's LIMIT binder ultimately converts the constant to signed
+        # INT64 even when its expression is represented as INT128. Clamping a
+        # larger value would hide that conversion error.
+        raise ValueError("LIMIT row count exceeds DuckDB's signed integer range")
+    return value
+
+
+def _is_unbounded_limit(expression: exp.Expression) -> bool:
+    original = expression
+    while isinstance(expression, exp.Paren):
+        expression = expression.this
+    if isinstance(expression, exp.Null):
+        return True
+    # DuckDB accepts parentheses around NULL but not around the LIMIT ALL
+    # keyword. Do not normalize invalid ``LIMIT (ALL)`` into a valid query.
+    if expression is not original:
+        return False
+    if not isinstance(expression, exp.Column) or expression.table:
+        return False
+    identifier = expression.this
+    return bool(
+        isinstance(identifier, exp.Identifier)
+        and not identifier.args.get("quoted")
+        and identifier.name.casefold() == "all"
+    )
+
+
 def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     """
     If the outermost query has no LIMIT clause, append one.
@@ -1106,17 +1341,77 @@ def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     if root is not None:
         limit_node = root.args.get("limit")
         if limit_node is not None:
+            if isinstance(limit_node, exp.Fetch):
+                count = limit_node.args.get("count")
+                # SQL permits ``FETCH FIRST ROW ONLY`` with an omitted count;
+                # it means exactly one row.
+                current = 1 if count is None else None
+                unbounded = (
+                    isinstance(count, exp.Expression)
+                    and _is_unbounded_limit(count)
+                )
+                if isinstance(count, exp.Expression):
+                    if not unbounded:
+                        current = _constant_limit_value(count)
+
+                options = limit_node.args.get("limit_options")
+                percent = bool(
+                    isinstance(options, exp.Expression)
+                    and options.args.get("percent")
+                )
+                with_ties = bool(
+                    isinstance(options, exp.Expression)
+                    and options.args.get("with_ties")
+                )
+
+                if percent or with_ties:
+                    # Neither modifier is a hard row bound: WITH TIES can emit
+                    # every input row and PERCENT scales with relation size.
+                    # An outer SELECT/LIMIT would rename duplicate output
+                    # columns and truncate tie groups, while sqlglot's DuckDB
+                    # generator silently drops the modifiers.  Reject rather
+                    # than execute different SQL or bypass the response ceiling.
+                    raise ValueError(
+                        "FETCH PERCENT and WITH TIES are unavailable on the "
+                        "bounded read path"
+                    )
+
+                if unbounded:
+                    bounded = root.copy()
+                    bounded_fetch = bounded.args.get("limit")
+                    bounded_fetch.set("count", exp.Literal.number(enforced))
+                    return bounded.sql(dialect="duckdb")
+
+                if current is not None and current >= 0:
+                    if current <= enforced:
+                        # In particular, FETCH 0 must remain zero; widening it
+                        # to the response ceiling changes an empty result into a
+                        # data-bearing one.
+                        return sql
+                    bounded = root.copy()
+                    bounded_fetch = bounded.args.get("limit")
+                    bounded_fetch.set("count", exp.Literal.number(enforced))
+                    # Emit the same dialect that was parsed.  The generic
+                    # generator can rewrite DuckDB-specific table functions
+                    # (for example RANGE -> GENERATE_SERIES) while retaining a
+                    # column reference that no longer binds.  The modifiers
+                    # DuckDB's generator cannot preserve were rejected above,
+                    # so its FETCH-to-LIMIT normalization is semantics-safe.
+                    return bounded.sql(dialect="duckdb")
+
+                raise ValueError("FETCH row count must be a supported integer constant")
+
             expression = getattr(limit_node, "expression", None)
-            current = None
-            if isinstance(expression, exp.Literal) and not expression.is_string:
-                try:
-                    current = int(expression.this)
-                except (TypeError, ValueError, OverflowError):
-                    current = None
+            if not isinstance(expression, exp.Expression):
+                raise ValueError("LIMIT row count is missing")
+            if _is_unbounded_limit(expression):
+                return root.limit(enforced, copy=True).sql(dialect="duckdb")
+            current = _constant_limit_value(expression)
             if current is not None and 0 <= current <= enforced:
                 return sql
-            # LIMIT ALL, expressions, negative limits, and numeric limits over
-            # the server ceiling are replaced at the outer AST node.
+            # A proven integer bound over the server ceiling can be clamped at
+            # the outer AST node without widening or masking an evaluation
+            # error. Unsupported and invalid expressions failed above.
             return root.limit(enforced, copy=True).sql(dialect="duckdb")
 
     # Preserve familiar formatting for the no-LIMIT path while removing

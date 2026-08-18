@@ -1,7 +1,7 @@
 # route: supertable.storage.local_storage
 import json
 import os
-import glob
+import fnmatch
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
@@ -34,6 +34,13 @@ class LocalStorage(StorageInterface):
         if root is None:
             root = os.getcwd()
         self.root = os.path.realpath(os.path.abspath(os.fspath(root)))
+        # Capture a directory that already existed when this storage namespace
+        # was opened. If the configured root itself does not exist yet, the
+        # first successful logical publication must also fsync every newly
+        # created ancestor that links it to this durable anchor.
+        self._logical_durability_anchor = self._nearest_existing_directory(
+            self.root,
+        )
 
     def _resolve_path(self, path: str | os.PathLike[str]) -> str:
         raw = os.fspath(path)
@@ -126,8 +133,18 @@ class LocalStorage(StorageInterface):
           - os.replace() to atomically swap into place
           - fsync directory entry
         """
+        logical_input = not os.path.isabs(os.fspath(path))
         path = self._resolve_path(path)
         directory = os.path.dirname(path) or "."
+        # Remember the closest durable ancestor before creating any missing
+        # components. Fsyncing only the deepest new directory persists the file
+        # rename inside it, but not the entries that link that hierarchy back to
+        # the already-durable storage tree.
+        durability_anchor = (
+            self._logical_durability_anchor
+            if logical_input
+            else self._nearest_existing_directory(directory)
+        )
         os.makedirs(directory, exist_ok=True)
 
         # write to a temp file in the same directory to ensure atomic rename on the same filesystem
@@ -141,16 +158,12 @@ class LocalStorage(StorageInterface):
             # atomic replace
             os.replace(tmp_path, path)
 
-            # fsync the directory to persist the rename on POSIX
-            try:
-                dir_fd = os.open(directory, os.O_DIRECTORY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except Exception:
-                # best-effort; not all platforms allow this
-                pass
+            # Persist the rename before acknowledging success. This helper uses
+            # O_DIRECTORY when available and propagates I/O failures; swallowing
+            # them can publish a Redis pointer to a rename lost on host crash.
+            self._fsync_directory_chain(
+                directory, stop_directory=durability_anchor,
+            )
         finally:
             # if something failed before replace(), make sure temp is gone
             try:
@@ -317,7 +330,14 @@ class LocalStorage(StorageInterface):
         physical_path = self._resolve_path(path)
         if not os.path.isdir(physical_path):
             return []
-        matches = sorted(glob.glob(os.path.join(physical_path, pattern)))
+        # Match only immediate child basenames, like the object-store
+        # adapters. Passing ``pattern`` to glob would let ``../*`` or an
+        # absolute pattern enumerate paths outside the configured namespace.
+        matches = sorted(
+            os.path.join(physical_path, name)
+            for name in os.listdir(physical_path)
+            if fnmatch.fnmatch(name, pattern)
+        )
         if logical_input:
             return [os.path.relpath(match, self.root) for match in matches]
         return matches
@@ -329,13 +349,117 @@ class LocalStorage(StorageInterface):
         For files and symlinks, os.remove() is used.
         For directories, shutil.rmtree() is used to remove the directory and its contents.
         """
-        path = self._resolve_path(path)
+        raw_path = os.fspath(path)
+        logical_input = not os.path.isabs(raw_path)
+        if not logical_input:
+            normalized_absolute = os.path.abspath(os.path.normpath(raw_path))
+            if os.path.dirname(normalized_absolute) == normalized_absolute:
+                raise ValueError("Refusing to delete a filesystem root")
+        self._reject_delete_dot_segments(raw_path)
+        if logical_input:
+            # Resolve and contain the parent, but preserve the final directory
+            # entry.  Realpathing the leaf would turn delete("link") into a
+            # deletion of its referent (including recursive directory loss).
+            normalized = os.path.normpath(raw_path)
+            parent, leaf = os.path.split(normalized)
+            parent_path = self._resolve_path(parent or ".")
+            path = os.path.normpath(os.path.join(parent_path, leaf))
+            try:
+                contained = os.path.commonpath((self.root, path)) == self.root
+            except ValueError:
+                contained = False
+            if not contained:
+                raise ValueError(
+                    f"Local storage delete path escapes configured root: {raw_path!r}"
+                )
+        else:
+            path = os.path.normpath(raw_path)
+        absolute_path = os.path.abspath(path)
+        if os.path.dirname(absolute_path) == absolute_path:
+            raise ValueError("Refusing to delete a filesystem root")
+        if absolute_path == self.root:
+            raise ValueError("Refusing to delete the configured storage root")
         if os.path.isfile(path) or os.path.islink(path):
             os.remove(path)
         elif os.path.isdir(path):
             shutil.rmtree(path)
         else:
+            # A retry after an acknowledged-visible but unsynced deletion can
+            # find the target already absent. Re-sync its surviving parent so
+            # callers such as delete_prefix can safely finish the tombstone.
+            self._fsync_deleted_parent(path, logical_input=logical_input)
             raise FileNotFoundError(f"File or folder not found: {path}")
+        self._fsync_deleted_parent(path, logical_input=logical_input)
+
+    @staticmethod
+    def _reject_delete_dot_segments(path: str) -> None:
+        """Reject destructive aliases before resolving or removing anything.
+
+        The final directory entry must remain unresolved so deleting an in-root
+        symlink unlinks the symlink rather than its target.  That makes lexical
+        validation important: normalising a final ``..`` first would turn it
+        into authority over the configured root's parent.  Treat both slash
+        spellings as separators so a path cannot become traversal merely by
+        moving the same storage configuration between POSIX and Windows.
+        """
+
+        if not isinstance(path, str):
+            raise ValueError("Local storage delete path must be a string")
+        portable = path.replace("\\", "/")
+        components = portable.split("/")
+        significant = [component for component in components if component]
+        if ".." in significant or (
+            significant and significant[-1] == "."
+        ):
+            raise ValueError(
+                "Refusing to delete a path containing traversal or a final dot segment"
+            )
+
+    def _fsync_deleted_parent(
+        self,
+        deleted_path: str,
+        *,
+        logical_input: bool,
+    ) -> None:
+        """Persist a deletion without opening any directory already removed."""
+
+        parent = os.path.dirname(os.path.abspath(deleted_path)) or os.path.sep
+        # A retry can arrive after both the target and one or more of its
+        # parents disappeared.  Start at the nearest surviving directory so
+        # the deletion can still be durably anchored instead of failing while
+        # trying to open an already-removed immediate parent.
+        surviving_parent = self._nearest_existing_directory(parent)
+        stop = (
+            self._logical_durability_anchor
+            if logical_input else surviving_parent
+        )
+        self._fsync_directory_chain(surviving_parent, stop_directory=stop)
+
+    def delete_prefix(self, path: str) -> None:
+        """Delete a non-root local prefix, preserving absolute-path support."""
+        raw_path = os.fspath(path)
+        if os.path.isabs(raw_path):
+            normalized_absolute = os.path.abspath(os.path.normpath(raw_path))
+            if os.path.dirname(normalized_absolute) == normalized_absolute:
+                raise ValueError("Refusing to delete a filesystem root")
+        self._reject_delete_dot_segments(raw_path)
+        normalized = self._require_nonempty_delete_prefix(path)
+        if os.path.isabs(normalized):
+            resolved = os.path.normpath(normalized)
+        else:
+            # Match ``delete``: contain every parent component but do not
+            # dereference the final directory entry. A final symlink is the
+            # logical prefix to remove, never authority to recurse into its
+            # target (which may intentionally live outside this root).
+            parent, leaf = os.path.split(normalized)
+            resolved_parent = self._resolve_path(parent or ".")
+            resolved = os.path.normpath(os.path.join(resolved_parent, leaf))
+        absolute_path = os.path.abspath(resolved)
+        if os.path.dirname(absolute_path) == absolute_path:
+            raise ValueError("Refusing to delete a filesystem root")
+        if absolute_path == self.root:
+            raise ValueError("Refusing to delete the configured storage root")
+        super().delete_prefix(normalized)
 
     def get_directory_structure(self, path: str) -> dict:
         """
@@ -376,15 +500,36 @@ class LocalStorage(StorageInterface):
         return directory_structure
 
     def write_parquet(self, table: pa.Table, path: str) -> None:
-        """
-        Writes a PyArrow table to a local Parquet file at 'path'.
-        """
-        path = self._resolve_path(path)
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        """Durably publish a complete local Parquet file at ``path``."""
 
-        pq.write_table(table, path)
+        logical_input = not os.path.isabs(os.fspath(path))
+        path = self._resolve_path(path)
+        directory = os.path.dirname(path) or "."
+        durability_anchor = (
+            self._logical_durability_anchor
+            if logical_input
+            else self._nearest_existing_directory(directory)
+        )
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-parquet-", dir=directory)
+        os.close(fd)
+        try:
+            # PyArrow owns/closes its path handle. Reopen the completed temp
+            # object only for fsync, then atomically install it in the same
+            # directory so readers can never observe a partial footer.
+            pq.write_table(table, tmp_path)
+            with open(tmp_path, "rb") as completed:
+                os.fsync(completed.fileno())
+            os.replace(tmp_path, path)
+            self._fsync_directory_chain(
+                directory, stop_directory=durability_anchor,
+            )
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         path = self._resolve_path(path)
@@ -392,7 +537,10 @@ class LocalStorage(StorageInterface):
             raise FileNotFoundError(f"Parquet file not found at: {path}")
 
         try:
-            proj = self._project_columns(pq.read_schema(path).names, columns) if columns else None
+            proj = (
+                self._project_columns(pq.read_schema(path).names, columns)
+                if columns is not None else None
+            )
             # partitioning=None: read only the file's own footer columns; never let
             # pyarrow infer Hive year/month/day from a ``year=YYYY/...`` path.  The
             # object-store backends read from a BytesIO buffer (no path) and so never
@@ -401,20 +549,16 @@ class LocalStorage(StorageInterface):
             # it a full read injects int32 year/month/day that compaction bakes into
             # the rewritten body, leaking them into query output and breaking later
             # reads with an int32-vs-dictionary merge error.
-            return (
-                pq.read_table(path, columns=proj, partitioning=None) if proj
-                else pq.read_table(path, partitioning=None)
-            )
+            return pq.read_table(path, columns=proj, partitioning=None)
         except Exception as e:
             raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
 
     def write_bytes(self, path: str, data: bytes) -> None:
-        path = self._resolve_path(path)
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(data)
+        # ``processing`` selects this exact-byte path for immutable Parquet
+        # resources and publishes their snapshot pointer immediately after the
+        # call. Give it the same crash-durable boundary as the explicit audit
+        # helper instead of acknowledging a buffered, partially visible file.
+        self.write_bytes_atomic(path, data)
 
     def write_bytes_atomic(self, path: str, data: bytes) -> None:
         """Durably replace a byte object without exposing a partial target.
@@ -424,9 +568,14 @@ class LocalStorage(StorageInterface):
         ``os.replace`` gives readers either the previous complete object or the
         new complete object, never a prefix written by a crashed process.
         """
+        logical_input = not os.path.isabs(os.fspath(path))
         path = self._resolve_path(path)
         directory = os.path.dirname(path) or "."
-        durability_anchor = self._nearest_existing_directory(directory)
+        durability_anchor = (
+            self._logical_durability_anchor
+            if logical_input
+            else self._nearest_existing_directory(directory)
+        )
         os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix=".tmp-bytes-", dir=directory)
         try:
@@ -449,10 +598,10 @@ class LocalStorage(StorageInterface):
     def _fsync_directory(directory: str) -> None:
         """Persist a directory-entry update or raise.
 
-        Audit archive publication must not acknowledge a record merely
-        because ``os.replace`` was visible before a crash.  On POSIX the
-        containing directory must also be fsynced; suppressing that error
-        would turn an I/O failure into a false durable-delivery result.
+        Storage publication must not acknowledge an object merely because
+        ``os.replace`` was visible before a crash. On POSIX the containing
+        directory must also be fsynced; suppressing that error would let a
+        catalog pointer reference an object whose rename was never durable.
         """
 
         directory_flag = getattr(os, "O_DIRECTORY", 0)
@@ -521,7 +670,7 @@ class LocalStorage(StorageInterface):
         # also anchors directory components created by a prior interrupted
         # publication. Absolute paths are treated as pre-provisioned and only
         # their immediate parent is synced.
-        stop = self.root if logical_input else directory
+        stop = self._logical_durability_anchor if logical_input else directory
         self._fsync_directory_chain(directory, stop_directory=stop)
 
     def read_bytes(self, path: str) -> bytes:
@@ -548,8 +697,30 @@ class LocalStorage(StorageInterface):
 
     def copy(self, src_path: str, dst_path: str) -> None:
         src_path = self._resolve_path(src_path)
+        logical_destination = not os.path.isabs(os.fspath(dst_path))
         dst_path = self._resolve_path(dst_path)
-        directory = os.path.dirname(dst_path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        shutil.copyfile(src_path, dst_path)
+        if os.path.exists(dst_path) and os.path.samefile(src_path, dst_path):
+            raise shutil.SameFileError(src_path, dst_path, "same file")
+        directory = os.path.dirname(dst_path) or "."
+        durability_anchor = (
+            self._logical_durability_anchor
+            if logical_destination
+            else self._nearest_existing_directory(directory)
+        )
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-copy-", dir=directory)
+        os.close(fd)
+        try:
+            shutil.copyfile(src_path, tmp_path)
+            with open(tmp_path, "rb") as completed:
+                os.fsync(completed.fileno())
+            os.replace(tmp_path, dst_path)
+            self._fsync_directory_chain(
+                directory, stop_directory=durability_anchor,
+            )
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass

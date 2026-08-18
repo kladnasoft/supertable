@@ -74,6 +74,7 @@ from supertable.engine.engine_common import (
     TombstoneCache,
     dv_table_name,
     dv_table_id,
+    validate_rbac_binding_stability,
 )
 from supertable.engine.data_estimator import DataEstimator, get_missing_columns
 from supertable.engine.engine_enum import Engine
@@ -450,6 +451,839 @@ class TestRewriteQuery:
         with pytest.raises(RuntimeError, match="not replaced"):
             rewrite_query_with_hashed_tables(
                 "SELECT * FROM keep_me", {"other": "st_abc"}
+            )
+
+    def test_case_only_aliases_in_union_share_protected_binding(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT x FROM t AS a UNION ALL SELECT x FROM t AS A"
+        parser = SQLParser("s", sql, "duckdb")
+        definitions = parser.get_table_tuples()
+        assert [(item.alias, item.columns) for item in definitions] == [
+            ("a", ["x"]),
+        ]
+
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"a": "protected_t"},
+            parsed_expression=parser._parsed,
+        )
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_t(x INTEGER)")
+        con.execute("INSERT INTO protected_t VALUES (1), (2)")
+        assert con.execute(rewritten).fetchall() == [(1,), (2,), (1,), (2,)]
+
+    @pytest.mark.parametrize("operator", ["UNION ALL", "INTERSECT", "EXCEPT"])
+    def test_independent_set_scopes_with_same_name_rewrite_distinct_sources(
+        self, operator,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            f"SELECT id FROM lake.orders {operator} "
+            "SELECT id FROM archive.orders"
+        )
+        parser = SQLParser("lake", sql, "duckdb")
+        definitions = parser.get_table_tuples()
+        assert {
+            (item.super_name, item.simple_name) for item in definitions
+        } == {("lake", "orders"), ("archive", "orders")}
+        assert len({item.alias.casefold() for item in definitions}) == 2
+
+        protected = {
+            item.alias: (
+                "protected_lake" if item.super_name == "lake"
+                else "protected_archive"
+            )
+            for item in definitions
+        }
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            protected,
+            parsed_expression=parser._parsed,
+            default_super_name=parser.default_super_name,
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_lake(id INTEGER)")
+        con.execute("CREATE TABLE protected_archive(id INTEGER)")
+        con.execute("INSERT INTO protected_lake VALUES (1), (2)")
+        con.execute("INSERT INTO protected_archive VALUES (2), (3)")
+        expected = {
+            "UNION ALL": [(1,), (2,), (2,), (3,)],
+            "INTERSECT": [(2,)],
+            "EXCEPT": [(1,)],
+        }[operator]
+        assert con.execute(rewritten).fetchall() == expected
+        assert "lake.orders" not in rewritten.casefold()
+        assert "archive.orders" not in rewritten.casefold()
+
+    def test_independent_union_aliases_preserve_whole_row_structs(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT a FROM s.t a UNION ALL SELECT A FROM other.u A"
+        parser = SQLParser("s", sql, "duckdb")
+        protected = {
+            item.alias: (
+                "protected_t" if item.simple_name == "t" else "protected_u"
+            )
+            for item in parser.get_table_tuples()
+        }
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            protected,
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE SCHEMA other")
+        for table in ("s.t", "other.u", "protected_t", "protected_u"):
+            con.execute(f"CREATE TABLE {table}(x INTEGER, y INTEGER)")
+        con.execute("INSERT INTO s.t VALUES (1, 2)")
+        con.execute("INSERT INTO other.u VALUES (3, 4)")
+        con.execute("INSERT INTO protected_t VALUES (1, 2)")
+        con.execute("INSERT INTO protected_u VALUES (3, 4)")
+        expected = [({"x": 1, "y": 2},), ({"x": 3, "y": 4},)]
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    def test_duplicate_alias_inside_one_scope_still_fails_closed(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        with pytest.raises(ValueError, match="ambiguous within a SQL scope"):
+            SQLParser(
+                "lake",
+                "SELECT a.id FROM lake.orders a "
+                "JOIN archive.orders a ON a.id = a.id",
+                "duckdb",
+            )
+
+    def test_group_alias_collision_keeps_physical_binding_available(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT y, COUNT(*) AS x FROM t GROUP BY y, x"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == []
+        assert parser.get_group_alias_ambiguities() == {"t": {"x"}}
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"t": "protected_t"},
+            parsed_expression=parser._parsed,
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_t(x INTEGER, y INTEGER)")
+        con.execute("INSERT INTO protected_t VALUES (1, 10), (2, 10), (1, 20)")
+        assert sorted(con.execute(rewritten).fetchall()) == [
+            (10, 1), (10, 1), (20, 1),
+        ]
+
+    def test_qualify_alias_collision_keeps_physical_binding_available(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            "SELECT y, ROW_NUMBER() OVER (ORDER BY y) AS x "
+            "FROM s.t QUALIFY x = 1"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == []
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"t": "protected_t"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE TABLE s.t(x INTEGER, y INTEGER)")
+        con.execute("CREATE TABLE protected_t(x INTEGER, y INTEGER)")
+        rows = [(100, 3), (100, 1), (0, 2)]
+        con.executemany("INSERT INTO s.t VALUES (?, ?)", rows)
+        con.executemany("INSERT INTO protected_t VALUES (?, ?)", rows)
+        assert con.execute(sql).fetchall() == []
+        assert con.execute(rewritten).fetchall() == []
+
+    @pytest.mark.parametrize(
+        ("table_name", "columns", "rows", "expected"),
+        [
+            ("alias_only", "y INTEGER", [(1,), (2,)], [(1,)]),
+            ("physical", "x INTEGER, y INTEGER", [(100, 1), (0, 2)], []),
+        ],
+    )
+    def test_where_alias_binding_preserves_schema_dependent_precedence(
+        self, table_name, columns, rows, expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = f"SELECT y AS x FROM s.{table_name} WHERE x = 1"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == []
+        protected_name = f"protected_{table_name}"
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {table_name: protected_name},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.{table_name}({columns})")
+        con.execute(f"CREATE TABLE {protected_name}({columns})")
+        placeholders = ", ".join("?" for _ in rows[0])
+        con.executemany(
+            f"INSERT INTO s.{table_name} VALUES ({placeholders})", rows,
+        )
+        con.executemany(
+            f"INSERT INTO {protected_name} VALUES ({placeholders})", rows,
+        )
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    @pytest.mark.parametrize(
+        ("table_name", "columns", "rows", "expected"),
+        [
+            ("prior_alias_only", "y INTEGER", [(1,), (2,)], [(1, 2), (2, 3)]),
+            (
+                "prior_alias_physical",
+                "x INTEGER, y INTEGER",
+                [(100, 1), (0, 2)],
+                [(1, 101), (2, 1)],
+            ),
+        ],
+    )
+    def test_later_projection_preserves_prior_alias_or_physical_precedence(
+        self, table_name, columns, rows, expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = f"SELECT y AS x, x + 1 AS z FROM s.{table_name} ORDER BY y"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == []
+        protected_name = f"protected_{table_name}"
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {table_name: protected_name},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.{table_name}({columns})")
+        con.execute(f"CREATE TABLE {protected_name}({columns})")
+        placeholders = ", ".join("?" for _ in rows[0])
+        con.executemany(
+            f"INSERT INTO s.{table_name} VALUES ({placeholders})", rows,
+        )
+        con.executemany(
+            f"INSERT INTO {protected_name} VALUES ({placeholders})", rows,
+        )
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    @pytest.mark.parametrize(
+        ("case_name", "sql", "t_schema", "u_schema", "t_rows", "u_rows", "expected"),
+        [
+            (
+                "select",
+                "SELECT x, t.y, u.z FROM s.t JOIN s.u ON t.id = u.id",
+                "id INTEGER, x INTEGER, y INTEGER",
+                "id INTEGER, z INTEGER",
+                [(1, 7, 70)],
+                [(1, 9)],
+                [(7, 70, 9)],
+            ),
+            (
+                "where",
+                "SELECT t.y, u.z FROM s.t JOIN s.u ON t.id = u.id "
+                "WHERE flag = 1",
+                "id INTEGER, y INTEGER",
+                "id INTEGER, flag INTEGER, z INTEGER",
+                [(1, 70), (2, 80)],
+                [(1, 1, 9), (2, 0, 10)],
+                [(70, 9)],
+            ),
+            (
+                "join",
+                "SELECT t.y, u.z FROM s.t JOIN s.u "
+                "ON join_key = u.other_key",
+                "join_key INTEGER, y INTEGER",
+                "other_key INTEGER, z INTEGER",
+                [(1, 70), (2, 80)],
+                [(2, 9), (3, 10)],
+                [(80, 9)],
+            ),
+        ],
+    )
+    def test_unqualified_multisource_name_disables_projection_for_all_sources(
+        self,
+        case_name,
+        sql,
+        t_schema,
+        u_schema,
+        t_rows,
+        u_rows,
+        expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        parser = SQLParser("s", sql, "duckdb")
+        assert {
+            item.alias: item.columns for item in parser.get_table_tuples()
+        } == {"t": [], "u": []}
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"t": f"protected_t_{case_name}", "u": f"protected_u_{case_name}"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.t({t_schema})")
+        con.execute(f"CREATE TABLE s.u({u_schema})")
+        con.execute(f"CREATE TABLE protected_t_{case_name}({t_schema})")
+        con.execute(f"CREATE TABLE protected_u_{case_name}({u_schema})")
+        t_placeholders = ", ".join("?" for _ in t_rows[0])
+        u_placeholders = ", ".join("?" for _ in u_rows[0])
+        con.executemany(f"INSERT INTO s.t VALUES ({t_placeholders})", t_rows)
+        con.executemany(f"INSERT INTO s.u VALUES ({u_placeholders})", u_rows)
+        con.executemany(
+            f"INSERT INTO protected_t_{case_name} VALUES ({t_placeholders})",
+            t_rows,
+        )
+        con.executemany(
+            f"INSERT INTO protected_u_{case_name} VALUES ({u_placeholders})",
+            u_rows,
+        )
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    def test_direct_two_source_using_keys_survive_projected_rewrite(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            "SELECT a.name, b.amount FROM s.left_input a "
+            "JOIN s.right_input b USING (id) ORDER BY a.name"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        assert {
+            item.alias: item.columns for item in parser.get_table_tuples()
+        } == {"a": ["id", "name"], "b": ["amount", "id"]}
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"a": "protected_left", "b": "protected_right"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(
+            "CREATE TABLE s.left_input(id INTEGER, name VARCHAR, hidden INTEGER)"
+        )
+        con.execute(
+            "CREATE TABLE s.right_input(id INTEGER, amount INTEGER, hidden INTEGER)"
+        )
+        # Model the engine's exact parser-driven projection: only requested
+        # columns exist on the protected reflections.
+        con.execute("CREATE TABLE protected_left(id INTEGER, name VARCHAR)")
+        con.execute("CREATE TABLE protected_right(id INTEGER, amount INTEGER)")
+        left_rows = [(1, "one", 101), (2, "two", 102)]
+        right_rows = [(2, 20, 202), (3, 30, 203)]
+        con.executemany("INSERT INTO s.left_input VALUES (?, ?, ?)", left_rows)
+        con.executemany("INSERT INTO s.right_input VALUES (?, ?, ?)", right_rows)
+        con.executemany(
+            "INSERT INTO protected_left VALUES (?, ?)",
+            [(row[0], row[1]) for row in left_rows],
+        )
+        con.executemany(
+            "INSERT INTO protected_right VALUES (?, ?)",
+            [(row[0], row[1]) for row in right_rows],
+        )
+        expected = [("two", 20)]
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    @pytest.mark.parametrize(
+        ("sql", "message"),
+        [
+            (
+                "SELECT a.x, b.y FROM a NATURAL JOIN b",
+                "NATURAL JOIN is not supported",
+            ),
+            (
+                "SELECT a.x FROM a JOIN b USING (id) JOIN c USING (id)",
+                "JOIN ... USING is supported only between two direct",
+            ),
+            (
+                "SELECT a.x FROM a JOIN b USING (id) JOIN c ON b.k = c.k",
+                "JOIN ... USING is supported only between two direct",
+            ),
+        ],
+    )
+    def test_schema_dependent_join_shapes_fail_closed(self, sql, message):
+        from supertable.utils.sql_parser import SQLParser
+
+        with pytest.raises(ValueError, match=message):
+            SQLParser("s", sql, "duckdb")
+
+    @pytest.mark.parametrize(
+        ("case_name", "inner_schema", "inner_rows", "expected"),
+        [
+            ("outer_bind", "z INTEGER", [(5,)], [(10,)]),
+            ("local_bind", "x INTEGER, z INTEGER", [(0, 5)], []),
+        ],
+    )
+    def test_unqualified_correlated_name_preserves_local_or_outer_binding(
+        self, case_name, inner_schema, inner_rows, expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        outer_name = f"outer_{case_name}"
+        inner_name = f"inner_{case_name}"
+        sql = (
+            f"SELECT o.y FROM s.{outer_name} o WHERE EXISTS ("
+            f"SELECT 1 FROM s.{inner_name} i WHERE x = 1) ORDER BY o.y"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        assert {
+            item.alias: item.columns for item in parser.get_table_tuples()
+        } == {"o": [], "i": []}
+        protected_outer = f"protected_{outer_name}"
+        protected_inner = f"protected_{inner_name}"
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"o": protected_outer, "i": protected_inner},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.{outer_name}(x INTEGER, y INTEGER)")
+        con.execute(f"CREATE TABLE s.{inner_name}({inner_schema})")
+        con.execute(f"CREATE TABLE {protected_outer}(x INTEGER, y INTEGER)")
+        con.execute(f"CREATE TABLE {protected_inner}({inner_schema})")
+        outer_rows = [(1, 10), (2, 20)]
+        con.executemany(f"INSERT INTO s.{outer_name} VALUES (?, ?)", outer_rows)
+        con.executemany(
+            f"INSERT INTO {protected_outer} VALUES (?, ?)", outer_rows,
+        )
+        inner_placeholders = ", ".join("?" for _ in inner_rows[0])
+        con.executemany(
+            f"INSERT INTO s.{inner_name} VALUES ({inner_placeholders})",
+            inner_rows,
+        )
+        con.executemany(
+            f"INSERT INTO {protected_inner} VALUES ({inner_placeholders})",
+            inner_rows,
+        )
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    @pytest.mark.parametrize(
+        ("table_name", "schema", "rows", "expected"),
+        [
+            (
+                "whole_row_alias",
+                "a INTEGER, b INTEGER",
+                [(1, 2)],
+                [({"a": 1, "b": 2},)],
+            ),
+            (
+                "physical_alias_column",
+                "q INTEGER, a INTEGER",
+                [(9, 1)],
+                [(9,)],
+            ),
+        ],
+    )
+    def test_bare_table_alias_preserves_whole_row_or_physical_binding(
+        self, table_name, schema, rows, expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = f"SELECT q FROM s.{table_name} AS q"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == []
+        protected_name = f"protected_{table_name}"
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"q": protected_name},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.{table_name}({schema})")
+        con.execute(f"CREATE TABLE {protected_name}({schema})")
+        placeholders = ", ".join("?" for _ in rows[0])
+        con.executemany(
+            f"INSERT INTO s.{table_name} VALUES ({placeholders})", rows,
+        )
+        con.executemany(
+            f"INSERT INTO {protected_name} VALUES ({placeholders})", rows,
+        )
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    @pytest.mark.parametrize(
+        ("table_name", "window_expression", "window_clause", "rows", "expected"),
+        [
+            (
+                "window_order",
+                "ROW_NUMBER() OVER (ORDER BY x)",
+                "",
+                [(2, 30), (1, 10), (3, 20)],
+                [(10, 1), (20, 3), (30, 2)],
+            ),
+            (
+                "window_partition",
+                "ROW_NUMBER() OVER (PARTITION BY x ORDER BY y)",
+                "",
+                [(1, 10), (1, 20), (2, 10)],
+                [(10, 1), (10, 1), (20, 2)],
+            ),
+            (
+                "window_named",
+                "ROW_NUMBER() OVER w",
+                "WINDOW w AS (PARTITION BY x ORDER BY y)",
+                [(1, 10), (1, 20), (2, 10)],
+                [(10, 1), (10, 1), (20, 2)],
+            ),
+        ],
+    )
+    def test_window_alias_collision_preserves_physical_input_precedence(
+        self,
+        table_name,
+        window_expression,
+        window_clause,
+        rows,
+        expected,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            f"SELECT y AS x, {window_expression} AS n "
+            f"FROM s.{table_name} {window_clause} ORDER BY y, n"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        # Projecting only y changes DuckDB's bind from the physical x column
+        # to the SELECT alias x and silently changes the window result.
+        assert parser.get_table_tuples()[0].columns == []
+        assert parser.get_group_alias_ambiguities() == {table_name: {"x"}}
+        protected_name = f"protected_{table_name}"
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {table_name: protected_name},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute(f"CREATE TABLE s.{table_name}(x INTEGER, y INTEGER)")
+        con.execute(f"CREATE TABLE {protected_name}(x INTEGER, y INTEGER)")
+        con.executemany(f"INSERT INTO s.{table_name} VALUES (?, ?)", rows)
+        con.executemany(f"INSERT INTO {protected_name} VALUES (?, ?)", rows)
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    def test_distinct_on_uses_select_alias_without_requesting_physical_name(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT DISTINCT ON (x) y AS x FROM s.distinct_input ORDER BY x"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_table_tuples()[0].columns == ["y"]
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"distinct_input": "protected_distinct"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE TABLE s.distinct_input(x INTEGER, y INTEGER)")
+        con.execute("CREATE TABLE protected_distinct(y INTEGER)")
+        source_rows = [(1, 30), (1, 10), (2, 20)]
+        con.executemany("INSERT INTO s.distinct_input VALUES (?, ?)", source_rows)
+        con.executemany(
+            "INSERT INTO protected_distinct VALUES (?)",
+            [(row[1],) for row in source_rows],
+        )
+        expected = [(10,), (20,), (30,)]
+        assert con.execute(sql).fetchall() == expected
+        assert con.execute(rewritten).fetchall() == expected
+
+    def test_schema_qualified_column_tracks_rewritten_source(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT s.a.x FROM s.a ORDER BY s.a.x"
+        parser = SQLParser("s", sql, "duckdb")
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"a": "protected_a"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_a(x INTEGER)")
+        con.execute("INSERT INTO protected_a VALUES (2), (1)")
+        assert con.execute(rewritten).fetchall() == [(1,), (2,)]
+        assert "s.a.x" not in rewritten.casefold()
+
+    def test_schema_qualified_struct_path_tracks_rewritten_source(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT s.a.st.f FROM s.a ORDER BY s.a.x"
+        parser = SQLParser("s", sql, "duckdb")
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"a": "protected_a"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_a(x INTEGER, st STRUCT(f INTEGER))")
+        con.execute("INSERT INTO protected_a VALUES (2, {'f': 20}), (1, {'f': 10})")
+        assert con.execute(rewritten).fetchall() == [(10,), (20,)]
+        assert "s.a.st.f" not in rewritten.casefold()
+
+    def test_schema_qualified_star_remains_rejected(self):
+        """Protection must not turn DuckDB-invalid input into SELECT alias.*."""
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT s.a.* FROM s.a"
+        parser = SQLParser("s", sql, "duckdb")
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE TABLE s.a(x INTEGER)")
+        with pytest.raises(duckdb.ParserException):
+            con.execute(sql)
+        with pytest.raises(RuntimeError, match="Schema-qualified stars"):
+            rewrite_query_with_hashed_tables(
+                sql,
+                {"a": "protected_a"},
+                parsed_expression=parser._parsed,
+                default_super_name="s",
+            )
+
+    def test_duckdb_using_sample_keeps_grammar_position_after_rewrite(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            "SELECT a.x, b.y FROM s.a AS a JOIN s.b AS b ON a.x = b.x "
+            "WHERE a.x > 0 USING SAMPLE 100 PERCENT ORDER BY a.x LIMIT 2"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"a": "protected_a", "b": "protected_b"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE TABLE s.a(x INTEGER)")
+        con.execute("CREATE TABLE s.b(x INTEGER, y INTEGER)")
+        con.execute("CREATE TABLE protected_a AS SELECT * FROM s.a")
+        con.execute("CREATE TABLE protected_b AS SELECT * FROM s.b")
+        con.execute("INSERT INTO s.a VALUES (1), (2), (3)")
+        con.execute("INSERT INTO s.b VALUES (1, 10), (2, 20), (3, 30)")
+        con.execute("INSERT INTO protected_a SELECT * FROM s.a")
+        con.execute("INSERT INTO protected_b SELECT * FROM s.b")
+
+        assert con.execute(rewritten).fetchall() == con.execute(sql).fetchall()
+        upper = rewritten.upper()
+        assert upper.index("USING SAMPLE") < upper.index("ORDER BY")
+        assert upper.index("USING SAMPLE") < upper.index("LIMIT")
+
+    def test_correlated_schema_qualifiers_resolve_in_lexical_scope(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = (
+            "SELECT a.x FROM s.a WHERE EXISTS ("
+            "SELECT 1 FROM other.a WHERE other.a.x = s.a.x"
+            ") ORDER BY a.x"
+        )
+        parser = SQLParser("s", sql, "duckdb")
+        protected = {
+            item.alias: (
+                "protected_outer"
+                if item.super_name == "s" else "protected_inner"
+            )
+            for item in parser.get_table_tuples()
+        }
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            protected,
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE protected_outer(x INTEGER)")
+        con.execute("CREATE TABLE protected_inner(x INTEGER)")
+        con.execute("INSERT INTO protected_outer VALUES (1), (2), (3)")
+        con.execute("INSERT INTO protected_inner VALUES (2), (3), (4)")
+        assert con.execute(rewritten).fetchall() == [(2,), (3,)]
+        assert "other.a.x" not in rewritten.casefold()
+        assert "s.a.x" not in rewritten.casefold()
+
+    def test_correlated_alias_rename_with_whole_row_reference_fails_closed(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT a FROM s.a WHERE EXISTS (SELECT a FROM other.a)"
+        parser = SQLParser("s", sql, "duckdb")
+        protected = {
+            item.alias: f"protected_{index}"
+            for index, item in enumerate(parser.get_table_tuples())
+        }
+        with pytest.raises(RuntimeError, match="whole-row expression"):
+            rewrite_query_with_hashed_tables(
+                sql,
+                protected,
+                parsed_expression=parser._parsed,
+                default_super_name="s",
+            )
+
+    @pytest.mark.parametrize(
+        ("case_name", "sql"),
+        [
+            (
+                "group",
+                "SELECT y, COUNT(*) AS x FROM t GROUP BY y, x",
+            ),
+            (
+                "where",
+                "SELECT y AS x FROM t WHERE x = 1",
+            ),
+            (
+                "qualify",
+                "SELECT y, ROW_NUMBER() OVER (ORDER BY y) AS x "
+                "FROM t QUALIFY x = 1",
+            ),
+            (
+                "window",
+                "SELECT y AS x, ROW_NUMBER() OVER (ORDER BY x) AS n FROM t",
+            ),
+            (
+                "prior_select_alias",
+                "SELECT y AS x, x + 1 AS z FROM t",
+            ),
+        ],
+    )
+    def test_column_policy_cannot_rebind_physical_alias_collisions(
+        self, case_name, sql,
+    ):
+        from supertable.utils.sql_parser import SQLParser
+
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_binding_ambiguities() == {"t": {"x"}}
+        with pytest.raises(PermissionError, match="change SQL name binding"):
+            validate_rbac_binding_stability(
+                parser,
+                {
+                    "t": RbacViewDef(
+                        allowed_columns=["*"],
+                        excluded_columns=["X"],
+                    ),
+                },
+            )
+
+    def test_binding_guard_allows_policy_that_keeps_precedence_column(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        parser = SQLParser(
+            "s", "SELECT y AS x FROM t WHERE x = 1", "duckdb",
+        )
+        validate_rbac_binding_stability(
+            parser,
+            {
+                "t": RbacViewDef(
+                    allowed_columns=["x", "y"],
+                    excluded_columns=["unrelated_secret"],
+                    where_clause="tenant_id = 1",
+                ),
+            },
+        )
+
+    def test_excluding_whole_row_collision_column_would_rebind_to_struct(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT q FROM t AS q"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_binding_ambiguities() == {"q": {"q"}}
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE t(q INTEGER, y INTEGER)")
+        con.execute("CREATE TABLE protected_t(y INTEGER)")
+        con.execute("INSERT INTO t VALUES (7, 9)")
+        con.execute("INSERT INTO protected_t VALUES (9)")
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"q": "protected_t"},
+            parsed_expression=parser._parsed,
+        )
+        assert con.execute(sql).fetchall() == [(7,)]
+        assert con.execute(rewritten).fetchall() == [({"y": 9},)]
+
+        with pytest.raises(PermissionError, match="change SQL name binding"):
+            validate_rbac_binding_stability(
+                parser,
+                {
+                    "q": RbacViewDef(
+                        allowed_columns=["*"], excluded_columns=["q"],
+                    ),
+                },
+            )
+
+    def test_excluding_one_ambiguous_join_column_cannot_make_query_executable(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT x FROM t JOIN u ON t.id = u.id"
+        parser = SQLParser("s", sql, "duckdb")
+        assert parser.get_binding_ambiguities() == {
+            "t": {"x"},
+            "u": {"x"},
+        }
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE t(id INTEGER, x INTEGER)")
+        con.execute("CREATE TABLE u(id INTEGER, x INTEGER)")
+        con.execute("CREATE TABLE protected_t(id INTEGER, x INTEGER)")
+        con.execute("CREATE TABLE protected_u(id INTEGER)")
+        con.execute("INSERT INTO t VALUES (1, 10)")
+        con.execute("INSERT INTO u VALUES (1, 20)")
+        con.execute("INSERT INTO protected_t VALUES (1, 10)")
+        con.execute("INSERT INTO protected_u VALUES (1)")
+        with pytest.raises(duckdb.BinderException, match="Ambiguous reference"):
+            con.execute(sql)
+        rewritten = rewrite_query_with_hashed_tables(
+            sql,
+            {"t": "protected_t", "u": "protected_u"},
+            parsed_expression=parser._parsed,
+        )
+        assert con.execute(rewritten).fetchall() == [(10,)]
+
+        with pytest.raises(PermissionError, match="change SQL name binding"):
+            validate_rbac_binding_stability(
+                parser,
+                {
+                    "u": RbacViewDef(
+                        allowed_columns=["id"], excluded_columns=["x"],
+                    ),
+                },
             )
 
 
@@ -1314,6 +2148,7 @@ class TestDataEstimator:
                  "resources": [{"file": "/data.parquet", "file_size": 100}],
                  "tombstone": None, "tombstone_rows": 0,
                  "tombstone_digest": None,
+                 "_row_filter": None,
              }},
         ]
         with pytest.raises(RuntimeError, match="Missing required column"):
@@ -1329,6 +2164,7 @@ class TestDataEstimator:
                  "resources": [{"file": "/data.parquet", "file_size": 500}],
                  "tombstone": None, "tombstone_rows": 0,
                  "tombstone_digest": None,
+                 "_row_filter": None,
              }},
         ]
         reflection = est.estimate()
@@ -1347,6 +2183,7 @@ class TestDataEstimator:
                  "resources": [],
                  "tombstone": None, "tombstone_rows": 0,
                  "tombstone_digest": None,
+                 "_row_filter": None,
              }},
         ]
         reflection = est.estimate()
@@ -1511,6 +2348,20 @@ def _exec_fixtures():
 
 
 class TestExecutor:
+
+    @pytest.fixture(autouse=True)
+    def _catalog_without_engine_overrides(self, monkeypatch):
+        """Executor unit tests use an explicit, genuinely absent config doc."""
+        import supertable.redis_catalog as redis_catalog_module
+
+        catalog = MagicMock()
+        catalog.get_engine_config.return_value = None
+        catalog.list_spark_clusters.return_value = []
+        monkeypatch.setattr(
+            redis_catalog_module,
+            "RedisCatalog",
+            lambda: catalog,
+        )
 
     @patch.object(DuckDB, "execute", return_value=pd.DataFrame({"a": [1]}))
     def test_route_duckdb(self, mock_exec):
@@ -1988,6 +2839,36 @@ class TestSparkRewriteQuery:
 
     def test_empty_alias(self):
         assert _spark_rewrite_query("SELECT 1", {}) == "SELECT 1"
+
+    def test_schema_qualified_columns_follow_protected_table(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT s.a.x FROM s.a"
+        parser = SQLParser("s", sql, "spark")
+        result = _spark_rewrite_query(
+            sql,
+            {"a": "protected_a"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        assert "protected_a" in result
+        assert "s.a.x" not in result.casefold()
+
+    def test_schema_qualified_struct_path_follows_protected_table(self):
+        from supertable.utils.sql_parser import SQLParser
+
+        sql = "SELECT s.a.st.f FROM s.a"
+        parser = SQLParser("s", sql, "spark")
+        result = _spark_rewrite_query(
+            sql,
+            {"a": "protected_a"},
+            parsed_expression=parser._parsed,
+            default_super_name="s",
+        )
+
+        assert "protected_a" in result
+        assert "s.a.st.f" not in result.casefold()
 
 
 class TestConfigureSparkS3:

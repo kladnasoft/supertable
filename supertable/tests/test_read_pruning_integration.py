@@ -99,6 +99,10 @@ def orders_on_disk(tmp_path):
 
     payload = {
         "snapshot_version": 7,
+        # This fixture models the complete Redis leaf payload.  The explicit
+        # marker distinguishes an unrestricted policy from a legacy cache
+        # entry whose policy state is unknown and must fall back to storage.
+        "_row_filter": None,
         "schema": [{"name": "id", "type": "BIGINT"},
                    {"name": "val", "type": "VARCHAR"}],
         "stats_file": stats_path,

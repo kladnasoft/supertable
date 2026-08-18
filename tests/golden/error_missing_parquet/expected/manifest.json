@@ -15,7 +15,7 @@
     ]
   },
   "input_checksum": "sha256:de6ddb72b7a001906d82e8e3b4fe5f42dab9f06d175d94073020143ca31f2ed3",
-  "expected_checksum": "sha256:45b8f11883fd0d4687d885694b0b8ceeff22b02dca8e78bbacedf2a7247c4aef",
+  "expected_checksum": "sha256:26242d8182824a84d3bda2fbf2ac23884af4d976a98403af14d5ab34ac9f2037",
   "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

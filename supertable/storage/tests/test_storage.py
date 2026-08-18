@@ -138,13 +138,18 @@ _botocore_config = _ensure_stub("botocore.config", {
 })
 
 
-class _FakeClientError(Exception):
+class _BootstrapClientError(Exception):
+    """Minimal botocore stand-in used only while importing production code."""
+
     def __init__(self, error_response=None, operation_name="op"):
         self.response = error_response or {"Error": {}}
+        self.operation_name = operation_name
         super().__init__(str(self.response))
 
 
-_botocore_exceptions = _ensure_stub("botocore.exceptions", {"ClientError": _FakeClientError})
+_botocore_exceptions = _ensure_stub(
+    "botocore.exceptions", {"ClientError": _BootstrapClientError},
+)
 
 _boto3 = _ensure_stub("boto3", {"client": MagicMock()})
 
@@ -167,6 +172,22 @@ from supertable.storage import minio_storage as _minio_module
 from supertable.storage import s3_storage as _s3_module
 from supertable.storage import storage_factory as _factory_module
 from dataclasses import replace as _dc_replace
+
+
+class _FakeClientError(_s3_module.ClientError):
+    """ClientError double matching the class production actually imported.
+
+    The full test collection can import ``s3_storage`` before this module.  In
+    that order production correctly retains the real botocore ``ClientError``;
+    an unrelated ``Exception`` fake would bypass every typed handler.  Derive
+    from the exact bound class so both real-SDK and bootstrap-stub orders test
+    the same exception boundary.
+    """
+
+    def __init__(self, error_response=None, operation_name="op"):
+        self.response = error_response or {"Error": {}}
+        self.operation_name = operation_name
+        Exception.__init__(self, str(self.response))
 
 
 def _patch_settings(test_case, **overrides):
@@ -374,6 +395,17 @@ class TestLocalStorage(unittest.TestCase):
         self.assertIn("c.txt", basenames)
         self.assertNotIn("b.json", basenames)
 
+    def test_list_files_pattern_cannot_escape_logical_directory(self):
+        storage = LocalStorage(self.tmpdir)
+        parent = os.path.dirname(self.tmpdir)
+        fd, outside = tempfile.mkstemp(prefix="outside-listing-", dir=parent)
+        os.close(fd)
+        try:
+            self.assertEqual(storage.list_files("", pattern="../*"), [])
+            self.assertEqual(storage.list_files("", pattern=f"{parent}/*"), [])
+        finally:
+            os.remove(outside)
+
     def test_list_files_nonexistent_dir(self):
         result = self.storage.list_files(self._path("nope"))
         self.assertEqual(result, [])
@@ -411,9 +443,183 @@ class TestLocalStorage(unittest.TestCase):
         self.assertFalse(os.path.exists(link))
         self.assertTrue(os.path.exists(target))  # target untouched
 
+    def test_delete_relative_symlink_does_not_delete_file_target(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("target-relative.txt")
+        with open(target, "w") as stream:
+            stream.write("real")
+        link = self._path("link-relative.txt")
+        os.symlink(target, link)
+
+        storage.delete("link-relative.txt")
+
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.isfile(target))
+
+    def test_delete_relative_directory_symlink_does_not_recurse_into_target(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("target-directory")
+        os.makedirs(target)
+        with open(os.path.join(target, "keep.txt"), "w") as stream:
+            stream.write("keep")
+        link = self._path("link-directory")
+        os.symlink(target, link)
+
+        storage.delete("link-directory")
+
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.isfile(os.path.join(target, "keep.txt")))
+
+    def test_delete_rejects_relative_traversal_before_destructive_io(self):
+        storage = LocalStorage(self.tmpdir)
+        aliases = (
+            "..",
+            "child/../..",
+            "inside/../../sibling",
+            "inside/.",
+            r"..\sibling",
+            r"inside\..\sibling",
+        )
+        with (
+            patch("supertable.storage.local_storage.shutil.rmtree") as rmtree,
+            patch("supertable.storage.local_storage.os.remove") as remove,
+        ):
+            for alias in aliases:
+                with self.subTest(alias=alias):
+                    with self.assertRaisesRegex(ValueError, "Refusing to delete"):
+                        storage.delete(alias)
+            rmtree.assert_not_called()
+            remove.assert_not_called()
+
+    def test_delete_prefix_rejects_traversal_before_calling_delete(self):
+        storage = LocalStorage(self.tmpdir)
+        aliases = (
+            "..",
+            "child/../target",
+            "inside/.",
+            r"..\target",
+            r"inside\..\target",
+        )
+        with patch.object(storage, "delete") as delete:
+            for alias in aliases:
+                with self.subTest(alias=alias):
+                    with self.assertRaisesRegex(ValueError, "Refusing to delete"):
+                        storage.delete_prefix(alias)
+            delete.assert_not_called()
+
+    def test_delete_prefix_unlinks_external_directory_symlink_without_recursing(self):
+        storage = LocalStorage(self.tmpdir)
+        with tempfile.TemporaryDirectory(prefix="outside-storage-") as outside:
+            target = os.path.join(outside, "target")
+            os.makedirs(target)
+            kept = os.path.join(target, "keep.txt")
+            with open(kept, "w") as stream:
+                stream.write("keep")
+            link = self._path("external-prefix")
+            os.symlink(target, link)
+            file_target = os.path.join(outside, "keep-file.txt")
+            with open(file_target, "w") as stream:
+                stream.write("keep")
+            file_link = self._path("external-file-prefix")
+            os.symlink(file_target, file_link)
+
+            storage.delete_prefix("external-prefix")
+            storage.delete_prefix("external-file-prefix")
+
+            self.assertFalse(os.path.lexists(link))
+            self.assertTrue(os.path.isfile(kept))
+            self.assertFalse(os.path.lexists(file_link))
+            self.assertTrue(os.path.isfile(file_target))
+
+    def test_delete_rejects_all_absolute_filesystem_root_aliases_without_io(self):
+        aliases = [os.sep, os.sep * 2, os.path.join(os.sep, "."), "/tmp/.."]
+        with patch("supertable.storage.local_storage.shutil.rmtree") as rmtree, \
+             patch("supertable.storage.local_storage.os.remove") as remove:
+            for alias in aliases:
+                with self.subTest(alias=alias):
+                    with self.assertRaisesRegex(ValueError, "filesystem root"):
+                        self.storage.delete(alias)
+            rmtree.assert_not_called()
+            remove.assert_not_called()
+
+    def test_delete_refuses_configured_storage_root(self):
+        storage = LocalStorage(self.tmpdir)
+        with self.assertRaisesRegex(ValueError, "storage root"):
+            storage.delete("")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+
     def test_delete_not_found(self):
         with self.assertRaises(FileNotFoundError):
             self.storage.delete(self._path("ghost"))
+
+    def test_delete_file_fsyncs_surviving_parent(self):
+        p = self._path("durable-delete.bin")
+        with open(p, "wb") as stream:
+            stream.write(b"data")
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda directory: synced.append(os.path.abspath(directory)),
+        ):
+            self.storage.delete(p)
+        self.assertEqual(synced, [self.tmpdir])
+
+    def test_delete_directory_fsyncs_ancestors_but_not_removed_directory(self):
+        storage = LocalStorage(self.tmpdir)
+        removed = self._path("parent/removed")
+        os.makedirs(removed)
+        with open(os.path.join(removed, "object"), "wb") as stream:
+            stream.write(b"data")
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda directory: synced.append(os.path.abspath(directory)),
+        ):
+            storage.delete("parent/removed")
+        self.assertEqual(
+            synced,
+            [self._path("parent"), self.tmpdir],
+        )
+        self.assertNotIn(removed, synced)
+
+    def test_delete_prefix_retry_resyncs_visible_prior_deletion(self):
+        p = self._path("retry-delete")
+        os.makedirs(p)
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=OSError("directory fsync failed"),
+        ), self.assertRaisesRegex(OSError, "directory fsync failed"):
+            self.storage.delete_prefix(p)
+        self.assertFalse(os.path.exists(p))
+
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda directory: synced.append(os.path.abspath(directory)),
+        ):
+            self.storage.delete_prefix(p)
+        self.assertEqual(synced, [self.tmpdir])
+
+    def test_delete_prefix_retry_with_missing_parent_syncs_surviving_root(self):
+        storage = LocalStorage(self.tmpdir)
+        os.makedirs(self._path("gone/child"))
+        # Model a prior interrupted deletion whose visible namespace change
+        # removed both the requested prefix and its immediate parent before
+        # the durability acknowledgement was lost.
+        shutil.rmtree(self._path("gone"))
+
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda directory: synced.append(os.path.abspath(directory)),
+        ):
+            storage.delete_prefix("gone/child")
+        self.assertEqual(synced, [self.tmpdir])
 
     # ---- get_directory_structure ----
 
@@ -460,7 +666,9 @@ class TestLocalStorage(unittest.TestCase):
         with patch("supertable.storage.local_storage.pq") as mock_pq:
             mock_pq.read_table.return_value = fake_table
             self.storage.write_parquet(fake_table, p)
-            mock_pq.write_table.assert_called_once_with(fake_table, p)
+            mock_pq.write_table.assert_called_once()
+            self.assertIs(mock_pq.write_table.call_args.args[0], fake_table)
+            self.assertNotEqual(mock_pq.write_table.call_args.args[1], p)
 
         # To read, we need the file to exist
         with open(p, "wb") as f:
@@ -475,6 +683,59 @@ class TestLocalStorage(unittest.TestCase):
         with patch("supertable.storage.local_storage.pq"):
             self.storage.write_parquet(MagicMock(), p)
         self.assertTrue(os.path.isdir(os.path.dirname(p)))
+
+    def test_write_parquet_file_fsync_failure_preserves_previous_object(self):
+        p = self._path("durable.parquet")
+
+        def encode(value, target):
+            with open(target, "wb") as stream:
+                stream.write(value)
+
+        with patch(
+            "supertable.storage.local_storage.pq.write_table",
+            side_effect=encode,
+        ):
+            self.storage.write_parquet(b"old-complete", p)
+            with (
+                patch(
+                    "supertable.storage.local_storage.os.fsync",
+                    side_effect=OSError("file fsync failed"),
+                ),
+                self.assertRaisesRegex(OSError, "file fsync failed"),
+            ):
+                self.storage.write_parquet(b"new-complete", p)
+
+        with open(p, "rb") as stream:
+            self.assertEqual(stream.read(), b"old-complete")
+        self.assertEqual(
+            list(Path(self.tmpdir).glob(".tmp-parquet-*")),
+            [],
+        )
+
+    def test_write_parquet_directory_fsync_failure_is_not_acknowledged(self):
+        p = self._path("directory-fsync.parquet")
+
+        def encode(value, target):
+            with open(target, "wb") as stream:
+                stream.write(value)
+
+        with (
+            patch(
+                "supertable.storage.local_storage.pq.write_table",
+                side_effect=encode,
+            ),
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=[None, OSError("directory fsync failed")],
+            ),
+            self.assertRaisesRegex(OSError, "directory fsync failed"),
+        ):
+            self.storage.write_parquet(b"complete", p)
+
+        # Rename visibility is not a durability acknowledgement: callers see
+        # the raised error and therefore cannot publish a catalog pointer.
+        with open(p, "rb") as stream:
+            self.assertEqual(stream.read(), b"complete")
 
     def test_read_parquet_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
@@ -501,6 +762,146 @@ class TestLocalStorage(unittest.TestCase):
         p = self._path("deep/dir/data.bin")
         self.storage.write_bytes(p, b"x")
         self.assertTrue(os.path.isfile(p))
+
+    def test_write_bytes_partial_temp_failure_preserves_previous_object(self):
+        p = self._path("atomic.bin")
+        self.storage.write_bytes(p, b"old-complete")
+
+        def partial_then_fail(stream, _data):
+            stream.write(b"partial")
+            raise OSError("interrupted write")
+
+        with (
+            patch(
+                "supertable.storage.local_storage.write_all",
+                side_effect=partial_then_fail,
+            ),
+            self.assertRaisesRegex(OSError, "interrupted write"),
+        ):
+            self.storage.write_bytes(p, b"new-complete")
+
+        self.assertEqual(self.storage.read_bytes(p), b"old-complete")
+        self.assertEqual(list(Path(self.tmpdir).glob(".tmp-bytes-*")), [])
+
+    def test_write_bytes_directory_fsync_failure_is_not_acknowledged(self):
+        p = self._path("directory-fsync.bin")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=[None, OSError("directory fsync failed")],
+            ),
+            self.assertRaisesRegex(OSError, "directory fsync failed"),
+        ):
+            self.storage.write_bytes(p, b"complete")
+        self.assertEqual(self.storage.read_bytes(p), b"complete")
+
+    def test_logical_write_retry_anchors_previously_created_ancestors(self):
+        storage = LocalStorage(self.tmpdir)
+        logical_path = "retry-created/child/data.bin"
+
+        def fail_after_directories(_stream, _data):
+            raise OSError("first write failed")
+
+        with (
+            patch(
+                "supertable.storage.local_storage.write_all",
+                side_effect=fail_after_directories,
+            ),
+            self.assertRaisesRegex(OSError, "first write failed"),
+        ):
+            storage.write_bytes(logical_path, b"first")
+
+        directory = self._path("retry-created/child")
+        self.assertTrue(os.path.isdir(directory))
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda path: synced.append(os.path.abspath(path)),
+        ):
+            storage.write_bytes(logical_path, b"second")
+
+        self.assertEqual(
+            synced,
+            [
+                directory,
+                self._path("retry-created"),
+                self.tmpdir,
+            ],
+        )
+
+    def test_logical_write_anchors_a_root_created_after_storage_init(self):
+        missing_root = self._path("new/storage/root")
+        storage = LocalStorage(missing_root)
+        synced = []
+        with patch.object(
+            LocalStorage,
+            "_fsync_directory",
+            side_effect=lambda path: synced.append(os.path.abspath(path)),
+        ):
+            storage.write_bytes("data.bin", b"complete")
+
+        self.assertEqual(
+            synced,
+            [
+                missing_root,
+                self._path("new/storage"),
+                self._path("new"),
+                self.tmpdir,
+            ],
+        )
+
+    def test_all_logical_publication_variants_anchor_through_storage_root(self):
+        storage = LocalStorage(self.tmpdir)
+        source = self._path("source.bin")
+        with open(source, "wb") as stream:
+            stream.write(b"source")
+
+        cases = (
+            (
+                "json/deep/data.json",
+                lambda: storage.write_json("json/deep/data.json", {"ok": True}),
+            ),
+            (
+                "parquet/deep/data.parquet",
+                lambda: storage.write_parquet(b"parquet", "parquet/deep/data.parquet"),
+            ),
+            (
+                "bytes/deep/data.bin",
+                lambda: storage.write_bytes("bytes/deep/data.bin", b"bytes"),
+            ),
+            (
+                "copy/deep/data.bin",
+                lambda: storage.copy(source, "copy/deep/data.bin"),
+            ),
+        )
+
+        def encode_parquet(value, target):
+            with open(target, "wb") as stream:
+                stream.write(value)
+
+        for logical_path, publish in cases:
+            with self.subTest(logical_path=logical_path):
+                # Model directories left visible by a prior failed publication.
+                os.makedirs(os.path.dirname(self._path(logical_path)), exist_ok=True)
+                synced = []
+                with (
+                    patch(
+                        "supertable.storage.local_storage.pq.write_table",
+                        side_effect=encode_parquet,
+                    ),
+                    patch.object(
+                        LocalStorage,
+                        "_fsync_directory",
+                        side_effect=lambda path: synced.append(os.path.abspath(path)),
+                    ),
+                ):
+                    publish()
+                self.assertEqual(synced[-1], self.tmpdir)
+                self.assertEqual(
+                    synced[0],
+                    os.path.dirname(self._path(logical_path)),
+                )
 
     def test_read_bytes_not_found(self):
         with self.assertRaises(FileNotFoundError):
@@ -546,6 +947,87 @@ class TestLocalStorage(unittest.TestCase):
             f.write("data")
         self.storage.copy(src, dst)
         self.assertTrue(os.path.isfile(dst))
+
+    def test_copy_partial_temp_failure_preserves_source_and_destination(self):
+        src = self._path("copy-source.bin")
+        dst = self._path("copy-destination.bin")
+        with open(src, "wb") as stream:
+            stream.write(b"source-complete")
+        with open(dst, "wb") as stream:
+            stream.write(b"destination-old")
+
+        def partial_then_fail(_source, target):
+            with open(target, "wb") as stream:
+                stream.write(b"partial")
+            raise OSError("copy interrupted")
+
+        with (
+            patch(
+                "supertable.storage.local_storage.shutil.copyfile",
+                side_effect=partial_then_fail,
+            ),
+            self.assertRaisesRegex(OSError, "copy interrupted"),
+        ):
+            self.storage.copy(src, dst)
+        with open(src, "rb") as stream:
+            self.assertEqual(stream.read(), b"source-complete")
+        with open(dst, "rb") as stream:
+            self.assertEqual(stream.read(), b"destination-old")
+        self.assertEqual(list(Path(self.tmpdir).glob(".tmp-copy-*")), [])
+
+    def test_copy_file_fsync_failure_preserves_prior_destination(self):
+        src = self._path("copy-fsync-source.bin")
+        dst = self._path("copy-fsync-destination.bin")
+        with open(src, "wb") as stream:
+            stream.write(b"source-complete")
+        with open(dst, "wb") as stream:
+            stream.write(b"destination-old")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=OSError("file fsync failed"),
+            ),
+            self.assertRaisesRegex(OSError, "file fsync failed"),
+        ):
+            self.storage.copy(src, dst)
+        with open(dst, "rb") as stream:
+            self.assertEqual(stream.read(), b"destination-old")
+
+    def test_copy_replace_failure_preserves_prior_destination(self):
+        src = self._path("copy-replace-source.bin")
+        dst = self._path("copy-replace-destination.bin")
+        with open(src, "wb") as stream:
+            stream.write(b"source-complete")
+        with open(dst, "wb") as stream:
+            stream.write(b"destination-old")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.replace",
+                side_effect=OSError("replace failed"),
+            ),
+            self.assertRaisesRegex(OSError, "replace failed"),
+        ):
+            self.storage.copy(src, dst)
+        with open(dst, "rb") as stream:
+            self.assertEqual(stream.read(), b"destination-old")
+
+    def test_copy_directory_fsync_failure_is_not_acknowledged(self):
+        src = self._path("copy-directory-source.bin")
+        dst = self._path("copy-directory-destination.bin")
+        with open(src, "wb") as stream:
+            stream.write(b"source-complete")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=[None, OSError("directory fsync failed")],
+            ),
+            self.assertRaisesRegex(OSError, "directory fsync failed"),
+        ):
+            self.storage.copy(src, dst)
+        with open(src, "rb") as stream:
+            self.assertEqual(stream.read(), b"source-complete")
+        with open(dst, "rb") as stream:
+            self.assertEqual(stream.read(), b"source-complete")
 
     # ---- read_json retry / race condition branches ----
 

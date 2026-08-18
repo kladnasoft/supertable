@@ -106,13 +106,21 @@ def exact_numeric_table():
     return EXACT_FQN
 
 
-def _execute(sql: str, engine: Engine):
+def _execute(
+    sql: str,
+    engine: Engine,
+    *,
+    allow_bounded_collection_aggregates: bool = False,
+):
     return execute_quality_sql(
         organization=ORG,
         super_name=SUPER,
         sql=sql,
         role_name=ROLE,
         engine=engine,
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
     )
 
 
@@ -153,7 +161,11 @@ def test_deep_profile_excludes_nan_and_infinities_from_distribution_metrics(
     nonfinite_table,
 ):
     sql = build_deep_numeric_sql(nonfinite_table, "value", "Float64")
-    result = _execute(sql, Engine.AUTO)
+    result = _execute(
+        sql,
+        Engine.AUTO,
+        allow_bounded_collection_aggregates=True,
+    )
     _assert_direct_duck(result)
     row = result.frame.iloc[0]
 
@@ -231,7 +243,11 @@ def test_deep_profile_groups_and_orders_exact_numeric_values_without_double_coll
 ):
     sql = build_deep_numeric_sql(exact_numeric_table, column, column_type)
     assert f'TRY_CAST("{column}" AS DOUBLE)' not in sql
-    result = _execute(sql, Engine.AUTO)
+    result = _execute(
+        sql,
+        Engine.AUTO,
+        allow_bounded_collection_aggregates=True,
+    )
     _assert_direct_duck(result)
     row = result.frame.iloc[0]
 

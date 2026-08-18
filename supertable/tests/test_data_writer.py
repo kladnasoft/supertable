@@ -97,8 +97,9 @@ def _hardened_writer_contract_adapter(monkeypatch):
     """
     from supertable.data_writer import DataWriter
 
-    def reserve(self, *, snapshot, simple_name, count, profiler,
+    def reserve(self, *, snapshot, simple_name, count, profiler, lock_token,
                 require_floor=False):
+        assert lock_token
         floor = snapshot.get("rowid_high_watermark", 0)
         floor = int(floor) if isinstance(floor, int) and not isinstance(floor, bool) else 0
         if count <= 0:

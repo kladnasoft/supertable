@@ -60,6 +60,18 @@ def _mock_data_reader_redis():
         yield MockCat
 
 
+@pytest.fixture(autouse=True)
+def _isolate_binding_stability_guard():
+    """These orchestration tests use unconstrained SQLParser/RBAC mocks.
+
+    The guard's schema-dependent deny behavior has executable coverage in the
+    engine suite; patch it here so unrelated lifecycle assertions do not depend
+    on MagicMock's fabricated ``get_binding_ambiguities`` return value.
+    """
+    with patch(f"{_MOD}.validate_rbac_binding_stability") as guard:
+        yield guard
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1296,6 +1308,151 @@ class TestEnsureSqlLimit:
         result = _ensure_sql_limit(sql, 100)
         assert result == "SELECT * FROM tbl ORDER BY id\nLIMIT 100"
 
+    def test_fetch_rows_only_below_cap_is_preserved_including_zero(self):
+        from supertable.data_reader import _ensure_sql_limit
+
+        for sql in (
+            "SELECT * FROM tbl FETCH FIRST ROW ONLY",
+            "SELECT * FROM tbl FETCH FIRST 3 ROWS ONLY",
+            "SELECT * FROM tbl FETCH NEXT 0 ROWS ONLY",
+            "SELECT * FROM tbl OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY",
+        ):
+            assert _ensure_sql_limit(sql, 5) == sql
+
+    def test_fetch_rows_only_over_cap_is_clamped_without_widening(self):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        sql = "SELECT * FROM range(20) OFFSET 2 ROWS FETCH NEXT 9 ROWS ONLY"
+        bounded = _ensure_sql_limit(sql, 5)
+
+        assert "LIMIT 5 OFFSET 2" in bounded
+        assert duckdb.connect().execute(bounded).fetchall() == [
+            (2,), (3,), (4,), (5,), (6,),
+        ]
+
+    def test_fetch_null_is_unbounded_and_clamped_to_server_cap(self):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        sql = "SELECT * FROM range(20) OFFSET 2 ROWS FETCH NEXT NULL ROWS ONLY"
+        bounded = _ensure_sql_limit(sql, 5)
+
+        assert duckdb.connect().execute(bounded).fetchall() == [
+            (2,), (3,), (4,), (5,), (6,),
+        ]
+
+    @pytest.mark.parametrize(
+        "clause",
+        ["LIMIT (NULL)", "FETCH NEXT (NULL) ROWS ONLY"],
+    )
+    def test_parenthesized_null_is_unbounded_and_clamped(self, clause):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        bounded = _ensure_sql_limit(f"SELECT * FROM range(20) {clause}", 5)
+
+        assert duckdb.connect().execute(bounded).fetchall() == [
+            (0,), (1,), (2,), (3,), (4,),
+        ]
+
+    def test_parenthesized_all_stays_invalid_instead_of_becoming_bounded(self):
+        from supertable.data_reader import _ensure_sql_limit
+
+        with pytest.raises(ValueError, match="LIMIT"):
+            _ensure_sql_limit("SELECT * FROM tbl LIMIT (ALL)", 5)
+
+    @pytest.mark.parametrize("modifier", ["WITH TIES", "PERCENT ROWS ONLY"])
+    def test_non_hard_fetch_modifier_is_rejected_not_silently_rewritten(self, modifier):
+        from supertable.data_reader import _ensure_sql_limit
+
+        if modifier == "WITH TIES":
+            sql = "SELECT * FROM tbl ORDER BY id FETCH FIRST 3 ROWS WITH TIES"
+        else:
+            sql = "SELECT * FROM tbl FETCH FIRST 10 PERCENT ROWS ONLY"
+
+        with pytest.raises(ValueError, match="bounded read path"):
+            _ensure_sql_limit(sql, 5)
+
+    def test_fetch_zero_with_duplicate_columns_and_semicolon_is_preserved(self):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        sql = (
+            "SELECT range AS x, range + 1 AS x FROM range(3) "
+            "FETCH FIRST 0 ROWS ONLY;"
+        )
+        bounded = _ensure_sql_limit(sql, 5)
+
+        assert bounded == sql
+        result = duckdb.connect().execute(bounded)
+        assert result.fetchall() == []
+        assert [item[0] for item in result.description] == ["x", "x"]
+
+    def test_clamped_fetch_preserves_duplicate_output_names_and_semantics(self):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        sql = (
+            "SELECT range AS x, range + 1 AS x FROM range(20) "
+            "FETCH FIRST 9 ROWS ONLY;"
+        )
+        bounded = _ensure_sql_limit(sql, 5)
+
+        result = duckdb.connect().execute(bounded)
+        assert result.fetchall() == [
+            (0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
+        ]
+        assert [item[0] for item in result.description] == ["x", "x"]
+
+    @pytest.mark.parametrize(
+        ("bound", "expected_rows"),
+        [
+            ("0 + 0", 0),
+            ("CAST(2 AS INTEGER)", 2),
+            ("(3)", 3),
+            ("1 * 2", 2),
+        ],
+    )
+    def test_valid_constant_limit_expression_below_cap_is_not_widened(
+        self, bound, expected_rows,
+    ):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        sql = f"SELECT * FROM range(20) LIMIT {bound}"
+        bounded = _ensure_sql_limit(sql, 5)
+
+        assert bounded == sql
+        assert len(duckdb.connect().execute(bounded).fetchall()) == expected_rows
+
+    def test_constant_limit_expression_over_cap_is_safely_clamped(self):
+        import duckdb
+        from supertable.data_reader import _ensure_sql_limit
+
+        bounded = _ensure_sql_limit(
+            "SELECT * FROM range(20) LIMIT (3 * 3)", 5,
+        )
+
+        assert len(duckdb.connect().execute(bounded).fetchall()) == 5
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            "?",
+            "random()",
+            "2147483647 + 1",
+            "CAST(999 AS TINYINT)",
+            "9223372036854775808",
+            "-1",
+        ],
+    )
+    def test_unproven_or_invalid_limit_expression_fails_closed(self, bound):
+        from supertable.data_reader import _ensure_sql_limit
+
+        with pytest.raises(ValueError, match="LIMIT"):
+            _ensure_sql_limit(f"SELECT * FROM tbl LIMIT {bound}", 5)
+
     def test_limit_word_in_column_name_does_not_match(self):
         from supertable.data_reader import _ensure_sql_limit
         sql = "SELECT credit_limit FROM tbl"
@@ -1984,6 +2141,127 @@ class TestExecuteRejectedCommands:
 
 class TestExecuteShowStats:
 
+    def test_stats_context_detects_linked_share_filter_in_atomic_leaf(self):
+        from supertable.data_reader import DataReader
+
+        reader = DataReader.__new__(DataReader)
+        reader.organization = "o"
+        with patch(_PATCH_REDIS_CATALOG) as Catalog:
+            Catalog.return_value.get_leaf.return_value = {
+                "version": 1,
+                "payload": {
+                    "snapshot_version": 1,
+                    "schema": {"id": "Int64"},
+                    "resources": [],
+                    "tombstone": None,
+                    "tombstone_rows": 0,
+                    "tombstone_digest": None,
+                    "stats_file": "private/full-stats.parquet",
+                    "_row_filter": "tenant = 'shared'",
+                },
+            }
+            assert reader._resolve_latest_stats_context(
+                "mysuper", "mytable",
+            ) == ("private/full-stats.parquet", True)
+
+    @pytest.mark.parametrize(
+        "outer_filter",
+        ["tenant = 'shared'", {"malformed": True}],
+    )
+    def test_stats_context_fails_closed_on_outer_leaf_filter(
+        self, outer_filter,
+    ):
+        from supertable.data_reader import DataReader
+
+        reader = DataReader.__new__(DataReader)
+        reader.organization = "o"
+        with patch(_PATCH_REDIS_CATALOG) as Catalog:
+            Catalog.return_value.get_leaf.return_value = {
+                "version": 1,
+                "_row_filter": outer_filter,
+                "payload": {
+                    "snapshot_version": 1,
+                    "schema": {"id": "Int64"},
+                    "resources": [],
+                    "tombstone": None,
+                    "tombstone_rows": 0,
+                    "tombstone_digest": None,
+                    "stats_file": "private/full-stats.parquet",
+                    "_row_filter": None,
+                },
+            }
+            assert reader._resolve_latest_stats_context(
+                "mysuper", "mytable",
+            ) == ("private/full-stats.parquet", True)
+
+    def test_stats_context_detects_conflicting_direct_and_nested_filters(self):
+        from supertable.data_reader import DataReader
+
+        snapshot = {
+            "snapshot_version": 1,
+            "schema": {"id": "Int64"},
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "stats_file": "private/full-stats.parquet",
+        }
+        reader = DataReader.__new__(DataReader)
+        reader.organization = "o"
+        with patch(_PATCH_REDIS_CATALOG) as Catalog:
+            Catalog.return_value.get_leaf.return_value = {
+                "version": 1,
+                "payload": {
+                    **snapshot,
+                    "_row_filter": None,
+                    "snapshot": {
+                        **snapshot,
+                        "_row_filter": "tenant = 'nested'",
+                    },
+                },
+            }
+            assert reader._resolve_latest_stats_context(
+                "mysuper", "mytable",
+            ) == ("private/full-stats.parquet", True)
+
+    def test_stats_context_loads_heavy_policy_when_cache_marker_is_missing(self):
+        """A tombstone-complete legacy cache cannot hide a storage filter."""
+        from supertable.data_reader import DataReader
+
+        cached = {
+            "snapshot_version": 1,
+            "schema": {"id": "Int64", "tenant": "String"},
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "stats_file": "cached/full-stats.parquet",
+        }
+        heavy = {
+            **cached,
+            "stats_file": "heavy/full-stats.parquet",
+            "_row_filter": "tenant = 'shared'",
+        }
+        reader = DataReader.__new__(DataReader)
+        reader.organization = "o"
+        with (
+            patch(_PATCH_REDIS_CATALOG) as Catalog,
+            patch("supertable.super_table.SuperTable") as SuperTable,
+        ):
+            Catalog.return_value.get_leaf.return_value = {
+                "version": 1,
+                "path": "snapshots/v1.json",
+                "payload": cached,
+            }
+            SuperTable.return_value.read_simple_table_snapshot.return_value = heavy
+
+            assert reader._resolve_latest_stats_context(
+                "mysuper", "mytable",
+            ) == ("heavy/full-stats.parquet", True)
+            SuperTable.return_value.read_simple_table_snapshot.assert_called_once_with(
+                "snapshots/v1.json"
+            )
+
     @patch(_PATCH_EXECUTOR)
     @patch(_PATCH_DATA_ESTIMATOR)
     @patch(_PATCH_SQL_PARSER)
@@ -2015,8 +2293,8 @@ class TestExecuteShowStats:
         from supertable.data_reader import DataReader, Status
 
         with patch.object(
-            DataReader, "_resolve_latest_stats_file",
-            return_value="redis://stats/v1",
+            DataReader, "_resolve_latest_stats_context",
+            return_value=("redis://stats/v1", False),
         ), patch("supertable.processing.load_stats", return_value=stats_df):
             dr = DataReader("mysuper", "o", "SHOW STATS mysuper.mytable")
             df, status, msg = dr.execute("admin")
@@ -2047,7 +2325,7 @@ class TestExecuteShowStats:
 
         # No stats pointer -> empty frame carrying the schema columns, OK status.
         with patch.object(
-            DataReader, "_resolve_latest_stats_file", return_value=None,
+            DataReader, "_resolve_latest_stats_context", return_value=(None, False),
         ):
             dr = DataReader("mysuper", "o", "SHOW STATS mytable")
             df, status, msg = dr.execute("admin")
@@ -2073,6 +2351,95 @@ class TestExecuteShowStats:
         dr = DataReader("mysuper", "o", "SHOW STATS mytable")
         with pytest.raises(PermissionError, match="no access to mytable"):
             dr.execute("reader_role")
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_rejects_rbac_row_filter_before_artifact_resolution(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        from supertable.data_classes import RbacViewDef
+        from supertable.data_reader import DataReader
+
+        mock_get_storage.return_value = MagicMock()
+        mock_restrict.return_value = {
+            "mytable": RbacViewDef(
+                allowed_columns=["salary"],
+                where_clause="department = 'public'",
+            ),
+        }
+        with patch.object(
+            DataReader, "_resolve_latest_stats_context",
+        ) as resolve_stats, patch("supertable.processing.load_stats") as load_stats:
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            with pytest.raises(
+                PermissionError,
+                match="unavailable under the effective access policy",
+            ) as denied:
+                dr.execute("reader_role")
+
+        assert "department" not in str(denied.value)
+        resolve_stats.assert_not_called()
+        load_stats.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_rejects_linked_share_filter_before_artifact_load(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        from supertable.data_reader import DataReader
+
+        mock_get_storage.return_value = MagicMock()
+        mock_restrict.return_value = {}
+        secret_path = "private/tenant/full-snapshot-stats.parquet"
+        with patch.object(
+            DataReader, "_resolve_latest_stats_context",
+            return_value=(secret_path, True),
+        ), patch("supertable.processing.load_stats") as load_stats:
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            with pytest.raises(
+                PermissionError,
+                match="unavailable under the effective access policy",
+            ) as denied:
+                dr.execute("share_reader")
+
+        assert secret_path not in str(denied.value)
+        load_stats.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_policy_resolution_failure_is_generic_and_fails_closed(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        from supertable.data_reader import DataReader
+
+        mock_get_storage.return_value = MagicMock()
+        mock_restrict.return_value = {}
+        secret_path = "s3://private-bucket/share/snapshot-v7.json?token=secret"
+        with patch.object(
+            DataReader, "_resolve_latest_stats_context",
+            side_effect=RuntimeError(f"unable to read {secret_path}"),
+        ), patch("supertable.processing.load_stats") as load_stats:
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            with pytest.raises(
+                PermissionError,
+                match="unavailable under the effective access policy",
+            ) as denied:
+                dr.execute("share_reader")
+
+        assert secret_path not in str(denied.value)
+        load_stats.assert_not_called()
 
     @patch(_PATCH_EXECUTOR)
     @patch(_PATCH_DATA_ESTIMATOR)

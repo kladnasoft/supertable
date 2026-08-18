@@ -827,15 +827,21 @@ def test_catalog_parser_rejects_external_table_sources(query):
         SQLParser("s", query, "duckdb")
 
 
-def test_catalog_parser_rejects_time_travel_and_cross_scope_alias_reuse():
+def test_catalog_parser_rejects_time_travel_but_tracks_correlated_alias_reuse():
     with pytest.raises(ValueError, match="AS OF|historical"):
         SQLParser("s", "SELECT * FROM t AT (VERSION => 1)", "duckdb")
-    with pytest.raises(ValueError, match="multiple physical tables"):
-        SQLParser(
-            "s",
-            "SELECT * FROM orders x WHERE EXISTS (SELECT 1 FROM customers x)",
-            "duckdb",
-        )
+    parser = SQLParser(
+        "s",
+        "SELECT * FROM orders x WHERE EXISTS (SELECT 1 FROM customers x)",
+        "duckdb",
+    )
+    assert {
+        (table.simple_name, table.alias)
+        for table in parser.get_table_tuples()
+    } == {
+        ("orders", "x"),
+        ("customers", "__supertable_binding_1_x"),
+    }
 
 
 @pytest.mark.parametrize(
@@ -851,12 +857,6 @@ def test_catalog_parser_rejects_time_travel_and_cross_scope_alias_reuse():
 def test_catalog_parser_rejects_non_query_commands(query):
     with pytest.raises(ValueError, match="Only read-only"):
         SQLParser("s", query, "duckdb")
-    with pytest.raises(ValueError, match="multiple physical tables"):
-        SQLParser(
-            "s",
-            "SELECT * FROM orders a WHERE EXISTS (SELECT 1 FROM customers A)",
-            "duckdb",
-        )
 
 
 def test_spark_describe_failure_with_tombstone_fails_closed():

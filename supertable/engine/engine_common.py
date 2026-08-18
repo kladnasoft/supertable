@@ -16,13 +16,18 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 import duckdb
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.duckdb import DuckDB as SQLGlotDuckDB
+from sqlglot.generator import csv as sqlglot_csv
 from sqlglot.optimizer.scope import traverse_scope
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
 from supertable.engine.engine_config import normalize_memory_size
-from supertable.utils.sql_parser import validate_read_query_ast
+from supertable.utils.sql_parser import (
+    _build_scoped_table_bindings,
+    validate_read_query_ast,
+)
 
 
 # =========================================================
@@ -37,6 +42,76 @@ def quote_if_needed(col: str) -> str:
     if all(ch.isalnum() or ch == "_" for ch in col):
         return col
     return '"' + col.replace('"', '""') + '"'
+
+
+def validate_rbac_binding_stability(
+    parser: object,
+    rbac_views: object,
+) -> None:
+    """Deny column policies that can change SQL identifier binding.
+
+    DuckDB accepts several schema-dependent unqualified forms: a physical
+    input can take precedence over a same-named SELECT alias, and a relation
+    alias can become a whole-row struct only when no physical column has that
+    name.  Removing the physical column in an RBAC view must not silently turn
+    the user's original query (including an originally ambiguous/invalid one)
+    into different executable SQL.
+
+    The parser records only supported lexical binding candidates.  Do not
+    recurse through arbitrary AST or policy payloads here: malformed maps fail
+    closed and unrestricted/row-filter-only views leave binding unchanged.
+    """
+    # An explicitly empty production view map cannot remove a column and thus
+    # cannot affect binding.  Short-circuiting also keeps unrestricted callers
+    # independent of this schema-dependent proof machinery.
+    if isinstance(rbac_views, dict) and not rbac_views:
+        return
+
+    getter = getattr(parser, "get_binding_ambiguities", None)
+    if not callable(getter):
+        # Execution boundaries reparse with the production parser.  A direct
+        # legacy/test parser lacking this proof cannot safely be paired with a
+        # column-restricting view.
+        ambiguities: object = {}
+    else:
+        ambiguities = getter()
+    if not isinstance(ambiguities, dict):
+        raise PermissionError("Unable to validate protected SQL name binding")
+    if not ambiguities:
+        return
+    if not isinstance(rbac_views, dict):
+        raise PermissionError("Unable to validate protected SQL name binding")
+
+    views_by_alias = {
+        str(alias).casefold(): view
+        for alias, view in rbac_views.items()
+    }
+    for alias, raw_names in ambiguities.items():
+        view = views_by_alias.get(str(alias).casefold())
+        if view is None:
+            continue
+        if not isinstance(raw_names, (set, frozenset, list, tuple)):
+            raise PermissionError("Unable to validate protected SQL name binding")
+        allowed_raw = getattr(view, "allowed_columns", None)
+        excluded_raw = getattr(view, "excluded_columns", None)
+        if not isinstance(allowed_raw, (list, tuple)) or not isinstance(
+            excluded_raw, (list, tuple)
+        ):
+            raise PermissionError("Unable to validate protected SQL name binding")
+        allowed = {str(name).casefold() for name in allowed_raw}
+        excluded = {str(name).casefold() for name in excluded_raw}
+        wildcard = "*" in allowed
+        for raw_name in raw_names:
+            if not isinstance(raw_name, str) or not raw_name:
+                raise PermissionError(
+                    "Unable to validate protected SQL name binding"
+                )
+            name = raw_name.casefold()
+            if name in excluded or (not wildcard and name not in allowed):
+                raise PermissionError(
+                    "Column policy would change SQL name binding; qualify the "
+                    "reference or use a non-conflicting alias"
+                )
 
 
 def sanitize_sql_string(value_sql: str) -> str:
@@ -837,7 +912,13 @@ def configure_httpfs_and_s3(
 
             secret_options = ["TYPE S3", "PROVIDER CONFIG"]
 
-            def add_secret_option(name: str, value: Optional[str]) -> None:
+            def add_secret_option(name: str, value: object) -> None:
+                if value is None:
+                    return
+                if not isinstance(value, str):
+                    raise RuntimeError(
+                        f"Invalid DuckDB S3 {name.casefold()} configuration"
+                    )
                 if value:
                     quoted_value = sanitize_sql_string("'" + value + "'")
                     secret_options.append(f"{name} {quoted_value}")
@@ -1218,11 +1299,78 @@ def create_reflection_view_with_presign_retry(
 # Query rewriting
 # =========================================================
 
+
+class _ProtectedDuckDBGenerator(SQLGlotDuckDB.Generator):
+    """Emit DuckDB's SELECT-level USING SAMPLE in its actual grammar slot.
+
+    sqlglot 26.x parses DuckDB ``USING SAMPLE`` onto ``Select.sample`` but its
+    generic generator emits that modifier after ORDER/LIMIT, which DuckDB
+    rejects.  DuckDB accepts the sampling modifier after WHERE/GROUP/HAVING
+    and before ORDER/OFFSET/LIMIT.  Keep the upstream modifier order intact
+    except for that one dialect-specific placement.
+    """
+
+    def query_modifiers(self, expression: exp.Expression, *sqls: str) -> str:
+        limit = expression.args.get("limit")
+        if self.LIMIT_FETCH == "LIMIT" and isinstance(limit, exp.Fetch):
+            limit = exp.Limit(
+                expression=exp.maybe_copy(limit.args.get("count")),
+            )
+        elif self.LIMIT_FETCH == "FETCH" and isinstance(limit, exp.Limit):
+            limit = exp.Fetch(
+                direction="FIRST",
+                count=exp.maybe_copy(limit.expression),
+            )
+
+        locks = self.expressions(expression, key="locks", sep=" ")
+        locks = f" {locks}" if locks else ""
+        return sqlglot_csv(
+            *sqls,
+            *[self.sql(join) for join in expression.args.get("joins") or []],
+            self.sql(expression, "match"),
+            *[
+                self.sql(lateral)
+                for lateral in expression.args.get("laterals") or []
+            ],
+            self.sql(expression, "prewhere"),
+            self.sql(expression, "where"),
+            self.sql(expression, "connect"),
+            self.sql(expression, "group"),
+            self.sql(expression, "having"),
+            *[
+                transform(self, expression)
+                for transform in self.AFTER_HAVING_MODIFIER_TRANSFORMS.values()
+            ],
+            self.sql(expression, "sample"),
+            self.sql(expression, "order"),
+            *self.offset_limit_modifiers(
+                expression, isinstance(limit, exp.Fetch), limit,
+            ),
+            locks,
+            self.options_modifier(expression),
+            self.for_modifiers(expression),
+            sep="",
+        )
+
+
+def _protected_duckdb_sql(expression: exp.Expression) -> str:
+    """Generate protected SQL, correcting sqlglot's DuckDB sample placement."""
+    has_select_sample = any(
+        isinstance(node, exp.Select) and node.args.get("sample") is not None
+        for node in expression.walk()
+    )
+    if not has_select_sample:
+        return expression.sql(dialect="duckdb")
+    return _ProtectedDuckDBGenerator(
+        dialect=SQLGlotDuckDB(),
+    ).generate(expression, copy=False)
+
 def rewrite_query_with_hashed_tables(
         original_sql: str,
         alias_to_table: Dict[str, str],
         *,
         parsed_expression: Optional[exp.Expression] = None,
+        default_super_name: Optional[str] = None,
 ) -> str:
     """Replace table references in SQL with hashed physical table names.
 
@@ -1250,50 +1398,348 @@ def rewrite_query_with_hashed_tables(
         if folded in folded_targets:
             raise RuntimeError("Ambiguous protected query table aliases")
         folded_targets[folded] = (str(alias), physical)
-    cte_reference_ids: set[int] = set()
     try:
-        for scope in traverse_scope(parsed):
-            for selected in scope.selected_sources.values():
-                node, source = selected
-                if isinstance(node, exp.Table) and not isinstance(source, exp.Table):
-                    cte_reference_ids.add(id(node))
+        scopes = tuple(traverse_scope(parsed))
+        layout = _build_scoped_table_bindings(
+            parsed,
+            default_super_name or "__supertable_default__",
+            scopes=scopes,
+        )
     except Exception as exc:
         raise RuntimeError(
             "Unable to prove protected query table bindings"
         ) from exc
     rewritten: set[str] = set()
 
+    # Replacing ``schema.table`` with a request-private unqualified view also
+    # changes how a valid three-part column reference must be spelled. Bind
+    # such columns through the same lexical scope graph before mutating table
+    # nodes. A global table-name lookup is unsafe when a correlated subquery
+    # reuses the same table name from another schema.
+    scopes_by_select = {
+        id(scope.expression): scope
+        for scope in scopes
+        if isinstance(scope.expression, exp.Select)
+    }
+    sources_by_scope: Dict[
+        int, tuple[Dict[str, Optional[exp.Table]], list[exp.Table]]
+    ] = {}
+    scope_by_table_id: Dict[int, object] = {}
+    for scope in scopes:
+        if not isinstance(scope.expression, exp.Select):
+            continue
+        source_aliases: Dict[str, Optional[exp.Table]] = {}
+        direct_sources: list[exp.Table] = []
+        try:
+            selected_sources = scope.selected_sources.items()
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to prove protected query column bindings"
+            ) from exc
+        for source_alias, selected in selected_sources:
+            try:
+                node, source = selected
+            except (TypeError, ValueError):
+                continue
+            source_table = (
+                node
+                if isinstance(node, exp.Table) and isinstance(source, exp.Table)
+                else None
+            )
+            source_aliases[str(source_alias).casefold()] = source_table
+            if source_table is not None:
+                direct_sources.append(node)
+                scope_by_table_id[id(node)] = scope
+        sources_by_scope[id(scope)] = (source_aliases, direct_sources)
+
+    def identifier_name(node: object) -> str:
+        if isinstance(node, exp.Identifier):
+            return node.name
+        if isinstance(node, exp.Expression):
+            return node.name
+        return ""
+
+    def original_source_alias(source: exp.Table) -> str:
+        alias_expr = source.args.get("alias")
+        if isinstance(alias_expr, exp.TableAlias):
+            alias_ident = alias_expr.this
+            if isinstance(alias_ident, exp.Identifier) and alias_ident.name:
+                return alias_ident.name
+        return source.name
+
+    original_alias_by_node_id = {
+        source_id: original_source_alias(source)
+        for _source_aliases, direct_sources in sources_by_scope.values()
+        for source in direct_sources
+        if (source_id := id(source)) in scope_by_table_id
+    }
+
+    # A request-wide catalog key is not automatically a SQL alias. Independent
+    # scopes (notably UNION branches) may reuse the same spelling safely, and
+    # changing it breaks DuckDB's bare-alias whole-row expression. Only a
+    # descendant scope that can actually correlate to an ancestor needs unique
+    # SQL aliases after schema qualifiers are stripped.
+    sources_by_original_alias: Dict[str, list[exp.Table]] = {}
+    recorded_source_ids: set[int] = set()
+    for _source_aliases, direct_sources in sources_by_scope.values():
+        for source_node in direct_sources:
+            if id(source_node) in recorded_source_ids:
+                continue
+            recorded_source_ids.add(id(source_node))
+            sources_by_original_alias.setdefault(
+                original_source_alias(source_node).casefold(), []
+            ).append(source_node)
+
+    def can_correlate_to(descendant: object, ancestor: object) -> bool:
+        current: Optional[object] = descendant
+        while current is not None and current is not ancestor:
+            if not bool(getattr(current, "can_be_correlated", False)):
+                return False
+            current = getattr(current, "parent", None)
+        return current is ancestor
+
+    correlation_alias_nodes: set[int] = set()
+    for same_alias_sources in sources_by_original_alias.values():
+        for index, left_source in enumerate(same_alias_sources):
+            left_scope = scope_by_table_id.get(id(left_source))
+            left_key = layout.by_node_id.get(id(left_source))
+            for right_source in same_alias_sources[index + 1:]:
+                right_scope = scope_by_table_id.get(id(right_source))
+                right_key = layout.by_node_id.get(id(right_source))
+                if (
+                    left_scope is None
+                    or right_scope is None
+                    or left_key is None
+                    or right_key is None
+                    or left_key.casefold() == right_key.casefold()
+                ):
+                    continue
+                if can_correlate_to(left_scope, right_scope) or can_correlate_to(
+                    right_scope, left_scope
+                ):
+                    correlation_alias_nodes.update(
+                        (id(left_source), id(right_source))
+                    )
+
+    def protected_alias(source: exp.Table) -> Optional[str]:
+        binding_key = layout.by_node_id.get(id(source))
+        target = (
+            folded_targets.get(binding_key.casefold())
+            if binding_key is not None else None
+        )
+        if target is None:
+            return None
+        if id(source) in correlation_alias_nodes:
+            return target[0]
+        return original_alias_by_node_id.get(id(source))
+
+    for column in parsed.find_all(exp.Column):
+        column_db = identifier_name(column.args.get("db"))
+        column_catalog = identifier_name(column.args.get("catalog"))
+        if column.is_star and (column_db or column_catalog):
+            # DuckDB rejects schema/catalog-qualified stars even though
+            # sqlglot accepts and regenerates them. Rewriting ``s.t.*`` to
+            # ``alias.*`` would otherwise turn invalid input into a
+            # data-bearing query.
+            raise RuntimeError(
+                "Schema-qualified stars are invalid in protected DuckDB queries"
+            )
+        nearest_select = column.find_ancestor(exp.Select)
+        scope = (
+            scopes_by_select.get(id(nearest_select))
+            if nearest_select is not None else None
+        )
+        if not column.table and not column_db and not column_catalog and scope is not None:
+            source_aliases, _direct_sources = sources_by_scope.get(
+                id(scope), ({}, []),
+            )
+            whole_row_source = source_aliases.get(column.name.casefold())
+            if (
+                whole_row_source is not None
+                and id(whole_row_source) in correlation_alias_nodes
+                and protected_alias(whole_row_source)
+                != original_source_alias(whole_row_source)
+            ):
+                raise RuntimeError(
+                    "Protected query cannot safely rename a correlated table "
+                    "alias used as an unqualified whole-row expression"
+                )
+        while scope is not None:
+            source_aliases, direct_sources = sources_by_scope.get(
+                id(scope), ({}, []),
+            )
+
+            # First prefer a real schema.table binding. DuckDB gives this
+            # interpretation precedence over an identically spelled
+            # alias.struct.field path in the same scope.
+            if column_db and column.table:
+                matches: list[exp.Table] = []
+                for source in direct_sources:
+                    # Once a table has an explicit alias DuckDB hides its
+                    # original schema-qualified name. Rewriting that invalid
+                    # spelling would incorrectly make a rejected query run.
+                    if isinstance(source.args.get("alias"), exp.TableAlias):
+                        continue
+                    source_db = identifier_name(source.args.get("db"))
+                    source_catalog = identifier_name(
+                        source.args.get("catalog")
+                    )
+                    if (
+                        source.name.casefold() == column.table.casefold()
+                        and source_db
+                        and source_db.casefold() == column_db.casefold()
+                        and (
+                            not column_catalog
+                            or (
+                                source_catalog
+                                and source_catalog.casefold()
+                                == column_catalog.casefold()
+                            )
+                        )
+                    ):
+                        matches.append(source)
+                if matches:
+                    if len(matches) != 1:
+                        raise RuntimeError(
+                            "Ambiguous schema-qualified column binding in "
+                            "protected query"
+                        )
+                    replacement_alias = protected_alias(matches[0])
+                    if replacement_alias is None:
+                        raise RuntimeError(
+                            "Protected query contains a qualified column whose "
+                            "physical source was not replaced"
+                        )
+                    column.set("catalog", None)
+                    column.set("db", None)
+                    column.set("table", exp.to_identifier(replacement_alias))
+                    break
+
+                # A two-part source followed by a nested struct path uses all
+                # four Column qualifier slots: ``schema.table.struct.field``
+                # parses as catalog=schema, db=table, table=struct. Match the
+                # physical relation prefix, then retain the struct/field tail.
+                nested_matches: list[exp.Table] = []
+                if column_catalog:
+                    for source in direct_sources:
+                        if isinstance(source.args.get("alias"), exp.TableAlias):
+                            continue
+                        source_db = identifier_name(source.args.get("db"))
+                        source_catalog = identifier_name(
+                            source.args.get("catalog")
+                        )
+                        if (
+                            not source_catalog
+                            and source.name.casefold() == column_db.casefold()
+                            and source_db
+                            and source_db.casefold() == column_catalog.casefold()
+                        ):
+                            nested_matches.append(source)
+                if nested_matches:
+                    if len(nested_matches) != 1:
+                        raise RuntimeError(
+                            "Ambiguous schema-qualified struct binding in "
+                            "protected query"
+                        )
+                    replacement_alias = protected_alias(nested_matches[0])
+                    if replacement_alias is None:
+                        raise RuntimeError(
+                            "Protected query contains a qualified struct whose "
+                            "physical source was not replaced"
+                        )
+                    column.set("catalog", None)
+                    column.set("db", exp.to_identifier(replacement_alias))
+                    break
+
+                # Otherwise ``alias.struct.field`` is represented by sqlglot
+                # in the same three-part Column shape. Preserve the field path
+                # and update only the physical relation alias if it was made
+                # request-unique below.
+                folded_db = column_db.casefold()
+                if folded_db in source_aliases:
+                    source = source_aliases[folded_db]
+                    if source is not None:
+                        replacement_alias = protected_alias(source)
+                        if replacement_alias is None:
+                            raise RuntimeError(
+                                "Protected query contains a qualified column "
+                                "whose physical source was not replaced"
+                            )
+                        column.set("db", exp.to_identifier(replacement_alias))
+                    break
+
+                # Four-or-more-part nested paths use the catalog slot for the
+                # relation alias (``alias.struct.field.child``). Preserve the
+                # nested tail while updating a request-unique alias.
+                folded_catalog = column_catalog.casefold() if column_catalog else ""
+                if folded_catalog and folded_catalog in source_aliases:
+                    source = source_aliases[folded_catalog]
+                    if source is not None:
+                        replacement_alias = protected_alias(source)
+                        if replacement_alias is None:
+                            raise RuntimeError(
+                                "Protected query contains a qualified column "
+                                "whose physical source was not replaced"
+                            )
+                        column.set(
+                            "catalog", exp.to_identifier(replacement_alias),
+                        )
+                    break
+
+            # Ordinary ``alias.column`` binding, including correlated outer
+            # references. A derived/CTE source is authoritative and stops the
+            # search without being rewritten.
+            elif column.table:
+                folded_table = column.table.casefold()
+                if folded_table in source_aliases:
+                    source = source_aliases[folded_table]
+                    if source is not None:
+                        replacement_alias = protected_alias(source)
+                        if replacement_alias is None:
+                            raise RuntimeError(
+                                "Protected query contains a qualified column "
+                                "whose physical source was not replaced"
+                            )
+                        column.set(
+                            "table", exp.to_identifier(replacement_alias),
+                        )
+                    break
+            scope = getattr(scope, "parent", None)
+
     for table in parsed.find_all(exp.Table):
-        if id(table) in cte_reference_ids:
+        if id(table) in layout.cte_reference_node_ids:
             # Query-local CTE reference; its physical leaf sources are handled
             # independently below/by their own Table nodes.
             continue
         alias_expr = table.args.get("alias")
-        alias_name = None
 
-        if isinstance(alias_expr, exp.TableAlias):
-            ident = alias_expr.this
-            if isinstance(ident, exp.Identifier):
-                alias_name = ident.name
-
-        if not alias_name:
-            alias_name = table.name
-
-        target = folded_targets.get(str(alias_name).casefold())
+        binding_key = layout.by_node_id.get(id(table))
+        target = (
+            folded_targets.get(binding_key.casefold())
+            if binding_key is not None
+            else None
+        )
         if target is not None:
             canonical_alias, new_physical = target
             rewritten.add(canonical_alias.casefold())
             table.set("this", exp.to_identifier(new_physical))
             table.set("db", None)
-            # Ensure the alias is always present so qualified column references
-            # (e.g. table_1.col) remain valid after the table is renamed.
-            # When the user wrote an explicit alias we keep it; when there was
-            # no alias the table name itself was used as the alias key, so we
-            # set it explicitly here.
-            if not isinstance(alias_expr, exp.TableAlias):
+            table.set("catalog", None)
+            # Ensure the alias is always present. Independent scopes retain the
+            # user's local alias; correlation-visible collisions use the
+            # request-wide key selected above so stripped schema qualifiers do
+            # not collapse distinct bindings.
+            rewritten_alias = protected_alias(table)
+            if rewritten_alias is None:
+                raise RuntimeError(
+                    "Protected query physical source was not replaced"
+                )
+            if isinstance(alias_expr, exp.TableAlias):
+                alias_expr.set("this", exp.to_identifier(rewritten_alias))
+            else:
                 table.set(
                     "alias",
-                    exp.TableAlias(this=exp.to_identifier(alias_name)),
+                    exp.TableAlias(this=exp.to_identifier(rewritten_alias)),
                 )
         else:
             raise RuntimeError(
@@ -1306,7 +1752,7 @@ def rewrite_query_with_hashed_tables(
             "Protected query reflection map did not match every physical source"
         )
 
-    return parsed.sql(dialect="duckdb")
+    return _protected_duckdb_sql(parsed)
 
 
 # =========================================================

@@ -51,14 +51,20 @@ def test_small_file_gate_emits_precise_compaction_log(caplog):
     simple = f"compact_log_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)  # bootstrap super + default superadmin role
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    # Open the small-file gate after just two accumulated files.
-    dw._table_config_cache[simple] = {"max_overlapping_files": 2}
 
     # Write #1 — one small file; gate closed (1 < 2), no compaction.
     dw.write(
         role_name=ROLE, simple_name=simple,
         data=_arrow({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
         overwrite_columns=[],
+    )
+    # Persist the threshold through the production configuration path.  The
+    # process-local cache is observational and writes intentionally refresh
+    # from Redis so another process's acknowledged changes cannot be missed.
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=2,
     )
 
     # Write #2 — second small file; gate opens (2 >= 2) → Phase B merges inline.
@@ -89,7 +95,6 @@ def test_normal_write_without_compaction_is_quiet(caplog):
     simple = f"quiet_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {"max_overlapping_files": 100}
 
     with caplog.at_level(logging.INFO, logger=LOGGER):
         dw.write(
@@ -107,11 +112,15 @@ def test_logged_compaction_preserves_all_rows(caplog):
     simple = f"compact_safe_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {"max_overlapping_files": 2}
 
     dw.write(role_name=ROLE, simple_name=simple,
              data=_arrow({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
              overwrite_columns=[])
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=2,
+    )
     with caplog.at_level(logging.INFO, logger=LOGGER):
         dw.write(role_name=ROLE, simple_name=simple,
                  data=_arrow({"id": [4, 5, 6], "v": ["d", "e", "f"]}),
@@ -138,13 +147,17 @@ def test_inline_compaction_keeps_latest_upload_schema_authoritative():
     simple = f"compact_schema_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {"max_overlapping_files": 2}
 
     dw.write(
         role_name=ROLE,
         simple_name=simple,
         data=_arrow({"id": [1], "legacy_only": ["old"]}),
         overwrite_columns=[],
+    )
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=2,
     )
     dw.write(
         role_name=ROLE,
@@ -178,13 +191,17 @@ def test_explicit_compaction_preserves_latest_schema_byte_for_byte():
     simple = f"explicit_schema_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {"max_overlapping_files": 100}
 
     dw.write(
         role_name=ROLE,
         simple_name=simple,
         data=_arrow({"id": [1], "legacy_only": ["old"]}),
         overwrite_columns=[],
+    )
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=100,
     )
     dw.write(
         role_name=ROLE,
@@ -220,16 +237,18 @@ def test_live_vector_and_small_file_gate_use_one_fused_source_pass(caplog):
     simple = f"fused_write_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    dw._table_config_cache[simple] = {
-        "max_overlapping_files": 2,
-        "max_tombstone_rows": 100,
-    }
 
     dw.write(
         role_name=ROLE,
         simple_name=simple,
         data=_arrow({"id": [1, 2], "v": ["dead", "keep"]}),
         overwrite_columns=["id"],
+    )
+    dw.configure_table(
+        role_name=ROLE,
+        simple_name=simple,
+        max_overlapping_files=2,
+        max_tombstone_rows=100,
     )
     dw.write(
         role_name=ROLE,

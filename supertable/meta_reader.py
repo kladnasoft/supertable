@@ -1,5 +1,6 @@
 import os
 import copy
+import hashlib
 
 from supertable.config.settings import settings
 import logging
@@ -20,6 +21,7 @@ from supertable import redis_keys as RK
 
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
+from supertable.utils.snapshot import complete_snapshot_payload
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +65,84 @@ def _visible_schema(schema_obj: Any, entry: dict) -> Dict[str, Any]:
     return {name: schema[name] for name in schema if name in visible}
 
 
+def _has_row_filter(entry: dict) -> bool:
+    """Whether metadata aggregates cannot be represented without a data scan.
+
+    Snapshot/resource counters describe the complete physical table.  Returning
+    them for a row-filtered role leaks facts about rows outside that role's
+    predicate.  Metadata APIs therefore omit such tables rather than presenting
+    the unfiltered counters as though they were policy-scoped.
+    """
+    return entry.get("filters", ["*"]) != ["*"]
+
+
+def _document_has_share_row_filter(document: object) -> bool:
+    """Conservatively recognize an effective linked-share row predicate.
+
+    ``_row_filter`` is trusted authorization metadata, not response data.  A
+    malformed non-null value therefore fails closed just like a valid
+    predicate; only an absent, null, or blank-string marker is unrestricted.
+    """
+    if not isinstance(document, dict) or "_row_filter" not in document:
+        return False
+    raw_filter = document.get("_row_filter")
+    if raw_filter is None:
+        return False
+    if isinstance(raw_filter, str):
+        return bool(raw_filter.strip())
+    return True
+
+
+def _metadata_has_share_row_filter(document: object) -> bool:
+    """Inspect the supported leaf/snapshot wrappers without exposing a filter.
+
+    Linked-share overlays have appeared both beside ``payload`` and inside its
+    nested ``snapshot``.  Restrict traversal to those metadata wrappers so a
+    user schema containing a column literally named ``_row_filter`` does not
+    become a false policy marker.
+    """
+    if not isinstance(document, dict):
+        return False
+    candidates = [document]
+    for wrapper_name in ("payload", "data", "snapshot"):
+        wrapped = document.get(wrapper_name)
+        if isinstance(wrapped, dict):
+            candidates.append(wrapped)
+            nested = wrapped.get("snapshot")
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    return any(_document_has_share_row_filter(item) for item in candidates)
+
+
+def _complete_leaf_snapshot(leaf: object) -> Optional[Dict[str, Any]]:
+    """Return the authoritative cached snapshot selected by a Redis leaf.
+
+    A merely snapshot-shaped payload is not enough: legacy/partial caches can
+    omit deletion state and linked-share authorization metadata.  Callers must
+    resolve the immutable document whenever this validator returns ``None``.
+    """
+    if not isinstance(leaf, dict):
+        return None
+    return complete_snapshot_payload(
+        leaf.get("payload"),
+        expected_version=leaf.get("version"),
+        require_policy_marker=True,
+    )
+
+
+def _leaf_has_complete_policy_context(leaf: object) -> bool:
+    """Whether Redis alone proves the selected snapshot's policy metadata."""
+    return _complete_leaf_snapshot(leaf) is not None
+
+
 def _sanitize_snapshot_stats(snapshot: Dict[str, Any], entry: dict) -> Dict[str, Any]:
     """Remove column-policy leaks while retaining useful table/file metrics."""
     result = _prune_dict(
         snapshot,
-        {"previous_snapshot", "schema", "schemaString", "location"},
+        {
+            "previous_snapshot", "schema", "schemaString", "location",
+            "_row_filter",
+        },
     )
     schema = _schema_to_dict(snapshot.get("schema", {}))
     visible_schema = _visible_schema(schema, entry)
@@ -148,71 +223,48 @@ def _get_redis_items(pattern) -> List[str]:
     Get all tables for this super table by scanning Redis keys.
     """
     catalog = RedisCatalog()
-    try:
-        items = []
-        cursor = 0
-        while True:
-            cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
-            for key in keys:
-                # Handle both bytes and string keys
-                if isinstance(key, bytes):
-                    key_str = key.decode('utf-8')
-                else:
-                    key_str = str(key)
+    items = []
+    cursor = 0
+    while True:
+        cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
+        for key in keys:
+            # Decode the catalog key strictly. A malformed key is corrupt
+            # metadata, not an empty namespace.
+            if isinstance(key, bytes):
+                key_str = key.decode("utf-8")
+            elif isinstance(key, str):
+                key_str = key
+            else:
+                raise RuntimeError("Redis SCAN returned an invalid key type")
 
-                items.append(key_str)
-            if cursor == 0:
-                break
-        return items
-    except Exception as e:
-        logger.error(f"Error getting tables from Redis: {e}")
-        return []
+            items.append(key_str)
+        if cursor == 0:
+            break
+    return items
 
 
 
 
 def _try_parse_leaf_meta(raw: Any) -> Optional[Dict[str, Any]]:
-    """Best-effort JSON decode for Redis leaf values (bytes/str)."""
+    """Strictly decode one Redis leaf, returning ``None`` only if absent."""
     if raw is None:
         return None
+    if isinstance(raw, (bytes, bytearray)):
+        raw_s = bytes(raw).decode("utf-8")
+    elif isinstance(raw, str):
+        raw_s = raw
+    else:
+        raise RuntimeError("Redis leaf value has an invalid type")
+    raw_s = raw_s.strip()
+    if not raw_s:
+        raise RuntimeError("Redis leaf value is empty")
     try:
-        if isinstance(raw, (bytes, bytearray)):
-            raw_s = raw.decode("utf-8")
-        else:
-            raw_s = str(raw)
-        raw_s = raw_s.strip()
-        if not raw_s:
-            return None
-        # Most leaf values are JSON payloads.
-        return json.loads(raw_s)
-    except Exception:
-        return None
-
-
-def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Return a dict that looks like SimpleTable snapshot data if the Redis leaf already stores it.
-    This is an optimization to avoid hitting object storage for reflection endpoints.
-    """
-    if not isinstance(meta, dict):
-        return None
-    if isinstance(meta.get("resources"), list):
-        return meta
-
-    payload = meta.get("payload")
-    if isinstance(payload, dict):
-        if isinstance(payload.get("resources"), list):
-            return payload
-        snapshot = payload.get("snapshot")
-        if isinstance(snapshot, dict) and isinstance(snapshot.get("resources"), list):
-            return snapshot
-    data = meta.get("data")
-    if isinstance(data, dict) and isinstance(data.get("resources"), list):
-        return data
-    snapshot = meta.get("snapshot")
-    if isinstance(snapshot, dict) and isinstance(snapshot.get("resources"), list):
-        return snapshot
-    return None
+        parsed = json.loads(raw_s)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Redis leaf value is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Redis leaf value is not a JSON object")
+    return parsed
 
 
 def _schema_to_dict(schema_obj: Any) -> Dict[str, Any]:
@@ -257,31 +309,44 @@ class MetaReader:
 
 
     def _get_all_tables(self) -> List[str]:
-        """Get all tables for this super table via catalog (replica-aware)."""
-        try:
-            tables = []
-            seen = set()
-            for key in self.catalog.scan_leaf_keys(
+        """Get one lifecycle-pinned, replica-aware set of valid leaf names."""
+        tables = []
+        seen = set()
+        for item in self.catalog.scan_leaf_items(
+            self.super_table.organization,
+            self.super_table.super_name,
+            count=1000,
+        ):
+            if not isinstance(item, dict):
+                raise RuntimeError("Catalog leaf scan returned an invalid item")
+            table_name = item.get("simple")
+            if not isinstance(table_name, str) or not table_name:
+                raise RuntimeError("Catalog leaf scan returned an invalid table name")
+            try:
+                RK.meta_leaf(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    table_name,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Catalog leaf scan returned an invalid table name"
+                ) from exc
+            self.catalog.check_deletion_intent_absent(
                 self.super_table.organization,
                 self.super_table.super_name,
-                count=1000,
+                simple=table_name,
+            )
+            if (
+                not (
+                    table_name.startswith("__")
+                    and table_name.endswith("__")
+                )
+                and table_name not in seen
             ):
-                key_str = key if isinstance(key, str) else key.decode('utf-8')
-                table_name = key_str.rsplit("meta:leaf:doc:", 1)[-1]
-                if (
-                    table_name
-                    and not (
-                        table_name.startswith("__")
-                        and table_name.endswith("__")
-                    )
-                    and table_name not in seen
-                ):
-                    seen.add(table_name)
-                    tables.append(table_name)
-            return tables
-        except Exception as e:
-            logger.error(f"Error getting tables from Redis: {e}")
-            return []
+                seen.add(table_name)
+                tables.append(table_name)
+        return tables
 
     def _authorized_meta_targets(
         self, table_name: str, role_name: str,
@@ -338,7 +403,7 @@ class MetaReader:
                 check_meta_access(super_name=self.super_table.super_name, organization=self.super_table.organization,
                               role_name=role_name, table_name=table)
                 result.append(table)
-            except Exception as e:
+            except PermissionError:
                 logger.warning(f"No permission for the user: {role_name} to table: {table}")
 
         return result
@@ -357,43 +422,41 @@ class MetaReader:
         schema_items: Set[Tuple[str, Any]] = set()
         targets = [target for target, _entry in authorized]
         table_policies = dict(authorized)
-        try:
-            if len(targets) == 1 and table_name != self.super_table.super_name:
-                raws = [self.catalog.r.get(RK.meta_leaf(
+        if len(targets) == 1 and table_name != self.super_table.super_name:
+            raws = [self.catalog.r.get(RK.meta_leaf(
+                self.super_table.organization,
+                self.super_table.super_name,
+                targets[0],
+            ))]
+        else:
+            leaf_keys = [
+                RK.meta_leaf(
                     self.super_table.organization,
                     self.super_table.super_name,
-                    targets[0],
-                ))]
-            else:
-                leaf_keys = [
-                    RK.meta_leaf(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        target,
-                    )
-                    for target in targets
-                ]
-                raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
-        except Exception:
-            raws = [None] * len(targets)
+                    target,
+                )
+                for target in targets
+            ]
+            raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
+        if len(raws) != len(targets):
+            raise RuntimeError("Redis MGET returned an incomplete leaf response")
 
         for index, target in enumerate(targets):
             entry = table_policies[target]
             try:
                 raw = raws[index] if index < len(raws) else None
                 leaf_meta = _try_parse_leaf_meta(raw)
-                st_data = (
-                    _leaf_to_snapshot_like(leaf_meta or {})
-                    if isinstance(leaf_meta, dict) else None
-                )
+                st_data = _complete_leaf_snapshot(leaf_meta)
                 if st_data is None:
                     simple_table = SimpleTable(
                         self.super_table, target, create_if_missing=False,
                     )
                     st_data, _ = simple_table.get_simple_table_snapshot()
+                if not isinstance(st_data, dict):
+                    raise RuntimeError("Simple table snapshot is invalid")
                 schema = _visible_schema((st_data or {}).get("schema", {}), entry)
                 schema_items.update(schema.items())
-            except (FileNotFoundError, KeyError, TableNotFoundError) as e:
+            except (FileNotFoundError, TableNotFoundError) as e:
                 logger.debug("Failed to read schema for table %s: %s", target, e)
                 continue
 
@@ -440,13 +503,37 @@ class MetaReader:
 
         stats: List[Dict[str, Any]] = []
         for table, entry in authorized:
+            if _has_row_filter(entry):
+                logger.info(
+                    "[get_table_stats] omitting unscoped counters for "
+                    "row-filtered table %s",
+                    table,
+                )
+                continue
             try:
                 st = SimpleTable(
                     self.super_table, table, create_if_missing=False,
                 )
                 st_data, _ = st.get_simple_table_snapshot()
+                # ``get_simple_table_snapshot`` can return the nested cached
+                # snapshot and thereby omit an outer linked-share overlay.
+                # Inspect both the exact leaf pinned by that read and the
+                # resolved snapshot before returning any full-table metric or
+                # physical resource path.
+                if (
+                    _metadata_has_share_row_filter(
+                        getattr(st, "_last_snapshot_leaf", None),
+                    )
+                    or _metadata_has_share_row_filter(st_data)
+                ):
+                    logger.info(
+                        "[get_table_stats] omitting unscoped counters for "
+                        "linked-share-filtered table %s",
+                        table,
+                    )
+                    continue
                 stats.append(_sanitize_snapshot_stats(st_data, entry))
-            except (FileNotFoundError, KeyError, TableNotFoundError):
+            except (FileNotFoundError, TableNotFoundError):
                 logger.debug("Simple table snapshot missing for %s", table)
                 continue
 
@@ -481,14 +568,108 @@ class MetaReader:
         root = self.catalog.get_root(org=self.super_table.organization, sup=self.super_table.super_name)
         t_root = time.perf_counter()
 
+        # Physical snapshot metrics cannot be reduced by an RBAC row predicate
+        # without executing the predicate against the table.  Treat those
+        # tables like other non-visible metadata targets for this aggregate API;
+        # schema/list APIs remain available through their dedicated methods.
+        metric_authorized = [
+            (table, entry) for table, entry in authorized
+            if not _has_row_filter(entry)
+        ]
+        if authorized and not metric_authorized:
+            logger.info(
+                "[get_super_meta] no unfiltered metadata targets for role '%s'",
+                role_name,
+            )
+            return None
+
+        candidate_tables = [table for table, _entry in metric_authorized]
+        candidate_policies: Dict[str, dict] = dict(metric_authorized)
+        t_scan = time.perf_counter()
+
+        # Resolve linked-share policy state before consulting the burst cache.
+        # Root versions do not necessarily advance when a consumer leaf overlay
+        # changes, so a cache keyed only by root+RBAC can otherwise replay raw
+        # counters after a share predicate is attached.
+        leaf_payloads: List[Optional[Dict[str, Any]]] = []
+        leaf_keys: List[str] = [
+            RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
+            for t in candidate_tables
+        ]
+        t_mget0 = time.perf_counter()
+        raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
+        if len(raws) != len(candidate_tables):
+            raise RuntimeError("Redis MGET returned an incomplete leaf response")
+        leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
+        t_mget1 = time.perf_counter()
+
+        cache_safe = len(raws) == len(candidate_tables)
+        leaf_identity = hashlib.sha256()
+        tables: List[str] = []
+        table_policies: Dict[str, dict] = {}
+        complete_leaf_snapshots: Dict[str, Dict[str, Any]] = {}
+        linked_filter_omitted = False
+        for index, table in enumerate(candidate_tables):
+            raw = raws[index] if index < len(raws) else None
+            leaf_identity.update(table.casefold().encode("utf-8"))
+            leaf_identity.update(b"\0")
+            if isinstance(raw, (bytes, bytearray)):
+                leaf_identity.update(bytes(raw))
+            elif raw is not None:
+                leaf_identity.update(str(raw).encode("utf-8"))
+            else:
+                leaf_identity.update(b"<missing>")
+                cache_safe = False
+            leaf_identity.update(b"\0")
+
+            leaf_meta = (
+                leaf_payloads[index] if index < len(leaf_payloads) else None
+            )
+            if not isinstance(leaf_meta, dict):
+                # A per-table SimpleTable fallback below can still recover the
+                # snapshot, but the linked-share state is not yet proven and no
+                # cached aggregate may be served or stored for this request.
+                cache_safe = False
+            elif _metadata_has_share_row_filter(leaf_meta):
+                linked_filter_omitted = True
+                logger.info(
+                    "[get_super_meta] omitting linked-share-filtered table %s",
+                    table,
+                )
+                continue
+            elif (
+                (complete_snapshot := _complete_leaf_snapshot(leaf_meta))
+                is None
+            ):
+                # The immutable storage document must be inspected before its
+                # policy state is known, so this request bypasses the cache.
+                cache_safe = False
+            else:
+                complete_leaf_snapshots[table] = complete_snapshot
+
+            tables.append(table)
+            table_policies[table] = candidate_policies[table]
+
+        if candidate_tables and not tables:
+            logger.info(
+                "[get_super_meta] no unfiltered metadata targets for role '%s'",
+                role_name,
+            )
+            return None
+
+        leaf_by_table = {
+            table: leaf_payloads[index] if index < len(leaf_payloads) else None
+            for index, table in enumerate(candidate_tables)
+        }
+
         ttl_s = _super_meta_cache_ttl_s()
         root_version = (root or {}).get("version", 0) if isinstance(root, dict) else 0
         role_id = str(context.role_info.get("role_id", role_name)).casefold()
         cache_key = (
             f"{self.super_table.organization}:{self.super_table.super_name}:"
-            f"{role_id}:{context.fingerprint}"
+            f"{role_id}:{context.fingerprint}:{leaf_identity.hexdigest()}"
         )
-        if ttl_s > 0:
+        if ttl_s > 0 and cache_safe:
             now = time.monotonic()
             with _SUPER_META_CACHE_LOCK:
                 cached = _SUPER_META_CACHE.get(cache_key)
@@ -502,9 +683,9 @@ class MetaReader:
                             (t_end - t0) * 1000.0,
                             (t_access - t0) * 1000.0,
                             (t_root - t_access) * 1000.0,
-                            0.0,
-                            0.0,
-                            0,
+                            (t_scan - t_root) * 1000.0,
+                            (t_mget1 - t_mget0) * 1000.0,
+                            len(tables),
                             0,
                             0.0,
                             0.0,
@@ -514,30 +695,6 @@ class MetaReader:
                             role_name[:12],
                         )
                     return copy.deepcopy(cached_result)
-
-        # Get all tables from Redis
-        all_tables = [table for table, _entry in authorized]
-        tables = list(all_tables)
-        table_policies: Dict[str, dict] = dict(authorized)
-        t_scan = time.perf_counter()
-
-        # Best-effort bulk fetch leaf metadata in one Redis roundtrip.
-        leaf_payloads: List[Optional[Dict[str, Any]]] = []
-        leaf_keys: List[str] = [
-            RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
-            for t in all_tables
-        ]
-        t_mget0 = time.perf_counter()
-        try:
-            raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
-            leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
-        except Exception:
-            leaf_payloads = [None for _ in all_tables]
-        t_mget1 = time.perf_counter()
-        leaf_by_table = {
-            table: leaf_payloads[index] if index < len(leaf_payloads) else None
-            for index, table in enumerate(all_tables)
-        }
 
         simple_table_info = []
         total_files = 0
@@ -553,7 +710,12 @@ class MetaReader:
             try:
                 entry = table_policies[table]
                 leaf_meta = leaf_by_table.get(table)
-                st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
+                # Never use a partial Redis payload for either the linked-share
+                # policy decision or its physical metrics.  A partial cache can
+                # legitimately omit fields; only the immutable snapshot selected
+                # by the exact leaf is authoritative in that case.
+                st_data = complete_leaf_snapshots.get(table)
+                pinned_leaf: object = leaf_meta
 
                 if st_data is None:
                     # Fallback: read the current snapshot from storage via SimpleTable.
@@ -562,6 +724,7 @@ class MetaReader:
                         self.super_table, table, create_if_missing=False,
                     )
                     st_data, _ = st.get_simple_table_snapshot()
+                    pinned_leaf = getattr(st, "_last_snapshot_leaf", None)
                     t_st1 = time.perf_counter()
 
                     snapshot_calls += 1
@@ -570,6 +733,20 @@ class MetaReader:
                     if dt_ms > max_snapshot_ms:
                         max_snapshot_ms = dt_ms
                         max_snapshot_table = table
+
+                if not isinstance(st_data, dict):
+                    raise RuntimeError("Simple table snapshot is invalid")
+
+                if (
+                    _metadata_has_share_row_filter(pinned_leaf)
+                    or _metadata_has_share_row_filter(st_data)
+                ):
+                    linked_filter_omitted = True
+                    logger.info(
+                        "[get_super_meta] omitting linked-share-filtered table %s",
+                        table,
+                    )
+                    continue
 
                 # Calculate table stats
                 resources = st_data.get("resources", []) if isinstance(st_data, dict) else []
@@ -605,9 +782,12 @@ class MetaReader:
                 total_rows += table_rows
                 total_size += table_size
 
-            except (FileNotFoundError, KeyError, TableNotFoundError) as e:
+            except (FileNotFoundError, TableNotFoundError) as e:
                 logger.debug("Failed to get stats for table %s: %s", table, e)
                 continue
+
+        if candidate_tables and not simple_table_info and linked_filter_omitted:
+            return None
 
         result = {
             "super": {
@@ -623,7 +803,7 @@ class MetaReader:
         }
 
         # Store in burst cache keyed by root version.
-        if ttl_s > 0:
+        if ttl_s > 0 and cache_safe:
             expires_at = time.monotonic() + ttl_s
             with _SUPER_META_CACHE_LOCK:
                 now = time.monotonic()
@@ -671,23 +851,40 @@ def list_supers(organization: str, role_name: str) -> List[str]:
 
     Filters results to only include supers where *role_name* has META access.
     """
-    result = []
+    result = set()
     pattern = RK.meta_root_pattern_for_org(organization)
+    catalog = RedisCatalog()
 
     items = _get_redis_items(pattern)
     for item in items:
         parsed = RK.parse_lake_key(item)
-        if parsed is None:
-            continue
+        if parsed is None or parsed[0] != organization:
+            raise RuntimeError("Redis root scan returned an invalid catalog key")
         _, super_name = parsed
+        if item != RK.meta_root(organization, super_name):
+            raise RuntimeError("Redis root scan returned an invalid catalog key")
+        if catalog.get_root(organization, super_name) is None:
+            raise RuntimeError(
+                f"Catalog root disappeared during discovery: "
+                f"{organization}/{super_name}"
+            )
         # A supertable name is a synthetic aggregate relation, not a physical
         # table policy target. Inclusion-only roles therefore discover it via
         # at least one authorized child rather than a nonexistent parent entry.
-        for leaf_item in _get_redis_items(
-            RK.meta_leaf_pattern(organization, super_name)
+        for leaf_item in catalog.scan_leaf_items(
+            organization, super_name, count=1000,
         ):
-            table_name = leaf_item.rsplit("meta:leaf:doc:", 1)[-1]
-            if not table_name or (
+            if not isinstance(leaf_item, dict):
+                raise RuntimeError("Catalog leaf scan returned an invalid item")
+            table_name = leaf_item.get("simple")
+            if not isinstance(table_name, str) or not table_name:
+                raise RuntimeError(
+                    "Catalog leaf scan returned an invalid table name"
+                )
+            catalog.check_deletion_intent_absent(
+                organization, super_name, simple=table_name,
+            )
+            if (
                 table_name.startswith("__") and table_name.endswith("__")
             ):
                 continue
@@ -698,7 +895,7 @@ def list_supers(organization: str, role_name: str) -> List[str]:
                     role_name=role_name,
                     table_name=table_name,
                 )
-                result.append(super_name)
+                result.add(super_name)
                 break
             except PermissionError:
                 continue
@@ -714,12 +911,19 @@ def list_tables(organization: str, super_name: str, role_name: str) -> List[str]
 
     Filters results to only include tables where *role_name* has META access.
     """
-    result = []
-    pattern = RK.meta_leaf_pattern(organization, super_name)
-
-    items = _get_redis_items(pattern)
-    for item in items:
-        table_name = item.split(':')[-1]
+    result = set()
+    catalog = RedisCatalog()
+    for item in catalog.scan_leaf_items(
+        organization, super_name, count=1000,
+    ):
+        if not isinstance(item, dict):
+            raise RuntimeError("Catalog leaf scan returned an invalid item")
+        table_name = item.get("simple")
+        if not isinstance(table_name, str) or not table_name:
+            raise RuntimeError("Catalog leaf scan returned an invalid table name")
+        catalog.check_deletion_intent_absent(
+            organization, super_name, simple=table_name,
+        )
         if table_name.startswith("__") and table_name.endswith("__"):
             continue
         try:
@@ -729,7 +933,7 @@ def list_tables(organization: str, super_name: str, role_name: str) -> List[str]
                 role_name=role_name,
                 table_name=table_name,
             )
-            result.append(table_name)
+            result.add(table_name)
         except PermissionError:
             continue
 

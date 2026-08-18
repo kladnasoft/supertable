@@ -183,7 +183,13 @@ def test_super_table_data_cleanup_cannot_bypass_the_rbac_ledger(
         _role("retained-role"),
         action_context=context,
     )
-    catalog.r.set(RK.meta_root(ORG, SUP), "snapshot-root")
+    # Namespace deletion requires the same structurally valid root document as
+    # every production catalog mutation.  A bare sentinel string would model
+    # catalog corruption, which must fail closed before deletion begins.
+    catalog.r.set(
+        RK.meta_root(ORG, SUP),
+        json.dumps({"version": 0, "ts": 1}),
+    )
     sequence_before = catalog.r.hget(
         RK.audit_privileged_meta(ORG), "sequence"
     )

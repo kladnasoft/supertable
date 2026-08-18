@@ -110,6 +110,7 @@ def _snapshot(*, commit_id: str = "commit-41"):
         "tombstone": None,
         "tombstone_rows": 0,
         "tombstone_digest": None,
+        "_row_filter": None,
         "_mirror_commit_id": commit_id,
         "_mirror_snapshot_path": "acme/lake/simple/events/snapshots/41.json",
     }
@@ -499,6 +500,7 @@ def _staging_dependencies():
     catalog.begin_stage_deletion.return_value = {
         "intent_id": "stage-delete-intent",
     }
+    catalog.get_staging_meta.return_value = None
     return storage, catalog
 
 
@@ -509,6 +511,8 @@ def test_staging_rejects_path_components_and_generates_upload_key():
     with (
         patch("supertable.staging_area.get_storage", return_value=storage),
         patch("supertable.staging_area.RedisCatalog", return_value=catalog),
+        patch("supertable.staging_area.check_create_access"),
+        patch("supertable.staging_area.check_meta_access"),
         patch("supertable.staging_area.check_write_access"),
     ):
         with pytest.raises(ValueError, match="Invalid staging_name"):
@@ -524,14 +528,20 @@ def test_staging_rejects_path_components_and_generates_upload_key():
             arrow_table=pa.table({"id": [1]}),
             base_file_name="../../outside.parquet",
         )
+        published = catalog.upsert_staging_meta.call_args.kwargs["meta"]
+        file_meta = published["files"][generated]
+        catalog.get_staging_meta.return_value = {
+            "files": {generated: file_meta},
+        }
+        listed = stage.list_files("reader")
 
     assert os.path.dirname(storage.write_parquet.call_args.args[1]) == (
         "acme/lake/staging/uploads"
     )
     assert generated.startswith("stage_") and generated.endswith(".parquet")
     assert "/" not in generated and "\\" not in generated
-    final_index = storage.write_json.call_args_list[-1].args[1]
-    assert final_index[0]["original_name"] == "outside.parquet"
+    assert file_meta["original_name"] == "outside.parquet"
+    assert listed == [generated]
 
 
 def test_staging_deletion_is_resumable_and_metadata_is_removed_last():
@@ -550,7 +560,7 @@ def test_staging_deletion_is_resumable_and_metadata_is_removed_last():
     with (
         patch("supertable.staging_area.get_storage", return_value=storage),
         patch("supertable.staging_area.RedisCatalog", return_value=catalog),
-        patch("supertable.staging_area.check_write_access"),
+        patch("supertable.staging_area.check_control_access"),
     ):
         stage = Staging(
             organization="acme", super_name="lake", staging_name="uploads",
@@ -565,7 +575,7 @@ def test_staging_deletion_is_resumable_and_metadata_is_removed_last():
     storage.reset_mock()
     catalog.delete_staging_meta.reset_mock()
     storage.delete_prefix.side_effect = OSError("cloud delete failed")
-    with patch("supertable.staging_area.check_write_access"):
+    with patch("supertable.staging_area.check_control_access"):
         with pytest.raises(OSError, match="cloud delete failed"):
             stage.delete("writer")
     catalog.delete_staging_meta.assert_not_called()
@@ -578,7 +588,7 @@ def test_staging_deletion_fails_when_catalog_cleanup_is_incomplete():
     with (
         patch("supertable.staging_area.get_storage", return_value=storage),
         patch("supertable.staging_area.RedisCatalog", return_value=catalog),
-        patch("supertable.staging_area.check_write_access"),
+        patch("supertable.staging_area.check_control_access"),
     ):
         stage = Staging(
             organization="acme", super_name="lake", staging_name="uploads",
@@ -899,8 +909,14 @@ def test_super_table_delete_fences_new_child_before_any_storage_write():
             self.namespace.release()
             return True
 
-        def scan_leaf_keys(self, *_args):
+        def scan_leaf_keys(self, *_args, **_kwargs):
             return iter(())
+
+        def scan_leaf_lock_names(self, *_args):
+            return []
+
+        def scan_stage_lock_names(self, *_args):
+            return []
 
         def begin_namespace_deletion(self, *_args, **_kwargs):
             return {"intent_id": "namespace-delete-intent"}

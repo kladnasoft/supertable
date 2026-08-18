@@ -1,5 +1,5 @@
 {
   "category": "RuntimeError",
-  "message_substring": "No files found",
+  "message_substring": "DuckDB managed query setup failed",
   "phase": "execution"
 }

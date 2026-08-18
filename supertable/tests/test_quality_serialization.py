@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from supertable import redis_keys as RK
 from supertable.quality import scheduler
 from supertable.quality.config import DQConfig
 from supertable.quality.history import build_history_row
@@ -24,6 +25,21 @@ from supertable.quality.serialization import (
 ORG = "dq-json-org"
 SUPER = "dq-json-lake"
 TABLE = "events"
+
+
+def _seed_live_catalog(redis_client):
+    redis_client.set(
+        RK.meta_root(ORG, SUPER),
+        json.dumps({"version": 0, "ts": 1}),
+    )
+    redis_client.set(
+        RK.meta_leaf(ORG, SUPER, TABLE),
+        json.dumps({
+            "version": 0,
+            "ts": 1,
+            "path": f"{ORG}/{SUPER}/{TABLE}/snapshot.json",
+        }),
+    )
 
 
 @dataclass
@@ -156,6 +172,7 @@ def test_json_normalizer_rejects_binary_values_without_stringifying_them():
 
 def test_redis_and_history_reject_oversized_scalars_before_publication():
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    _seed_live_catalog(fake)
     dqc = DQConfig(fake, ORG, SUPER)
     oversized = "x" * (DEFAULT_MAX_SCALAR_BYTES + 1)
 
@@ -256,6 +273,7 @@ def test_deep_d3_d4_structures_survive_redis_roundtrip(
     expected_buckets,
 ):
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    _seed_live_catalog(fake)
     dqc = DQConfig(fake, ORG, SUPER)
     assert dqc.set_global_config({
         "checks": {

@@ -24,7 +24,16 @@ from pathlib import PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from supertable import redis_keys as RK
-from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.redis_catalog import (
+    _REDIS_LUA_MAX_SAFE_INTEGER,
+    _canonicalize_role_document,
+    _validate_root_document,
+    validate_username,
+)
+from supertable.utils.snapshot import (
+    complete_snapshot_payload,
+    snapshot_cache_payload,
+)
 
 
 _CHECKPOINT_VERSION = 2
@@ -479,6 +488,7 @@ def _validate_snapshot(
     super_name: str,
     simple_name: str,
     leaf_raw: str,
+    schema_item: Optional[Mapping[str, Any]],
 ) -> dict[str, Any]:
     try:
         leaf = json.loads(leaf_raw)
@@ -501,11 +511,63 @@ def _validate_snapshot(
         )
     if complete.get("simple_name") != simple_name:
         raise RecoveryError(f"snapshot {path!r} has the wrong table identity")
+
+    # Snapshot commit writes this compatibility schema document atomically
+    # beside the leaf.  Restoring a divergent Redis schema makes metadata and
+    # writes disagree with the immutable snapshot selected by the leaf.
+    if schema_item is None:
+        raise RecoveryError(f"catalog schema is missing for {super_name}/{simple_name}")
+    if (
+        schema_item.get("type") != "string"
+        or not isinstance(schema_item.get("value"), str)
+    ):
+        raise RecoveryError(
+            f"catalog schema for {super_name}/{simple_name} is not a Redis string"
+        )
     try:
-        leaf_version = int(leaf["version"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RecoveryError(f"leaf {super_name}/{simple_name} has no valid version") from exc
-    if leaf_version != int(complete["snapshot_version"]):
+        redis_schema = json.loads(str(schema_item["value"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RecoveryError(
+            f"catalog schema for {super_name}/{simple_name} is invalid JSON"
+        ) from exc
+    if not isinstance(redis_schema, dict):
+        raise RecoveryError(
+            f"catalog schema for {super_name}/{simple_name} is not an object"
+        )
+    snapshot_schema = complete.get("schema", {})
+    expected_schema: dict[str, Any]
+    if isinstance(snapshot_schema, dict):
+        expected_schema = dict(snapshot_schema)
+    elif isinstance(snapshot_schema, list):
+        expected_schema = {}
+        for entry in snapshot_schema:
+            if isinstance(entry, dict):
+                expected_schema.update(entry)
+    else:
+        expected_schema = {}
+    if redis_schema != expected_schema:
+        raise RecoveryError(
+            f"catalog schema differs from snapshot for {super_name}/{simple_name}"
+        )
+    leaf_version = leaf.get("version")
+    leaf_ts = leaf.get("ts")
+    if (
+        type(leaf_version) is not int
+        or leaf_version < 0
+        or leaf_version > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise RecoveryError(
+            f"leaf {super_name}/{simple_name} has no valid version"
+        )
+    if (
+        type(leaf_ts) is not int
+        or leaf_ts < 0
+        or leaf_ts > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise RecoveryError(
+            f"leaf {super_name}/{simple_name} has no valid timestamp"
+        )
+    if leaf_version != complete["snapshot_version"]:
         raise RecoveryError(f"leaf {super_name}/{simple_name} version differs from snapshot")
     table_prefix = f"{organization}/{super_name}/tables/{simple_name}/"
     artifact_seals: dict[str, dict[str, Any]] = {}
@@ -527,6 +589,34 @@ def _validate_snapshot(
             raise RecoveryError(
                 f"snapshot artifact {artifact!r} has conflicting declarations"
             )
+    # The embedded leaf payload is a cache, but readers deliberately trust it
+    # whenever ``complete_snapshot_payload`` accepts it.  Recovery must apply
+    # that exact same acceptance rule and prove that an accepted cache is the
+    # immutable snapshot selected by ``path``.  Merely sealing the storage JSON
+    # while restoring a divergent cache would make post-DR readers observe data
+    # that was never validated (for example an empty resources list).
+    raw_cached = leaf.get("payload")
+    cached = complete_snapshot_payload(
+        raw_cached,
+        expected_version=leaf_version,
+        require_policy_marker=True,
+    )
+    if raw_cached is not None and cached is None:
+        # A missing cache is a supported legacy/fallback state: normal readers
+        # load the immutable JSON selected by ``path``.  A *present* cache must
+        # never be restored unless it satisfies the same completeness contract
+        # as runtime readers.  Otherwise looser metadata fast paths can observe
+        # forged schema/resources even though data readers fall back to storage.
+        raise RecoveryError(
+            f"leaf {super_name}/{simple_name} cached payload is incomplete"
+        )
+    if (
+        cached is not None
+        and snapshot_cache_payload(cached) != snapshot_cache_payload(complete)
+    ):
+        raise RecoveryError(
+            f"leaf {super_name}/{simple_name} cached payload differs from snapshot"
+        )
     return {
         "organization": organization,
         "super_name": super_name,
@@ -538,23 +628,439 @@ def _validate_snapshot(
     }
 
 
+def _state_json_object(
+        item: Mapping[str, Any], *, label: str,
+) -> dict[str, Any]:
+    if item.get("type") != "string" or not isinstance(item.get("value"), str):
+        raise RecoveryError(f"{label} is not a Redis string")
+    try:
+        document = json.loads(str(item["value"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RecoveryError(f"{label} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise RecoveryError(f"{label} is not a JSON object")
+    return document
+
+
+def _validate_nonnegative_int(value: Any, *, field: str) -> int:
+    if (
+        type(value) is not int
+        or value < 0
+        or value > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
+        raise RecoveryError(f"{field} is not a Redis-Lua-safe integer")
+    return value
+
+
+def _validate_deletion_intent_document(
+        document: Mapping[str, Any],
+        *,
+        organization: str,
+        super_name: str,
+        kind: str,
+        child_field: Optional[str] = None,
+        child_name: Optional[str] = None,
+) -> None:
+    if (
+        document.get("schema_version") != 1
+        or document.get("kind") != kind
+        or document.get("organization") != organization
+        or document.get("super_name") != super_name
+        or document.get("status") not in {"deleting", "deleted"}
+        or not isinstance(document.get("intent_id"), str)
+        or not document.get("intent_id")
+    ):
+        raise RecoveryError(
+            f"deletion intent for {super_name}/{child_name or ''} has invalid identity"
+        )
+    if child_field is not None and document.get(child_field) != child_name:
+        raise RecoveryError(
+            f"deletion intent for {super_name}/{child_name or ''} has invalid identity"
+        )
+    token_fields = (
+        ("namespace_lock_token", "leaf_lock_token")
+        if kind == "simple_table"
+        else (("lock_token",) if kind == "staging" else ("namespace_lock_token",))
+    )
+    if any(
+        not isinstance(document.get(field), str) or not document.get(field)
+        for field in token_fields
+    ):
+        raise RecoveryError(
+            f"deletion intent for {super_name}/{child_name or ''} has invalid ownership"
+        )
+    _validate_nonnegative_int(
+        document.get("created_at_ms"), field="deletion intent created_at_ms",
+    )
+    _validate_nonnegative_int(
+        document.get("recovery_count"), field="deletion intent recovery_count",
+    )
+    for field in ("recovered_at_ms", "deleted_at_ms"):
+        if field in document:
+            _validate_nonnegative_int(
+                document[field], field=f"deletion intent {field}",
+            )
+    if document.get("status") == "deleted" and "deleted_at_ms" not in document:
+        raise RecoveryError("terminal deletion intent has no deletion timestamp")
+
+
+def _child_prefix(builder: Callable[..., str], *parents: str) -> str:
+    probe = "__recovery_probe__"
+    return builder(*parents, probe)[:-len(probe)]
+
+
+def _rbac_decimal(
+    value: Any,
+    *,
+    field: str,
+    maximum: int = 9_223_372_036_854_775_807,
+) -> int:
+    """Validate the canonical decimal representation used by RBAC HASHes."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"0|[1-9][0-9]*", value) is None
+    ):
+        raise RecoveryError(f"{field} is not a canonical revision")
+    parsed = int(value)
+    if parsed > maximum:
+        raise RecoveryError(f"{field} exceeds the runtime revision range")
+    return parsed
+
+
+def _rbac_hash(
+    state: Mapping[str, Mapping[str, Any]], key: str, *, label: str,
+) -> dict[str, str]:
+    item = state.get(key)
+    if item is None:
+        return {}
+    value = item.get("value")
+    if item.get("type") != "hash" or not isinstance(value, dict):
+        raise RecoveryError(f"{label} is not a Redis HASH")
+    return dict(value)
+
+
+def _rbac_set(
+    state: Mapping[str, Mapping[str, Any]], key: str, *, label: str,
+) -> set[str]:
+    item = state.get(key)
+    if item is None:
+        return set()
+    value = item.get("value")
+    if item.get("type") != "set" or not isinstance(value, list):
+        raise RecoveryError(f"{label} is not a Redis SET")
+    return set(value)
+
+
+def _validate_rbac_meta(
+    state: Mapping[str, Mapping[str, Any]],
+    key: str,
+    *,
+    label: str,
+    has_state: bool,
+) -> None:
+    item = state.get(key)
+    if item is None:
+        if has_state:
+            raise RecoveryError(f"{label} revision head is missing")
+        return
+    meta = _rbac_hash(state, key, label=label)
+    if "version" not in meta:
+        raise RecoveryError(f"{label} revision head is missing")
+    version = _rbac_decimal(meta["version"], field=f"{label} version")
+    if has_state and version == 0:
+        raise RecoveryError(f"{label} has state at revision zero")
+    if "last_updated_ms" in meta:
+        updated = _rbac_decimal(
+            meta["last_updated_ms"],
+            field=f"{label} last_updated_ms",
+            maximum=_REDIS_LUA_MAX_SAFE_INTEGER,
+        )
+        if has_state and updated == 0:
+            raise RecoveryError(f"{label} has an invalid update timestamp")
+    if "initialized" in meta and meta["initialized"] != "true":
+        raise RecoveryError(f"{label} initialized marker is invalid")
+
+
+def _validate_rbac_catalog_state(
+    organization: str,
+    state: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Reject RBAC state that the runtime cannot safely enumerate or mutate.
+
+    Namespace deletion deliberately preserves RBAC, so this validation is
+    independent of catalog-root existence.  It is bounded by the already
+    bounded checkpoint key/value set and performs no Redis reads.
+    """
+    grouped: dict[str, dict[str, Mapping[str, Any]]] = {}
+    marker = ":rbac:"
+    for key, item in state.items():
+        if marker not in key:
+            continue
+        parsed = RK.parse_lake_key(key)
+        if parsed is None or parsed[0] != organization:
+            raise RecoveryError(f"catalog contains an unsafe RBAC key {key!r}")
+        _org, sup = parsed
+        try:
+            scope = RK.rbac_scope(organization, sup) + ":"
+        except (TypeError, ValueError) as exc:
+            raise RecoveryError(
+                f"catalog contains an unsafe RBAC key {key!r}"
+            ) from exc
+        if not key.startswith(scope):
+            raise RecoveryError(f"catalog contains an unsafe RBAC key {key!r}")
+        grouped.setdefault(sup, {})[key] = item
+
+    valid_role_types = {"superadmin", "admin", "writer", "reader", "meta"}
+    for sup, namespace in grouped.items():
+        role_meta_key = RK.rbac_role_meta(organization, sup)
+        role_index_key = RK.rbac_role_index(organization, sup)
+        role_name_key = RK.rbac_rolename_to_id(organization, sup)
+        role_doc_prefix = RK.rbac_role_doc_prefix(organization, sup)
+        role_type_prefix = _child_prefix(
+            RK.rbac_role_type_index, organization, sup,
+        )
+        user_meta_key = RK.rbac_user_meta(organization, sup)
+        user_index_key = RK.rbac_user_index(organization, sup)
+        user_name_key = RK.rbac_username_to_id(organization, sup)
+        user_doc_prefix = RK.rbac_user_doc_prefix(organization, sup)
+        fixed = {
+            role_meta_key,
+            role_index_key,
+            role_name_key,
+            user_meta_key,
+            user_index_key,
+            user_name_key,
+        }
+
+        roles: dict[str, dict[str, str]] = {}
+        users: dict[str, dict[str, str]] = {}
+        type_indexes: dict[str, set[str]] = {}
+        for key, item in namespace.items():
+            if key in fixed:
+                continue
+            if key.startswith(role_doc_prefix):
+                role_id = key[len(role_doc_prefix):]
+                try:
+                    canonical_key = RK.rbac_role_doc(
+                        organization, sup, role_id,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RecoveryError(
+                        f"catalog contains an unsafe RBAC role key {key!r}"
+                    ) from exc
+                if canonical_key != key or item.get("type") != "hash":
+                    raise RecoveryError(f"RBAC role document {key!r} is invalid")
+                roles[role_id] = dict(item.get("value", {}))
+                continue
+            if key.startswith(user_doc_prefix):
+                user_id = key[len(user_doc_prefix):]
+                try:
+                    canonical_key = RK.rbac_user_doc(
+                        organization, sup, user_id,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RecoveryError(
+                        f"catalog contains an unsafe RBAC user key {key!r}"
+                    ) from exc
+                if canonical_key != key or item.get("type") != "hash":
+                    raise RecoveryError(f"RBAC user document {key!r} is invalid")
+                users[user_id] = dict(item.get("value", {}))
+                continue
+            if key.startswith(role_type_prefix):
+                role_type = key[len(role_type_prefix):]
+                try:
+                    canonical_key = RK.rbac_role_type_index(
+                        organization, sup, role_type,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RecoveryError(
+                        f"catalog contains an unsafe role-type index {key!r}"
+                    ) from exc
+                if (
+                    canonical_key != key
+                    or role_type not in valid_role_types
+                    or item.get("type") != "set"
+                ):
+                    raise RecoveryError(f"RBAC role-type index {key!r} is invalid")
+                type_indexes[role_type] = set(item.get("value", ()))
+                continue
+            raise RecoveryError(f"catalog contains an unknown RBAC key {key!r}")
+
+        expected_role_names: dict[str, str] = {}
+        expected_role_types: dict[str, set[str]] = {
+            role_type: set() for role_type in valid_role_types
+        }
+        role_types: dict[str, str] = {}
+        for role_id, document in roles.items():
+            stored_id = document.get("role_id", "")
+            if stored_id and stored_id != role_id:
+                raise RecoveryError(
+                    f"RBAC role identity differs from its key for {sup}/{role_id}"
+                )
+            try:
+                canonical = _canonicalize_role_document(
+                    dict(document), default_if_empty=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RecoveryError(
+                    f"RBAC role document is invalid for {sup}/{role_id}"
+                ) from exc
+            stored_hash = document.get("content_hash", "")
+            if stored_hash and stored_hash != canonical["content_hash"]:
+                raise RecoveryError(
+                    f"RBAC role policy digest is invalid for {sup}/{role_id}"
+                )
+            if "doc_version" in document:
+                _rbac_decimal(
+                    document["doc_version"],
+                    field=f"RBAC role doc_version for {sup}/{role_id}",
+                    maximum=9_223_372_036_854_775_806,
+                )
+            role_type = str(canonical["role"])
+            role_types[role_id] = role_type
+            expected_role_types[role_type].add(role_id)
+            role_name = str(canonical.get("role_name", ""))
+            if role_name:
+                lowered = role_name.lower()
+                if lowered in expected_role_names:
+                    raise RecoveryError(
+                        f"RBAC role names are not unique for {sup!r}"
+                    )
+                expected_role_names[lowered] = role_id
+
+        role_index = _rbac_set(
+            namespace, role_index_key, label=f"RBAC role index for {sup}",
+        )
+        role_names = _rbac_hash(
+            namespace, role_name_key, label=f"RBAC role-name map for {sup}",
+        )
+        if role_index != set(roles):
+            raise RecoveryError(f"RBAC role index disagrees for {sup!r}")
+        if role_names != expected_role_names:
+            raise RecoveryError(f"RBAC role-name map disagrees for {sup!r}")
+        for role_type in valid_role_types:
+            actual = type_indexes.get(role_type, set())
+            if actual != expected_role_types[role_type]:
+                raise RecoveryError(
+                    f"RBAC {role_type!r} role index disagrees for {sup!r}"
+                )
+        _validate_rbac_meta(
+            namespace,
+            role_meta_key,
+            label=f"RBAC role namespace for {sup}",
+            has_state=bool(roles or role_index or role_names),
+        )
+
+        expected_user_names: dict[str, str] = {}
+        for user_id, document in users.items():
+            stored_id = document.get("user_id", "")
+            if stored_id and stored_id != user_id:
+                raise RecoveryError(
+                    f"RBAC user identity differs from its key for {sup}/{user_id}"
+                )
+            username = document.get("username")
+            if not isinstance(username, str):
+                raise RecoveryError(
+                    f"RBAC username is invalid for {sup}/{user_id}"
+                )
+            try:
+                validate_username(username)
+            except (TypeError, ValueError) as exc:
+                raise RecoveryError(
+                    f"RBAC username is invalid for {sup}/{user_id}"
+                ) from exc
+            raw_roles = document.get("roles")
+            try:
+                assigned = json.loads(raw_roles) if isinstance(raw_roles, str) else None
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RecoveryError(
+                    f"RBAC user roles are invalid for {sup}/{user_id}"
+                ) from exc
+            if not isinstance(assigned, list) or any(
+                not isinstance(role_id, str) or not role_id
+                for role_id in assigned
+            ):
+                raise RecoveryError(
+                    f"RBAC user roles are invalid for {sup}/{user_id}"
+                )
+            for role_id in assigned:
+                try:
+                    RK.rbac_role_doc(organization, sup, role_id)
+                except (TypeError, ValueError) as exc:
+                    raise RecoveryError(
+                        f"RBAC user role ID is unsafe for {sup}/{user_id}"
+                    ) from exc
+                if role_id not in role_types:
+                    raise RecoveryError(
+                        f"RBAC user references a missing role for {sup}/{user_id}"
+                    )
+            if (
+                str(username).casefold() == "superuser"
+                and not any(role_types[role_id] == "superadmin" for role_id in assigned)
+            ):
+                raise RecoveryError(
+                    f"RBAC default superuser lacks superadmin for {sup!r}"
+                )
+            if "doc_version" in document:
+                _rbac_decimal(
+                    document["doc_version"],
+                    field=f"RBAC user doc_version for {sup}/{user_id}",
+                    maximum=9_223_372_036_854_775_806,
+                )
+            lowered = str(username).lower()
+            if lowered in expected_user_names:
+                raise RecoveryError(f"RBAC usernames are not unique for {sup!r}")
+            expected_user_names[lowered] = user_id
+
+        user_index = _rbac_set(
+            namespace, user_index_key, label=f"RBAC user index for {sup}",
+        )
+        user_names = _rbac_hash(
+            namespace, user_name_key, label=f"RBAC username map for {sup}",
+        )
+        if user_index != set(users):
+            raise RecoveryError(f"RBAC user index disagrees for {sup!r}")
+        if user_names != expected_user_names:
+            raise RecoveryError(f"RBAC username map disagrees for {sup!r}")
+        _validate_rbac_meta(
+            namespace,
+            user_meta_key,
+            label=f"RBAC user namespace for {sup}",
+            has_state=bool(users or user_index or user_names),
+        )
+
+
 def _validate_catalog_state(
     storage: Any,
     organization: str,
     state: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], ...]:
     by_key = _validate_state_items(organization, state)
-    roots: set[str] = set()
+    roots: dict[str, dict[str, Any]] = {}
     for key, item in by_key.items():
         parsed = RK.parse_lake_key(key)
         if parsed is None or parsed[0] != organization:
             continue
         if key == RK.meta_root(*parsed):
-            roots.add(parsed[1])
-            if item.get("type") != "string":
-                raise RecoveryError(f"catalog root {parsed[1]!r} is not a string")
+            sup = parsed[1]
+            root = _state_json_object(item, label=f"catalog root {sup!r}")
+            try:
+                roots[sup] = _validate_root_document(
+                    root, org=organization, sup=sup,
+                )
+            except ValueError as exc:
+                detail = (
+                    "invalid identity fields"
+                    if str(exc) == "invalid root identity fields"
+                    else str(exc)
+                )
+                raise RecoveryError(
+                    f"catalog root {sup!r} violates the runtime contract: {detail}"
+                ) from exc
+
     snapshots: list[dict[str, Any]] = []
     names_by_super: dict[str, set[str]] = {sup: set() for sup in roots}
+    leaf_documents: dict[tuple[str, str], dict[str, Any]] = {}
     for key, item in by_key.items():
         parsed = RK.parse_lake_key(key)
         if parsed is None or parsed[0] != organization:
@@ -571,26 +1077,400 @@ def _validate_catalog_state(
             raise RecoveryError(f"catalog contains an unsafe leaf key {key!r}") from exc
         if sup not in roots:
             raise RecoveryError(f"leaf {sup}/{simple} has no catalog root")
-        if item.get("type") != "string" or not isinstance(item.get("value"), str):
-            raise RecoveryError(f"leaf {sup}/{simple} is not a Redis string")
+        leaf = _state_json_object(item, label=f"leaf {sup}/{simple}")
+        leaf_documents[(sup, simple)] = leaf
         snapshots.append(_validate_snapshot(
             storage,
             organization=org,
             super_name=sup,
             simple_name=simple,
             leaf_raw=str(item["value"]),
+            schema_item=by_key.get(RK.schema(org, sup, simple)),
         ))
         names_by_super[sup].add(simple)
+
     for sup, names in names_by_super.items():
         names_item = by_key.get(RK.meta_table_names(organization, sup))
         if names_item is None:
             if names:
                 raise RecoveryError(f"catalog table-name index is missing for {sup!r}")
-            continue
-        if names_item.get("type") != "set" or set(names_item.get("value", ())) != names:
+        elif (
+            names_item.get("type") != "set"
+            or set(names_item.get("value", ())) != names
+        ):
             raise RecoveryError(
                 f"catalog table-name index disagrees with leaves for {sup!r}"
             )
+
+        # Validate every table-scoped correctness key, including orphan keys
+        # that would otherwise be resurrected beside no live leaf.
+        family_builders = (
+            ("schema", RK.schema),
+            ("rowid sequence", RK.meta_rowid_seq),
+            ("table config", RK.meta_table_config),
+            ("mirror publication", RK.meta_mirror_publication),
+        )
+        for family, builder in family_builders:
+            prefix = _child_prefix(builder, organization, sup)
+            for key, item in by_key.items():
+                if not key.startswith(prefix):
+                    continue
+                simple = key[len(prefix):]
+                try:
+                    canonical = builder(organization, sup, simple)
+                except (TypeError, ValueError) as exc:
+                    raise RecoveryError(
+                        f"catalog contains an unsafe {family} key {key!r}"
+                    ) from exc
+                if key != canonical or simple not in names:
+                    raise RecoveryError(
+                        f"catalog contains an orphan/unsafe {family} key {key!r}"
+                    )
+
+                if family == "schema":
+                    # Exact semantic equality was already checked with the
+                    # corresponding sealed snapshot above.
+                    continue
+                if family == "rowid sequence":
+                    value = item.get("value")
+                    if (
+                        item.get("type") != "string"
+                        or not isinstance(value, str)
+                        or re.fullmatch(r"0|[1-9][0-9]*", value) is None
+                    ):
+                        raise RecoveryError(
+                            f"rowid sequence for {sup}/{simple} is not canonical"
+                        )
+                    try:
+                        parsed_rowid = int(value)
+                    except ValueError as exc:
+                        raise RecoveryError(
+                            f"rowid sequence for {sup}/{simple} is invalid"
+                        ) from exc
+                    if parsed_rowid > 9_223_372_036_854_775_807:
+                        raise RecoveryError(
+                            f"rowid sequence for {sup}/{simple} exceeds signed Int64"
+                        )
+                    continue
+
+                document = _state_json_object(
+                    item, label=f"{family} for {sup}/{simple}",
+                )
+                if family == "table config":
+                    # Preserve unknown legacy/user metadata, but every field
+                    # interpreted by the current writer must have the exact
+                    # runtime shape.  Otherwise a checkpoint can be sealed and
+                    # restored successfully only for the next write to fail (or
+                    # silently fall back) while resolving its limits.
+                    for field in (
+                        "max_memory_chunk_size",
+                        "max_decoded_compaction_bytes",
+                        "max_overlapping_files",
+                        "max_tombstone_rows",
+                    ):
+                        if field in document and (
+                            type(document[field]) is not int
+                            or document[field] <= 0
+                        ):
+                            raise RecoveryError(
+                                f"table config {field} for {sup}/{simple} "
+                                "must be a positive integer"
+                            )
+                    if "tombstone_compaction_workers" in document and (
+                        type(document["tombstone_compaction_workers"]) is not int
+                        or not 1 <= document["tombstone_compaction_workers"] <= 8
+                    ):
+                        raise RecoveryError(
+                            "table config tombstone_compaction_workers for "
+                            f"{sup}/{simple} must be an integer from 1 to 8"
+                        )
+                    if "modified_ms" in document:
+                        _validate_nonnegative_int(
+                            document["modified_ms"],
+                            field=(
+                                f"table config modified_ms for {sup}/{simple}"
+                            ),
+                        )
+                    continue
+
+                required_strings = (
+                    "organization", "super_name", "table_name", "commit_id",
+                    "snapshot_path", "publication_owner",
+                )
+                mirrors = document.get("mirrors")
+                if (
+                    document.get("schema_version") != 2
+                    or document.get("organization") != organization
+                    or document.get("super_name") != sup
+                    or document.get("table_name") != simple
+                    or document.get("status") not in {
+                        "prepared", "core_committed", "complete", "failed",
+                    }
+                    or any(
+                        not isinstance(document.get(field), str)
+                        or not document.get(field)
+                        for field in required_strings
+                    )
+                    or not isinstance(mirrors, list)
+                    or not mirrors
+                    or len(mirrors) != len(set(mirrors))
+                    or any(
+                        not isinstance(fmt, str)
+                        or fmt not in {"DELTA", "ICEBERG", "PARQUET"}
+                        for fmt in mirrors
+                    )
+                    or type(document.get("core_committed")) is not bool
+                    or type(document.get("publisher_quiesced")) is not bool
+                ):
+                    raise RecoveryError(
+                        f"mirror publication for {sup}/{simple} is invalid"
+                    )
+                _logical_path(
+                    document["snapshot_path"], field="mirror snapshot path",
+                )
+                for field in (
+                    "owner_generation", "created_at_ms", "updated_at_ms",
+                ):
+                    _validate_nonnegative_int(
+                        document.get(field), field=f"mirror publication {field}",
+                    )
+                status = document["status"]
+                core_committed = document["core_committed"]
+                if status in {"core_committed", "complete"} and not core_committed:
+                    raise RecoveryError(
+                        f"mirror publication for {sup}/{simple} is inconsistent"
+                    )
+                if status == "prepared" and core_committed:
+                    raise RecoveryError(
+                        f"mirror publication for {sup}/{simple} is inconsistent"
+                    )
+
+    # The per-root loop above validates all known children.  This inverse pass
+    # catches the same key families stranded beneath a namespace with no root.
+    for key in by_key:
+        parsed = RK.parse_lake_key(key)
+        if parsed is None or parsed[0] != organization:
+            continue
+        org, sup = parsed
+        for family, builder in (
+            ("schema", RK.schema),
+            ("rowid sequence", RK.meta_rowid_seq),
+            ("table config", RK.meta_table_config),
+            ("mirror publication", RK.meta_mirror_publication),
+        ):
+            if key.startswith(_child_prefix(builder, org, sup)) and sup not in roots:
+                raise RecoveryError(
+                    f"catalog contains an orphan {family} key {key!r}"
+                )
+
+    # Mirror configuration affects deletion-vector materialization decisions.
+    # Restore only the exact document shape emitted by the fenced mutators.
+    for key, item in by_key.items():
+        parsed = RK.parse_lake_key(key)
+        if parsed is None or parsed[0] != organization:
+            continue
+        org, sup = parsed
+        if key != RK.meta_mirrors(org, sup):
+            continue
+        if sup not in roots:
+            raise RecoveryError(f"mirror configuration for {sup!r} has no root")
+        document = _state_json_object(item, label=f"mirror configuration for {sup}")
+        formats = document.get("formats")
+        if (
+            not isinstance(formats, list)
+            or len(formats) != len(set(formats))
+            or any(
+                not isinstance(fmt, str)
+                or fmt not in {"DELTA", "ICEBERG", "PARQUET"}
+                for fmt in formats
+            )
+        ):
+            raise RecoveryError(f"mirror configuration for {sup!r} is invalid")
+        _validate_nonnegative_int(
+            document.get("ts"), field=f"mirror configuration timestamp for {sup}",
+        )
+
+    namespace_intents: dict[str, dict[str, Any]] = {}
+    simple_intents: dict[str, set[str]] = {}
+    stage_intents: dict[str, set[str]] = {}
+    for key, item in by_key.items():
+        parsed = RK.parse_lake_key(key)
+        if parsed is None or parsed[0] != organization:
+            continue
+        org, sup = parsed
+        if key == RK.meta_namespace_deletion_intent(org, sup):
+            document = _state_json_object(
+                item, label=f"namespace deletion intent for {sup}",
+            )
+            _validate_deletion_intent_document(
+                document,
+                organization=org,
+                super_name=sup,
+                kind="super_table",
+            )
+            namespace_intents[sup] = document
+            continue
+
+        simple_prefix = _child_prefix(
+            RK.meta_simple_deletion_intent, org, sup,
+        )
+        if key.startswith(simple_prefix):
+            simple = key[len(simple_prefix):]
+            try:
+                canonical = RK.meta_simple_deletion_intent(org, sup, simple)
+            except (TypeError, ValueError) as exc:
+                raise RecoveryError(f"unsafe simple deletion intent key {key!r}") from exc
+            if key != canonical:
+                raise RecoveryError(f"unsafe simple deletion intent key {key!r}")
+            document = _state_json_object(
+                item, label=f"simple deletion intent for {sup}/{simple}",
+            )
+            _validate_deletion_intent_document(
+                document,
+                organization=org,
+                super_name=sup,
+                kind="simple_table",
+                child_field="table_name",
+                child_name=simple,
+            )
+            simple_intents.setdefault(sup, set()).add(simple)
+            continue
+
+        stage_prefix = _child_prefix(
+            RK.meta_stage_deletion_intent, org, sup,
+        )
+        if key.startswith(stage_prefix):
+            stage = key[len(stage_prefix):]
+            try:
+                canonical = RK.meta_stage_deletion_intent(org, sup, stage)
+            except (TypeError, ValueError) as exc:
+                raise RecoveryError(f"unsafe stage deletion intent key {key!r}") from exc
+            if key != canonical:
+                raise RecoveryError(f"unsafe stage deletion intent key {key!r}")
+            document = _state_json_object(
+                item, label=f"stage deletion intent for {sup}/{stage}",
+            )
+            _validate_deletion_intent_document(
+                document,
+                organization=org,
+                super_name=sup,
+                kind="staging",
+                child_field="staging_name",
+                child_name=stage,
+            )
+            stage_intents.setdefault(sup, set()).add(stage)
+
+    indexed_intent_supers: set[str] = set()
+    for key in by_key:
+        parsed = RK.parse_lake_key(key)
+        if parsed is None or parsed[0] != organization:
+            continue
+        org, sup = parsed
+        if key in {
+            RK.meta_simple_deletion_intent_index(org, sup),
+            RK.meta_stage_deletion_intent_index(org, sup),
+        }:
+            indexed_intent_supers.add(sup)
+    all_intent_supers = (
+        set(namespace_intents)
+        | set(simple_intents)
+        | set(stage_intents)
+        | indexed_intent_supers
+    )
+    for sup in all_intent_supers:
+        simple_names = simple_intents.get(sup, set())
+        stage_names = stage_intents.get(sup, set())
+        simple_index = by_key.get(
+            RK.meta_simple_deletion_intent_index(organization, sup)
+        )
+        stage_index = by_key.get(
+            RK.meta_stage_deletion_intent_index(organization, sup)
+        )
+        if simple_index is not None and simple_index.get("type") != "set":
+            raise RecoveryError(f"simple deletion-intent index is invalid for {sup!r}")
+        if stage_index is not None and stage_index.get("type") != "set":
+            raise RecoveryError(f"stage deletion-intent index is invalid for {sup!r}")
+        if (
+            (simple_index is None and simple_names)
+            or (
+                simple_index is not None
+                and set(simple_index.get("value", ())) != simple_names
+            )
+        ):
+            raise RecoveryError(
+                f"simple deletion-intent index disagrees for {sup!r}"
+            )
+        if (
+            (stage_index is None and stage_names)
+            or (
+                stage_index is not None
+                and set(stage_index.get("value", ())) != stage_names
+            )
+        ):
+            raise RecoveryError(
+                f"stage deletion-intent index disagrees for {sup!r}"
+            )
+        if sup in namespace_intents and (simple_names or stage_names):
+            raise RecoveryError(
+                f"namespace and child deletion intents overlap for {sup!r}"
+            )
+        if (simple_names or stage_names) and sup not in roots:
+            raise RecoveryError(
+                f"child deletion intent for {sup!r} has no catalog root"
+            )
+        for simple in simple_names:
+            status = _state_json_object(
+                by_key[RK.meta_simple_deletion_intent(
+                    organization, sup, simple,
+                )],
+                label=f"simple deletion intent for {sup}/{simple}",
+            )["status"]
+            leaf_exists = (sup, simple) in leaf_documents
+            if (status == "deleting") != leaf_exists:
+                raise RecoveryError(
+                    f"simple deletion intent state disagrees with leaf {sup}/{simple}"
+                )
+        for stage in stage_names:
+            status = _state_json_object(
+                by_key[RK.meta_stage_deletion_intent(
+                    organization, sup, stage,
+                )],
+                label=f"stage deletion intent for {sup}/{stage}",
+            )["status"]
+            stage_exists = RK.staging_doc(
+                organization, sup, stage,
+            ) in by_key
+            if (status == "deleting") != stage_exists:
+                raise RecoveryError(
+                    f"stage deletion intent state disagrees with metadata {sup}/{stage}"
+                )
+        namespace = namespace_intents.get(sup)
+        if (
+            namespace is not None
+            and namespace.get("status") == "deleted"
+            and sup in roots
+        ):
+            raise RecoveryError(
+                f"terminal namespace deletion intent still has root {sup!r}"
+            )
+
+    # Replica reads are one-hop references to a live source namespace.  A
+    # checkpoint must not restore a target that resolves orphan leaves or a
+    # source already fenced for deletion.
+    for sup, root in roots.items():
+        if root.get("clone_type") != "replica":
+            continue
+        source = str(root["cloned_from"])
+        source_root = roots.get(source)
+        if source_root is None:
+            raise RecoveryError(f"replica {sup!r} has no live source root")
+        if source in namespace_intents:
+            raise RecoveryError(f"replica {sup!r} source is fenced for deletion")
+        if source_root.get("clone_type") == "replica":
+            raise RecoveryError(f"replica {sup!r} forms an unsupported replica chain")
+
+    _validate_rbac_catalog_state(organization, by_key)
+
     snapshots.sort(key=lambda item: (item["super_name"], item["simple_name"]))
     return tuple(snapshots)
 

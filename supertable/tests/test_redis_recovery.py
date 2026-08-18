@@ -25,6 +25,7 @@ from supertable.recovery.redis_rebuild import (
     rebuild_redis,
 )
 from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import _canonicalize_role_document
 
 
 ORG = "acme"
@@ -91,6 +92,7 @@ def _seed_catalog(redis_client, storage):
         "rowid_high_watermark": 42,
         "stats_file": None,
         "stats_rows": 0,
+        "_row_filter": None,
     }
     storage.files[SNAPSHOT_PATH] = json.dumps(snapshot).encode()
     storage.files[DATA_PATH] = data_bytes
@@ -196,6 +198,58 @@ def _checkpoint(source, storage):
     )
 
 
+def _seed_consistent_rbac(source):
+    role_id = "reader-role"
+    role = _canonicalize_role_document(
+        {
+            "role": "reader",
+            "role_name": "Analyst",
+            "tables": {TABLE: {"columns": ["id"], "filters": ["*"]}},
+        },
+        default_if_empty=False,
+    )
+    role.update({"role_id": role_id, "doc_version": "1"})
+    source.hset(
+        RK.rbac_role_doc(ORG, SUP, role_id),
+        mapping={
+            key: json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+            for key, value in role.items()
+        },
+    )
+    source.sadd(RK.rbac_role_index(ORG, SUP), role_id)
+    source.sadd(RK.rbac_role_type_index(ORG, SUP, "reader"), role_id)
+    source.hset(RK.rbac_rolename_to_id(ORG, SUP), "analyst", role_id)
+    source.hset(
+        RK.rbac_role_meta(ORG, SUP),
+        mapping={
+            "version": "1",
+            "last_updated_ms": "1700000000000",
+            "initialized": "true",
+        },
+    )
+    user_id = "analyst-user"
+    source.hset(
+        RK.rbac_user_doc(ORG, SUP, user_id),
+        mapping={
+            "user_id": user_id,
+            "username": "analyst",
+            "roles": json.dumps([role_id]),
+            "doc_version": "1",
+        },
+    )
+    source.sadd(RK.rbac_user_index(ORG, SUP), user_id)
+    source.hset(RK.rbac_username_to_id(ORG, SUP), "analyst", user_id)
+    source.hset(
+        RK.rbac_user_meta(ORG, SUP),
+        mapping={
+            "version": "1",
+            "last_updated_ms": "1700000000000",
+            "initialized": "true",
+        },
+    )
+    return role_id, user_id
+
+
 def test_rebuild_dry_run_apply_and_idempotent_retry():
     source = _redis()
     destination = _redis()
@@ -219,6 +273,375 @@ def test_rebuild_dry_run_apply_and_idempotent_retry():
     assert retry.applied is False
     assert retry.already_current is True
     assert retry.checkpoint_sha256 == checkpoint.manifest_sha256
+
+
+@pytest.mark.parametrize(
+    "root_value, message",
+    [
+        ("not-json", "not valid JSON"),
+        ("[]", "not a JSON object"),
+        ("{}", "invalid identity fields"),
+        ('{"version": 8, "ts": true}', "invalid identity fields"),
+        ('{"version": 9007199254740992, "ts": 1}', "invalid identity fields"),
+        ('{"version": 8, "ts": 9007199254740992}', "invalid identity fields"),
+    ],
+)
+def test_checkpoint_rejects_malformed_or_non_object_catalog_root(
+    root_value, message,
+):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_root(ORG, SUP), root_value)
+
+    with pytest.raises(RecoveryError, match=message):
+        _checkpoint(source, storage)
+
+    assert not any("/__recovery__/" in path for path in storage.files)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("version", "3", "no valid version"),
+        ("version", True, "no valid version"),
+        ("version", -1, "no valid version"),
+        ("version", 1 << 53, "no valid version"),
+        ("ts", "1700000000000", "no valid timestamp"),
+        ("ts", True, "no valid timestamp"),
+        ("ts", -1, "no valid timestamp"),
+        ("ts", 1 << 53, "no valid timestamp"),
+        ("ts", None, "no valid timestamp"),
+    ],
+)
+def test_checkpoint_rejects_leaf_identity_runtime_cannot_commit(
+    field, value, message,
+):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    key = RK.meta_leaf(ORG, SUP, TABLE)
+    leaf = json.loads(source.get(key))
+    if value is None:
+        leaf.pop(field)
+    else:
+        leaf[field] = value
+    source.set(key, json.dumps(leaf))
+
+    with pytest.raises(RecoveryError, match=message):
+        _checkpoint(source, storage)
+
+    assert not any("/__recovery__/" in path for path in storage.files)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cloned_from", "../source"),
+        ("replica_tables", "all"),
+        ("read_only", 0),
+    ],
+)
+def test_checkpoint_rejects_root_fields_runtime_replica_reads_reject(field, value):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    key = RK.meta_root(ORG, SUP)
+    root = json.loads(source.get(key))
+    root.update({
+        "read_only": True,
+        "clone_type": "replica",
+        "cloned_from": "source",
+        "replica_tables": [TABLE],
+    })
+    root[field] = value
+    source.set(key, json.dumps(root))
+
+    with pytest.raises(RecoveryError, match="runtime contract|live source"):
+        _checkpoint(source, storage)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-an-integer", "-1", "+1", "01", str(1 << 63)],
+)
+def test_checkpoint_rejects_noncanonical_or_unsafe_rowid_sequence(value):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_rowid_seq(ORG, SUP, TABLE), value)
+
+    with pytest.raises(RecoveryError, match="rowid sequence"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_allows_repairable_rowid_below_snapshot_floor():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_rowid_seq(ORG, SUP, TABLE), "1")
+
+    assert _checkpoint(source, storage).snapshot_count == 1
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"max_memory_chunk_size": "1024"},
+        {"max_decoded_compaction_bytes": True},
+        {"max_overlapping_files": 0},
+        {"max_tombstone_rows": -1},
+        {"tombstone_compaction_workers": 9},
+        {"modified_ms": True},
+        {"modified_ms": 1 << 53},
+    ],
+)
+def test_checkpoint_rejects_table_config_runtime_cannot_use(document):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_table_config(ORG, SUP, TABLE), json.dumps(document))
+
+    with pytest.raises(RecoveryError, match="table config"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_preserves_unknown_table_config_metadata():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(
+        RK.meta_table_config(ORG, SUP, TABLE),
+        json.dumps({
+            "max_memory_chunk_size": 1024,
+            "modified_ms": 1_700_000_000_000,
+            "legacy_annotation": {"owner": "analytics"},
+        }),
+    )
+
+    assert _checkpoint(source, storage).snapshot_count == 1
+
+
+def test_checkpoint_rejects_orphan_malformed_rbac_role_state():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.hset(
+        RK.rbac_role_doc(ORG, SUP, "evil"),
+        mapping={
+            "role_id": "evil",
+            "role": "superadmin",
+            "tables": "not-json",
+            "doc_version": "1",
+        },
+    )
+
+    with pytest.raises(RecoveryError, match="RBAC role"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_accepts_structurally_consistent_rbac_namespace():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    _seed_consistent_rbac(source)
+
+    assert _checkpoint(source, storage).snapshot_count == 1
+
+
+@pytest.mark.parametrize("fault", ["role_index", "username_map", "revision"])
+def test_checkpoint_rejects_inconsistent_rbac_control_indexes(fault):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    _role_id, _user_id = _seed_consistent_rbac(source)
+    if fault == "role_index":
+        source.delete(RK.rbac_role_index(ORG, SUP))
+    elif fault == "username_map":
+        source.hset(RK.rbac_username_to_id(ORG, SUP), "analyst", "other-user")
+    else:
+        source.delete(RK.rbac_user_meta(ORG, SUP))
+
+    with pytest.raises(RecoveryError, match="RBAC"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_rejects_schema_that_differs_from_sealed_snapshot():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.schema(ORG, SUP, TABLE), json.dumps({"id": "string"}))
+
+    with pytest.raises(RecoveryError, match="schema differs from snapshot"):
+        _checkpoint(source, storage)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [],
+        {"formats": "DELTA", "ts": 1},
+        {"formats": ["DELTA", "DELTA"], "ts": 1},
+        {"formats": ["UNKNOWN"], "ts": 1},
+        {"formats": ["DELTA"], "ts": True},
+    ],
+)
+def test_checkpoint_rejects_malformed_mirror_control_document(document):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_mirrors(ORG, SUP), json.dumps(document))
+
+    with pytest.raises(RecoveryError, match="mirror configuration"):
+        _checkpoint(source, storage)
+
+
+@pytest.mark.parametrize("scope", ["namespace", "simple", "stage"])
+def test_checkpoint_rejects_malformed_deletion_intent_documents(scope):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    malformed = {
+        "schema_version": 1,
+        "kind": "wrong-kind",
+        "organization": ORG,
+        "super_name": SUP,
+        "intent_id": "delete-1",
+        "status": "deleting",
+        "created_at_ms": 1,
+        "recovery_count": 0,
+    }
+    if scope == "namespace":
+        key = RK.meta_namespace_deletion_intent(ORG, SUP)
+    elif scope == "simple":
+        key = RK.meta_simple_deletion_intent(ORG, SUP, TABLE)
+        source.sadd(RK.meta_simple_deletion_intent_index(ORG, SUP), TABLE)
+    else:
+        key = RK.meta_stage_deletion_intent(ORG, SUP, "uploads")
+        source.sadd(RK.meta_stage_deletion_intent_index(ORG, SUP), "uploads")
+    source.set(key, json.dumps(malformed))
+
+    with pytest.raises(RecoveryError, match="deletion intent"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_rejects_divergent_complete_leaf_payload():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    # Keep the cached object structurally complete and at the sealed version so
+    # normal catalog reads would trust it, but make its table contents differ
+    # from the snapshot selected by ``path``.
+    leaf["payload"] = dict(leaf["payload"])
+    leaf["payload"]["resources"] = []
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    with pytest.raises(
+        RecoveryError, match="cached payload differs from snapshot",
+    ):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_normalizes_legacy_heavy_unrestricted_policy_marker():
+    """Explicit cache null equals legacy immutable absence semantically."""
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    heavy = json.loads(storage.files[SNAPSHOT_PATH])
+    heavy.pop("_row_filter")
+    storage.files[SNAPSHOT_PATH] = json.dumps(heavy).encode()
+
+    checkpoint = _checkpoint(source, storage)
+
+    assert checkpoint.snapshot_count == 1
+
+
+def test_checkpoint_rejects_cache_that_erases_heavy_share_policy():
+    """A cache-null policy may not replace a filtered immutable snapshot."""
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    heavy = json.loads(storage.files[SNAPSHOT_PATH])
+    heavy["_row_filter"] = "tenant_id = 7"
+    storage.files[SNAPSHOT_PATH] = json.dumps(heavy).encode()
+
+    with pytest.raises(
+        RecoveryError, match="cached payload differs from snapshot",
+    ):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_rejects_legacy_cache_without_policy_marker():
+    """A restored legacy cache must never regain fast-path authority."""
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    leaf["payload"].pop("_row_filter")
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    with pytest.raises(RecoveryError, match="cached payload is incomplete"):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_rejects_incomplete_leaf_payload():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    # This shape is intentionally incomplete for the canonical snapshot-cache
+    # contract, but historical metadata fast paths accepted it merely because
+    # ``resources`` was a list.  DR must not seal storage while restoring this
+    # divergent cache alongside it.
+    leaf["payload"] = {
+        "snapshot_version": 3,
+        "schema": {"forged": "string"},
+        "resources": [],
+    }
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    with pytest.raises(
+        RecoveryError, match="cached payload is incomplete",
+    ):
+        _checkpoint(source, storage)
+
+
+def test_checkpoint_allows_leaf_without_optional_cache():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    leaf.pop("payload")
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    checkpoint = _checkpoint(source, storage)
+
+    assert checkpoint.snapshot_count == 1
+
+
+def test_checkpoint_allows_complete_nested_share_cache():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    snapshot = leaf["payload"]
+    leaf["payload"] = {
+        "_row_filter": "tenant_id = 7",
+        "snapshot": snapshot,
+    }
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    checkpoint = _checkpoint(source, storage)
+
+    assert checkpoint.snapshot_count == 1
 
 
 def test_rebuild_refuses_partial_or_unexpected_destination_state():

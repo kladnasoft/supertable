@@ -32,6 +32,7 @@ from supertable.engine.engine_common import (
     create_typed_empty_view,
     redact_url_credentials,
     _validated_rbac_predicate_sql,
+    validate_rbac_binding_stability,
 )
 from supertable.engine.island_resources import (
     ArrowBatchStream,
@@ -51,7 +52,7 @@ def _fresh_validated_duckdb_parser(parser: SQLParser) -> SQLParser:
         try:
             supplied_tables = parser.get_table_tuples()
         except Exception:
-            supplied_tables = ()
+            supplied_tables = []
         for table in supplied_tables or ():
             candidate = getattr(table, "super_name", None)
             if isinstance(candidate, str) and candidate:
@@ -458,6 +459,10 @@ class DuckDB:
         parser = _fresh_validated_duckdb_parser(caller_parser)
         validated_ast = parser._parsed
         _assert_reflection_covers_requested_tables(parser, reflection)
+        validate_rbac_binding_stability(
+            parser,
+            getattr(reflection, "rbac_views", None) or {},
+        )
         if _streaming:
             # Keep request validation outside the backend-error boundary so a
             # malformed public batch cap remains a meaningful ValueError.
@@ -547,6 +552,13 @@ class DuckDB:
             for sup in reflection.supers
         }
         table_defs = parser.get_table_tuples()
+        ambiguity_getter = getattr(parser, "get_group_alias_ambiguities", None)
+        group_alias_ambiguities = (
+            ambiguity_getter() if callable(ambiguity_getter) else {}
+        )
+        ambiguous_aliases = {
+            str(alias).casefold() for alias in group_alias_ambiguities
+        }
         # Every relation in a Lite query is request-private.  The persistent
         # root connection is shared across Executor instances, so using only
         # the snapshot hash here lets concurrent queries CREATE OR REPLACE and
@@ -569,6 +581,11 @@ class DuckDB:
                 continue
 
             cols = list(td.columns or [])
+            if td.alias.casefold() in ambiguous_aliases:
+                # DuckDB gives an input column precedence over a same-named
+                # SELECT alias in GROUP BY.  Only the backend has the real
+                # schema, so retain the full protected input for that binding.
+                cols = []
             # Row/share filters may depend on columns that the user did not
             # project.  Load the complete pinned relation for those queries;
             # the RBAC view reapplies the column policy before user SQL runs.
@@ -798,6 +815,7 @@ class DuckDB:
                 parser.original_query,
                 query_alias_to_name,
                 parsed_expression=validated_ast,
+                default_super_name=parser.default_super_name,
             )
             # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
             # query (over the reflection/tombstone/RBAC view chain) instead of
@@ -810,7 +828,7 @@ class DuckDB:
                 )
             parser.executing_query = executing_query
             try:
-                caller_parser.executing_query = executing_query
+                setattr(caller_parser, "executing_query", executing_query)
             except Exception:
                 pass
 

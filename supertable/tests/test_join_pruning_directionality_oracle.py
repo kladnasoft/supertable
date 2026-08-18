@@ -161,14 +161,17 @@ JOIN_SHAPES.extend([
         "WHERE b.k=c.k",
     ),
     (
-        "using-left",
-        "SELECT * FROM s.a a LEFT JOIN s.b b USING(k) "
-        "INNER JOIN s.c c USING(k)",
+        "left-then-inner",
+        # Chained USING requires schema-aware accumulated-left binding and is
+        # intentionally rejected at the parser boundary.  Keep this oracle's
+        # mixed-direction coverage with the unambiguous explicit equivalent.
+        "SELECT * FROM s.a a LEFT JOIN s.b b ON a.k=b.k "
+        "INNER JOIN s.c c ON a.k=c.k",
     ),
     (
-        "using-right",
-        "SELECT * FROM s.a a RIGHT JOIN s.b b USING(k) "
-        "INNER JOIN s.c c USING(k)",
+        "right-then-inner",
+        "SELECT * FROM s.a a RIGHT JOIN s.b b ON a.k=b.k "
+        "INNER JOIN s.c c ON b.k=c.k",
     ),
     (
         "derived-table",

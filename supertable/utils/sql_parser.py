@@ -1,12 +1,175 @@
 # route: supertable.utils.sql_parser
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
 from supertable.data_classes import JoinEdge, PredInterval, TableDefinition
+
+
+@dataclass(frozen=True)
+class _ScopedTableBindings:
+    """Stable internal keys for physical/derived sources in SQL scopes.
+
+    SQL aliases are local to a SELECT scope.  The same spelling can therefore
+    legitimately identify different relations in independent set-operation or
+    subquery scopes.  Catalog reflection maps, however, need one request-wide
+    key per distinct binding.  ``by_node_id`` bridges those two models without
+    changing the alias that remains visible in the user's SQL.
+    """
+
+    by_node_id: Dict[int, str]
+    alias_to_table: Dict[str, Tuple[str, str]]
+    cte_reference_node_ids: Set[int]
+    physical_keys: Set[str]
+
+
+def _build_scoped_table_bindings(
+    parsed: exp.Expression,
+    default_super_name: str,
+    *,
+    scopes: Optional[Tuple[Any, ...]] = None,
+) -> _ScopedTableBindings:
+    """Assign request-wide keys while respecting SQL scope boundaries.
+
+    Identical aliases bound to the same relation continue to share a key (and
+    therefore a reflection).  An alias rebound to another relation in an
+    independent scope receives an opaque collision-proof key.  Duplicate
+    bindings inside one scope remain invalid and fail closed.
+    """
+    if scopes is None:
+        try:
+            scopes = tuple(traverse_scope(parsed))
+        except Exception as exc:
+            raise ValueError("Unable to resolve SQL table scopes") from exc
+
+    table_scope: Dict[int, int] = {}
+    cte_references: Set[int] = set()
+    for scope_index, scope in enumerate(scopes):
+        try:
+            selected_sources = scope.selected_sources.values()
+        except Exception as exc:
+            # sqlglot reports duplicate aliases in a SELECT while constructing
+            # selected_sources.  Such a query cannot have an unambiguous
+            # protected-source rewrite.
+            raise ValueError("Table alias is ambiguous within a SQL scope") from exc
+        for selected in selected_sources:
+            try:
+                node, source = selected
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(node, exp.Table):
+                continue
+            table_scope[id(node)] = scope_index
+            if not isinstance(source, exp.Table):
+                cte_references.add(id(node))
+
+    tables = list(parsed.find_all(exp.Table))
+    reserved_folds = {
+        (SQLParser._get_alias(table) or table.name).casefold()
+        for table in tables
+        if table.name
+    }
+    by_node_id: Dict[int, str] = {}
+    alias_to_table: Dict[str, Tuple[str, str]] = {}
+    used_key_folds: Set[str] = set()
+    physical_keys: Set[str] = set()
+    binding_keys: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+    scope_bindings: Dict[Tuple[int, str], Tuple[str, ...]] = {}
+    synthetic_index = 0
+
+    # A query-local CTE reference never needs its own catalog reflection.  If
+    # a same-named physical leaf exists (the recursive-looking but valid
+    # ``WITH x AS (SELECT ... FROM x)`` pattern), retain the historic/public
+    # alias for that physical leaf and let the skipped CTE node share its
+    # internal key.  This also keeps existing reflection/RBAC maps compatible.
+    preferred_physical: Dict[
+        str, Tuple[Tuple[str, ...], Tuple[str, str]]
+    ] = {}
+    for table in tables:
+        if not table.name or id(table) in cte_references:
+            continue
+        alias = SQLParser._get_alias(table) or table.name
+        db_name = SQLParser._get_db_name(table) or default_super_name
+        preferred_physical.setdefault(
+            alias.casefold(),
+            (
+                ("physical", db_name.casefold(), table.name.casefold()),
+                (db_name, table.name),
+            ),
+        )
+
+    for table in tables:
+        table_name = table.name
+        if not table_name:
+            continue
+        alias = SQLParser._get_alias(table) or table_name
+        folded_alias = alias.casefold()
+        db_name = SQLParser._get_db_name(table) or default_super_name
+        is_cte_reference = id(table) in cte_references
+        if is_cte_reference:
+            relation: Tuple[str, ...] = ("derived", table_name.casefold())
+        else:
+            relation = (
+                "physical",
+                db_name.casefold(),
+                table_name.casefold(),
+            )
+
+        scope_index = table_scope.get(id(table), -1)
+        scoped_alias = (scope_index, folded_alias)
+        prior_relation = scope_bindings.get(scoped_alias)
+        if prior_relation is not None and prior_relation != relation:
+            raise ValueError(
+                f"Table alias {alias!r} resolves to multiple relations "
+                "within one SQL scope"
+            )
+        scope_bindings[scoped_alias] = relation
+
+        key_relation = (
+            preferred_physical[folded_alias][0]
+            if is_cte_reference and folded_alias in preferred_physical
+            else relation
+        )
+        identity = (folded_alias, key_relation)
+        key = binding_keys.get(identity)
+        if key is None:
+            if folded_alias not in used_key_folds:
+                key = alias
+            else:
+                while True:
+                    synthetic_index += 1
+                    candidate = (
+                        f"__supertable_binding_{synthetic_index}_{alias}"
+                    )
+                    candidate_fold = candidate.casefold()
+                    if (
+                        candidate_fold not in reserved_folds
+                        and candidate_fold not in used_key_folds
+                    ):
+                        key = candidate
+                        break
+            binding_keys[identity] = key
+            alias_to_table[key] = (
+                preferred_physical[folded_alias][1]
+                if is_cte_reference and folded_alias in preferred_physical
+                else (db_name, table_name)
+            )
+            used_key_folds.add(key.casefold())
+
+        by_node_id[id(table)] = key
+        if not is_cte_reference:
+            physical_keys.add(key)
+
+    return _ScopedTableBindings(
+        by_node_id=by_node_id,
+        alias_to_table=alias_to_table,
+        cte_reference_node_ids=cte_references,
+        physical_keys=physical_keys,
+    )
 
 
 # User queries execute in backend sessions that also own managed reflection
@@ -240,6 +403,45 @@ def _reject_unmanaged_table_sources(
             )
 
 
+def _validate_schema_dependent_joins(parsed: exp.Expression) -> None:
+    """Reject joins whose keys cannot be preserved before schema loading.
+
+    NATURAL JOIN derives its keys from the runtime schema, so column
+    projection or an RBAC view can silently change it into a different join.
+    USING keys are explicit and safe only for the currently supported direct
+    two-source shape; more complex accumulated-left bindings need schema-aware
+    resolution before they can be projected and authorized correctly.
+    """
+    for select_expr in parsed.find_all(exp.Select):
+        joins = list(select_expr.args.get("joins") or [])
+        if any(
+            str(join.args.get("method") or "").casefold() == "natural"
+            for join in joins
+        ):
+            raise ValueError(
+                "NATURAL JOIN is not supported in supertable read queries; "
+                "use an explicit JOIN ... ON condition"
+            )
+
+        using_joins = [join for join in joins if join.args.get("using")]
+        if not using_joins:
+            continue
+        from_clause = select_expr.args.get("from")
+        left_source = getattr(from_clause, "this", None)
+        right_source = using_joins[0].this
+        if (
+            len(joins) != 1
+            or len(using_joins) != 1
+            or not isinstance(left_source, exp.Table)
+            or not isinstance(right_source, exp.Table)
+        ):
+            raise ValueError(
+                "JOIN ... USING is supported only between two direct table "
+                "sources in supertable read queries; use an explicit "
+                "JOIN ... ON condition"
+            )
+
+
 def _reject_bare_session_identifiers(
     parsed: exp.Expression,
     dialect: str,
@@ -297,6 +499,7 @@ def validate_read_query_ast(
             "Only read-only SELECT/WITH/set-operation queries are allowed "
             "on the supertable read path"
         )
+    _validate_schema_dependent_joins(parsed)
     _reject_unmanaged_table_sources(parsed, dialect)
     _reject_bare_session_identifiers(parsed, dialect)
     validate_read_query_functions(
@@ -581,8 +784,11 @@ class SQLParser:
         - Unqualified columns:
             - If there is exactly one direct physical source in the current
               SELECT scope, they are attributed to that source.
-            - If the current scope has multiple or derived sources, they are
-              ignored as ambiguous; physical leaf scopes remain exact.
+            - If the current scope has multiple sources, every direct physical
+              source is conservatively kept at full projection because only
+              the runtime schemas can resolve the name.
+            - Derived sources retain the independently collected dependencies
+              of their physical leaf scopes.
         - For SELECT projections with aliases, e.g. "o.id AS order_id":
             - We record "id" for alias "o".
         - Star handling:
@@ -638,13 +844,25 @@ class SQLParser:
 
         # alias -> (supertable, table)
         self._alias_to_table: Dict[str, Tuple[str, str]] = {}
+        # SQL identifiers are case-insensitive.  Retain one canonical spelling
+        # when the same physical relation is referenced with case-only alias
+        # variants in independent scopes (for example UNION branches).
+        self._canonical_alias_by_fold: Dict[str, str] = {}
+        # alias -> unqualified names whose binding depends on the runtime input
+        # schema.  This includes SELECT-alias collisions, unresolved names in
+        # multi/correlated scopes, and relation-alias whole-row expressions.
+        # Projection must retain candidate schemas, and an RBAC column policy
+        # must not remove a precedence-winning physical column and thereby
+        # rebind the same token to an alias/struct.  The historical GROUP name
+        # remains as an API alias for older executor integrations.
+        self._binding_ambiguities: Dict[str, Set[str]] = {}
+        self._group_alias_ambiguities = self._binding_ambiguities
 
         # alias -> ordered unique list of column names
         # (or [] if meaning "all columns" due to * or t.*)
         self._alias_to_columns: Dict[str, List[str]] = {}
-        self._cte_reference_node_ids: Set[int] = (
-            self._collect_cte_reference_node_ids()
-        )
+        self._cte_reference_node_ids: Set[int] = set()
+        self._table_binding_by_node_id: Dict[int, str] = {}
         self._physical_aliases: Set[str] = set()
 
         self._extract_tables()
@@ -834,34 +1052,20 @@ class SQLParser:
             - Otherwise, prefix with default supertable.
             - If no alias is present, alias = table name.
         """
-        alias_to_table: Dict[str, Tuple[str, str]] = {}
-        alias_bindings: Dict[str, Tuple[str, str]] = {}
-
-        for table in self._parsed.find_all(exp.Table):
-            table_name = table.name
-            if not table_name:
-                continue
-
-            db_name = self._get_db_name(table) or self.default_super_name
-            alias = self._get_alias(table) or table_name
-
-            physical = (db_name, table_name)
-            folded_alias = alias.casefold()
-            existing = alias_bindings.get(folded_alias)
-            if existing is not None and existing != physical:
-                raise ValueError(
-                    f"Table alias {alias!r} resolves to multiple physical tables: "
-                    f"{existing[0]}.{existing[1]} and {db_name}.{table_name}"
-                )
-            alias_bindings[folded_alias] = physical
-            alias_to_table[alias] = physical
-            if id(table) not in self._cte_reference_node_ids:
-                self._physical_aliases.add(alias)
-
-        if not alias_to_table:
+        layout = _build_scoped_table_bindings(
+            self._parsed,
+            self.default_super_name,
+            scopes=self._get_pruning_scopes(),
+        )
+        if not layout.alias_to_table:
             raise ValueError("No tables found in SQL query.")
-
-        self._alias_to_table = alias_to_table
+        self._alias_to_table = layout.alias_to_table
+        self._canonical_alias_by_fold = {
+            alias.casefold(): alias for alias in layout.alias_to_table
+        }
+        self._cte_reference_node_ids = layout.cte_reference_node_ids
+        self._table_binding_by_node_id = layout.by_node_id
+        self._physical_aliases = layout.physical_keys
 
     # ---------------- CTE detection ────────────────────────────────── #
 
@@ -885,11 +1089,37 @@ class SQLParser:
     # ---------------- Column extraction helpers ----------------
 
     @staticmethod
+    def _is_inside_window_spec(col: exp.Column) -> bool:
+        """Whether *col* belongs to an OVER/WINDOW specification.
+
+        DuckDB resolves unqualified partition/order names against physical
+        inputs before SELECT aliases when both exist, but accepts the SELECT
+        alias when the input is absent.  Columns used by the window function
+        itself (for example ``SUM(x) OVER (...)``) are ordinary source
+        expressions and must not be mistaken for specification references.
+        On the ascent to ``Window``, ``child is window.this`` distinguishes
+        the function expression from PARTITION/ORDER/frame arguments in both
+        inline and named WINDOW forms.
+        """
+        child: exp.Expression = col
+        node = col.parent
+        while node is not None:
+            if isinstance(node, exp.Window):
+                return child is not node.this
+            if isinstance(node, exp.Select):
+                return False
+            child = node
+            node = node.parent
+        return False
+
+    @staticmethod
     def _is_inside_alias_scope(col: exp.Column) -> bool:
         """
         True if this Column lives inside a clause where SELECT alias
-        references are legal in the supported dialects: GROUP BY, ORDER BY,
-        HAVING, or QUALIFY.
+        references are legal in DuckDB: WHERE, GROUP BY, ORDER BY, HAVING,
+        QUALIFY, DISTINCT ON, or a window specification. Some clauses prefer
+        a same-named physical input while others prefer the alias; the caller
+        handles that distinction separately.
 
         Walking up the AST from the Column node, if we hit one of these
         clause types before reaching the Select node, the column is in
@@ -898,10 +1128,36 @@ class SQLParser:
         """
         node = col.parent
         while node is not None:
-            if isinstance(node, (exp.Group, exp.Order, exp.Having, exp.Qualify)):
+            if isinstance(node, exp.Window):
+                return SQLParser._is_inside_window_spec(col)
+            if isinstance(
+                node,
+                (
+                    exp.Where,
+                    exp.Group,
+                    exp.Order,
+                    exp.Having,
+                    exp.Qualify,
+                    exp.Distinct,
+                ),
+            ):
                 return True
             if isinstance(node, exp.Select):
                 # Reached SELECT without passing through an alias-aware clause.
+                return False
+            node = node.parent
+        return False
+
+    @staticmethod
+    def _is_inside_physical_alias_precedence_scope(col: exp.Column) -> bool:
+        """Whether DuckDB may prefer a physical input over a SELECT alias."""
+        if SQLParser._is_inside_window_spec(col):
+            return True
+        node = col.parent
+        while node is not None:
+            if isinstance(node, (exp.Where, exp.Group, exp.Qualify)):
+                return True
+            if isinstance(node, exp.Select):
                 return False
             node = node.parent
         return False
@@ -928,13 +1184,13 @@ class SQLParser:
         seen_per_alias: Dict[str, Set[str]] = {
             alias: set() for alias in self._alias_to_table
         }
+        force_full_projection: Set[str] = set()
 
         # Bind columns through the nearest sqlglot Scope, never through a
         # query-global alias map.  The same spelling can denote a physical
         # table in one scope and a CTE/derived relation in another.  A global
         # lookup would therefore project derived names such as ``finite_value``
         # or ``freq`` from an unrelated Parquet leaf.
-        aliases_by_fold = {alias.casefold(): alias for alias in self._alias_to_table}
         scopes_by_select: Dict[int, object] = {}
         bindings_by_scope: Dict[int, Dict[str, Optional[str]]] = {}
         owner_by_select: Dict[int, str] = {}
@@ -945,16 +1201,17 @@ class SQLParser:
             bindings: Dict[str, Optional[str]] = {}
             for source_alias, selected in scope.selected_sources.items():
                 try:
-                    source = selected[1]
-                except (TypeError, IndexError):
+                    node, source = selected
+                except (TypeError, IndexError, ValueError):
                     continue
                 folded = str(source_alias).casefold()
                 # A Scope source is a CTE or derived table.  Store the binding
                 # explicitly as None so a same-named outer physical alias can
                 # never capture its qualified columns.
                 bindings[folded] = (
-                    aliases_by_fold.get(folded)
-                    if isinstance(source, exp.Table)
+                    self._table_binding_by_node_id.get(id(node))
+                    if isinstance(node, exp.Table)
+                    and isinstance(source, exp.Table)
                     else None
                 )
             bindings_by_scope[id(scope)] = bindings
@@ -999,17 +1256,24 @@ class SQLParser:
         # Select so an inner GROUP/ORDER alias cannot be confused with an
         # outer projection (or vice versa).
         select_alias_names: Dict[int, Set[str]] = {}
+        select_alias_positions: Dict[int, Dict[str, int]] = {}
+        projection_positions: Dict[int, int] = {}
+        using_columns_by_owner: Dict[str, Set[str]] = {}
         table_star_aliases: Set[str] = set()
         for scope in self._get_pruning_scopes():
             select_expr = scope.expression
             if not isinstance(select_expr, exp.Select):
                 continue
             projection_aliases: Set[str] = set()
-            for proj in select_expr.expressions:
+            alias_positions: Dict[str, int] = {}
+            for projection_index, proj in enumerate(select_expr.expressions):
+                projection_positions[id(proj)] = projection_index
                 if isinstance(proj, exp.Alias):
                     alias_ident = proj.args.get("alias")
                     if isinstance(alias_ident, exp.Identifier) and alias_ident.name:
-                        projection_aliases.add(alias_ident.name.casefold())
+                        folded_alias = alias_ident.name.casefold()
+                        projection_aliases.add(folded_alias)
+                        alias_positions.setdefault(folded_alias, projection_index)
 
                 # Case 1: explicit Star node
                 if isinstance(proj, exp.Star):
@@ -1040,6 +1304,92 @@ class SQLParser:
                     if owner is not None:
                         table_star_aliases.add(owner)
             select_alias_names[id(select_expr)] = projection_aliases
+            select_alias_positions[id(select_expr)] = alias_positions
+
+            # Validation above admits USING only for one direct two-source
+            # join.  Its identifiers are not exp.Column nodes, so record them
+            # explicitly on both physical operands.  This is required not just
+            # for loading: RBAC must see the join key as a requested column and
+            # reject an excluded key before a restricted view can alter the
+            # join's semantics.
+            joins = list(select_expr.args.get("joins") or [])
+            if len(joins) == 1 and joins[0].args.get("using"):
+                from_clause = select_expr.args.get("from")
+                left_source = getattr(from_clause, "this", None)
+                right_source = joins[0].this
+                if isinstance(left_source, exp.Table) and isinstance(
+                    right_source, exp.Table
+                ):
+                    owners = (
+                        self._table_binding_by_node_id.get(id(left_source)),
+                        self._table_binding_by_node_id.get(id(right_source)),
+                    )
+                    using_names = {
+                        identifier.name
+                        for identifier in joins[0].args.get("using") or []
+                        if isinstance(identifier, exp.Identifier)
+                        and identifier.name
+                    }
+                    for owner in owners:
+                        if owner in self._physical_aliases:
+                            using_columns_by_owner.setdefault(
+                                owner, set(),
+                            ).update(using_names)
+
+        def _projection_position(
+            column: exp.Column,
+            select_expr: Optional[exp.Select],
+        ) -> Optional[int]:
+            """Return the containing SELECT-list position, if any."""
+            if select_expr is None:
+                return None
+            child: exp.Expression = column
+            node = column.parent
+            while node is not None and node is not select_expr:
+                child = node
+                node = node.parent
+            if node is not select_expr:
+                return None
+            return projection_positions.get(id(child))
+
+        def _force_full_for_scope(
+            scope: object,
+            *,
+            include_ancestors: bool = False,
+        ) -> None:
+            """Retain physical schemas for bindings the AST cannot prove."""
+            current_scope: Optional[object] = scope
+            while current_scope is not None:
+                force_full_projection.update(
+                    owner
+                    for owner in bindings_by_scope.get(
+                        id(current_scope), {}
+                    ).values()
+                    if owner is not None
+                )
+                if not include_ancestors:
+                    break
+                current_scope = getattr(current_scope, "parent", None)
+
+        def _record_schema_dependent_binding(
+            scope: object,
+            column_name: str,
+            *,
+            include_ancestors: bool = False,
+        ) -> None:
+            """Record every physical binding that may own an unqualified name."""
+            current_scope: Optional[object] = scope
+            while current_scope is not None:
+                for owner in bindings_by_scope.get(
+                    id(current_scope), {}
+                ).values():
+                    if owner is not None:
+                        self._binding_ambiguities.setdefault(
+                            owner, set(),
+                        ).add(column_name)
+                if not include_ancestors:
+                    break
+                current_scope = getattr(current_scope, "parent", None)
 
         # Attribute every non-star column exactly once.  Direct Alias values
         # are normal source expressions and are intentionally included; only a
@@ -1055,19 +1405,101 @@ class SQLParser:
                 if nearest_select is not None
                 else set()
             )
+            folded_column = col_name.casefold()
+            projection_position = _projection_position(col, nearest_select)
+            alias_position = (
+                select_alias_positions.get(id(nearest_select), {}).get(
+                    folded_column
+                )
+                if nearest_select is not None
+                else None
+            )
+            references_prior_projection_alias = (
+                projection_position is not None
+                and alias_position is not None
+                and alias_position < projection_position
+            )
             if (
-                col_name.casefold() in local_aliases
+                folded_column in local_aliases
                 and not col.table
-                and self._is_inside_alias_scope(col)
+                and (
+                    self._is_inside_alias_scope(col)
+                    or references_prior_projection_alias
+                )
             ):
+                if (
+                    self._is_inside_physical_alias_precedence_scope(col)
+                    or references_prior_projection_alias
+                ):
+                    # DuckDB resolves unqualified names in WHERE, GROUP BY and
+                    # QUALIFY, window specifications, and later SELECT-list
+                    # expressions to an input column before a SELECT alias
+                    # when both exist, while also accepting the alias when the
+                    # input is absent. The parser has no physical schema yet,
+                    # so deciding either way can change results or reject a
+                    # valid query after projection pruning.
+                    # Mark every direct physical source in this scope so the
+                    # executor can disable projection pruning without turning
+                    # the alias spelling itself into a literal Parquet column.
+                    scope = _nearest_scope(col)
+                    if scope is not None:
+                        _force_full_for_scope(scope)
+                        _record_schema_dependent_binding(scope, col_name)
+                continue
+
+            scope = _nearest_scope(col)
+            scope_bindings = (
+                bindings_by_scope.get(id(scope), {})
+                if scope is not None
+                else {}
+            )
+            if (
+                not col.table
+                and len(scope_bindings) == 1
+                and folded_column in scope_bindings
+                and scope_bindings[folded_column] is not None
+            ):
+                # DuckDB treats a bare relation alias as a whole-row struct
+                # when no same-named physical column exists; that physical
+                # column takes precedence when present. Keeping only a guessed
+                # column loses one of those valid bindings, so retain the
+                # relation's complete visible schema.
+                _force_full_for_scope(scope)
+                _record_schema_dependent_binding(scope, col_name)
+                continue
+
+            if (
+                not col.table
+                and scope is not None
+                and bool(getattr(scope, "can_be_correlated", False))
+            ):
+                # SQL resolves an unqualified name locally and then through
+                # correlated ancestor scopes if no local source exposes it.
+                # Without runtime schemas, assigning it to either side can
+                # request a nonexistent local column or project away the outer
+                # column that actually binds. Preserve every physical
+                # candidate and let the backend perform its normal bind.
+                _force_full_for_scope(scope, include_ancestors=True)
+                _record_schema_dependent_binding(
+                    scope,
+                    col_name,
+                    include_ancestors=True,
+                )
                 continue
 
             resolved_alias = _resolve_column(col)
             if not resolved_alias:
-                # Derived-only and ambiguous scopes deliberately contribute no
-                # guessed projection.  Their physical leaf scopes still record
-                # their own exact dependencies; an untouched [] remains the
-                # existing conservative "all columns" sentinel.
+                # An unqualified name in a multi-source scope cannot be
+                # attributed without the runtime schemas. Explicitly retain
+                # every direct physical source: relying on its initial [] is
+                # unsafe because another qualified reference may already have
+                # narrowed that source's projection. Derived sources retain
+                # the independently collected dependencies of their leaf
+                # scopes.
+                if not col.table:
+                    if len(scope_bindings) > 1:
+                        _force_full_for_scope(scope)
+                        _record_schema_dependent_binding(scope, col_name)
                 continue
 
             if (
@@ -1078,10 +1510,26 @@ class SQLParser:
                 seen_per_alias[resolved_alias].add(col_name)
                 alias_to_columns[resolved_alias].append(col_name)
 
+        for owner, using_names in using_columns_by_owner.items():
+            if owner in table_star_aliases:
+                continue
+            for name in using_names:
+                if name not in seen_per_alias[owner]:
+                    seen_per_alias[owner].add(name)
+                    alias_to_columns[owner].append(name)
+
         # Apply star semantics after collection: star always wins.
-        for alias in table_star_aliases:
+        for alias in table_star_aliases | force_full_projection:
             alias_to_columns[alias] = []
 
+        # An unqualified WHERE/GROUP BY/QUALIFY/window-spec name that also names
+        # a SELECT alias is schema-dependent: DuckDB gives a same-named
+        # physical input column precedence while accepting the alias when the
+        # input is absent.
+        # Make the conservative decision at the shared parser boundary so
+        # every estimator/engine receives the physical schema it may need;
+        # fixing only one backend's loader leaves AUTO-routed engines with the
+        # same missing-column failure (and understates their scan estimate).
         # Sort columns for aliases that are not "all columns".
         for alias, cols in alias_to_columns.items():
             if cols:  # leave [] as special "all columns"
@@ -1115,6 +1563,29 @@ class SQLParser:
             result.append(definition)
 
         return result
+
+    def get_group_alias_ambiguities(self) -> Dict[str, Set[str]]:
+        """Return schema-dependent alias/input-name binding collisions.
+
+        The compatibility name predates WHERE/QUALIFY/window-spec support.
+        Callers must treat the returned mapping as read-only. A defensive copy
+        keeps parser state immutable when engines prepare a query.
+        """
+        return self.get_binding_ambiguities()
+
+    def get_binding_ambiguities(self) -> Dict[str, Set[str]]:
+        """Return schema-dependent unqualified-name binding candidates.
+
+        Each name must remain visible on every listed physical binding.  A
+        protected view that removes one can change backend name resolution,
+        turning an originally invalid/physical reference into a data-bearing
+        alias or whole-row expression.  Executors use this map to deny that
+        semantic change before creating protected relations.
+        """
+        return {
+            alias: set(columns)
+            for alias, columns in self._binding_ambiguities.items()
+        }
 
     def get_physical_tables(self) -> List[TableDefinition]:
         """

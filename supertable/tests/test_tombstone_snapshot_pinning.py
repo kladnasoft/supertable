@@ -3,21 +3,78 @@
 from __future__ import annotations
 
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import fakeredis
 import pandas as pd
 import pytest
 
+from supertable import redis_keys as RK
 from supertable.data_classes import Reflection, SuperSnapshot, TableDefinition
 from supertable.engine.engine_enum import Engine
+from supertable.redis_catalog import RedisCatalog
+from supertable.utils.snapshot import (
+    collect_share_row_filters,
+    complete_snapshot_payload,
+)
 
 
 _PINNED_DIGEST = "0" * 64
 
 
 class _LocalLikeStorage:
-    """No URL helpers: estimator leaves local/bare paths unchanged."""
+    """Explicit local resolver, independent of the developer's cloud env."""
+
+    @staticmethod
+    def to_duckdb_path(key):
+        return key
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {},
+        {"_row_filter": None},
+        {"_row_filter": ""},
+        {"_row_filter": " \t\n"},
+    ],
+)
+def test_blank_share_policy_markers_are_canonical_unrestricted(document):
+    """Catalog-compatible no-policy markers must agree across read paths."""
+    assert collect_share_row_filters(document) == ()
+
+
+@pytest.mark.parametrize("marker", [False, 0, [], {}])
+def test_nonstring_share_policy_markers_fail_closed(marker):
+    """Only the catalog's documented no-policy markers are unrestricted."""
+    with pytest.raises(RuntimeError, match="policy metadata is invalid"):
+        collect_share_row_filters({"_row_filter": marker})
+
+
+def test_cached_snapshot_versions_are_bounded_to_lua_exact_increment_range():
+    payload = {
+        "snapshot_version": 2**53 - 1,
+        "schema": [],
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": None,
+    }
+    assert complete_snapshot_payload(
+        payload,
+        expected_version=2**53 - 1,
+        require_policy_marker=True,
+    ) == payload
+
+    beyond_lua_exact_increment = {**payload, "snapshot_version": 2**53}
+    assert complete_snapshot_payload(
+        beyond_lua_exact_increment,
+        expected_version=2**53,
+        require_policy_marker=True,
+    ) is None
 
 
 def test_estimator_pins_tombstone_from_path_only_snapshot(monkeypatch):
@@ -111,6 +168,230 @@ def test_estimator_partial_leaf_falls_back_to_heavy_active_tombstone(monkeypatch
     )
 
 
+def test_complete_cache_without_policy_marker_loads_authoritative_filter(monkeypatch):
+    """A tombstone-complete legacy cache may still omit share authorization."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    cached = {
+        "snapshot_version": 4,
+        "schema": {"id": "Int64", "tenant_id": "Int64"},
+        "resources": [
+            {"file": "data/v4.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
+    heavy = {**cached, "_row_filter": "tenant_id = 7"}
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t", "path": "snapshots/v4.json", "version": 4,
+        "ts": 44, "payload": cached,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    super_table = MagicMock()
+    super_table.read_simple_table_snapshot.return_value = heavy
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: super_table,
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org", _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    assert reflection.supers[0].share_row_filter == "tenant_id = 7"
+    super_table.read_simple_table_snapshot.assert_called_once_with(
+        "snapshots/v4.json"
+    )
+
+
+@pytest.mark.parametrize("policy_location", ["payload", "snapshot"])
+def test_estimator_rejects_malformed_nonnull_share_policy(
+    monkeypatch, policy_location,
+):
+    """Corrupt share metadata may never become an unrestricted snapshot."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    snapshot = {
+        "snapshot_version": 4,
+        "schema": {"id": "Int64"},
+        "resources": [
+            {"file": "data/v4.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": None,
+    }
+    if policy_location == "payload":
+        leaf_payload = {**snapshot, "_row_filter": {"invalid": True}}
+        heavy_snapshot = snapshot
+    else:
+        # Force immutable resolution and put the malformed marker there.
+        leaf_payload = {
+            "snapshot_version": 4,
+            "schema": {"id": "Int64"},
+            "resources": snapshot["resources"],
+        }
+        heavy_snapshot = {**snapshot, "_row_filter": ["invalid"]}
+
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t", "path": "snapshots/v4.json", "version": 4,
+        "ts": 44, "payload": leaf_payload,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    super_table = MagicMock()
+    super_table.read_simple_table_snapshot.return_value = heavy_snapshot
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: super_table,
+    )
+
+    estimator = estimator_module.DataEstimator(
+        "org", _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    )
+    with pytest.raises(RuntimeError, match="policy metadata is invalid"):
+        estimator.estimate()
+
+
+@pytest.mark.parametrize(
+    ("outer_filter", "expected_filter", "error"),
+    [
+        ("tenant_id = 7", "tenant_id = 7", None),
+        ({"invalid": True}, None, "policy metadata is invalid"),
+    ],
+)
+def test_outer_leaf_share_policy_survives_catalog_enumeration(
+    monkeypatch, outer_filter, expected_filter, error,
+):
+    """The catalog must not erase an outer linked-share policy marker."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    client = fakeredis.FakeStrictRedis(decode_responses=True)
+    catalog = RedisCatalog(redis_client=client)
+    client.set(
+        RK.meta_root("org", "s"),
+        json.dumps({"version": 1, "ts": 1}),
+    )
+    payload = {
+        "snapshot_version": 4,
+        "schema": {"id": "Int64"},
+        "resources": [
+            {"file": "data/v4.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": None,
+    }
+    client.set(
+        RK.meta_leaf("org", "s", "t"),
+        json.dumps({
+            "version": 4,
+            "ts": 44,
+            "path": "snapshots/v4.json",
+            "payload": payload,
+            "_row_filter": outer_filter,
+        }),
+    )
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: MagicMock(),
+    )
+    estimator = estimator_module.DataEstimator(
+        "org", _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    )
+
+    if error is not None:
+        with pytest.raises(RuntimeError, match=error):
+            estimator.estimate()
+        return
+    reflection = estimator.estimate()
+    assert reflection.supers[0].share_row_filter == expected_filter
+
+
+def test_conflicting_share_policy_wrappers_are_combined_fail_closed(monkeypatch):
+    """No supported policy wrapper may silently replace another restriction."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    payload = {
+        "snapshot_version": 4,
+        "schema": {"id": "Int64", "tenant_id": "Int64"},
+        "resources": [
+            {"file": "data/v4.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": "tenant_id > 0",
+    }
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t",
+        "path": "snapshots/v4.json",
+        "version": 4,
+        "ts": 44,
+        "payload": payload,
+        "_row_filter": "tenant_id < 10",
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: MagicMock(),
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org",
+        _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    assert reflection.supers[0].share_row_filter == (
+        "(tenant_id < 10) AND (tenant_id > 0)"
+    )
+
+
+def test_direct_and_nested_share_policy_wrappers_are_both_enforced(monkeypatch):
+    """A complete direct cache must not hide its nested legacy restriction."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    nested = {
+        "snapshot_version": 4,
+        "schema": {"id": "Int64", "tenant_id": "Int64"},
+        "resources": [
+            {"file": "data/v4.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": "tenant_id < 10",
+    }
+    payload = {
+        **nested,
+        "_row_filter": "tenant_id > 0",
+        "snapshot": nested,
+    }
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t",
+        "path": "snapshots/v4.json",
+        "version": 4,
+        "ts": 44,
+        "payload": payload,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: MagicMock(),
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org",
+        _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    assert reflection.supers[0].share_row_filter == (
+        "(tenant_id > 0) AND (tenant_id < 10)"
+    )
+
+
 def test_estimator_accepts_authoritative_zero_resource_snapshot(monkeypatch):
     """Metadata-only delete-all remains a readable typed empty table."""
     estimator_module = importlib.import_module("supertable.engine.data_estimator")
@@ -127,6 +408,7 @@ def test_estimator_accepts_authoritative_zero_resource_snapshot(monkeypatch):
             "tombstone": None,
             "tombstone_rows": 0,
             "tombstone_digest": None,
+            "_row_filter": None,
         },
     }]
     monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)

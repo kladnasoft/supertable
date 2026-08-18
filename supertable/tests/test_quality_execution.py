@@ -201,3 +201,43 @@ def test_reader_is_tagged_as_quality_source_and_auto_is_default():
     assert result.ok
     assert seen["init"]["source"] == "quality"
     assert seen["execute"]["engine"] is Engine.AUTO
+
+
+def test_bounded_collection_capability_is_forwarded_as_a_boolean():
+    seen = {}
+
+    class Reader(_Reader):
+        response = (pd.DataFrame({"n": [1]}), Status.OK, None)
+
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            super().__init__(**kwargs)
+
+    result = execute_quality_sql(
+        organization="org",
+        super_name="sup",
+        sql="SELECT 1 AS n FROM sup.t",
+        reader_factory=Reader,
+        allow_bounded_collection_aggregates=True,
+    )
+
+    assert result.ok
+    assert seen["_allow_bounded_collection_aggregates"] is True
+
+
+def test_reader_construction_failure_is_structured_without_plan_stats():
+    def broken_reader(**_kwargs):
+        raise RuntimeError("reader construction failed")
+
+    result = execute_quality_sql(
+        organization="org",
+        super_name="sup",
+        sql="SELECT 1 AS n FROM sup.t",
+        reader_factory=broken_reader,
+    )
+
+    assert result.ok is False
+    assert result.status == "error"
+    assert result.message == "reader construction failed"
+    assert result.actual_engine is None
+    assert result.plan_stats == ()

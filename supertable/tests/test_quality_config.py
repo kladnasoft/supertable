@@ -6,10 +6,27 @@ import fakeredis
 import pytest
 
 from supertable.quality.config import BUILTIN_CHECKS, DQConfig, DQConfigReadError
+from supertable import redis_keys as RK
+
+
+def _seed_live_catalog(redis_client, table="facts"):
+    redis_client.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 0, "ts": 1}),
+    )
+    redis_client.set(
+        RK.meta_leaf("org", "lake", table),
+        json.dumps({
+            "version": 0,
+            "ts": 1,
+            "path": f"org/lake/{table}/snapshot.json",
+        }),
+    )
 
 
 def _config():
     redis_client = fakeredis.FakeRedis(decode_responses=True)
+    _seed_live_catalog(redis_client)
     return redis_client, DQConfig(redis_client, "org", "lake")
 
 
@@ -47,6 +64,25 @@ def test_config_setters_do_not_mutate_the_callers_object():
     assert config.set_table_config("facts", table_document, "alice")
     assert global_document == {"checks": {"T1": {"enabled": False}}}
     assert table_document == {"scope": "full"}
+
+
+def test_schedule_cooldown_rejects_values_outside_redis_safe_range():
+    redis_client, config = _config()
+    too_large = (1 << 31)
+
+    assert not config.set_schedule({"cooldown_seconds": too_large})
+    assert not config.set_table_schedule(
+        "facts", {"cooldown_seconds": too_large},
+    )
+    assert redis_client.get(config._key("schedule")) is None
+    assert redis_client.get(config._key("schedule", "facts")) is None
+
+    redis_client.set(
+        config._key("schedule"),
+        json.dumps({"cooldown_seconds": too_large}),
+    )
+    with pytest.raises(DQConfigReadError, match="cooldown_seconds"):
+        config.get_schedule()
 
 
 @pytest.mark.parametrize("column", ["event_time", "__timestamp__", None])
@@ -274,6 +310,9 @@ class _FaultPipeline:
     def sismember(self, *args, **kwargs):
         return self.inner.sismember(*args, **kwargs)
 
+    def type(self, *args, **kwargs):
+        return self.inner.type(*args, **kwargs)
+
     def multi(self):
         self.inner.multi()
         return self
@@ -432,6 +471,22 @@ def test_update_rule_rejects_orphaned_document_and_dangling_index():
         config.update_rule("orphan", {"threshold": 999})
     assert redis_client.get(document_key) is None
     assert redis_client.sismember(index_key, "orphan")
+
+
+def test_disabling_rule_cannot_persist_inventory_poison():
+    redis_client, config = _config()
+    original = config.create_rule(_valid_rule("disable_safely"))
+    document_key = config._key("rules", "doc", "disable_safely")
+
+    with pytest.raises(DQConfigReadError, match="unknown rule_type"):
+        config.update_rule(
+            "disable_safely",
+            {"enabled": False, "rule_type": "garbage"},
+        )
+
+    assert config.get_rule("disable_safely") == original
+    assert config.list_rules() == [original]
+    assert json.loads(redis_client.get(document_key)) == original
 
 
 class _ReadFaultRedis:
@@ -672,3 +727,166 @@ def test_delete_rule_is_atomic_and_returns_false_on_transaction_failure(phase):
     assert not config.delete_rule("delete_me")
     assert redis_client.get(config._key("rules", "doc", "delete_me")) is not None
     assert redis_client.sismember(config._key("rules", "index"), "delete_me")
+
+
+def test_delete_rule_wrong_type_index_cannot_partially_delete_document():
+    redis_client, config = _config()
+    document = _valid_rule("wrong-type-delete")
+    document_key = config._key("rules", "doc", document["rule_id"])
+    index_key = config._key("rules", "index")
+    encoded = json.dumps(document)
+    redis_client.set(document_key, encoded)
+    redis_client.set(index_key, "corrupt-not-a-set")
+
+    assert not config.delete_rule(document["rule_id"])
+    assert redis_client.get(document_key) == encoded
+    assert redis_client.get(index_key) == "corrupt-not-a-set"
+
+
+def test_create_rule_wrong_type_index_cannot_leave_orphan_document():
+    redis_client, config = _config()
+    rule_id = "wrong-type-create"
+    document_key = config._key("rules", "doc", rule_id)
+    index_key = config._key("rules", "index")
+    redis_client.set(index_key, "corrupt-not-a-set")
+
+    with pytest.raises(RuntimeError, match="could not persist quality rule"):
+        config.create_rule(_valid_rule(rule_id))
+
+    assert redis_client.get(document_key) is None
+    assert redis_client.get(index_key) == "corrupt-not-a-set"
+
+
+def test_quality_mutations_require_live_catalog_and_deletion_intent_absence():
+    redis_client, config = _config()
+    namespace_intent = RK.meta_namespace_deletion_intent("org", "lake")
+    table_intent = RK.meta_simple_deletion_intent("org", "lake", "facts")
+
+    redis_client.set(namespace_intent, json.dumps({"intent_id": "delete"}))
+    assert not config.set_schedule({"enabled": True})
+    assert not config.set_table_config("facts", {"scope": "full"})
+    assert not config.set_latest("facts", {"status": "ok"})
+    with pytest.raises(RuntimeError, match="could not persist quality rule"):
+        config.create_rule(_valid_rule("during-delete"))
+    assert redis_client.get(config._key("schedule")) is None
+    assert redis_client.get(config._key("latest", "facts")) is None
+
+    redis_client.delete(namespace_intent)
+    redis_client.set(table_intent, json.dumps({"intent_id": "delete-table"}))
+    assert config.set_schedule({"enabled": True})
+    assert not config.set_table_schedule("facts", {"enabled": True})
+    assert not config.set_latest_column("facts", "amount", {"status": "ok"})
+    assert not config.set_anomalies("facts", [])
+
+    redis_client.delete(table_intent)
+    redis_client.delete(RK.meta_leaf("org", "lake", "facts"))
+    assert not config.set_latest("facts", {"status": "ok"})
+    redis_client.delete(RK.meta_root("org", "lake"))
+    assert not config.set_global_config({"checks": {}})
+
+
+@pytest.mark.parametrize("field", ["version", "ts"])
+def test_quality_mutations_reject_catalog_identities_unsafe_in_redis_lua(field):
+    redis_client, config = _config()
+    too_large = (1 << 53)
+
+    root_key = RK.meta_root("org", "lake")
+    root = json.loads(redis_client.get(root_key))
+    root[field] = too_large
+    redis_client.set(root_key, json.dumps(root))
+    assert not config.set_global_config({"checks": {}})
+    with pytest.raises(RuntimeError, match="could not persist quality rule"):
+        config.create_rule(_valid_rule(f"unsafe-root-{field}"))
+
+    _seed_live_catalog(redis_client)
+    leaf_key = RK.meta_leaf("org", "lake", "facts")
+    leaf = json.loads(redis_client.get(leaf_key))
+    leaf[field] = too_large
+    redis_client.set(leaf_key, json.dumps(leaf))
+    assert not config.set_table_config("facts", {"scope": "full"})
+    assert not config.set_latest("facts", {"status": "stale"})
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        {"read_only": "garbage"},
+        {"clone_type": "unknown"},
+        {
+            "read_only": False,
+            "clone_type": "replica",
+            "cloned_from": "source",
+        },
+        {"replica_tables": ["facts", "facts"]},
+    ],
+)
+def test_quality_mutations_reject_corrupt_optional_root_lifecycle_fields(
+    corruption,
+):
+    redis_client, config = _config()
+    root_key = RK.meta_root("org", "lake")
+    root = json.loads(redis_client.get(root_key))
+    root.update(corruption)
+    redis_client.set(root_key, json.dumps(root))
+
+    assert not config.set_global_config({"checks": {}})
+    assert not config.set_table_schedule("facts", {"enabled": True})
+    assert not config.set_latest("facts", {"status": "stale"})
+    with pytest.raises(RuntimeError, match="could not persist quality rule"):
+        config.create_rule(_valid_rule("corrupt-root"))
+
+
+def test_quality_table_mutation_is_fenced_against_delete_recreate_aba():
+    redis_client, _ = _config()
+    leaf_key = RK.meta_leaf("org", "lake", "facts")
+
+    class RecreateBeforeMutation:
+        def __init__(self, inner):
+            self.inner = inner
+            self.swapped = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def eval(self, script, *args):
+            if "quality-config lifecycle-fenced set" in script and not self.swapped:
+                self.swapped = True
+                self.inner.set(
+                    leaf_key,
+                    json.dumps({
+                        "version": 0,
+                        "ts": 2,
+                        "path": "org/lake/facts/recreated-snapshot.json",
+                    }),
+                )
+            return self.inner.eval(script, *args)
+
+    raced = DQConfig(RecreateBeforeMutation(redis_client), "org", "lake")
+    assert not raced.set_latest("facts", {"status": "stale"})
+    assert redis_client.get(raced._key("latest", "facts")) is None
+
+
+def test_bulk_quality_inventories_fail_closed_on_backend_or_document_error():
+    redis_client, healthy = _config()
+
+    class ScanFault:
+        def __getattr__(self, name):
+            return getattr(redis_client, name)
+
+        def scan(self, *_args, **_kwargs):
+            raise RuntimeError("injected SCAN failure")
+
+    fault = DQConfig(ScanFault(), "org", "lake")
+    with pytest.raises(DQConfigReadError, match="schedule inventory"):
+        fault.get_all_table_schedules()
+    with pytest.raises(DQConfigReadError, match="latest quality"):
+        fault.get_all_latest()
+
+    redis_client.set(healthy._key("schedule", "facts"), "[]")
+    with pytest.raises(DQConfigReadError, match="wrong shape"):
+        healthy.get_all_table_schedules()
+
+    redis_client.delete(healthy._key("schedule", "facts"))
+    redis_client.set(healthy._key("latest", "facts"), "not-json")
+    with pytest.raises(DQConfigReadError, match="malformed"):
+        healthy.get_all_latest()

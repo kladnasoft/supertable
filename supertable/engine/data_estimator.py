@@ -22,7 +22,10 @@ from supertable.data_classes import (
 )
 from supertable.super_table import SuperTable
 from supertable.utils.helper import dict_keys_to_lowercase
-from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.utils.snapshot import (
+    combined_share_row_filter,
+    complete_snapshot_payload,
+)
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
@@ -57,9 +60,6 @@ def _safe_path_for_log(value: object) -> str:
     except Exception:
         pass
     return text
-
-
-from typing import Dict, List, Optional, Set, Tuple
 
 
 def get_missing_columns(
@@ -370,6 +370,7 @@ class DataEstimator:
                     "path": it["path"],
                     "version": it['version'],
                     "payload": it.get("payload"),
+                    "_row_filter": it.get("_row_filter"),
                 }
             )
         return snapshots
@@ -1237,6 +1238,7 @@ class DataEstimator:
                     current_snapshot_data = complete_snapshot_payload(
                         leaf_payload,
                         expected_version=snapshot.get("version"),
+                        require_policy_marker=True,
                     )
                     if current_snapshot_data is None:
                         current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
@@ -1315,18 +1317,17 @@ class DataEstimator:
                             )
                         tombstone_digest = None
 
-                    # Share policy is an overlay stored in the atomic Redis leaf
-                    # payload.  Prefer it there even when resources must fall
-                    # back to the heavy snapshot JSON.
-                    share_row_filter = None
-                    if isinstance(leaf_payload, dict):
-                        candidate_filter = leaf_payload.get("_row_filter")
-                        if isinstance(candidate_filter, str) and candidate_filter:
-                            share_row_filter = candidate_filter
-                    if share_row_filter is None:
-                        candidate_filter = current_snapshot_data.get("_row_filter")
-                        if isinstance(candidate_filter, str) and candidate_filter:
-                            share_row_filter = candidate_filter
+                    # Policy overlays have existed in all three wrappers
+                    # across catalog versions.  Never let a newer/outer marker
+                    # silently replace a different inner restriction: metadata
+                    # disagreement is safest when every valid predicate is
+                    # enforced.  Exact duplicates are collapsed to avoid
+                    # needlessly growing the expression passed to the strict
+                    # row-filter AST validator at the read boundary.
+                    share_row_filter = combined_share_row_filter(
+                        snapshot,
+                        current_snapshot_data,
+                    )
 
                     pinned_snapshot_metadata.append({
                         "path": current_snapshot_path,

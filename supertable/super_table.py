@@ -214,7 +214,8 @@ class SuperTable:
                 f"Could not acquire deletion fence for "
                 f"{self.organization}/{self.super_name}"
             )
-        leaf_tokens = {}
+        leaf_tokens: Dict[str, str] = {}
+        stage_tokens: Dict[str, str] = {}
         try:
             if recovery_intent_id is None:
                 intent = self.catalog.begin_namespace_deletion(
@@ -251,7 +252,9 @@ class SuperTable:
             names = sorted({
                 key.rsplit(leaf_marker, 1)[-1]
                 for key in self.catalog.scan_leaf_keys(
-                    self.organization, self.super_name,
+                    self.organization,
+                    self.super_name,
+                    resolve_replica=False,
                 )
                 if leaf_marker in key
             })
@@ -269,6 +272,88 @@ class SuperTable:
                         f"{self.organization}/{self.super_name}/{name}"
                     )
                 leaf_tokens[name] = token
+
+            # A first-time writer owns a leaf lock before it has any leaf to
+            # enumerate. Discover live lock keys as well and require two stable
+            # complete scans after the durable parent intent. New entrants now
+            # fail their pre-I/O intent check; pre-intent owners are drained.
+            stable_leaf_scans = 0
+            leaf_scan_rounds = 0
+            while stable_leaf_scans < 2:
+                leaf_scan_rounds += 1
+                if leaf_scan_rounds > 10_000:
+                    raise RuntimeError(
+                        "Table-writer drain exceeded its stability bound"
+                    )
+                names = self.catalog.scan_leaf_lock_names(
+                    self.organization,
+                    self.super_name,
+                )
+                missing = sorted(set(names).difference(leaf_tokens))
+                if not missing:
+                    stable_leaf_scans += 1
+                    continue
+                stable_leaf_scans = 0
+                if len(leaf_tokens) + len(missing) > 10_000:
+                    raise RuntimeError(
+                        "Table-writer drain exceeded its key bound"
+                    )
+                for name in missing:
+                    token = self.catalog.acquire_simple_lock(
+                        self.organization,
+                        self.super_name,
+                        name,
+                        ttl_s=30,
+                        timeout_s=60,
+                    )
+                    if not token:
+                        raise TimeoutError(
+                            f"Could not drain writer for "
+                            f"{self.organization}/{self.super_name}/{name}"
+                        )
+                    leaf_tokens[name] = token
+
+            # Stage uploads also perform object-store I/O while holding their
+            # own renewable lease. Enumerate lock keys rather than only the
+            # staging index: a first-time creator owns a lock before it has any
+            # metadata to list. Two complete stable scans close discovery churn
+            # after the durable namespace intent has made every newly-entering
+            # writer fail before storage I/O.
+            stable_stage_scans = 0
+            stage_scan_rounds = 0
+            while stable_stage_scans < 2:
+                stage_scan_rounds += 1
+                if stage_scan_rounds > 10_000:
+                    raise RuntimeError(
+                        "Stage-writer drain exceeded its stability bound"
+                    )
+                names = self.catalog.scan_stage_lock_names(
+                    self.organization,
+                    self.super_name,
+                )
+                missing = sorted(set(names).difference(stage_tokens))
+                if not missing:
+                    stable_stage_scans += 1
+                    continue
+                stable_stage_scans = 0
+                if len(stage_tokens) + len(missing) > 10_000:
+                    raise RuntimeError(
+                        "Stage-writer drain exceeded its key bound"
+                    )
+                for name in missing:
+                    token = self.catalog.acquire_stage_lock(
+                        self.organization,
+                        self.super_name,
+                        name,
+                        ttl_s=30,
+                        timeout_s=60,
+                    )
+                    if not token:
+                        raise TimeoutError(
+                            f"Could not drain staging writer for "
+                            f"{self.organization}/{self.super_name}/{name}"
+                        )
+                    stage_tokens[name] = token
 
             # Object-store prefixes normally have no exact marker object. The
             # backend operation drains and verifies the full prefix while no
@@ -295,6 +380,10 @@ class SuperTable:
                     ),
                 )
         finally:
+            for name, token in reversed(list(stage_tokens.items())):
+                self.catalog.release_stage_lock(
+                    self.organization, self.super_name, name, token,
+                )
             for name, token in reversed(list(leaf_tokens.items())):
                 self.catalog.release_simple_lock(
                     self.organization, self.super_name, name, token,

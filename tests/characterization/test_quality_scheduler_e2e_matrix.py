@@ -197,8 +197,8 @@ def test_real_write_all_quality_modes_are_truthful_and_auto_certified(
     executions = []
     original_execute = scheduler._execute_quality_statement
 
-    def observe_execution(org: str, sup: str, sql: str):
-        result = original_execute(org, sup, sql)
+    def observe_execution(org: str, sup: str, sql: str, **kwargs):
+        result = original_execute(org, sup, sql, **kwargs)
         executions.append((sql, result))
         return result
 
@@ -412,9 +412,9 @@ def test_scheduler_quotes_hyphenated_supertable_identifier_end_to_end(
     observed_sql = []
     original_execute = scheduler._execute_quality_statement
 
-    def observe(org: str, sup: str, sql: str):
+    def observe(org: str, sup: str, sql: str, **kwargs):
         observed_sql.append(sql)
-        return original_execute(org, sup, sql)
+        return original_execute(org, sup, sql, **kwargs)
 
     monkeypatch.setattr(scheduler, "_execute_quality_statement", observe)
     outcomes = {

@@ -80,6 +80,7 @@ def _dummy_snapshot(
         "tombstone_rows": 0,
         "tombstone_digest": None,
         "rowid_high_watermark": 0,
+        "_row_filter": None,
     }
 
 
@@ -111,7 +112,10 @@ def _install_writer_catalog_contract(
         catalog.commit_snapshot_mock.return_value = (1, 1)
     catalog.mirror_state_events = []
 
-    def reserve_rowids_at_least(self, org, sup, simple, count, floor):
+    def reserve_rowids_at_least(
+            self, org, sup, simple, count, floor, *, lock_token,
+    ):
+        assert lock_token
         return self.reserve_rowids_at_least_mock(
             org, sup, simple, count, floor,
         )
@@ -707,7 +711,7 @@ class TestSimpleTableGetSnapshot:
         from supertable.simple_table import SimpleTable
 
         inner_snap = _dummy_snapshot("tbl", resources=[_resource_entry("f.parquet")])
-        payload = {"snapshot": inner_snap}
+        payload = {"snapshot": inner_snap, "_row_filter": None}
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
@@ -1668,6 +1672,7 @@ class TestDataReaderExecute:
         mock_parser.get_physical_tables.return_value = [table]
         mock_parser.get_predicate_constraints.return_value = {}
         mock_parser.get_join_edges.return_value = []
+        mock_parser.get_binding_ambiguities.return_value = {}
         mock_parser.original_query = "SELECT * FROM tbl"
         mock_parser_cls.return_value = mock_parser
         mock_get_storage.return_value = MagicMock()
@@ -1732,6 +1737,7 @@ class TestDataReaderExecute:
 
         mock_parser = MagicMock()
         mock_parser.get_table_tuples.return_value = []
+        mock_parser.get_binding_ambiguities.return_value = {}
         mock_parser.original_query = "SELECT * FROM tbl"
         mock_parser_cls.return_value = mock_parser
         mock_get_storage.return_value = MagicMock()
@@ -1779,6 +1785,7 @@ class TestDataReaderExecute:
 
         mock_parser = MagicMock()
         mock_parser.get_table_tuples.return_value = []
+        mock_parser.get_binding_ambiguities.return_value = {}
         mock_parser.original_query = "SELECT * FROM tbl"
         mock_parser_cls.return_value = mock_parser
         mock_get_storage.return_value = MagicMock()

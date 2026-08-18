@@ -39,6 +39,12 @@ class DQConfigReadError(RuntimeError):
 
 
 _MISSING = object()
+# Keep scheduler-controlled expirations in a conservative range supported by
+# every Redis deployment we target.  Lua represents numbers as doubles and
+# Redis converts EX seconds to signed millisecond deadlines; a smaller exact
+# bound also prevents a late SET/EX error from turning a script into a partial
+# success publication.
+_MAX_REDIS_TTL_SECONDS = (1 << 31) - 1
 
 
 def _now_iso() -> str:
@@ -59,6 +65,32 @@ from supertable import redis_keys as RK
 
 def _dq_key(org: str, sup: str, *parts: str) -> str:
     return RK.quality_prefix(org, sup) + ":".join(parts)
+
+
+_LUA_SET_QUALITY_IF_LIVE = """
+-- quality-config lifecycle-fenced set
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return -1 end
+if redis.call('exists', KEYS[2]) == 1 then return -2 end
+if ARGV[2] == '1' then
+  if redis.call('get', KEYS[3]) ~= ARGV[3] then return -3 end
+  if redis.call('exists', KEYS[4]) == 1 then return -2 end
+end
+redis.call('set', KEYS[5], ARGV[4])
+return 1
+"""
+
+
+_LUA_DELETE_QUALITY_IF_LIVE = """
+-- quality-config lifecycle-fenced delete
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return -1 end
+if redis.call('exists', KEYS[2]) == 1 then return -2 end
+if ARGV[2] == '1' then
+  if redis.call('get', KEYS[3]) ~= ARGV[3] then return -3 end
+  if redis.call('exists', KEYS[4]) == 1 then return -2 end
+end
+redis.call('del', KEYS[5])
+return 1
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -152,6 +184,112 @@ class DQConfig:
 
     def _key(self, *parts: str) -> str:
         return _dq_key(self.org, self.sup, *parts)
+
+    def _valid_catalog_identity(self, raw: Any, *, leaf: bool) -> bool:
+        """Validate the canonical catalog lifecycle document before fencing."""
+
+        if raw is None:
+            return False
+        try:
+            document = json.loads(raw)
+            # Keep this boundary identical to RedisCatalog's authoritative
+            # structural contract. Identity-only checks would accept corrupt
+            # read-only/clone fields and acknowledge quality mutations under a
+            # namespace every catalog operation treats as invalid.
+            from supertable.redis_catalog import (
+                _validate_leaf_document,
+                _validate_root_document,
+            )
+            if leaf:
+                _validate_leaf_document(document)
+            else:
+                _validate_root_document(
+                    document, org=self.org, sup=self.sup,
+                )
+        except (ImportError, TypeError, ValueError, UnicodeError):
+            return False
+        return True
+
+    def _snapshot_mutation_lifecycle(
+        self,
+        table: Optional[str],
+    ) -> Optional[tuple[Any, Any]]:
+        """Capture the exact namespace/table incarnation a write targets."""
+
+        try:
+            root_raw = self.r.get(RK.meta_root(self.org, self.sup))
+            if not self._valid_catalog_identity(root_raw, leaf=False):
+                return None
+            leaf_raw = ""
+            if table is not None:
+                leaf_raw = self.r.get(RK.meta_leaf(self.org, self.sup, table))
+                if not self._valid_catalog_identity(leaf_raw, leaf=True):
+                    return None
+            return root_raw, leaf_raw
+        except Exception as exc:
+            logger.error("[dq-config] catalog lifecycle read error: %s", exc)
+            return None
+
+    def _mutate_if_live(
+        self,
+        target_key: str,
+        *,
+        table: Optional[str],
+        payload: Optional[str],
+    ) -> bool:
+        """Set/delete one quality key iff its catalog incarnation is live.
+
+        The root/leaf values captured before the call are compared in the same
+        Redis boundary as the mutation.  Namespace or table deletion, and a
+        delete/recreate ABA, therefore cannot turn a stale DQConfig call into a
+        write against a different logical table.
+        """
+
+        lifecycle = self._snapshot_mutation_lifecycle(table)
+        if lifecycle is None:
+            return False
+        root_raw, leaf_raw = lifecycle
+        has_table = table is not None
+        leaf_key = (
+            RK.meta_leaf(self.org, self.sup, table)
+            if table is not None else RK.meta_root(self.org, self.sup)
+        )
+        simple_intent_key = (
+            RK.meta_simple_deletion_intent(self.org, self.sup, table)
+            if table is not None
+            else RK.meta_namespace_deletion_intent(self.org, self.sup)
+        )
+        script = (
+            _LUA_SET_QUALITY_IF_LIVE
+            if payload is not None else _LUA_DELETE_QUALITY_IF_LIVE
+        )
+        try:
+            result = int(self.r.eval(
+                script,
+                5,
+                RK.meta_root(self.org, self.sup),
+                RK.meta_namespace_deletion_intent(self.org, self.sup),
+                leaf_key,
+                simple_intent_key,
+                target_key,
+                root_raw,
+                "1" if has_table else "0",
+                leaf_raw if has_table else "",
+                payload if payload is not None else "",
+            ))
+            return result == 1
+        except Exception as exc:
+            logger.error("[dq-config] lifecycle-fenced mutation error: %s", exc)
+            return False
+
+    def _require_watched_namespace_live(self, pipe: Any) -> None:
+        """Validate namespace lifecycle after its keys have been WATCHed."""
+
+        root_raw = pipe.get(RK.meta_root(self.org, self.sup))
+        if not self._valid_catalog_identity(root_raw, leaf=False):
+            raise RuntimeError("quality namespace is not live")
+        if pipe.exists(RK.meta_namespace_deletion_intent(self.org, self.sup)):
+            raise RuntimeError("quality namespace deletion is active")
 
     def _read_json(
         self,
@@ -247,6 +385,7 @@ class DQConfig:
                 isinstance(cooldown, bool)
                 or not isinstance(cooldown, int)
                 or cooldown < 0
+                or cooldown > _MAX_REDIS_TTL_SECONDS
             ):
                 raise DQConfigReadError(
                     f"persisted {label} has an invalid cooldown_seconds"
@@ -315,9 +454,10 @@ class DQConfig:
             stored = deepcopy(config)
             stored["updated_by"] = updated_by
             stored["updated_at"] = _now_iso()
-            persisted = self.r.set(
+            persisted = self._mutate_if_live(
                 self._key("config", "__global__"),
-                json.dumps(stored, default=str),
+                table=None,
+                payload=json.dumps(stored, default=str),
             )
             return bool(persisted)
         except Exception as e:
@@ -349,9 +489,10 @@ class DQConfig:
             stored = deepcopy(config)
             stored["updated_by"] = updated_by
             stored["updated_at"] = _now_iso()
-            persisted = self.r.set(
+            persisted = self._mutate_if_live(
                 self._key("config", table),
-                json.dumps(stored, default=str),
+                table=table,
+                payload=json.dumps(stored, default=str),
             )
             return bool(persisted)
         except Exception as e:
@@ -360,8 +501,9 @@ class DQConfig:
 
     def delete_table_config(self, table: str) -> bool:
         try:
-            self.r.delete(self._key("config", table))
-            return True
+            return self._mutate_if_live(
+                self._key("config", table), table=table, payload=None,
+            )
         except Exception as e:
             logger.error(f"[dq-config] delete_table_config error: {e}")
             return False
@@ -537,6 +679,10 @@ class DQConfig:
         candidate["created_at"] = _now_iso()
         document_key = self._key("rules", "doc", rule_id)
         index_key = self._key("rules", "index")
+        root_key = RK.meta_root(self.org, self.sup)
+        namespace_intent_key = RK.meta_namespace_deletion_intent(
+            self.org, self.sup,
+        )
         payload = json.dumps(candidate, default=str)
         pipe = None
         try:
@@ -547,7 +693,22 @@ class DQConfig:
             pipe = self.r.pipeline()
             while True:
                 try:
-                    pipe.watch(document_key, index_key)
+                    pipe.watch(
+                        document_key,
+                        index_key,
+                        root_key,
+                        namespace_intent_key,
+                    )
+                    self._require_watched_namespace_live(pipe)
+                    index_type = pipe.type(index_key)
+                    if isinstance(index_type, bytes):
+                        index_type = index_type.decode("ascii", errors="strict")
+                    if index_type not in ("none", "set"):
+                        # EXEC does not roll back an earlier successful SET
+                        # when the following SADD fails with WRONGTYPE.
+                        raise DQConfigReadError(
+                            "quality rule index has the wrong Redis type"
+                        )
                     if pipe.exists(document_key) or pipe.sismember(index_key, rule_id):
                         raise ValueError(
                             f"quality rule {rule_id!r} already exists"
@@ -595,6 +756,10 @@ class DQConfig:
         requested_updates = deepcopy(updates)
         document_key = self._key("rules", "doc", rule_id)
         index_key = self._key("rules", "index")
+        root_key = RK.meta_root(self.org, self.sup)
+        namespace_intent_key = RK.meta_namespace_deletion_intent(
+            self.org, self.sup,
+        )
         pipe = None
         try:
             pipe = self.r.pipeline()
@@ -603,7 +768,13 @@ class DQConfig:
                     # Both the document and discoverability index are
                     # authorities. A delete or repair racing this update must
                     # invalidate EXEC so SET can never recreate an orphan.
-                    pipe.watch(document_key, index_key)
+                    pipe.watch(
+                        document_key,
+                        index_key,
+                        root_key,
+                        namespace_intent_key,
+                    )
+                    self._require_watched_namespace_live(pipe)
                     raw = pipe.get(document_key)
                     indexed = bool(pipe.sismember(index_key, rule_id))
                     if raw is None:
@@ -667,6 +838,13 @@ class DQConfig:
                                 f"invalid quality rule ({validation.code}): "
                                 f"{validation.message}"
                             )
+                    # Disabling is the remediation path for recognisable
+                    # legacy rules, not permission to persist an arbitrary
+                    # document that poisons the indexed inventory.  Enforce
+                    # identity, known type, table scope, and minimum shape for
+                    # both enabled and disabled candidates; only the deeper
+                    # execution validator above is relaxed while disabled.
+                    self._validate_rule_inventory_document(rule_id, candidate)
                     candidate["updated_at"] = _now_iso()
                     pipe.multi()
                     pipe.set(
@@ -711,10 +889,40 @@ class DQConfig:
     def delete_rule(self, rule_id: str) -> bool:
         pipe = None
         try:
-            pipe = self.r.pipeline(transaction=True)
-            pipe.delete(self._key("rules", "doc", rule_id))
-            pipe.srem(self._key("rules", "index"), rule_id)
-            results = pipe.execute()
+            document_key = self._key("rules", "doc", rule_id)
+            index_key = self._key("rules", "index")
+            root_key = RK.meta_root(self.org, self.sup)
+            namespace_intent_key = RK.meta_namespace_deletion_intent(
+                self.org, self.sup,
+            )
+            pipe = self.r.pipeline()
+            while True:
+                try:
+                    pipe.watch(
+                        document_key,
+                        index_key,
+                        root_key,
+                        namespace_intent_key,
+                    )
+                    self._require_watched_namespace_live(pipe)
+                    index_type = pipe.type(index_key)
+                    if isinstance(index_type, bytes):
+                        index_type = index_type.decode("ascii", errors="strict")
+                    if index_type not in ("none", "set"):
+                        # Redis transactions do not roll back earlier commands
+                        # after a later command returns WRONGTYPE.  Entering
+                        # MULTI with a string-valued index would therefore let
+                        # DEL remove the document before SREM failed.
+                        raise DQConfigReadError(
+                            "quality rule index has the wrong Redis type"
+                        )
+                    pipe.multi()
+                    pipe.delete(document_key)
+                    pipe.srem(index_key, rule_id)
+                    results = pipe.execute()
+                    break
+                except redis.WatchError:
+                    continue
         except Exception as e:
             logger.error(f"[dq-config] delete_rule error: {e}")
             return False
@@ -769,10 +977,12 @@ class DQConfig:
             if not isinstance(schedule, dict):
                 return False
             self._validate_schedule_document(schedule, "global quality schedule")
-            schedule["updated_at"] = _now_iso()
-            persisted = self.r.set(
+            stored = deepcopy(schedule)
+            stored["updated_at"] = _now_iso()
+            persisted = self._mutate_if_live(
                 self._key("schedule"),
-                json.dumps(schedule, default=str),
+                table=None,
+                payload=json.dumps(stored, default=str),
             )
             return bool(persisted)
         except Exception as e:
@@ -801,10 +1011,12 @@ class DQConfig:
                 schedule,
                 f"quality schedule for table {table!r}",
             )
-            schedule["updated_at"] = _now_iso()
-            persisted = self.r.set(
+            stored = deepcopy(schedule)
+            stored["updated_at"] = _now_iso()
+            persisted = self._mutate_if_live(
                 self._key("schedule", table),
-                json.dumps(schedule, default=str),
+                table=table,
+                payload=json.dumps(stored, default=str),
             )
             return bool(persisted)
         except Exception as e:
@@ -814,8 +1026,9 @@ class DQConfig:
     def delete_table_schedule(self, table: str) -> bool:
         """Remove a per-table schedule override (reverts to global)."""
         try:
-            self.r.delete(self._key("schedule", table))
-            return True
+            return self._mutate_if_live(
+                self._key("schedule", table), table=table, payload=None,
+            )
         except Exception as e:
             logger.error(f"[dq-config] delete_table_schedule error: {e}")
             return False
@@ -837,13 +1050,43 @@ class DQConfig:
                 for key in keys_found:
                     pipe.get(key)
                 values = pipe.execute()
+                if (
+                    not isinstance(values, (list, tuple))
+                    or len(values) != len(keys_found)
+                ):
+                    raise DQConfigReadError(
+                        "quality table schedule inventory read was incomplete"
+                    )
                 for key, raw in zip(keys_found, values):
                     k = key if isinstance(key, str) else key.decode("utf-8")
                     suffix = k[len(prefix):]
-                    if raw:
-                        results[suffix] = json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_all_table_schedules error: {e}")
+                    if raw is None:
+                        raise DQConfigReadError(
+                            f"quality schedule for table {suffix!r} disappeared "
+                            "during inventory read"
+                        )
+                    try:
+                        document = json.loads(raw)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise DQConfigReadError(
+                            f"quality schedule for table {suffix!r} is malformed"
+                        ) from exc
+                    if not isinstance(document, dict):
+                        raise DQConfigReadError(
+                            f"quality schedule for table {suffix!r} has the wrong shape"
+                        )
+                    self._validate_schedule_document(
+                        document,
+                        f"quality schedule for table {suffix!r}",
+                    )
+                    results[suffix] = document
+        except DQConfigReadError:
+            raise
+        except Exception as exc:
+            logger.error("[dq-config] get_all_table_schedules error: %s", exc)
+            raise DQConfigReadError(
+                "could not read quality table schedule inventory"
+            ) from exc
         return results
 
     # ── Latest results (fast UI cache) ────────────────────────────────
@@ -858,9 +1101,10 @@ class DQConfig:
 
     def set_latest(self, table: str, result: Dict[str, Any]) -> bool:
         try:
-            persisted = self.r.set(
+            persisted = self._mutate_if_live(
                 self._key("latest", table),
-                json.dumps(
+                table=table,
+                payload=json.dumps(
                     normalize_json_value(result),
                     allow_nan=False,
                     ensure_ascii=False,
@@ -882,9 +1126,10 @@ class DQConfig:
 
     def set_latest_column(self, table: str, column: str, result: Dict[str, Any]) -> bool:
         try:
-            persisted = self.r.set(
+            persisted = self._mutate_if_live(
                 self._key("latest", table, column),
-                json.dumps(
+                table=table,
+                payload=json.dumps(
                     normalize_json_value(result),
                     allow_nan=False,
                     ensure_ascii=False,
@@ -906,9 +1151,10 @@ class DQConfig:
 
     def set_anomalies(self, table: str, anomalies: List[Dict[str, Any]]) -> bool:
         try:
-            persisted = self.r.set(
+            persisted = self._mutate_if_live(
                 self._key("anomalies", table),
-                json.dumps(
+                table=table,
+                payload=json.dumps(
                     normalize_json_value(anomalies),
                     allow_nan=False,
                     ensure_ascii=False,
@@ -945,9 +1191,37 @@ class DQConfig:
                 for rkey, _ in table_keys:
                     pipe.get(rkey)
                 values = pipe.execute()
+                if (
+                    not isinstance(values, (list, tuple))
+                    or len(values) != len(table_keys)
+                ):
+                    raise DQConfigReadError(
+                        "latest quality result inventory read was incomplete"
+                    )
                 for (_, table_name), raw in zip(table_keys, values):
-                    if raw:
-                        results[table_name] = json.loads(raw)
-        except Exception as e:
-            logger.error(f"[dq-config] get_all_latest error: {e}")
+                    if raw is None:
+                        raise DQConfigReadError(
+                            f"latest quality result for table {table_name!r} "
+                            "disappeared during inventory read"
+                        )
+                    try:
+                        document = json.loads(raw)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise DQConfigReadError(
+                            f"latest quality result for table {table_name!r} "
+                            "is malformed"
+                        ) from exc
+                    if not isinstance(document, dict):
+                        raise DQConfigReadError(
+                            f"latest quality result for table {table_name!r} "
+                            "has the wrong shape"
+                        )
+                    results[table_name] = document
+        except DQConfigReadError:
+            raise
+        except Exception as exc:
+            logger.error("[dq-config] get_all_latest error: %s", exc)
+            raise DQConfigReadError(
+                "could not read latest quality result inventory"
+            ) from exc
         return results

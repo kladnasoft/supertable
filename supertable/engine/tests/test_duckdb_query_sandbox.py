@@ -601,6 +601,48 @@ def test_user_duckdb_execution_does_not_persist_raw_profiles(tmp_path):
     assert not profile.exists()
 
 
+def test_duckdb_group_alias_collision_disables_source_projection(tmp_path):
+    source = tmp_path / "group-alias-collision.parquet"
+    pl.DataFrame({
+        "x": [1, 2, 1],
+        "y": [10, 10, 20],
+        "__rowid__": [1, 2, 3],
+        "__timestamp__": [1, 1, 1],
+    }).write_parquet(source)
+    snapshot = SuperSnapshot(
+        "lake",
+        "facts",
+        1,
+        [str(source)],
+        {"x", "y", "__rowid__", "__timestamp__"},
+        ["raw/facts/one"],
+        column_types={
+            "x": "Int64",
+            "y": "Int64",
+            "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    )
+    sql = "SELECT y, COUNT(*) AS x FROM lake.facts GROUP BY y, x"
+    parser = SQLParser("lake", sql, "duckdb")
+    assert parser.get_table_tuples()[0].columns == []
+    assert parser.get_group_alias_ambiguities() == {"facts": {"x"}}
+
+    result = DuckDB().execute(
+        Reflection("local", source.stat().st_size, 1, [snapshot]),
+        parser,
+        SimpleNamespace(
+            temp_dir=str(tmp_path),
+            query_plan_path=str(tmp_path / "profile.json"),
+        ),
+        lambda _event: None,
+    )
+
+    assert sorted(result.itertuples(index=False, name=None)) == [
+        (10, 1), (10, 1), (20, 1),
+    ]
+
+
 def test_public_error_redaction_removes_url_userinfo_query_and_fragment():
     raw = (
         "failed https://alice:password@example.test/path/data.parquet"

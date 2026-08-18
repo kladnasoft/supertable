@@ -390,6 +390,7 @@ class GCSStorage(StorageInterface):
         """Delete and verify a GCS prefix with bounded retry batches."""
         import itertools
 
+        path = self._require_nonempty_delete_prefix(path)
         physical = self._with_base(path)
         exact = self.bucket.get_blob(physical)
         if exact is not None:
@@ -484,10 +485,10 @@ class GCSStorage(StorageInterface):
             raise ValueError(f"File is empty: {path}")
         buf = io.BytesIO(data)
         proj = None
-        if columns:
+        if columns is not None:
             proj = self._project_columns(pq.read_schema(buf).names, columns)
             buf.seek(0)
-        return pq.read_table(buf, columns=proj) if proj else pq.read_table(buf)
+        return pq.read_table(buf, columns=proj)
 
     # -------------------------
     # Raw bytes / text

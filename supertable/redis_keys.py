@@ -809,6 +809,19 @@ def lock_stage(org: str, sup: str, stage_name: str) -> str:
     )
 
 
+def lock_stage_pattern(org: str, sup: str) -> str:
+    """SCAN pattern matching every staging lock in one SuperTable."""
+    return lock_stage_prefix(org, sup) + "*"
+
+
+def lock_stage_prefix(org: str, sup: str) -> str:
+    """Prefix used to recover a validated stage name from a lock key."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:stage:doc:"
+    )
+
+
 # --- RBAC — users ---------------------------------------------------------- #
 
 def rbac_scope(org: str, sup: str) -> str:

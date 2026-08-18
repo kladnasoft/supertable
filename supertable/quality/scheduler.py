@@ -46,7 +46,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from supertable.quality.serialization import normalize_json_value
 
@@ -67,15 +67,45 @@ DEFAULT_MAX_WORKERS = max(
 DEFAULT_JOB_DEADLINE_SECONDS = max(
     1, int(os.environ.get("SUPERTABLE_DQ_JOB_DEADLINE_SECONDS", "300"))
 )
+DEFAULT_PREPARED_HISTORY_TTL_SECONDS = max(
+    86_400,
+    DEFAULT_JOB_DEADLINE_SECONDS + DEFAULT_RUNNING_TTL_SECONDS,
+)
 _PROCESS_POLL_SECONDS = 0.02
 _PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 _PROCESS_RESULT_EXIT_GRACE_SECONDS = 0.25
 
 QUALITY_MODES = ("quick", "deep", "custom")
+_REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
+_MAX_REDIS_TTL_SECONDS = (1 << 31) - 1
+_CronLeaseAdmission = Tuple[str, int, str, str, int]
+_TableLeaseAdmission = Tuple[str, Any, str, str]
+_IngestNotificationAdmission = Tuple[str, Any, str, Any, str, str]
 
 
 class _LeaseLostError(RuntimeError):
     """Raised when a scheduler worker no longer owns its table lease."""
+
+
+def _require_redis_ttl_seconds(
+    value: Any,
+    *,
+    label: str,
+    allow_zero: bool = False,
+) -> int:
+    """Return an exact, portable Redis EX duration without coercion."""
+
+    minimum = 0 if allow_zero else 1
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > _MAX_REDIS_TTL_SECONDS
+    ):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(
+            f"{label} must be an exact {qualifier} Redis-safe integer"
+        )
+    return value
 
 
 @dataclass
@@ -92,6 +122,8 @@ class _LeaseGuard:
     token: str
     lost: threading.Event = field(default_factory=threading.Event)
     fence_lock: Any = field(default_factory=threading.RLock)
+    table_admission: Optional[_TableLeaseAdmission] = None
+    prepared_history: Optional["_PreparedHistory"] = None
 
     def mark_lost(self) -> None:
         with self.fence_lock:
@@ -130,6 +162,16 @@ def _assert_lease_owned(lease_guard: Optional[_LeaseGuard]) -> None:
 
 
 @dataclass(frozen=True)
+class _PreparedHistory:
+    """A durable history row that is not deliverable until success commits."""
+
+    history_id: str
+    prepared_key: str
+    outbox_key: str
+    payload: str
+
+
+@dataclass(frozen=True)
 class CheckRunOutcome:
     """Truthful result of one scheduler attempt.
 
@@ -149,6 +191,20 @@ class CheckRunOutcome:
     skipped: int = 0
     message: str = ""
     details: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    # Scheduler-owned runners defer their Redis-visible latest/column bundle
+    # until the outer lease owner can commit it together with cooldown,
+    # pending-generation and cron-phase bookkeeping.  Direct/manual runners
+    # publish immediately and leave this empty.
+    publication: Tuple[Tuple[Tuple[str, ...], Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+        compare=False,
+    )
+    prepared_history: Optional[_PreparedHistory] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def successful(self) -> bool:
@@ -186,6 +242,8 @@ def _success(
     critical: int = 0,
     skipped: int = 0,
     details: Optional[List[Dict[str, Any]]] = None,
+    publication: Optional[List[Tuple[Tuple[str, ...], Any]]] = None,
+    prepared_history: Optional[_PreparedHistory] = None,
 ) -> CheckRunOutcome:
     return CheckRunOutcome(
         mode=mode,
@@ -196,6 +254,8 @@ def _success(
         critical=critical,
         skipped=skipped,
         details=tuple(details or ()),
+        publication=tuple(publication or ()),
+        prepared_history=prepared_history,
     )
 
 
@@ -239,6 +299,171 @@ _scheduler_stats: Dict[str, Any] = {
 # Public API — called from ingest code
 # ──────────────────────────────────────────────────────────────────────
 
+def _begin_ingest_notification(
+    r,
+    org: str,
+    sup: str,
+    table_name: str,
+    generation: str,
+) -> Optional[_IngestNotificationAdmission]:
+    """Persist an unresolved generation under one live root/leaf snapshot."""
+
+    root_key = RK.meta_root(org, sup)
+    leaf_key = RK.meta_leaf(org, sup, table_name)
+    simple_intent_key = RK.meta_simple_deletion_intent(org, sup, table_name)
+    namespace_intent_key = RK.meta_namespace_deletion_intent(org, sup)
+    unresolved_key = _unresolved_pending_key(org, sup, table_name)
+    script = """
+    -- atomically capture the ingest notification's catalog incarnation
+    if redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return {}
+    end
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if not root_payload or not leaf_payload then
+        return {}
+    end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return {}
+    end
+    redis.call('set', KEYS[5], ARGV[1])
+    return {root_payload, leaf_payload}
+    """
+    captured = r.eval(
+        script,
+        5,
+        root_key,
+        leaf_key,
+        simple_intent_key,
+        namespace_intent_key,
+        unresolved_key,
+        generation,
+    )
+    if not isinstance(captured, (list, tuple)) or len(captured) != 2:
+        return None
+    return (
+        root_key,
+        captured[0],
+        leaf_key,
+        captured[1],
+        simple_intent_key,
+        namespace_intent_key,
+    )
+
+
+def _complete_ingest_notification(
+    r,
+    org: str,
+    sup: str,
+    table_name: str,
+    generation: Any,
+    modes: Tuple[str, ...],
+    admission: _IngestNotificationAdmission,
+) -> bool:
+    """Publish pending modes and consume unresolved work in one lifecycle CAS."""
+
+    (
+        root_key,
+        root_payload,
+        leaf_key,
+        leaf_payload,
+        simple_intent_key,
+        namespace_intent_key,
+    ) = admission
+    expected = (
+        RK.meta_root(org, sup),
+        RK.meta_leaf(org, sup, table_name),
+        RK.meta_simple_deletion_intent(org, sup, table_name),
+        RK.meta_namespace_deletion_intent(org, sup),
+    )
+    if (
+        root_key,
+        leaf_key,
+        simple_intent_key,
+        namespace_intent_key,
+    ) != expected:
+        return False
+    unresolved_key = _unresolved_pending_key(org, sup, table_name)
+    scalar_key = _pending_key(org, sup, table_name)
+    mode_keys = [_pending_key(org, sup, table_name, mode) for mode in modes]
+    script = """
+    -- atomically resolve one exact ingest generation under its captured table
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if root_payload ~= ARGV[1]
+        or leaf_payload ~= ARGV[2]
+        or redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return -1
+    end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return -1
+    end
+    if redis.call('get', KEYS[5]) ~= ARGV[3] then
+        return 0
+    end
+    local mode_count = tonumber(ARGV[5])
+    if mode_count > 0 then
+        redis.call('set', KEYS[6], ARGV[3], 'EX', ARGV[4])
+        for i = 1, mode_count do
+            redis.call('set', KEYS[6 + i], ARGV[3])
+        end
+    end
+    redis.call('del', KEYS[5])
+    return 1
+    """
+    result = int(r.eval(
+        script,
+        6 + len(mode_keys),
+        root_key,
+        leaf_key,
+        simple_intent_key,
+        namespace_intent_key,
+        unresolved_key,
+        scalar_key,
+        *mode_keys,
+        root_payload,
+        leaf_payload,
+        generation,
+        DEFAULT_PENDING_TTL_SECONDS,
+        len(mode_keys),
+    ))
+    return result == 1
+
+
 def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
     """
     Called by the ingest/write path after data is loaded into a table.
@@ -255,14 +480,19 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
         return
 
     generation = f"{time.time_ns()}:{uuid.uuid4().hex}"
-    unresolved_key = _unresolved_pending_key(org, sup, table_name)
     try:
         # Persist uncertainty *before* reading schedule configuration. A
         # transient config GET failure can then delay mode resolution but can
-        # never silently lose this ingest generation.
-        if not r.set(unresolved_key, generation):
+        # never silently lose this ingest generation. Root/leaf capture and
+        # the SET are one operation so deletion cleanup cannot finish first
+        # and then have this stale notifier repopulate quality state.
+        admission = _begin_ingest_notification(
+            r, org, sup, table_name, generation,
+        )
+        if admission is None:
             logger.warning(
-                "[dq-ingest] Could not persist unresolved generation for %s/%s/%s",
+                "[dq-ingest] Table is absent or deleting; notification was "
+                "not persisted for %s/%s/%s",
                 org,
                 sup,
                 table_name,
@@ -279,7 +509,9 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
             else ()
         )
         if not modes:
-            _consume_pending_generation(r, unresolved_key, generation)
+            # A disabled snapshot can race with a concurrent enable. Retain
+            # the overwrite-only marker so a later enabled scheduler snapshot
+            # can resolve the ingest instead of silently losing it.
             return
 
         # One immutable token identifies the ingest generation.  Each mode has
@@ -287,47 +519,13 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
         # erase a failed/deferred custom or deep profile.  Replacing the value
         # is the debounce operation; compare-and-delete in the scheduler makes
         # an ingest racing with a running check impossible to lose.
-        try:
-            pipe = r.pipeline(transaction=True)
-            # Keep the historical scalar marker for observers and rolling
-            # upgrades.  The scheduler migrates/consumes it into the
-            # authoritative per-mode keys below.
-            pipe.set(
-                _pending_key(org, sup, table_name),
-                generation,
-                ex=DEFAULT_PENDING_TTL_SECONDS,
-            )
-            for mode in modes:
-                # Authoritative work must outlive an arbitrarily long
-                # cooldown.  It is removed only by compare-and-delete after a
-                # fenced successful run.  The compatibility scalar below may
-                # retain its bounded TTL.
-                pipe.set(
-                    _pending_key(org, sup, table_name, mode),
-                    generation,
-                )
-            results = pipe.execute()
-            if not all(results):
-                raise RuntimeError("pending generation transaction was not acknowledged")
-        except (AttributeError, NotImplementedError):
-            # Small Redis-compatible test/embedded clients need not implement
-            # pipelines.  Independent SETs remain safe because modes are never
-            # consumed as a group.
-            if not r.set(
-                _pending_key(org, sup, table_name),
-                generation,
-                ex=DEFAULT_PENDING_TTL_SECONDS,
-            ):
-                raise RuntimeError("scalar pending generation was not acknowledged")
-            for mode in modes:
-                if not r.set(
-                    _pending_key(org, sup, table_name, mode),
-                    generation,
-                ):
-                    raise RuntimeError(
-                        f"{mode} pending generation was not acknowledged"
-                    )
-        _consume_pending_generation(r, unresolved_key, generation)
+        if not _complete_ingest_notification(
+            r, org, sup, table_name, generation, modes, admission,
+        ):
+            # A newer notifier may own the unresolved marker, or the captured
+            # catalog incarnation changed. This worker must publish neither a
+            # stale scalar nor stale per-mode work.
+            return
         logger.debug(
             "[dq-ingest] Pending generation set for %s/%s/%s modes=%s",
             org,
@@ -694,6 +892,7 @@ def _quality_mode_process_entry(
     mode: str,
     running_key: str,
     lock_token: str,
+    table_admission: Optional[_TableLeaseAdmission],
 ) -> None:
     """Recreate process-local clients and execute one fenced quality mode."""
 
@@ -704,10 +903,16 @@ def _quality_mode_process_entry(
     )
 
     outcome: CheckRunOutcome
+    guard: Optional[_LeaseGuard] = None
     try:
         redis_client = create_redis_client()
         config = DQConfig(redis_client, org, sup)
-        guard = _LeaseGuard(redis_client, running_key, lock_token)
+        guard = _LeaseGuard(
+            redis_client,
+            running_key,
+            lock_token,
+            table_admission=table_admission,
+        )
         runners = {
             "quick": _run_quick_check,
             "deep": _run_deep_check,
@@ -727,6 +932,8 @@ def _quality_mode_process_entry(
             f"isolated quality execution failed: {type(exc).__name__}: {exc}",
         )
     finally:
+        if guard is not None and not outcome.successful:
+            _discard_prepared_history(redis_client, guard.prepared_history)
         try:
             close_all_redis_clients()
         except Exception:
@@ -750,7 +957,15 @@ def _run_isolated_mode_check(
 
     result = _run_killable_subprocess(
         _quality_mode_process_entry,
-        (org, sup, table_name, mode, running_key, lock_token),
+        (
+            org,
+            sup,
+            table_name,
+            mode,
+            running_key,
+            lock_token,
+            lease_guard.table_admission,
+        ),
         deadline_monotonic=deadline_monotonic,
         cancel_event=cancel_event,
         lease_lost_event=lease_guard.lost,
@@ -937,8 +1152,10 @@ def _scheduler_tick(
         _drain_history_outbox(r, org, sup)
         try:
             schedule = dqc.get_schedule()
-            cooldown_sec = int(
-                schedule.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)
+            cooldown_sec = _require_redis_ttl_seconds(
+                schedule.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS),
+                label="quality cooldown_seconds",
+                allow_zero=True,
             )
         except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
             message = f"Global quality schedule could not be read safely: {exc}"
@@ -962,9 +1179,18 @@ def _scheduler_tick(
 
         if not schedule.get("enabled", True):
             for table_name in tables:
-                _resolve_unresolved_pending(
-                    r, org, sup, table_name, (),
+                lifecycle_admission = _snapshot_pending_lifecycle_admission(
+                    r, org, sup, table_name,
                 )
+                if lifecycle_admission is not None:
+                    _resolve_unresolved_pending(
+                        r,
+                        org,
+                        sup,
+                        table_name,
+                        (),
+                        lifecycle_admission,
+                    )
             continue
         for table_name in tables:
             jobs.append((
@@ -1000,6 +1226,120 @@ def _scheduler_tick(
             )
 
 
+def _table_lease_admission(
+    org: str,
+    sup: str,
+    table: str,
+    leaf_payload: Any,
+) -> _TableLeaseAdmission:
+    """Return the exact catalog incarnation required for scheduled work."""
+
+    return (
+        RK.meta_leaf(org, sup, table),
+        leaf_payload,
+        RK.meta_simple_deletion_intent(org, sup, table),
+        RK.meta_namespace_deletion_intent(org, sup),
+    )
+
+
+def _snapshot_table_lease_admission(
+    r,
+    org: str,
+    sup: str,
+    table: str,
+) -> Optional[_TableLeaseAdmission]:
+    """Pin one existing table incarnation before reading scheduler config."""
+
+    try:
+        leaf_payload = r.get(RK.meta_leaf(org, sup, table))
+    except Exception as exc:
+        logger.warning(
+            "[dq-scheduler] Could not read table incarnation for %s/%s/%s: %s",
+            org,
+            sup,
+            table,
+            exc,
+        )
+        return None
+    if leaf_payload is None:
+        return None
+    return _table_lease_admission(org, sup, table, leaf_payload)
+
+
+def _snapshot_pending_lifecycle_admission(
+    r,
+    org: str,
+    sup: str,
+    table: str,
+) -> Optional[_IngestNotificationAdmission]:
+    """Atomically pin a live root and leaf for pending-key transformations."""
+
+    root_key = RK.meta_root(org, sup)
+    leaf_key = RK.meta_leaf(org, sup, table)
+    simple_intent_key = RK.meta_simple_deletion_intent(org, sup, table)
+    namespace_intent_key = RK.meta_namespace_deletion_intent(org, sup)
+    script = """
+    -- atomically snapshot a live pending-work lifecycle
+    if redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return {}
+    end
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if not root_payload or not leaf_payload then
+        return {}
+    end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return {}
+    end
+    return {root_payload, leaf_payload}
+    """
+    try:
+        captured = r.eval(
+            script,
+            4,
+            root_key,
+            leaf_key,
+            simple_intent_key,
+            namespace_intent_key,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[dq-scheduler] Could not pin pending lifecycle for %s/%s/%s: %s",
+            org,
+            sup,
+            table,
+            exc,
+        )
+        return None
+    if not isinstance(captured, (list, tuple)) or len(captured) != 2:
+        return None
+    return (
+        root_key,
+        captured[0],
+        leaf_key,
+        captured[1],
+        simple_intent_key,
+        namespace_intent_key,
+    )
+
+
 def _process_table_job(
     r,
     org: str,
@@ -1026,27 +1366,59 @@ def _process_table_job(
     if cancel_event is not None and cancel_event.is_set():
         _stats_increment("jobs_cancelled")
         return
+    pending_lifecycle_admission = _snapshot_pending_lifecycle_admission(
+        r, org, sup, table_name,
+    )
+    if pending_lifecycle_admission is None:
+        return
+    table_admission = _table_lease_admission(
+        org, sup, table_name, pending_lifecycle_admission[3],
+    )
     try:
         ts = dqc.get_table_schedule(table_name)
         table_schedule = ts or {}
-        table_cooldown_sec = int(
-            table_schedule.get("cooldown_seconds", cooldown_sec)
+        table_cooldown_sec = _require_redis_ttl_seconds(
+            table_schedule.get("cooldown_seconds", cooldown_sec),
+            label="table quality cooldown_seconds",
+            allow_zero=True,
         )
     except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
         _record_tick_config_failure(
             r, org, sup, table_name, dqc, QUALITY_MODES, cooldown_sec,
             f"Table quality schedule could not be read safely: {exc}",
+            table_admission=table_admission,
         )
         return
     if ts and not ts.get("enabled", True):
-        _resolve_unresolved_pending(r, org, sup, table_name, ())
+        _resolve_unresolved_pending(
+            r,
+            org,
+            sup,
+            table_name,
+            (),
+            pending_lifecycle_admission,
+        )
         return
     timezone_name = str(
         table_schedule.get("timezone") or schedule.get("timezone") or "UTC"
     )
     post_ingest_modes = _post_ingest_modes(schedule, table_schedule)
-    _resolve_unresolved_pending(r, org, sup, table_name, post_ingest_modes)
-    _migrate_legacy_pending(r, org, sup, table_name, post_ingest_modes)
+    _resolve_unresolved_pending(
+        r,
+        org,
+        sup,
+        table_name,
+        post_ingest_modes,
+        pending_lifecycle_admission,
+    )
+    _migrate_legacy_pending(
+        r,
+        org,
+        sup,
+        table_name,
+        post_ingest_modes,
+        pending_lifecycle_admission,
+    )
     pending_generations = {
         mode: r.get(_pending_key(org, sup, table_name, mode))
         for mode in QUALITY_MODES
@@ -1073,6 +1445,7 @@ def _process_table_job(
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             isolate_runner=isolate_runners,
+            table_admission=table_admission,
         )
         if outcome.successful:
             last_run_maps[mode][tkey] = now
@@ -1081,6 +1454,7 @@ def _process_table_job(
     quick_due, quick_state = _cron_schedule_state(
         r, org, sup, table_name, "quick", table_quick_cron,
         timezone_name, int(now * 1000),
+        table_admission=table_admission,
     )
     if "quick" not in handled_pending and quick_due:
         outcome = _try_run_check(
@@ -1088,12 +1462,12 @@ def _process_table_job(
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             isolate_runner=isolate_runners,
+            table_admission=table_admission,
+            lease_admission=_cron_state_admission(
+                org, sup, table_name, "quick", quick_state,
+            ),
+            cron_state=quick_state,
         )
-        if outcome.executed:
-            _record_cron_outcome(
-                r, org, sup, table_name, "quick", quick_state,
-                outcome, int(time.time() * 1000),
-            )
         if outcome.successful:
             last_quick_run[tkey] = now
 
@@ -1102,6 +1476,7 @@ def _process_table_job(
     deep_due, deep_state = _cron_schedule_state(
         r, org, sup, table_name, "deep", table_deep_cron,
         timezone_name, int(now * 1000),
+        table_admission=table_admission,
     )
     if deep_enabled and "deep" not in handled_pending and deep_due:
         try:
@@ -1117,6 +1492,7 @@ def _process_table_job(
                 r, org, sup, table_name, dqc, ("deep",),
                 table_cooldown_sec,
                 f"Deep quality config could not be read safely: {exc}",
+                table_admission=table_admission,
             )
             has_deep = stale_deep = False
         if has_deep or stale_deep:
@@ -1125,12 +1501,12 @@ def _process_table_job(
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=cancel_event,
                 isolate_runner=isolate_runners,
+                table_admission=table_admission,
+                lease_admission=_cron_state_admission(
+                    org, sup, table_name, "deep", deep_state,
+                ),
+                cron_state=deep_state,
             )
-            if outcome.executed:
-                _record_cron_outcome(
-                    r, org, sup, table_name, "deep", deep_state,
-                    outcome, int(time.time() * 1000),
-                )
             if outcome.successful:
                 last_deep_run[tkey] = now
 
@@ -1139,6 +1515,7 @@ def _process_table_job(
     custom_due, custom_state = _cron_schedule_state(
         r, org, sup, table_name, "custom", table_custom_cron,
         timezone_name, int(now * 1000),
+        table_admission=table_admission,
     )
     if custom_enabled and "custom" not in handled_pending and custom_due:
         try:
@@ -1149,6 +1526,7 @@ def _process_table_job(
                 r, org, sup, table_name, dqc, ("custom",),
                 table_cooldown_sec,
                 f"Custom quality rules could not be read safely: {exc}",
+                table_admission=table_admission,
             )
             has_rules = stale_custom = False
         if has_rules or stale_custom:
@@ -1157,12 +1535,12 @@ def _process_table_job(
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=cancel_event,
                 isolate_runner=isolate_runners,
+                table_admission=table_admission,
+                lease_admission=_cron_state_admission(
+                    org, sup, table_name, "custom", custom_state,
+                ),
+                cron_state=custom_state,
             )
-            if outcome.executed:
-                _record_cron_outcome(
-                    r, org, sup, table_name, "custom", custom_state,
-                    outcome, int(time.time() * 1000),
-                )
             if outcome.successful:
                 last_custom_run[tkey] = now
 
@@ -1176,9 +1554,21 @@ def _record_tick_config_failure(
     modes: Tuple[str, ...],
     cooldown_sec: int,
     message: str,
+    *,
+    table_admission: Optional[_TableLeaseAdmission] = None,
 ) -> None:
     """Turn a tick-time config uncertainty into normal failed attempts."""
 
+    if table_admission is None:
+        lifecycle_admission = _snapshot_pending_lifecycle_admission(
+            r, org, sup, table_name,
+        )
+        if lifecycle_admission is not None:
+            table_admission = _table_lease_admission(
+                org, sup, table_name, lifecycle_admission[3],
+            )
+    if table_admission is None:
+        return
     for mode in modes:
         try:
             _try_run_check(
@@ -1190,6 +1580,7 @@ def _record_tick_config_failure(
                 dqc,
                 cooldown_sec,
                 forced_failure=message,
+                table_admission=table_admission,
             )
         except Exception as exc:
             logger.error(
@@ -1284,6 +1675,7 @@ def _expire_job_if_owned(
     lock_token: str,
     cooldown_sec: int,
     reason: str,
+    table_admission: Optional[_TableLeaseAdmission] = None,
 ) -> bool:
     """Atomically make an unfinished job replayable and release its lease.
 
@@ -1293,28 +1685,56 @@ def _expire_job_if_owned(
     the final recovery bound.
     """
 
+    cooldown_sec = _require_redis_ttl_seconds(
+        cooldown_sec,
+        label="quality cooldown",
+        allow_zero=True,
+    )
     retry_seconds = max(
         1,
         min(DEFAULT_RETRY_BACKOFF_SECONDS, max(1, int(cooldown_sec))),
     )
+    if table_admission is not None:
+        leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+            table_admission
+        )
+    else:
+        leaf_key = running_key
+        leaf_payload = ""
+        simple_delete_key = running_key
+        namespace_delete_key = running_key
     script = """
     if redis.call('get', KEYS[1]) ~= ARGV[1] then
         return 0
+    end
+    if ARGV[4] == '1' then
+        if redis.call('get', KEYS[3]) ~= ARGV[5]
+            or redis.call('exists', KEYS[4]) == 1
+            or redis.call('exists', KEYS[5]) == 1 then
+            redis.call('del', KEYS[1])
+            return -1
+        end
     end
     redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
     redis.call('del', KEYS[1])
     return 1
     """
     try:
-        return bool(r.eval(
+        result = int(r.eval(
             script,
-            2,
+            5,
             running_key,
             retry_key,
+            leaf_key,
+            simple_delete_key,
+            namespace_delete_key,
             lock_token,
             f"{_now_iso()}:{reason}",
             retry_seconds,
+            "1" if table_admission is not None else "0",
+            leaf_payload if table_admission is not None else "",
         ))
+        return result == 1
     except Exception:
         return False
 
@@ -1333,6 +1753,12 @@ def _try_run_check(
     deadline_monotonic: Optional[float] = None,
     cancel_event: Optional[threading.Event] = None,
     isolate_runner: bool = False,
+    table_admission: Optional[_TableLeaseAdmission] = None,
+    lease_admission: Optional[_CronLeaseAdmission] = None,
+    cron_state: Optional[Dict[str, Any]] = None,
+    owned_completion: Optional[
+        Callable[[CheckRunOutcome, _LeaseGuard], None]
+    ] = None,
 ) -> CheckRunOutcome:
     """
     Attempt to run a quality check with lock + cooldown protection.
@@ -1341,6 +1767,14 @@ def _try_run_check(
     """
     if mode not in QUALITY_MODES:
         return _failed(mode, f"unknown quality mode: {mode}")
+    try:
+        cooldown_sec = _require_redis_ttl_seconds(
+            cooldown_sec,
+            label="quality cooldown",
+            allow_zero=True,
+        )
+    except ValueError as exc:
+        return _failed(mode, str(exc))
     if deadline_monotonic is not None:
         if (
             isinstance(deadline_monotonic, bool)
@@ -1355,36 +1789,150 @@ def _try_run_check(
         _stats_increment("jobs_cancelled")
         return _failed(mode, "quality scheduler is shutting down")
 
+    if cron_state is not None:
+        if lease_admission is None:
+            return _failed(mode, "quality cron state requires fenced admission")
+        try:
+            expected_admission = _cron_state_admission(
+                org, sup, table_name, mode, cron_state,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            return _failed(mode, f"quality cron state is invalid: {exc}")
+        if expected_admission != lease_admission:
+            return _failed(mode, "quality cron admission does not match its state")
+
+    if table_admission is not None:
+        try:
+            (
+                expected_leaf_key,
+                expected_leaf_payload,
+                expected_simple_deletion_key,
+                expected_namespace_deletion_key,
+            ) = table_admission
+        except (TypeError, ValueError):
+            return _failed(mode, "quality table admission is invalid")
+        if table_admission != _table_lease_admission(
+            org, sup, table_name, expected_leaf_payload,
+        ):
+            return _failed(mode, "quality table admission does not match its table")
+    else:
+        expected_leaf_key = ""
+        expected_leaf_payload = ""
+        expected_simple_deletion_key = ""
+        expected_namespace_deletion_key = ""
+
     running_key = _running_key(org, sup, table_name)
     cooldown_key = _cooldown_key(org, sup, table_name, mode)
     retry_key = _retry_key(org, sup, table_name, mode)
-
-    # ── Check cooldown ────────────────────────────────────────
-    if forced_failure is None and r.exists(cooldown_key):
-        ttl = r.ttl(cooldown_key)
-        logger.debug(
-            f"[dq-scheduler] Skipping {table_name} ({mode}): "
-            f"cooldown active, {ttl}s remaining"
-        )
-        return _skipped(mode, "success cooldown active")
-
-    if r.exists(retry_key):
-        ttl = r.ttl(retry_key)
-        logger.debug(
-            f"[dq-scheduler] Skipping {table_name} ({mode}): "
-            f"retry backoff active, {ttl}s remaining"
-        )
-        return _skipped(mode, "failure retry backoff active")
-
-    # ── Acquire lock (SET NX = only if not exists) ────────────
-    lock_token = f"{_now_iso()}:{uuid.uuid4().hex}"
-    acquired = r.set(
-        running_key,
-        lock_token,
-        nx=True,                          # only set if key does not exist
-        ex=DEFAULT_RUNNING_TTL_SECONDS,   # safety TTL in case of crash
+    pending_key = (
+        _pending_key(org, sup, table_name, mode)
+        if pending_generation is not None else None
     )
-    if not acquired:
+    has_pending_admission = pending_key is not None
+    admission_pending_key = pending_key or running_key
+
+    # Cooldown/retry/pending-generation admission and SET NX must share one
+    # Redis linearization point.  A worker that checked any prerequisite first
+    # and then paused could otherwise acquire after another worker completed,
+    # entering a new cooldown or replaying an already-consumed generation.
+    lock_token = f"{_now_iso()}:{uuid.uuid4().hex}"
+    admission_key = running_key
+    expected_schema_version = 0
+    expected_expression = ""
+    expected_timezone = ""
+    expected_next_due_ms = 0
+    has_cron_admission = lease_admission is not None
+    has_table_admission = table_admission is not None
+    if lease_admission is not None:
+        (
+            admission_key,
+            expected_schema_version,
+            expected_expression,
+            expected_timezone,
+            expected_next_due_ms,
+        ) = lease_admission
+    script = """
+        if ARGV[1] == '1' then
+        local raw = redis.call('get', KEYS[1])
+        if not raw then
+            return -1
+        end
+        local decoded, state = pcall(cjson.decode, raw)
+        if not decoded or type(state) ~= 'table' then
+            return -1
+        end
+        if state['schema_version'] ~= tonumber(ARGV[2])
+            or state['expression'] ~= ARGV[3]
+            or state['timezone'] ~= ARGV[4]
+            or state['next_due_ms'] ~= tonumber(ARGV[5]) then
+            return -1
+        end
+        end
+        if ARGV[8] == '0' and redis.call('exists', KEYS[3]) == 1 then
+            return -2
+        end
+        if redis.call('exists', KEYS[4]) == 1 then
+            return -3
+        end
+        if ARGV[9] == '1'
+            and redis.call('get', KEYS[5]) ~= ARGV[10] then
+            return -4
+        end
+        if ARGV[11] == '1' then
+            if redis.call('get', KEYS[6]) ~= ARGV[12]
+                or redis.call('exists', KEYS[7]) == 1
+                or redis.call('exists', KEYS[8]) == 1 then
+                return -5
+            end
+        end
+        if redis.call('set', KEYS[2], ARGV[6], 'NX', 'EX', ARGV[7]) then
+            return 1
+        end
+        return 0
+    """
+    try:
+        admission_result = int(r.eval(
+            script,
+            8,
+            admission_key,
+            running_key,
+            cooldown_key,
+            retry_key,
+            admission_pending_key,
+            expected_leaf_key or running_key,
+            expected_simple_deletion_key or running_key,
+            expected_namespace_deletion_key or running_key,
+            "1" if has_cron_admission else "0",
+            expected_schema_version,
+            expected_expression,
+            expected_timezone,
+            expected_next_due_ms,
+            lock_token,
+            DEFAULT_RUNNING_TTL_SECONDS,
+            "1" if forced_failure is not None else "0",
+            "1" if has_pending_admission else "0",
+            pending_generation if has_pending_admission else "",
+            "1" if has_table_admission else "0",
+            expected_leaf_payload if has_table_admission else "",
+        ))
+    except Exception as exc:
+        logger.error(
+            "[dq-scheduler] Could not verify execution admission for %s: %s",
+            table_name,
+            exc,
+        )
+        return _failed(mode, "quality execution admission could not be verified")
+    if admission_result == -1:
+        return _skipped(mode, "scheduled phase already completed or changed")
+    if admission_result == -2:
+        return _skipped(mode, "success cooldown active")
+    if admission_result == -3:
+        return _skipped(mode, "failure retry backoff active")
+    if admission_result == -4:
+        return _skipped(mode, "pending generation already consumed or changed")
+    if admission_result == -5:
+        return _skipped(mode, "table incarnation changed or deletion is active")
+    if admission_result != 1:
         logger.debug(
             f"[dq-scheduler] Skipping {table_name} ({mode}): "
             f"another check is already running"
@@ -1392,13 +1940,57 @@ def _try_run_check(
         return _skipped(mode, "table execution lock busy")
 
     lease_stop = threading.Event()
-    lease_guard = _LeaseGuard(r, running_key, lock_token)
+    lease_guard = _LeaseGuard(
+        r,
+        running_key,
+        lock_token,
+        table_admission=table_admission,
+    )
     lease_thread: Optional[threading.Thread] = None
     completion_event = threading.Event()
     deadline_fired = threading.Event()
     deadline_timer: Optional[threading.Timer] = None
     cancel_watch_stop = threading.Event()
     cancel_watch_thread: Optional[threading.Thread] = None
+    owned_completion_started = False
+    cron_completion_started = False
+    outcome: Optional[CheckRunOutcome] = None
+
+    def publish_owned_completion(outcome: CheckRunOutcome) -> None:
+        """Run terminal caller bookkeeping before this lease can be released."""
+
+        nonlocal owned_completion_started
+        if (
+            owned_completion is None
+            or not outcome.executed
+            or owned_completion_started
+        ):
+            return
+        # Mark before calling so a callback exception cannot make the broad
+        # failure handler execute a non-idempotent terminal transition twice.
+        owned_completion_started = True
+        with lease_guard.fence_lock:
+            lease_guard.assert_owned()
+            owned_completion(outcome, lease_guard)
+
+    def publish_cron_completion(outcome: CheckRunOutcome) -> None:
+        """Persist fallback/non-atomic cron bookkeeping at most once."""
+
+        nonlocal cron_completion_started
+        if cron_state is None or not outcome.executed or cron_completion_started:
+            return
+        cron_completion_started = True
+        _record_cron_outcome(
+            r,
+            org,
+            sup,
+            table_name,
+            mode,
+            cron_state,
+            outcome,
+            int(time.time() * 1000),
+            lease_guard=lease_guard,
+        )
 
     def expire_for(reason: str, *, deadline: bool) -> None:
         with lease_guard.fence_lock:
@@ -1411,6 +2003,7 @@ def _try_run_check(
                 lock_token=lock_token,
                 cooldown_sec=cooldown_sec,
                 reason=reason,
+                table_admission=table_admission,
             )
             # Even an ambiguous Redis response is terminal locally. A late
             # worker can no longer publish, and the original lease TTL safely
@@ -1494,9 +2087,18 @@ def _try_run_check(
                 lease_guard,
                 cooldown_sec,
             )
+            publish_cron_completion(outcome)
+            publish_owned_completion(outcome)
         except _LeaseLostError:
             pass
-        _delete_if_value(r, running_key, lock_token)
+        except Exception as callback_exc:
+            logger.error(
+                "[dq-scheduler] terminal state publication failed for %s: %s",
+                table_name,
+                callback_exc,
+            )
+        finally:
+            _delete_if_value(r, running_key, lock_token)
         return outcome
 
     # ── Execute the check ─────────────────────────────────────
@@ -1547,51 +2149,85 @@ def _try_run_check(
                 mode,
                 "quality runner returned no structured completion outcome",
             )
+        elif outcome.prepared_history is not None:
+            # Isolated runners prepare through their process-local guard. Keep
+            # the descriptor on the parent guard so every rejection/exception
+            # path can compare-delete the still-private payload.
+            lease_guard.prepared_history = outcome.prepared_history
 
         if outcome.successful:
             lease_guard.assert_owned()
-            # Publish/clear the mode's attempt marker before success can earn
-            # cooldown or consume pending work.  If ownership disappears after
-            # finalization there must not be a stale prior failure left in
-            # ``latest`` while the generation has already been removed.
-            if not _publish_mode_attempt(
-                dqc,
-                table_name,
-                outcome,
-                lease_guard=lease_guard,
-            ):
-                failed_outcome = _failed(
-                    mode,
-                    "quality result completed but success state could not be published",
-                )
-                _set_retry_if_owned(
-                    r, retry_key, lock_token, lease_guard, cooldown_sec,
+            if _has_atomic_quality_publication(dqc, r):
+                # Result/baseline publication, the success attempt marker,
+                # cooldown, retry deletion, exact pending consumption and cron
+                # phase advancement share one Redis linearization point.  A
+                # failed or ambiguous commit therefore cannot expose a new
+                # comparison baseline without all success bookkeeping.
+                if not _commit_success_if_owned(
+                    dqc,
+                    org=org,
+                    sup=sup,
+                    table_name=table_name,
+                    outcome=outcome,
+                    lease_guard=lease_guard,
+                    cooldown_key=cooldown_key,
+                    retry_key=retry_key,
+                    cooldown_sec=cooldown_sec,
+                    pending_key=pending_key,
+                    pending_generation=pending_generation,
+                    cron_state=cron_state,
+                    table_admission=table_admission,
                     completion_event=completion_event,
-                )
-                return failed_outcome
-
-            # Ownership check, success cooldown, retry deletion and optional
-            # pending consumption are one Redis operation in production.
-            # Thus an expired/reacquired worker cannot announce success or
-            # erase a newer ingest generation.
-            if not _finalize_success_if_owned(
-                r,
-                lease_guard,
-                cooldown_key,
-                retry_key,
-                cooldown_sec,
-                pending_key=(
-                    _pending_key(org, sup, table_name, mode)
-                    if pending_generation is not None else None
-                ),
-                pending_generation=pending_generation,
-                completion_event=completion_event,
-            ):
-                lease_guard.mark_lost()
-                return _failed(
-                    mode,
-                    "quality execution lease was lost before success finalization",
-                )
+                ):
+                    return _failed(
+                        mode,
+                        "quality success commit could not be verified",
+                    )
+                _deliver_committed_history(r, outcome.prepared_history)
+                if cron_state is not None:
+                    cron_completion_started = True
+            else:
+                # Compatibility path for in-memory/custom configuration
+                # providers that do not expose the production Redis keyspace.
+                if outcome.publication:
+                    published = _publish_success_fallback(
+                        dqc, table_name, outcome, lease_guard,
+                    )
+                else:
+                    published = _publish_mode_attempt(
+                        dqc,
+                        table_name,
+                        outcome,
+                        lease_guard=lease_guard,
+                    )
+                if not published:
+                    failed_outcome = _failed(
+                        mode,
+                        "quality result completed but success state could not be published",
+                    )
+                    _set_retry_if_owned(
+                        r, retry_key, lock_token, lease_guard, cooldown_sec,
+                        completion_event=completion_event,
+                    )
+                    return failed_outcome
+                if not _finalize_success_if_owned(
+                    r,
+                    lease_guard,
+                    cooldown_key,
+                    retry_key,
+                    cooldown_sec,
+                    pending_key=pending_key,
+                    pending_generation=pending_generation,
+                    prepared_history=outcome.prepared_history,
+                    completion_event=completion_event,
+                ):
+                    lease_guard.mark_lost()
+                    return _failed(
+                        mode,
+                        "quality execution lease was lost before success finalization",
+                    )
+                _deliver_committed_history(r, outcome.prepared_history)
+                publish_cron_completion(outcome)
         elif outcome.state == "failed":
             lease_guard.assert_owned()
             _publish_failure_and_retry(
@@ -1605,12 +2241,14 @@ def _try_run_check(
                 cooldown_sec,
                 completion_event=completion_event,
             )
+            publish_cron_completion(outcome)
             logger.error(
                 "[dq-scheduler] %s check failed for %s: %s",
                 mode,
                 table_name,
                 outcome.message,
             )
+        publish_owned_completion(outcome)
         return outcome
 
     except _LeaseLostError as exc:
@@ -1642,11 +2280,22 @@ def _try_run_check(
                 cooldown_sec,
                 completion_event=completion_event,
             )
+            publish_cron_completion(outcome)
+            publish_owned_completion(outcome)
         except _LeaseLostError:
             pass
         return outcome
 
     finally:
+        prepared_to_discard = (
+            outcome.prepared_history
+            if (
+                isinstance(outcome, CheckRunOutcome)
+                and outcome.prepared_history is not None
+            )
+            else lease_guard.prepared_history
+        )
+        _discard_prepared_history(r, prepared_to_discard)
         # Stop renewal before releasing.  Both renewal and release are
         # ownership-checked, so an expired/reacquired lease is never damaged.
         lease_stop.set()
@@ -2318,7 +2967,9 @@ def _publish_dqc_documents(
     redis_client = getattr(dqc, "r", None)
     key_builder = getattr(dqc, "_key", None)
     if lease_guard is not None and redis_client is not None and callable(key_builder):
-        keys = [key_builder(*parts) for parts, _ in normalized_documents]
+        document_keys = [
+            key_builder(*parts) for parts, _ in normalized_documents
+        ]
         payloads = [
             json.dumps(
                 value,
@@ -2328,26 +2979,51 @@ def _publish_dqc_documents(
             )
             for _, value in normalized_documents
         ]
+        table_admission = lease_guard.table_admission
+        if table_admission is not None:
+            leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+                table_admission
+            )
+        else:
+            leaf_key = lease_guard.key
+            leaf_payload = ""
+            simple_delete_key = lease_guard.key
+            namespace_delete_key = lease_guard.key
+        keys = [
+            lease_guard.key,
+            leaf_key,
+            simple_delete_key,
+            namespace_delete_key,
+            *document_keys,
+        ]
         script = """
         if redis.call('get', KEYS[1]) ~= ARGV[1] then
             return 0
         end
-        for i = 2, #KEYS do
-            redis.call('set', KEYS[i], ARGV[i])
+        if ARGV[2] == '1' then
+            if redis.call('get', KEYS[2]) ~= ARGV[3]
+                or redis.call('exists', KEYS[3]) == 1
+                or redis.call('exists', KEYS[4]) == 1 then
+                return -1
+            end
+        end
+        for i = 5, #KEYS do
+            redis.call('set', KEYS[i], ARGV[i - 1])
         end
         return 1
         """
         with lease_guard.fence_lock:
             lease_guard.assert_owned()
             try:
-                published = bool(redis_client.eval(
+                published = int(redis_client.eval(
                     script,
-                    len(keys) + 1,
-                    lease_guard.key,
+                    len(keys),
                     *keys,
                     lease_guard.token,
+                    "1" if table_admission is not None else "0",
+                    leaf_payload if table_admission is not None else "",
                     *payloads,
-                ))
+                )) == 1
             except Exception as exc:
                 lease_guard.lost.set()
                 raise _LeaseLostError(
@@ -2379,6 +3055,22 @@ def _publish_mode_attempt(
 
     _assert_lease_owned(lease_guard)
     existing = dqc.get_latest(table_name) or {}
+    latest = _latest_with_attempt(existing, outcome)
+    published = _publish_dqc_documents(
+        dqc,
+        [(('latest', table_name), latest)],
+        [lambda value: dqc.set_latest(table_name, value)],
+        lease_guard=lease_guard,
+    )
+    return published is not None
+
+
+def _latest_with_attempt(
+    existing: Dict[str, Any],
+    outcome: CheckRunOutcome,
+) -> Dict[str, Any]:
+    """Return ``existing`` with one truthful terminal attempt record."""
+
     latest = dict(existing)
     raw_attempts = existing.get("mode_attempts")
     if not isinstance(raw_attempts, dict):
@@ -2402,13 +3094,7 @@ def _publish_mode_attempt(
         latest.setdefault(field_name, 0)
     latest.setdefault("configured_checks", int(latest.get("total_checks", 0) or 0))
     _apply_attempt_status(latest)
-    published = _publish_dqc_documents(
-        dqc,
-        [(('latest', table_name), latest)],
-        [lambda value: dqc.set_latest(table_name, value)],
-        lease_guard=lease_guard,
-    )
-    return published is not None
+    return latest
 
 
 def _mode_history_document(
@@ -2441,18 +3127,17 @@ def _write_mode_history(
     elapsed_ms: int,
     *,
     lease_guard: Optional[_LeaseGuard] = None,
-) -> bool:
-    """Durably queue history before attempting the Parquet sink.
+) -> Any:
+    """Durably prepare history without exposing scheduler success early.
 
-    Scheduler calls have a lease (and therefore a Redis client). They may only
-    advance cooldown/pending state after the immutable payload is accepted by
-    the outbox hash. Sink failures leave that payload replayable. Direct/manual
-    calls without a lease retain the historical best-effort behaviour.
+    Scheduler calls put the immutable payload in a private, expiring prepared
+    key.  The outer exact-lease success transaction promotes it into the
+    deliverable outbox together with result/baseline, cooldown, pending and
+    cron state. Direct/manual calls without a lease retain their historical
+    immediate sink behaviour.
     """
 
     try:
-        from supertable.quality.history import write_history
-
         history_document = _mode_history_document(latest, mode)
         _assert_lease_owned(lease_guard)
         history_id = uuid.uuid4().hex
@@ -2473,15 +3158,24 @@ def _write_mode_history(
             separators=(",", ":"),
         )
         if lease_guard is not None:
-            outbox_key = _history_outbox_key(org, sup)
-            if not _queue_history_outbox_if_owned(
+            prepared = _PreparedHistory(
+                history_id=history_id,
+                prepared_key=_history_prepared_key(
+                    org, sup, table_name, history_id,
+                ),
+                outbox_key=_history_outbox_key(org, sup),
+                payload=encoded,
+            )
+            if not _prepare_history_if_owned(
                 lease_guard,
-                outbox_key,
-                history_id,
-                encoded,
+                prepared,
             ):
                 return False
-            _assert_lease_owned(lease_guard)
+            lease_guard.prepared_history = prepared
+            return prepared
+
+        from supertable.quality.history import write_history
+
         wrote = write_history(
             org,
             sup,
@@ -2491,14 +3185,7 @@ def _write_mode_history(
             elapsed_ms,
             history_id=history_id,
         )
-        _assert_lease_owned(lease_guard)
-        if wrote and lease_guard is not None:
-            _ack_history_outbox(
-                lease_guard.redis, outbox_key, history_id, encoded,
-            )
-        # A durable queued payload is sufficient for scheduler success; the
-        # replay worker will finish a failed/ambiguous Parquet delivery.
-        return bool(wrote or lease_guard is not None)
+        return bool(wrote)
     except _LeaseLostError:
         raise
     except Exception as exc:
@@ -2556,17 +3243,16 @@ def _cleared_mode_columns(
     return updates
 
 
-def _publish_mode_latest(
+def _prepare_mode_latest(
     dqc,
     table_name: str,
     mode: str,
     mode_record: Dict[str, Any],
     *,
     base_updates: Optional[Dict[str, Any]] = None,
-    column_updates: Optional[Dict[str, Dict[str, Any]]] = None,
     lease_guard: Optional[_LeaseGuard] = None,
-) -> Optional[Dict[str, Any]]:
-    """Merge one completed mode without deleting other modes' latest data."""
+) -> Dict[str, Any]:
+    """Build one merged mode document without advancing the live baseline."""
 
     _assert_lease_owned(lease_guard)
     existing = dqc.get_latest(table_name) or {}
@@ -2614,17 +3300,45 @@ def _publish_mode_latest(
     # _try_run_check.  Until then, preserve any prior failure marker rather
     # than claiming scheduler success prematurely.
     _apply_attempt_status(latest)
+    return latest
 
-    documents: List[Tuple[Tuple[str, ...], Any]] = [
-        (("latest", table_name), latest),
-        (("anomalies", table_name), combined_anomalies),
-    ]
+
+def _publish_mode_latest(
+    dqc,
+    table_name: str,
+    mode: str,
+    mode_record: Dict[str, Any],
+    *,
+    base_updates: Optional[Dict[str, Any]] = None,
+    column_updates: Optional[Dict[str, Dict[str, Any]]] = None,
+    lease_guard: Optional[_LeaseGuard] = None,
+    prepared_latest: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Publish one completed mode without deleting other modes' latest data."""
+
+    _assert_lease_owned(lease_guard)
+    latest = (
+        prepared_latest
+        if prepared_latest is not None
+        else _prepare_mode_latest(
+            dqc,
+            table_name,
+            mode,
+            mode_record,
+            base_updates=base_updates,
+            lease_guard=lease_guard,
+        )
+    )
+    documents = _mode_publication_documents(
+        table_name,
+        latest,
+        column_updates=column_updates,
+    )
     fallback_writers: List[Any] = [
         lambda value: dqc.set_latest(table_name, value),
         lambda value: dqc.set_anomalies(table_name, value),
     ]
-    for column_name, document in (column_updates or {}).items():
-        documents.append((("latest", table_name, column_name), document))
+    for column_name in (column_updates or {}):
         fallback_writers.append(
             lambda value, column_name=column_name: dqc.set_latest_column(
                 table_name, column_name, value,
@@ -2639,6 +3353,23 @@ def _publish_mode_latest(
     if published is None:
         return None
     return published[0]
+
+
+def _mode_publication_documents(
+    table_name: str,
+    latest: Dict[str, Any],
+    *,
+    column_updates: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Tuple[Tuple[str, ...], Any]]:
+    """Build the complete latest/anomaly/column result bundle."""
+
+    documents: List[Tuple[Tuple[str, ...], Any]] = [
+        (("latest", table_name), latest),
+        (("anomalies", table_name), list(latest.get("anomalies") or [])),
+    ]
+    for column_name, document in (column_updates or {}).items():
+        documents.append((("latest", table_name, column_name), document))
+    return documents
 
 def _run_quick_check(
     r,
@@ -2813,7 +3544,9 @@ def _run_quick_check(
     # The table-level latest write below is the completion marker.
     pending_columns: Dict[str, Dict[str, Any]] = {}
     for col_name, col_data in parsed.get("columns", {}).items():
-        merged_col = dqc.get_latest_column(table_name, col_name) or {}
+        # Configuration providers may return a live object; staging must not
+        # mutate it before history durability and the atomic publish boundary.
+        merged_col = dict(dqc.get_latest_column(table_name, col_name) or {})
         merged_col.update(col_data)
         merged_col["checked_at"] = checked_at
         col_issues = [a for a in anomalies if a.get("column") == col_name]
@@ -2823,26 +3556,20 @@ def _run_quick_check(
         merged_col.pop("data_watermark", None)
         pending_columns[col_name] = merged_col
 
-    latest = _publish_mode_latest(
+    latest = _prepare_mode_latest(
         dqc,
         table_name,
         "quick",
         mode_record,
         base_updates=base_updates,
-        column_updates=pending_columns,
         lease_guard=lease_guard,
     )
-    if latest is None:
-        return _failed("quick", f"Could not publish quick result for {table_name}")
 
-    logger.info(
-        f"[dq-scheduler] Quick check done: {table_name} — "
-        f"score={score}, anomalies={len(anomalies)}"
-    )
-
-    # ── Write to __data_quality__ history table ───────────────
+    # Durability must precede publication of the next comparison baseline.  If
+    # history cannot be accepted, a retry must still compare against the last
+    # genuinely completed profile rather than against its own failed attempt.
     _check_elapsed_ms = int(time.time() * 1000) - _check_start_ms
-    if not _write_mode_history(
+    history_result = _write_mode_history(
         org,
         sup,
         table_name,
@@ -2850,8 +3577,38 @@ def _run_quick_check(
         latest,
         _check_elapsed_ms,
         lease_guard=lease_guard,
-    ):
+    )
+    if not history_result:
         return _failed("quick", "quality history could not be durably queued")
+    prepared_history = (
+        history_result if isinstance(history_result, _PreparedHistory) else None
+    )
+
+    publication: List[Tuple[Tuple[str, ...], Any]] = []
+    if lease_guard is not None:
+        publication = _mode_publication_documents(
+            table_name,
+            latest,
+            column_updates=pending_columns,
+        )
+    else:
+        published = _publish_mode_latest(
+            dqc,
+            table_name,
+            "quick",
+            mode_record,
+            base_updates=base_updates,
+            column_updates=pending_columns,
+            lease_guard=lease_guard,
+            prepared_latest=latest,
+        )
+        if published is None:
+            return _failed("quick", f"Could not publish quick result for {table_name}")
+
+    logger.info(
+        f"[dq-scheduler] Quick check done: {table_name} — "
+        f"score={score}, anomalies={len(anomalies)}"
+    )
 
     return _success(
         "quick",
@@ -2861,6 +3618,8 @@ def _run_quick_check(
         critical=summary["critical"],
         skipped=summary["skipped"],
         details=outcomes,
+        publication=publication,
+        prepared_history=prepared_history,
     )
 
 
@@ -2922,20 +3681,15 @@ def _run_deep_check(
                 "parsed": {"total": 0, "columns": {}},
                 "schema": [list(c) for c in columns],
             }
-        latest = _publish_mode_latest(
+        latest = _prepare_mode_latest(
             dqc,
             table_name,
             "deep",
             mode_record,
             base_updates=base_updates,
-            column_updates=_cleared_mode_columns(
-                dqc, table_name, columns, "deep",
-            ),
             lease_guard=lease_guard,
         )
-        if latest is None:
-            return _failed("deep", f"Could not clear disabled deep result for {table_name}")
-        if not _write_mode_history(
+        history_result = _write_mode_history(
             org,
             sup,
             table_name,
@@ -2943,9 +3697,44 @@ def _run_deep_check(
             latest,
             int(time.time() * 1000) - _deep_start_ms,
             lease_guard=lease_guard,
-        ):
+        )
+        if not history_result:
             return _failed("deep", "quality history could not be durably queued")
-        return _success("deep")
+        prepared_history = (
+            history_result
+            if isinstance(history_result, _PreparedHistory)
+            else None
+        )
+        cleared_columns = _cleared_mode_columns(
+            dqc, table_name, columns, "deep",
+        )
+        publication: List[Tuple[Tuple[str, ...], Any]] = []
+        if lease_guard is not None:
+            publication = _mode_publication_documents(
+                table_name,
+                latest,
+                column_updates=cleared_columns,
+            )
+        else:
+            published = _publish_mode_latest(
+                dqc,
+                table_name,
+                "deep",
+                mode_record,
+                base_updates=base_updates,
+                column_updates=cleared_columns,
+                lease_guard=lease_guard,
+                prepared_latest=latest,
+            )
+            if published is None:
+                return _failed(
+                    "deep", f"Could not clear disabled deep result for {table_name}",
+                )
+        return _success(
+            "deep",
+            publication=publication,
+            prepared_history=prepared_history,
+        )
 
     try:
         table_fqn = quality_table_fqn(sup, table_name)
@@ -3075,23 +3864,19 @@ def _run_deep_check(
             "parsed": {"total": 0, "columns": {}},
             "schema": [list(c) for c in columns],
         }
-    latest = _publish_mode_latest(
+    latest = _prepare_mode_latest(
         dqc,
         table_name,
         "deep",
         mode_record,
         base_updates=base_updates,
-        column_updates=pending_columns,
         lease_guard=lease_guard,
     )
-    if latest is None:
-        return _failed("deep", f"Could not publish deep result for {table_name}")
 
-    logger.info(f"[dq-scheduler] Deep check done: {table_name}")
-
-    # ── Write to __data_quality__ history table ───────────────
+    # As with quick mode, keep the previous deep comparison baseline live until
+    # this attempt's immutable history payload is durably accepted.
     _deep_elapsed_ms = int(time.time() * 1000) - _deep_start_ms
-    if not _write_mode_history(
+    history_result = _write_mode_history(
         org,
         sup,
         table_name,
@@ -3099,8 +3884,35 @@ def _run_deep_check(
         latest,
         _deep_elapsed_ms,
         lease_guard=lease_guard,
-    ):
+    )
+    if not history_result:
         return _failed("deep", "quality history could not be durably queued")
+    prepared_history = (
+        history_result if isinstance(history_result, _PreparedHistory) else None
+    )
+
+    publication = []
+    if lease_guard is not None:
+        publication = _mode_publication_documents(
+            table_name,
+            latest,
+            column_updates=pending_columns,
+        )
+    else:
+        published = _publish_mode_latest(
+            dqc,
+            table_name,
+            "deep",
+            mode_record,
+            base_updates=base_updates,
+            column_updates=pending_columns,
+            lease_guard=lease_guard,
+            prepared_latest=latest,
+        )
+        if published is None:
+            return _failed("deep", f"Could not publish deep result for {table_name}")
+
+    logger.info(f"[dq-scheduler] Deep check done: {table_name}")
 
     return _success(
         "deep",
@@ -3110,6 +3922,8 @@ def _run_deep_check(
         critical=summary["critical"],
         skipped=summary["skipped"],
         details=outcomes,
+        publication=publication,
+        prepared_history=prepared_history,
     )
 
 
@@ -3181,20 +3995,15 @@ def _run_custom_check(
                 "parsed": {"total": 0, "columns": {}},
                 "schema": [list(c) for c in columns],
             }
-        latest = _publish_mode_latest(
+        latest = _prepare_mode_latest(
             dqc,
             table_name,
             "custom",
             mode_record,
             base_updates=base_updates,
-            column_updates=_cleared_mode_columns(
-                dqc, table_name, columns, "custom",
-            ),
             lease_guard=lease_guard,
         )
-        if latest is None:
-            return _failed("custom", f"Could not clear disabled custom result for {table_name}")
-        if not _write_mode_history(
+        history_result = _write_mode_history(
             org,
             sup,
             table_name,
@@ -3202,9 +4011,45 @@ def _run_custom_check(
             latest,
             int(time.time() * 1000) - _custom_start_ms,
             lease_guard=lease_guard,
-        ):
+        )
+        if not history_result:
             return _failed("custom", "quality history could not be durably queued")
-        return _success("custom")
+        prepared_history = (
+            history_result
+            if isinstance(history_result, _PreparedHistory)
+            else None
+        )
+        cleared_columns = _cleared_mode_columns(
+            dqc, table_name, columns, "custom",
+        )
+        publication: List[Tuple[Tuple[str, ...], Any]] = []
+        if lease_guard is not None:
+            publication = _mode_publication_documents(
+                table_name,
+                latest,
+                column_updates=cleared_columns,
+            )
+        else:
+            published = _publish_mode_latest(
+                dqc,
+                table_name,
+                "custom",
+                mode_record,
+                base_updates=base_updates,
+                column_updates=cleared_columns,
+                lease_guard=lease_guard,
+                prepared_latest=latest,
+            )
+            if published is None:
+                return _failed(
+                    "custom",
+                    f"Could not clear disabled custom result for {table_name}",
+                )
+        return _success(
+            "custom",
+            publication=publication,
+            prepared_history=prepared_history,
+        )
 
     validated_sql: List[Tuple[Dict[str, Any], Optional[str]]] = []
 
@@ -3323,7 +4168,7 @@ def _run_custom_check(
             "parsed": {"total": 0, "columns": {}},
             "schema": [list(c) for c in columns],
         }
-    latest = _publish_mode_latest(
+    latest = _prepare_mode_latest(
         dqc,
         table_name,
         "custom",
@@ -3331,18 +4176,10 @@ def _run_custom_check(
         base_updates=base_updates,
         lease_guard=lease_guard,
     )
-    if latest is None:
-        return _failed("custom", f"Could not publish custom result for {table_name}")
-
-    logger.info(
-        f"[dq-scheduler] Custom rules check done: {table_name} — "
-        f"{len(custom_rules)} rules, {len(rule_anomalies)} issues, "
-        f"score={latest.get('quality_score', 0)}"
-    )
 
     # ── Write to __data_quality__ history table ───────────────
     _custom_elapsed_ms = int(time.time() * 1000) - _custom_start_ms
-    if not _write_mode_history(
+    history_result = _write_mode_history(
         org,
         sup,
         table_name,
@@ -3350,8 +4187,34 @@ def _run_custom_check(
         latest,
         _custom_elapsed_ms,
         lease_guard=lease_guard,
-    ):
+    )
+    if not history_result:
         return _failed("custom", "quality history could not be durably queued")
+    prepared_history = (
+        history_result if isinstance(history_result, _PreparedHistory) else None
+    )
+
+    publication = []
+    if lease_guard is not None:
+        publication = _mode_publication_documents(table_name, latest)
+    else:
+        published = _publish_mode_latest(
+            dqc,
+            table_name,
+            "custom",
+            mode_record,
+            base_updates=base_updates,
+            lease_guard=lease_guard,
+            prepared_latest=latest,
+        )
+        if published is None:
+            return _failed("custom", f"Could not publish custom result for {table_name}")
+
+    logger.info(
+        f"[dq-scheduler] Custom rules check done: {table_name} — "
+        f"{len(custom_rules)} rules, {len(rule_anomalies)} issues, "
+        f"score={latest.get('quality_score', 0)}"
+    )
 
     return _success(
         "custom",
@@ -3361,6 +4224,8 @@ def _run_custom_check(
         critical=summary["critical"],
         skipped=summary["skipped"],
         details=rule_results,
+        publication=publication,
+        prepared_history=prepared_history,
     )
 
 
@@ -3408,6 +4273,138 @@ def _retry_key(org: str, sup: str, table: str, mode: str) -> str:
 
 def _history_outbox_key(org: str, sup: str) -> str:
     return RK.quality_prefix(org, sup) + "history_outbox"
+
+
+def _history_prepared_key(
+    org: str,
+    sup: str,
+    table: str,
+    history_id: str,
+) -> str:
+    return (
+        RK.quality_prefix(org, sup)
+        + f"history_prepared:{table}:{history_id}"
+    )
+
+
+def _history_outbox_cursor_key(org: str, sup: str) -> str:
+    return RK.quality_prefix(org, sup) + "history_outbox_cursor"
+
+
+def _prepare_history_if_owned(
+    lease_guard: _LeaseGuard,
+    prepared: _PreparedHistory,
+) -> bool:
+    """Durably store a non-deliverable row under lease and leaf fences."""
+
+    table_admission = lease_guard.table_admission
+    if table_admission is not None:
+        leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+            table_admission
+        )
+    else:
+        leaf_key = lease_guard.key
+        leaf_payload = ""
+        simple_delete_key = lease_guard.key
+        namespace_delete_key = lease_guard.key
+    script = """
+    -- prepare an immutable, non-deliverable quality history row
+    if redis.call('get', KEYS[1]) ~= ARGV[1] then
+        return 0
+    end
+    if ARGV[4] == '1' then
+        if redis.call('get', KEYS[3]) ~= ARGV[5]
+            or redis.call('exists', KEYS[4]) == 1
+            or redis.call('exists', KEYS[5]) == 1 then
+            return -1
+        end
+    end
+    local current = redis.call('get', KEYS[2])
+    if current then
+        if current == ARGV[2] then
+            return 2
+        end
+        return -2
+    end
+    redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
+    return 1
+    """
+    try:
+        result = int(lease_guard.redis.eval(
+            script,
+            5,
+            lease_guard.key,
+            prepared.prepared_key,
+            leaf_key,
+            simple_delete_key,
+            namespace_delete_key,
+            lease_guard.token,
+            prepared.payload,
+            DEFAULT_PREPARED_HISTORY_TTL_SECONDS,
+            "1" if table_admission is not None else "0",
+            leaf_payload if table_admission is not None else "",
+        ))
+    except Exception as exc:
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality history preparation could not be verified"
+        ) from exc
+    if result in (0, -1):
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality lease or table incarnation changed before history preparation"
+        )
+    if result not in (1, 2):
+        logger.error(
+            "[dq-scheduler] Refusing conflicting prepared history payload %s",
+            prepared.history_id,
+        )
+        return False
+    return True
+
+
+def _discard_prepared_history(r, prepared: Optional[_PreparedHistory]) -> bool:
+    """Remove only the exact still-private payload; committed rows are untouched."""
+
+    if prepared is None:
+        return True
+    return _delete_if_value(r, prepared.prepared_key, prepared.payload)
+
+
+def _deliver_committed_history(r, prepared: Optional[_PreparedHistory]) -> bool:
+    """Try one committed outbox row after its success transaction returns."""
+
+    if prepared is None:
+        return True
+    try:
+        persisted = r.hget(prepared.outbox_key, prepared.history_id)
+        if persisted is None or not _redis_values_equal(
+            persisted, prepared.payload,
+        ):
+            return False
+        payload = json.loads(prepared.payload)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("history_id") != prepared.history_id
+        ):
+            return False
+        from supertable.quality.history import write_history_payload
+
+        if not write_history_payload(payload):
+            return False
+        return _ack_history_outbox(
+            r,
+            prepared.outbox_key,
+            prepared.history_id,
+            prepared.payload,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[dq-scheduler] Committed history delivery failed for %s: %s",
+            prepared.history_id,
+            exc,
+        )
+        return False
 
 
 def _queue_history_outbox_if_owned(
@@ -3495,18 +4492,43 @@ def _ack_history_outbox(r, key: str, history_id: str, payload: str) -> bool:
 
 
 def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
-    """Retry a bounded number of durable history deliveries."""
+    """Retry one rotating scan page of durable history deliveries.
+
+    Redis ``HSCAN COUNT`` is a hint and may return more than the requested
+    number of fields.  Advancing its cursor while truncating that page can skip
+    entries forever, so the complete returned page is processed and only then
+    is the cursor persisted for the next drain.
+    """
 
     from supertable.quality.history import write_history_payload
 
     key = _history_outbox_key(org, sup)
+    cursor_key = _history_outbox_cursor_key(org, sup)
     try:
-        _cursor, raw_items = r.hscan(key, cursor=0, count=max(1, min(limit, 1000)))
+        raw_cursor = r.get(cursor_key)
+    except Exception as exc:
+        logger.warning("[dq-scheduler] history outbox cursor read failed: %s", exc)
+        return 0
+    try:
+        cursor = int(raw_cursor) if raw_cursor is not None else 0
+        if cursor < 0 or cursor > (2**64 - 1):
+            raise ValueError("history outbox cursor is outside Redis range")
+    except (TypeError, ValueError, OverflowError) as exc:
+        # Cursor state is only a fairness hint.  A malformed hint must not
+        # strand durable history; restart the scan from the beginning.
+        logger.warning("[dq-scheduler] resetting invalid history outbox cursor: %s", exc)
+        cursor = 0
+    try:
+        next_cursor, raw_items = r.hscan(
+            key,
+            cursor=cursor,
+            count=max(1, min(int(limit), 1000)),
+        )
     except Exception as exc:
         logger.warning("[dq-scheduler] history outbox scan failed: %s", exc)
         return 0
     delivered = 0
-    for raw_id, raw_payload in list((raw_items or {}).items())[:limit]:
+    for raw_id, raw_payload in (raw_items or {}).items():
         history_id = (
             raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
         )
@@ -3529,11 +4551,79 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
                 history_id,
                 exc,
             )
+    # Multiple scheduler hosts may drain the same outbox.  Advance only from
+    # the exact cursor this worker scanned: a delayed page-zero worker must not
+    # rewind a cursor that another host has already moved through later pages.
+    # A failed CAS is harmless because this complete page was already handled,
+    # and the winning cursor will eventually wrap around to any poison entry.
+    cursor_script = """
+    -- quality history outbox cursor compare-and-set
+    if ARGV[1] == '1' then
+        if redis.call('get', KEYS[1]) ~= ARGV[2] then
+            return 0
+        end
+    elseif redis.call('exists', KEYS[1]) == 1 then
+        return 0
+    end
+    if redis.call('hlen', KEYS[2]) > 0 then
+        redis.call('set', KEYS[1], ARGV[3])
+    else
+        redis.call('del', KEYS[1])
+    end
+    return 1
+    """
+    try:
+        r.eval(
+            cursor_script,
+            2,
+            cursor_key,
+            key,
+            "1" if raw_cursor is not None else "0",
+            raw_cursor if raw_cursor is not None else "",
+            str(int(next_cursor)),
+        )
+    except Exception as exc:
+        logger.warning("[dq-scheduler] history outbox cursor CAS failed: %s", exc)
     return delivered
 
 
 def _cron_state_key(org: str, sup: str, table: str, mode: str) -> str:
     return RK.quality_prefix(org, sup) + f"cron_state:{table}:{mode}"
+
+
+def _cron_state_admission(
+    org: str,
+    sup: str,
+    table: str,
+    mode: str,
+    state: Dict[str, Any],
+) -> _CronLeaseAdmission:
+    """Return the exact cron phase that must still exist when locking."""
+
+    schema_version = state.get("schema_version")
+    next_due_ms = state.get("next_due_ms")
+    expression = state.get("expression")
+    timezone_name = state.get("timezone")
+    if (
+        type(schema_version) is not int
+        or schema_version != 1
+        or type(next_due_ms) is not int
+        or next_due_ms < 0
+        or next_due_ms > _REDIS_LUA_MAX_SAFE_INTEGER
+        or not isinstance(expression, str)
+        or not expression
+        or not isinstance(timezone_name, str)
+        or not timezone_name
+    ):
+        raise ValueError("quality cron phase has an invalid identity")
+
+    return (
+        _cron_state_key(org, sup, table, mode),
+        schema_version,
+        expression,
+        timezone_name,
+        next_due_ms,
+    )
 
 
 def _cron_schedule_state(
@@ -3545,6 +4635,8 @@ def _cron_schedule_state(
     expression: str,
     timezone_name: str,
     now_ms: int,
+    *,
+    table_admission: Optional[_TableLeaseAdmission] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Return persisted cron due state, initializing the next phase safely."""
 
@@ -3558,6 +4650,7 @@ def _cron_schedule_state(
     current_minute_start_ms = now_ms - (now_ms % 60_000)
     first_due_ms = schedule.next_after_ms(current_minute_start_ms - 1)
     raw = r.get(key)
+    lost_initialization_race = False
     state: Dict[str, Any]
     if raw is None:
         state = {
@@ -3572,10 +4665,42 @@ def _cron_schedule_state(
             "last_outcome": None,
         }
         payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
-        if not r.set(key, payload, nx=True):
+        if table_admission is not None:
+            leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+                table_admission
+            )
+            initialize_script = """
+            if redis.call('get', KEYS[2]) ~= ARGV[2]
+                or redis.call('exists', KEYS[3]) == 1
+                or redis.call('exists', KEYS[4]) == 1 then
+                return -1
+            end
+            if redis.call('set', KEYS[1], ARGV[1], 'NX') then
+                return 1
+            end
+            return 0
+            """
+            initialized = int(r.eval(
+                initialize_script,
+                4,
+                key,
+                leaf_key,
+                simple_delete_key,
+                namespace_delete_key,
+                payload,
+                leaf_payload,
+            ))
+            if initialized == -1:
+                raise RuntimeError(
+                    "table incarnation changed before cron initialization"
+                )
+        else:
+            initialized = 1 if r.set(key, payload, nx=True) else 0
+        if initialized != 1:
             raw = r.get(key)
             if raw is None:
                 raise RuntimeError("cron state initialization was not acknowledged")
+            lost_initialization_race = True
         else:
             return now_ms >= first_due_ms, state
     if raw is not None:
@@ -3583,7 +4708,12 @@ def _cron_schedule_state(
             state = json.loads(raw)
         except (TypeError, ValueError, UnicodeError) as exc:
             raise RuntimeError("persisted quality cron state is malformed") from exc
-        if not isinstance(state, dict) or state.get("schema_version") != 1:
+        schema_version = state.get("schema_version") if isinstance(state, dict) else None
+        if (
+            not isinstance(state, dict)
+            or isinstance(schema_version, bool)
+            or schema_version != 1
+        ):
             raise RuntimeError("persisted quality cron state has the wrong shape")
     if (
         state.get("expression") != schedule.expression
@@ -3602,11 +4732,96 @@ def _cron_schedule_state(
             "last_completed_ms": None,
             "last_outcome": None,
         }
-        if not r.set(key, json.dumps(state, sort_keys=True, separators=(",", ":"))):
-            raise RuntimeError("updated quality cron state was not persisted")
+        if lost_initialization_race:
+            # Another scheduler initialized the key after our first read.  Our
+            # schedule input may already be stale relative to that winner; only
+            # the next tick may reconcile it from a fresh config snapshot.
+            raise RuntimeError(
+                "quality cron state was concurrently initialized with another schedule"
+            )
+        encoded = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        script = """
+        if redis.call('get', KEYS[1]) ~= ARGV[1] then
+            return 0
+        end
+        if ARGV[3] == '1' then
+            if redis.call('get', KEYS[2]) ~= ARGV[4]
+                or redis.call('exists', KEYS[3]) == 1
+                or redis.call('exists', KEYS[4]) == 1 then
+                return -1
+            end
+        end
+        redis.call('set', KEYS[1], ARGV[2])
+        return 1
+        """
+        try:
+            if table_admission is not None:
+                leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+                    table_admission
+                )
+                replace_result = int(r.eval(
+                    script,
+                    4,
+                    key,
+                    leaf_key,
+                    simple_delete_key,
+                    namespace_delete_key,
+                    raw,
+                    encoded,
+                    "1",
+                    leaf_payload,
+                ))
+            else:
+                replace_result = int(r.eval(
+                    script, 1, key, raw, encoded, "0", "",
+                ))
+        except Exception as exc:
+            raise RuntimeError(
+                "updated quality cron state could not be CAS-persisted"
+            ) from exc
+        if replace_result == -1:
+            raise RuntimeError(
+                "table incarnation changed before cron schedule reset"
+            )
+        replaced = replace_result == 1
+        if not replaced:
+            # A concurrent tick/configuration change won.  It is safe to share
+            # its phase only when it installed the exact schedule requested by
+            # this caller; never overwrite a different, potentially newer one.
+            fresh_raw = r.get(key)
+            try:
+                fresh = json.loads(fresh_raw) if fresh_raw is not None else None
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise RuntimeError(
+                    "quality cron state changed to malformed data during reset"
+                ) from exc
+            fresh_version = (
+                fresh.get("schema_version") if isinstance(fresh, dict) else None
+            )
+            fresh_due = fresh.get("next_due_ms") if isinstance(fresh, dict) else None
+            if (
+                not isinstance(fresh, dict)
+                or isinstance(fresh_version, bool)
+                or fresh_version != 1
+                or fresh.get("expression") != schedule.expression
+                or fresh.get("timezone") != schedule.timezone_name
+                or isinstance(fresh_due, bool)
+                or not isinstance(fresh_due, int)
+                or fresh_due < 0
+                or fresh_due > _REDIS_LUA_MAX_SAFE_INTEGER
+            ):
+                raise RuntimeError(
+                    "quality cron schedule changed concurrently during reset"
+                )
+            return now_ms >= fresh_due, fresh
         return now_ms >= first_due_ms, state
     next_due = state.get("next_due_ms")
-    if isinstance(next_due, bool) or not isinstance(next_due, int) or next_due < 0:
+    if (
+        isinstance(next_due, bool)
+        or not isinstance(next_due, int)
+        or next_due < 0
+        or next_due > _REDIS_LUA_MAX_SAFE_INTEGER
+    ):
         raise RuntimeError("persisted quality cron next_due_ms is invalid")
     return now_ms >= next_due, state
 
@@ -3620,8 +4835,110 @@ def _record_cron_outcome(
     state: Dict[str, Any],
     outcome: CheckRunOutcome,
     now_ms: int,
+    *,
+    lease_guard: Optional[_LeaseGuard] = None,
 ) -> None:
     """Persist the exact phase and last outcome before the next tick."""
+
+    updated = _cron_outcome_document(state, outcome, now_ms)
+    key = _cron_state_key(org, sup, table, mode)
+    encoded = json.dumps(updated, sort_keys=True, separators=(",", ":"))
+    if lease_guard is not None:
+        (
+            _admission_key,
+            expected_schema_version,
+            expected_expression,
+            expected_timezone,
+            expected_next_due_ms,
+        ) = _cron_state_admission(org, sup, table, mode, state)
+        table_admission = lease_guard.table_admission
+        if table_admission is not None:
+            leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+                table_admission
+            )
+        else:
+            leaf_key = lease_guard.key
+            leaf_payload = ""
+            simple_delete_key = lease_guard.key
+            namespace_delete_key = lease_guard.key
+        script = """
+        if redis.call('get', KEYS[1]) ~= ARGV[1] then
+            return 0
+        end
+        if ARGV[7] == '1' then
+            if redis.call('get', KEYS[3]) ~= ARGV[8]
+                or redis.call('exists', KEYS[4]) == 1
+                or redis.call('exists', KEYS[5]) == 1 then
+                return -2
+            end
+        end
+        local raw = redis.call('get', KEYS[2])
+        if not raw then
+            return -1
+        end
+        local decoded, state = pcall(cjson.decode, raw)
+        if not decoded or type(state) ~= 'table' then
+            return -1
+        end
+        if state['schema_version'] ~= tonumber(ARGV[2])
+            or state['expression'] ~= ARGV[3]
+            or state['timezone'] ~= ARGV[4]
+            or state['next_due_ms'] ~= tonumber(ARGV[5]) then
+            return -1
+        end
+        redis.call('set', KEYS[2], ARGV[6])
+        return 1
+        """
+        with lease_guard.fence_lock:
+            lease_guard.assert_owned()
+            try:
+                result = int(r.eval(
+                    script,
+                    5,
+                    lease_guard.key,
+                    key,
+                    leaf_key,
+                    simple_delete_key,
+                    namespace_delete_key,
+                    lease_guard.token,
+                    expected_schema_version,
+                    expected_expression,
+                    expected_timezone,
+                    expected_next_due_ms,
+                    encoded,
+                    "1" if table_admission is not None else "0",
+                    leaf_payload if table_admission is not None else "",
+                ))
+            except Exception as exc:
+                lease_guard.lost.set()
+                raise _LeaseLostError(
+                    "quality cron outcome ownership could not be verified"
+                ) from exc
+            if result == 0:
+                lease_guard.lost.set()
+                raise _LeaseLostError(
+                    "quality execution lease was lost before cron publication"
+                )
+            if result == -2:
+                lease_guard.lost.set()
+                raise _LeaseLostError(
+                    "table incarnation changed before cron publication"
+                )
+            if result != 1:
+                raise RuntimeError(
+                    "quality cron phase changed during execution"
+                )
+        return
+    if not r.set(key, encoded):
+        raise RuntimeError("quality cron outcome was not persisted")
+
+
+def _cron_outcome_document(
+    state: Dict[str, Any],
+    outcome: CheckRunOutcome,
+    now_ms: int,
+) -> Dict[str, Any]:
+    """Build the next persisted cron phase without mutating ``state``."""
 
     from supertable.quality.cron import CronSchedule
 
@@ -3647,9 +4964,7 @@ def _record_cron_outcome(
         "last_outcome": outcome.state,
         "last_message": outcome.message[:4096],
     })
-    key = _cron_state_key(org, sup, table, mode)
-    if not r.set(key, json.dumps(updated, sort_keys=True, separators=(",", ":"))):
-        raise RuntimeError("quality cron outcome was not persisted")
+    return updated
 
 
 def _post_ingest_modes(
@@ -3721,6 +5036,10 @@ def _delete_if_value(r, key: str, expected: Any) -> bool:
 
 
 def _expire_if_value(r, key: str, expected: Any, ttl_seconds: int) -> bool:
+    ttl_seconds = _require_redis_ttl_seconds(
+        ttl_seconds,
+        label="Redis expiration",
+    )
     script = """
     if redis.call('get', KEYS[1]) == ARGV[1] then
         return redis.call('expire', KEYS[1], ARGV[2])
@@ -3728,14 +5047,14 @@ def _expire_if_value(r, key: str, expected: Any, ttl_seconds: int) -> bool:
     return 0
     """
     try:
-        return bool(r.eval(script, 1, key, expected, int(ttl_seconds)))
+        return bool(r.eval(script, 1, key, expected, ttl_seconds))
     except (AttributeError, NotImplementedError):
         # Compatibility only for clients that genuinely do not implement
         # scripts. Operational Redis errors are ambiguous and fail closed.
         try:
             current = r.get(key)
             if current is not None and _redis_values_equal(current, expected):
-                return bool(r.expire(key, int(ttl_seconds)))
+                return bool(r.expire(key, ttl_seconds))
         except Exception:
             return False
     except Exception:
@@ -3779,13 +5098,35 @@ def _set_retry_if_owned(
     *,
     completion_event: Optional[threading.Event] = None,
 ) -> bool:
+    cooldown_sec = _require_redis_ttl_seconds(
+        cooldown_sec,
+        label="quality cooldown",
+        allow_zero=True,
+    )
     retry_seconds = max(
         1,
         min(DEFAULT_RETRY_BACKOFF_SECONDS, max(1, cooldown_sec)),
     )
+    table_admission = lease_guard.table_admission
+    if table_admission is not None:
+        leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+            table_admission
+        )
+    else:
+        leaf_key = lease_guard.key
+        leaf_payload = ""
+        simple_delete_key = lease_guard.key
+        namespace_delete_key = lease_guard.key
     script = """
     if redis.call('get', KEYS[1]) ~= ARGV[1] then
         return 0
+    end
+    if ARGV[4] == '1' then
+        if redis.call('get', KEYS[3]) ~= ARGV[5]
+            or redis.call('exists', KEYS[4]) == 1
+            or redis.call('exists', KEYS[5]) == 1 then
+            return -1
+        end
     end
     redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
     return 1
@@ -3793,24 +5134,29 @@ def _set_retry_if_owned(
     with lease_guard.fence_lock:
         lease_guard.assert_owned()
         try:
-            written = bool(r.eval(
+            result = int(r.eval(
                 script,
-                2,
+                5,
                 lease_guard.key,
                 retry_key,
+                leaf_key,
+                simple_delete_key,
+                namespace_delete_key,
                 lease_guard.token,
                 _now_iso(),
                 retry_seconds,
+                "1" if table_admission is not None else "0",
+                leaf_payload if table_admission is not None else "",
             ))
         except Exception as exc:
             lease_guard.lost.set()
             raise _LeaseLostError(
                 f"retry ownership fence could not be verified: {exc}"
             ) from exc
-        if not written:
+        if result != 1:
             lease_guard.lost.set()
             raise _LeaseLostError(
-                "quality execution lease was lost before retry publication"
+                "quality lease or table incarnation changed before retry publication"
             )
         if completion_event is not None:
             completion_event.set()
@@ -3826,24 +5172,110 @@ def _finalize_success_if_owned(
     *,
     pending_key: Optional[str] = None,
     pending_generation: Any = None,
+    prepared_history: Optional[_PreparedHistory] = None,
     completion_event: Optional[threading.Event] = None,
 ) -> bool:
     """Atomically fence success bookkeeping and exact-generation consumption."""
 
-    keys = [lease_guard.key, cooldown_key, retry_key]
+    cooldown_sec = _require_redis_ttl_seconds(
+        cooldown_sec,
+        label="quality cooldown",
+        allow_zero=True,
+    )
     has_pending = pending_key is not None and pending_generation is not None
-    if has_pending:
-        keys.append(str(pending_key))
+    effective_pending_key = str(pending_key) if has_pending else lease_guard.key
+    table_admission = lease_guard.table_admission
+    if table_admission is not None:
+        leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
+            table_admission
+        )
+    else:
+        leaf_key = lease_guard.key
+        leaf_payload = ""
+        simple_delete_key = lease_guard.key
+        namespace_delete_key = lease_guard.key
+    keys = [
+        lease_guard.key,
+        cooldown_key,
+        retry_key,
+        effective_pending_key,
+        leaf_key,
+        simple_delete_key,
+        namespace_delete_key,
+        (
+            prepared_history.prepared_key
+            if prepared_history is not None else lease_guard.key
+        ),
+        (
+            prepared_history.outbox_key
+            if prepared_history is not None else lease_guard.key
+        ),
+    ]
     script = """
+    local function redis_key_type(key)
+        local reply = redis.call('type', key)
+        if type(reply) == 'table' then
+            return reply['ok']
+        end
+        return reply
+    end
+    local cooldown_seconds = tonumber(ARGV[3])
+    if not cooldown_seconds
+        or cooldown_seconds < 0
+        or cooldown_seconds > 2147483647
+        or cooldown_seconds ~= math.floor(cooldown_seconds) then
+        return -4
+    end
+    if redis_key_type(KEYS[1]) ~= 'string' then
+        return -5
+    end
     if redis.call('get', KEYS[1]) ~= ARGV[1] then
         return 0
     end
-    if tonumber(ARGV[3]) > 0 then
-        redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
+    local pending_matches = false
+    if ARGV[4] == '1' then
+        local pending_type = redis_key_type(KEYS[4])
+        if pending_type ~= 'none' and pending_type ~= 'string' then
+            return -5
+        end
+        pending_matches = redis.call('get', KEYS[4]) == ARGV[5]
+    end
+    if ARGV[6] == '1' then
+        if redis_key_type(KEYS[5]) ~= 'string' then
+            return -5
+        end
+        if redis.call('get', KEYS[5]) ~= ARGV[7]
+            or redis.call('exists', KEYS[6]) == 1
+            or redis.call('exists', KEYS[7]) == 1 then
+            return -1
+        end
+    end
+    if ARGV[8] == '1' then
+        if redis_key_type(KEYS[8]) ~= 'string' then
+            return -5
+        end
+        local outbox_type = redis_key_type(KEYS[9])
+        if outbox_type ~= 'none' and outbox_type ~= 'hash' then
+            return -5
+        end
+        if redis.call('get', KEYS[8]) ~= ARGV[10] then
+            return -2
+        end
+        local existing = redis.call('hget', KEYS[9], ARGV[9])
+        if existing and existing ~= ARGV[10] then
+            return -3
+        end
+    end
+    if cooldown_seconds > 0 then
+        redis.call('set', KEYS[2], ARGV[2], 'EX', cooldown_seconds)
     end
     redis.call('del', KEYS[3])
-    if ARGV[4] == '1' and redis.call('get', KEYS[4]) == ARGV[5] then
+    if ARGV[4] == '1' and pending_matches then
         redis.call('del', KEYS[4])
+    end
+    if ARGV[8] == '1' then
+        redis.call('hset', KEYS[9], ARGV[9], ARGV[10])
+        redis.call('del', KEYS[8])
     end
     return 1
     """
@@ -3851,16 +5283,27 @@ def _finalize_success_if_owned(
         if lease_guard.lost.is_set():
             return False
         try:
-            finalized = bool(r.eval(
+            finalized = int(r.eval(
                 script,
                 len(keys),
                 *keys,
                 lease_guard.token,
                 _now_iso(),
-                max(0, int(cooldown_sec)),
+                cooldown_sec,
                 "1" if has_pending else "0",
                 pending_generation if has_pending else "",
-            ))
+                "1" if table_admission is not None else "0",
+                leaf_payload if table_admission is not None else "",
+                "1" if prepared_history is not None else "0",
+                (
+                    prepared_history.history_id
+                    if prepared_history is not None else ""
+                ),
+                (
+                    prepared_history.payload
+                    if prepared_history is not None else ""
+                ),
+            )) == 1
         except Exception:
             lease_guard.lost.set()
             return False
@@ -3871,14 +5314,341 @@ def _finalize_success_if_owned(
         return finalized
 
 
+def _has_atomic_quality_publication(dqc: Any, redis_client: Any) -> bool:
+    """Whether result documents share the execution lease's Redis context."""
+
+    return getattr(dqc, "r", None) is redis_client and callable(
+        getattr(dqc, "_key", None)
+    )
+
+
+def _success_publication_documents(
+    dqc: Any,
+    table_name: str,
+    outcome: CheckRunOutcome,
+) -> List[Tuple[Tuple[str, ...], Any]]:
+    """Return the deferred result bundle with success telemetry merged in."""
+
+    documents = list(outcome.publication)
+    latest_positions = [
+        index
+        for index, (parts, _value) in enumerate(documents)
+        if parts == ("latest", table_name)
+    ]
+    if len(latest_positions) > 1:
+        raise RuntimeError("quality publication contains duplicate latest documents")
+    if latest_positions:
+        latest_index = latest_positions[0]
+        raw_latest = documents[latest_index][1]
+        if not isinstance(raw_latest, dict):
+            raise RuntimeError("quality publication latest document is invalid")
+        latest = _latest_with_attempt(raw_latest, outcome)
+        documents[latest_index] = (("latest", table_name), latest)
+    else:
+        existing = dqc.get_latest(table_name) or {}
+        latest = _latest_with_attempt(existing, outcome)
+        documents.insert(0, (("latest", table_name), latest))
+    return documents
+
+
+def _fallback_writer_for_document(dqc: Any, parts: Tuple[str, ...]) -> Any:
+    if len(parts) == 2 and parts[0] == "latest":
+        return lambda value: dqc.set_latest(parts[1], value)
+    if len(parts) == 2 and parts[0] == "anomalies":
+        return lambda value: dqc.set_anomalies(parts[1], value)
+    if len(parts) == 3 and parts[0] == "latest":
+        return lambda value: dqc.set_latest_column(parts[1], parts[2], value)
+    raise RuntimeError(f"unsupported quality publication document: {parts!r}")
+
+
+def _publish_success_fallback(
+    dqc: Any,
+    table_name: str,
+    outcome: CheckRunOutcome,
+    lease_guard: _LeaseGuard,
+) -> bool:
+    documents = _success_publication_documents(dqc, table_name, outcome)
+    writers = [
+        _fallback_writer_for_document(dqc, parts) for parts, _value in documents
+    ]
+    return _publish_dqc_documents(
+        dqc,
+        documents,
+        writers,
+        lease_guard=lease_guard,
+    ) is not None
+
+
+def _commit_success_if_owned(
+    dqc: Any,
+    *,
+    org: str,
+    sup: str,
+    table_name: str,
+    outcome: CheckRunOutcome,
+    lease_guard: _LeaseGuard,
+    cooldown_key: str,
+    retry_key: str,
+    cooldown_sec: int,
+    pending_key: Optional[str],
+    pending_generation: Any,
+    cron_state: Optional[Dict[str, Any]],
+    table_admission: Optional[_TableLeaseAdmission],
+    completion_event: threading.Event,
+) -> bool:
+    """Atomically publish result, success state, work consumption and cron phase."""
+
+    cooldown_sec = _require_redis_ttl_seconds(
+        cooldown_sec,
+        label="quality cooldown",
+        allow_zero=True,
+    )
+    documents = _success_publication_documents(dqc, table_name, outcome)
+    normalized_values = normalize_json_value([
+        value for _parts, value in documents
+    ])
+    if not isinstance(normalized_values, list):
+        raise RuntimeError("quality publication bundle could not be normalized")
+    key_builder = getattr(dqc, "_key")
+    document_keys = [key_builder(*parts) for parts, _value in documents]
+    payloads = [
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for value in normalized_values
+    ]
+
+    has_pending = pending_key is not None and pending_generation is not None
+    effective_pending_key = str(pending_key) if has_pending else lease_guard.key
+    has_cron = cron_state is not None
+    cron_key = lease_guard.key
+    expected_schema_version = 0
+    expected_expression = ""
+    expected_timezone = ""
+    expected_next_due_ms = 0
+    cron_encoded = ""
+    if cron_state is not None:
+        (
+            cron_key,
+            expected_schema_version,
+            expected_expression,
+            expected_timezone,
+            expected_next_due_ms,
+        ) = _cron_state_admission(org, sup, table_name, outcome.mode, cron_state)
+        cron_updated = _cron_outcome_document(
+            cron_state,
+            outcome,
+            int(time.time() * 1000),
+        )
+        cron_encoded = json.dumps(
+            cron_updated, sort_keys=True, separators=(",", ":"),
+        )
+
+    has_table_admission = table_admission is not None
+    if table_admission is not None:
+        (
+            expected_leaf_key,
+            expected_leaf_payload,
+            expected_simple_deletion_key,
+            expected_namespace_deletion_key,
+        ) = table_admission
+    else:
+        expected_leaf_key = lease_guard.key
+        expected_leaf_payload = ""
+        expected_simple_deletion_key = lease_guard.key
+        expected_namespace_deletion_key = lease_guard.key
+    prepared_history = outcome.prepared_history
+    prepared_history_key = (
+        prepared_history.prepared_key
+        if prepared_history is not None else lease_guard.key
+    )
+    history_outbox_key = (
+        prepared_history.outbox_key
+        if prepared_history is not None else lease_guard.key
+    )
+
+    control_keys = {
+        lease_guard.key,
+        cooldown_key,
+        retry_key,
+        effective_pending_key,
+        cron_key,
+        expected_leaf_key,
+        expected_simple_deletion_key,
+        expected_namespace_deletion_key,
+        prepared_history_key,
+        history_outbox_key,
+    }
+    if len(set(document_keys)) != len(document_keys):
+        raise RuntimeError("quality success publication contains duplicate keys")
+    if any(document_key in control_keys for document_key in document_keys):
+        raise RuntimeError("quality success publication aliases a control key")
+
+    script = """
+    -- atomic quality success document publication
+    local function redis_key_type(key)
+        local reply = redis.call('type', key)
+        if type(reply) == 'table' then
+            return reply['ok']
+        end
+        return reply
+    end
+    local cooldown_seconds = tonumber(ARGV[3])
+    if not cooldown_seconds
+        or cooldown_seconds < 0
+        or cooldown_seconds > 2147483647
+        or cooldown_seconds ~= math.floor(cooldown_seconds) then
+        return -5
+    end
+    if redis_key_type(KEYS[1]) ~= 'string' then
+        return -6
+    end
+    if redis.call('get', KEYS[1]) ~= ARGV[1] then
+        return 0
+    end
+    local pending_matches = false
+    if ARGV[4] == '1' then
+        local pending_type = redis_key_type(KEYS[4])
+        if pending_type ~= 'none' and pending_type ~= 'string' then
+            return -6
+        end
+        pending_matches = redis.call('get', KEYS[4]) == ARGV[5]
+    end
+    if ARGV[6] == '1' then
+        if redis_key_type(KEYS[5]) ~= 'string' then
+            return -6
+        end
+        local raw = redis.call('get', KEYS[5])
+        if not raw then
+            return -1
+        end
+        local decoded, state = pcall(cjson.decode, raw)
+        if not decoded or type(state) ~= 'table' then
+            return -1
+        end
+        if state['schema_version'] ~= tonumber(ARGV[7])
+            or state['expression'] ~= ARGV[8]
+            or state['timezone'] ~= ARGV[9]
+            or state['next_due_ms'] ~= tonumber(ARGV[10]) then
+            return -1
+        end
+    end
+    if ARGV[12] == '1' then
+        if redis_key_type(KEYS[6]) ~= 'string' then
+            return -6
+        end
+        if redis.call('get', KEYS[6]) ~= ARGV[13]
+            or redis.call('exists', KEYS[7]) == 1
+            or redis.call('exists', KEYS[8]) == 1 then
+            return -2
+        end
+    end
+    if ARGV[14] == '1' then
+        if redis_key_type(KEYS[9]) ~= 'string' then
+            return -6
+        end
+        local outbox_type = redis_key_type(KEYS[10])
+        if outbox_type ~= 'none' and outbox_type ~= 'hash' then
+            return -6
+        end
+        if redis.call('get', KEYS[9]) ~= ARGV[16] then
+            return -3
+        end
+        local existing = redis.call('hget', KEYS[10], ARGV[15])
+        if existing and existing ~= ARGV[16] then
+            return -4
+        end
+    end
+    for i = 11, #KEYS do
+        redis.call('set', KEYS[i], ARGV[i + 6])
+    end
+    if cooldown_seconds > 0 then
+        redis.call('set', KEYS[2], ARGV[2], 'EX', cooldown_seconds)
+    end
+    redis.call('del', KEYS[3])
+    if ARGV[4] == '1' and pending_matches then
+        redis.call('del', KEYS[4])
+    end
+    if ARGV[6] == '1' then
+        redis.call('set', KEYS[5], ARGV[11])
+    end
+    if ARGV[14] == '1' then
+        redis.call('hset', KEYS[10], ARGV[15], ARGV[16])
+        redis.call('del', KEYS[9])
+    end
+    return 1
+    """
+    keys = [
+        lease_guard.key,
+        cooldown_key,
+        retry_key,
+        effective_pending_key,
+        cron_key,
+        expected_leaf_key,
+        expected_simple_deletion_key,
+        expected_namespace_deletion_key,
+        prepared_history_key,
+        history_outbox_key,
+        *document_keys,
+    ]
+    with lease_guard.fence_lock:
+        if lease_guard.lost.is_set():
+            return False
+        try:
+            result = int(lease_guard.redis.eval(
+                script,
+                len(keys),
+                *keys,
+                lease_guard.token,
+                _now_iso(),
+                cooldown_sec,
+                "1" if has_pending else "0",
+                pending_generation if has_pending else "",
+                "1" if has_cron else "0",
+                expected_schema_version,
+                expected_expression,
+                expected_timezone,
+                expected_next_due_ms,
+                cron_encoded,
+                "1" if has_table_admission else "0",
+                expected_leaf_payload if has_table_admission else "",
+                "1" if prepared_history is not None else "0",
+                (
+                    prepared_history.history_id
+                    if prepared_history is not None else ""
+                ),
+                (
+                    prepared_history.payload
+                    if prepared_history is not None else ""
+                ),
+                *payloads,
+            ))
+        except Exception as exc:
+            lease_guard.lost.set()
+            logger.error(
+                "[dq-scheduler] Atomic quality success commit was ambiguous: %s",
+                exc,
+            )
+            return False
+        if result != 1:
+            lease_guard.lost.set()
+            return False
+        completion_event.set()
+        return True
+
+
 def _migrate_legacy_pending(
     r,
     org: str,
     sup: str,
     table: str,
     modes: Tuple[str, ...],
+    lifecycle_admission: _IngestNotificationAdmission,
 ) -> None:
-    """Move a pre/per-mode scalar pending marker into independent mode keys."""
+    """Atomically migrate scalar work under an exact live root/leaf pin."""
 
     legacy_key = _pending_key(org, sup, table)
     try:
@@ -3889,28 +5659,89 @@ def _migrate_legacy_pending(
         return
     if not modes:
         return
-    all_ready = True
-    for mode in modes:
-        mode_key = _pending_key(org, sup, table, mode)
-        try:
-            current = r.get(mode_key)
-            if current is None:
-                # Migrated authoritative mode work is persistent, exactly like
-                # work produced by notify_ingest in the current release.
-                r.set(mode_key, generation, nx=True)
-                current = r.get(mode_key)
-            if current is None or not _redis_values_equal(current, generation):
-                # A newer/different generation already owns this mode. Keep
-                # the scalar so the older generation can be migrated after it
-                # drains; deleting it here would lose pending work.
-                all_ready = False
-        except Exception:
-            # Do not delete the scalar marker unless every requested mode had a
-            # matching durable pending generation.
-            all_ready = False
-            break
-    if all_ready:
-        _consume_pending_generation(r, legacy_key, generation)
+    try:
+        (
+            root_key,
+            root_payload,
+            leaf_key,
+            leaf_payload,
+            simple_intent_key,
+            namespace_intent_key,
+        ) = lifecycle_admission
+    except (TypeError, ValueError):
+        return
+    if (
+        root_key != RK.meta_root(org, sup)
+        or leaf_key != RK.meta_leaf(org, sup, table)
+        or simple_intent_key
+        != RK.meta_simple_deletion_intent(org, sup, table)
+        or namespace_intent_key != RK.meta_namespace_deletion_intent(org, sup)
+    ):
+        return
+    mode_keys = [_pending_key(org, sup, table, mode) for mode in modes]
+    script = """
+    -- atomically migrate one legacy pending generation under catalog pins
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if root_payload ~= ARGV[1] or leaf_payload ~= ARGV[2]
+        or redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return -1
+    end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return -1
+    end
+    if redis.call('get', KEYS[5]) ~= ARGV[3] then
+        return 0
+    end
+    local all_ready = true
+    for i = 6, #KEYS do
+        local current = redis.call('get', KEYS[i])
+        if not current then
+            redis.call('set', KEYS[i], ARGV[3])
+        elseif current ~= ARGV[3] then
+            all_ready = false
+        end
+    end
+    if all_ready then
+        redis.call('del', KEYS[5])
+        return 1
+    end
+    return 2
+    """
+    try:
+        r.eval(
+            script,
+            5 + len(mode_keys),
+            root_key,
+            leaf_key,
+            simple_intent_key,
+            namespace_intent_key,
+            legacy_key,
+            *mode_keys,
+            root_payload,
+            leaf_payload,
+            generation,
+        )
+    except Exception:
+        # The scalar remains the retry record after an ambiguous response.
+        return
 
 
 def _resolve_unresolved_pending(
@@ -3919,6 +5750,7 @@ def _resolve_unresolved_pending(
     sup: str,
     table: str,
     modes: Tuple[str, ...],
+    lifecycle_admission: _IngestNotificationAdmission,
 ) -> None:
     """Resolve a pre-config ingest marker after strict schedule reads recover."""
 
@@ -3930,26 +5762,91 @@ def _resolve_unresolved_pending(
     if generation is None:
         return
     if not modes:
-        _consume_pending_generation(r, unresolved_key, generation)
+        # An empty mode set may come from a disabled schedule snapshot that
+        # raced with a later enable + ingest.  Consuming a generation created
+        # after that stale read would lose the post-ingest check.  This is one
+        # overwrite-only key per table, so retaining it is bounded; a later
+        # enabled snapshot resolves it, and table deletion removes it.
         return
-
     try:
-        pipe = r.pipeline(transaction=True)
-        pipe.set(
-            _pending_key(org, sup, table),
-            generation,
-            ex=DEFAULT_PENDING_TTL_SECONDS,
-        )
-        for mode in modes:
-            pipe.set(_pending_key(org, sup, table, mode), generation)
-        results = pipe.execute()
-        if not all(results):
-            return
-    except Exception:
-        # The persistent unresolved key is the retry record. Never consume it
-        # after an ambiguous/partial resolution attempt.
+        (
+            root_key,
+            root_payload,
+            leaf_key,
+            leaf_payload,
+            simple_intent_key,
+            namespace_intent_key,
+        ) = lifecycle_admission
+    except (TypeError, ValueError):
         return
-    _consume_pending_generation(r, unresolved_key, generation)
+    if (
+        root_key != RK.meta_root(org, sup)
+        or leaf_key != RK.meta_leaf(org, sup, table)
+        or simple_intent_key
+        != RK.meta_simple_deletion_intent(org, sup, table)
+        or namespace_intent_key != RK.meta_namespace_deletion_intent(org, sup)
+    ):
+        return
+    scalar_key = _pending_key(org, sup, table)
+    mode_keys = [_pending_key(org, sup, table, mode) for mode in modes]
+    script = """
+    -- atomically resolve deferred ingest work under exact catalog pins
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if root_payload ~= ARGV[1] or leaf_payload ~= ARGV[2]
+        or redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return -1
+    end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return -1
+    end
+    if redis.call('get', KEYS[5]) ~= ARGV[3] then
+        return 0
+    end
+    redis.call('set', KEYS[6], ARGV[3], 'EX', ARGV[4])
+    for i = 7, #KEYS do
+        redis.call('set', KEYS[i], ARGV[3])
+    end
+    redis.call('del', KEYS[5])
+    return 1
+    """
+    try:
+        r.eval(
+            script,
+            6 + len(mode_keys),
+            root_key,
+            leaf_key,
+            simple_intent_key,
+            namespace_intent_key,
+            unresolved_key,
+            scalar_key,
+            *mode_keys,
+            root_payload,
+            leaf_payload,
+            generation,
+            DEFAULT_PENDING_TTL_SECONDS,
+        )
+    except Exception:
+        # The persistent unresolved key remains the retry record after an
+        # ambiguous response.
+        return
 
 
 # ──────────────────────────────────────────────────────────────────────

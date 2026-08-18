@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import os
+import posixpath
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -284,6 +285,10 @@ class StorageInterface(abc.ABC):
         """
         Deletes a file/object at the given path.
         Raises FileNotFoundError if the path does not exist.
+
+        A successful return acknowledges durable disappearance: callers may
+        immediately finalize a catalog tombstone or recreate the same logical
+        name without an old local object reappearing after a host crash.
         """
         pass
 
@@ -294,7 +299,11 @@ class StorageInterface(abc.ABC):
         retried batch deletion.  The compatibility implementation is suitable
         for local and third-party hierarchical backends whose ``delete`` is
         already recursive.  Missing prefixes make retries idempotent.
+
+        A successful return acknowledges durable disappearance for backends
+        whose namespace is hosted on the local filesystem.
         """
+        path = self._require_nonempty_delete_prefix(path)
         try:
             self.delete(path)
         except FileNotFoundError:
@@ -304,6 +313,21 @@ class StorageInterface(abc.ABC):
             raise OSError(
                 f"Storage prefix is not empty after deletion: {path!r}"
             )
+
+    @staticmethod
+    def _require_nonempty_delete_prefix(path: str) -> str:
+        """Normalize dot segments and reject logical-root aliases."""
+        if not isinstance(path, str):
+            raise ValueError("Storage deletion prefix must be a string")
+        candidate = path.strip().replace("\\", "/")
+        normalized = posixpath.normpath(candidate)
+        if (
+            normalized in ("", ".", "/", "..")
+            or normalized.startswith("../")
+            or not normalized.lstrip("/")
+        ):
+            raise ValueError("Refusing to delete an empty storage prefix")
+        return normalized
 
     @abc.abstractmethod
     def get_directory_structure(self, path: str) -> dict:
@@ -331,6 +355,11 @@ class StorageInterface(abc.ABC):
         Writes a PyArrow table to the given path (local or cloud/object storage) in Parquet format.
         For local, use pyarrow.parquet.write_table.
         For cloud, you may rely on s3fs or a custom upload method.
+
+        A successful return acknowledges a complete, durable object. Snapshot
+        and staging publishers may make the path visible in Redis immediately
+        afterward, so an implementation must not expose or acknowledge a
+        partial local file.
         """
         pass
 
@@ -353,13 +382,12 @@ class StorageInterface(abc.ABC):
         Parquet files within one table can carry heterogeneous schemas, so a
         requested column a given file lacks is silently dropped rather than
         raising a binder error.  Returns the projection list to hand the parquet
-        reader, or ``None`` to read every column (nothing requested, or none of
-        the requested columns exist in this file).
+        reader, including an empty list when none of the requested columns exist;
+        only ``None`` means read every column.
         """
-        if not columns:
+        if columns is None:
             return None
-        present = [c for c in columns if c in set(available)]
-        return present or None
+        return [c for c in columns if c in set(available)]
 
     # -------------------------
     # Byte / text / copy operations
@@ -369,6 +397,10 @@ class StorageInterface(abc.ABC):
         """
         Writes raw bytes to the given path.
         Creates parent directories/prefixes as needed.
+
+        A successful return acknowledges complete, durable bytes. Core Parquet
+        publication uses this exact-byte path when a backend supports it and
+        may publish the object in the catalog immediately afterward.
         """
         pass
 

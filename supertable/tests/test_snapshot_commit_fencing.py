@@ -9,7 +9,7 @@ import redis
 from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
 from supertable.errors import LockLostError, SnapshotCommitConflictError
-from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import DeletionIntentConflictError, RedisCatalog
 
 
 def _catalog():
@@ -23,7 +23,12 @@ def _catalog():
 def _seed(fake, *, token="token", version=4, path="snap/4.json"):
     fake.set(
         RK.meta_leaf("org", "lake", "table"),
-        json.dumps({"version": version, "path": path, "payload": {"resources": []}}),
+        json.dumps({
+            "version": version,
+            "ts": 1,
+            "path": path,
+            "payload": {"resources": [], "_row_filter": None},
+        }),
     )
     fake.set(
         RK.meta_root("org", "lake"),
@@ -48,7 +53,10 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
         "version": 5,
         "ts": 123,
         "path": "snap/5.json",
-        "payload": {"resources": [{"file": "f"}]},
+        "payload": {
+            "resources": [{"file": "f"}],
+            "_row_filter": None,
+        },
         "commit_id": "commit-5",
     }
     assert root["version"] == 10
@@ -431,6 +439,8 @@ def test_simple_delete_atomically_cleans_index_and_recreation_fences():
 
     # Explicit recovery first rebinds and re-finalizes the exact tombstone;
     # only then may the confirmed operator clear it for recreation.
+    quality_running = RK.quality_prefix("org", "lake") + "running:table"
+    fake.set(quality_running, "stale-quality-owner")
     catalog.recover_simple_deletion(
         "org", "lake", "table",
         expected_intent_id="delete-1",
@@ -438,6 +448,7 @@ def test_simple_delete_atomically_cleans_index_and_recreation_fences():
         lock_token="new-token",
         confirm_previous_owner_stopped=True,
     )
+    assert not fake.exists(quality_running)
     assert catalog.delete_simple_table(
         "org", "lake", "table", lock_token="new-token",
         namespace_token="new-namespace", intent_id="delete-1",
@@ -480,6 +491,198 @@ def test_replica_resolution_transport_error_cannot_fall_back_to_local(monkeypatc
         catalog.get_leaf("org", "replica", "table")
 
 
+@pytest.mark.parametrize(
+    "replica_tables",
+    [[], "table", {"table": True}, ["table", 7]],
+)
+def test_replica_allowlist_never_fails_open(replica_tables):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "source"),
+        json.dumps({"version": 1, "ts": 1}),
+    )
+    fake.set(
+        RK.meta_leaf("org", "source", "table"),
+        json.dumps({"version": 1, "ts": 1, "path": "snap/1.json"}),
+    )
+    fake.set(
+        RK.meta_root("org", "replica"),
+        json.dumps({
+            "version": 1,
+            "ts": 1,
+            "read_only": True,
+            "clone_type": "replica",
+            "cloned_from": "source",
+            "replica_tables": replica_tables,
+        }),
+    )
+
+    if replica_tables == []:
+        assert catalog.get_leaf("org", "replica", "table") is None
+        assert catalog.leaf_exists("org", "replica", "table") is False
+        assert list(catalog.scan_leaf_keys("org", "replica")) == []
+    else:
+        with pytest.raises(RuntimeError, match="Corrupt Redis root JSON"):
+            catalog.get_leaf("org", "replica", "table")
+
+
+@pytest.mark.parametrize("source", [None, "", "replica", "../source"])
+def test_replica_invalid_source_never_falls_back_to_local(source):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "replica"),
+        json.dumps({
+            "version": 1,
+            "ts": 1,
+            "read_only": True,
+            "clone_type": "replica",
+            "cloned_from": source,
+            "replica_tables": None,
+        }),
+    )
+    # A stale local leaf must remain unreachable when replica metadata is bad.
+    fake.set(
+        RK.meta_leaf("org", "replica", "table"),
+        json.dumps({"version": 1, "ts": 1, "path": "private/1.json"}),
+    )
+
+    with pytest.raises(RuntimeError, match="Corrupt Redis root JSON"):
+        catalog.get_leaf("org", "replica", "table")
+
+
+def test_replica_rejects_orphan_source_and_source_deletion_intent():
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "replica"),
+        json.dumps({
+            "version": 1,
+            "ts": 1,
+            "read_only": True,
+            "clone_type": "replica",
+            "cloned_from": "source",
+            "replica_tables": None,
+        }),
+    )
+    fake.set(
+        RK.meta_leaf("org", "source", "table"),
+        json.dumps({"version": 1, "ts": 1, "path": "source/snap.json"}),
+    )
+
+    with pytest.raises(RuntimeError, match="missing source namespace"):
+        catalog.get_leaf("org", "replica", "table")
+
+    fake.set(
+        RK.meta_root("org", "source"),
+        json.dumps({"version": 1, "ts": 1}),
+    )
+    fake.set(
+        RK.meta_namespace_deletion_intent("org", "source"),
+        json.dumps({"intent_id": "delete-source"}),
+    )
+    with pytest.raises(DeletionIntentConflictError, match="source is fenced"):
+        catalog.get_leaf("org", "replica", "table")
+
+
+def test_replica_rejects_replica_chain_source():
+    catalog, fake = _catalog()
+    for name, source in (("replica", "middle"), ("middle", "origin")):
+        fake.set(
+            RK.meta_root("org", name),
+            json.dumps({
+                "version": 1,
+                "ts": 1,
+                "read_only": True,
+                "clone_type": "replica",
+                "cloned_from": source,
+                "replica_tables": None,
+            }),
+        )
+    with pytest.raises(RuntimeError, match="another replica"):
+        catalog.get_leaf("org", "replica", "table")
+
+
+def test_replica_scan_pins_target_and_source_roots(monkeypatch):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "source-a"),
+        json.dumps({"version": 1, "ts": 1}),
+    )
+    fake.set(
+        RK.meta_root("org", "source-b"),
+        json.dumps({"version": 1, "ts": 1}),
+    )
+    target_key = RK.meta_root("org", "replica")
+    target = {
+        "version": 1,
+        "ts": 1,
+        "read_only": True,
+        "clone_type": "replica",
+        "cloned_from": "source-a",
+        "replica_tables": ["table"],
+    }
+    fake.set(target_key, json.dumps(target))
+    leaf_key = RK.meta_leaf("org", "source-a", "table")
+    fake.set(
+        leaf_key,
+        json.dumps({"version": 1, "ts": 1, "path": "source-a/snap.json"}),
+    )
+
+    original_scan = catalog._scan_leaf_keys_raw
+
+    def changing_scan(*args, **kwargs):
+        yield from original_scan(*args, **kwargs)
+        changed = dict(target)
+        changed["cloned_from"] = "source-b"
+        fake.set(target_key, json.dumps(changed))
+
+    monkeypatch.setattr(catalog, "_scan_leaf_keys_raw", changing_scan)
+    with pytest.raises(SnapshotCommitConflictError, match="Catalog changed"):
+        list(catalog.scan_leaf_items("org", "replica", count=1))
+
+
+def test_get_leaf_transport_and_corruption_fail_closed(monkeypatch):
+    catalog, fake = _catalog()
+    _seed(fake)
+    # Resolve the ordinary root first, then inject a leaf-only transport fault.
+    original_get = fake.get
+
+    def failing_get(key):
+        if key == RK.meta_leaf("org", "lake", "table"):
+            raise redis.TimeoutError("leaf timeout")
+        return original_get(key)
+
+    monkeypatch.setattr(fake, "get", failing_get)
+    with pytest.raises(redis.TimeoutError, match="leaf timeout"):
+        catalog.get_leaf("org", "lake", "table")
+
+    monkeypatch.setattr(fake, "get", original_get)
+    fake.set(RK.meta_leaf("org", "lake", "table"), "[]")
+    with pytest.raises(RuntimeError, match="Corrupt Redis leaf JSON"):
+        catalog.get_leaf("org", "lake", "table")
+
+
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        {"version": "4", "ts": 1, "path": "snap/4.json"},
+        {"version": True, "ts": 1, "path": "snap/4.json"},
+        {"version": 4, "ts": "1", "path": "snap/4.json"},
+        {"version": 4, "ts": True, "path": "snap/4.json"},
+        {"version": 4, "ts": 1, "path": ""},
+    ],
+)
+def test_leaf_reads_and_enumeration_share_strict_identity_contract(leaf):
+    catalog, fake = _catalog()
+    _seed(fake)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    fake.set(leaf_key, json.dumps(leaf))
+
+    with pytest.raises(RuntimeError, match="Corrupt Redis leaf JSON"):
+        catalog.get_leaf("org", "lake", "table")
+    with pytest.raises(RuntimeError, match="Malformed catalog leaf"):
+        list(catalog._fetch_batch([leaf_key]))
+
+
 def test_readonly_guard_transport_error_fails_closed(monkeypatch):
     from supertable.rbac import access_control
 
@@ -497,7 +700,7 @@ def test_invalid_mirror_configuration_cannot_be_treated_as_disabled():
     catalog, fake = _catalog()
     fake.set(
         RK.meta_mirrors("org", "lake"),
-        json.dumps({"formats": ["PARQUE"]}),
+        json.dumps({"formats": ["PARQUE"], "ts": 1}),
     )
     with pytest.raises(ValueError, match="Unsupported configured mirror"):
         catalog.get_mirrors("org", "lake")
@@ -535,7 +738,7 @@ def test_leaf_scan_rejects_catalog_generation_change(monkeypatch):
         )
 
     monkeypatch.setattr(catalog, "_resolve_replica_info", lambda *a: None)
-    monkeypatch.setattr(catalog, "scan_leaf_keys", keys)
+    monkeypatch.setattr(catalog, "_scan_leaf_keys_raw", keys)
 
     with pytest.raises(SnapshotCommitConflictError, match="Catalog changed"):
         list(catalog.scan_leaf_items("org", "lake", count=1))
@@ -630,48 +833,217 @@ def test_catalog_without_atomic_fenced_commit_is_rejected():
 
 def test_rowid_reservation_recovers_above_snapshot_high_watermark():
     catalog, fake = _catalog()
+    _seed(fake)
     seq_key = RK.meta_rowid_seq("org", "lake", "table")
     fake.set(seq_key, 2)  # Redis was restored behind immutable table data.
 
     assert catalog.reserve_rowids_at_least(
-        "org", "lake", "table", count=3, floor=100
+        "org", "lake", "table", count=3, floor=100,
+        lock_token="token",
     ) == (101, 103)
     assert int(fake.get(seq_key)) == 103
     assert catalog.reserve_rowids_at_least(
-        "org", "lake", "table", count=2, floor=50
+        "org", "lake", "table", count=2, floor=50,
+        lock_token="token",
     ) == (104, 105)
 
 
 def test_rowid_reservation_is_exact_above_double_precision_boundary():
     catalog, fake = _catalog()
+    _seed(fake)
     boundary = (1 << 53) + 17
 
     assert catalog.reserve_rowids_at_least(
-        "org", "lake", "table", count=3, floor=boundary
+        "org", "lake", "table", count=3, floor=boundary,
+        lock_token="token",
     ) == (boundary + 1, boundary + 3)
     assert int(fake.get(RK.meta_rowid_seq("org", "lake", "table"))) == boundary + 3
 
 
 def test_rowid_reservation_rejects_signed_int64_overflow():
     catalog, fake = _catalog()
+    _seed(fake)
     seq_key = RK.meta_rowid_seq("org", "lake", "table")
     fake.set(seq_key, (1 << 63) - 1)
 
     with pytest.raises(Exception, match="overflow|increment|range"):
         catalog.reserve_rowids_at_least(
-            "org", "lake", "table", count=1, floor=0
+            "org", "lake", "table", count=1, floor=0,
+            lock_token="token",
         )
 
 
 def test_rowid_reservation_rejects_corrupt_negative_counter():
     catalog, fake = _catalog()
+    _seed(fake)
     seq_key = RK.meta_rowid_seq("org", "lake", "table")
     fake.set(seq_key, -1)
 
     with pytest.raises(Exception, match="non-negative|rowid|sequence"):
         catalog.reserve_rowids_at_least(
-            "org", "lake", "table", count=1, floor=0
+            "org", "lake", "table", count=1, floor=0,
+            lock_token="token",
         )
 
     # A corrupt allocator must not be advanced into the valid id namespace.
     assert fake.get(seq_key) == "-1"
+
+
+@pytest.mark.parametrize(
+    "count,floor",
+    [(True, 0), (1.0, 0), (1, False), (1, 0.0), (1, "0")],
+)
+def test_rowid_reservation_rejects_noninteger_arguments(count, floor):
+    catalog, fake = _catalog()
+    _seed(fake)
+
+    with pytest.raises(TypeError, match="must be integers"):
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            count=count,
+            floor=floor,
+            lock_token="token",
+        )
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+def test_stale_writer_cannot_recreate_rowid_state_after_delete_and_clear():
+    catalog, fake = _catalog()
+    _seed(fake, token="stale-writer")
+    fake.sadd(RK.meta_table_names("org", "lake"), "table")
+
+    # The writer pinned this incarnation, then its lease expired. A deleter
+    # acquires both locks and fully finalizes the table lifecycle.
+    fake.delete(RK.lock_leaf("org", "lake", "table"))
+    fake.set(RK.lock_leaf("org", "lake", "table"), "deleter")
+    fake.set(RK.lock_namespace("org", "lake"), "namespace")
+    intent = catalog.begin_simple_deletion(
+        "org",
+        "lake",
+        "table",
+        namespace_token="namespace",
+        lock_token="deleter",
+        intent_id="delete-rowids",
+    )
+    assert catalog.delete_simple_table(
+        "org",
+        "lake",
+        "table",
+        namespace_token="namespace",
+        lock_token="deleter",
+        intent_id=intent["intent_id"],
+    )
+    catalog.clear_simple_deletion_tombstone(
+        "org",
+        "lake",
+        "table",
+        expected_intent_id=intent["intent_id"],
+        namespace_token="namespace",
+        lock_token="deleter",
+        confirm_previous_owner_stopped=True,
+    )
+
+    seq_key = RK.meta_rowid_seq("org", "lake", "table")
+    assert not fake.exists(seq_key)
+    with pytest.raises(LockLostError):
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            count=1,
+            floor=100,
+            lock_token="stale-writer",
+        )
+    assert not fake.exists(seq_key)
+
+    # Even if a stale token is reintroduced externally, the missing leaf
+    # prevents the allocator from recreating table-scoped state.
+    fake.set(RK.lock_leaf("org", "lake", "table"), "stale-writer")
+    with pytest.raises(FileNotFoundError, match="SimpleTable does not exist"):
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            count=1,
+            floor=100,
+            lock_token="stale-writer",
+        )
+    assert not fake.exists(seq_key)
+
+
+@pytest.mark.parametrize(
+    "intent_key",
+    [
+        RK.meta_namespace_deletion_intent("org", "lake"),
+        RK.meta_simple_deletion_intent("org", "lake", "table"),
+    ],
+)
+def test_rowid_reservation_is_fenced_by_deletion_intents(intent_key):
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.set(intent_key, "pending")
+
+    with pytest.raises(DeletionIntentConflictError):
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            count=1,
+            floor=0,
+            lock_token="token",
+        )
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+@pytest.mark.parametrize(
+    "catalog_state,error_type",
+    [
+        ("missing-root", FileNotFoundError),
+        ("corrupt-root", RuntimeError),
+        ("missing-leaf", FileNotFoundError),
+        ("corrupt-leaf", RuntimeError),
+    ],
+)
+def test_rowid_reservation_requires_valid_live_catalog(catalog_state, error_type):
+    catalog, fake = _catalog()
+    _seed(fake)
+    if catalog_state == "missing-root":
+        fake.delete(RK.meta_root("org", "lake"))
+    elif catalog_state == "corrupt-root":
+        fake.set(RK.meta_root("org", "lake"), "[]")
+    elif catalog_state == "missing-leaf":
+        fake.delete(RK.meta_leaf("org", "lake", "table"))
+    else:
+        fake.set(RK.meta_leaf("org", "lake", "table"), "[]")
+
+    with pytest.raises(error_type):
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            count=1,
+            floor=0,
+            lock_token="token",
+        )
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+@pytest.mark.parametrize("state", ["absent", "deleting"])
+def test_legacy_rowid_allocator_is_retired_without_mutating_catalog(state):
+    catalog, fake = _catalog()
+    if state == "deleting":
+        _seed(fake)
+        fake.set(
+            RK.meta_simple_deletion_intent("org", "lake", "table"),
+            json.dumps({"status": "deleting"}),
+        )
+
+    with pytest.raises(RuntimeError, match="reserve_rowids is retired"):
+        catalog.reserve_rowids("org", "lake", "table", count=1)
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))

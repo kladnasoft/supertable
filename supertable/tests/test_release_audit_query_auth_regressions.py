@@ -117,8 +117,18 @@ def test_inclusion_only_metadata_exposes_parent_through_visible_child(monkeypatc
     reader._get_all_tables = lambda: ["visible", "hidden"]
     reader.catalog.get_root.return_value = {"version": 7, "ts": 1}
     snapshot = json.dumps({
-        "schema": {"id": "int"},
-        "resources": [{"file": "f", "rows": 3, "file_size": 10}],
+        "version": 1,
+        "ts": 1,
+        "path": "snapshots/v1.json",
+        "payload": {
+            "snapshot_version": 1,
+            "schema": {"id": "int"},
+            "resources": [{"file": "f", "rows": 3, "file_size": 10}],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "_row_filter": None,
+        },
     })
     reader.catalog.r.mget.return_value = [snapshot]
     checked = []

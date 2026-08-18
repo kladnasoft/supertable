@@ -130,7 +130,10 @@ class FakeCatalog:
         self._rowid_counter += count
         return start
 
-    def reserve_rowids_at_least(self, org, sup, simple, count, floor):
+    def reserve_rowids_at_least(
+            self, org, sup, simple, count, floor, *, lock_token,
+    ):
+        assert lock_token
         self._rowid_counter = max(self._rowid_counter, int(floor))
         start = self._rowid_counter + 1
         self._rowid_counter += int(count)
@@ -170,7 +173,7 @@ class FakeCatalog:
     def commit_snapshot(
             self, org, sup, simple, payload, path, *, expected_version,
             expected_path, lock_token, commit_id=None,
-            mirror_publication=False, now_ms=None,
+            mirror_publication=False, expected_mirrors=None, now_ms=None,
     ):
         """Test-double implementation of the production atomic primitive."""
         key = f"{org}:{sup}:{simple}"
@@ -602,6 +605,22 @@ class TestConfigureTable:
             with pytest.raises(ValueError, match="max_overlapping_files must be a positive"):
                 dw.configure_table("admin", "t1", max_overlapping_files=0)
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "max_memory_chunk_size",
+            "max_overlapping_files",
+            "max_tombstone_rows",
+        ],
+    )
+    def test_integer_table_limits_reject_boolean_values(
+        self, fake_catalog, field,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="must be a positive integer"):
+                dw.configure_table("admin", "t1", **{field: True})
+
     def test_configure_updates_limits(self, fake_catalog):
         """When both limits are provided, they read existing config from Redis first."""
         fake_catalog.set_table_config("testorg", "testsuper", "t1", {
@@ -676,16 +695,17 @@ class TestGetTableConfig:
         cfg = dw._get_table_config("t1")
         assert cfg["primary_keys"] == ["id"]
 
-    def test_caches_after_first_call(self, fake_catalog):
+    def test_refreshes_after_acknowledged_change(self, fake_catalog):
         fake_catalog.set_table_config("testorg", "testsuper", "t1", {"primary_keys": ["id"]})
         dw = self._make_writer(fake_catalog)
 
         cfg1 = dw._get_table_config("t1")
-        # Change Redis but cache should still return old value
+        # A change acknowledged through another writer/process must be visible
+        # to this long-lived writer on its next operation.
         fake_catalog.set_table_config("testorg", "testsuper", "t1", {"primary_keys": ["new_id"]})
         cfg2 = dw._get_table_config("t1")
-        assert cfg1 == cfg2
-        assert cfg2["primary_keys"] == ["id"]
+        assert cfg1["primary_keys"] == ["id"]
+        assert cfg2["primary_keys"] == ["new_id"]
 
 
 # ===========================================================================
@@ -1106,6 +1126,42 @@ class TestWriteMonitoring:
 # ===========================================================================
 
 class TestWriteErrorPropagation:
+
+    def test_concurrent_create_requires_write_authorization_after_lock(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        """CREATE-only authority cannot mutate a concurrently-created table."""
+        original_acquire = fake_catalog.acquire_simple_lock
+
+        def create_table_before_lock_returns(
+            org, sup, simple, ttl_s=30, timeout_s=60,
+        ):
+            _bootstrap_leaf(fake_catalog, org, sup, simple)
+            return original_acquire(
+                org, sup, simple, ttl_s=ttl_s, timeout_s=timeout_s,
+            )
+
+        monkeypatch.setattr(
+            fake_catalog, "acquire_simple_lock", create_table_before_lock_returns,
+        )
+        with (
+            patch("supertable.data_writer.check_create_access") as create_access,
+            patch(
+                "supertable.data_writer.check_write_access",
+                side_effect=PermissionError("write denied"),
+            ) as write_access,
+        ):
+            with pytest.raises(PermissionError, match="write denied"):
+                writer.write(
+                    "create_only", "raced", _simple_arrow(1),
+                    overwrite_columns=[],
+                )
+
+        create_access.assert_called_once()
+        write_access.assert_called_once()
+        writer._mocks["SimpleTable"].assert_not_called()
+        writer._mocks["process"].assert_not_called()
+        assert len(fake_catalog.release_calls) == 1
 
     def test_access_control_error_propagates(self):
         """If check_write_access raises, write() should re-raise."""

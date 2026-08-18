@@ -6,7 +6,10 @@ from typing import Iterable, List, Dict, Any, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
-from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.utils.snapshot import (
+    complete_snapshot_payload,
+    snapshot_cache_payload,
+)
 
 # Writers are split per-format
 from supertable.mirroring.mirror_delta import (
@@ -421,6 +424,7 @@ class MirrorFormats:
             leaf_snapshot = complete_snapshot_payload(
                 leaf.get("payload"),
                 expected_version=leaf.get("version"),
+                require_policy_marker=True,
             )
             if leaf_snapshot is None:
                 raise RuntimeError(
@@ -437,8 +441,12 @@ class MirrorFormats:
                     "Committed mirror snapshot object is incomplete or invalid"
                 )
             if (
-                _canonical_snapshot_bytes(stored_snapshot)
-                != _canonical_snapshot_bytes(leaf_snapshot)
+                _canonical_snapshot_bytes(
+                    snapshot_cache_payload(stored_snapshot)
+                )
+                != _canonical_snapshot_bytes(
+                    snapshot_cache_payload(leaf_snapshot)
+                )
             ):
                 raise RuntimeError(
                     "Committed mirror snapshot object does not match the "

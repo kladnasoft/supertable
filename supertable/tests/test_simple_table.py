@@ -557,6 +557,7 @@ class TestGetSimpleTableSnapshot:
             "tombstone": None,
             "tombstone_rows": 0,
             "tombstone_digest": None,
+            "_row_filter": None,
         }
         obj.catalog.get_leaf.return_value = {
             "path": "/snap.json",
@@ -580,11 +581,12 @@ class TestGetSimpleTableSnapshot:
             "tombstone": None,
             "tombstone_rows": 0,
             "tombstone_digest": None,
+            "_row_filter": None,
         }
         obj.catalog.get_leaf.return_value = {
             "path": "/snap.json",
             "version": 2,
-            "payload": {"snapshot": snap},
+            "payload": {"_row_filter": None, "snapshot": snap},
         }
 
         data, path = obj.get_simple_table_snapshot()
@@ -616,6 +618,30 @@ class TestGetSimpleTableSnapshot:
 
         assert data is heavy
         assert data["tombstone"] == "tombstone/v3.parquet"
+        assert path == "/snap.json"
+        obj.storage.read_json.assert_called_once_with("/snap.json")
+
+    def test_complete_cache_without_policy_marker_loads_authoritative_filter(self):
+        """A legacy cache cannot erase a filter held only by storage JSON."""
+        obj = _make_simple()
+        cached = {
+            "snapshot_version": 3,
+            "resources": [{"file": "data/f.parquet"}],
+            "schema": {"id": "Int64", "tenant_id": "Int64"},
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        }
+        heavy = {**cached, "_row_filter": "tenant_id = 7"}
+        obj.catalog.get_leaf.return_value = {
+            "path": "/snap.json", "version": 3, "payload": cached,
+        }
+        obj.storage.read_json.return_value = heavy
+
+        data, path = obj.get_simple_table_snapshot()
+
+        assert data is heavy
+        assert data["_row_filter"] == "tenant_id = 7"
         assert path == "/snap.json"
         obj.storage.read_json.assert_called_once_with("/snap.json")
 
@@ -670,6 +696,7 @@ class TestGetSimpleTableSnapshot:
             "tombstone": None,
             "tombstone_rows": 0,
             "tombstone_digest": None,
+            "_row_filter": None,
         }
         obj.catalog.get_leaf.return_value = {
             "path": "/snap.json", "version": 0, "payload": payload,
@@ -759,6 +786,7 @@ class TestUpdate:
                 "tombstone": None,
                 "tombstone_rows": 0,
                 "tombstone_digest": None,
+                "_row_filter": None,
             },
         }
 
